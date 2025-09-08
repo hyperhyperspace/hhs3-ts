@@ -15,6 +15,6 @@ To build the system, run
 
 ```
 npm install
-npm run build -workspaces
+npm run build
 ```
 
