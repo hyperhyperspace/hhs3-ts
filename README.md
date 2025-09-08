@@ -13,6 +13,8 @@ It is organized as a collection of modules. This is WIP, the following modules h
 
 To build the system, run
 
-`npm install`
-`npm run build -workspaces`
+```
+npm install
+npm run build -workspaces
+```
 

@@ -36,7 +36,7 @@ In-memory storage for the DAG and the indexing strategies is provided with this 
 
 DAG entries are composed by a payload, a metadata section (not included in the hash) and a header (computed automatically, includes the predecessor entries).
 
-To crate a DAGs, do as follows:
+To crate DAGs, do as follows:
 
 ```typescript
 // DAG with flat indexing
