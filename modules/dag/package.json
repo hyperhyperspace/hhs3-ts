@@ -1,0 +1,28 @@
+{
+  "name": "@hyper-hyper-space/hhs3_dag",
+  "version": "0.1.0",
+  "description": "Merkle-DAG",
+  "source": "src/index.ts",
+  "main": "dist/index.js",
+  "module": "dist/index.esm.js",
+  "types": "dist/index.d.ts",
+  
+  "scripts": {
+    "test": "NODE_PATH=\"src\" node -r ts-node/register  ./test/run_tests.ts",
+    "bench": "NODE_PATH=\"src\" node -r ts-node/register  ./test/run_benchmark.ts",
+    "debug": "NODE_PATH=\"src\" node --inspect-brk -r ts-node/register ./test/run_tests.ts",
+    "build": "npx tsc"
+  },
+  "author": "Santiago Bazerque",
+  "license": "MIT",
+  "dependencies": {
+    "@hyper-hyper-space/hhs3_json": "^0.1.0",
+    "@hyper-hyper-space/hhs3_crypto": "^0.1.0",
+    "@hyper-hyper-space/hhs3_util": "^0.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "ts-node": "^10.9.2",
+    "@types/node": "^22.2.0"
+  }
+}

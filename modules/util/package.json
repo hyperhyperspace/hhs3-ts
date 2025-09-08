@@ -1,0 +1,22 @@
+{
+  "name": "@hyper-hyper-space/hhs3_util",
+  "version": "0.1.0",
+  "description": "Utility functions and data types for HHSv3",
+  "source": "src/index.ts",
+  "main": "dist/index.js",
+  "module": "dist/index.esm.js",
+  "types": "dist/index.d.ts",
+  
+  "scripts": {
+    "test": "NODE_PATH=\"src\" node -r ts-node/register  ./src/test/run-tests.ts",
+    "debug": "NODE_PATH=\"src\" node -r ts-node/register ./src/test/run-tests.ts",
+    "build": "npx tsc"
+  },
+  "author": "Santiago Bazerque",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "ts-node": "^10.9.2",
+    "@types/node": "^22.2.0"
+  }
+}

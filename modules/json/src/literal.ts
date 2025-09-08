@@ -1,0 +1,1 @@
+export type Literal = string|number|Array<Literal>|{[key: string]: Literal};
