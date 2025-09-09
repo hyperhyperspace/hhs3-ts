@@ -6,10 +6,10 @@ This is the monorepo for the TypeScript version of [Hyper Hyper Space](https://w
 
 It is organized as a collection of modules. This is WIP, the following modules have been published:
 
-`modules/crypto` Cryptographic primitives for hashing, encoding, randomness
-`modules/json` JSON module for content-based addressing data structures
-`modules/dag` A DAG-based append-only log with fast fork/merge operations
-`modules/util` Collection of helper utilities used across HHS v3.0
+- `modules/crypto` Cryptographic primitives for hashing, encoding, randomness
+- `modules/json` JSON module for content-based addressing data structures
+- `modules/dag` A DAG-based append-only log with fast fork/merge operations
+- `modules/util` Collection of helper utilities used across HHS v3.0
 
 To build the system, run
 
