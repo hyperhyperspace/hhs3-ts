@@ -5,16 +5,16 @@ import { DagIndex } from "idx/dag_idx";
 
 export * as mem from './level_idx_mem_store';
 
-// Implementation of the fork finding alogrithm using a multi-level index and graph fast traversal.
+// Implementation of the fork finding alogrithm using a multi-level index for fast graph traversal.
 
 // Each entry is assinged a level (0, 1, 2...) using the distance to the root that is closer in the DAG.
 
-// A sub-graph is built at each level. Level 0 is just the DAG, while there is an arc between entries i, j
-// in level i+1 iif there is a path from i to j using only entries in level <=i.
+// A sub-graph is built at each level. Level 0 is just the DAG, while there is an arc between entries m, n
+// in level i+1 iif there is a path from m to n using only entries in level <=i.
 
-// The fast fork finding algorithm works by projecting the two forks into the next level, recursively solving
-// a slightly strengthened version of the fork problem there, and then extending that solution for the current
-// level.
+// The fast fork finding algorithm works by projecting the fork into the next level, recursively solving a
+// slightly strengthened version of the fork problem there, and then extending that solution for the level
+// below. Finally, a ForkPosition is extracted from the strengthened result.
 
 export type EntryInfo = {
     topoIndex: number, // topological order is still used within each level
@@ -47,8 +47,8 @@ export async function addToLevelIndex(index: LevelIndexStore, n: Hash, preds: Po
                           // build the i+1 level pred index
 
             const projection = await projectIntoNextLevel(index, await index.getPreds(i, n), i, {minimal: false});
-            // it's important to project using {minimal: false}, otherwise some predecessors can be "lost" when
-            // coming back from a higher level in the fork finding function below.
+            // It's important to project using {minimal: false}, otherwise some predecessors can be "lost" when
+            // coming back from a higher level in the fork position finding function below.
 
             for (const predInNextLevel of projection.keys()) {
                 await index.addPred(i+1, n, predInNextLevel);
@@ -104,7 +104,7 @@ export async function findMinimalCoverUsingLevelIndex(index: LevelIndexStore, p:
 
 // options.minimal: if true, make the result a minimal covering.
 
-// For example, if projecting A1 into level 1 (the numbers indicate the level of 
+// For example, if projecting A0 into level 1 (the numbers indicate the level of 
 // each entry):
 
 // A0 --> B1 --> C0 --> D1
@@ -138,7 +138,6 @@ async function projectIntoNextLevel(index: LevelIndexStore, nodes :Set<Hash>, le
         uncoveredPaths.add(n);
     }
 
-    let c = 0;
     while (covered.size < queue.size() || uncoveredPaths.size > 0) {
         const n = queue.dequeue()!;
         enqueued.delete(n);
@@ -172,7 +171,6 @@ async function projectIntoNextLevel(index: LevelIndexStore, nodes :Set<Hash>, le
                 covered.add(nextPred);
             }
 
-            //if ((!isCovered || nextInfo.level <= level) && hasUncoveredPath) {
             if (!project && hasUncoveredPath) {
                 uncoveredPaths.add(nextPred);
             }
@@ -180,12 +178,7 @@ async function projectIntoNextLevel(index: LevelIndexStore, nodes :Set<Hash>, le
 
         covered.delete(n);
         uncoveredPaths.delete(n);
-        c++;
     }
-
-    const end = performance.now();
-
-    //console.log('computed projection in', end-start, ', visited', c, 'nodes for a start set of', nodes.size, 'and a projected size of', projection.size);
 
     return projection;
 }
@@ -198,10 +191,10 @@ type LevelForkPosition = {
     common: Position,
     forkA: Position,
     forkB: Position,
-    forkSiblings: Position // nodes in both in h(a) and in h(b) 
-                           // with a predecessor in the "common" set
+    forkSiblings: Position // Bodes both in h(a) and in h(b) with
+                           // a predecessor in the "common" set
 
-                    // (or: nodes that are "siblings" with an element in
+                    // (or: nodes that are "siblings" of an element in
                    //               forkA or forkB)
 
             //      * forkSib * forkA
@@ -213,13 +206,7 @@ type LevelForkPosition = {
 
 export async function findForkPositionUsingLevelIndex(index: LevelIndexStore, a: Position, b: Position): Promise<ForkPosition> {
 
-    const start = performance.now();
-
     const levelFP = await findForkPositionAtLevel(index, 0, a, b);
-
-    const end = performance.now();
-
-    //console.log('computed fork using level index in ', end-start)
 
     return {
         commonFrontier: levelFP.commonFrontier,
@@ -244,14 +231,14 @@ export async function findForkPositionAtLevel(index: LevelIndexStore, level: num
     const succsInB = new MultiMap<Hash, Hash>(); // set of succesors of a in reachFromB
     const succsInAB = new MultiMap<Hash, Hash>(); // set of successors of a in reachFromAB
 
-    // see defs in dag_defs.ts and above:
+    // See defs in dag_defs.ts and above:
     const commonFrontier = new Set<Hash>();
     const common = new Set<Hash>();
     const forkA = new Set<Hash>();
     const forkB = new Set<Hash>();
     const forkSiblings = new Set<Hash>();
 
-    const toCover = new Set<Hash>(); // nodes in aUb, we need to make sure we cover them all.
+    const toCover = new Set<Hash>(); // Nodes in aUb, we need to make sure we cover them all.
 
     // Build the initial queue state
 
@@ -347,7 +334,6 @@ export async function findForkPositionAtLevel(index: LevelIndexStore, level: num
             // n is in h(a) and in h(b): update common and commonFrontier
         
             if (nReachFromA || nReachFromB) {
-                //console.log('adding ', label(n), 'to common: its reachable from A and from B')
                 common.add(n);
             }
             

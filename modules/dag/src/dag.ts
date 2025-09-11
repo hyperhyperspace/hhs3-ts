@@ -3,8 +3,6 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import { Entry, ForkPosition, Header, Position } from "dag_defs";
 import { DagIndex } from "idx/dag_idx";
 import { DagStore } from "store/dag_store";
-import { label } from "../test/utils/dag_diagram";
-import { MultiMap } from "@hyper-hyper-space/hhs3_util";
 
 export * from "dag_defs";
 export * as store from "store";
