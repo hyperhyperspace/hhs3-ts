@@ -1,7 +1,7 @@
 {
   "name": "@hyper-hyper-space/hhs3_dag",
   "version": "0.1.0",
-  "description": "Merkle-DAG",
+  "description": "Merkle-DAG for HHSv3",
   "source": "src/index.ts",
   "main": "dist/index.js",
   "module": "dist/index.esm.js",

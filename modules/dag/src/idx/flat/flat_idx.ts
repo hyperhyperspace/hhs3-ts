@@ -1,7 +1,6 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { Entry, ForkPosition, Position } from "dag_defs";
 import { DagIndex } from "idx/dag_idx";
-import { label } from "../../../test/utils/dag_diagram";
 
 export * as mem from './flat_idx_mem_store';
 
