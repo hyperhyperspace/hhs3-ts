@@ -6,8 +6,8 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import { Hash, sha } from "@hyper-hyper-space/hhs3_crypto";
 import { Dag, MetaProps, position, computeEntryHash } from "@hyper-hyper-space/hhs3_dag";
 
-import { Event, Payload, Replica, RObject, version, Version, View } from "../replica";
-import { DagContext } from "dag/dag_replica";
+import { Event, Payload, Replica, ResourcesBase, RObject, version, Version, View } from "../replica";
+import { DagResource } from "dag/dag_replica";
 import { copySet } from "@hyper-hyper-space/hhs3_json/dist/set";
 
 export const MAX_SEED_LENGTH = 1024;
@@ -93,18 +93,20 @@ export type RSetOptions = {
     hashAlgorithm?: string;
 }
 
+export type RSetResources = ResourcesBase & DagResource;
+
 export class RSet<T extends json.Literal = json.Literal> implements RObject {
 
-    static create = async (options: RSetOptions, replica: Replica<DagContext>) => {
+    static create = async (options: RSetOptions, replica: Replica<RSetResources>) => {
         return await RSet.createImpl(options, replica);
     }
 
-    static createNested = async (options: RSetOptions, replica: Replica<DagContext>, dagWrapper: (dag: Dag) => Promise<Dag>, payloadWrapper: (payload: json.Literal) => Promise<json.Literal>, at: Version) => {
+    static createNested = async (options: RSetOptions, replica: Replica<RSetResources>, dagWrapper: (dag: Dag) => Promise<Dag>, payloadWrapper: (payload: json.Literal) => Promise<json.Literal>, at: Version) => {
         return await RSet.createImpl(options, replica, dagWrapper, payloadWrapper, at);
     }
 
 
-    private static createImpl = async (options: RSetOptions, replica: Replica<DagContext>, dagWrapper?: (dag: Dag) => Promise<Dag>, payloadWrapper?: (payload: json.Literal) => Promise<json.Literal>, at?: Version) => {
+    private static createImpl = async (options: RSetOptions, replica: Replica<RSetResources>, dagWrapper?: (dag: Dag) => Promise<Dag>, payloadWrapper?: (payload: json.Literal) => Promise<json.Literal>, at?: Version) => {
         const createPayload: CreateSetPayload = {
             action: 'create',
             seed: options.seed,
@@ -118,17 +120,17 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
         };
 
         const createOpId = await computeEntryHash(payloadWrapper? await payloadWrapper(createPayload) : createPayload, at || position());
-        const context = await replica.getContext(createOpId);
+        const resources = await replica.getResources(createOpId);
 
-        const dag = dagWrapper ? await dagWrapper(await context.getDag()) : await context.getDag();
+        const dag = dagWrapper ? await dagWrapper(await resources.dag.get()) : await resources.dag.get();
         await dag.append(createPayload, {}, at || position());
-        return new RSet(createOpId, createPayload, context);
+        return new RSet(createOpId, createPayload, resources);
     }
 
-    static load = async (createOpId: Hash, context: DagContext) => {
-        const dag = await context.getDag();
+    static load = async (createOpId: Hash, resources: RSetResources) => {
+        const dag = await resources.dag.get();
         const createOp = (await dag.loadEntry(createOpId))!;
-        return new RSet(createOpId, createOp.payload as CreateSetPayload, context);
+        return new RSet(createOpId, createOp.payload as CreateSetPayload, resources);
     }
 
     static validateCreatePayload = async (opHash: Hash, payload: Payload): Promise<boolean> => {
@@ -138,7 +140,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
     static typeId = "hhs/set_v1";
 
     createOpId: Hash;
-    context: DagContext;
+    resources: RSetResources;
 
     seed: string;
     elementsTypeId: string;
@@ -148,9 +150,9 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
     supportBarrierDelete: boolean;
     private hashAlgorithm: string;
 
-    constructor(createOpId: Hash, createOp: CreateSetPayload, context: DagContext) {
+    constructor(createOpId: Hash, createOp: CreateSetPayload, resources: RSetResources) {
         this.createOpId = createOpId;
-        this.context = context;
+        this.resources = resources;
 
         this.seed = createOp.seed;
         this.elementsTypeId = createOp.elementsTypeId;
@@ -387,7 +389,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
     }
 
     dag(): Promise<Dag> {
-        return this.context.getDag();
+        return this.resources.dag.get();
     }
 }
 

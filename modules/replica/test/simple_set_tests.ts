@@ -1,13 +1,13 @@
-import { DagContext, DagReplica, DagStorageProvider } from "../src/dag/dag_replica";
-import { TypeRegistryMap, version } from "../src/replica";
-import { RSet } from "../src/types/rset";
+import { DagResourceProvider } from "../src/dag/dag_replica";
+import { Replica, TypeRegistryMap, version } from "../src/replica";
+import { RSet, RSetResources } from "../src/types/rset";
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test";
-import { createMemDagStorageProvider } from "dag/mem_dag_storage";
+import { createMemDagResourceProvider } from "dag/mem_dag_storage";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { sha } from "@hyper-hyper-space/hhs3_crypto";
 
-const createReplica = (storageProvider?: DagStorageProvider): DagReplica => {
-    const registry = new TypeRegistryMap<DagContext>();
+const createReplica = (resourceProvider?: DagResourceProvider): Replica<RSetResources> => {
+    const registry = new TypeRegistryMap<RSetResources>();
 
     registry.register(
         RSet.typeId,
@@ -15,11 +15,11 @@ const createReplica = (storageProvider?: DagStorageProvider): DagReplica => {
         RSet.validateCreatePayload
     );
 
-    return new DagReplica(registry, storageProvider || createMemDagStorageProvider());
+    return new Replica(registry, resourceProvider || createMemDagResourceProvider());
 };
 
 const createTestEnvironment = async () => {
-    const storageProvider = createMemDagStorageProvider();
+    const storageProvider = createMemDagResourceProvider();
     const replica = createReplica(storageProvider);
 
     const set = await RSet.create(

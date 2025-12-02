@@ -48,37 +48,74 @@ export type Event = {
 // This can be enriched locally with metadata, in which case this type should be extended.
 // However, only the payload is actually replicated.
 
-export type LoadRObject<Ctx extends RContext = RContext> = (createOpId: Hash, context: Ctx) => Promise<RObject>;
-export type ValidateCreationOp<Ctx extends RContext = RContext> = (createOpId: Hash, createOpPayload: Payload, context: Ctx) => Promise<boolean>;
+export type LoadRObject<R extends ResourcesBase = ResourcesBase> = (createOpId: Hash, context: R) => Promise<RObject>;
+export type ValidateCreationOp<R extends ResourcesBase = ResourcesBase> = (createOpId: Hash, createOpPayload: Payload, context: R) => Promise<boolean>;
 
-export type TypeRegistry<Ctx extends RContext = RContext> = {
+export type TypeRegistry<R extends ResourcesBase = ResourcesBase> = {
     register: (type: string, load: LoadRObject, validate: ValidateCreationOp) => void;
-    getLoadFun(type: string) : LoadRObject<Ctx>;
-    getValidateCreationFun(type: String): ValidateCreationOp<Ctx>;
+    getLoadFun(type: string) : LoadRObject<R>;
+    getValidateCreationFun(type: String): ValidateCreationOp<R>;
 }
 
-export class TypeRegistryMap<Ctx extends RContext = RContext> implements TypeRegistry<Ctx> {
-    private types: Map<string, [LoadRObject<Ctx>, ValidateCreationOp<Ctx>]> = new Map();
+export class TypeRegistryMap<R extends ResourcesBase = ResourcesBase> implements TypeRegistry<R> {
+    private types: Map<string, [LoadRObject<R>, ValidateCreationOp<R>]> = new Map();
 
-    register(type: string, create: LoadRObject<Ctx>, checkCreate: ValidateCreationOp<Ctx>) {
+    register(type: string, create: LoadRObject<R>, checkCreate: ValidateCreationOp<R>) {
         this.types.set(type, [create, checkCreate]);
     }
 
-    getLoadFun(type: string): LoadRObject<Ctx> {
+    getLoadFun(type: string): LoadRObject<R> {
         return this.types.get(type)![0];
     }
 
-    getValidateCreationFun(type: string): ValidateCreationOp<Ctx> {
+    getValidateCreationFun(type: string): ValidateCreationOp<R> {
         return this.types.get(type)![1];
     }
 }
 
-export type RContext = {
-    replica: Replica;
+export type ResourcesBase = {
+    replica: Replica<any>;
 };
 
-export type Replica<Ctx extends RContext = RContext> = {
-    getContext: (id: Hash) => Promise<Ctx>;
-    getObject(id: Hash): Promise<RObject>;
-    addObject(type: string, creationChangeId: Hash, creationPayload: json.Literal): Promise<boolean>;
+export type Resource = {[key: string]: any};
+
+export type ResourceProvider<R extends ResourcesBase, T extends Resource> = {
+    addResource: (id: Hash, resources: R) => Promise<R&T>;
+};
+
+export class Replica<R extends ResourcesBase = ResourcesBase> {
+
+    private typeRegistry: TypeRegistry<R>;
+    private objects: Map<Hash, RObject> = new Map();
+    private resourceProvider: ResourceProvider<ResourcesBase, R>;
+
+    constructor(typeRegistry: TypeRegistry<R>, resourceProvider: ResourceProvider<ResourcesBase, R>) {
+        this.typeRegistry = typeRegistry;
+        this.resourceProvider = resourceProvider;
+    }
+
+    async getObject(id: Hash): Promise<RObject> {
+        return this.objects.get(id)!;
+    }
+
+    async addObject(type: string, createOpId: Hash, creationPayload: json.Literal): Promise<boolean> {
+        const validateCreateFun = this.typeRegistry.getValidateCreationFun(type);
+        const context = await this.resourceProvider.addResource(createOpId, { replica: this });
+
+        const isValid = await validateCreateFun(createOpId, creationPayload, context);
+        
+        if (isValid) {
+
+            const loadFun = this.typeRegistry.getLoadFun(type);
+            const object = await loadFun(createOpId, context);
+            this.objects.set(object.getId(), object);
+            return true;
+        }
+
+        return false;
+    }
+
+    async getResources(id: Hash): Promise<R> {
+        return this.resourceProvider.addResource(id, { replica: this });
+    }
 }
