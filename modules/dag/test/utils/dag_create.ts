@@ -1,17 +1,56 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { Position } from "dag_defs";
-import { Dag, position } from "dag";
+import { MetaProps, Position } from "../../src/dag_defs";
+import { Dag, position } from "../../src/dag";
 import { draw, label } from "./dag_diagram";
-import { dag } from "index";
+import { dag } from "../../src/index";
 import { MultiMap } from "@hyper-hyper-space/hhs3_util";
+import { json } from "@hyper-hyper-space/hhs3_json";
+
+const createDeterministicMeta = (nodeIndex: number, prng: PRNG): MetaProps => ({
+    bucket: json.toSet([Boolean(nodeIndex % 4).toString()]),
+    parity: json.toSet(nodeIndex % 2 === 0 ? 'even' : 'odd'),
+    tier: json.toSet([prng.nextInt(0, 3).toString()]),
+    tag: json.toSet([`tag-${prng.nextInt(0, 1_000_000)}`])
+});
 
 export async function createD1(dag: Dag): Promise<[Position, Position]> {
+    const a = await dag.append({'a': 1}, {});
+    const b1 = await dag.append({'b1': 1}, {'p1': json.toSet(['1'])} , position(a));
+    const b2 = await dag.append({'b2': 1}, {'p1': json.toSet(['1']), 'p2': json.toSet(['2'])}, position(a));
+    const c1 = await dag.append({'c1': 1}, {'p1': json.toSet(['1']), 'p2': json.toSet(['3'])}, position(b1));
+
+    return [new Set([b2]), new Set([c1])];
+}
+
+export async function createD2(dag: Dag): Promise<[Position, Position]> {
     const a = await dag.append({'a': 1}, {});
     const b1 = await dag.append({'b1': 1}, {}, position(a));
     const b2 = await dag.append({'b2': 1}, {}, position(a));
     const c1 = await dag.append({'c1': 1}, {}, position(b1));
+    const c2 = await dag.append({'c2': 1}, {}, position(b2));
+    
+    return [new Set([b2]), new Set([c1, c2])];
+}
 
-    return [new Set([b2]), new Set([c1])];
+export async function createD3(dag: Dag): Promise<{ [key: string]: Hash }> {
+    const a = await dag.append({'a': 1}, {});
+    const b1 = await dag.append({'b1': 1}, {'p1': json.toSet(['1'])}, position(a));
+    const b2 = await dag.append({'b2': 1}, {'p1': json.toSet(['1']), 'p2': json.toSet(['2'])}, position(a));
+    const c1 = await dag.append({'c1': 1}, {'p1': json.toSet(['1']), 'p2': json.toSet(['3'])}, position(b1));
+    const d1 = await dag.append({'d1': 1}, {'p1': json.toSet(['1']), 'p2': json.toSet(['4'])}, position(c1));
+    const d2 = await dag.append({'d2': 1}, {'p1': json.toSet(['1']), 'p2': json.toSet(['5'])}, position(c1));
+
+    return {'a': a, 'b1': b1, 'b2': b2, 'c1': c1, 'd1': d1, 'd2': d2};
+}
+
+export async function createD4(dag: Dag): Promise<{ [key: string]: Hash }> {
+    const a = await dag.append({'a': 1}, {});
+    const b1 = await dag.append({'b1': 1}, {}, position(a));
+    const b2 = await dag.append({'b2': 1}, {}, position(a));
+    const c1 = await dag.append({'c1': 1}, {}, position(b1));
+    const c2 = await dag.append({'c2': 1}, {}, position(b2));
+    
+    return {'a': a, 'b1': b1, 'b2': b2, 'c1': c1, 'c2': c2};
 }
 
 export async function createRandomBranchingDags(constrs: [()=>dag.Dag, ()=>dag.Dag], seed: number, size: number, options?: { progressBar?: boolean, instanceCount?: number }): Promise<{ dags: Array<[dag.Dag, dag.Dag]>, branches: Array<[Position, Position]>}> {
@@ -108,8 +147,10 @@ export async function appendNodesToDag(dag: Dag, seed: number, size: number, sta
         }
 
         while (i<limit) {
-            const id = i + ":" + prng.nextInt(0, 2000000000);
-            const n = await dag.append({id: id}, {}, after);
+            const nodeIndex = i;
+            const id = nodeIndex + ":" + prng.nextInt(0, 2000000000);
+            const meta = createDeterministicMeta(nodeIndex, prng);
+            const n = await dag.append({id: id}, meta, after);
             frontier.add(n);
 
             i = i + 1;
@@ -211,8 +252,10 @@ export async function createRandomDag(dag: Dag, seed: number, size: number): Pro
         }
 
         after = minimalCover(after, preds);
-        const id = i + ":" + prng.nextInt(0, 2000000000);
-        const n = await dag.append({id: id}, {}, after);
+        const nodeIndex = i;
+        const id = nodeIndex + ":" + prng.nextInt(0, 2000000000);
+        const meta = createDeterministicMeta(nodeIndex, prng);
+        const n = await dag.append({id: id}, meta, after);
 
         nodes.push(n);
 
@@ -297,11 +340,11 @@ export const createD1s = async () => {
     const dags: Array<dag.Dag> = [];
 
     const store1 = new dag.store.MemDagStorage();
-    const topoIndex = dag.idx.topo.createDagTopoIndex(new dag.idx.topo.mem.MemTopoIndexStore());
+    const topoIndex = dag.idx.topo.createDagTopoIndex(store1, new dag.idx.topo.mem.MemTopoIndexStore());
     const d1Topo = dag.create(store1, topoIndex)
 
     const store2 = new dag.store.MemDagStorage();
-    const flatIndex = dag.idx.flat.createFlatIndex(new dag.idx.flat.mem.MemFlatIndexStore());
+    const flatIndex = dag.idx.flat.createFlatIndex(store2, new dag.idx.flat.mem.MemFlatIndexStore());
 
     const d1Flat = dag.create(store2, flatIndex);
 

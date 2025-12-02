@@ -46,7 +46,7 @@ const dag1 = dag.create(store1, index1);
 
 // DAG with topological indexing
 const store2 = new dag.store.MemDagStorage();
-const index2 = dag.idx.topo.createDagTopoIndex(new dag.idx.topo.mem.MemTopoIndexStore());
+const index2 = dag.idx.topo.createDagTopoIndex(store2, new dag.idx.topo.mem.MemTopoIndexStore());
 const dag2 = dag.create(store2, index2); 
 
 // DAG with multi-level indexing

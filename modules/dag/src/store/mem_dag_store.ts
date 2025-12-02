@@ -1,7 +1,8 @@
+import { json } from "@hyper-hyper-space/hhs3_json";
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { DagStore } from "./dag_store";
-import { Entry, Header, Position } from "dag_defs";
-import { json } from "@hyper-hyper-space/hhs3_json";
+import { Entry, Header, Position } from "../dag_defs";
+
 
 // In-memory implementation of the DAG store
 

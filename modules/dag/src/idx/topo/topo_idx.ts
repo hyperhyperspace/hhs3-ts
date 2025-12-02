@@ -1,7 +1,8 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { MultiMap, PriorityQueue, Queue } from "@hyper-hyper-space/hhs3_util";
-import { Entry, ForkPosition, Position } from "dag_defs";
-import { DagIndex } from "idx/dag_idx";
+import { Entry, EntryMetaFilter, ForkPosition, Position } from "../../dag_defs";
+import { checkFilter, DagIndex } from "../../idx/dag_idx";
+import { DagStore } from "../../store";
 
 export * as mem from './topo_idx_mem_store';
 
@@ -245,7 +246,61 @@ export async function findForkPositionUsingTopoIndex(index: TopoIndexStore, a: P
     return {commonFrontier, common, forkA, forkB};
 }
 
-export function createDagTopoIndex(index: TopoIndexStore): DagIndex {
+export async function findCoverWithFilterUsingTopoIndex(store: DagStore, index: TopoIndexStore, from: Position, meta: EntryMetaFilter): Promise<Position> {
+
+    const queue = new PriorityQueue<Hash>();
+    const enqueued = new Set<Hash>();
+    const visited = new Set<Hash>();
+    const preCover = new Set<Hash>();
+
+    const enqueue = async (node: Hash): Promise<void> => {
+        if (enqueued.has(node) || visited.has(node)) {
+            return;
+        }
+        queue.enqueue(node, -(await index.getTopoIndex(node)));
+        enqueued.add(node);
+    };
+
+    for (const hash of from) {
+        await enqueue(hash);
+    }
+
+    while (!queue.isEmpty()) {
+        const node = queue.dequeue()!;
+        enqueued.delete(node);
+
+        if (visited.has(node)) {
+            continue;
+        }
+
+        visited.add(node);
+
+        const entry = await store.loadEntry(node);
+
+        if (entry === undefined) {
+            throw new Error('node ' + node + ' not found');
+        }
+
+        if (checkFilter(entry.meta, meta)) {
+            preCover.add(node);
+            continue;
+        }
+
+        const preds = await index.getPreds(node);
+
+        for (const pred of preds) {
+            await enqueue(pred);
+        }
+    }
+
+    return findMinimalCoverUsingTopoIndex(index, preCover);
+}
+
+export async function findConcurrentCoverWithFilterUsingTopoIndex(store: DagStore, index: TopoIndexStore, from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
+    throw new Error('not implemented');
+}
+
+export function createDagTopoIndex(store: DagStore, index: TopoIndexStore): DagIndex {
 
     return {
         index: function (node: Hash, after?: Position): Promise<void> {
@@ -258,6 +313,14 @@ export function createDagTopoIndex(index: TopoIndexStore): DagIndex {
 
         findForkPosition: function (a: Position, b: Position): Promise<ForkPosition> {
             return findForkPositionUsingTopoIndex(index, a, b)
+        },
+
+        findCoverWithFilter(from: Position, meta: EntryMetaFilter): Promise<Position> {
+            return findCoverWithFilterUsingTopoIndex(store, index, from, meta);
+        },
+
+        findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
+            return findConcurrentCoverWithFilterUsingTopoIndex(store, index, from, concurrentTo, meta);
         },
 
         getIndexStore: () => index

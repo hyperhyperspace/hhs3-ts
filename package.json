@@ -4,6 +4,6 @@
     "modules/*"
   ],
   "scripts": {
-    "build": "npm run build --workspace=modules/crypto && npm run build --workspace=modules/json && npm run build --workspace=modules/util && npm run build --workspace=modules/dag"
+    "build": "npm run build --workspace=modules/crypto && npm run build --workspace=modules/json && npm run build --workspace=modules/util && npm run build --workspace=modules/dag && npm run build --workspace=modules/replica"
   }
 }

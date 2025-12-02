@@ -1,6 +1,6 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { Dag } from "dag";
+import { Dag } from "../../src/dag";
 
 import { writeFileSync } from 'fs';
 import { exec } from 'child_process';

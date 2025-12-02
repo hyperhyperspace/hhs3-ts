@@ -1,7 +1,7 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { MultiMap, PriorityQueue } from "@hyper-hyper-space/hhs3_util";
-import { ForkPosition, Position } from "dag_defs";
-import { DagIndex } from "idx/dag_idx";
+import { EntryMetaFilter, ForkPosition, Position } from "../../dag_defs";
+import { DagIndex } from "../../idx/dag_idx";
 
 export * as mem from './level_idx_mem_store';
 
@@ -191,7 +191,7 @@ type LevelForkPosition = {
     common: Position,
     forkA: Position,
     forkB: Position,
-    forkSiblings: Position // Bodes both in h(a) and in h(b) with
+    forkSiblings: Position // Nodes both in h(a) and in h(b) with
                            // a predecessor in the "common" set
 
                     // (or: nodes that are "siblings" of an element in
@@ -216,7 +216,6 @@ export async function findForkPositionUsingLevelIndex(index: LevelIndexStore, a:
     };
 
 }
-
 
 export async function findForkPositionAtLevel(index: LevelIndexStore, level: number, a: Position, b: Position): Promise<LevelForkPosition> {
 
@@ -424,6 +423,14 @@ export async function findForkPositionAtLevel(index: LevelIndexStore, level: num
 
 }
 
+export async function findCoverWithMetaUsingLevelIndex(index: LevelIndexStore, from: Position, meta: EntryMetaFilter): Promise<Position> {
+    throw new Error('not implemented');
+}
+
+export async function findConcurrentCoverWithMetaUsingLevelIndex(index: LevelIndexStore, from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
+    throw new Error('not implemented');
+}
+
 export function createDagLevelIndex(index: LevelIndexStore): DagIndex {
 
     return {
@@ -438,6 +445,16 @@ export function createDagLevelIndex(index: LevelIndexStore): DagIndex {
         findForkPosition: function (a: Position, b: Position): Promise<ForkPosition> {
             return findForkPositionUsingLevelIndex(index, a, b)
         },
+
+        findCoverWithFilter(from: Position, meta: EntryMetaFilter): Promise<Position> {
+            return findCoverWithMetaUsingLevelIndex(index, from, meta);
+        },
+
+        findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
+            return findConcurrentCoverWithMetaUsingLevelIndex(index, from, concurrentTo, meta);
+        },
+
+        
         getIndexStore: () => index
     }
 };

@@ -1,12 +1,15 @@
-import { dag, ForkPosition, Position } from "index";
-import { position } from "index";
+import { dag, EntryMetaFilter, ForkPosition, MetaProps, Position } from "../src/index";
+import { position } from "../src/index";
 
 import { assertTrue, run } from "@hyper-hyper-space/hhs3_util/dist/test";
 
-import { appendNodesToDag, createBranchingDag, createD1, createRandomBranchingDags, createRandomDags, createRandomDisconnectedDags } from "./utils/dag_create";
+import { appendNodesToDag, createBranchingDag, createD1, createD3, createRandomBranchingDags, createRandomDag, createRandomDags, createRandomDisconnectedDags } from "./utils/dag_create";
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { set }from "@hyper-hyper-space/hhs3_util";
+import { json } from "@hyper-hyper-space/hhs3_json";
+
 import { draw, graph, label } from "./utils/dag_diagram";
-import { MemLevelIndexStore } from "idx/level/level_idx_mem_store";
+import { MemLevelIndexStore } from "../src/idx/level/level_idx_mem_store";
 
 const pp = (ns: Set<Hash>) => Array.from(ns).map(label).sort() 
 
@@ -24,35 +27,21 @@ const showBranches = (a: Position, b: Position) => {
     console.log("branch b", pp(b));
 }
 
-const setsMatch = (a: Set<Hash>, b: Set<Hash>) => {
-    if (a.size !== b.size) {
-        return false;
-    }
-
-    for (const x of a) {
-        if (!b.has(x)) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
 const forkPositionsMatch = (f1: ForkPosition, f2: ForkPosition) => {
 
-    if (!setsMatch(f1.common, f2.common)) {
+    if (!set.eq(f1.common, f2.common)) {
         return false;
     }
 
-    if (!setsMatch(f1.commonFrontier, f2.commonFrontier)) {
+    if (!set.eq(f1.commonFrontier, f2.commonFrontier)) {
         return false;
     }
 
-    if (!setsMatch(f1.forkA, f2.forkA)) {
+    if (!set.eq(f1.forkA, f2.forkA)) {
         return false;
     }
 
-    if (!setsMatch(f1.forkB, f2.forkB)) {
+    if (!set.eq(f1.forkB, f2.forkB)) {
         return false;
     }
 
@@ -62,13 +51,13 @@ const forkPositionsMatch = (f1: ForkPosition, f2: ForkPosition) => {
 const topoDagPairConstr: [() => dag.Dag, () => dag.Dag] = [
     () => {
         const store = new dag.store.MemDagStorage();
-        const index = dag.idx.flat.createFlatIndex(new dag.idx.flat.mem.MemFlatIndexStore());
+        const index = dag.idx.flat.createFlatIndex(store, new dag.idx.flat.mem.MemFlatIndexStore());
         return dag.create(store, index);
     },
     () => {
         
         const store = new dag.store.MemDagStorage();
-        const index = dag.idx.topo.createDagTopoIndex(new dag.idx.topo.mem.MemTopoIndexStore());
+        const index = dag.idx.topo.createDagTopoIndex(store, new dag.idx.topo.mem.MemTopoIndexStore());
         return dag.create(store, index);
     }
 ]
@@ -76,7 +65,7 @@ const topoDagPairConstr: [() => dag.Dag, () => dag.Dag] = [
 const levelDagPairConstr: [() => dag.Dag, () => dag.Dag] = [
     () => {
         const store = new dag.store.MemDagStorage();
-        const index = dag.idx.topo.createDagTopoIndex(new dag.idx.topo.mem.MemTopoIndexStore());
+        const index = dag.idx.topo.createDagTopoIndex(store, new dag.idx.topo.mem.MemTopoIndexStore());
         return dag.create(store, index);
     },
     () => {
@@ -129,10 +118,10 @@ export const testForkingDags = async (cases: { dags: Array<[dag.Dag, dag.Dag]>, 
         timings1.push(end1-start1);
         timings2.push(end2-start2);
 
-        const commonMatches = setsMatch(f1.common, f2.common);
-        const commonFrontierMatches = setsMatch(f1.commonFrontier, f2.commonFrontier);
-        const forkAMatches = setsMatch(f1.forkA, f2.forkA);
-        const forkBMatches = setsMatch(f1.forkB, f2.forkB);
+        const commonMatches = set.eq(f1.common, f2.common);
+        const commonFrontierMatches = set.eq(f1.commonFrontier, f2.commonFrontier);
+        const forkAMatches = set.eq(f1.forkA, f2.forkA);
+        const forkBMatches = set.eq(f1.forkB, f2.forkB);
 
         const match = commonMatches && commonFrontierMatches && forkAMatches && forkBMatches;
 
@@ -317,6 +306,8 @@ const createSuite = (tag: string, title: string, constrs: [() => dag.Dag, () => 
             name: '[' + tag + '11] Testing on large disconnected DAGs w/disconnected branches',
             invoke: async () => {
                 console.log('Generating test cases');
+                const d1 = topoDagPairConstr[0]();
+
                 const seed = 91;
                 const cases = await createRandomDisconnectedDags(constrs, seed, 20000, {connectedBranches: false, progressBar: true});
                 console.log('Testing');
@@ -328,6 +319,134 @@ const createSuite = (tag: string, title: string, constrs: [() => dag.Dag, () => 
 
 const topoSuite = createSuite("TOP", "Test Topological Fork Analysis Solution", topoDagPairConstr);
 const levelSuite = createSuite("LEV", "Test Level-index Fork Analysis Solution", levelDagPairConstr);
+
+const collectMetas = async (d: dag.Dag): Promise<Array<MetaProps>> => {
+    const metas: Array<MetaProps> = [];
+    for await (const entry of d.loadAllEntries()) {
+        metas.push(entry.meta);
+    }
+    return metas;
+};
+
+const metaSearchSuite = {
+    title: '[MET] Test Meta Search Solutions',
+    tests: [
+        {
+            name: '[MET00] Basic meta property covering tests using flat index',
+            invoke: async () => {
+                const store = new dag.store.MemDagStorage();
+                const flatIndex = dag.idx.flat.createFlatIndex(store, new dag.idx.flat.mem.MemFlatIndexStore());
+                const d3 = dag.create(store, flatIndex);
+                const h = await createD3(d3);
+
+                const cp1 = await d3.findCoverWithFilter(position(h['b1'], h['b2']), {containsKeys: ['p1']});
+                const cp1ok = set.eq(cp1, position(h['b1'], h['b2']));
+
+                assertTrue(cp1ok, 'filter on p1 key failed for d3');
+
+                const cp2 = await d3.findCoverWithFilter(position(h['b1'], h['b2']), {containsValues: {p2: ['2']}});
+                const cp2ok = set.eq(cp2, position(h['b2']));
+
+                assertTrue(cp2ok, 'filter on p2 value failed for d3');
+
+                const cp23 = await d3.findCoverWithFilter(position(h['b1'], h['b2']), {containsValues: {p2: ['3']}});
+                const cp23ok = set.eq(cp23, position());    
+
+                assertTrue(cp23ok, 'filter on p2=3 value failed for d3');
+
+                const cp2too = await d3.findCoverWithFilter(position(h['c1'], h['b2']), {containsKeys: ['p1', 'p2']});
+                const cp2toook = set.eq(cp2too, position(h['c1'], h['b2']));
+
+                assertTrue(cp2toook, 'filter on p1 and p2 keys failed for d3');
+
+                const cp23too = await d3.findCoverWithFilter(position(h['c1'], h['b2']), {containsValues: {p1: ['1']}, containsKeys: ['p2']});
+                const cp23toook = set.eq(cp23too, position(h['c1'], h['b2']));
+
+                assertTrue(cp23toook, 'filter on p1=1 and p2 key failed for d3');
+            }
+        },
+        {
+            name: '[MET01] Basic meta property concurrent covering tests using flat index',
+            invoke: async () => {
+                const store = new dag.store.MemDagStorage();
+                const flatIndex = dag.idx.flat.createFlatIndex(store, new dag.idx.flat.mem.MemFlatIndexStore());
+                const d3 = dag.create(store, flatIndex);
+                const h = await createD3(d3);
+
+                const cc1 = await d3.findConcurrentCoverWithFilter(position(h['c1'], h['b2']), position(h['b1']), {containsKeys: ['p1']});
+                const cc1ok = set.eq(cc1, position(h['b2']));
+
+                assertTrue(cc1ok, 'concurrent (b1) covering filter on p1 key failed for d3');
+                
+                const cc2 = await d3.findConcurrentCoverWithFilter(position(h['c1']), position(h['b1']), {containsValues: {p2: ['4']}});
+                const cc2ok = set.eq(cc2, position());
+
+                assertTrue(cc2ok, 'concurrent (b1) covering filter on p2=4 value failed for d3');
+
+                const cc3 = await d3.findConcurrentCoverWithFilter(position(h['d1'], h['d2']), position(h['d1']), {containsKeys: ['p1']});
+                const cc3ok = set.eq(cc3, position(h['d2']));
+
+                assertTrue(cc3ok, 'concurrent (d1) covering filter on p1 key failed for d3');
+
+                const cc4 = await d3.findConcurrentCoverWithFilter(position(h['d1'], h['d2'], h['b2']), position(h['d1']), {containsKeys: ['p1']});
+                const cc4ok = set.eq(cc4, position(h['d2'], h['b2']));
+
+                assertTrue(cc4ok, 'concurrent (d1) covering filter on p1 key failed for d3 (v2)');
+            }
+        },
+        {
+            name: '[MET02] Pseudo-random cover filters topo vs flat parity',
+            invoke: async () => {
+                const topoStore = new dag.store.MemDagStorage();
+                const topoIndex = dag.idx.topo.createDagTopoIndex(topoStore, new dag.idx.topo.mem.MemTopoIndexStore());
+                const topoDag = dag.create(topoStore, topoIndex);
+
+                const flatStore = new dag.store.MemDagStorage();
+                const flatIndex = dag.idx.flat.createFlatIndex(flatStore, new dag.idx.flat.mem.MemFlatIndexStore());
+                const flatDag = dag.create(flatStore, flatIndex);
+
+                const seed = 1771;
+                const size = 24;
+
+                const [branchA, branchB] = await createRandomDag(topoDag, seed, size);
+                await dag.copy(topoDag, flatDag);
+
+                const positions: Array<Position> = [
+                    branchA,
+                    branchB,
+                    new Set<Hash>([...branchA, ...branchB]),
+                    await topoDag.getFrontier()
+                ];
+
+                const metas = await collectMetas(topoDag);
+                const sample1 = metas[0];
+                const sample2 = metas[Math.max(0, metas.length - 1)];
+
+                const bucketSample = Object.keys(sample1['bucket'])[0];
+                const paritySample = Object.keys(sample1['parity'])[0];
+                const tagSample = Object.keys(sample2['tag'])[0];
+                const tierSample = Object.keys(sample2['tier'])[0];
+
+                const filters: EntryMetaFilter[] = [];
+                filters.push({ containsValues: { bucket: [bucketSample] } });
+                filters.push({ containsValues: { bucket: [bucketSample], parity: [paritySample] } });
+                filters.push({ containsKeys: ['bucket', 'tag'] });
+                filters.push({ containsValues: { tag: [tagSample] } });
+                filters.push({ containsValues: { tier: [tierSample] }, containsKeys: ['bucket'] });
+
+                for (let i = 0; i < filters.length; i++) {
+                    for (let j = 0; j < positions.length; j++) {
+                        const topoCover = await topoDag.findCoverWithFilter(positions[j], filters[i]);
+                        const flatCover = await flatDag.findCoverWithFilter(positions[j], filters[i]);
+
+                        const coversMatch = set.eq(topoCover, flatCover);
+                        assertTrue(coversMatch, `filter ${i} position ${j} mismatch`);
+                    }
+                }
+            }
+        }
+    ]
+}
 
 const benchmarkSuite = {
     title: '[BEN] Timings for long branching random DAGs',
@@ -377,7 +496,7 @@ const benchmarkSuite = {
     ]
 }
 
-export { topoSuite, levelSuite, benchmarkSuite };
+export { topoSuite, levelSuite, metaSearchSuite,benchmarkSuite };
 
 
 

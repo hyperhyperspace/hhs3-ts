@@ -18,5 +18,5 @@ export function toArrayBuffer(b64: string): ArrayBuffer {
         array[i] = raw.charCodeAt(i);
     }
 
-    return array;    
+    return array.buffer;    
 } 

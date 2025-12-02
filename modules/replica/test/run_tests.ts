@@ -1,4 +1,4 @@
-import {topoSuite as topo, levelSuite as level, metaSearchSuite as meta} from "./all_index_test";
+import { simpleSetTests } from "./simple_set_tests";
 import { testing } from "@hyper-hyper-space/hhs3_util/";
 
 async function main() {
@@ -7,11 +7,9 @@ async function main() {
 
     const filters = process.argv.slice(2);
 
-    allTests.set(topo.title, topo.tests);
-    allTests.set(level.title, level.tests);
-    allTests.set(meta.title, meta.tests);
+    allTests.set(simpleSetTests.title, simpleSetTests.tests);
 
-    console.log('Running tests for Hyper Hyper Space v3 DAG module' + (filters.length > 0? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');    
+    console.log('Running tests for Hyper Hyper Space v3 Replica module' + (filters.length > 0? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');    
 
     for (const [title, tests] of allTests.entries()) {
         console.log(title);
@@ -20,7 +18,7 @@ async function main() {
 
             let match = true;
             for (const filter of filters) {
-                match = match && (/*title.indexOf(filter) >= 0 || */test.name.indexOf(filter) >= 0)
+                match = match && (test.name.indexOf(filter) >= 0)
             }
 
             if (match) {
@@ -39,5 +37,3 @@ async function main() {
 }
 
 main();
-
-

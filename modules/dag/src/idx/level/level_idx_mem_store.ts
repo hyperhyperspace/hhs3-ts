@@ -1,7 +1,8 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { EntryInfo, LevelIndexStore } from "./level_idx";
 import { MultiMap } from "@hyper-hyper-space/hhs3_util";
-import { Position } from "dag_defs";
+
+import { EntryInfo, LevelIndexStore } from "./level_idx";
+import { Position } from "../../dag_defs";
 
 
 export class MemLevelIndexStore implements LevelIndexStore {

@@ -1,6 +1,7 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { TopoIndexStore } from "./topo_idx";
 import { MultiMap } from "@hyper-hyper-space/hhs3_util";
+import { TopoIndexStore } from "./topo_idx";
+
 
 export class MemTopoIndexStore implements TopoIndexStore {
 

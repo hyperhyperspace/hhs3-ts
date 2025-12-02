@@ -1,5 +1,5 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { Entry, Header, Position } from "dag_defs";
+import { Entry, Header, Position } from "../dag_defs";
 
 // Store all the entries and their headers for a DAG.
 

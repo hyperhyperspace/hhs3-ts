@@ -1,4 +1,4 @@
-type Literal = string|number|Array<Literal>|{[key: string]: Literal};
+import { Literal } from "./literal";
 
 function toStringNormalized(literal: Literal): string {
     var plain = '';
@@ -43,4 +43,18 @@ function escapeString(text: string) {
     return '"' + text.replaceAll("\\", "\\\\").replaceAll('"', '\\"') + '"';
 }
 
-export { toStringNormalized };
+function eq(a: Literal, b: Literal): boolean {
+    return toStringNormalized(a) === toStringNormalized(b);
+}
+
+function strongEq(a?: Literal, b?: Literal): boolean {
+    if (a === undefined && b === undefined) {
+        return true;
+    }
+    if (a === undefined || b === undefined) {
+        return false;
+    }
+    return eq(a, b);
+}
+
+export { toStringNormalized, eq, strongEq };
