@@ -1,7 +1,7 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { MultiMap, PriorityQueue, Queue } from "@hyper-hyper-space/hhs3_util";
-import { Entry, EntryMetaFilter, ForkPosition, Position } from "../../dag_defs";
-import { checkFilter, DagIndex } from "../../idx/dag_idx";
+import { Entry, EntryMetaFilter, ForkPosition, Position, checkFilter } from "../../dag_defs";
+import { DagIndex } from "../../idx/dag_idx";
 import { DagStore } from "../../store";
 
 export * as mem from './topo_idx_mem_store';

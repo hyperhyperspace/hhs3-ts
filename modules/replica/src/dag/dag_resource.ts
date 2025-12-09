@@ -1,6 +1,6 @@
 import { dag } from "@hyper-hyper-space/hhs3_dag";
 
-import { ResourcesBase, Replica, RObject, TypeRegistry } from "../replica";
+import { ResourcesBase, Replica, RObject, RObjectRegistry } from "../replica";
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
 
 export type DagStorage = {
@@ -12,5 +12,6 @@ export type DagResource = {
 };
 
 export type DagResourceProvider<R extends ResourcesBase = ResourcesBase> = {
-    addResource: (id: Hash, resources: R) => Promise<R & DagResource>;
+    addForObject: (id: Hash, resources: R) => Promise<R & DagResource>;
+    addForObjectPreflight: (resources: R) => Promise<R & DagResource>;
 };

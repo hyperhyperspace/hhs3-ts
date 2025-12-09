@@ -88,3 +88,53 @@ export type EntryMetaFilter = { containsKeys?: MetaKeys, containsValues?: MetaCo
 
 export type FindCoverWithFilterFn = (from: Position, filter: EntryMetaFilter) => Promise<Position>;
 export type FindConcurrentCoverWithFilterFn = (from: Position, concurrentTo: Position, filter: EntryMetaFilter) => Promise<Position>;
+
+export function joinFilters(filter1: EntryMetaFilter, filter2: EntryMetaFilter): EntryMetaFilter {
+    const hasKeyFilters = filter1.containsKeys !== undefined || filter2.containsKeys !== undefined;
+    const containsKeys = hasKeyFilters
+        ? [...new Set([...(filter1.containsKeys || []), ...(filter2.containsKeys || [])])]
+        : undefined;
+
+    const mergedContainsValues: MetaContainsValues = {};
+    const entries: Array<[string, Array<string>]> = [
+        ...Object.entries(filter1.containsValues || {}),
+        ...Object.entries(filter2.containsValues || {}),
+    ];
+
+    for (const [key, values] of entries) {
+        const existing = mergedContainsValues[key] || [];
+        mergedContainsValues[key] = [...new Set([...existing, ...values])];
+    }
+
+    const containsValues = Object.keys(mergedContainsValues).length > 0 ? mergedContainsValues : undefined;
+
+    return {
+        containsKeys,
+        containsValues,
+    };
+}
+
+export function checkFilter(meta: MetaProps, filter: EntryMetaFilter): boolean {
+  
+    for (const key of filter.containsKeys || []) {
+        if (!json.hasKey(meta, key)) {
+            return false;
+        }
+    }
+
+    for (const [key, values] of Object.entries(filter.containsValues || [])) {
+
+        if (!json.hasKey(meta, key) && values.length > 0) {
+            return false;
+        }
+
+        for (const value of values) {
+
+            if (!json.hasKey(meta[key], value)) {
+                return false;
+            }
+        }
+    }
+
+  return true;
+}

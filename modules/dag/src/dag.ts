@@ -13,6 +13,9 @@ export * as idx from "./idx";
 export type Dag = {
     append(payload: json.Literal, meta: MetaProps, after?: Position): Promise<Hash>;
     
+    // like append, but just computes the hash (useful for pre-flights, etc.)
+    computeEntryHash(payload: json.Literal, after?: Position): Promise<Hash>;
+    
     loadEntry(h: Hash): Promise<Entry|undefined>;
     loadHeader(h: Hash): Promise<Header|undefined>;
 
@@ -55,11 +58,6 @@ export function position(...hashes: Hash[]): Position {
     return new Set(hashes);
 }
 
-export async function computeEntryHash(payload: json.Literal, after?: Position): Promise<Hash> {
-    const entry = await createEntry(payload, {}, after);
-    return entry.hash;
-}
-
 export function create(
                     store: DagStore,
                     index: DagIndex,
@@ -78,6 +76,11 @@ export function create(
 
             await index.index(e.hash, after);
             await store.append(e);
+            return e.hash;
+        },
+
+        computeEntryHash: async (payload, after) => {
+            const e = await createEntry(payload, {}, after);
             return e.hash;
         },
 

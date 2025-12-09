@@ -111,9 +111,9 @@ export function checkFormat(format: Format, literal: Literal): boolean {
                 case Type.BoundedArray:
                     if (format.length !== 3) {
                         throw new Error('Invalid format (expected 3 elements): ' + JSON.stringify(format));
-                    } else if (typeof(format[1]) !== 'object' || Array.isArray(format[1])) {
+                    }/* else if (typeof(format[1]) !== 'object' || Array.isArray(format[1])) {
                         throw new Error('Invalid format (expected format for array elements in position 1): ' + JSON.stringify(format));
-                    } else if (typeof(format[2]) !== 'number') {
+                    }*/ else if (typeof(format[2]) !== 'number') {
                         throw new Error('Invalid format (expected number for array length in position 2): ' + JSON.stringify(format));
                     } else if (!Number.isInteger(format[2])) {
                         throw new Error('Invalid format (expected integer for array length in position 2): ' + JSON.stringify(format));
@@ -174,7 +174,7 @@ export function checkFormat(format: Format, literal: Literal): boolean {
                     optional = false;
                 }
 
-                if (format.hasOwnProperty(key)) {
+                if (literal.hasOwnProperty(key)) {
                     const value = literal[key];
                     if (!checkFormat(keyFormat, value)) {
                         return false;

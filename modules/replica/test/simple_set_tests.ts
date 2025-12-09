@@ -1,47 +1,47 @@
-import { DagResourceProvider } from "../src/dag/dag_replica";
-import { Replica, TypeRegistryMap, version } from "../src/replica";
-import { RSet, RSetResources } from "../src/types/rset";
+import { DagResource, DagResourceProvider } from "../src/dag/dag_resource";
+import { Replica, ResourcesBase, TypeRegistryMap, version } from "../src/replica";
+import { RSet, rSetFactory, RSetResources } from "../src/types/rset";
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test";
 import { createMemDagResourceProvider } from "dag/mem_dag_storage";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { sha } from "@hyper-hyper-space/hhs3_crypto";
 
 const createReplica = (resourceProvider?: DagResourceProvider): Replica<RSetResources> => {
-    const registry = new TypeRegistryMap<RSetResources>();
+    const registry = new TypeRegistryMap<ResourcesBase & DagResource>();
 
     registry.register(
         RSet.typeId,
-        RSet.load,
-        RSet.validateCreatePayload
+        rSetFactory
     );
 
     return new Replica(registry, resourceProvider || createMemDagResourceProvider());
 };
 
-const createTestEnvironment = async () => {
+const createTestEnvironment = async (initialElements: Array<json.Literal> = []) => {
     const storageProvider = createMemDagResourceProvider();
     const replica = createReplica(storageProvider);
 
-    const set = await RSet.create(
+    const init = await RSet.create(
         {
             seed: 'set00',
-            elementsTypeId: 'json/string',
-            elements: [],
+            initialElements: initialElements,
             hashAlgorithm: 'sha256',
             supportBarrierAdd: true,
             supportBarrierDelete: true,
-        },
-        replica
+        }
     );
 
-    return { replica, set, setId: set.getId() };
+    const setId = await replica.addObject(init)
+    const set = (await replica.getObject(setId)) as RSet;
+
+    return { replica, set, setId };
 };
 
 export const simpleSetTests = {
-    title: '[SET00] Small set tests wit flat DAG indexing',
+    title: '[SET00] Small set tests with flat DAG indexing',
     tests: [
         {
-            name: '[SET00] Test sequentiall additions and deletions',
+            name: '[SET00] Test sequential additions and deletions',
             invoke: async () => {
                 const { set } = await createTestEnvironment();
 
@@ -128,6 +128,57 @@ export const simpleSetTests = {
                 assertTrue(await latestView.has('barrier-delta'), 'latest view should still include barrier add');
                 assertFalse(await latestView.has('root'), 'latest view should reflect the barrier delete');
             }
-        }
+        },
+        {
+            name: '[SET03] Test reading initial elements across history',
+            invoke: async () => {
+                const { set } = await createTestEnvironment(['alpha', 'beta']);
+
+                const creationVersion = version(set.getId());
+                const initialView = await set.getView(creationVersion);
+                assertTrue(await initialView.has('alpha'), 'alpha should be present at creation');
+                assertTrue(await initialView.has('beta'), 'beta should be present at creation');
+
+                await set.add('gamma');
+                await set.delete('alpha');
+
+                const latestView = await set.getView();
+                assertFalse(await latestView.has('alpha'), 'alpha should have been deleted from the latest view');
+                assertTrue(await latestView.has('beta'), 'beta should still be present in the latest view');
+                assertTrue(await latestView.has('gamma'), 'gamma should be present after being added');
+
+                const historicalView = await set.getView(creationVersion);
+                assertTrue(await historicalView.has('alpha'), 'historical view should retain alpha');
+                assertTrue(await historicalView.has('beta'), 'historical view should retain beta');
+                assertFalse(await historicalView.has('gamma'), 'historical view should not include future elements');
+            }
+        },
+        {
+            name: '[SET04] Test barrier deletes affecting initial elements',
+            invoke: async () => {
+                const { set } = await createTestEnvironment(['root', 'shared']);
+
+                const creationVersion = version(set.getId());
+
+                const leftHash = await set.add('left', creationVersion);
+                const rightHash = await set.add('right', creationVersion);
+
+                const leftVersion = version(leftHash);
+                const rightVersion = version(rightHash);
+
+                const sharedHash = await sha.sha256(json.toStringNormalized('shared'));
+                await set.deleteWithBarrierByHash(sharedHash, leftVersion);
+
+                const concurrentView = await set.getView(rightVersion);
+                assertFalse(await concurrentView.has('shared'), 'barrier delete should remove shared from concurrent branch');
+                assertTrue(await concurrentView.has('root'), 'other initial elements should remain unless deleted');
+
+                const ancestorView = await set.getView(creationVersion);
+                assertTrue(await ancestorView.has('shared'), 'ancestor view should still see shared');
+
+                const latestView = await set.getView();
+                assertFalse(await latestView.has('shared'), 'latest view should reflect barrier delete over initial element');
+            }
+        },
     ],
 };

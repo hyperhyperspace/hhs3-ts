@@ -1,6 +1,6 @@
 import { hash, Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { Entry, EntryMetaFilter, ForkPosition, Position } from "../../dag_defs";
-import { checkFilter, DagIndex } from "../../idx/dag_idx";
+import { Entry, EntryMetaFilter, ForkPosition, Position, checkFilter } from "../../dag_defs";
+import { DagIndex } from "../../idx/dag_idx";
 import { DagStore } from "store";
 import { MultiMap } from "@hyper-hyper-space/hhs3_util";
 
@@ -228,8 +228,6 @@ export async function findConcurrentCoverWithFilterUsingFlatIndex(store: DagStor
     }
 
     // Do a search for a pre cover, starting at the "from" position backwards, ignoring the nodes in notConcurrentTo
-
-    debugger
 
     pending = new Set<Hash>([...from]);
     visited = new Set<Hash>();

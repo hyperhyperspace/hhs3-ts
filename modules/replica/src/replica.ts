@@ -1,7 +1,9 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { dag } from "@hyper-hyper-space/hhs3_dag";
+import { dag, MetaProps } from "@hyper-hyper-space/hhs3_dag";
 
 import { json } from "@hyper-hyper-space/hhs3_json";
+
+export const MAX_TYPE_LENGTH = 128;
 
 export type Version = dag.Position;
 export const emptyVersion: () => Version = dag.emptyPosition;
@@ -31,6 +33,20 @@ export type RObject = {
     unsubscribe(callback: (event: Event) => void): void;
 }
 
+export type RObjectInit = {
+    type: string;
+    payload: Payload;
+}
+
+export type RObjectFactory<R extends ResourcesBase = ResourcesBase> = {
+    computeObjectId: (createPayload: Payload, resources: R) => Promise<Hash>;
+    
+    validateCreationPayload: (createPayload: Payload, resources: R) => Promise<boolean>;
+    executeCreationPayload: (createPayload: Payload, resources: R) => Promise<Hash>;
+    
+    loadObject: (id: Hash, resources: R) => Promise<RObject>;
+}
+
 // A static view of a replicable object's state at a given version
 export type View = {
     getObject(): RObject;
@@ -48,49 +64,47 @@ export type Event = {
 // This can be enriched locally with metadata, in which case this type should be extended.
 // However, only the payload is actually replicated.
 
-export type LoadRObject<R extends ResourcesBase = ResourcesBase> = (createOpId: Hash, context: R) => Promise<RObject>;
-export type ValidateCreationOp<R extends ResourcesBase = ResourcesBase> = (createOpId: Hash, createOpPayload: Payload, context: R) => Promise<boolean>;
 
-export type TypeRegistry<R extends ResourcesBase = ResourcesBase> = {
-    register: (type: string, load: LoadRObject, validate: ValidateCreationOp) => void;
-    getLoadFun(type: string) : LoadRObject<R>;
-    getValidateCreationFun(type: String): ValidateCreationOp<R>;
+export type RObjectRegistry<R extends ResourcesBase = ResourcesBase> = {
+    lookup(typeName: string): Promise<RObjectFactory<R>>;
 }
 
-export class TypeRegistryMap<R extends ResourcesBase = ResourcesBase> implements TypeRegistry<R> {
-    private types: Map<string, [LoadRObject<R>, ValidateCreationOp<R>]> = new Map();
+export class TypeRegistryMap<R extends ResourcesBase = ResourcesBase> implements RObjectRegistry<R> {
+    private types: Map<string, RObjectFactory<R>> = new Map();
 
-    register(type: string, create: LoadRObject<R>, checkCreate: ValidateCreationOp<R>) {
-        this.types.set(type, [create, checkCreate]);
+    async register(typeName: string, type: RObjectFactory<R>) {
+        this.types.set(typeName, type);
     }
-
-    getLoadFun(type: string): LoadRObject<R> {
-        return this.types.get(type)![0];
-    }
-
-    getValidateCreationFun(type: string): ValidateCreationOp<R> {
-        return this.types.get(type)![1];
+    
+    async lookup(typeName: string): Promise<RObjectFactory<R>> {
+        return this.types.get(typeName)!;
     }
 }
 
 export type ResourcesBase = {
     replica: Replica<any>;
+    registry: RObjectRegistry<any>;
 };
 
 export type Resource = {[key: string]: any};
 
-export type ResourceProvider<R extends ResourcesBase, T extends Resource> = {
-    addResource: (id: Hash, resources: R) => Promise<R&T>;
+export type ResourcesProvider<R extends ResourcesBase, T extends Resource> = {
+    
+    // resources needed for object normal lifetime
+    addForObject: (id: Hash, resources: R) => Promise<R&T>;
+    
+    // any resources are needed before object creation (e.g. for computing its hash id, validation, etc.)
+    addForObjectPreflight: (resources: R) => Promise<R&T>;
 };
 
 export class Replica<R extends ResourcesBase = ResourcesBase> {
 
-    private typeRegistry: TypeRegistry<R>;
+    private registry: RObjectRegistry<R>;
     private objects: Map<Hash, RObject> = new Map();
-    private resourceProvider: ResourceProvider<ResourcesBase, R>;
+    private resourceProvider: ResourcesProvider<ResourcesBase, R>;
 
-    constructor(typeRegistry: TypeRegistry<R>, resourceProvider: ResourceProvider<ResourcesBase, R>) {
-        this.typeRegistry = typeRegistry;
+    constructor(registry: RObjectRegistry<R>, resourceProvider: ResourcesProvider<ResourcesBase, R>) {
+        this.registry = registry;
         this.resourceProvider = resourceProvider;
     }
 
@@ -98,24 +112,33 @@ export class Replica<R extends ResourcesBase = ResourcesBase> {
         return this.objects.get(id)!;
     }
 
-    async addObject(type: string, createOpId: Hash, creationPayload: json.Literal): Promise<boolean> {
-        const validateCreateFun = this.typeRegistry.getValidateCreationFun(type);
-        const context = await this.resourceProvider.addResource(createOpId, { replica: this });
+    async addObject(init: RObjectInit): Promise<Hash> {
 
-        const isValid = await validateCreateFun(createOpId, creationPayload, context);
+        const factory = await this.registry.lookup(init.type);
+
         
-        if (isValid) {
+        const preflightResources = await this.resourceProvider.addForObjectPreflight({ replica: this, registry: this.registry });
+        
+        const id = await factory.computeObjectId(init.payload, preflightResources);
+        const valid = await factory.validateCreationPayload(init.payload, preflightResources);
 
-            const loadFun = this.typeRegistry.getLoadFun(type);
-            const object = await loadFun(createOpId, context);
-            this.objects.set(object.getId(), object);
-            return true;
+        if (valid) {
+            const resources = await this.resourceProvider.addForObject(id, { replica: this, registry: this.registry });
+            await factory.executeCreationPayload(init.payload, resources);
+            this.objects.set(id, await factory.loadObject(id, resources));
+            return id
+        } else {
+            throw new Error('Invalid creation payload');
         }
-
-        return false;
     }
 
-    async getResources(id: Hash): Promise<R> {
-        return this.resourceProvider.addResource(id, { replica: this });
+    async getResourcesForObject(id: Hash): Promise<R> {
+        return this.resourceProvider.addForObject(id, { replica: this, registry: this.registry });
     }
+
+    async getResourcesForPreflight(): Promise<R> {
+        return this.resourceProvider.addForObjectPreflight({ replica: this, registry: this.registry });
+    }
+
+    
 }

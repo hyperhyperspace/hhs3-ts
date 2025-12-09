@@ -1,4 +1,5 @@
 import { simpleSetTests } from "./simple_set_tests";
+import { nestedSetTests } from "./nested_set_tests";
 import { testing } from "@hyper-hyper-space/hhs3_util/";
 
 async function main() {
@@ -8,6 +9,7 @@ async function main() {
     const filters = process.argv.slice(2);
 
     allTests.set(simpleSetTests.title, simpleSetTests.tests);
+    allTests.set(nestedSetTests.title, nestedSetTests.tests);
 
     console.log('Running tests for Hyper Hyper Space v3 Replica module' + (filters.length > 0? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');    
 

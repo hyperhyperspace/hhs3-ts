@@ -5,3 +5,4 @@ export { LabelledQueue } from "./labelled_queue";
 export { PriorityQueue } from "./priority_queue"
 export * as testing from "./test";
 export * as set from "./set";
+export * as iterators from "./iterators";
