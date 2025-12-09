@@ -189,11 +189,9 @@ export const rSetFactory: RObjectFactory<RSetResources> = {
 
         const meta: MetaProps = {};
         const createPayload = payload as CreateSetPayload;
-        const initialElements = createPayload['initialElements'] || [];
 
         if (createPayload['contentType'] === undefined) {
-            // Guard against missing initialElements in nested creation payloads.
-            meta['elmts'] = json.toSet(await Promise.all(initialElements.map(async (e: json.Literal) => hashElement(e))));
+            meta['elmts'] = json.toSet(await Promise.all(createPayload['initialElements'].map(async (e: json.Literal) => hashElement(e))));
         }
         
         
