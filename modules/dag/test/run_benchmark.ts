@@ -1,4 +1,4 @@
-import {benchmarkSuite as bench} from "./all_index_test";
+import { benchmarkSuite as bench } from "./forking_benchmarks";
 import { testing } from "@hyper-hyper-space/hhs3_util/";
 
 async function main() {

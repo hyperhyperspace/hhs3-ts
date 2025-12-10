@@ -1,4 +1,5 @@
-import {topoSuite as topo, levelSuite as level, metaSearchSuite as meta} from "./all_index_test";
+import { topoSuite as topo, levelSuite as level } from "./forking_tests";
+import { metaSearchSuite as meta } from "./meta_search_tests";
 import { testing } from "@hyper-hyper-space/hhs3_util/";
 
 async function main() {

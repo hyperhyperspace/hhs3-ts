@@ -7,7 +7,6 @@ import { Position } from "../../dag_defs";
 
 export class MemLevelIndexStore implements LevelIndexStore {
 
-
     levelFactor: number;
 
     nextTopoIndex: number = 0;
