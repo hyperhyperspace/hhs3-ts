@@ -4,7 +4,7 @@
 
 This is the monorepo for the TypeScript version of [Hyper Hyper Space](https://www.hyperhyperspace.org), version 3.0 [(roadmap)](https://www.hyperhyperspace.org/work-plan-2025.html).
 
-Hyper Hyper Space is a data sync engine focused on **Authority Decentralization**. It enables applications to run locally with full autonomy, yet sync their state securely over the open Internet, even across untrusted peers. Furthermore, it provides support for sophisticated behavioral rules, intended to enable application that foster civil, cooperative and productive interactions.
+Hyper Hyper Space is a data sync engine focused on **Authority Decentralization**. It enables applications to run locally with full autonomy, and to sync their state securely over the open Internet even in the presence of malfunctioning or adversarial peers. Furthermore, it provides support for sophisticated behavioral rules, intended to enable applications that foster cooperative and productive interactions.
 
  Earlier versions were built using CRDTs over secure Merkle DAGs as the basic data type abstraction. Eventually we learned there is a fundamental tension between coordination-free systems (like the ones we want to build, that are able to run on a local device) and what is technically known as non-monotonic behaviour (these would be the *conflicts* in Conflict-free replicated data types). It turns out most non-trivial application behavior is non-monotonic: capability systems, access control systems, any kind of scheduling, moderation, anything involving currency / transactions, etc. Hyper Hyper Space used ad-hoc CRDTs extensions to work around this issue, but the resulting system was limited and hard to program.
 
@@ -12,7 +12,7 @@ Hyper Hyper Space is a data sync engine focused on **Authority Decentralization*
 
  Our implementation of **Monotone View Types** needs fast solution for fork/merge, minimal cover, and metadata querying on DAGs. Support for these is provided in the **`dag`** module [[local]](modules/dag) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/dag).
 
-**Current status:** We're completing the data modeling layer in the **`replica`** module. While the implementation of **Monotone View Types** is complete, we're working on a concurrency model for **Monotone View Type** composition, called **Convergent Version Resolution**. Once that's complete, the synchronizer will need to be ported over and adapted to work on this new model. After that, adapters and tooling for using the synchronizer with existing information systems (mostly RDBMs) will be developed. Please see the **`replica`** module and the [roadmap](https://www.hyperhyperspace.org/work-plan-2025.html) for details.
+**Current status:** We're completing the data modeling layer in the **`replica`** module. While the implementation of **Monotone View Types** is complete, we're working on a concurrency model for **Monotone View Type** composition, based on the idea of **State-Observation-as-Data** (SOaD). Once that's complete, the synchronizer will need to be ported over and adapted to work on this new model. After that, adapters and tooling for using the synchronizer with existing information systems (mostly RDBMs) will be developed. Please see the **`replica`** module and the [roadmap](https://www.hyperhyperspace.org/work-plan-2025.html) for details.
 
 This monorepo is organized as a collection of modules. This is of course WIP.
 
