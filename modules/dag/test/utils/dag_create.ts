@@ -200,7 +200,7 @@ export async function createRandomDisconnectedDags(constrs: [()=>dag.Dag, ()=>da
     return {dags: dags, branches: branches};
 }
 
-export async function createRandomDags(constrs: [()=>dag.Dag, ()=>dag.Dag], seed: number, size: number, options?: { progressBar?: boolean }): Promise<{ dags: Array<[dag.Dag, dag.Dag]>, branches: Array<[Position, Position]>}> {
+export async function createRandomDags(constrs: [()=>dag.Dag, ()=>dag.Dag], seed: number, size: number, options?: { progressBar?: boolean, addMeta?: boolean }): Promise<{ dags: Array<[dag.Dag, dag.Dag]>, branches: Array<[Position, Position]>}> {
     const dags: Array<[dag.Dag, dag.Dag]> = [];
     const branches: Array<[Position, Position]> = [];
 
@@ -211,7 +211,7 @@ export async function createRandomDags(constrs: [()=>dag.Dag, ()=>dag.Dag], seed
         const d1 = constrs[0]();
         const d2 = constrs[1]();
 
-        const [b1, b2] = await createRandomDag(d1, seeds.nextInt(0, 2000000000), size);
+        const [b1, b2] = await createRandomDag(d1, seeds.nextInt(0, 2000000000), size, {addMeta: options?.addMeta ?? false});
 
         await dag.copy(d1, d2);
 
@@ -229,7 +229,7 @@ export async function createRandomDags(constrs: [()=>dag.Dag, ()=>dag.Dag], seed
     return {dags: dags, branches: branches};
 }
 
-export async function createRandomDag(dag: Dag, seed: number, size: number): Promise<[Position, Position]> {
+export async function createRandomDag(dag: Dag, seed: number, size: number, options?: {addMeta: boolean}): Promise<[Position, Position]> {
 
     const prng = new PRNG(seed);
 
@@ -254,7 +254,7 @@ export async function createRandomDag(dag: Dag, seed: number, size: number): Pro
         after = minimalCover(after, preds);
         const nodeIndex = i;
         const id = nodeIndex + ":" + prng.nextInt(0, 2000000000);
-        const meta = createDeterministicMeta(nodeIndex, prng);
+        const meta = options?.addMeta ? createDeterministicMeta(nodeIndex, prng) : {};
         const n = await dag.append({id: id}, meta, after);
 
         nodes.push(n);

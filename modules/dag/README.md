@@ -1,6 +1,6 @@
 # DAG
 
-A module for using an append-only DAG as a hash-linked history log. The DAG supports indexing to provide fast analysis of forks / merges.
+A module for using an append-only DAG as a hash-linked history log. The DAG supports indexing to provide fast analysis of forks / merges and minimal cover finding.
 
 The module uses two storage interfaces: one for the DAG entries, and another for storing the index. Three indexing algorithms are supported: flat (naive, used as a testing baseline), a topological index (a simple, well known algorithm), and a new multi-level indexing algorithm (faster, scales logarithmically over long branches by using progressively smaller projections of the DAG for the search).
 
@@ -10,13 +10,24 @@ Here's the DAG interface:
  type Dag = {
     append(payload: json.Literal, meta: json.Literal, after?: Position): Promise<Hash>;
 
+    computeEntryHash(payload: json.Literal, after?: Position): Promise<Hash>;
+
     loadEntry(h: Hash): Promise<Entry|undefined>;
     loadHeader(h: Hash): Promise<Header|undefined>;
+
     getFrontier(): Promise<Position>;
 
     // latest position where history hasn't forked yet
     findForkPosition(first: Position, second: Position): Promise<ForkPosition>;
     findMinimalCover(p: Position): Promise<Position>;
+
+    // The following two are used for finding entries with specific properties
+
+    // This one is for reading a value at a specific version, by finding the last changes on that value
+    findCoverWithFilter(from: Position, meta: EntryMetaFilter): Promise<Position>;
+
+    // This is useful for finding barrier ops that should be applied to concurrent changes
+    findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position>;
 };
 ```
 
@@ -27,7 +38,7 @@ To build, please write the following commands at the workspace level (top direct
 
 ```
 npm install
-npm run build -workspaces
+npm run build
 ```
 
 ## Usage
@@ -87,12 +98,24 @@ Fork positions have 4 fields:
 
 Performance was analyzed by creating a synthetic set of branching DAGs of different sizes. We're showing average wall clock time, measeured in milliseconds.
 
+### Fork Analysis
+
 |DAG entries|  Topological | Multi-level  | Speedup |
 |----------:|-------------:|-------------:|--------:|
 | 10,000    | 30.3         | 6.8          | 4.4X    |
 | 20,000    | 74.1         | 9.5          | 7.8X    |
 | 50,000    | 193.2        | 9.6          | 20.1X   |
 | 100,000   | 324.2        | 9.6          | 33.7X   |
+
+
+## Minimal Cover Finding
+
+|DAG entries|  Topological | Multi-level  | Speedup |
+|----------:|-------------:|-------------:|--------:|
+| 10,000    | 18.4         | 0.6          | 24.5X   |
+| 20,000    | 25.8         | 0.5          | 55.2X   |
+| 50,000    | 81.0         | 0.6          | 131.0X  |
+| 100,000   | 439.8        | 0.9          | 470.2X  |
 
 To run the benchmark, first build the workspace and then do
 
@@ -108,4 +131,17 @@ We do deterministic testing over families of pseudo-randomly generated DAGs of d
 
 ```
 npm run test
+```
+
+To re-run specific tests, you can pass keywords that act as filters on which tests will be run, like
+
+
+```
+npm run test FORK_LEVEL_11
+```
+
+or
+
+```
+npm run test cover topo small
 ```

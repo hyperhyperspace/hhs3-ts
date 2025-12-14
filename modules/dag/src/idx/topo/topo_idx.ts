@@ -30,6 +30,8 @@ export async function addToTopoIndex(index: TopoIndexStore, n: Hash, preds?: Ite
 
 export async function findMinimalCoverUsingTopoIndex(index: TopoIndexStore, p: Position): Promise<Position> {
     
+    //const startTime = performance.now();
+
     const queue = new PriorityQueue<Hash>();
     const enqueued = new Set<Hash>();
     let minTopoIdx = Number.MAX_SAFE_INTEGER;
@@ -58,13 +60,16 @@ export async function findMinimalCoverUsingTopoIndex(index: TopoIndexStore, p: P
 
             const idx = await index.getTopoIndex(pred);
 
-            if (idx >= minTopoIdx) {
+            if (idx >= minTopoIdx && !enqueued.has(pred)) {
                 queue.enqueue(pred, -idx);
                 enqueued.add(pred);
             }
         }
     }
     
+    //const endTime = performance.now();
+    //console.log('findMinimalCoverUsingTopoIndex took', (endTime - startTime).toFixed(2), 'ms');
+
     return minCover;
 }
 
@@ -297,7 +302,93 @@ export async function findCoverWithFilterUsingTopoIndex(store: DagStore, index: 
 }
 
 export async function findConcurrentCoverWithFilterUsingTopoIndex(store: DagStore, index: TopoIndexStore, from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
-    throw new Error('not implemented');
+    // Create a successor map in forwardMap
+
+    const forwardMap = new MultiMap<Hash, Hash>();
+
+    let pending = new Set<Hash>([...from]);
+    let visited = new Set<Hash>();
+
+    while (pending.size > 0) {
+        const n = pending.values().next().value!;
+        pending.delete(n);
+
+        for (const pred of await index.getPreds(n)) {
+            forwardMap.add(pred, n);
+
+            if (!visited.has(pred)) {
+                pending.add(pred);
+            }
+        }
+
+        visited.add(n);
+    }
+
+    // Use the forward map to close the concurrentTo set upwards
+
+    pending = new Set<Hash>([...concurrentTo]);
+    visited = new Set<Hash>();
+
+    const notConcurrentTo = new Set<Hash>([...concurrentTo]);
+
+    while (pending.size > 0) {
+        const n = pending.values().next().value!;
+        pending.delete(n);
+
+        for (const succ of forwardMap.get(n) || []) {
+            if (!visited.has(succ)) {
+                pending.add(succ);
+                notConcurrentTo.add(succ);
+            }
+        }
+
+        visited.add(n);
+    }
+
+    // And the backwards map to close the concurrentTo set downwards
+
+    pending = new Set<Hash>([...concurrentTo]);
+    visited = new Set<Hash>();
+
+    while (pending.size > 0) {
+        const n = pending.values().next().value!;
+        pending.delete(n);
+
+        for (const pred of await index.getPreds(n)) {
+            if (!visited.has(pred)) {
+                pending.add(pred);
+                notConcurrentTo.add(pred);
+            }
+        }
+
+        visited.add(n);
+    }
+
+    // Do a search for a pre cover, starting at the "from" position backwards, ignoring the nodes in notConcurrentTo
+
+    pending = new Set<Hash>([...from]);
+    visited = new Set<Hash>();
+
+    const preConcCover = new Set<Hash>();
+
+    while (pending.size > 0) {
+        const n = pending.values().next().value!;
+        pending.delete(n);
+
+        if (!notConcurrentTo.has(n) && checkFilter((await store.loadEntry(n))!.meta, meta)) {
+            preConcCover.add(n);
+        } else {
+            for (const pred of await index.getPreds(n)) {
+                if (!visited.has(pred)) {
+                    pending.add(pred);
+                }
+            }
+        }
+
+        visited.add(n);
+    }
+
+    return findMinimalCoverUsingTopoIndex(index, preConcCover);
 }
 
 export function createDagTopoIndex(store: DagStore, index: TopoIndexStore): DagIndex {

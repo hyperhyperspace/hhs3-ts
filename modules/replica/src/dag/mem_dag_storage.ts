@@ -18,7 +18,7 @@ class MemDagResourceProvider<R extends ResourcesBase = ResourcesBase> implements
 
     async addForObjectPreflight(resources: R): Promise<R & DagResource> {
         const store = new dag.store.MemDagStorage();
-        const index = dag.idx.flat.createFlatIndex(store, new dag.idx.flat.mem.MemFlatIndexStore);
+        const index = dag.idx.level.createDagLevelIndex(store, new dag.idx.level.mem.MemLevelIndexStore);
         return {...resources, ...{dag: {get: async () => dag.create(store, index)}}}
     }
 

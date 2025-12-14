@@ -18,14 +18,14 @@ const collectMetas = async (d: dag.Dag): Promise<Array<MetaProps>> => {
     return metas;
 };
 
-const runMetaParity = async (constrs: [() => dag.Dag, () => dag.Dag]) => {
+const runMetaParity = async (constrs: [() => dag.Dag, () => dag.Dag], options?: {size?: number, seed?: number}) => {
     const dagA = constrs[0]();
     const dagB = constrs[1]();
 
-    const seed = 1771;
-    const size = 24;
+    const seed = options?.seed ?? 1771;
+    const size = options?.size ?? 24;
 
-    const [branchA, branchB] = await createRandomDag(dagA, seed, size);
+    const [branchA, branchB] = await createRandomDag(dagA, seed, size, {addMeta: true});
     await dag.copy(dagA, dagB);
 
     const positions: Array<Position> = [
@@ -69,11 +69,30 @@ const runMetaParity = async (constrs: [() => dag.Dag, () => dag.Dag]) => {
     }
 };
 
+const topoFlatDagPairConstr: [() => dag.Dag, () => dag.Dag] = [
+    () => {
+        const store = new dag.store.MemDagStorage();
+        const index = dag.idx.topo.createDagTopoIndex(
+            store,
+            new dag.idx.topo.mem.MemTopoIndexStore()
+        );
+        return dag.create(store, index);
+    },
+    () => {
+        const store = new dag.store.MemDagStorage();
+        const index = dag.idx.flat.createFlatIndex(
+            store,
+            new dag.idx.flat.mem.MemFlatIndexStore()
+        );
+        return dag.create(store, index);
+    }
+];
+
 const metaSearchSuite = {
-    title: "[MET] Test Meta Search Solutions",
+    title: "[META] Test Meta Search Solutions",
     tests: [
         {
-            name: "[MET00] Basic meta property covering tests using flat index",
+            name: "[META_00] Basic meta property covering tests using flat index",
             invoke: async () => {
                 const store = new dag.store.MemDagStorage();
                 const flatIndex = dag.idx.flat.createFlatIndex(
@@ -125,7 +144,7 @@ const metaSearchSuite = {
             }
         },
         {
-            name: "[MET01] Basic meta property concurrent covering tests using flat index",
+            name: "[META_01] Basic meta property concurrent covering tests using flat index",
             invoke: async () => {
                 const store = new dag.store.MemDagStorage();
                 const flatIndex = dag.idx.flat.createFlatIndex(
@@ -185,28 +204,24 @@ const metaSearchSuite = {
             }
         },
         {
-            name: "[MET02] Pseudo-random cover filters topo vs flat parity",
+            name: "[META_02] Pseudo-random cover filters topo vs flat parity on small random DAGs",
             invoke: async () => {
-                await runMetaParity([
-                    () => {
-                        const store = new dag.store.MemDagStorage();
-                        const index = dag.idx.topo.createDagTopoIndex(
-                            store,
-                            new dag.idx.topo.mem.MemTopoIndexStore()
-                        );
-                        return dag.create(store, index);
-                    },
-                    () => {
-                        const store = new dag.store.MemDagStorage();
-                        const index = dag.idx.flat.createFlatIndex(
-                            store,
-                            new dag.idx.flat.mem.MemFlatIndexStore()
-                        );
-                        return dag.create(store, index);
-                    }
-                ]);
+                await runMetaParity(topoFlatDagPairConstr, {size: 1000, seed: 1771});
+            }
+        },
+        {
+            name: "[META_03] Pseudo-random cover filters topo vs flat parity on medium random DAGs",
+            invoke: async () => {
+                await runMetaParity(topoFlatDagPairConstr, {size: 5000, seed: 1776});
+            }
+        },
+        {
+            name: "[META_04] Pseudo-random cover filters topo vs flat parity on medium random DAGs",
+            invoke: async () => {
+                await runMetaParity(topoFlatDagPairConstr, {size: 10000, seed: 1774});
             }
         }
+        
     ]
 };
 

@@ -1,9 +1,13 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { MultiMap, PriorityQueue } from "@hyper-hyper-space/hhs3_util";
-import { EntryMetaFilter, ForkPosition, Position } from "../../dag_defs";
+import { checkFilter, EntryMetaFilter, ForkPosition, Position } from "../../dag_defs";
 import { DagIndex } from "../../idx/dag_idx";
+import { position } from "../../dag";
+import { DagStore } from "../../store";
 
 export * as mem from './level_idx_mem_store';
+
+function label(h: Hash) { return "_" + h.replace(/[^a-zA-Z0-9]/g, "").slice(-6, -1); }
 
 // Implementation of the fork finding alogrithm using a multi-level index for fast graph traversal.
 
@@ -28,7 +32,10 @@ export type LevelIndexStore = {
     getEntryInfo: (node: Hash) => Promise<EntryInfo>;
 
     addPred: (level: number, node: Hash, pred: Hash) => Promise<void>;
-    getPreds: (level: number, node: Hash) => Promise<Set<Hash>>; 
+    getPreds: (level: number, node: Hash) => Promise<Set<Hash>>;
+
+    addSucc: (level: number, node: Hash, succ: Hash) => Promise<void>;
+    getSuccs: (level: number, node: Hash) => Promise<Set<Hash>>;
 }
 
 export async function addToLevelIndex(index: LevelIndexStore, n: Hash, preds: Position): Promise<void> {
@@ -39,6 +46,7 @@ export async function addToLevelIndex(index: LevelIndexStore, n: Hash, preds: Po
     
         for (const pred of preds) {
             await index.addPred(0, n, pred);
+            await index.addSucc(0, pred, n);
         }
 
         let i = 0;
@@ -54,6 +62,12 @@ export async function addToLevelIndex(index: LevelIndexStore, n: Hash, preds: Po
                 await index.addPred(i+1, n, predInNextLevel);
             }
 
+            const forwardProjection = await projectForwardIntoNextLevel(index, await index.getSuccs(i, n), i, {minimal: false});
+            
+            for (const succInNextLevel of forwardProjection.keys()) {
+                await index.addSucc(i+1, n, succInNextLevel);
+            }
+
             i = i+1;
         }
     }
@@ -61,42 +75,157 @@ export async function addToLevelIndex(index: LevelIndexStore, n: Hash, preds: Po
 
 export async function findMinimalCoverUsingLevelIndex(index: LevelIndexStore, p: Position): Promise<Position> {
     
-    const queue = new PriorityQueue<Hash>();
-    const enqueued = new Set<Hash>();
-    let minTopoIdx = Number.MAX_SAFE_INTEGER;
+
+    //const startTime = performance.now();
+
+    const start = new Set<Hash>();
 
     for (const n of p) {
+        const preds = await index.getPreds(0, n);
+        for (const pred of preds) {
+            start.add(pred);
+        }
+    }
+
+    const reachable = await reachabilityAtLevel(index, 0, start, p);
+
+    const minCover = new Set<Hash>();
+
+    for (const n of p) {
+        if (!reachable.has(n)) {
+            minCover.add(n);
+        }
+    }
+
+    //const endTime = performance.now();
+    //console.log('findMinimalCoverUsingLevelIndex took', (endTime - startTime).toFixed(2), 'ms');
+    
+    //console.log('min cover is', [...minCover].map(label));
+
+    return minCover;
+
+}
+
+async function reachabilityAtLevel(index: LevelIndexStore, level: number, start: Position, target: Position): Promise<Position> {
+
+
+
+    //console.log('reachability at level', level, 'from', [...start].map(label), 'to', [...target].map(label));
+
+    let minTopoIdx = Number.MAX_SAFE_INTEGER;
+
+    for (const n of target) {
         const idx = (await index.getEntryInfo(n)).topoIndex;
-
-        queue.enqueue(n, -idx);
-        enqueued.add(n);
-
         if (idx < minTopoIdx) {
             minTopoIdx = idx;
         }
     }
 
-    const minCover = new Set<Hash>(p);
+    let maxTopoIdx = Number.MIN_SAFE_INTEGER;
+
+    for (const n of start) {
+        const idx = (await index.getEntryInfo(n)).topoIndex;
+        if (idx > maxTopoIdx) {
+            maxTopoIdx = idx;
+        }
+    }
+
+    //let startTime = performance.now();
+    const projectStart = await projectIntoNextLevelFaster(index, start, level, {minTopoIdx: minTopoIdx});
+    //let endTime = performance.now();
+    //console.log('project into next level from ', level, 'took', (endTime - startTime).toFixed(2), 'ms');
+    
+    //startTime = performance.now();
+    const projectTarget = projectStart.size > 0 ? await projectForwardIntoNextLevelFaster(index, target, level, {maxTopoIdx: maxTopoIdx}) : new Map<Hash, EntryInfo>();
+    //endTime = performance.now();
+    //console.log('project forward into next level from ', level, 'took', (endTime - startTime).toFixed(2), 'ms');
+    
+
+    const properProjectTarget = new Set<Hash>(projectTarget.keys());
+    for (const n of projectStart.keys()) {
+        properProjectTarget.delete(n);
+    }
+
+    let reachabilityAtNext = new Set<Hash>();
+
+    let minLevel = Number.MAX_SAFE_INTEGER;
+
+    for (const info of chain(projectStart.values(), projectTarget.values())) {
+        if (info.level < minLevel) {
+            minLevel = info.level;
+        }
+    }
+
+    if (minLevel < Number.MAX_SAFE_INTEGER && projectStart.size > 0 && properProjectTarget.size > 0) {
+        //startTime = performance.now();
+        reachabilityAtNext = await reachabilityAtLevel(index, level+1, position(...projectStart.keys()), position(...projectTarget.keys()));
+        //endTime = performance.now();
+        //console.log('reachability at level', level+1, 'took', (endTime - startTime).toFixed(2), 'ms');
+    } else if (minLevel === Number.MAX_SAFE_INTEGER) {
+        // projected start and target have only root nodes, hence they are reachable at next only if they are in the start set.
+        for (const n of projectStart.keys()) {
+            if (projectTarget.has(n)) {
+                reachabilityAtNext.add(n);
+            }
+        }
+    }
+
+
+    //startTime = performance.now();
+    const queue = new PriorityQueue<Hash>();
+    const enqueued = new Set<Hash>();
+
+    for (const n of chain(start, projectStart.keys(), reachabilityAtNext)) {
+        const info = await index.getEntryInfo(n);
+        const idx = info.topoIndex;
+
+        if (idx >= minTopoIdx && idx <= maxTopoIdx) {
+            queue.enqueue(n, -idx);
+            enqueued.add(n);
+        }
+    }
+
+
+    const reachable = new Set<Hash>();
+
+    //console.log('reach at l=', level, 'from', [...start].map(label), 'to', [...target].map(label), 'queue size is', queue.size(), 'minIdx is', minTopoIdx);
 
     while (!queue.isEmpty()) {
         const n = queue.dequeue()!;
         enqueued.delete(n);
 
-        const preds = await index.getPreds(0, n);
+        //console.log('dequeued', label(n));
+
+        if (target.has(n)) {
+            reachable.add(n);
+            //console.log('added', label(n), 'to reachable');
+        }
+
+        const preds = await index.getPreds(level, n);
 
         for (const pred of preds) {
-            minCover.delete(pred);
 
-            const idx = (await index.getEntryInfo(pred)).topoIndex;
+            const predInfo = await index.getEntryInfo(pred);
 
-            if (idx >= minTopoIdx) {
-                queue.enqueue(pred, -idx);
+            const predIdx = predInfo.topoIndex;
+            const predLevel = predInfo.level;
+
+            if ((predLevel === level || predLevel === Number.MAX_SAFE_INTEGER) && predIdx >= minTopoIdx && !enqueued.has(pred)) {
+                queue.enqueue(pred, -predIdx);
                 enqueued.add(pred);
+                //console.log('enqueued', label(pred));
             }
         }
+
+        if (reachable.size >= target.size) {
+            break;
+        }
     }
-    
-    return minCover;
+
+    //console.log('reachable at l=', level, 'from', [...start].map(label), 'to', [...target].map(label), 'is', [...reachable].map(label));
+    //endTime = performance.now();
+    //console.log('reachability at level', level, 'took', (endTime - startTime).toFixed(2), 'ms');
+    return reachable;
 }
 
 // Projection: given a set of starting nodes, traverse the DAG until a set of
@@ -119,7 +248,7 @@ export async function findMinimalCoverUsingLevelIndex(index: LevelIndexStore, p:
 // returned.
 
 
-async function projectIntoNextLevel(index: LevelIndexStore, nodes :Set<Hash>, level: number, options: {minimal:boolean}): Promise<Map<Hash, EntryInfo>> {
+async function projectIntoNextLevel(index: LevelIndexStore, nodes :Set<Hash>, level: number, options: {minimal:boolean, minTopoIdx?: number}): Promise<Map<Hash, EntryInfo>> {
     
     const start = performance.now();
 
@@ -133,12 +262,15 @@ async function projectIntoNextLevel(index: LevelIndexStore, nodes :Set<Hash>, le
 
     for (const n of nodes) {
         const topoIndex = (await index.getEntryInfo(n)).topoIndex;
-        queue.enqueue(n, -topoIndex);
-        enqueued.add(n);
-        uncoveredPaths.add(n);
+        if (options.minTopoIdx === undefined || topoIndex >= options.minTopoIdx) {
+            queue.enqueue(n, -topoIndex);
+            enqueued.add(n);
+            uncoveredPaths.add(n);
+        }
     }
 
     while (covered.size < queue.size() || uncoveredPaths.size > 0) {
+        //console.log('queue size is', queue.size(), 'covered size is', covered.size, 'uncoveredPaths size is', uncoveredPaths.size);
         const n = queue.dequeue()!;
         enqueued.delete(n);
 
@@ -161,18 +293,19 @@ async function projectIntoNextLevel(index: LevelIndexStore, nodes :Set<Hash>, le
 
         for (const nextPred of nextPreds) {
             const nextInfo = await index.getEntryInfo(nextPred);
-            if (!enqueued.has(nextPred)) {
-                let topoIndex = nextInfo.topoIndex;
-                queue.enqueue(nextPred, -topoIndex);
-                enqueued.add(nextPred);
-            }
+            if (options.minTopoIdx === undefined || nextInfo.topoIndex >= options.minTopoIdx) {
+                if (!enqueued.has(nextPred)) {
+                    queue.enqueue(nextPred, -nextInfo.topoIndex);
+                    enqueued.add(nextPred);
+                }
 
-            if (isCovered && !nodes.has(nextPred)) {
-                covered.add(nextPred);
-            }
+                if (isCovered && !nodes.has(nextPred)) {
+                    covered.add(nextPred);
+                }
 
-            if (!project && hasUncoveredPath) {
-                uncoveredPaths.add(nextPred);
+                if (!project && hasUncoveredPath) {
+                    uncoveredPaths.add(nextPred);
+                }
             }
         }
 
@@ -180,6 +313,185 @@ async function projectIntoNextLevel(index: LevelIndexStore, nodes :Set<Hash>, le
         uncoveredPaths.delete(n);
     }
 
+    //console.log('project into next level for', [...nodes].map(label), 'at level', level, 'is', [...projection.keys()].map(label));
+
+    return projection;
+}
+
+// this can only do minimal: false
+async function projectIntoNextLevelFaster(index: LevelIndexStore, nodes :Set<Hash>, level: number, options: {minTopoIdx?: number}): Promise<Map<Hash, EntryInfo>> {
+    
+    const start = performance.now();
+
+    const projection = new Map<Hash, EntryInfo>();
+    
+    let queue = new PriorityQueue<Hash>();
+    let enqueued = new Set<Hash>();
+
+    for (const n of nodes) {
+        const topoIndex = (await index.getEntryInfo(n)).topoIndex;
+        if (options.minTopoIdx === undefined || topoIndex >= options.minTopoIdx) {
+            queue.enqueue(n, -topoIndex);
+            enqueued.add(n);
+        }
+    }
+
+    while (queue.size() > 0) {
+        //console.log('queue size is', queue.size(), 'covered size is', covered.size, 'uncoveredPaths size is', uncoveredPaths.size);
+        const n = queue.dequeue()!;
+        enqueued.delete(n);
+
+        const info = await index.getEntryInfo(n);
+        let nLevel = info.level;
+
+        let project = nLevel > level;
+
+        if (project) {
+            projection.set(n, info);
+        } else {
+
+            const nextPreds = await index.getPreds(level, n);
+
+            for (const nextPred of nextPreds) {
+                if (!enqueued.has(nextPred)) {
+                    
+                    const nextInfo = await index.getEntryInfo(nextPred);
+
+                    if (options.minTopoIdx === undefined || nextInfo.topoIndex >= options.minTopoIdx) {        
+                        queue.enqueue(nextPred, -nextInfo.topoIndex);
+                        enqueued.add(nextPred);
+                    }
+                }
+            }
+        }
+    }
+
+    //console.log('project into next level for', [...nodes].map(label), 'at level', level, 'is', [...projection.keys()].map(label));
+
+    return projection;
+}
+
+// this can only do minimal: false
+async function projectForwardIntoNextLevelFaster(index: LevelIndexStore, nodes :Set<Hash>, level: number, options: {maxTopoIdx?: number}): Promise<Map<Hash, EntryInfo>> {
+    
+    const start = performance.now();
+
+    const projection = new Map<Hash, EntryInfo>();
+    
+    let queue = new PriorityQueue<Hash>();
+    let enqueued = new Set<Hash>();
+
+    for (const n of nodes) {
+        const topoIndex = (await index.getEntryInfo(n)).topoIndex;
+        if (options.maxTopoIdx === undefined || topoIndex <= options.maxTopoIdx) {
+            queue.enqueue(n, -topoIndex);
+            enqueued.add(n);
+        }
+    }
+
+    while (queue.size() > 0) {
+        //console.log('queue size is', queue.size(), 'covered size is', covered.size, 'uncoveredPaths size is', uncoveredPaths.size);
+        const n = queue.dequeue()!;
+        enqueued.delete(n);
+
+        const info = await index.getEntryInfo(n);
+        let nLevel = info.level;
+
+        let project = nLevel > level;
+
+        if (project) {
+            projection.set(n, info);
+        } else {
+
+            const nextSuccs = await index.getSuccs(level, n);
+
+            for (const nextSucc of nextSuccs) {
+                if (!enqueued.has(nextSucc)) {
+                    
+                    const nextInfo = await index.getEntryInfo(nextSucc);
+
+                    if (options.maxTopoIdx === undefined || nextInfo.topoIndex <= options.maxTopoIdx) {        
+                        queue.enqueue(nextSucc, -nextInfo.topoIndex);
+                        enqueued.add(nextSucc);
+                    }
+                }
+            }
+        }
+    }
+
+    //console.log('project into next level for', [...nodes].map(label), 'at level', level, 'is', [...projection.keys()].map(label));
+
+    return projection;
+}
+
+
+async function projectForwardIntoNextLevel(index: LevelIndexStore, nodes :Set<Hash>, level: number, options: {minimal:boolean, maxTopoIdx?: number}): Promise<Map<Hash, EntryInfo>> {
+    
+    const start = performance.now();
+
+    const projection = new Map<Hash, EntryInfo>();
+    
+    let queue = new PriorityQueue<Hash>();
+    let enqueued = new Set<Hash>();
+
+    let covered = new Set<Hash>();
+    let uncoveredPaths = new Set<Hash>();
+
+    for (const n of nodes) {
+        const topoIndex = (await index.getEntryInfo(n)).topoIndex;
+        if (options.maxTopoIdx === undefined || topoIndex <= options.maxTopoIdx) {
+            queue.enqueue(n, topoIndex);
+            enqueued.add(n);
+            uncoveredPaths.add(n);
+        }
+    }
+
+    while (covered.size < queue.size() || uncoveredPaths.size > 0) {
+        const n = queue.dequeue()!;
+        enqueued.delete(n);
+
+        let isCovered = covered.has(n);
+        let hasUncoveredPath = uncoveredPaths.has(n);
+
+        const info = await index.getEntryInfo(n);
+        let nLevel = info.level;
+
+        let project = nLevel > level;
+
+        if (project) {
+            if (!isCovered || (!options.minimal && hasUncoveredPath)) {
+                projection.set(n, info);
+                isCovered = true;
+            }
+        }
+
+        const nextSuccs = await index.getSuccs(level, n);
+
+        for (const nextSucc of nextSuccs) {
+            const nextInfo = await index.getEntryInfo(nextSucc);
+            
+            if (options.maxTopoIdx === undefined || nextInfo.topoIndex <= options.maxTopoIdx) {
+                if (!enqueued.has(nextSucc)) {
+                    let topoIndex = nextInfo.topoIndex;
+                    queue.enqueue(nextSucc, topoIndex);
+                    enqueued.add(nextSucc);
+                }
+
+                if (isCovered && !nodes.has(nextSucc)) {
+                    covered.add(nextSucc);
+                }
+
+                if (!project && hasUncoveredPath) {
+                    uncoveredPaths.add(nextSucc);
+                }
+            }
+        }
+
+        covered.delete(n);
+        uncoveredPaths.delete(n);
+    }
+
+    //console.log('project forward into next level for', [...nodes].map(label), 'at level', level, 'is', [...projection.keys()].map(label));
     return projection;
 }
 
@@ -423,15 +735,146 @@ export async function findForkPositionAtLevel(index: LevelIndexStore, level: num
 
 }
 
-export async function findCoverWithMetaUsingLevelIndex(index: LevelIndexStore, from: Position, meta: EntryMetaFilter): Promise<Position> {
-    throw new Error('not implemented');
+export async function findCoverWithMetaUsingLevelIndex(store: DagStore, index: LevelIndexStore, from: Position, meta: EntryMetaFilter): Promise<Position> {
+    const queue = new PriorityQueue<Hash>();
+    const enqueued = new Set<Hash>();
+    const visited = new Set<Hash>();
+    const preCover = new Set<Hash>();
+
+    const enqueue = async (node: Hash): Promise<void> => {
+        if (enqueued.has(node) || visited.has(node)) {
+            return;
+        }
+        queue.enqueue(node, -(await index.getEntryInfo(node)).topoIndex);
+        enqueued.add(node);
+    };
+
+    for (const hash of from) {
+        await enqueue(hash);
+    }
+
+    while (!queue.isEmpty()) {
+        const node = queue.dequeue()!;
+        enqueued.delete(node);
+
+        if (visited.has(node)) {
+            continue;
+        }
+
+        visited.add(node);
+
+        const entry = await store.loadEntry(node);
+
+        if (entry === undefined) {
+            throw new Error('node ' + node + ' not found');
+        }
+
+        if (checkFilter(entry.meta, meta)) {
+            preCover.add(node);
+            continue;
+        }
+
+        const preds = await index.getPreds(0, node);
+
+        for (const pred of preds) {
+            await enqueue(pred);
+        }
+    }
+
+    return findMinimalCoverUsingLevelIndex(index, preCover);
 }
 
-export async function findConcurrentCoverWithMetaUsingLevelIndex(index: LevelIndexStore, from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
-    throw new Error('not implemented');
+export async function findConcurrentCoverWithMetaUsingLevelIndex(store: DagStore, index: LevelIndexStore, from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
+    // Create a successor map in forwardMap
+
+    const forwardMap = new MultiMap<Hash, Hash>();
+
+    let pending = new Set<Hash>([...from]);
+    let visited = new Set<Hash>();
+
+    while (pending.size > 0) {
+        const n = pending.values().next().value!;
+        pending.delete(n);
+
+        for (const pred of await index.getPreds(0, n)) {
+            forwardMap.add(pred, n);
+
+            if (!visited.has(pred)) {
+                pending.add(pred);
+            }
+        }
+
+        visited.add(n);
+    }
+
+    // Use the forward map to close the concurrentTo set upwards
+
+    pending = new Set<Hash>([...concurrentTo]);
+    visited = new Set<Hash>();
+
+    const notConcurrentTo = new Set<Hash>([...concurrentTo]);
+
+    while (pending.size > 0) {
+        const n = pending.values().next().value!;
+        pending.delete(n);
+
+        for (const succ of forwardMap.get(n) || []) {
+            if (!visited.has(succ)) {
+                pending.add(succ);
+                notConcurrentTo.add(succ);
+            }
+        }
+
+        visited.add(n);
+    }
+
+    // And the backwards map to close the concurrentTo set downwards
+
+    pending = new Set<Hash>([...concurrentTo]);
+    visited = new Set<Hash>();
+
+    while (pending.size > 0) {
+        const n = pending.values().next().value!;
+        pending.delete(n);
+
+        for (const pred of await index.getPreds(0, n)) {
+            if (!visited.has(pred)) {
+                pending.add(pred);
+                notConcurrentTo.add(pred);
+            }
+        }
+
+        visited.add(n);
+    }
+
+    // Do a search for a pre cover, starting at the "from" position backwards, ignoring the nodes in notConcurrentTo
+
+    pending = new Set<Hash>([...from]);
+    visited = new Set<Hash>();
+
+    const preConcCover = new Set<Hash>();
+
+    while (pending.size > 0) {
+        const n = pending.values().next().value!;
+        pending.delete(n);
+
+        if (!notConcurrentTo.has(n) && checkFilter((await store.loadEntry(n))!.meta, meta)) {
+            preConcCover.add(n);
+        } else {
+            for (const pred of await index.getPreds(0, n)) {
+                if (!visited.has(pred)) {
+                    pending.add(pred);
+                }
+            }
+        }
+
+        visited.add(n);
+    }
+
+    return findMinimalCoverUsingLevelIndex(index, preConcCover);
 }
 
-export function createDagLevelIndex(index: LevelIndexStore): DagIndex {
+export function createDagLevelIndex(store: DagStore, index: LevelIndexStore): DagIndex {
 
     return {
         index: function (node: Hash, after: Position): Promise<void> {
@@ -447,11 +890,11 @@ export function createDagLevelIndex(index: LevelIndexStore): DagIndex {
         },
 
         findCoverWithFilter(from: Position, meta: EntryMetaFilter): Promise<Position> {
-            return findCoverWithMetaUsingLevelIndex(index, from, meta);
+            return findCoverWithMetaUsingLevelIndex(store, index, from, meta);
         },
 
         findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
-            return findConcurrentCoverWithMetaUsingLevelIndex(index, from, concurrentTo, meta);
+            return findConcurrentCoverWithMetaUsingLevelIndex(store, index, from, concurrentTo, meta);
         },
 
         

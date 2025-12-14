@@ -84,7 +84,8 @@ export const levelDagPairConstr: [() => dag.Dag, () => dag.Dag] = [
     () => {
         const store = new dag.store.MemDagStorage();
         const index = dag.idx.level.createDagLevelIndex(
-            new dag.idx.level.mem.MemLevelIndexStore({ levelFactor: 8 })
+            store,
+            new dag.idx.level.mem.MemLevelIndexStore({ levelFactor: 4 })
         );
         return dag.create(store, index);
     }
@@ -369,12 +370,12 @@ const createSuite = (tag: string, title: string, constrs: [() => dag.Dag, () => 
 });
 
 const topoSuite = createSuite(
-    "TOP",
+    "FORK_TOPO_",
     "Test Topological Fork Analysis Solution",
     topoDagPairConstr
 );
 const levelSuite = createSuite(
-    "LEV",
+    "FORK_LEVEL_",
     "Test Level-index Fork Analysis Solution",
     levelDagPairConstr
 );

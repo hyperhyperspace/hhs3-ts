@@ -13,6 +13,7 @@ export class MemLevelIndexStore implements LevelIndexStore {
     props: Map<Hash, EntryInfo> = new Map();
 
     predLevels: Map<number, MultiMap<Hash, Hash>> = new Map();
+    succLevels: Map<number, MultiMap<Hash, Hash>> = new Map();
 
     constructor(props?: {levelFactor?: number}) {
         this.levelFactor = props?.levelFactor || 64;
@@ -81,4 +82,17 @@ export class MemLevelIndexStore implements LevelIndexStore {
     };
 
     getPreds = async (level:number, node: Hash) => this.predLevels.get(level)?.get(node)||new Set<Hash>();
+
+    addSucc = async (level: number, node: Hash, succ: Hash) => {
+
+        let succLevel = this.succLevels.get(level);
+        
+        if (succLevel === undefined) {
+            succLevel = new MultiMap();
+            this.succLevels.set(level, succLevel);
+        }
+        succLevel.add(node, succ);
+    };
+
+    getSuccs = async (level: number, node: Hash) => this.succLevels.get(level)?.get(node)||new Set<Hash>();
 }
