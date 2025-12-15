@@ -10,7 +10,7 @@ This new version has two main goals:
 
  - **Greater modularization**. Previous versions of Hyper Hyper Space were bundled as a monolithic JavaScript app for usage in web browsers. While we still see the browser as a possible target, we're now trying to build a collection of modules that can be re-used on any platform. See below for the modules that have been ported to v3 so far.
  
- - **A new data model**. We've developed a new formalism for coordination-free replication, **Monotone View Types**, in which observations are monotonic but explicitly version-scoped, allowing historical views to be refined as additional information becomes available. MVTs are a powerful _monotonic transformation_ mechanism, that helps application developers create coordination-free approximations for applciations in any domain. Learn more in the **`replica`** module [[local]](modules/replica) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/replica).
+ - **A new data model**. We've developed a new formalism for coordination-free replication, **Monotone View Types**, in which observations are monotonic but explicitly version-scoped, allowing historical views to be refined as additional information becomes available. MVTs are a powerful _monotonic transformation_ mechanism, that helps application developers create coordination-free approximations for applications in any domain. Learn more in the **`replica`** module [[local]](modules/replica) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/replica).
 
 ### Current status
  
