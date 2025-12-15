@@ -25,7 +25,7 @@ The architectural pattern this **`replica`** module follows is:
  
 Since we cannot, without coordination, prevent these conflicting updates from happening, we're left with two main options:
 
- - **Automated conflict resolution**: this has been widely explored, mainly in academia. R. Jefferson described in [Virtual time](https://dl.acm.org/doi/10.1145/3916.3988) (1985) a do-undo mechanism that replays updates in a deterministic order, cancelling the ones that break consistency. Terry et al, in [Managing update conflicts in Bayou, a weakly connected replicated storage system](https://people.eecs.berkeley.edu/~brewer/cs262b/update-conflicts.pdf) (1995) enhance that approach by supporting application-provided conflict resolution procedures, instead of cancellation.
+ - **Automated conflict resolution**: this has been widely explored, mainly in academia. R. Jefferson described in [Virtual time](https://dl.acm.org/doi/10.1145/3916.3988) (1985) a do-undo mechanism that replays updates in a deterministic order, cancelling the ones that break consistency. Terry et al, in [Managing update conflicts in Bayou, a weakly connected replicated storage system](https://people.eecs.berkeley.edu/~brewer/cs262b/update-conflicts.pdf) (1995) enhance that approach by supporting application-provided conflict resolution procedures, instead of cancellation. There are later improvements, but the essence of the idea remains the same.
  
  - **Conflict internalization**: we can make some conflicted states acceptable by the application, and just expose them through the UI where they can be manually resolved (e.g. what git and similar tools do for collaboration on source code).
  
@@ -53,7 +53,7 @@ We'll define `concurrent(to: Version, from: Version)` as the operations in `from
 
 Finally, we'll define `getView(at: Version, from: Version)` as the version that contains the union of all the operations in the set `at` and the **barrier operations** in `concurrent(at, from)`. Intuitively, to update the version `at` with anything relevant happening up to `from`, we need to add any barrier ops in `from` that happened concurrently with `at`.
 
-The view mechanism ensures that **Monotone View Types** are coordination-free, and can be safely replicated. However, the price we pay is having "non final" views.
+The view mechanism ensures that **Monotone View Types** are coordination-free, and can be safely replicated, even if the underlying type is not (because of the barriers). However, the price we pay is having "non final" views.
 
 To be of practical application, we'll require that whenever a new operation is applied at version `v`, we can derive a boundary that limits how far in the past other views may be affected:
 
@@ -69,6 +69,8 @@ obj.getView(w, v) == obj.getView(w, v ∪ {op})
 
 Therefore, when applying a new update, the set of versions that need to be revised is  well specified.
 
+Finally, the operational model with barriers + scoped views generalizes well when different levels of coordination are used. The outcome of a coordinated action can be encoded as a barrier op that rules out any concurrent modifications authored by peers that did not participate in the coordination scheme. The coordination protocol itself can be executed either operationally, modifying the state, or by a different channel.
+
 #### Implementation
 
 We provide an implementation of Monotone View Types over hash-linked DAGs. The **`dag`** module [[local]](../dag) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/dag) provides the fundamental algorithms (see `findForkPosition`, `findMinimalCover`, `findCoverWithFilter` and `findConcurrentCoverWithFilter`) to support MVTs that work by finding filtered minimal covers over the DAG.
@@ -83,7 +85,7 @@ Nesting at the DAG level is supported for MVTs. Oereations for the inner instanc
 
 Application state will normally be modeled using a collection of Monotonic View Types. We've defined an architectural pattern, **State-Observation-as-Data** (SOaD), to maximize composability and reuse and to simplify reasoning, ensuring monotonicity by construction.
 
-As an example, imagine a system composed by a `Cap` data type, that defines the set of user capabilities, and a series of types `A`, `B`, `C` with operations that are conditional to the right capabilities being present in `Cap`. We'll model concurrency in this system by enriching the state of each of `A`, `B` and `C` with a reference to the last known version of `Cap`. A _reference update_ operation to move this reference forward will also be added to each of them. The procedure to update `Cap` will now need logic to move this reference forward in all the types that _observe_ it, or alternatively this can by done espontaneously whenever any peer that replicates `A`, `B` or `C`discovers the new version of `Cap`.
+As an example, imagine a system composed by a `Cap` data type, that defines the set of user capabilities, and a series of types `A`, `B`, `C` with operations that are conditional to the right capabilities being present in `Cap`. We'll model concurrency in this system by enriching the state of each of `A`, `B` and `C` with a reference to the last known version of `Cap`. A _reference update_ operation to move this reference forward will also be added to each of them. The procedure to update `Cap` will now need logic to move this reference forward in all the types that _observe_ it, or alternatively this can by done spontaneously whenever any peer that replicates `A`, `B` or `C`discovers the new version of `Cap`.
 
 Since references to foreign versions can only be moved forward, it's easy to see that the _reference update_ operations will be well defined. If two branches of `A`, `B` or `C` have received different versions of `Cap`, they can be reconciled by taking the union of both versions as the branches are merged.
 
