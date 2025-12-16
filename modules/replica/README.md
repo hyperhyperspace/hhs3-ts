@@ -69,7 +69,7 @@ obj.getView(w, v) == obj.getView(w, v ∪ {op})
 
 Therefore, when applying a new update, the set of versions that need to be revised is  well specified.
 
-Finally, the operational model with barriers + scoped views generalizes well when different levels of coordination are used. The outcome of a coordinated action can be encoded as a barrier op that rules out any concurrent modifications authored by peers that did not participate in the coordination scheme. The coordination protocol itself can be executed either operationally, modifying the state, or by a different channel.
+Finally, the operational model with barriers + scoped views generalizes well when different levels of coordination are used. The outcome of a coordinated action can be encoded as a barrier op that rules out any concurrent modifications authored by peers that did not participate in the coordination scheme. The coordination protocol itself can be executed either operationally, modifying the state, or on a different channel.
 
 #### Implementation
 
@@ -79,7 +79,7 @@ As an example, a Monotone View Replicated Set was implemented here [[local]](src
 
 #### Nesting
 
-Nesting at the DAG level is supported for MVTs. Oereations for the inner instance are wrapped and inserted into the outer instance's DAG. The Monotone View Replicated Set was extended to support nesting (sets of sets of aribtrary depth).
+Nesting at the DAG level is supported for MVTs. Operations for the inner instance are wrapped and inserted into the outer instance's DAG. The Monotone View Replicated Set was extended to support nesting (sets of sets of aribtrary depth).
 
 ### Composability: SOaD Architecture
 
@@ -96,7 +96,7 @@ This procedure can be generalized to any number of types and state dependencies,
 
 It also fosters re-use of types, since the observed type is unaware of where and how it is being observed. Only the observers are modified, by being enriched with state references. Furthermore, this provides an interesting application interoperability mechanism, where an app can depend on parts of the state of another. This is an interesting data-centric alterantive to integration via APIs or other execution-driven schemes.
 
-It's interesting to notice how in traditional systems observation is _implicit_ and managed by the runtime, using metadata that's hidden from the application (locks, snapshots, isolation levels), while in this MVT-based concurrency resolution pattern it is _explicit_ and _stored as data_.
+It's interesting to notice how in traditional systems observation is _implicit_ and managed by the runtime, using metadata that's hidden from the application (locks, snapshots, isolation levels), while in this MVT-based concurrency resolution pattern it is _explicit_ and stored _as data_.
 
 ## Development Status
 
