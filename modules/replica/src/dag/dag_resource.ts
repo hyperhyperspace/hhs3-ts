@@ -1,14 +1,18 @@
-import { dag } from "@hyper-hyper-space/hhs3_dag";
-
 import { ResourcesBase, Replica, RObject, RObjectRegistry } from "../replica";
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { ScopedDag, CausalDag } from "./dag_nesting";
 
-export type DagStorage = {
-    get: () => Promise<dag.Dag>;
+export type ScopedDagStorage = {
+    get: () => Promise<ScopedDag>;
+};
+
+export type CausalDagStorage = {
+    get: () => Promise<CausalDag>;
 };
 
 export type DagResource = {
-    dag: DagStorage;
+    scopedDag: ScopedDagStorage;
+    causalDag: CausalDagStorage;
 };
 
 export type DagResourceProvider<R extends ResourcesBase = ResourcesBase> = {

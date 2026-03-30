@@ -1,22 +1,66 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { checkFilter, Dag, Entry, EntryMetaFilter, ForkPosition, Header, joinFilters, MetaProps, position, Position } from "@hyper-hyper-space/hhs3_dag";
-import { DagIndex } from "@hyper-hyper-space/hhs3_dag/dist/idx";
-import { DagStore } from "@hyper-hyper-space/hhs3_dag/dist/store";
+import { Dag, Entry, EntryMetaFilter, ForkPosition, joinFilters, MetaProps, position, Position } from "@hyper-hyper-space/hhs3_dag";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { Literal } from "@hyper-hyper-space/hhs3_json/dist/literal";
-import { iterators } from "@hyper-hyper-space/hhs3_util";
 
-// A wrapper that restricts the DAG to the subset of entries that affect a given
-// sub-object. This works mostly transparently, wrapping/unwrapping payloads and
-// metadata.
+// ScopedDag: the object's logical history surface.
+// For root objects, backed by RootScopedDag; for nested objects, backed by NestedScopedDag.
 
-// Note: the DAG structure still contains all the entries from the parent object,
-//       so some aspects will not be fully transparen:
-//       - the predecessers are not wrapped, so they will refer to unrelated operations
-//       - findForkPosition will search over the full, unfiltered DAG
-//       - maybe other things?
+export type ScopedDag = {
+    append(payload: Literal, meta: MetaProps, after?: Position): Promise<Hash>;
+    computeEntryHash(payload: Literal, after?: Position): Promise<Hash>;
+    loadEntry(h: Hash): Promise<Entry | undefined>;
+    getFrontier(): Promise<Position>;
+    findCoverWithFilter(from: Position, meta: EntryMetaFilter): Promise<Position>;
+    findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position>;
+    findMinimalCover(p: Position): Promise<Position>;
+};
 
-export type SubDagCreator = (createOpPayload: Literal, createOpMeta: MetaProps, at: Position) => Promise<Dag>;
+// CausalDag: the broader causal structure, read-only from the object's perspective.
+// Always backed by the real enclosing DAG.
+
+export type CausalDag = {
+    findForkPosition(first: Position, second: Position): Promise<ForkPosition>;
+};
+
+// RootScopedDag: wraps a full Dag exposing only ScopedDag methods at runtime,
+// ensuring root-level objects have the same method surface as nested objects.
+
+export class RootScopedDag implements ScopedDag {
+    private dag: Dag;
+
+    constructor(dag: Dag) {
+        this.dag = dag;
+    }
+
+    append(payload: Literal, meta: MetaProps, after?: Position): Promise<Hash> {
+        return this.dag.append(payload, meta, after);
+    }
+
+    computeEntryHash(payload: Literal, after?: Position): Promise<Hash> {
+        return this.dag.computeEntryHash(payload, after);
+    }
+
+    loadEntry(h: Hash): Promise<Entry | undefined> {
+        return this.dag.loadEntry(h);
+    }
+
+    getFrontier(): Promise<Position> {
+        return this.dag.getFrontier();
+    }
+
+    findCoverWithFilter(from: Position, meta: EntryMetaFilter): Promise<Position> {
+        return this.dag.findCoverWithFilter(from, meta);
+    }
+
+    findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
+        return this.dag.findConcurrentCoverWithFilter(from, concurrentTo, meta);
+    }
+
+    findMinimalCover(p: Position): Promise<Position> {
+        return this.dag.findMinimalCover(p);
+    }
+}
 
 
 export interface DagScope {
@@ -35,13 +79,13 @@ export interface DagScope {
 }
 
 
-export class SubDag implements Dag {
+export class NestedScopedDag implements ScopedDag {
 
-    private dag: Dag;
+    private dag: ScopedDag;
     private scope: DagScope;
     private empty: boolean;
 
-    constructor(dag: Dag, scope: DagScope) {
+    constructor(dag: ScopedDag, scope: DagScope) {
         this.dag = dag;
         this.scope = scope;
         this.empty = scope.startEmpty();
@@ -103,16 +147,8 @@ export class SubDag implements Dag {
         };
     }
     
-    loadHeader(h: Hash): Promise<Header | undefined> {
-        return this.dag.loadHeader(h);
-    }
-    
     async getFrontier(): Promise<Position> {
         return this.dag.findCoverWithFilter(await this.dag.getFrontier(), this.scope.baseFilter());
-    }
-    
-    findForkPosition(first: Position, second: Position): Promise<ForkPosition> {
-        return this.dag.findForkPosition(first, second);
     }
     
     findMinimalCover(p: Position): Promise<Position> {
@@ -125,19 +161,5 @@ export class SubDag implements Dag {
     
     findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
         return this.dag.findConcurrentCoverWithFilter(from, concurrentTo, joinFilters(this.scope.baseFilter(), this.scope.wrapFilter(meta)));
-    }
-    
-    loadAllEntries(): AsyncIterable<Entry> {
-        return this.dag.loadAllEntries();
-
-       // return iterators.filter(this.dag.loadAllEntries(), (entry: Entry) => checkFilter(entry.meta, this.scope.baseFilter()));
-    }
-    
-    getStore(): DagStore {
-        return this.dag.getStore();
-    }
-    
-    getIndex(): DagIndex {
-        return this.dag.getIndex();
     }
 }

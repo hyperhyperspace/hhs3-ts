@@ -25,11 +25,11 @@
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { Hash, sha } from "@hyper-hyper-space/hhs3_crypto";
-import { Dag, MetaProps, position, EntryMetaFilter, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
+import { MetaProps, position, EntryMetaFilter, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
 
 import { Event, MAX_TYPE_LENGTH, Payload, Replica, ResourcesBase, RObject, RObjectFactory, RObjectInit, version, Version, View } from "../replica";
 import { DagResource } from "dag/dag_resource";
-import { DagScope, SubDag } from "dag/dag_nesting";
+import { DagScope, NestedScopedDag, ScopedDag, CausalDag } from "dag/dag_nesting";
 import { set } from "@hyper-hyper-space/hhs3_util";
 
 export const MAX_SEED_LENGTH = 1024;
@@ -146,7 +146,7 @@ export const rSetFactory: RObjectFactory<RSetResources> = {
 
     computeObjectId: async (payload: json.Literal, resources: RSetResources) => {
 
-        const dag = await resources.dag.get();
+        const dag = await resources.scopedDag.get();
         return dag.computeEntryHash(payload, position());
     },
 
@@ -186,7 +186,7 @@ export const rSetFactory: RObjectFactory<RSetResources> = {
 
     executeCreationPayload: async (payload: json.Literal, resources: RSetResources) => {
 
-        const dag = await resources.dag.get();
+        const dag = await resources.scopedDag.get();
 
 
         const meta: MetaProps = {};
@@ -201,7 +201,7 @@ export const rSetFactory: RObjectFactory<RSetResources> = {
     },
 
     loadObject: async (id: Hash, resources: RSetResources) => {
-        const dag = await resources.dag.get();
+        const dag = await resources.scopedDag.get();
         const createOp = (await dag.loadEntry(id))!.payload as CreateSetPayload;
         return new RSet(id, createOp, resources);
     }
@@ -292,7 +292,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
     // Set operations
 
     async add(element: T, at?: Version): Promise<Hash> {
-        const dag = await this.dag();
+        const dag = await this.scopedDag();
 
         at = at || await dag.getFrontier();
         const payload = await this.createAddPayload(element, false, at);
@@ -301,7 +301,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
     }
     
     async addWithBarrier(element: T, at?: Version): Promise<Hash> {
-        const dag = await this.dag();
+        const dag = await this.scopedDag();
 
         at = at || await dag.getFrontier();
         const payload = await this.createAddPayload(element, true, at);
@@ -342,7 +342,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
     }
 
     async deleteByHash(elementHash: Hash, at?: Version): Promise<Hash> {
-        const dag = await this.dag();
+        const dag = await this.scopedDag();
 
         at = at || await dag.getFrontier();
         const payload: DeleteElmtPayload = await this.createDeletePayload(elementHash, false, at);
@@ -356,7 +356,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
     }
 
     async deleteWithBarrierByHash(elementHash: Hash, at?: Version): Promise<Hash> {
-        const dag = await this.dag();
+        const dag = await this.scopedDag();
 
         at = at || await dag.getFrontier();
         const payload: DeleteElmtPayload = await this.createDeletePayload(elementHash, true, at);
@@ -496,9 +496,10 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
             if (contentType !== undefined) {
                 const innerFactory = await this.resources.registry.lookup(contentType);
                 const innerResources = { ...this.resources };
-                const dag = await this.resources.dag.get();
+                const parentScopedDag = await this.resources.scopedDag.get();
                 const scope = new ElementUpdateScope(this, updatePayload['elementHash'], position(updatePayload['elementHash']));
-                innerResources.dag = {get: async () => new SubDag(dag, scope)};
+                innerResources.scopedDag = {get: async () => new NestedScopedDag(parentScopedDag, scope)};
+                innerResources.causalDag = this.resources.causalDag;
                 const innerRObject = await innerFactory.loadObject(updatePayload['elementHash'], innerResources);
                 if (!await innerRObject.validatePayload(updatePayload['updatePayload'], at)) {
                     return false;
@@ -515,9 +516,10 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
         
         if (setPayload['action'] === 'update') {
             const innerResources = { ...this.resources };
-            const dag = await this.resources.dag.get();
+            const parentScopedDag = await this.resources.scopedDag.get();
             const scope = new ElementUpdateScope(this, setPayload['elementHash'], position(setPayload['elementHash']));
-            innerResources.dag = {get: async () => new SubDag(dag, scope)};
+            innerResources.scopedDag = {get: async () => new NestedScopedDag(parentScopedDag, scope)};
+            innerResources.causalDag = this.resources.causalDag;
             const innerFactory = await this.resources.registry.lookup(this.contentType()!);
             const innerRObject = await innerFactory.loadObject(setPayload['elementHash'], innerResources);
             return await innerRObject.applyPayload(setPayload['updatePayload'], at);
@@ -529,14 +531,15 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
                     throw new Error("Create operation is not supposed to be applied _to_ a set");
                 case 'add':
                     if (this.contentType() !== undefined) {
-                        const dag = await this.dag();
+                        const dag = await this.scopedDag();
 
                         const elementHash = await dag.computeEntryHash(setPayload, at)
 
                         const scope = new ElementAddScope(this, elementHash, at, setPayload);
                         
                         const innerResources = { ...this.resources };
-                        innerResources.dag = {get: async () => new SubDag(dag, scope)};
+                        innerResources.scopedDag = {get: async () => new NestedScopedDag(dag, scope)};
+                        innerResources.causalDag = this.resources.causalDag;
                         const innerFactory = await this.resources.registry.lookup(this.contentType()!);
                 
                         await innerFactory.executeCreationPayload(setPayload['element'], innerResources);
@@ -555,7 +558,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
                     throw new Error("Invalid set action in payload: " + setPayload['action']);
             }
             
-            const dag = await this.dag();
+            const dag = await this.scopedDag();
     
             return await dag.append(payload, meta, at);
         }
@@ -565,7 +568,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
 
     async getView(at?: Version, from?: Version): Promise<RSetView<T>> {
         
-        const dag = await this.dag();
+        const dag = await this.scopedDag();
 
         at = at || await dag.getFrontier();
         from = from || await dag.getFrontier();
@@ -618,8 +621,12 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
         throw new Error("Method not implemented.");
     }
 
-    dag(): Promise<Dag> {
-        return this.resources.dag.get();
+    scopedDag(): Promise<ScopedDag> {
+        return this.resources.scopedDag.get();
+    }
+
+    causalDag(): Promise<CausalDag> {
+        return this.resources.causalDag.get();
     }
 }
 
@@ -670,7 +677,7 @@ export class RSetView<T  extends json.Literal> implements View {
 
         let barriers = version();
 
-        const dag = await this.target.dag();
+        const dag = await this.target.scopedDag();
 
         if (this.target.supportBarrierAdd() || this.target.supportBarrierDelete()) {
             barriers = await dag.findConcurrentCoverWithFilter(this.from, this.at, {containsValues: {barrier: ['t'], elmts: [elementHash]}});
@@ -707,7 +714,8 @@ export class RSetView<T  extends json.Literal> implements View {
             if (deleteBarriers.size === 0) {
                 return true;
             } else {
-                const fork = await dag.findForkPosition(adds, deleteBarriers);
+                const causalDag = await this.target.causalDag();
+                const fork = await causalDag.findForkPosition(adds, deleteBarriers);
                 return fork.forkA.size > 0;
             }
         } else {
@@ -721,11 +729,12 @@ export class RSetView<T  extends json.Literal> implements View {
             throw new Error("RSetView.getRObjectByHash is not supported when RSet has no contentType");
         }
         
-        const dag = await this.target.dag();
+        const parentScopedDag = await this.target.scopedDag();
         const scope = new ElementUpdateScope(this.target, elementHash, position(elementHash));
         
         const innerResources = { ...this.target.resources };
-        innerResources.dag = {get: async () => new SubDag(dag, scope)};
+        innerResources.scopedDag = {get: async () => new NestedScopedDag(parentScopedDag, scope)};
+        innerResources.causalDag = this.target.resources.causalDag;
         const innerFactory = await this.target.resources.registry.lookup(this.target.contentType()!);
 
         return innerFactory.loadObject(elementHash, innerResources);

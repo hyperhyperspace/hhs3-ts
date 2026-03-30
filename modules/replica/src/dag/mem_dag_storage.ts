@@ -1,7 +1,8 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { dag } from "@hyper-hyper-space/hhs3_dag";
 
-import { DagResource, DagResourceProvider, DagStorage } from "./dag_resource";
+import { DagResource, DagResourceProvider } from "./dag_resource";
+import { RootScopedDag } from "./dag_nesting";
 import { ResourcesBase } from "replica";
 
 class MemDagResourceProvider<R extends ResourcesBase = ResourcesBase> implements DagResourceProvider<R> {
@@ -11,7 +12,12 @@ class MemDagResourceProvider<R extends ResourcesBase = ResourcesBase> implements
         if (!this.stores.has(objectId)) {
             const store = new dag.store.MemDagStorage();
             const index = dag.idx.flat.createFlatIndex(store, new dag.idx.flat.mem.MemFlatIndexStore);
-            this.stores.set(objectId, {...resources, ...{dag: {get: async () => dag.create(store, index)}}});
+            const d = dag.create(store, index);
+            this.stores.set(objectId, {
+                ...resources,
+                scopedDag: { get: async () => new RootScopedDag(d) },
+                causalDag: { get: async () => d },
+            });
         }
         return this.stores.get(objectId)!;
     }
@@ -19,7 +25,12 @@ class MemDagResourceProvider<R extends ResourcesBase = ResourcesBase> implements
     async addForObjectPreflight(resources: R): Promise<R & DagResource> {
         const store = new dag.store.MemDagStorage();
         const index = dag.idx.level.createDagLevelIndex(store, new dag.idx.level.mem.MemLevelIndexStore);
-        return {...resources, ...{dag: {get: async () => dag.create(store, index)}}}
+        const d = dag.create(store, index);
+        return {
+            ...resources,
+            scopedDag: { get: async () => new RootScopedDag(d) },
+            causalDag: { get: async () => d },
+        };
     }
 
 }
