@@ -19,7 +19,7 @@
 // automatically wrap any updates to the nested type into RSet update operations, and will also automatically wrap
 // any metadata and filtering parameters. When an element is read, the payload is automatically unwrapped.
 
-// Notice that this wrapping process is not 100% transparetn: some operations (like fork poistion finding) will
+// Notice that this wrapping process is not 100% transparent: some operations (like fork poistion finding) will
 // return DAG entries from the outer, full DAG. So types that support being inserted as nested elements must be
 // aware of this caveats.
 
@@ -136,7 +136,9 @@ const updateElmtFormat: json.Format = {
 //   - DAG storage.
 //   - (in the future, we may add dyamic crypto resources here)
 
-export type RSetResources = ResourcesBase & DagResource;
+export type RSetResources = ResourcesBase & DagResource & {
+    selfValidate?: boolean;
+};
 
 // RSet factory: initial creation and validation of set creation ops.
 
@@ -295,15 +297,15 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
         at = at || await dag.getFrontier();
         const payload = await this.createAddPayload(element, false, at);
 
-        return this.applyPayload(payload, at);
+        return this.applyValidatedPayload(payload, at);
     }
     
     async addWithBarrier(element: T, at?: Version): Promise<Hash> {
         const dag = await this.dag();
 
         at = at || await dag.getFrontier();
-        const payload: AddElmtPayload = {action: 'add', element, barrier: true};
-        return this.applyPayload(payload, at);
+        const payload = await this.createAddPayload(element, true, at);
+        return this.applyValidatedPayload(payload, at);
     }
 
     private async createAddPayload(element: T, barrier: boolean, at: Version): Promise<AddElmtPayload> {
@@ -344,7 +346,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
 
         at = at || await dag.getFrontier();
         const payload: DeleteElmtPayload = await this.createDeletePayload(elementHash, false, at);
-        return this.applyPayload(payload, at);
+        return this.applyValidatedPayload(payload, at);
         
     }
 
@@ -358,7 +360,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
 
         at = at || await dag.getFrontier();
         const payload: DeleteElmtPayload = await this.createDeletePayload(elementHash, true, at);
-        return this.applyPayload(payload, at);
+        return this.applyValidatedPayload(payload, at);
     }
 
     private async createDeletePayload(elementHash: Hash, barrier: boolean, at: Version): Promise<DeleteElmtPayload> {
@@ -380,6 +382,18 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
         } else {
             return {action: 'delete', elementHash};
         }        
+    }
+
+    private async applyValidatedPayload(payload: Payload, at: Version): Promise<Hash> {
+        if (!this.selfValidate()) {
+            return this.applyPayload(payload, at);
+        }
+
+        if (!await this.validatePayload(payload, at)) {
+            throw new Error("Attempted to apply an invalid payload");
+        }
+
+        return this.applyPayload(payload, at);
     }
 
     // RObject interface
@@ -442,14 +456,14 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
             const deletePayload = payload as DeleteElmtPayload;
             if (!this.acceptRedundantDelete()) {
                 const view = await this.getView(at, at);
-                const hasElmt = await view.hasByHash(await hashElement(deletePayload['elementHash']));
+                const hasElmt = await view.hasByHash(deletePayload['elementHash']);
                 if (!hasElmt) {
                     return false;
                 }
                 return true;
             }
 
-            if (!this.supportBarrierAdd() && json.hasKey(deletePayload, 'barrier')) {
+            if (!this.supportBarrierDelete() && json.hasKey(deletePayload, 'barrier')) {
                 return false;
             }
 
@@ -471,7 +485,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
             
             if (!this.acceptUpdateForDeleted()) {
                 const view = await this.getView(at, at);
-                const hasElmt = await view.hasByHash(await hashElement(updatePayload['elementHash']));
+                const hasElmt = await view.hasByHash(updatePayload['elementHash']);
                 if (!hasElmt) {
                     return false;
                 }
@@ -481,8 +495,12 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
 
             if (contentType !== undefined) {
                 const innerFactory = await this.resources.registry.lookup(contentType);
-                const innerResources = await this.resources.replica.getResourcesForPreflight();
-                if (!await innerFactory.validateCreationPayload(updatePayload['updatePayload'], innerResources)) {
+                const innerResources = { ...this.resources };
+                const dag = await this.resources.dag.get();
+                const scope = new ElementUpdateScope(this, updatePayload['elementHash'], position(updatePayload['elementHash']));
+                innerResources.dag = {get: async () => new SubDag(dag, scope)};
+                const innerRObject = await innerFactory.loadObject(updatePayload['elementHash'], innerResources);
+                if (!await innerRObject.validatePayload(updatePayload['updatePayload'], at)) {
                     return false;
                 }
             }
@@ -498,7 +516,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
         if (setPayload['action'] === 'update') {
             const innerResources = { ...this.resources };
             const dag = await this.resources.dag.get();
-            const scope = new ElementUpdateScope(setPayload['elementHash'], position(setPayload['elementHash']));
+            const scope = new ElementUpdateScope(this, setPayload['elementHash'], position(setPayload['elementHash']));
             innerResources.dag = {get: async () => new SubDag(dag, scope)};
             const innerFactory = await this.resources.registry.lookup(this.contentType()!);
             const innerRObject = await innerFactory.loadObject(setPayload['elementHash'], innerResources);
@@ -515,7 +533,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
 
                         const elementHash = await dag.computeEntryHash(setPayload, at)
 
-                        const scope = new ElementAddScope(elementHash, at, setPayload);
+                        const scope = new ElementAddScope(this, elementHash, at, setPayload);
                         
                         const innerResources = { ...this.resources };
                         innerResources.dag = {get: async () => new SubDag(dag, scope)};
@@ -582,6 +600,14 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
 
     supportBarrierDelete(): boolean {
         return this.createOp['supportBarrierDelete'] || false;
+    }
+
+    selfValidate(): boolean {
+        return this.resources.selfValidate || false;
+    }
+
+    setSelfValidate(enabled: boolean = true): void {
+        this.resources.selfValidate = enabled;
     }
 
     subscribe(callback: (event: RAddEvent | RDeleteEvent) => void): void {
@@ -696,7 +722,7 @@ export class RSetView<T  extends json.Literal> implements View {
         }
         
         const dag = await this.target.dag();
-        const scope = new ElementUpdateScope(elementHash, position(elementHash));
+        const scope = new ElementUpdateScope(this.target, elementHash, position(elementHash));
         
         const innerResources = { ...this.target.resources };
         innerResources.dag = {get: async () => new SubDag(dag, scope)};
@@ -708,11 +734,13 @@ export class RSetView<T  extends json.Literal> implements View {
 
 class NestedElementScope implements DagScope {
 
+    private parent: RSet;
     private elementHash: Hash;
     private start: Position;
     private executeAddOp?: AddElmtPayload;
 
-    constructor(elementHash: Hash, startAt: Position, executeAddOp?: AddElmtPayload) {
+    constructor(parent: RSet, elementHash: Hash, startAt: Position, executeAddOp?: AddElmtPayload) {
+        this.parent = parent;
         this.start = startAt;
         this.elementHash = elementHash;
         this.executeAddOp = executeAddOp;
@@ -818,19 +846,27 @@ class NestedElementScope implements DagScope {
         
         return wrappedFilter;
     }
+
+    async validateWrappedPayload(wrappedPayload: json.Literal, _wrappedMeta: MetaProps, at: Position): Promise<boolean> {
+        if (!this.parent.selfValidate()) {
+            return true;
+        }
+
+        return this.parent.validatePayload(wrappedPayload, at);
+    }
 }
 
 class ElementAddScope extends NestedElementScope implements DagScope {
 
-    constructor(elementHash: Hash, startAt: Position, executeAddOp: AddElmtPayload) {
-        super(elementHash, startAt, executeAddOp);
+    constructor(parent: RSet, elementHash: Hash, startAt: Position, executeAddOp: AddElmtPayload) {
+        super(parent, elementHash, startAt, executeAddOp);
     }
 }
 
 class ElementUpdateScope extends NestedElementScope implements DagScope {
 
-    constructor(elementHash: Hash, startAt: Position) {
-        super(elementHash, startAt);
+    constructor(parent: RSet, elementHash: Hash, startAt: Position) {
+        super(parent, elementHash, startAt);
     }
 }
 

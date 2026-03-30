@@ -31,6 +31,7 @@ export interface DagScope {
     unwrapMeta(meta: MetaProps, wrappedPayload: Literal, at: Position): MetaProps;
     
     wrapFilter(filter: EntryMetaFilter): EntryMetaFilter;
+    validateWrappedPayload?(wrappedPayload: Literal, wrappedMeta: MetaProps, at: Position): Promise<boolean>;
 }
 
 
@@ -60,11 +61,19 @@ export class SubDag implements Dag {
             }
         }
 
-        this.empty = false;
-
         const wrappedPayload = this.scope.wrapPayload(payload, after);
         const wrappedMeta = this.scope.wrapMeta(meta, wrappedPayload, after);
-        return this.dag.append(wrappedPayload, wrappedMeta, after);
+
+        if (this.scope.validateWrappedPayload !== undefined) {
+            const valid = await this.scope.validateWrappedPayload(wrappedPayload, wrappedMeta, after);
+            if (!valid) {
+                throw new Error("Attempted to append an invalid wrapped payload");
+            }
+        }
+
+        const hash = await this.dag.append(wrappedPayload, wrappedMeta, after);
+        this.empty = false;
+        return hash;
     }
     
 
