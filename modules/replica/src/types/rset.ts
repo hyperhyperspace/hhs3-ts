@@ -1,6 +1,6 @@
 
 
-// A Convergent Concurrency Control (CCR) enabled Replicable Set
+// A Replicable Set that implements Monotonic Views.
 
 // This class implements the RObject interface, and can be used as a top-level object in a Replica, or as
 // a nested element inside other DAG-based RObjects.
@@ -25,112 +25,21 @@
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { Hash, sha } from "@hyper-hyper-space/hhs3_crypto";
-import { MetaProps, position, EntryMetaFilter, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
+import { dag, MetaProps, position, EntryMetaFilter, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
 
-import { Event, MAX_TYPE_LENGTH, Payload, Replica, ResourcesBase, RObject, RObjectFactory, RObjectInit, version, Version, View } from "../replica";
+import { Payload, ResourcesBase, RObject, RObjectFactory, RObjectInit, version, Version, View } from "../replica";
 import { DagResource } from "dag/dag_resource";
 import { DagScope, NestedScopedDag, ScopedDag, CausalDag } from "dag/dag_nesting";
 import { set } from "@hyper-hyper-space/hhs3_util";
 
-export const MAX_SEED_LENGTH = 1024;
-export const MAX_HASH_LENGTH = 128;
-export const MAX_ELEMENTS_TYPE_ID_LENGTH = 256;
-export const MAX_INITIAL_ELEMENTS = 1024;
-export const MAX_HASH_ALGORITHM_LENGTH = 256;
+import { RAddEvent, RDeleteEvent, RSetEvent } from "./rset/events";
 
-// Events are still unimplemented, but here are some stubs for now
+import { createSetFormat, CreateSetPayload } from "./rset/payload";
+import { addElmtFormat, AddElmtPayload } from "./rset/payload";
+import { deleteElmtFormat, DeleteElmtPayload } from "./rset/payload";
+import { updateElmtFormat, UpdateElmtPayload } from "./rset/payload";
 
-export type RAddEvent = Event & {
-    type(): "add";
-    element(): json.Literal;
-}
-
-export type RDeleteEvent = Event &{
-    type(): "delete";
-    element(): json.Literal;
-}
-
-export type RSetEvent = RAddEvent | RDeleteEvent;
-
-// Actual payload for RSet operations, and their format validators.
-
-type SetPayload = CreateSetPayload | AddElmtPayload | DeleteElmtPayload | UpdateElmtPayload;
-
-// Create a set:
-
-// Note: Sets of RObjects (when contentType !== undefined) cannot have initial elements.
-//       In that case, initialElements MUST be an empty array.
-
-type CreateSetPayload = {
-    action: 'create';
-    seed: string;
-    contentType?: string;
-    initialElements: Array<json.Literal>;
-    acceptRedundantAdd?: boolean;
-    acceptRedundantDelete: boolean;
-    acceptUpdateForDeleted?: boolean;
-    supportBarrierAdd?: boolean;
-    supportBarrierDelete?: boolean;
-    hashAlgorithm?: string;
-}
- 
-const createSetFormat: json.Format = {
-    action: [json.Type.Constant, 'create'],
-    seed: [json.Type.BoundedString, MAX_SEED_LENGTH],
-    contentType: [json.Type.Option, [json.Type.BoundedString, MAX_TYPE_LENGTH]],
-    initialElements: [json.Type.BoundedArray, json.Type.String, MAX_INITIAL_ELEMENTS],
-    acceptRedundantAdd: [json.Type.Option, json.Type.Boolean],
-    acceptRedundantDelete: json.Type.Boolean,
-    acceptUpdateForDeleted: [json.Type.Option, json.Type.Boolean],
-    supportBarrierAdd: [json.Type.Option, json.Type.Boolean],
-    supportBarrierDelete: [json.Type.Option, json.Type.Boolean],
-    hashAlgorithm: [json.Type.Option, [json.Type.BoundedString, MAX_HASH_ALGORITHM_LENGTH]],
-};
-
-// Add an element:
-
-type AddElmtPayload = {
-    action: 'add';
-    element: json.Literal;
-    barrier?: boolean;
-    type?: string;
-};
-
-const addElmtFormat: json.Format = {
-    action: [json.Type.Constant, 'add'],
-    element: json.Type.Something,
-    barrier: [json.Type.Option, json.Type.Boolean],
-};
-
-// Delete an element:
-
-type DeleteElmtPayload = {
-    action: 'delete';
-    elementHash: Hash;
-    barrier?: boolean;
-};
-
-const deleteElmtFormat: json.Format = {
-    action: [json.Type.Constant, 'delete'],
-    elementHash: [json.Type.BoundedString, MAX_HASH_LENGTH],
-    barrier: [json.Type.Option, json.Type.Boolean],
-};
-
-// Update an element (*):
-
-// (*) Used by the DAG wrapper automatically when the contained element is updated
-
-type UpdateElmtPayload = {
-    action: 'update';
-    elementHash: Hash;
-    updatePayload: json.Literal;
-}
-
-const updateElmtFormat: json.Format = {
-    action: [json.Type.Constant, 'update'],
-    elementHash: [json.Type.BoundedString, MAX_HASH_LENGTH],
-    updatePayload: json.Type.Something,
-};
+import { SetPayload } from "./rset/payload";
 
 // Resources required by RSet:
 //   - DAG storage.
@@ -142,13 +51,13 @@ export type RSetResources = ResourcesBase & DagResource;
 
 export const rSetFactory: RObjectFactory<RSetResources> = {
 
-    computeObjectId: async (payload: json.Literal, resources: RSetResources) => {
+    computeRootObjectId: async (payload: json.Literal) => {
 
-        const dag = await resources.scopedDag.get();
-        return dag.computeEntryHash(payload, position());
+        const entry = await dag.createEntry(payload, {}, position());
+        return entry.hash;
     },
 
-    validateCreationPayload: async (payload: json.Literal, resources: RSetResources) => {
+    validateCreationPayload: async (payload: json.Literal, resources: ResourcesBase) => {
         
         if (!json.checkFormat(createSetFormat, payload)) {
             console.log('fmt')

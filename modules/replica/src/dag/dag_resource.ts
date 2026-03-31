@@ -17,5 +17,4 @@ export type DagResource = {
 
 export type DagResourceProvider<R extends ResourcesBase = ResourcesBase> = {
     addForObject: (id: Hash, resources: R) => Promise<R & DagResource>;
-    addForObjectPreflight: (resources: R) => Promise<R & DagResource>;
 };

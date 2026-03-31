@@ -22,17 +22,6 @@ class MemDagResourceProvider<R extends ResourcesBase = ResourcesBase> implements
         return this.stores.get(objectId)!;
     }
 
-    async addForObjectPreflight(resources: R): Promise<R & DagResource> {
-        const store = new dag.store.MemDagStorage();
-        const index = dag.idx.level.createDagLevelIndex(store, new dag.idx.level.mem.MemLevelIndexStore);
-        const d = dag.create(store, index);
-        return {
-            ...resources,
-            scopedDag: { get: async () => new RootScopedDag(d) },
-            causalDag: { get: async () => d },
-        };
-    }
-
 }
 
 export const createMemDagResourceProvider = () => {

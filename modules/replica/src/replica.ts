@@ -39,9 +39,9 @@ export type RObjectInit = {
 }
 
 export type RObjectFactory<R extends ResourcesBase = ResourcesBase> = {
-    computeObjectId: (createPayload: Payload, resources: R) => Promise<Hash>;
+    computeRootObjectId: (createPayload: Payload) => Promise<Hash>;
     
-    validateCreationPayload: (createPayload: Payload, resources: R) => Promise<boolean>;
+    validateCreationPayload: (createPayload: Payload, resources: ResourcesBase) => Promise<boolean>;
     executeCreationPayload: (createPayload: Payload, resources: R) => Promise<Hash>;
     
     loadObject: (id: Hash, resources: R) => Promise<RObject>;
@@ -89,12 +89,7 @@ export type ResourcesBase = {
 export type Resource = {[key: string]: any};
 
 export type ResourcesProvider<R extends ResourcesBase, T extends Resource> = {
-    
-    // resources needed for object normal lifetime
     addForObject: (id: Hash, resources: R) => Promise<R&T>;
-    
-    // any resources are needed before object creation (e.g. for computing its hash id, validation, etc.)
-    addForObjectPreflight: (resources: R) => Promise<R&T>;
 };
 
 export type ReplicaConfig = {
@@ -122,17 +117,14 @@ export class Replica<R extends ResourcesBase = ResourcesBase> {
 
         const factory = await this.registry.lookup(init.type);
 
-        
-        const preflightResources = await this.resourceProvider.addForObjectPreflight({ replica: this, registry: this.registry });
-        
-        const id = await factory.computeObjectId(init.payload, preflightResources);
-        const valid = await factory.validateCreationPayload(init.payload, preflightResources);
+        const id = await factory.computeRootObjectId(init.payload);
+        const valid = await factory.validateCreationPayload(init.payload, { replica: this, registry: this.registry });
 
         if (valid) {
             const resources = await this.resourceProvider.addForObject(id, { replica: this, registry: this.registry });
             await factory.executeCreationPayload(init.payload, resources);
             this.objects.set(id, await factory.loadObject(id, resources));
-            return id
+            return id;
         } else {
             throw new Error('Invalid creation payload');
         }
@@ -140,10 +132,6 @@ export class Replica<R extends ResourcesBase = ResourcesBase> {
 
     async getResourcesForObject(id: Hash): Promise<R> {
         return this.resourceProvider.addForObject(id, { replica: this, registry: this.registry });
-    }
-
-    async getResourcesForPreflight(): Promise<R> {
-        return this.resourceProvider.addForObjectPreflight({ replica: this, registry: this.registry });
     }
 
     
