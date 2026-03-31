@@ -38,13 +38,18 @@ export type RObjectInit = {
     payload: Payload;
 }
 
-export type RObjectFactory<R extends ResourcesBase = ResourcesBase> = {
-    computeRootObjectId: (createPayload: Payload) => Promise<Hash>;
+export type BasicProvider = {
+    getReplica(): Replica<any>;
+    getRegistry(): RObjectTypeRegistry<any>;
+};
+
+export type RObjectFactory<P extends BasicProvider = BasicProvider> = {
+    computeRootObjectId: (createPayload: Payload, provider: BasicProvider) => Promise<Hash>;
     
-    validateCreationPayload: (createPayload: Payload, resources: ResourcesBase) => Promise<boolean>;
-    executeCreationPayload: (createPayload: Payload, resources: R) => Promise<Hash>;
+    validateCreationPayload: (createPayload: Payload, provider: BasicProvider) => Promise<boolean>;
+    executeCreationPayload: (createPayload: Payload, provider: P) => Promise<Hash>;
     
-    loadObject: (id: Hash, resources: R) => Promise<RObject>;
+    loadObject: (id: Hash, provider: P) => Promise<RObject>;
 }
 
 // A static view of a replicable object's state at a given version
@@ -65,49 +70,40 @@ export type Event = {
 // However, only the payload is actually replicated.
 
 
-export type RObjectRegistry<R extends ResourcesBase = ResourcesBase> = {
-    lookup(typeName: string): Promise<RObjectFactory<R>>;
+export type RObjectTypeRegistry<P extends BasicProvider = BasicProvider> = {
+    lookup(typeName: string): Promise<RObjectFactory<P>>;
 }
 
-export class TypeRegistryMap<R extends ResourcesBase = ResourcesBase> implements RObjectRegistry<R> {
-    private types: Map<string, RObjectFactory<R>> = new Map();
+export class TypeRegistryMap<P extends BasicProvider = BasicProvider> implements RObjectTypeRegistry<P> {
+    private types: Map<string, RObjectFactory<P>> = new Map();
 
-    async register(typeName: string, type: RObjectFactory<R>) {
+    async register(typeName: string, type: RObjectFactory<P>) {
         this.types.set(typeName, type);
     }
     
-    async lookup(typeName: string): Promise<RObjectFactory<R>> {
+    async lookup(typeName: string): Promise<RObjectFactory<P>> {
         return this.types.get(typeName)!;
     }
 }
-
-export type ResourcesBase = {
-    replica: Replica<any>;
-    registry: RObjectRegistry<any>;
-};
-
-export type Resource = {[key: string]: any};
-
-export type ResourcesProvider<R extends ResourcesBase, T extends Resource> = {
-    addForObject: (id: Hash, resources: R) => Promise<R&T>;
-};
 
 export type ReplicaConfig = {
     selfValidate?: boolean;
 };
 
-export class Replica<R extends ResourcesBase = ResourcesBase> {
+export class Replica<P extends BasicProvider = BasicProvider> {
 
-    private registry: RObjectRegistry<R>;
+    private registry: RObjectTypeRegistry<P>;
     private objects: Map<Hash, RObject> = new Map();
-    private resourceProvider: ResourcesProvider<ResourcesBase, R>;
+    private createProvider: (id: Hash, replica: Replica<P>) => P;
     config: ReplicaConfig;
 
-    constructor(registry: RObjectRegistry<R>, resourceProvider: ResourcesProvider<ResourcesBase, R>, config: ReplicaConfig = {}) {
+    constructor(registry: RObjectTypeRegistry<P>, createProvider: (id: Hash, replica: Replica<P>) => P, config: ReplicaConfig = {}) {
         this.registry = registry;
-        this.resourceProvider = resourceProvider;
+        this.createProvider = createProvider;
         this.config = config;
     }
+
+    getRegistry(): RObjectTypeRegistry<P> { return this.registry; }
 
     async getObject(id: Hash): Promise<RObject> {
         return this.objects.get(id)!;
@@ -117,22 +113,17 @@ export class Replica<R extends ResourcesBase = ResourcesBase> {
 
         const factory = await this.registry.lookup(init.type);
 
-        const id = await factory.computeRootObjectId(init.payload);
-        const valid = await factory.validateCreationPayload(init.payload, { replica: this, registry: this.registry });
+        const basicProvider: BasicProvider = { getReplica: () => this, getRegistry: () => this.registry };
+        const id = await factory.computeRootObjectId(init.payload, basicProvider);
+        const provider = this.createProvider(id, this);
+        const valid = await factory.validateCreationPayload(init.payload, provider);
 
         if (valid) {
-            const resources = await this.resourceProvider.addForObject(id, { replica: this, registry: this.registry });
-            await factory.executeCreationPayload(init.payload, resources);
-            this.objects.set(id, await factory.loadObject(id, resources));
+            await factory.executeCreationPayload(init.payload, provider);
+            this.objects.set(id, await factory.loadObject(id, provider));
             return id;
         } else {
             throw new Error('Invalid creation payload');
         }
     }
-
-    async getResourcesForObject(id: Hash): Promise<R> {
-        return this.resourceProvider.addForObject(id, { replica: this, registry: this.registry });
-    }
-
-    
 }

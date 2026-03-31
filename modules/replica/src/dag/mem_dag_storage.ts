@@ -1,29 +1,30 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { dag } from "@hyper-hyper-space/hhs3_dag";
+import { dag, Dag } from "@hyper-hyper-space/hhs3_dag";
 
-import { DagResource, DagResourceProvider } from "./dag_resource";
-import { RootScopedDag } from "./dag_nesting";
-import { ResourcesBase } from "replica";
+import { RootScopedDag, ScopedDag, CausalDag } from "./dag_nesting";
 
-class MemDagResourceProvider<R extends ResourcesBase = ResourcesBase> implements DagResourceProvider<R> {
-    private stores: Map<Hash, R & DagResource> = new Map();
+export type MemDagBackend = {
+    getScopedDag(id: Hash, tag?: string): Promise<ScopedDag>;
+    getCausalDag(id: Hash, tag?: string): Promise<CausalDag>;
+};
 
-    async addForObject(objectId: Hash, resources: R): Promise<R & DagResource> {
-        if (!this.stores.has(objectId)) {
+export function createMemDagBackend(): MemDagBackend {
+    const dags = new Map<string, Dag>();
+
+    // Returns existing DAG for the key, or creates a new one
+    const createDag = (key: string): Dag => {
+        if (!dags.has(key)) {
             const store = new dag.store.MemDagStorage();
-            const index = dag.idx.flat.createFlatIndex(store, new dag.idx.flat.mem.MemFlatIndexStore);
-            const d = dag.create(store, index);
-            this.stores.set(objectId, {
-                ...resources,
-                scopedDag: { get: async () => new RootScopedDag(d) },
-                causalDag: { get: async () => d },
-            });
+            const index = dag.idx.flat.createFlatIndex(store, new dag.idx.flat.mem.MemFlatIndexStore());
+            dags.set(key, dag.create(store, index));
         }
-        return this.stores.get(objectId)!;
-    }
+        return dags.get(key)!;
+    };
 
-}
+    const dagForObject = (id: string, tag?: string) => createDag(tag ? `${id}:${tag}` : id);
 
-export const createMemDagResourceProvider = () => {
-    return new MemDagResourceProvider();
+    return {
+        getScopedDag: async (id, tag?) => new RootScopedDag(dagForObject(id, tag)),
+        getCausalDag: async (id, tag?) => dagForObject(id, tag),
+    };
 }

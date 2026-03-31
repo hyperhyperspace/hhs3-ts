@@ -1,25 +1,32 @@
-import { DagResource, DagResourceProvider } from "../src/dag/dag_resource";
-import { Replica, ResourcesBase, TypeRegistryMap, version } from "../src/replica";
-import { RSet, rSetFactory, RSetResources } from "../src/types/rset";
+import { Replica, TypeRegistryMap, version } from "../src/replica";
+import { RSet, rSetFactory, RSetProvider } from "../src/types/rset";
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test";
-import { createMemDagResourceProvider } from "dag/mem_dag_storage";
+import { createMemDagBackend } from "dag/mem_dag_storage";
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { sha } from "@hyper-hyper-space/hhs3_crypto";
+import { sha, Hash } from "@hyper-hyper-space/hhs3_crypto";
 
-const createReplica = (resourceProvider?: DagResourceProvider): Replica<RSetResources> => {
-    const registry = new TypeRegistryMap<ResourcesBase & DagResource>();
+const createReplica = (): Replica<RSetProvider> => {
+    const registry = new TypeRegistryMap<RSetProvider>();
 
     registry.register(
         RSet.typeId,
         rSetFactory
     );
 
-    return new Replica(registry, resourceProvider || createMemDagResourceProvider(), { selfValidate: true });
+    const dagBackend = createMemDagBackend();
+
+    const createProvider = (id: Hash, replica: Replica<RSetProvider>): RSetProvider => ({
+        getReplica: () => replica,
+        getRegistry: () => replica.getRegistry(),
+        getScopedDag: (tag?: string) => dagBackend.getScopedDag(id, tag),
+        getCausalDag: (tag?: string) => dagBackend.getCausalDag(id, tag),
+    });
+
+    return new Replica(registry, createProvider, { selfValidate: true });
 };
 
 const createTestEnvironment = async (initialElements: Array<json.Literal> = []) => {
-    const storageProvider = createMemDagResourceProvider();
-    const replica = createReplica(storageProvider);
+    const replica = createReplica();
 
     const init = await RSet.create(
         {
