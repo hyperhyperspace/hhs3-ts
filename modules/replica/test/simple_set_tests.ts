@@ -14,7 +14,7 @@ const createReplica = (resourceProvider?: DagResourceProvider): Replica<RSetReso
         rSetFactory
     );
 
-    return new Replica(registry, resourceProvider || createMemDagResourceProvider());
+    return new Replica(registry, resourceProvider || createMemDagResourceProvider(), { selfValidate: true });
 };
 
 const createTestEnvironment = async (initialElements: Array<json.Literal> = []) => {
@@ -33,7 +33,6 @@ const createTestEnvironment = async (initialElements: Array<json.Literal> = []) 
 
     const setId = await replica.addObject(init)
     const set = (await replica.getObject(setId)) as RSet;
-    set.setSelfValidate(true);
 
     return { replica, set, setId };
 };

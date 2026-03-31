@@ -10,9 +10,9 @@ export const emptyVersion: () => Version = dag.emptyPosition;
 export const version: (...hashes: Hash[]) => Version = dag.position;
 export type Payload = json.Literal;
 
-// A replicable object, used both to write and interpret changes to a DAG-based history log.
+// RObject (Replicable Object): used both to write and interpret changes to a DAG-based history log.
 
-// An r-object may contain other r-objects within it, that will share its DAG store
+// An RObject may contain other RObjects within it, that will share its DAG store
 // and use its DAG for their change history. The applyPayload function will handle applying
 // changes to any sub-objects that are being modified, and the createView function will
 // use views from sub-objects when necessary.
@@ -97,15 +97,21 @@ export type ResourcesProvider<R extends ResourcesBase, T extends Resource> = {
     addForObjectPreflight: (resources: R) => Promise<R&T>;
 };
 
+export type ReplicaConfig = {
+    selfValidate?: boolean;
+};
+
 export class Replica<R extends ResourcesBase = ResourcesBase> {
 
     private registry: RObjectRegistry<R>;
     private objects: Map<Hash, RObject> = new Map();
     private resourceProvider: ResourcesProvider<ResourcesBase, R>;
+    config: ReplicaConfig;
 
-    constructor(registry: RObjectRegistry<R>, resourceProvider: ResourcesProvider<ResourcesBase, R>) {
+    constructor(registry: RObjectRegistry<R>, resourceProvider: ResourcesProvider<ResourcesBase, R>, config: ReplicaConfig = {}) {
         this.registry = registry;
         this.resourceProvider = resourceProvider;
+        this.config = config;
     }
 
     async getObject(id: Hash): Promise<RObject> {

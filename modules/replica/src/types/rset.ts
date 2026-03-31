@@ -136,9 +136,7 @@ const updateElmtFormat: json.Format = {
 //   - DAG storage.
 //   - (in the future, we may add dyamic crypto resources here)
 
-export type RSetResources = ResourcesBase & DagResource & {
-    selfValidate?: boolean;
-};
+export type RSetResources = ResourcesBase & DagResource;
 
 // RSet factory: initial creation and validation of set creation ops.
 
@@ -606,11 +604,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
     }
 
     selfValidate(): boolean {
-        return this.resources.selfValidate || false;
-    }
-
-    setSelfValidate(enabled: boolean = true): void {
-        this.resources.selfValidate = enabled;
+        return this.resources.replica.config.selfValidate || false;
     }
 
     subscribe(callback: (event: RAddEvent | RDeleteEvent) => void): void {

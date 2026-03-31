@@ -14,7 +14,7 @@ const createReplica = (resourceProvider?: DagResourceProvider): Replica<RSetReso
         rSetFactory
     );
 
-    return new Replica(registry, resourceProvider || createMemDagResourceProvider());
+    return new Replica(registry, resourceProvider || createMemDagResourceProvider(), { selfValidate: true });
 };
 
 export const nestedSetTests = {
@@ -38,7 +38,7 @@ export const nestedSetTests = {
 
                 const outerSetId = await replica.addObject(outerSetInit);
                 const outerSet = (await replica.getObject(outerSetId)) as RSet;
-                outerSet.setSelfValidate(true);
+
 
                 // Add a nested set to the outer set
                 const nestedSetPayload = await RSet.create({
@@ -95,7 +95,7 @@ export const nestedSetTests = {
 
                 const outerSetId = await replica.addObject(outerSetInit);
                 const outerSet = (await replica.getObject(outerSetId)) as RSet;
-                outerSet.setSelfValidate(true);
+
 
                 // Helper to create and add a nested set, returning its hash and instance
                 const addNestedSet = async (seed: string) => {
@@ -169,7 +169,7 @@ export const nestedSetTests = {
 
                 const outerSetId = await replica.addObject(outerSetInit);
                 const outerSet = (await replica.getObject(outerSetId)) as RSet;
-                outerSet.setSelfValidate(true);
+
 
                 // Helper to create and add a nested set, returning its hash and instance
                 const addNestedSet = async (seed: string) => {
@@ -323,7 +323,7 @@ export const nestedSetTests = {
 
                 const outerSetId = await replica.addObject(outerSetInit);
                 const outerSet = (await replica.getObject(outerSetId)) as RSet;
-                outerSet.setSelfValidate(true);
+
 
                 const makeNestedInit = async (seed: string) => {
                     return RSet.create({
@@ -400,7 +400,7 @@ export const nestedSetTests = {
 
                 const outerSetId = await replica.addObject(outerSetInit);
                 const outerSet = (await replica.getObject(outerSetId)) as RSet;
-                outerSet.setSelfValidate(true);
+
 
                 // Helper to create an empty nested set with barrier support, add it to the outer set,
                 // and load it back as an RSet instance.
@@ -548,7 +548,7 @@ export const nestedSetTests = {
 
                 const outerSetId = await replica.addObject(outerSetInit);
                 const outerSet = (await replica.getObject(outerSetId)) as RSet;
-                outerSet.setSelfValidate(true);
+
 
                 // Create a nested RSet payload with initialElements.
                 const nestedInit = await RSet.create({
@@ -593,7 +593,7 @@ export const nestedSetTests = {
 
                 const outerSetId = await replica.addObject(outerSetInit);
                 const outerSet = (await replica.getObject(outerSetId)) as RSet;
-                outerSet.setSelfValidate(true);
+
 
                 // Nested RSet with initial elements.
                 const nestedInit = await RSet.create({
@@ -658,7 +658,7 @@ export const nestedSetTests = {
 
                 const outerId = await replica.addObject(outerInit);
                 const outerSet = (await replica.getObject(outerId)) as RSet;
-                outerSet.setSelfValidate(true);
+
 
                 // Mid-level nested set that will itself hold another nested set plus its own literals.
                 const midInit = await RSet.create({
