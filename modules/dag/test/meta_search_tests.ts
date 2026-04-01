@@ -4,7 +4,7 @@ import { position } from "../src/index";
 import { assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test";
 
 import { createRandomDag, createD3 } from "./utils/dag_create";
-import { Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { Hash, sha } from "@hyper-hyper-space/hhs3_crypto";
 import { set } from "@hyper-hyper-space/hhs3_util";
 import { label } from "./utils/dag_diagram";
 
@@ -76,7 +76,7 @@ const topoFlatDagPairConstr: [() => dag.Dag, () => dag.Dag] = [
             store,
             new dag.idx.topo.mem.MemTopoIndexStore()
         );
-        return dag.create(store, index);
+        return dag.create(store, index, sha.sha256);
     },
     () => {
         const store = new dag.store.MemDagStorage();
@@ -84,7 +84,7 @@ const topoFlatDagPairConstr: [() => dag.Dag, () => dag.Dag] = [
             store,
             new dag.idx.flat.mem.MemFlatIndexStore()
         );
-        return dag.create(store, index);
+        return dag.create(store, index, sha.sha256);
     }
 ];
 
@@ -99,7 +99,7 @@ const metaSearchSuite = {
                     store,
                     new dag.idx.flat.mem.MemFlatIndexStore()
                 );
-                const d3 = dag.create(store, flatIndex);
+                const d3 = dag.create(store, flatIndex, sha.sha256);
                 const h = await createD3(d3);
 
                 const cp1 = await d3.findCoverWithFilter(
@@ -151,7 +151,7 @@ const metaSearchSuite = {
                     store,
                     new dag.idx.flat.mem.MemFlatIndexStore()
                 );
-                const d3 = dag.create(store, flatIndex);
+                const d3 = dag.create(store, flatIndex, sha.sha256);
                 const h = await createD3(d3);
 
                 const cc1 = await d3.findConcurrentCoverWithFilter(

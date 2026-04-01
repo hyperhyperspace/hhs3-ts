@@ -1,4 +1,4 @@
-import { Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { Hash, BasicCrypto } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, MetaProps } from "@hyper-hyper-space/hhs3_dag";
 
 import { json } from "@hyper-hyper-space/hhs3_json";
@@ -41,12 +41,13 @@ export type RObjectInit = {
 export type BasicProvider = {
     getReplica(): Replica<any>;
     getRegistry(): RObjectTypeRegistry<any>;
+    getCrypto(): BasicCrypto;
 };
 
 export type RObjectFactory<P extends BasicProvider = BasicProvider> = {
-    computeRootObjectId: (createPayload: Payload, provider: BasicProvider) => Promise<Hash>;
+    computeRootObjectId: (createPayload: Payload, provider: P) => Promise<Hash>;
     
-    validateCreationPayload: (createPayload: Payload, provider: BasicProvider) => Promise<boolean>;
+    validateCreationPayload: (createPayload: Payload, provider: P) => Promise<boolean>;
     executeCreationPayload: (createPayload: Payload, provider: P) => Promise<Hash>;
     
     loadObject: (id: Hash, provider: P) => Promise<RObject>;
@@ -94,10 +95,16 @@ export class Replica<P extends BasicProvider = BasicProvider> {
 
     private registry: RObjectTypeRegistry<P>;
     private objects: Map<Hash, RObject> = new Map();
-    private createProvider: (id: Hash, replica: Replica<P>) => P;
     config: ReplicaConfig;
 
-    constructor(registry: RObjectTypeRegistry<P>, createProvider: (id: Hash, replica: Replica<P>) => P, config: ReplicaConfig = {}) {
+    // If id is missing, the object creation payload has not yet been validated.
+    // In that case yhe provider will refuse to return any resources that consume 
+    // significant resources, throwing an exception isntead. This mode is intended
+    // for use in validation only.
+    private createProvider: (replica: Replica<P>, id?: Hash) => P;
+    
+
+    constructor(registry: RObjectTypeRegistry<P>, createProvider: (replica: Replica<P>, id?: Hash) => P, config: ReplicaConfig = {}) {
         this.registry = registry;
         this.createProvider = createProvider;
         this.config = config;
@@ -113,9 +120,8 @@ export class Replica<P extends BasicProvider = BasicProvider> {
 
         const factory = await this.registry.lookup(init.type);
 
-        const basicProvider: BasicProvider = { getReplica: () => this, getRegistry: () => this.registry };
-        const id = await factory.computeRootObjectId(init.payload, basicProvider);
-        const provider = this.createProvider(id, this);
+        const id = await factory.computeRootObjectId(init.payload, this.createProvider(this));
+        const provider = this.createProvider(this, id);
         const valid = await factory.validateCreationPayload(init.payload, provider);
 
         if (valid) {

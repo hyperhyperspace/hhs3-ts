@@ -1,9 +1,10 @@
-import { Hash, sha } from "@hyper-hyper-space/hhs3_crypto";
+import { Hash, HashFn } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { Entry, EntryMetaFilter, ForkPosition, Header, MetaProps, Position } from "./dag_defs";
 import { DagIndex } from "./idx/dag_idx";
 import { DagStore } from "./store/dag_store";
 
+export { HashFn } from "@hyper-hyper-space/hhs3_crypto";
 export * from "./dag_defs";
 export * as store from "./store";
 export * as idx from "./idx";
@@ -39,16 +40,16 @@ export type Dag = {
     getIndex(): DagIndex;
 };
 
-export async function createHeader(payload: json.Literal, after?: Position): Promise<Header> {
-    const payloadHash: Hash = await sha.sha256(json.toStringNormalized(payload));
+export async function createHeader(payload: json.Literal, after: Position | undefined, hashFn: HashFn): Promise<Header> {
+    const payloadHash: Hash = await hashFn(json.toStringNormalized(payload));
     const prevEntryHashes = json.toSet(after ?? new Set<Hash>());
     const header: Header = { payloadHash, prevEntryHashes};
     return header;
 }
 
-export async function createEntry(payload: json.Literal, meta: MetaProps, after?: Position): Promise<Entry> {
-    const header = await createHeader(payload, after);
-    const hash: Hash = await sha.sha256(json.toStringNormalized(header));
+export async function createEntry(payload: json.Literal, meta: MetaProps, after: Position | undefined, hashFn: HashFn): Promise<Entry> {
+    const header = await createHeader(payload, after, hashFn);
+    const hash: Hash = await hashFn(json.toStringNormalized(header));
     const entry: Entry = { hash, header, payload, meta };
 
     return entry;
@@ -61,12 +62,13 @@ export function position(...hashes: Hash[]): Position {
 export function create(
                     store: DagStore,
                     index: DagIndex,
+                    hashFn: HashFn,
                 ): Dag {
 
     return {
         append: async (payload, meta, after) => {
         
-            const e = await createEntry(payload, meta, after);
+            const e = await createEntry(payload, meta, after, hashFn);
 
             for (const prev of after||[]) {
                 if (await store.loadHeader(prev) === undefined) {
@@ -80,7 +82,7 @@ export function create(
         },
 
         computeEntryHash: async (payload, after) => {
-            const e = await createEntry(payload, {}, after);
+            const e = await createEntry(payload, {}, after, hashFn);
             return e.hash;
         },
 

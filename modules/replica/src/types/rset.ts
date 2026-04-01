@@ -24,7 +24,7 @@
 // aware of this caveats.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { Hash, sha } from "@hyper-hyper-space/hhs3_crypto";
+import { Hash, sha, BasicCrypto } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, MetaProps, position, EntryMetaFilter, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
 
 import { Payload, BasicProvider, RObject, RObjectFactory, RObjectTypeRegistry, RObjectInit, Replica, version, Version, View } from "../replica";
@@ -46,6 +46,7 @@ export type RSetProvider = BasicProvider & DagCapability;
 type RSetResources = {
     replica: Replica<any>;
     registry: RObjectTypeRegistry<any>;
+    getCrypto: () => BasicCrypto;
     getScopedDag: (tag?: string) => Promise<ScopedDag>;
     getCausalDag: (tag?: string) => Promise<CausalDag>;
 };
@@ -54,13 +55,13 @@ type RSetResources = {
 
 export const rSetFactory: RObjectFactory<RSetProvider> = {
 
-    computeRootObjectId: async (payload: json.Literal, provider: BasicProvider) => {
+    computeRootObjectId: async (payload: json.Literal, provider: RSetProvider) => {
 
-        const entry = await dag.createEntry(payload, {}, position());
+        const entry = await dag.createEntry(payload, {}, position(), provider.getCrypto().hash.sha256);
         return entry.hash;
     },
 
-    validateCreationPayload: async (payload: json.Literal, provider: BasicProvider) => {
+    validateCreationPayload: async (payload: json.Literal, provider: RSetProvider) => {
         
         if (!json.checkFormat(createSetFormat, payload)) {
             console.log('fmt')
@@ -188,6 +189,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
         this.resources = {
             replica: provider.getReplica(),
             registry: provider.getRegistry(),
+            getCrypto: () => provider.getCrypto(),
             getScopedDag: (tag?) => provider.getScopedDag(tag),
             getCausalDag: (tag?) => provider.getCausalDag(tag),
         };
@@ -495,7 +497,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
     }
     
     acceptRedundantAdd(): boolean {
-        return this.createOp['acceptRedundantAdd'] || true;
+        return this.createOp['acceptRedundantAdd'] ?? true;
     }
 
     acceptRedundantDelete(): boolean {
@@ -538,6 +540,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
         return {
             getReplica: () => this.resources.replica,
             getRegistry: () => this.resources.registry,
+            getCrypto: () => this.resources.getCrypto(),
             getScopedDag: async (tag?) => new NestedScopedDag(await this.resources.getScopedDag(tag), scope),
             getCausalDag: (tag?) => this.resources.getCausalDag(tag),
         };
@@ -616,7 +619,7 @@ export class RSetView<T  extends json.Literal> implements View {
             const payload = (await dag.loadEntry(hash))!.payload as unknown as SetPayload;
 
             if (payload['action'] === 'add' || payload['action'] === 'create') { // create is included to handle the initial elements
-                if (!this.target.supportBarrierDelete) {
+                if (!this.target.supportBarrierDelete()) {
                     return true;
                 } else {
                     adds.add(hash);

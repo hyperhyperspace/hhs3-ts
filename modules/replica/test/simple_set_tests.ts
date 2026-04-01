@@ -3,7 +3,9 @@ import { RSet, rSetFactory, RSetProvider } from "../src/types/rset";
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test";
 import { createMemDagBackend } from "dag/mem_dag_storage";
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { sha, Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { sha, Hash, createBasicCrypto } from "@hyper-hyper-space/hhs3_crypto";
+
+const crypto = createBasicCrypto();
 
 const createReplica = (): Replica<RSetProvider> => {
     const registry = new TypeRegistryMap<RSetProvider>();
@@ -13,13 +15,20 @@ const createReplica = (): Replica<RSetProvider> => {
         rSetFactory
     );
 
-    const dagBackend = createMemDagBackend();
+    const dagBackend = createMemDagBackend(crypto.hash.sha256);
 
-    const createProvider = (id: Hash, replica: Replica<RSetProvider>): RSetProvider => ({
+    const createProvider = (replica: Replica<RSetProvider>, id?: Hash): RSetProvider => ({
         getReplica: () => replica,
         getRegistry: () => replica.getRegistry(),
-        getScopedDag: (tag?: string) => dagBackend.getScopedDag(id, tag),
-        getCausalDag: (tag?: string) => dagBackend.getCausalDag(id, tag),
+        getCrypto: () => crypto,
+        getScopedDag: (tag?: string) => {
+            if (id === undefined) throw new Error("Object ID not yet assigned");
+            return dagBackend.getScopedDag(id, tag);
+        },
+        getCausalDag: (tag?: string) => {
+            if (id === undefined) throw new Error("Object ID not yet assigned");
+            return dagBackend.getCausalDag(id, tag);
+        },
     });
 
     return new Replica(registry, createProvider, { selfValidate: true });
@@ -45,7 +54,7 @@ const createTestEnvironment = async (initialElements: Array<json.Literal> = []) 
 };
 
 export const simpleSetTests = {
-    title: '[SET00] Small set tests with flat DAG indexing',
+    title: '[SET] Small set tests with flat DAG indexing',
     tests: [
         {
             name: '[SET00] Test sequential additions and deletions',
@@ -185,6 +194,181 @@ export const simpleSetTests = {
 
                 const latestView = await set.getView();
                 assertFalse(await latestView.has('shared'), 'latest view should reflect barrier delete over initial element');
+            }
+        },
+        {
+            name: '[SET05] Test delete then re-add of the same element',
+            invoke: async () => {
+                const { set } = await createTestEnvironment();
+
+                await set.add('alpha');
+                await set.add('beta');
+
+                const viewBefore = await set.getView();
+                assertTrue(await viewBefore.has('alpha'), 'alpha should be present after initial add');
+                assertTrue(await viewBefore.has('beta'), 'beta should be present after initial add');
+
+                await set.delete('alpha');
+
+                const viewAfterDelete = await set.getView();
+                assertFalse(await viewAfterDelete.has('alpha'), 'alpha should be gone after delete');
+                assertTrue(await viewAfterDelete.has('beta'), 'beta should survive unrelated delete');
+
+                await set.add('alpha');
+
+                const viewAfterReAdd = await set.getView();
+                assertTrue(await viewAfterReAdd.has('alpha'), 'alpha should reappear after re-add');
+                assertTrue(await viewAfterReAdd.has('beta'), 'beta should still be present');
+
+                await set.delete('alpha');
+                await set.add('alpha');
+
+                const viewAfterSecondCycle = await set.getView();
+                assertTrue(await viewAfterSecondCycle.has('alpha'), 'alpha should survive a second delete/re-add cycle');
+            }
+        },
+        {
+            name: '[SET06] Test delete then re-add of an initial element',
+            invoke: async () => {
+                const { set } = await createTestEnvironment(['alpha', 'beta']);
+
+                const viewInitial = await set.getView();
+                assertTrue(await viewInitial.has('alpha'), 'alpha should be present from initial elements');
+
+                await set.delete('alpha');
+
+                const viewAfterDelete = await set.getView();
+                assertFalse(await viewAfterDelete.has('alpha'), 'alpha should be gone after delete');
+                assertTrue(await viewAfterDelete.has('beta'), 'beta should survive unrelated delete');
+
+                await set.add('alpha');
+
+                const viewAfterReAdd = await set.getView();
+                assertTrue(await viewAfterReAdd.has('alpha'), 'alpha should reappear after re-add');
+                assertTrue(await viewAfterReAdd.has('beta'), 'beta should still be present');
+            }
+        },
+        {
+            name: '[SET07] Test barrier-delete then re-add of the same element',
+            invoke: async () => {
+                const { set } = await createTestEnvironment();
+
+                const addHash = await set.add('alpha');
+                const addVersion = version(addHash);
+
+                await set.deleteWithBarrier('alpha');
+
+                const viewAfterBarrierDelete = await set.getView();
+                assertFalse(await viewAfterBarrierDelete.has('alpha'), 'alpha should be gone after barrier delete');
+
+                await set.add('alpha');
+
+                const viewAfterReAdd = await set.getView();
+                assertTrue(await viewAfterReAdd.has('alpha'), 'alpha should reappear after re-add following barrier delete');
+
+                // Historical view at the original add should still see alpha
+                const historicalView = await set.getView(addVersion);
+                assertTrue(await historicalView.has('alpha'), 'historical view should still see alpha at its original add');
+            }
+        },
+        {
+            name: '[SET08] Set without barrier support: basic add and delete work',
+            invoke: async () => {
+                const replica = createReplica();
+
+                const init = await RSet.create({
+                    seed: 'no-barrier-set',
+                    initialElements: ['alpha'],
+                    hashAlgorithm: 'sha256',
+                });
+
+                const setId = await replica.addObject(init);
+                const set = (await replica.getObject(setId)) as RSet;
+
+                const view0 = await set.getView();
+                assertTrue(await view0.has('alpha'), 'initial element alpha should be present');
+
+                await set.add('beta');
+                await set.add('gamma');
+
+                const view1 = await set.getView();
+                assertTrue(await view1.has('alpha'), 'alpha should still be present');
+                assertTrue(await view1.has('beta'), 'beta should be present after add');
+                assertTrue(await view1.has('gamma'), 'gamma should be present after add');
+
+                await set.delete('beta');
+
+                const view2 = await set.getView();
+                assertFalse(await view2.has('beta'), 'beta should be gone after delete');
+                assertTrue(await view2.has('alpha'), 'alpha should survive unrelated delete');
+                assertTrue(await view2.has('gamma'), 'gamma should survive unrelated delete');
+            }
+        },
+        {
+            name: '[SET09] Set without barrier support: addWithBarrier throws',
+            invoke: async () => {
+                const replica = createReplica();
+
+                const init = await RSet.create({
+                    seed: 'no-barrier-add-set',
+                    initialElements: [],
+                    hashAlgorithm: 'sha256',
+                });
+
+                const setId = await replica.addObject(init);
+                const set = (await replica.getObject(setId)) as RSet;
+
+                let threw = false;
+                try {
+                    await set.addWithBarrier('alpha');
+                } catch (e) {
+                    threw = true;
+                }
+                assertTrue(threw, 'addWithBarrier should throw when barrier add is not supported');
+            }
+        },
+        {
+            name: '[SET10] Set without barrier support: deleteWithBarrier throws',
+            invoke: async () => {
+                const replica = createReplica();
+
+                const init = await RSet.create({
+                    seed: 'no-barrier-delete-set',
+                    initialElements: [],
+                    hashAlgorithm: 'sha256',
+                });
+
+                const setId = await replica.addObject(init);
+                const set = (await replica.getObject(setId)) as RSet;
+
+                await set.add('alpha');
+
+                let threw = false;
+                try {
+                    await set.deleteWithBarrier('alpha');
+                } catch (e) {
+                    threw = true;
+                }
+                assertTrue(threw, 'deleteWithBarrier should throw when barrier delete is not supported');
+            }
+        },
+        {
+            name: '[SET11] Deleting a non-existent element throws when acceptRedundantDelete is false',
+            invoke: async () => {
+                const { set } = await createTestEnvironment();
+
+                let threw = false;
+                try {
+                    await set.delete('nonexistent');
+                } catch (e) {
+                    threw = true;
+                }
+                assertTrue(threw, 'delete of non-existent element should throw');
+
+                // Also verify the set is still functional after the failed delete
+                await set.add('alpha');
+                const view = await set.getView();
+                assertTrue(await view.has('alpha'), 'set should remain usable after a failed delete');
             }
         },
     ],

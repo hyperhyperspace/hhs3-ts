@@ -1,4 +1,4 @@
-import { Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { Hash, HashFn } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, Dag } from "@hyper-hyper-space/hhs3_dag";
 
 import { RootScopedDag, ScopedDag, CausalDag } from "./dag_nesting";
@@ -8,15 +8,14 @@ export type MemDagBackend = {
     getCausalDag(id: Hash, tag?: string): Promise<CausalDag>;
 };
 
-export function createMemDagBackend(): MemDagBackend {
+export function createMemDagBackend(hashFn: HashFn): MemDagBackend {
     const dags = new Map<string, Dag>();
 
-    // Returns existing DAG for the key, or creates a new one
     const createDag = (key: string): Dag => {
         if (!dags.has(key)) {
             const store = new dag.store.MemDagStorage();
             const index = dag.idx.flat.createFlatIndex(store, new dag.idx.flat.mem.MemFlatIndexStore());
-            dags.set(key, dag.create(store, index));
+            dags.set(key, dag.create(store, index, hashFn));
         }
         return dags.get(key)!;
     };

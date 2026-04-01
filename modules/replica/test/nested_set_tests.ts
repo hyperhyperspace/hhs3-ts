@@ -3,7 +3,9 @@ import { RSet, rSetFactory, RSetProvider } from "../src/types/rset";
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test";
 import { createMemDagBackend } from "dag/mem_dag_storage";
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { sha, Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { sha, Hash, createBasicCrypto } from "@hyper-hyper-space/hhs3_crypto";
+
+const crypto = createBasicCrypto();
 
 const createReplica = (): Replica<RSetProvider> => {
     const registry = new TypeRegistryMap<RSetProvider>();
@@ -13,20 +15,27 @@ const createReplica = (): Replica<RSetProvider> => {
         rSetFactory
     );
 
-    const dagBackend = createMemDagBackend();
+    const dagBackend = createMemDagBackend(crypto.hash.sha256);
 
-    const createProvider = (id: Hash, replica: Replica<RSetProvider>): RSetProvider => ({
+    const createProvider = (replica: Replica<RSetProvider>, id?: Hash): RSetProvider => ({
         getReplica: () => replica,
         getRegistry: () => replica.getRegistry(),
-        getScopedDag: (tag?: string) => dagBackend.getScopedDag(id, tag),
-        getCausalDag: (tag?: string) => dagBackend.getCausalDag(id, tag),
+        getCrypto: () => crypto,
+        getScopedDag: (tag?: string) => {
+            if (id === undefined) throw new Error("Object ID not yet assigned");
+            return dagBackend.getScopedDag(id, tag);
+        },
+        getCausalDag: (tag?: string) => {
+            if (id === undefined) throw new Error("Object ID not yet assigned");
+            return dagBackend.getCausalDag(id, tag);
+        },
     });
 
     return new Replica(registry, createProvider, { selfValidate: true });
 };
 
 export const nestedSetTests = {
-    title: '[NESTED00] Nested set tests',
+    title: '[NESTED] Nested set tests',
     tests: [
         {
             name: '[NES00] Test adding a nested set and inserting elements into it',
@@ -718,6 +727,72 @@ export const nestedSetTests = {
                 assertTrue(await reloadedInnerView.has('leaf-alpha'), 'reloaded inner set should contain leaf-alpha');
                 assertTrue(await reloadedInnerView.has('leaf-gamma'), 'reloaded inner set should contain leaf-gamma');
                 assertFalse(await reloadedInnerView.has('leaf-beta'), 'reloaded inner set should still exclude leaf-beta');
+            }
+        },
+        {
+            name: '[NES08] Regular deleteByHash removes a nested set while siblings remain',
+            invoke: async () => {
+                const replica = createReplica();
+
+                const outerSetInit = await RSet.create({
+                    seed: 'outer-set-regular-delete',
+                    contentType: RSet.typeId,
+                    initialElements: [],
+                    hashAlgorithm: 'sha256',
+                    supportBarrierAdd: true,
+                    supportBarrierDelete: true,
+                });
+
+                const outerSetId = await replica.addObject(outerSetInit);
+                const outerSet = (await replica.getObject(outerSetId)) as RSet;
+
+                const addNestedSet = async (seed: string) => {
+                    const nestedInit = await RSet.create({
+                        seed,
+                        initialElements: [],
+                        hashAlgorithm: 'sha256',
+                        supportBarrierAdd: true,
+                        supportBarrierDelete: true,
+                    });
+
+                    const nestedHash = await outerSet.add(nestedInit.payload);
+                    const outerView = await outerSet.getView();
+                    const nested = await outerView.loadRObjectByHash(nestedHash) as RSet;
+                    return { nestedHash, nested };
+                };
+
+                const { nestedHash: hashA, nested: setA } = await addNestedSet('nested-del-A');
+                const { nestedHash: hashB, nested: setB } = await addNestedSet('nested-del-B');
+                const { nestedHash: hashC, nested: setC } = await addNestedSet('nested-del-C');
+
+                // Populate each nested set so they are non-trivial
+                await setA.add('a1');
+                await setB.add('b1');
+                await setC.add('c1');
+
+                // Verify all three are present before deletion
+                const viewBefore = await outerSet.getView();
+                assertTrue(await viewBefore.hasByHash(hashA), 'outer set should contain nested set A before delete');
+                assertTrue(await viewBefore.hasByHash(hashB), 'outer set should contain nested set B before delete');
+                assertTrue(await viewBefore.hasByHash(hashC), 'outer set should contain nested set C before delete');
+
+                // Regular delete of set B from the outer set
+                await outerSet.deleteByHash(hashB);
+
+                // B should be gone, A and C should remain
+                const viewAfter = await outerSet.getView();
+                assertTrue(await viewAfter.hasByHash(hashA), 'nested set A should survive deletion of B');
+                assertFalse(await viewAfter.hasByHash(hashB), 'nested set B should be removed after deleteByHash');
+                assertTrue(await viewAfter.hasByHash(hashC), 'nested set C should survive deletion of B');
+
+                // Surviving nested sets should still be functional
+                const reloadedA = await viewAfter.loadRObjectByHash(hashA) as RSet;
+                const reloadedAView = await reloadedA.getView();
+                assertTrue(await reloadedAView.has('a1'), 'nested set A should still contain its elements');
+
+                const reloadedC = await viewAfter.loadRObjectByHash(hashC) as RSet;
+                const reloadedCView = await reloadedC.getView();
+                assertTrue(await reloadedCView.has('c1'), 'nested set C should still contain its elements');
             }
         },
     ],

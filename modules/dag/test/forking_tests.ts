@@ -12,7 +12,7 @@ import {
     createRandomDags,
     createRandomDisconnectedDags
 } from "./utils/dag_create";
-import { Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { Hash, sha } from "@hyper-hyper-space/hhs3_crypto";
 import { set } from "@hyper-hyper-space/hhs3_util";
 import { json } from "@hyper-hyper-space/hhs3_json";
 
@@ -60,7 +60,7 @@ const topoDagPairConstr: [() => dag.Dag, () => dag.Dag] = [
             store,
             new dag.idx.flat.mem.MemFlatIndexStore()
         );
-        return dag.create(store, index);
+        return dag.create(store, index, sha.sha256);
     },
     () => {
         const store = new dag.store.MemDagStorage();
@@ -68,7 +68,7 @@ const topoDagPairConstr: [() => dag.Dag, () => dag.Dag] = [
             store,
             new dag.idx.topo.mem.MemTopoIndexStore()
         );
-        return dag.create(store, index);
+        return dag.create(store, index, sha.sha256);
     }
 ];
 
@@ -79,7 +79,7 @@ export const levelDagPairConstr: [() => dag.Dag, () => dag.Dag] = [
             store,
             new dag.idx.topo.mem.MemTopoIndexStore()
         );
-        return dag.create(store, index);
+        return dag.create(store, index, sha.sha256);
     },
     () => {
         const store = new dag.store.MemDagStorage();
@@ -87,7 +87,7 @@ export const levelDagPairConstr: [() => dag.Dag, () => dag.Dag] = [
             store,
             new dag.idx.level.mem.MemLevelIndexStore({ levelFactor: 4 })
         );
-        return dag.create(store, index);
+        return dag.create(store, index, sha.sha256);
     }
 ];
 
