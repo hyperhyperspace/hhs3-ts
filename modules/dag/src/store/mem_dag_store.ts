@@ -12,6 +12,9 @@ export class MemDagStorage implements DagStore {
     private frontier = new Set<Hash>();
     private roots = new Set<Hash>();
 
+    async withTransaction<T>(fn: () => Promise<T>): Promise<T> {
+        return fn();
+    }
 
     async append(entry: Entry): Promise<void> {
         const { hash, header } = entry;

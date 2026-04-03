@@ -26,27 +26,27 @@ export type EntryInfo = {
     distanceToARoot: number
 }
 
-export type LevelIndexStore = {
+export type LevelIndexStore<Tx = void> = {
 
-    assignEntryInfo: (node: Hash, after: Position) => Promise<EntryInfo>;
+    assignEntryInfo: (node: Hash, after: Position, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<EntryInfo>;
     getEntryInfo: (node: Hash) => Promise<EntryInfo>;
 
-    addPred: (level: number, node: Hash, pred: Hash) => Promise<void>;
+    addPred: (level: number, node: Hash, pred: Hash, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<void>;
     getPreds: (level: number, node: Hash) => Promise<Set<Hash>>;
 
-    addSucc: (level: number, node: Hash, succ: Hash) => Promise<void>;
+    addSucc: (level: number, node: Hash, succ: Hash, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<void>;
     getSuccs: (level: number, node: Hash) => Promise<Set<Hash>>;
 }
 
-export async function addToLevelIndex(index: LevelIndexStore, n: Hash, preds: Position): Promise<void> {
+export async function addToLevelIndex<Tx = void>(index: LevelIndexStore<Tx>, n: Hash, preds: Position, ...tx: Tx extends void ? [] : [tx: Tx]): Promise<void> {
 
-    const { level } = await index.assignEntryInfo(n, preds);
+    const { level } = await index.assignEntryInfo(n, preds, ...tx);
 
     if (preds.size > 0) {
     
         for (const pred of preds) {
-            await index.addPred(0, n, pred);
-            await index.addSucc(0, pred, n);
+            await index.addPred(0, n, pred, ...tx);
+            await index.addSucc(0, pred, n, ...tx);
         }
 
         let i = 0;
@@ -59,13 +59,13 @@ export async function addToLevelIndex(index: LevelIndexStore, n: Hash, preds: Po
             // coming back from a higher level in the fork position finding function below.
 
             for (const predInNextLevel of projection.keys()) {
-                await index.addPred(i+1, n, predInNextLevel);
+                await index.addPred(i+1, n, predInNextLevel, ...tx);
             }
 
             const forwardProjection = await projectForwardIntoNextLevel(index, await index.getSuccs(i, n), i, {minimal: false});
             
             for (const succInNextLevel of forwardProjection.keys()) {
-                await index.addSucc(i+1, n, succInNextLevel);
+                await index.addSucc(i+1, n, succInNextLevel, ...tx);
             }
 
             i = i+1;
@@ -73,7 +73,7 @@ export async function addToLevelIndex(index: LevelIndexStore, n: Hash, preds: Po
     }
 }
 
-export async function findMinimalCoverUsingLevelIndex(index: LevelIndexStore, p: Position): Promise<Position> {
+export async function findMinimalCoverUsingLevelIndex(index: LevelIndexStore<any>, p: Position): Promise<Position> {
     
 
     //const startTime = performance.now();
@@ -106,7 +106,7 @@ export async function findMinimalCoverUsingLevelIndex(index: LevelIndexStore, p:
 
 }
 
-async function reachabilityAtLevel(index: LevelIndexStore, level: number, start: Position, target: Position): Promise<Position> {
+async function reachabilityAtLevel(index: LevelIndexStore<any>, level: number, start: Position, target: Position): Promise<Position> {
 
 
 
@@ -248,7 +248,7 @@ async function reachabilityAtLevel(index: LevelIndexStore, level: number, start:
 // returned.
 
 
-async function projectIntoNextLevel(index: LevelIndexStore, nodes :Set<Hash>, level: number, options: {minimal:boolean, minTopoIdx?: number}): Promise<Map<Hash, EntryInfo>> {
+async function projectIntoNextLevel(index: LevelIndexStore<any>, nodes :Set<Hash>, level: number, options: {minimal:boolean, minTopoIdx?: number}): Promise<Map<Hash, EntryInfo>> {
     
     const start = performance.now();
 
@@ -319,7 +319,7 @@ async function projectIntoNextLevel(index: LevelIndexStore, nodes :Set<Hash>, le
 }
 
 // this can only do minimal: false
-async function projectIntoNextLevelFaster(index: LevelIndexStore, nodes :Set<Hash>, level: number, options: {minTopoIdx?: number}): Promise<Map<Hash, EntryInfo>> {
+async function projectIntoNextLevelFaster(index: LevelIndexStore<any>, nodes :Set<Hash>, level: number, options: {minTopoIdx?: number}): Promise<Map<Hash, EntryInfo>> {
     
     const start = performance.now();
 
@@ -372,7 +372,7 @@ async function projectIntoNextLevelFaster(index: LevelIndexStore, nodes :Set<Has
 }
 
 // this can only do minimal: false
-async function projectForwardIntoNextLevelFaster(index: LevelIndexStore, nodes :Set<Hash>, level: number, options: {maxTopoIdx?: number}): Promise<Map<Hash, EntryInfo>> {
+async function projectForwardIntoNextLevelFaster(index: LevelIndexStore<any>, nodes :Set<Hash>, level: number, options: {maxTopoIdx?: number}): Promise<Map<Hash, EntryInfo>> {
     
     const start = performance.now();
 
@@ -425,7 +425,7 @@ async function projectForwardIntoNextLevelFaster(index: LevelIndexStore, nodes :
 }
 
 
-async function projectForwardIntoNextLevel(index: LevelIndexStore, nodes :Set<Hash>, level: number, options: {minimal:boolean, maxTopoIdx?: number}): Promise<Map<Hash, EntryInfo>> {
+async function projectForwardIntoNextLevel(index: LevelIndexStore<any>, nodes :Set<Hash>, level: number, options: {minimal:boolean, maxTopoIdx?: number}): Promise<Map<Hash, EntryInfo>> {
     
     const start = performance.now();
 
@@ -516,7 +516,7 @@ type LevelForkPosition = {
             //           * common
 }
 
-export async function findForkPositionUsingLevelIndex(index: LevelIndexStore, a: Position, b: Position): Promise<ForkPosition> {
+export async function findForkPositionUsingLevelIndex(index: LevelIndexStore<any>, a: Position, b: Position): Promise<ForkPosition> {
 
     const levelFP = await findForkPositionAtLevel(index, 0, a, b);
 
@@ -529,7 +529,7 @@ export async function findForkPositionUsingLevelIndex(index: LevelIndexStore, a:
 
 }
 
-export async function findForkPositionAtLevel(index: LevelIndexStore, level: number, a: Position, b: Position): Promise<LevelForkPosition> {
+export async function findForkPositionAtLevel(index: LevelIndexStore<any>, level: number, a: Position, b: Position): Promise<LevelForkPosition> {
 
     const queue = new PriorityQueue<Hash>();
     const enqueued = new Set<Hash>();
@@ -735,7 +735,7 @@ export async function findForkPositionAtLevel(index: LevelIndexStore, level: num
 
 }
 
-export async function findCoverWithMetaUsingLevelIndex(store: DagStore, index: LevelIndexStore, from: Position, meta: EntryMetaFilter): Promise<Position> {
+export async function findCoverWithMetaUsingLevelIndex(store: DagStore<any>, index: LevelIndexStore<any>, from: Position, meta: EntryMetaFilter): Promise<Position> {
     const queue = new PriorityQueue<Hash>();
     const enqueued = new Set<Hash>();
     const visited = new Set<Hash>();
@@ -784,7 +784,7 @@ export async function findCoverWithMetaUsingLevelIndex(store: DagStore, index: L
     return findMinimalCoverUsingLevelIndex(index, preCover);
 }
 
-export async function findConcurrentCoverWithMetaUsingLevelIndex(store: DagStore, index: LevelIndexStore, from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
+export async function findConcurrentCoverWithMetaUsingLevelIndex(store: DagStore<any>, index: LevelIndexStore<any>, from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
     // Create a successor map in forwardMap
 
     const forwardMap = new MultiMap<Hash, Hash>();
@@ -874,11 +874,11 @@ export async function findConcurrentCoverWithMetaUsingLevelIndex(store: DagStore
     return findMinimalCoverUsingLevelIndex(index, preConcCover);
 }
 
-export function createDagLevelIndex(store: DagStore, index: LevelIndexStore): DagIndex {
+export function createDagLevelIndex<Tx = void>(store: DagStore<Tx>, index: LevelIndexStore<Tx>): DagIndex<Tx> {
 
     return {
-        index: function (node: Hash, after: Position): Promise<void> {
-            return addToLevelIndex(index, node, after);
+        index: function (node: Hash, after?: Position, ...tx: Tx extends void ? [] : [tx: Tx]): Promise<void> {
+            return addToLevelIndex(index, node, after ?? new Set(), ...tx);
         },
 
         findMinimalCover(p: Position): Promise<Position> {

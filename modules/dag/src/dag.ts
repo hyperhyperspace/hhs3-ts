@@ -36,8 +36,8 @@ export type Dag = {
     
     loadAllEntries(): AsyncIterable<Entry>; // in topo order
 
-    getStore(): DagStore;
-    getIndex(): DagIndex;
+    getStore(): DagStore<any>;
+    getIndex(): DagIndex<any>;
 };
 
 export async function createHeader(payload: json.Literal, after: Position | undefined, hashFn: HashFn): Promise<Header> {
@@ -59,9 +59,9 @@ export function position(...hashes: Hash[]): Position {
     return new Set(hashes);
 }
 
-export function create(
-                    store: DagStore,
-                    index: DagIndex,
+export function create<Tx = void>(
+                    store: DagStore<Tx>,
+                    index: DagIndex<Tx>,
                     hashFn: HashFn,
                 ): Dag {
 
@@ -76,8 +76,10 @@ export function create(
                 }
             }
 
-            await index.index(e.hash, after);
-            await store.append(e);
+            await store.withTransaction(async (...tx) => {
+                await index.index(e.hash, after, ...tx);
+                await store.append(e, ...tx);
+            });
             return e.hash;
         },
 

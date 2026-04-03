@@ -13,19 +13,19 @@ export * as mem from './flat_idx_mem_store';
 
 export type LevelFn = (e: Entry) => number;
 
-export type FlatIndexStore = {
-    addPred: (node: Hash, pred: Hash) => Promise<void>;
+export type FlatIndexStore<Tx = void> = {
+    addPred: (node: Hash, pred: Hash, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<void>;
     getPreds: (child: Hash) => Promise<Set<Hash>>;
 };
 
-export async function addToFlatIndex(index: FlatIndexStore, n: Hash, preds?: Iterable<Hash>): Promise<void> {
+export async function addToFlatIndex<Tx = void>(index: FlatIndexStore<Tx>, n: Hash, preds?: Iterable<Hash>, ...tx: Tx extends void ? [] : [tx: Tx]): Promise<void> {
 
     for (const pred of (preds || [])) {
-        await index.addPred(n, pred);
+        await index.addPred(n, pred, ...tx);
     }
 };
 
-export async function findMinimalCoverUsingFlatIndex(index: FlatIndexStore, p: Position): Promise<Position> {
+export async function findMinimalCoverUsingFlatIndex(index: FlatIndexStore<any>, p: Position): Promise<Position> {
 
     const minCover = new Set<Hash>([...p]);
 
@@ -50,7 +50,7 @@ export async function findMinimalCoverUsingFlatIndex(index: FlatIndexStore, p: P
     return minCover;
 }
 
-async function findAllPreds(index: FlatIndexStore, p: Position): Promise<Set<Hash>> {
+async function findAllPreds(index: FlatIndexStore<any>, p: Position): Promise<Set<Hash>> {
 
     const pending = new Set<Hash>([...p]);
     const visited = new Set<Hash>();
@@ -70,7 +70,7 @@ async function findAllPreds(index: FlatIndexStore, p: Position): Promise<Set<Has
     return visited;
 }
 
-export async function findForkPositionUsingFlatIndex(index: FlatIndexStore, a: Position, b: Position): Promise<ForkPosition> {
+export async function findForkPositionUsingFlatIndex(index: FlatIndexStore<any>, a: Position, b: Position): Promise<ForkPosition> {
 
     const reachFromA = await findAllPreds(index, a);
     const reachFromB = await findAllPreds(index, b);
@@ -127,7 +127,7 @@ export async function findForkPositionUsingFlatIndex(index: FlatIndexStore, a: P
     return {commonFrontier, common, forkA, forkB};
 }
 
-export async function findCoverWithFilterUsingFlatIndex(dag: DagStore, index: FlatIndexStore, from: Position, filter: EntryMetaFilter): Promise<Position> {
+export async function findCoverWithFilterUsingFlatIndex(dag: DagStore<any>, index: FlatIndexStore<any>, from: Position, filter: EntryMetaFilter): Promise<Position> {
     
     //const minCover = new Set<Hash>([...from].filter(async (e: Hash) => checkFilter((await dag.loadHeader(e))!.meta, filter)));
 
@@ -162,7 +162,7 @@ export async function findCoverWithFilterUsingFlatIndex(dag: DagStore, index: Fl
 
 }
 
-export async function findConcurrentCoverWithFilterUsingFlatIndex(store: DagStore, index: FlatIndexStore, from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
+export async function findConcurrentCoverWithFilterUsingFlatIndex(store: DagStore<any>, index: FlatIndexStore<any>, from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
 
 
     // Create a successor map in forwardMap
@@ -254,11 +254,11 @@ export async function findConcurrentCoverWithFilterUsingFlatIndex(store: DagStor
     return findMinimalCoverUsingFlatIndex(index, preConcCover);
 }
 
-export function createFlatIndex(store: DagStore, indexStore: FlatIndexStore): DagIndex {
+export function createFlatIndex<Tx = void>(store: DagStore<Tx>, indexStore: FlatIndexStore<Tx>): DagIndex<Tx> {
 
     return {
-        index: function (node: Hash, after?: Position): Promise<void> {
-            return addToFlatIndex(indexStore, node, after);
+        index: function (node: Hash, after?: Position, ...tx: Tx extends void ? [] : [tx: Tx]): Promise<void> {
+            return addToFlatIndex(indexStore, node, after, ...tx);
         },
 
         findMinimalCover(p: Position): Promise<Position> {

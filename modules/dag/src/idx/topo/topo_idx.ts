@@ -10,25 +10,25 @@ export * as mem from './topo_idx_mem_store';
 
 export type LevelFn = (e: Entry) => number;
 
-export type TopoIndexStore = {
+export type TopoIndexStore<Tx = void> = {
 
-    assignNextTopoIndex: (node: Hash) => Promise<void>;
+    assignNextTopoIndex: (node: Hash, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<void>;
     getTopoIndex: (node: Hash) => Promise<number>;
 
-    addPred: (node: Hash, pred: Hash) => Promise<void>;
+    addPred: (node: Hash, pred: Hash, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<void>;
     getPreds: (child: Hash) => Promise<Set<Hash>>;
 };
 
-export async function addToTopoIndex(index: TopoIndexStore, n: Hash, preds?: Iterable<Hash>): Promise<void> {
+export async function addToTopoIndex<Tx = void>(index: TopoIndexStore<Tx>, n: Hash, preds?: Iterable<Hash>, ...tx: Tx extends void ? [] : [tx: Tx]): Promise<void> {
 
-    await index.assignNextTopoIndex(n);
+    await index.assignNextTopoIndex(n, ...tx);
 
     for (const pred of (preds || [])) {
-        await index.addPred(n, pred);
+        await index.addPred(n, pred, ...tx);
     }
 };
 
-export async function findMinimalCoverUsingTopoIndex(index: TopoIndexStore, p: Position): Promise<Position> {
+export async function findMinimalCoverUsingTopoIndex(index: TopoIndexStore<any>, p: Position): Promise<Position> {
     
     //const startTime = performance.now();
 
@@ -99,7 +99,7 @@ export async function findMinimalCoverUsingTopoIndex(index: TopoIndexStore, p: P
 //                 know it belongs in the commonFrontier.
 
 
-export async function findForkPositionUsingTopoIndex(index: TopoIndexStore, a: Position, b: Position): Promise<ForkPosition> {
+export async function findForkPositionUsingTopoIndex(index: TopoIndexStore<any>, a: Position, b: Position): Promise<ForkPosition> {
 
     const start = performance.now();
 
@@ -251,7 +251,7 @@ export async function findForkPositionUsingTopoIndex(index: TopoIndexStore, a: P
     return {commonFrontier, common, forkA, forkB};
 }
 
-export async function findCoverWithFilterUsingTopoIndex(store: DagStore, index: TopoIndexStore, from: Position, meta: EntryMetaFilter): Promise<Position> {
+export async function findCoverWithFilterUsingTopoIndex(store: DagStore<any>, index: TopoIndexStore<any>, from: Position, meta: EntryMetaFilter): Promise<Position> {
 
     const queue = new PriorityQueue<Hash>();
     const enqueued = new Set<Hash>();
@@ -301,7 +301,7 @@ export async function findCoverWithFilterUsingTopoIndex(store: DagStore, index: 
     return findMinimalCoverUsingTopoIndex(index, preCover);
 }
 
-export async function findConcurrentCoverWithFilterUsingTopoIndex(store: DagStore, index: TopoIndexStore, from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
+export async function findConcurrentCoverWithFilterUsingTopoIndex(store: DagStore<any>, index: TopoIndexStore<any>, from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
     // Create a successor map in forwardMap
 
     const forwardMap = new MultiMap<Hash, Hash>();
@@ -391,11 +391,11 @@ export async function findConcurrentCoverWithFilterUsingTopoIndex(store: DagStor
     return findMinimalCoverUsingTopoIndex(index, preConcCover);
 }
 
-export function createDagTopoIndex(store: DagStore, index: TopoIndexStore): DagIndex {
+export function createDagTopoIndex<Tx = void>(store: DagStore<Tx>, index: TopoIndexStore<Tx>): DagIndex<Tx> {
 
     return {
-        index: function (node: Hash, after?: Position): Promise<void> {
-            return addToTopoIndex(index, node, after);
+        index: function (node: Hash, after?: Position, ...tx: Tx extends void ? [] : [tx: Tx]): Promise<void> {
+            return addToTopoIndex(index, node, after, ...tx);
         },
 
         findMinimalCover(p: Position): Promise<Position> {
