@@ -42,8 +42,9 @@ export class SqlTopoIndexStore implements TopoIndexStore<SqlConnection> {
         );
     };
 
-    getTopoIndex = async (node: Hash): Promise<number> => {
-        const rows = await this.conn.query(
+    getTopoIndex = async (node: Hash, ...tx: [tx: SqlConnection] | []): Promise<number> => {
+        const c = tx[0] ?? this.conn;
+        const rows = await c.query(
             `SELECT topo_order FROM topo_index WHERE dag_id = ? AND hash = ?`,
             [this.dagId, node]
         );
@@ -58,8 +59,9 @@ export class SqlTopoIndexStore implements TopoIndexStore<SqlConnection> {
         );
     };
 
-    getPreds = async (node: Hash): Promise<Set<Hash>> => {
-        const rows = await this.conn.query(
+    getPreds = async (node: Hash, ...tx: [tx: SqlConnection] | []): Promise<Set<Hash>> => {
+        const c = tx[0] ?? this.conn;
+        const rows = await c.query(
             `SELECT pred FROM topo_preds WHERE dag_id = ? AND node = ?`,
             [this.dagId, node]
         );

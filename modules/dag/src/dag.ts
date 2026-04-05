@@ -65,18 +65,20 @@ export function create<Tx = void>(
                     hashFn: HashFn,
                 ): Dag {
 
+    // Read-only view: avoids deferred-conditional-type errors when Tx is generic
+    const ro = store as DagStore<any>;
+
     return {
         append: async (payload, meta, after) => {
         
             const e = await createEntry(payload, meta, after, hashFn);
 
-            for (const prev of after||[]) {
-                if (await store.loadHeader(prev) === undefined) {
-                    throw new Error('cannot add ' + e.hash + ' before ' + prev);
-                }
-            }
-
             await store.withTransaction(async (...tx) => {
+                for (const prev of after||[]) {
+                    if (await store.loadHeader(prev, ...tx) === undefined) {
+                        throw new Error('cannot add ' + e.hash + ' before ' + prev);
+                    }
+                }
                 await index.index(e.hash, after, ...tx);
                 await store.append(e, ...tx);
             });
@@ -88,10 +90,10 @@ export function create<Tx = void>(
             return e.hash;
         },
 
-        loadEntry: (h) => store.loadEntry(h),
-        loadHeader: (h) => store.loadHeader(h),
+        loadEntry: (h) => ro.loadEntry(h),
+        loadHeader: (h) => ro.loadHeader(h),
 
-        getFrontier: () => store.getFrontier(),
+        getFrontier: () => ro.getFrontier(),
 
         findMinimalCover: async(p) => index.findMinimalCover(p),
         findForkPosition: async (first, second) => index.findForkPosition(first, second),
@@ -99,7 +101,7 @@ export function create<Tx = void>(
         findCoverWithFilter: async (from, filter) => index.findCoverWithFilter(from, filter),
         findConcurrentCoverWithFilter: async (from, concurrentTo, filter) => index.findConcurrentCoverWithFilter(from, concurrentTo, filter),
 
-        loadAllEntries: () => store.loadAllEntries(),
+        loadAllEntries: () => ro.loadAllEntries(),
 
         getStore: () => store,
         getIndex: () => index

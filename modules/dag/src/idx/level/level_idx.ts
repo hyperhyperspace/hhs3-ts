@@ -29,13 +29,13 @@ export type EntryInfo = {
 export type LevelIndexStore<Tx = void> = {
 
     assignEntryInfo: (node: Hash, after: Position, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<EntryInfo>;
-    getEntryInfo: (node: Hash) => Promise<EntryInfo>;
+    getEntryInfo: (node: Hash, ...tx: Tx extends void ? [] : [tx: Tx] | []) => Promise<EntryInfo>;
 
     addPred: (level: number, node: Hash, pred: Hash, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<void>;
-    getPreds: (level: number, node: Hash) => Promise<Set<Hash>>;
+    getPreds: (level: number, node: Hash, ...tx: Tx extends void ? [] : [tx: Tx] | []) => Promise<Set<Hash>>;
 
     addSucc: (level: number, node: Hash, succ: Hash, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<void>;
-    getSuccs: (level: number, node: Hash) => Promise<Set<Hash>>;
+    getSuccs: (level: number, node: Hash, ...tx: Tx extends void ? [] : [tx: Tx] | []) => Promise<Set<Hash>>;
 }
 
 export async function addToLevelIndex<Tx = void>(index: LevelIndexStore<Tx>, n: Hash, preds: Position, ...tx: Tx extends void ? [] : [tx: Tx]): Promise<void> {
@@ -54,7 +54,7 @@ export async function addToLevelIndex<Tx = void>(index: LevelIndexStore<Tx>, n: 
         while (i<level) { // this iteration follows i level indexed preds to
                           // build the i+1 level pred index
 
-            const projection = await projectIntoNextLevel(index, await index.getPreds(i, n), i, {minimal: false});
+            const projection = await projectIntoNextLevel(index, await index.getPreds(i, n, ...tx), i, {minimal: false});
             // It's important to project using {minimal: false}, otherwise some predecessors can be "lost" when
             // coming back from a higher level in the fork position finding function below.
 
@@ -62,7 +62,7 @@ export async function addToLevelIndex<Tx = void>(index: LevelIndexStore<Tx>, n: 
                 await index.addPred(i+1, n, predInNextLevel, ...tx);
             }
 
-            const forwardProjection = await projectForwardIntoNextLevel(index, await index.getSuccs(i, n), i, {minimal: false});
+            const forwardProjection = await projectForwardIntoNextLevel(index, await index.getSuccs(i, n, ...tx), i, {minimal: false});
             
             for (const succInNextLevel of forwardProjection.keys()) {
                 await index.addSucc(i+1, n, succInNextLevel, ...tx);

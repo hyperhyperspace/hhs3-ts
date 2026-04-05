@@ -15,7 +15,7 @@ export type LevelFn = (e: Entry) => number;
 
 export type FlatIndexStore<Tx = void> = {
     addPred: (node: Hash, pred: Hash, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<void>;
-    getPreds: (child: Hash) => Promise<Set<Hash>>;
+    getPreds: (child: Hash, ...tx: Tx extends void ? [] : [tx: Tx] | []) => Promise<Set<Hash>>;
 };
 
 export async function addToFlatIndex<Tx = void>(index: FlatIndexStore<Tx>, n: Hash, preds?: Iterable<Hash>, ...tx: Tx extends void ? [] : [tx: Tx]): Promise<void> {

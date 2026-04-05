@@ -41,8 +41,9 @@ export class SqlDagStore implements DagStore<SqlConnection> {
         );
     }
 
-    async loadEntry(h: Hash): Promise<Entry | undefined> {
-        const rows = await this.conn.query(
+    async loadEntry(h: Hash, ...tx: [tx: SqlConnection] | []): Promise<Entry | undefined> {
+        const c = tx[0] ?? this.conn;
+        const rows = await c.query(
             `SELECT hash, payload, meta, header FROM entries WHERE dag_id = ? AND hash = ?`,
             [this.dagId, h]
         );
@@ -58,8 +59,9 @@ export class SqlDagStore implements DagStore<SqlConnection> {
         };
     }
 
-    async loadHeader(h: Hash): Promise<Header | undefined> {
-        const rows = await this.conn.query(
+    async loadHeader(h: Hash, ...tx: [tx: SqlConnection] | []): Promise<Header | undefined> {
+        const c = tx[0] ?? this.conn;
+        const rows = await c.query(
             `SELECT header FROM entries WHERE dag_id = ? AND hash = ?`,
             [this.dagId, h]
         );
@@ -69,21 +71,22 @@ export class SqlDagStore implements DagStore<SqlConnection> {
         return JSON.parse(rows[0].header as string);
     }
 
-    async getFrontier(): Promise<Position> {
-        const rows = await this.conn.query(
+    async getFrontier(...tx: [tx: SqlConnection] | []): Promise<Position> {
+        const c = tx[0] ?? this.conn;
+        const rows = await c.query(
             `SELECT hash FROM frontier WHERE dag_id = ?`,
             [this.dagId]
         );
         return new Set(rows.map(r => r.hash as Hash));
     }
 
-    loadAllEntries(): AsyncIterable<Entry> {
-        const conn = this.conn;
+    loadAllEntries(...tx: [tx: SqlConnection] | []): AsyncIterable<Entry> {
+        const c = tx[0] ?? this.conn;
         const dagId = this.dagId;
 
         return {
             async *[Symbol.asyncIterator]() {
-                const rows = await conn.query(
+                const rows = await c.query(
                     `SELECT hash, payload, meta, header FROM entries WHERE dag_id = ? ORDER BY rowid`,
                     [dagId]
                 );

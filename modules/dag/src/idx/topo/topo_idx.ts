@@ -13,10 +13,10 @@ export type LevelFn = (e: Entry) => number;
 export type TopoIndexStore<Tx = void> = {
 
     assignNextTopoIndex: (node: Hash, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<void>;
-    getTopoIndex: (node: Hash) => Promise<number>;
+    getTopoIndex: (node: Hash, ...tx: Tx extends void ? [] : [tx: Tx] | []) => Promise<number>;
 
     addPred: (node: Hash, pred: Hash, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<void>;
-    getPreds: (child: Hash) => Promise<Set<Hash>>;
+    getPreds: (child: Hash, ...tx: Tx extends void ? [] : [tx: Tx] | []) => Promise<Set<Hash>>;
 };
 
 export async function addToTopoIndex<Tx = void>(index: TopoIndexStore<Tx>, n: Hash, preds?: Iterable<Hash>, ...tx: Tx extends void ? [] : [tx: Tx]): Promise<void> {

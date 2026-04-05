@@ -84,8 +84,9 @@ export class SqlLevelIndexStore implements LevelIndexStore<SqlConnection> {
         return { topoIndex, level, distanceToARoot };
     };
 
-    getEntryInfo = async (node: Hash): Promise<EntryInfo> => {
-        const rows = await this.conn.query(
+    getEntryInfo = async (node: Hash, ...tx: [tx: SqlConnection] | []): Promise<EntryInfo> => {
+        const c = tx[0] ?? this.conn;
+        const rows = await c.query(
             `SELECT topo_index, level, distance_to_root FROM entry_info WHERE dag_id = ? AND hash = ?`,
             [this.dagId, node]
         );
@@ -106,8 +107,9 @@ export class SqlLevelIndexStore implements LevelIndexStore<SqlConnection> {
         );
     };
 
-    getPreds = async (level: number, node: Hash): Promise<Set<Hash>> => {
-        const rows = await this.conn.query(
+    getPreds = async (level: number, node: Hash, ...tx: [tx: SqlConnection] | []): Promise<Set<Hash>> => {
+        const c = tx[0] ?? this.conn;
+        const rows = await c.query(
             `SELECT pred FROM level_preds WHERE dag_id = ? AND level = ? AND node = ?`,
             [this.dagId, level, node]
         );
@@ -122,8 +124,9 @@ export class SqlLevelIndexStore implements LevelIndexStore<SqlConnection> {
         );
     };
 
-    getSuccs = async (level: number, node: Hash): Promise<Set<Hash>> => {
-        const rows = await this.conn.query(
+    getSuccs = async (level: number, node: Hash, ...tx: [tx: SqlConnection] | []): Promise<Set<Hash>> => {
+        const c = tx[0] ?? this.conn;
+        const rows = await c.query(
             `SELECT succ FROM level_succs WHERE dag_id = ? AND level = ? AND node = ?`,
             [this.dagId, level, node]
         );
