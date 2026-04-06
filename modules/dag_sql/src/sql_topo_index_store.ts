@@ -7,20 +7,10 @@ export class SqlTopoIndexStore implements TopoIndexStore<SqlConnection> {
 
     private conn: SqlConnection;
     private dagId: number;
-    private nextTopoIndex: number = 0;
 
     constructor(conn: SqlConnection, dagId: number) {
         this.conn = conn;
         this.dagId = dagId;
-    }
-
-    async init(): Promise<void> {
-        const rows = await this.conn.query(
-            `SELECT MAX(topo_order) as max_topo FROM topo_index WHERE dag_id = ?`,
-            [this.dagId]
-        );
-        const maxTopo = rows[0]?.max_topo;
-        this.nextTopoIndex = (maxTopo != null) ? (maxTopo as number) + 1 : 0;
     }
 
     assignNextTopoIndex = async (node: Hash, tx: SqlConnection): Promise<void> => {
@@ -33,8 +23,11 @@ export class SqlTopoIndexStore implements TopoIndexStore<SqlConnection> {
 
         if (existing.length > 0) return;
 
-        const idx = this.nextTopoIndex;
-        this.nextTopoIndex++;
+        const topoRows = await c.query(
+            `SELECT COALESCE(MAX(topo_order), -1) + 1 AS next_topo FROM topo_index WHERE dag_id = ?`,
+            [this.dagId]
+        );
+        const idx = topoRows[0].next_topo as number;
 
         await c.execute(
             `INSERT INTO topo_index (dag_id, hash, topo_order) VALUES (?, ?, ?)`,

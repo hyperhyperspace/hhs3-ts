@@ -9,21 +9,11 @@ export class SqlLevelIndexStore implements LevelIndexStore<SqlConnection> {
     private conn: SqlConnection;
     private dagId: number;
     private levelFactor: number;
-    private nextTopoIndex: number = 0;
 
     constructor(conn: SqlConnection, dagId: number, opts?: { levelFactor?: number }) {
         this.conn = conn;
         this.dagId = dagId;
         this.levelFactor = opts?.levelFactor ?? 64;
-    }
-
-    async init(): Promise<void> {
-        const rows = await this.conn.query(
-            `SELECT MAX(topo_index) as max_topo FROM entry_info WHERE dag_id = ?`,
-            [this.dagId]
-        );
-        const maxTopo = rows[0]?.max_topo;
-        this.nextTopoIndex = (maxTopo != null) ? (maxTopo as number) + 1 : 0;
     }
 
     assignEntryInfo = async (node: Hash, after: Position, tx: SqlConnection): Promise<EntryInfo> => {
@@ -43,8 +33,11 @@ export class SqlLevelIndexStore implements LevelIndexStore<SqlConnection> {
             };
         }
 
-        const topoIndex = this.nextTopoIndex;
-        this.nextTopoIndex++;
+        const topoRows = await c.query(
+            `SELECT COALESCE(MAX(topo_index), -1) + 1 AS next_topo FROM entry_info WHERE dag_id = ?`,
+            [this.dagId]
+        );
+        const topoIndex = topoRows[0].next_topo as number;
 
         let distanceToARoot = 0;
         for (const pred of (after ?? [])) {

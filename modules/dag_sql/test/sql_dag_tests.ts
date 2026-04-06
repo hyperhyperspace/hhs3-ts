@@ -17,7 +17,7 @@ import { createBackendTestSuite, createParitySuite } from "@hyper-hyper-space/hh
 async function createSqlDag(indexType: 'level' | 'topo'): Promise<dag.Dag> {
     const conn = createSqliteConnection(":memory:");
     await initSchema(conn);
-    const dagId = await getOrCreateDag(conn, "test-dag-" + Math.random());
+    const dagId = await getOrCreateDag(conn, "test-dag-" + Math.random(), indexType);
 
     const store = new SqlDagStore(conn, dagId);
 
@@ -36,8 +36,8 @@ async function testMultipleDagsInSameDb() {
     const conn = createSqliteConnection(":memory:");
     await initSchema(conn);
 
-    const dagId1 = await getOrCreateDag(conn, "dag-1");
-    const dagId2 = await getOrCreateDag(conn, "dag-2");
+    const dagId1 = await getOrCreateDag(conn, "dag-1", "topo");
+    const dagId2 = await getOrCreateDag(conn, "dag-2", "topo");
 
     assertTrue(dagId1 !== dagId2, 'dag ids should be different');
 
@@ -70,8 +70,8 @@ async function testGetOrCreateDagIdempotent() {
     const conn = createSqliteConnection(":memory:");
     await initSchema(conn);
 
-    const id1 = await getOrCreateDag(conn, "same-dag");
-    const id2 = await getOrCreateDag(conn, "same-dag");
+    const id1 = await getOrCreateDag(conn, "same-dag", "level");
+    const id2 = await getOrCreateDag(conn, "same-dag", "level");
 
     assertEquals(id1, id2, 'getOrCreateDag should return same id for same hash');
 }
