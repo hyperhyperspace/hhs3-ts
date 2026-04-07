@@ -1,16 +1,16 @@
 import { dag } from "@hyper-hyper-space/hhs3_dag";
-import { sha } from "@hyper-hyper-space/hhs3_crypto";
-import { assertTrue, assertEquals } from "@hyper-hyper-space/hhs3_util/dist/test";
+import { sha256 } from "@hyper-hyper-space/hhs3_crypto";
+import { assertTrue, assertEquals } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 
-import { createSqliteConnection } from "./sqlite_connection";
-import { initSchema, getOrCreateDag } from "../src/sql_schema";
-import { SqlDagStore } from "../src/sql_dag_store";
-import { SqlLevelIndexStore } from "../src/sql_level_index_store";
-import { SqlTopoIndexStore } from "../src/sql_topo_index_store";
-import { SqlConnection } from "../src/sql_connection";
+import { createSqliteConnection } from "./sqlite_connection.js";
+import { initSchema, getOrCreateDag } from "../src/sql_schema.js";
+import { SqlDagStore } from "../src/sql_dag_store.js";
+import { SqlLevelIndexStore } from "../src/sql_level_index_store.js";
+import { SqlTopoIndexStore } from "../src/sql_topo_index_store.js";
+import { SqlConnection } from "../src/sql_connection.js";
 
-import { createDagLevelIndex } from "@hyper-hyper-space/hhs3_dag/dist/idx/level/level_idx";
-import { createDagTopoIndex } from "@hyper-hyper-space/hhs3_dag/dist/idx/topo/topo_idx";
+import { createDagLevelIndex } from "@hyper-hyper-space/hhs3_dag/dist/idx/level/level_idx.js";
+import { createDagTopoIndex } from "@hyper-hyper-space/hhs3_dag/dist/idx/topo/topo_idx.js";
 
 import { createBackendTestSuite, createParitySuite } from "@hyper-hyper-space/hhs3_dag_test";
 
@@ -24,11 +24,11 @@ async function createSqlDag(indexType: 'level' | 'topo'): Promise<dag.Dag> {
     if (indexType === 'level') {
         const indexStore = new SqlLevelIndexStore(conn, dagId);
         const index = createDagLevelIndex<SqlConnection>(store, indexStore);
-        return dag.create(store, index, sha.sha256);
+        return dag.create(store, index, sha256);
     } else {
         const indexStore = new SqlTopoIndexStore(conn, dagId);
         const index = createDagTopoIndex<SqlConnection>(store, indexStore);
-        return dag.create(store, index, sha.sha256);
+        return dag.create(store, index, sha256);
     }
 }
 
@@ -50,8 +50,8 @@ async function testMultipleDagsInSameDb() {
     const index1 = createDagTopoIndex<SqlConnection>(store1, idx1);
     const index2 = createDagTopoIndex<SqlConnection>(store2, idx2);
 
-    const d1 = dag.create(store1, index1, sha.sha256);
-    const d2 = dag.create(store2, index2, sha.sha256);
+    const d1 = dag.create(store1, index1, sha256);
+    const d2 = dag.create(store2, index2, sha256);
 
     const h1 = await d1.append({ 'in-dag-1': true }, {});
     const h2 = await d2.append({ 'in-dag-2': true }, {});

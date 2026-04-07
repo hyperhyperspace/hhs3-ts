@@ -1,4 +1,4 @@
-import { Literal } from "literal";
+import { Literal } from "./literal.js";
 
 export enum Type {
     String = 'string',

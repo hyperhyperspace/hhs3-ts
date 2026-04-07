@@ -1,2 +1,2 @@
-export { SqliteDagDb } from "./sqlite_dag_db";
-export { openSqliteConnection, SqliteHandle } from "./sqlite_connection";
+export { SqliteDagDb } from "./sqlite_dag_db.js";
+export { openSqliteConnection, SqliteHandle } from "./sqlite_connection.js";

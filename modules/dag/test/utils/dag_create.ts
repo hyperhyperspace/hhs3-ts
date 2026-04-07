@@ -1,8 +1,8 @@
-import { Hash, sha } from "@hyper-hyper-space/hhs3_crypto";
-import { MetaProps, Position } from "../../src/dag_defs";
-import { Dag, position } from "../../src/dag";
-import { draw, label } from "./dag_diagram";
-import { dag } from "../../src/index";
+import { Hash, sha256 } from "@hyper-hyper-space/hhs3_crypto";
+import { MetaProps, Position } from "../../src/dag_defs.js";
+import { Dag, position } from "../../src/dag.js";
+import { draw, label } from "./dag_diagram.js";
+import { dag } from "../../src/index.js";
 import { MultiMap } from "@hyper-hyper-space/hhs3_util";
 import { json } from "@hyper-hyper-space/hhs3_json";
 
@@ -341,12 +341,12 @@ export const createD1s = async () => {
 
     const store1 = new dag.store.MemDagStorage();
     const topoIndex = dag.idx.topo.createDagTopoIndex(store1, new dag.idx.topo.mem.MemTopoIndexStore());
-    const d1Topo = dag.create(store1, topoIndex, sha.sha256)
+    const d1Topo = dag.create(store1, topoIndex, sha256)
 
     const store2 = new dag.store.MemDagStorage();
     const flatIndex = dag.idx.flat.createFlatIndex(store2, new dag.idx.flat.mem.MemFlatIndexStore());
 
-    const d1Flat = dag.create(store2, flatIndex, sha.sha256);
+    const d1Flat = dag.create(store2, flatIndex, sha256);
 
     await createD1(d1Topo);
     const bs = await createD1(d1Flat);

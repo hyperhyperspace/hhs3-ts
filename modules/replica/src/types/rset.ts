@@ -24,22 +24,22 @@
 // aware of this caveats.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { Hash, sha, BasicCrypto } from "@hyper-hyper-space/hhs3_crypto";
+import { Hash, BasicCrypto, sha256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, MetaProps, position, EntryMetaFilter, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
 
-import { Payload, BasicProvider, RObject, RObjectFactory, RObjectTypeRegistry, RObjectInit, Replica, version, Version, View } from "../replica";
-import { DagCapability } from "dag/dag_resource";
-import { DagScope, NestedScopedDag, ScopedDag, CausalDag } from "dag/dag_nesting";
+import { Payload, BasicProvider, RObject, RObjectFactory, RObjectTypeRegistry, RObjectInit, Replica, version, Version, View } from "../replica.js";
+import { DagCapability } from "../dag/dag_resource.js";
+import { DagScope, NestedScopedDag, ScopedDag, CausalDag } from "../dag/dag_nesting.js";
 import { set } from "@hyper-hyper-space/hhs3_util";
 
-import { RAddEvent, RDeleteEvent, RSetEvent } from "./rset/events";
+import { RAddEvent, RDeleteEvent, RSetEvent } from "./rset/events.js";
 
-import { createSetFormat, CreateSetPayload } from "./rset/payload";
-import { addElmtFormat, AddElmtPayload } from "./rset/payload";
-import { deleteElmtFormat, DeleteElmtPayload } from "./rset/payload";
-import { updateElmtFormat, UpdateElmtPayload } from "./rset/payload";
+import { createSetFormat, CreateSetPayload } from "./rset/payload.js";
+import { addElmtFormat, AddElmtPayload } from "./rset/payload.js";
+import { deleteElmtFormat, DeleteElmtPayload } from "./rset/payload.js";
+import { updateElmtFormat, UpdateElmtPayload } from "./rset/payload.js";
 
-import { SetPayload } from "./rset/payload";
+import { SetPayload } from "./rset/payload.js";
 
 export type RSetProvider = BasicProvider & DagCapability;
 
@@ -57,7 +57,7 @@ export const rSetFactory: RObjectFactory<RSetProvider> = {
 
     computeRootObjectId: async (payload: json.Literal, provider: RSetProvider) => {
 
-        const entry = await dag.createEntry(payload, {}, position(), provider.getCrypto().hash.sha256);
+        const entry = dag.createEntry(payload, {}, position(), provider.getCrypto().hash('sha-256'));
         return entry.hash;
     },
 
@@ -792,6 +792,6 @@ class ElementUpdateScope extends NestedElementScope implements DagScope {
     }
 }
 
-async function hashElement<T extends json.Literal>(element: T): Promise<Hash> {
-    return await sha.sha256(json.toStringNormalized(element));
+function hashElement<T extends json.Literal>(element: T): Hash {
+    return sha256.hash(stringToUint8Array(json.toStringNormalized(element)));
 }

@@ -1,5 +1,5 @@
-import { schemaSuite, levelBackendSuite, topoBackendSuite, levelParitySuite, topoParitySuite } from "./sql_dag_tests";
-import { testing } from "@hyper-hyper-space/hhs3_util/";
+import { schemaSuite, levelBackendSuite, topoBackendSuite, levelParitySuite, topoParitySuite } from "./sql_dag_tests.js";
+import { testing } from "@hyper-hyper-space/hhs3_util";
 
 async function main() {
 

@@ -1,5 +1,5 @@
-import { testMinimalCoverDags, flatTopoPairConstr, topoLevelPairConstr } from "./cover_tests";
-import { createRandomBranchingDags } from "./utils/dag_create";
+import { testMinimalCoverDags, flatTopoPairConstr, topoLevelPairConstr } from "./cover_tests.js";
+import { createRandomBranchingDags } from "./utils/dag_create.js";
 
 const coverBenchmarkSuite = {
     title: "[COVER_BENCH] Minimal Cover finding benchmarks for long branching random DAGs",

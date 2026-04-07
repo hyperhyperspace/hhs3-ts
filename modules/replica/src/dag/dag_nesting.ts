@@ -1,7 +1,7 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { Dag, Entry, EntryMetaFilter, ForkPosition, joinFilters, MetaProps, position, Position } from "@hyper-hyper-space/hhs3_dag";
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { Literal } from "@hyper-hyper-space/hhs3_json/dist/literal";
+import { Literal } from "@hyper-hyper-space/hhs3_json/dist/literal.js";
 
 // ScopedDag: the object's logical history surface.
 // For root objects, backed by RootScopedDag; for nested objects, backed by NestedScopedDag.

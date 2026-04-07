@@ -1,7 +1,7 @@
 // Events are still unimplemented, but here are some stubs for now
 
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { Event } from "../../replica";
+import { Event } from "../../replica.js";
 
 export type RAddEvent = Event & {
     type(): "add";

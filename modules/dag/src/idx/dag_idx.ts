@@ -1,5 +1,5 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { FindForkPositionFn, FindMinimalCoverFn, FindCoverWithFilterFn, FindConcurrentCoverWithFilterFn, Position, EntryMetaFilter, MetaProps, MetaContainsValues } from "../dag_defs";
+import { FindForkPositionFn, FindMinimalCoverFn, FindCoverWithFilterFn, FindConcurrentCoverWithFilterFn, Position, EntryMetaFilter, MetaProps, MetaContainsValues } from "../dag_defs.js";
 import { json } from "@hyper-hyper-space/hhs3_json";
 
 export type DagIndex<Tx = void> = {

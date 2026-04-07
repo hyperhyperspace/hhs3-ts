@@ -1,6 +1,6 @@
-import { dag, HashFn, Dag } from "@hyper-hyper-space/hhs3_dag";
-import { createDagLevelIndex } from "@hyper-hyper-space/hhs3_dag/dist/idx/level/level_idx";
-import { createDagTopoIndex } from "@hyper-hyper-space/hhs3_dag/dist/idx/topo/topo_idx";
+import { dag, HashSuite, Dag } from "@hyper-hyper-space/hhs3_dag";
+import { createDagLevelIndex } from "@hyper-hyper-space/hhs3_dag/dist/idx/level/level_idx.js";
+import { createDagTopoIndex } from "@hyper-hyper-space/hhs3_dag/dist/idx/topo/topo_idx.js";
 import {
     SqlConnection,
     initSchema,
@@ -13,7 +13,7 @@ import {
     IdxType,
 } from "@hyper-hyper-space/hhs3_dag_sql";
 
-import { SqliteHandle, openSqliteConnection } from "./sqlite_connection";
+import { SqliteHandle, openSqliteConnection } from "./sqlite_connection.js";
 
 export class SqliteDagDb {
     private handle: SqliteHandle;
@@ -31,17 +31,17 @@ export class SqliteDagDb {
         return new SqliteDagDb(handle);
     }
 
-    async createDag(dagHash: string, indexType: IdxType, hashFn: HashFn): Promise<Dag> {
+    async createDag(dagHash: string, indexType: IdxType, hash: HashSuite): Promise<Dag> {
         const cached = this.dagCache.get(dagHash);
         if (cached !== undefined) return cached;
 
         const dagId = await getOrCreateDag(this.handle.conn, dagHash, indexType);
-        const d = this.buildDag(dagId, indexType, hashFn);
+        const d = this.buildDag(dagId, indexType, hash);
         this.dagCache.set(dagHash, d);
         return d;
     }
 
-    async openDag(dagHash: string, hashFn: HashFn): Promise<Dag> {
+    async openDag(dagHash: string, hash: HashSuite): Promise<Dag> {
         const cached = this.dagCache.get(dagHash);
         if (cached !== undefined) return cached;
 
@@ -50,7 +50,7 @@ export class SqliteDagDb {
             throw new Error('DAG "' + dagHash + '" does not exist — use createDag() first');
         }
 
-        const d = this.buildDag(info.dagId, info.idxType, hashFn);
+        const d = this.buildDag(info.dagId, info.idxType, hash);
         this.dagCache.set(dagHash, d);
         return d;
     }
@@ -59,18 +59,18 @@ export class SqliteDagDb {
         this.handle.close();
     }
 
-    private buildDag(dagId: number, idxType: IdxType, hashFn: HashFn): Dag {
+    private buildDag(dagId: number, idxType: IdxType, hash: HashSuite): Dag {
         const conn = this.handle.conn;
         const store = new SqlDagStore(conn, dagId);
 
         if (idxType === 'level') {
             const indexStore = new SqlLevelIndexStore(conn, dagId);
             const index = createDagLevelIndex<SqlConnection>(store, indexStore);
-            return dag.create(store, index, hashFn);
+            return dag.create(store, index, hash);
         } else {
             const indexStore = new SqlTopoIndexStore(conn, dagId);
             const index = createDagTopoIndex<SqlConnection>(store, indexStore);
-            return dag.create(store, index, hashFn);
+            return dag.create(store, index, hash);
         }
     }
 }

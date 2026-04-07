@@ -1,4 +1,4 @@
-import { SqlConnection } from "./sql_connection";
+import { SqlConnection } from "./sql_connection.js";
 
 export const SCHEMA_VERSION = 1;
 

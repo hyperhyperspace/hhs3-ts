@@ -2,13 +2,12 @@
   "name": "@hyper-hyper-space/hhs3_dag_sqlite",
   "version": "0.1.0",
   "description": "Production SQLite-backed DAG store for HHSv3",
+  "type": "module",
   "source": "src/index.ts",
   "main": "dist/index.js",
-  "module": "dist/index.esm.js",
   "types": "dist/index.d.ts",
-
   "scripts": {
-    "test": "NODE_PATH=\"src\" node -r ts-node/register ./test/run_tests.ts",
+    "test": "node --import ../../register.mjs ./test/run_tests.ts",
     "build": "npx tsc",
     "clean": "rm -rf dist"
   },

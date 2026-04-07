@@ -1,9 +1,9 @@
-import { Replica, TypeRegistryMap, version } from "../src/replica";
-import { RSet, rSetFactory, RSetProvider } from "../src/types/rset";
-import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test";
-import { createMemDagBackend } from "dag/mem_dag_storage";
+import { Replica, TypeRegistryMap, version } from "../src/replica.js";
+import { RSet, rSetFactory, RSetProvider } from "../src/types/rset.js";
+import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.js";
+import { createMemDagBackend } from "../src/dag/mem_dag_storage.js";
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { sha, Hash, createBasicCrypto } from "@hyper-hyper-space/hhs3_crypto";
+import { Hash, createBasicCrypto, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
 
 const crypto = createBasicCrypto();
 
@@ -15,7 +15,7 @@ const createReplica = (): Replica<RSetProvider> => {
         rSetFactory
     );
 
-    const dagBackend = createMemDagBackend(crypto.hash.sha256);
+    const dagBackend = createMemDagBackend(crypto.hash('sha-256'));
 
     const createProvider = (replica: Replica<RSetProvider>, id?: Hash): RSetProvider => ({
         getReplica: () => replica,
@@ -134,7 +134,7 @@ export const simpleSetTests = {
                 const rightViewAfterBarrierAdd = await set.getView(rightVersion);
                 assertTrue(await rightViewAfterBarrierAdd.has('barrier-delta'), 'barrier add should apply to concurrent versions');
 
-                const rootLiteralHash = await sha.sha256(json.toStringNormalized('root'));
+                const rootLiteralHash = crypto.hash('sha-256').hash(stringToUint8Array(json.toStringNormalized('root')));
                 await set.deleteWithBarrierByHash(rootLiteralHash, leftVersion);
 
                 const rightViewAfterBarrierDelete = await set.getView(rightVersion);
@@ -182,7 +182,7 @@ export const simpleSetTests = {
                 const leftVersion = version(leftHash);
                 const rightVersion = version(rightHash);
 
-                const sharedHash = await sha.sha256(json.toStringNormalized('shared'));
+                const sharedHash = crypto.hash('sha-256').hash(stringToUint8Array(json.toStringNormalized('shared')));
                 await set.deleteWithBarrierByHash(sharedHash, leftVersion);
 
                 const concurrentView = await set.getView(rightVersion);

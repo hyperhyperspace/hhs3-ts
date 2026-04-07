@@ -1,8 +1,8 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { Position } from "@hyper-hyper-space/hhs3_dag";
-import type { EntryInfo, LevelIndexStore } from "@hyper-hyper-space/hhs3_dag/dist/idx/level/level_idx";
+import type { EntryInfo, LevelIndexStore } from "@hyper-hyper-space/hhs3_dag/dist/idx/level/level_idx.js";
 
-import { SqlConnection } from "./sql_connection";
+import { SqlConnection } from "./sql_connection.js";
 
 export class SqlLevelIndexStore implements LevelIndexStore<SqlConnection> {
 

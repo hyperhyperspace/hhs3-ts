@@ -1,5 +1,5 @@
-import { levelDagPairConstr, testForkingDags } from "./forking_tests";
-import { createRandomBranchingDags } from "./utils/dag_create";
+import { levelDagPairConstr, testForkingDags } from "./forking_tests.js";
+import { createRandomBranchingDags } from "./utils/dag_create.js";
 
 const benchmarkSuite = {
     title: "[FORK_BENCH] Fork Analysis Timings for long branching random DAGs",

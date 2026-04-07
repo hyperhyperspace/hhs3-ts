@@ -2,9 +2,9 @@ import { Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, Dag, position, Position } from "@hyper-hyper-space/hhs3_dag";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { set } from "@hyper-hyper-space/hhs3_util";
-import { assertTrue, assertEquals } from "@hyper-hyper-space/hhs3_util/dist/test";
+import { assertTrue, assertEquals } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 
-import { createD1, createD3 } from "./dag_create";
+import { createD1, createD3 } from "./dag_create.js";
 
 export type DagFactory = () => Dag | Promise<Dag>;
 

@@ -1,8 +1,8 @@
-export { MultiMap } from "./multimap";
-export { Queue } from "./queue";
-export { DedupQueue } from "./dedup_queue";
-export { LabelledQueue } from "./labelled_queue";
-export { PriorityQueue } from "./priority_queue"
-export * as testing from "./test";
-export * as set from "./set";
-export * as iterators from "./iterators";
+export { MultiMap } from "./multimap.js";
+export { Queue } from "./queue.js";
+export { DedupQueue } from "./dedup_queue.js";
+export { LabelledQueue } from "./labelled_queue.js";
+export { PriorityQueue } from "./priority_queue.js"
+export * as testing from "./test.js";
+export * as set from "./set.js";
+export * as iterators from "./iterators.js";

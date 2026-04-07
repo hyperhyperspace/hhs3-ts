@@ -1,7 +1,12 @@
 export function getInt(min:number, max: number) {
     const array = new Uint32Array(1);
-    window.crypto.getRandomValues(array);
+    globalThis.crypto.getRandomValues(array);
 
-    // Scale to desired range
     return min + (array[0] % (max - min + 1));
+}
+
+export function getBytes(n: number): Uint8Array {
+    const bytes = new Uint8Array(n);
+    globalThis.crypto.getRandomValues(bytes);
+    return bytes;
 }

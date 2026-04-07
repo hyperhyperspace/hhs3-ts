@@ -1,22 +1,28 @@
 {
   "name": "@hyper-hyper-space/hhs3_crypto",
   "version": "0.1.0",
-  "description": "Hashing for HHSv3",
+  "description": "Cryptographic primitives for HHSv3",
+  "type": "module",
   "source": "src/index.ts",
   "main": "dist/index.js",
-  "module": "dist/index.esm.js",
   "types": "dist/index.d.ts",
-  
   "scripts": {
-    "test": "NODE_PATH=\"src\" node -r ts-node/register  ./src/test/run-tests.ts",
-    "debug": "NODE_PATH=\"src\" node -r ts-node/register ./src/test/run-tests.ts",
+    "test": "node --import ../../register.mjs ./src/test/run-tests.ts",
+    "debug": "node --import ../../register.mjs ./src/test/run-tests.ts",
     "build": "npx tsc"
   },
   "author": "Santiago Bazerque",
   "license": "MIT",
   "devDependencies": {
-    "typescript": "^5.5.4",
+    "@hyper-hyper-space/hhs3_util": "^0.1.0",
+    "@types/node": "^22.2.0",
     "ts-node": "^10.9.2",
-    "@types/node": "^22.2.0"
+    "typescript": "^5.5.4"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^2.1.1",
+    "@noble/curves": "^2.0.1",
+    "@noble/hashes": "^2.0.1",
+    "@noble/post-quantum": "^0.6.0"
   }
 }

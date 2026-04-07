@@ -1,6 +1,6 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { Literal } from "@hyper-hyper-space/hhs3_json/dist/literal";
+import { Literal } from "@hyper-hyper-space/hhs3_json/dist/literal.js";
 import { MultiMap } from "@hyper-hyper-space/hhs3_util";
 
 // basic data types for reasoning about DAGs

@@ -1,6 +1,6 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { MultiMap } from "@hyper-hyper-space/hhs3_util";
-import { FlatIndexStore } from "./flat_idx";
+import { FlatIndexStore } from "./flat_idx.js";
 
 
 class MemFlatIndexStore implements FlatIndexStore {

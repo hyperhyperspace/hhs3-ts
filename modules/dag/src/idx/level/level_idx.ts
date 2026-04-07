@@ -1,11 +1,11 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { MultiMap, PriorityQueue } from "@hyper-hyper-space/hhs3_util";
-import { checkFilter, EntryMetaFilter, ForkPosition, Position } from "../../dag_defs";
-import { DagIndex } from "../../idx/dag_idx";
-import { position } from "../../dag";
-import { DagStore } from "../../store";
+import { checkFilter, EntryMetaFilter, ForkPosition, Position } from "../../dag_defs.js";
+import { DagIndex } from "../../idx/dag_idx.js";
+import { position } from "../../dag.js";
+import { DagStore } from "../../store/index.js";
 
-export * as mem from './level_idx_mem_store';
+export * as mem from './level_idx_mem_store.js';
 
 function label(h: Hash) { return "_" + h.replace(/[^a-zA-Z0-9]/g, "").slice(-6, -1); }
 

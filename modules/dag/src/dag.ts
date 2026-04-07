@@ -1,13 +1,13 @@
-import { Hash, HashFn } from "@hyper-hyper-space/hhs3_crypto";
+import { Hash, HashSuite, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { Entry, EntryMetaFilter, ForkPosition, Header, MetaProps, Position } from "./dag_defs";
-import { DagIndex } from "./idx/dag_idx";
-import { DagStore } from "./store/dag_store";
+import { Entry, EntryMetaFilter, ForkPosition, Header, MetaProps, Position } from "./dag_defs.js";
+import { DagIndex } from "./idx/dag_idx.js";
+import { DagStore } from "./store/dag_store.js";
 
-export { HashFn } from "@hyper-hyper-space/hhs3_crypto";
-export * from "./dag_defs";
-export * as store from "./store";
-export * as idx from "./idx";
+export { HashSuite } from "@hyper-hyper-space/hhs3_crypto";
+export * from "./dag_defs.js";
+export * as store from "./store/index.js";
+export * as idx from "./idx/index.js";
 
 // DAG definition
 
@@ -40,17 +40,17 @@ export type Dag = {
     getIndex(): DagIndex<any>;
 };
 
-export async function createHeader(payload: json.Literal, after: Position | undefined, hashFn: HashFn): Promise<Header> {
-    const payloadHash: Hash = await hashFn(json.toStringNormalized(payload));
+export function createHeader(payload: json.Literal, after: Position | undefined, hash: HashSuite): Header {
+    const payloadHash: Hash = hash.hash(stringToUint8Array(json.toStringNormalized(payload)));
     const prevEntryHashes = json.toSet(after ?? new Set<Hash>());
     const header: Header = { payloadHash, prevEntryHashes};
     return header;
 }
 
-export async function createEntry(payload: json.Literal, meta: MetaProps, after: Position | undefined, hashFn: HashFn): Promise<Entry> {
-    const header = await createHeader(payload, after, hashFn);
-    const hash: Hash = await hashFn(json.toStringNormalized(header));
-    const entry: Entry = { hash, header, payload, meta };
+export function createEntry(payload: json.Literal, meta: MetaProps, after: Position | undefined, hash: HashSuite): Entry {
+    const header = createHeader(payload, after, hash);
+    const entryHash: Hash = hash.hash(stringToUint8Array(json.toStringNormalized(header)));
+    const entry: Entry = { hash: entryHash, header, payload, meta };
 
     return entry;
 }
@@ -62,7 +62,7 @@ export function position(...hashes: Hash[]): Position {
 export function create<Tx = void>(
                     store: DagStore<Tx>,
                     index: DagIndex<Tx>,
-                    hashFn: HashFn,
+                    hash: HashSuite,
                 ): Dag {
 
     // Read-only view: avoids deferred-conditional-type errors when Tx is generic
@@ -71,7 +71,7 @@ export function create<Tx = void>(
     return {
         append: async (payload, meta, after) => {
         
-            const e = await createEntry(payload, meta, after, hashFn);
+            const e = createEntry(payload, meta, after, hash);
 
             await store.withTransaction(async (...tx) => {
                 for (const prev of after||[]) {
@@ -86,7 +86,7 @@ export function create<Tx = void>(
         },
 
         computeEntryHash: async (payload, after) => {
-            const e = await createEntry(payload, {}, after, hashFn);
+            const e = createEntry(payload, {}, after, hash);
             return e.hash;
         },
 

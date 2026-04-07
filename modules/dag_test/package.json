@@ -2,9 +2,9 @@
   "name": "@hyper-hyper-space/hhs3_dag_test",
   "version": "0.1.0",
   "description": "Shared DAG backend conformance test suite for HHSv3",
+  "type": "module",
   "source": "src/index.ts",
   "main": "dist/index.js",
-  "module": "dist/index.esm.js",
   "types": "dist/index.d.ts",
   
   "scripts": {

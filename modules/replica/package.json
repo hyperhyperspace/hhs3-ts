@@ -2,14 +2,13 @@
   "name": "@hyper-hyper-space/hhs3_replica",
   "version": "0.1.0",
   "description": "State materialization and time trvelling over a Merkle-DAG history log",
+  "type": "module",
   "source": "src/index.ts",
   "main": "dist/index.js",
-  "module": "dist/index.esm.js",
   "types": "dist/index.d.ts",
-  
   "scripts": {
-    "test": "NODE_PATH=\"src\" node -r ts-node/register  ./test/run_tests.ts",
-    "debug": "NODE_PATH=\"src\" node --inspect-brk -r ts-node/register ./test/run_tests.ts",
+    "test": "node --import ../../register.mjs ./test/run_tests.ts",
+    "debug": "node --inspect-brk --import ../../register.mjs ./test/run_tests.ts",
     "build": "npx tsc",
     "clean": "rm -rf dist"
   },

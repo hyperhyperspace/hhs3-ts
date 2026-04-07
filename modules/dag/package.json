@@ -2,15 +2,18 @@
   "name": "@hyper-hyper-space/hhs3_dag",
   "version": "0.1.0",
   "description": "Merkle-DAG for HHSv3",
+  "type": "module",
   "source": "src/index.ts",
   "main": "dist/index.js",
-  "module": "dist/index.esm.js",
   "types": "dist/index.d.ts",
-  
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    "./dist/*": "./dist/*"
+  },
   "scripts": {
-    "test": "NODE_PATH=\"src\" node -r ts-node/register  ./test/run_tests.ts",
-    "bench": "NODE_PATH=\"src\" node -r ts-node/register  ./test/run_benchmark.ts",
-    "debug": "NODE_PATH=\"src\" node --inspect-brk -r ts-node/register ./test/run_tests.ts",
+    "test": "node --import ../../register.mjs ./test/run_tests.ts",
+    "bench": "node --import ../../register.mjs ./test/run_benchmark.ts",
+    "debug": "node --inspect-brk --import ../../register.mjs ./test/run_tests.ts",
     "build": "npx tsc",
     "clean": "rm -rf dist"
   },

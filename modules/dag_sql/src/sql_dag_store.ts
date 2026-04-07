@@ -1,9 +1,9 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { Entry, Header, Position } from "@hyper-hyper-space/hhs3_dag";
-import { DagStore } from "@hyper-hyper-space/hhs3_dag/dist/store/dag_store";
+import { DagStore } from "@hyper-hyper-space/hhs3_dag/dist/store/dag_store.js";
 
-import { SqlConnection } from "./sql_connection";
+import { SqlConnection } from "./sql_connection.js";
 
 export class SqlDagStore implements DagStore<SqlConnection> {
 

@@ -1,6 +1,6 @@
 // deduplicating queue: inserting an element that is already in the queue does nothing
 
-import { MultiMap } from "./multimap";
+import { MultiMap } from "./multimap.js";
 
 class LabelledQueue<Q, L> {
 

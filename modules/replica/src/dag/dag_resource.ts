@@ -1,4 +1,4 @@
-import { ScopedDag, CausalDag } from "./dag_nesting";
+import { ScopedDag, CausalDag } from "./dag_nesting.js";
 
 export type DagCapability = {
     getScopedDag(tag?: string): Promise<ScopedDag>;

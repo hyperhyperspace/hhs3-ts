@@ -1,6 +1,6 @@
-import { benchmarkSuite as forkBench } from "./forking_benchmarks";
-import { coverBenchmarkSuite as coverBench } from "./cover_benchmarks";
-import { testing } from "@hyper-hyper-space/hhs3_util/";
+import { benchmarkSuite as forkBench } from "./forking_benchmarks.js";
+import { coverBenchmarkSuite as coverBench } from "./cover_benchmarks.js";
+import { testing } from "@hyper-hyper-space/hhs3_util";
 
 async function main() {
 

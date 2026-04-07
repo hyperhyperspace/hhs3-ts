@@ -1,2 +1,2 @@
-export * from "./dag_store";
-export * from "./mem_dag_store";
+export * from "./dag_store.js";
+export * from "./mem_dag_store.js";

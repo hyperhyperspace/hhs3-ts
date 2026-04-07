@@ -1,5 +1,5 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { Entry, Header, Position } from "../dag_defs";
+import { Entry, Header, Position } from "../dag_defs.js";
 
 // Store all the entries and their headers for a DAG.
 // When Tx is void (the default), the tx parameter is absent — intended for

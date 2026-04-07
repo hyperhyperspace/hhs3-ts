@@ -1,10 +1,10 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { MultiMap, PriorityQueue, Queue } from "@hyper-hyper-space/hhs3_util";
-import { Entry, EntryMetaFilter, ForkPosition, Position, checkFilter } from "../../dag_defs";
-import { DagIndex } from "../../idx/dag_idx";
-import { DagStore } from "../../store";
+import { Entry, EntryMetaFilter, ForkPosition, Position, checkFilter } from "../../dag_defs.js";
+import { DagIndex } from "../../idx/dag_idx.js";
+import { DagStore } from "../../store/index.js";
 
-export * as mem from './topo_idx_mem_store';
+export * as mem from './topo_idx_mem_store.js';
 
 // Implementation of the fork finding alogrithm using a topological traversal of the base graph.
 

@@ -1,6 +1,6 @@
-import { simpleSetTests } from "./simple_set_tests";
-import { nestedSetTests } from "./nested_set_tests";
-import { testing } from "@hyper-hyper-space/hhs3_util/";
+import { simpleSetTests } from "./simple_set_tests.js";
+import { nestedSetTests } from "./nested_set_tests.js";
+import { testing } from "@hyper-hyper-space/hhs3_util";
 
 async function main() {
 

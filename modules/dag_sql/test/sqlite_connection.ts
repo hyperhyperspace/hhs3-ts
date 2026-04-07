@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { SqlConnection, SqlRow } from "../src/sql_connection";
+import { SqlConnection, SqlRow } from "../src/sql_connection.js";
 
 export function createSqliteConnection(path: string): SqlConnection {
     const db = new Database(path);

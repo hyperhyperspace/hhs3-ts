@@ -1,7 +1,7 @@
 import { Hash } from "@hyper-hyper-space/hhs3_crypto";
-import type { TopoIndexStore } from "@hyper-hyper-space/hhs3_dag/dist/idx/topo/topo_idx";
+import type { TopoIndexStore } from "@hyper-hyper-space/hhs3_dag/dist/idx/topo/topo_idx.js";
 
-import { SqlConnection } from "./sql_connection";
+import { SqlConnection } from "./sql_connection.js";
 
 export class SqlTopoIndexStore implements TopoIndexStore<SqlConnection> {
 

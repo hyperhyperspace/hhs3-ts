@@ -1,14 +1,14 @@
-import { Hash, sha } from "@hyper-hyper-space/hhs3_crypto";
+import { Hash, sha256 } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, Dag, EntryMetaFilter, MetaProps, position, Position } from "@hyper-hyper-space/hhs3_dag";
 import { set } from "@hyper-hyper-space/hhs3_util";
-import { assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test";
+import { assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 
-import { DagFactory } from "./backend_tests";
+import { DagFactory } from "./backend_tests.js";
 import {
     createRandomBranchingDags,
     createRandomDags,
     createRandomDag,
-} from "./dag_create";
+} from "./dag_create.js";
 
 function createGoldStandard(): Dag {
     const store = new dag.store.MemDagStorage();
@@ -16,7 +16,7 @@ function createGoldStandard(): Dag {
         store,
         new dag.idx.level.mem.MemLevelIndexStore()
     );
-    return dag.create(store, index, sha.sha256);
+    return dag.create(store, index, sha256);
 }
 
 async function testForkPositionParity(

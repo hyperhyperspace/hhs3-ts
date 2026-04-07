@@ -1,1 +1,1 @@
-export * as json from "./json";
+export * as json from "./json.js";

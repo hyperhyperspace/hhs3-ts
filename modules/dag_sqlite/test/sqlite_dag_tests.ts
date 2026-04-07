@@ -1,12 +1,12 @@
 import { dag } from "@hyper-hyper-space/hhs3_dag";
-import { sha } from "@hyper-hyper-space/hhs3_crypto";
+import { sha256 } from "@hyper-hyper-space/hhs3_crypto";
 
 import { createBackendTestSuite, createParitySuite } from "@hyper-hyper-space/hhs3_dag_test";
-import { SqliteDagDb } from "../src/sqlite_dag_db";
+import { SqliteDagDb } from "../src/sqlite_dag_db.js";
 
 async function createSqliteDag(indexType: 'level' | 'topo'): Promise<dag.Dag> {
     const db = await SqliteDagDb.open(":memory:");
-    return db.createDag("test-dag-" + Math.random(), indexType, sha.sha256);
+    return db.createDag("test-dag-" + Math.random(), indexType, sha256);
 }
 
 export const levelBackendSuite = createBackendTestSuite(

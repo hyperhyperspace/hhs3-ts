@@ -1,10 +1,10 @@
-import { hash, Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { Entry, EntryMetaFilter, ForkPosition, Position, checkFilter } from "../../dag_defs";
-import { DagIndex } from "../../idx/dag_idx";
-import { DagStore } from "store";
+import { Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { Entry, EntryMetaFilter, ForkPosition, Position, checkFilter } from "../../dag_defs.js";
+import { DagIndex } from "../../idx/dag_idx.js";
+import { DagStore } from "../../store/index.js";
 import { MultiMap } from "@hyper-hyper-space/hhs3_util";
 
-export * as mem from './flat_idx_mem_store';
+export * as mem from './flat_idx_mem_store.js';
 
 // This naive implementation of the DAG index is intended to be used as a
 // reliable baseline for tests.

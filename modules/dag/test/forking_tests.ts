@@ -1,6 +1,6 @@
-import { dag, ForkPosition, Position } from "../src/index";
+import { dag, ForkPosition, Position } from "../src/index.js";
 
-import { assertTrue, run } from "@hyper-hyper-space/hhs3_util/dist/test";
+import { assertTrue, run } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 
 import {
     appendNodesToDag,
@@ -11,13 +11,13 @@ import {
     createRandomDag,
     createRandomDags,
     createRandomDisconnectedDags
-} from "./utils/dag_create";
-import { Hash, sha } from "@hyper-hyper-space/hhs3_crypto";
+} from "./utils/dag_create.js";
+import { Hash, sha256 } from "@hyper-hyper-space/hhs3_crypto";
 import { set } from "@hyper-hyper-space/hhs3_util";
 import { json } from "@hyper-hyper-space/hhs3_json";
 
-import { draw, graph, label } from "./utils/dag_diagram";
-import { MemLevelIndexStore } from "../src/idx/level/level_idx_mem_store";
+import { draw, graph, label } from "./utils/dag_diagram.js";
+import { MemLevelIndexStore } from "../src/idx/level/level_idx_mem_store.js";
 
 const pp = (ns: Set<Hash>) => Array.from(ns).map(label).sort();
 
@@ -60,7 +60,7 @@ const topoDagPairConstr: [() => dag.Dag, () => dag.Dag] = [
             store,
             new dag.idx.flat.mem.MemFlatIndexStore()
         );
-        return dag.create(store, index, sha.sha256);
+        return dag.create(store, index, sha256);
     },
     () => {
         const store = new dag.store.MemDagStorage();
@@ -68,7 +68,7 @@ const topoDagPairConstr: [() => dag.Dag, () => dag.Dag] = [
             store,
             new dag.idx.topo.mem.MemTopoIndexStore()
         );
-        return dag.create(store, index, sha.sha256);
+        return dag.create(store, index, sha256);
     }
 ];
 
@@ -79,7 +79,7 @@ export const levelDagPairConstr: [() => dag.Dag, () => dag.Dag] = [
             store,
             new dag.idx.topo.mem.MemTopoIndexStore()
         );
-        return dag.create(store, index, sha.sha256);
+        return dag.create(store, index, sha256);
     },
     () => {
         const store = new dag.store.MemDagStorage();
@@ -87,7 +87,7 @@ export const levelDagPairConstr: [() => dag.Dag, () => dag.Dag] = [
             store,
             new dag.idx.level.mem.MemLevelIndexStore({ levelFactor: 4 })
         );
-        return dag.create(store, index, sha.sha256);
+        return dag.create(store, index, sha256);
     }
 ];
 
