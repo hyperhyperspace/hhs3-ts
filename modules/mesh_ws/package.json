@@ -1,0 +1,27 @@
+{
+  "name": "@hyper-hyper-space/hhs3_mesh_ws",
+  "version": "0.1.0",
+  "description": "WebSocket transport for HHSv3 mesh",
+  "type": "module",
+  "source": "src/index.ts",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "scripts": {
+    "test": "node --import ../../register.mjs ./test/run_tests.ts",
+    "debug": "node --import ../../register.mjs ./test/run_tests.ts",
+    "build": "npx tsc"
+  },
+  "author": "Santiago Bazerque",
+  "license": "MIT",
+  "devDependencies": {
+    "@hyper-hyper-space/hhs3_util": "^0.1.0",
+    "@types/node": "^22.2.0",
+    "@types/ws": "^8.5.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.4"
+  },
+  "dependencies": {
+    "@hyper-hyper-space/hhs3_mesh": "^0.1.0",
+    "ws": "^8.18.0"
+  }
+}
