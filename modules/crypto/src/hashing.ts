@@ -1,3 +1,7 @@
+// Cryptographic hash functions. Used for DAG entry hashing, element identity
+// in replicated data types, and KeyId derivation from public keys. Digests are
+// returned as base64-encoded strings (the Hash type used throughout the project).
+
 import { sha256 as nobleSha256 } from '@noble/hashes/sha2.js';
 import { blake3 as nobleBlake3 } from '@noble/hashes/blake3.js';
 

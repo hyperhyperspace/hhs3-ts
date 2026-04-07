@@ -1,3 +1,7 @@
+// HMAC-based Key Derivation Function (RFC 5869). Used internally by the KEM
+// suites to derive shared secrets from raw DH output and to combine component
+// secrets in hybrid constructions via domain-separated extract-then-expand.
+
 import { hkdf as nobleHkdf, extract as nobleExtract, expand as nobleExpand } from '@noble/hashes/hkdf.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 

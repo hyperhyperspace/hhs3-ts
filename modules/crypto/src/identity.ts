@@ -1,3 +1,7 @@
+// Cryptographic identity types. A PublicKey is self-describing key material
+// (suite name + raw bytes). A KeyId is a compact, suite-agnostic hash of a
+// serialized PublicKey, used as a stable peer identifier across the system.
+
 import { Hash, HashSuite, stringToUint8Array } from './hashing.js';
 
 export type PublicKey = {

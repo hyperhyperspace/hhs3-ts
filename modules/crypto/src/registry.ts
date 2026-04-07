@@ -1,3 +1,8 @@
+// Suite registry. All supported cryptographic algorithms are registered here at
+// module load. Provides both untyped lookups (for deserialization / wire-protocol
+// negotiation where names arrive as strings) and BasicCrypto, a typed facade
+// with compile-time-checked algorithm names for use by application code.
+
 import { SigningSuite, ed25519, mlDsa65, ed25519_mlDsa65 } from './signing.js';
 import { KemSuite, x25519Hkdf, mlKem768, x25519Hkdf_mlKem768 } from './kem.js';
 import { AeadSuite, chacha20Poly1305 } from './aead.js';

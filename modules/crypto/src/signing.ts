@@ -1,3 +1,7 @@
+// Digital signature suites for identity authentication and message integrity.
+// Provides classical (Ed25519), post-quantum (ML-DSA-65 / FIPS 204), and a
+// hybrid that requires both to verify, for quantum-resistant transition safety.
+
 import { ed25519 as nobleEd25519 } from '@noble/curves/ed25519.js';
 import { ml_dsa65 } from '@noble/post-quantum/ml-dsa.js';
 

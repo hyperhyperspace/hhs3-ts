@@ -1,3 +1,7 @@
+// Authenticated Encryption with Associated Data. Used for encrypting session
+// traffic after key agreement. The AEAD construction binds ciphertext integrity
+// to optional associated data (e.g. message headers), preventing tampering.
+
 import { chacha20poly1305 as nobleChacha } from '@noble/ciphers/chacha.js';
 
 export interface AeadSuite {

@@ -1,3 +1,8 @@
+// Key Encapsulation Mechanism suites for establishing shared secrets between
+// peers without prior key exchange. Used for session key negotiation in the
+// mesh layer. Provides classical (X25519-HKDF / RFC 9180 DHKEM), post-quantum
+// (ML-KEM-768 / FIPS 203), and a hybrid that combines both via HKDF.
+
 import { x25519 } from '@noble/curves/ed25519.js';
 import { ml_kem768 } from '@noble/post-quantum/ml-kem.js';
 import { hkdfSha256 } from './hkdf.js';
