@@ -1,6 +1,6 @@
 # Crypto
 
-Cryptographic primitives for Hyper Hyper Space v3. This module consolidates all cryptographic operations into a single place — hashing, signing, key encapsulation, authenticated encryption, key derivation, and identity management — with classical, hybrid and post-quantum algorithm options. All implementations are backed by the audited [`@noble`](https://paulmillr.com/noble/) library family and follow FIPS and RFC standards for cross-language interoperability.
+Cryptographic primitives for Hyper Hyper Space v3. This module consolidates all cryptographic operations into a single place — hashing, signing, key encapsulation, authenticated encryption, key derivation, and identity management — with classical, hybrid and post-quantum algorithm options. All implementations are backed by the audited `[@noble](https://paulmillr.com/noble/)` library family and follow FIPS and RFC standards for cross-language interoperability.
 
 ## Design
 
@@ -12,7 +12,7 @@ Every category of cryptographic operation is modeled as a **suite interface** wi
 └───────┬───────┘
         │
   ┌─────┴──────┐
-  │  Registry   │  ← maps name strings → suite instances
+  │  Registry  │  ← maps name strings → suite instances
   └─────┬──────┘
         │
  ┌──────┼──────────┬──────────┬────────┬───────┐
@@ -24,10 +24,12 @@ Hash  Signing    KEM       AEAD     KDF   Identity
 
 ### Hashing (`HashSuite`)
 
-| Constant | Name | Digest | Source |
-|----------|------|--------|--------|
-| `HASH_SHA256` | `sha-256` | 32 bytes | FIPS 180-4 |
-| `HASH_BLAKE3` | `blake3` | 32 bytes | [BLAKE3 spec](https://github.com/BLAKE3-team/BLAKE3-specs) |
+
+| Constant      | Name      | Digest   | Source                                                     |
+| ------------- | --------- | -------- | ---------------------------------------------------------- |
+| `HASH_SHA256` | `sha-256` | 32 bytes | FIPS 180-4                                                 |
+| `HASH_BLAKE3` | `blake3`  | 32 bytes | [BLAKE3 spec](https://github.com/BLAKE3-team/BLAKE3-specs) |
+
 
 ```typescript
 interface HashSuite {
@@ -42,11 +44,13 @@ Used for DAG entry hashing, element identity in replicated data types, and `KeyI
 
 ### Signing (`SigningSuite`)
 
-| Constant | Name | PK | SK | Sig | Standard |
-|----------|------|----|----|-----|----------|
-| `SIGNING_ED25519` | `ed25519` | 32 B | 32 B | 64 B | RFC 8032 |
-| `SIGNING_ML_DSA_65` | `ml-dsa-65` | 1952 B | 4032 B | 3309 B | FIPS 204 |
+
+| Constant                    | Name                | PK     | SK     | Sig    | Standard                  |
+| --------------------------- | ------------------- | ------ | ------ | ------ | ------------------------- |
+| `SIGNING_ED25519`           | `ed25519`           | 32 B   | 32 B   | 64 B   | RFC 8032                  |
+| `SIGNING_ML_DSA_65`         | `ml-dsa-65`         | 1952 B | 4032 B | 3309 B | FIPS 204                  |
 | `SIGNING_ED25519_ML_DSA_65` | `ed25519+ml-dsa-65` | 1984 B | 4064 B | 3373 B | Hybrid (both must verify) |
+
 
 ```typescript
 interface SigningSuite {
@@ -64,11 +68,13 @@ The hybrid suite concatenates classical and post-quantum keys/signatures and req
 
 ### Key Encapsulation (`KemSuite`)
 
-| Constant | Name | PK | SK | CT | SS | Source |
-|----------|------|----|----|----|----|--------|
-| `KEM_X25519_HKDF` | `x25519-hkdf` | 32 B | 32 B | 32 B | 32 B | RFC 9180 DHKEM |
-| `KEM_ML_KEM_768` | `ml-kem-768` | 1184 B | 2400 B | 1088 B | 32 B | FIPS 203 |
+
+| Constant                     | Name                     | PK     | SK     | CT     | SS   | Source                 |
+| ---------------------------- | ------------------------ | ------ | ------ | ------ | ---- | ---------------------- |
+| `KEM_X25519_HKDF`            | `x25519-hkdf`            | 32 B   | 32 B   | 32 B   | 32 B | RFC 9180 DHKEM         |
+| `KEM_ML_KEM_768`             | `ml-kem-768`             | 1184 B | 2400 B | 1088 B | 32 B | FIPS 203               |
 | `KEM_X25519_HKDF_ML_KEM_768` | `x25519-hkdf+ml-kem-768` | 1216 B | 2432 B | 1120 B | 32 B | Hybrid (HKDF combiner) |
+
 
 ```typescript
 interface KemSuite {
@@ -87,9 +93,11 @@ Used for session key negotiation in the mesh layer's Noise-like handshake.
 
 ### Authenticated Encryption (`AeadSuite`)
 
-| Constant | Name | Key | Nonce | Tag |
-|----------|------|-----|-------|-----|
-| `AEAD_CHACHA20_POLY1305` | `chacha20-poly1305` | 32 B | 12 B | 16 B |
+
+| Constant                 | Name                | Key  | Nonce | Tag  |
+| ------------------------ | ------------------- | ---- | ----- | ---- |
+| `AEAD_CHACHA20_POLY1305` | `chacha20-poly1305` | 32 B | 12 B  | 16 B |
+
 
 ```typescript
 interface AeadSuite {
@@ -104,9 +112,11 @@ interface AeadSuite {
 
 ### Key Derivation (`KdfSuite`)
 
-| Constant | Name | Standard |
-|----------|------|----------|
+
+| Constant          | Name          | Standard |
+| ----------------- | ------------- | -------- |
 | `KDF_HKDF_SHA256` | `hkdf-sha256` | RFC 5869 |
+
 
 ```typescript
 interface KdfSuite {
@@ -143,7 +153,7 @@ const suite = getSigningSuite('ed25519');       // SigningSuite | undefined
 const hash  = getHashSuite('sha-256');          // HashSuite | undefined
 ```
 
-**`BasicCrypto` typed facade** — for application code where algorithm choices are known at compile time:
+`**BasicCrypto` typed facade** — for application code where algorithm choices are known at compile time:
 
 ```typescript
 const crypto = createBasicCrypto();
@@ -164,12 +174,12 @@ The name constants (`HASH_SHA256`, `SIGNING_ED25519`, etc.) are the single sourc
 
 ## Dependencies
 
-All cryptographic implementations use the [`@noble`](https://paulmillr.com/noble/) library family:
+All cryptographic implementations use the `[@noble](https://paulmillr.com/noble/)` library family:
 
-- [`@noble/hashes`](https://github.com/paulmillr/noble-hashes) — SHA-256, BLAKE3, HKDF
-- [`@noble/curves`](https://github.com/paulmillr/noble-curves) — Ed25519, X25519
-- [`@noble/post-quantum`](https://github.com/paulmillr/noble-post-quantum) — ML-DSA-65, ML-KEM-768
-- [`@noble/ciphers`](https://github.com/paulmillr/noble-ciphers) — ChaCha20-Poly1305
+- `[@noble/hashes](https://github.com/paulmillr/noble-hashes)` — SHA-256, BLAKE3, HKDF
+- `[@noble/curves](https://github.com/paulmillr/noble-curves)` — Ed25519, X25519
+- `[@noble/post-quantum](https://github.com/paulmillr/noble-post-quantum)` — ML-DSA-65, ML-KEM-768
+- `[@noble/ciphers](https://github.com/paulmillr/noble-ciphers)` — ChaCha20-Poly1305
 
 These are pure TypeScript, audited, and follow FIPS/RFC specifications, ensuring interoperability with Rust and other implementations.
 
@@ -189,3 +199,4 @@ The test suite covers all suite interfaces, hybrid constructions (component tamp
 ```
 npm run test
 ```
+
