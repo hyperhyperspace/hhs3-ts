@@ -7,7 +7,23 @@ import { hkdfSha256 } from '../hkdf.js';
 import { serializePublicKey, deserializePublicKey, keyIdFromPublicKey, PublicKey } from '../identity.js';
 import { sha256, blake3 } from '../hashing.js';
 import { random } from '../index.js';
-import { getSigningSuite, getKemSuite, getAeadSuite, getKdfSuite, getHashSuite, createBasicCrypto } from '../registry.js';
+import {
+    HASH_SHA256,
+    HASH_BLAKE3,
+    SIGNING_ED25519,
+    SIGNING_ML_DSA_65,
+    SIGNING_ED25519_ML_DSA_65,
+    KEM_X25519_HKDF,
+    KEM_ML_KEM_768,
+    AEAD_CHACHA20_POLY1305,
+    KDF_HKDF_SHA256,
+    getSigningSuite,
+    getKemSuite,
+    getAeadSuite,
+    getKdfSuite,
+    getHashSuite,
+    createBasicCrypto,
+} from '../registry.js';
 import { ed25519 as nobleEd25519 } from '@noble/curves/ed25519.js';
 
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
@@ -165,7 +181,7 @@ async function testHybridKemTampering() {
 
 async function testIdentityRoundTrip() {
     const { publicKey: rawKey } = await ed25519.generateKeyPair();
-    const pk: PublicKey = { suite: 'ed25519', key: rawKey };
+    const pk: PublicKey = { suite: SIGNING_ED25519, key: rawKey };
 
     const serialized = serializePublicKey(pk);
     const deserialized = deserializePublicKey(serialized);
@@ -178,15 +194,15 @@ async function testIdentityRoundTrip() {
     testing.assertEquals(keyId1, keyId2, 'same PublicKey should produce same KeyId');
 
     const { publicKey: rawKey2 } = await ed25519.generateKeyPair();
-    const pk2: PublicKey = { suite: 'ed25519', key: rawKey2 };
+    const pk2: PublicKey = { suite: SIGNING_ED25519, key: rawKey2 };
     const keyId3 = keyIdFromPublicKey(pk2, sha256);
     testing.assertTrue(keyId1 !== keyId3, 'different keys should produce different KeyIds');
 }
 
 async function testIdentitySuiteDistinction() {
     const keyBytes = random.getBytes(32);
-    const pk1: PublicKey = { suite: 'ed25519', key: keyBytes };
-    const pk2: PublicKey = { suite: 'ml-dsa-65', key: keyBytes };
+    const pk1: PublicKey = { suite: SIGNING_ED25519, key: keyBytes };
+    const pk2: PublicKey = { suite: SIGNING_ML_DSA_65, key: keyBytes };
 
     const id1 = keyIdFromPublicKey(pk1, sha256);
     const id2 = keyIdFromPublicKey(pk2, sha256);
@@ -274,33 +290,33 @@ async function testBlake3RoundTrip() {
 // ---- Registry tests ----
 
 async function testRegistryLookups() {
-    const s = getSigningSuite('ed25519');
+    const s = getSigningSuite(SIGNING_ED25519);
     testing.assertTrue(s !== undefined, 'ed25519 signing suite should be in registry');
     testing.assertEquals(s!.name, 'ed25519', 'registry should return correct suite');
 
-    const s2 = getSigningSuite('ml-dsa-65');
+    const s2 = getSigningSuite(SIGNING_ML_DSA_65);
     testing.assertTrue(s2 !== undefined, 'ml-dsa-65 should be in registry');
 
-    const s3 = getSigningSuite('ed25519+ml-dsa-65');
+    const s3 = getSigningSuite(SIGNING_ED25519_ML_DSA_65);
     testing.assertTrue(s3 !== undefined, 'hybrid signing should be in registry');
 
-    const k = getKemSuite('x25519-hkdf');
+    const k = getKemSuite(KEM_X25519_HKDF);
     testing.assertTrue(k !== undefined, 'x25519-hkdf should be in registry');
 
-    const k2 = getKemSuite('ml-kem-768');
+    const k2 = getKemSuite(KEM_ML_KEM_768);
     testing.assertTrue(k2 !== undefined, 'ml-kem-768 should be in registry');
 
-    const a = getAeadSuite('chacha20-poly1305');
+    const a = getAeadSuite(AEAD_CHACHA20_POLY1305);
     testing.assertTrue(a !== undefined, 'chacha20-poly1305 should be in registry');
 
-    const kdf = getKdfSuite('hkdf-sha256');
+    const kdf = getKdfSuite(KDF_HKDF_SHA256);
     testing.assertTrue(kdf !== undefined, 'hkdf-sha256 should be in registry');
 
-    const h = getHashSuite('sha-256');
+    const h = getHashSuite(HASH_SHA256);
     testing.assertTrue(h !== undefined, 'sha-256 should be in registry');
     testing.assertEquals(h!.digestSize, 32, 'sha-256 digest size should be 32');
 
-    const h2 = getHashSuite('blake3');
+    const h2 = getHashSuite(HASH_BLAKE3);
     testing.assertTrue(h2 !== undefined, 'blake3 should be in registry');
     testing.assertEquals(h2!.digestSize, 32, 'blake3 digest size should be 32');
 
@@ -313,23 +329,23 @@ async function testRegistryLookups() {
 async function testBasicCrypto() {
     const c = createBasicCrypto();
 
-    const h = c.hash('sha-256');
+    const h = c.hash(HASH_SHA256);
     testing.assertEquals(h.name, 'sha-256', 'BasicCrypto hash should return sha-256');
     testing.assertEquals(h.digestSize, 32, 'sha-256 digest size via BasicCrypto');
 
-    const s = c.signing('ed25519');
+    const s = c.signing(SIGNING_ED25519);
     testing.assertEquals(s.name, 'ed25519', 'BasicCrypto signing should return ed25519');
 
-    const s2 = c.signing('ed25519+ml-dsa-65');
+    const s2 = c.signing(SIGNING_ED25519_ML_DSA_65);
     testing.assertEquals(s2.name, 'ed25519+ml-dsa-65', 'BasicCrypto hybrid signing');
 
-    const k = c.kem('x25519-hkdf');
+    const k = c.kem(KEM_X25519_HKDF);
     testing.assertEquals(k.name, 'x25519-hkdf', 'BasicCrypto kem should return x25519-hkdf');
 
-    const a = c.aead('chacha20-poly1305');
+    const a = c.aead(AEAD_CHACHA20_POLY1305);
     testing.assertEquals(a.name, 'chacha20-poly1305', 'BasicCrypto aead');
 
-    const kdf = c.kdf('hkdf-sha256');
+    const kdf = c.kdf(KDF_HKDF_SHA256);
     testing.assertEquals(kdf.name, 'hkdf-sha256', 'BasicCrypto kdf');
 }
 

@@ -9,13 +9,30 @@ import { AeadSuite, chacha20Poly1305 } from './aead.js';
 import { KdfSuite, hkdfSha256 } from './hkdf.js';
 import { HashSuite, sha256, blake3 } from './hashing.js';
 
-// Supported algorithm name types (compile-time checked)
+// Algorithm name constants (single source of truth for wire labels)
 
-export type HashName    = 'sha-256' | 'blake3';
-export type SigningName = 'ed25519' | 'ml-dsa-65' | 'ed25519+ml-dsa-65';
-export type KemName     = 'x25519-hkdf' | 'ml-kem-768' | 'x25519-hkdf+ml-kem-768';
-export type AeadName    = 'chacha20-poly1305';
-export type KdfName     = 'hkdf-sha256';
+export const HASH_SHA256                = 'sha-256'                  as const;
+export const HASH_BLAKE3                = 'blake3'                   as const;
+
+export const SIGNING_ED25519            = 'ed25519'                  as const;
+export const SIGNING_ML_DSA_65          = 'ml-dsa-65'                as const;
+export const SIGNING_ED25519_ML_DSA_65  = 'ed25519+ml-dsa-65'        as const;
+
+export const KEM_X25519_HKDF            = 'x25519-hkdf'              as const;
+export const KEM_ML_KEM_768             = 'ml-kem-768'               as const;
+export const KEM_X25519_HKDF_ML_KEM_768 = 'x25519-hkdf+ml-kem-768'  as const;
+
+export const AEAD_CHACHA20_POLY1305     = 'chacha20-poly1305'        as const;
+
+export const KDF_HKDF_SHA256            = 'hkdf-sha256'              as const;
+
+// Union types derived from the constants
+
+export type HashName    = typeof HASH_SHA256 | typeof HASH_BLAKE3;
+export type SigningName = typeof SIGNING_ED25519 | typeof SIGNING_ML_DSA_65 | typeof SIGNING_ED25519_ML_DSA_65;
+export type KemName     = typeof KEM_X25519_HKDF | typeof KEM_ML_KEM_768 | typeof KEM_X25519_HKDF_ML_KEM_768;
+export type AeadName    = typeof AEAD_CHACHA20_POLY1305;
+export type KdfName     = typeof KDF_HKDF_SHA256;
 
 // Registry maps
 

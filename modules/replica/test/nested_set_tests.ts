@@ -3,7 +3,7 @@ import { RSet, rSetFactory, RSetProvider } from "../src/types/rset.js";
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { createMemDagBackend } from "../src/dag/mem_dag_storage.js";
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { B64Hash, createBasicCrypto, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash, createBasicCrypto, HASH_SHA256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
 
 const crypto = createBasicCrypto();
 
@@ -15,7 +15,7 @@ const createReplica = (): Replica<RSetProvider> => {
         rSetFactory
     );
 
-    const dagBackend = createMemDagBackend(crypto.hash('sha-256'));
+    const dagBackend = createMemDagBackend(crypto.hash(HASH_SHA256));
 
     const createProvider = (replica: Replica<RSetProvider>, id?: B64Hash): RSetProvider => ({
         getReplica: () => replica,
@@ -451,7 +451,7 @@ export const nestedSetTests = {
                     const leftVersion = version(leftHash);
                     const rightVersion = version(rightHash);
 
-                    const sharedLiteralHash = crypto.hash('sha-256').hashToB64(stringToUint8Array(json.toStringNormalized('shared')));
+                    const sharedLiteralHash = crypto.hash(HASH_SHA256).hashToB64(stringToUint8Array(json.toStringNormalized('shared')));
                     const deleteBarrierHash = await target.deleteWithBarrierByHash(sharedLiteralHash, leftVersion);
 
                     const concurrentView = await target.getView(rightVersion);

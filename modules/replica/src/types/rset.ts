@@ -24,7 +24,7 @@
 // aware of this caveats.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { B64Hash, BasicCrypto, sha256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash, BasicCrypto, HASH_SHA256, sha256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, MetaProps, position, EntryMetaFilter, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
 
 import { Payload, BasicProvider, RObject, RObjectFactory, RObjectTypeRegistry, RObjectInit, Replica, version, Version, View } from "../replica.js";
@@ -57,7 +57,7 @@ export const rSetFactory: RObjectFactory<RSetProvider> = {
 
     computeRootObjectId: async (payload: json.Literal, provider: RSetProvider) => {
 
-        const entry = dag.createEntry(payload, {}, position(), provider.getCrypto().hash('sha-256'));
+        const entry = dag.createEntry(payload, {}, position(), provider.getCrypto().hash(HASH_SHA256));
         return entry.hash;
     },
 
