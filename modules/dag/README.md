@@ -7,17 +7,17 @@ The module uses two storage interfaces: one for the DAG entries, and another for
 Here's the DAG interface:
 
 ```typescript
- type Dag = {
-    append(payload: json.Literal, meta: json.Literal, after?: Position): Promise<Hash>;
+type Dag = {
+    append(payload: json.Literal, meta: MetaProps, after?: Position): Promise<B64Hash>;
 
-    computeEntryHash(payload: json.Literal, after?: Position): Promise<Hash>;
+    computeEntryHash(payload: json.Literal, after?: Position): Promise<B64Hash>;
 
-    loadEntry(h: Hash): Promise<Entry|undefined>;
-    loadHeader(h: Hash): Promise<Header|undefined>;
+    loadEntry(h: B64Hash): Promise<Entry|undefined>;
+    loadHeader(h: B64Hash): Promise<Header|undefined>;
 
     getFrontier(): Promise<Position>;
 
-    // latest position where history hasn't forked yet
+    // Latest position where history hasn't forked yet
     findForkPosition(first: Position, second: Position): Promise<ForkPosition>;
     findMinimalCover(p: Position): Promise<Position>;
 
@@ -28,13 +28,18 @@ Here's the DAG interface:
 
     // This is useful for finding barrier ops that should be applied to concurrent changes
     findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position>;
+
+    loadAllEntries(): AsyncIterable<Entry>; // in topo order
+
+    getStore(): DagStore<any>;
+    getIndex(): DagIndex<any>;
 };
 ```
 
 
 ## Building
 
-To build, please write the following commands at the workspace level (top directory in this repo):
+To build, run the following commands at the workspace level (top directory in this repo):
 
 ```
 npm install
@@ -43,27 +48,29 @@ npm run build
 
 ## Usage
 
-In-memory storage for the DAG and the indexing strategies is provided with this package.
+In-memory storage for the DAG and the indexing strategies is provided with this package. For persistent storage, see the companion modules **`dag_sql`** (abstract SQL backend) and **`dag_sqlite`** (SQLite bindings).
 
-DAG entries are composed by a payload, a metadata section (not included in the hash) and a header (computed automatically, includes the predecessor entries).
+DAG entries are composed by a payload, a metadata section (not included in the hash) and a header (computed automatically, includes the predecessor entries). A `HashSuite` from the `crypto` module is required to compute entry hashes.
 
-To crate DAGs, do as follows:
+To create DAGs, do as follows:
 
 ```typescript
+import { sha256 } from '@hyper-hyper-space/hhs3_crypto';
+
 // DAG with flat indexing
 const store1 = new dag.store.MemDagStorage();
 const index1 = dag.idx.flat.createFlatIndex(new dag.idx.flat.mem.MemFlatIndexStore());
-const dag1 = dag.create(store1, index1); 
+const dag1 = dag.create(store1, index1, sha256); 
 
 // DAG with topological indexing
 const store2 = new dag.store.MemDagStorage();
 const index2 = dag.idx.topo.createDagTopoIndex(store2, new dag.idx.topo.mem.MemTopoIndexStore());
-const dag2 = dag.create(store2, index2); 
+const dag2 = dag.create(store2, index2, sha256); 
 
-// DAG with multi-level indexing
+// DAG with multi-level indexing (using a grouping factor of 8 at each level)
 const store3 = new dag.store.MemDagStorage();
 const index3 = dag.idx.level.createDagLevelIndex(new dag.idx.level.mem.MemLevelIndexStore({levelFactor: 8}));
-const dag3 = dag.create(store, index);  //Using a groping factor of 8 at each level
+const dag3 = dag.create(store3, index3, sha256);
 ```
 
 And then, to use:
@@ -94,9 +101,16 @@ Fork positions have 4 fields:
 
 - __commonFrontier__: a minimal covering of the intersection of __A__ and __B__'s histories.
 
+## Storage backends
+
+This module includes only in-memory storage. Persistent backends are provided by companion modules:
+
+- **`dag_sql`** [[local]](../dag_sql) — Implements `DagStore` and index stores over an abstract SQL connection interface, suitable for any SQL database.
+- **`dag_sqlite`** [[local]](../dag_sqlite) — Provides a concrete SQLite connection for `dag_sql`, using native SQLite bindings.
+
 ## Performance
 
-Performance was analyzed by creating a synthetic set of branching DAGs of different sizes. We're showing average wall clock time, measeured in milliseconds.
+Performance was analyzed by creating a synthetic set of branching DAGs of different sizes. We're showing average wall clock time, measured in milliseconds.
 
 ### Fork Analysis
 
@@ -127,7 +141,9 @@ in `modules/dag`.
 
 ## Testing
 
-We do deterministic testing over families of pseudo-randomly generated DAGs of different sizes. To run the test suite, first build the workspace and then do:
+We do deterministic testing over families of pseudo-randomly generated DAGs of different sizes. The **`dag_test`** module [[local]](../dag_test) provides shared test suites (backend parity, DAG creation helpers) reusable across storage backends.
+
+To run the test suite, first build the workspace and then do:
 
 ```
 npm run test
