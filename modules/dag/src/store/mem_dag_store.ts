@@ -1,5 +1,5 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { DagStore } from "./dag_store.js";
 import { Entry, Header, Position } from "../dag_defs.js";
 
@@ -7,10 +7,10 @@ import { Entry, Header, Position } from "../dag_defs.js";
 // In-memory implementation of the DAG store
 
 export class MemDagStorage implements DagStore {
-    private entries = new Map<Hash, Entry>();
-    private headers = new Map<Hash, Header>();
-    private frontier = new Set<Hash>();
-    private roots = new Set<Hash>();
+    private entries = new Map<B64Hash, Entry>();
+    private headers = new Map<B64Hash, Header>();
+    private frontier = new Set<B64Hash>();
+    private roots = new Set<B64Hash>();
 
     async withTransaction<T>(fn: () => Promise<T>): Promise<T> {
         return fn();
@@ -28,11 +28,11 @@ export class MemDagStorage implements DagStore {
         this.frontier.add(hash);
     }
 
-    async loadEntry(h: Hash): Promise<Readonly<Entry> | undefined> {
+    async loadEntry(h: B64Hash): Promise<Readonly<Entry> | undefined> {
         return this.entries.get(h);
     }
 
-    async loadHeader(h: Hash): Promise<Readonly<Header> | undefined> {
+    async loadHeader(h: B64Hash): Promise<Readonly<Header> | undefined> {
         return this.headers.get(h);
     }
 

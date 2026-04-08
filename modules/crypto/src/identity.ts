@@ -2,14 +2,14 @@
 // (suite name + raw bytes). A KeyId is a compact, suite-agnostic hash of a
 // serialized PublicKey, used as a stable peer identifier across the system.
 
-import { Hash, HashSuite, stringToUint8Array } from './hashing.js';
+import { B64Hash, HashSuite, stringToUint8Array } from './hashing.js';
 
 export type PublicKey = {
     suite: string;
     key: Uint8Array;
 };
 
-export type KeyId = Hash;
+export type KeyId = B64Hash;
 
 export function serializePublicKey(pk: PublicKey): Uint8Array {
     const suiteBytes = stringToUint8Array(pk.suite);
@@ -33,5 +33,5 @@ export function deserializePublicKey(bytes: Uint8Array): PublicKey {
 }
 
 export function keyIdFromPublicKey(pk: PublicKey, hash: HashSuite): KeyId {
-    return hash.hash(serializePublicKey(pk));
+    return hash.hashToB64(serializePublicKey(pk));
 }

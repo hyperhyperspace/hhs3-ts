@@ -24,7 +24,7 @@
 // aware of this caveats.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { Hash, BasicCrypto, sha256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash, BasicCrypto, sha256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, MetaProps, position, EntryMetaFilter, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
 
 import { Payload, BasicProvider, RObject, RObjectFactory, RObjectTypeRegistry, RObjectInit, Replica, version, Version, View } from "../replica.js";
@@ -110,7 +110,7 @@ export const rSetFactory: RObjectFactory<RSetProvider> = {
         return await scopedDag.append(createPayload, meta, position());
     },
 
-    loadObject: async (id: Hash, provider: RSetProvider) => {
+    loadObject: async (id: B64Hash, provider: RSetProvider) => {
         const scopedDag = await provider.getScopedDag();
         const createOp = (await scopedDag.loadEntry(id))!.payload as CreateSetPayload;
         return new RSet(id, createOp, provider);
@@ -179,11 +179,11 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
 
     static typeId = "hhs/set_v1";
 
-    createOpId: Hash;
+    createOpId: B64Hash;
     createOp: CreateSetPayload;
     private resources: RSetResources;
 
-    constructor(createOpId: Hash, createOp: CreateSetPayload, provider: RSetProvider) {
+    constructor(createOpId: B64Hash, createOp: CreateSetPayload, provider: RSetProvider) {
         this.createOpId = createOpId;
         this.createOp = createOp;
         this.resources = {
@@ -207,7 +207,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
 
     // Set operations
 
-    async add(element: T, at?: Version): Promise<Hash> {
+    async add(element: T, at?: Version): Promise<B64Hash> {
         const dag = await this.scopedDag();
 
         at = at || await dag.getFrontier();
@@ -216,7 +216,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
         return this.applyValidatedPayload(payload, at);
     }
     
-    async addWithBarrier(element: T, at?: Version): Promise<Hash> {
+    async addWithBarrier(element: T, at?: Version): Promise<B64Hash> {
         const dag = await this.scopedDag();
 
         at = at || await dag.getFrontier();
@@ -247,7 +247,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
         }        
     }
 
-    async delete(element: T, at?: Version): Promise<Hash> {
+    async delete(element: T, at?: Version): Promise<B64Hash> {
 
         if (this.contentType() !== undefined) {
             throw new Error("RSet.delete(element) is not well defined when contentType is present, please use deleteByHash");
@@ -257,7 +257,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
         return this.deleteByHash(elementHash, at);
     }
 
-    async deleteByHash(elementHash: Hash, at?: Version): Promise<Hash> {
+    async deleteByHash(elementHash: B64Hash, at?: Version): Promise<B64Hash> {
         const dag = await this.scopedDag();
 
         at = at || await dag.getFrontier();
@@ -266,12 +266,12 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
         
     }
 
-    async deleteWithBarrier(element: T, at?: Version): Promise<Hash> {
+    async deleteWithBarrier(element: T, at?: Version): Promise<B64Hash> {
         const elementHash = await hashElement(element);
         return this.deleteWithBarrierByHash(elementHash, at);
     }
 
-    async deleteWithBarrierByHash(elementHash: Hash, at?: Version): Promise<Hash> {
+    async deleteWithBarrierByHash(elementHash: B64Hash, at?: Version): Promise<B64Hash> {
         const dag = await this.scopedDag();
 
         at = at || await dag.getFrontier();
@@ -279,7 +279,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
         return this.applyValidatedPayload(payload, at);
     }
 
-    private async createDeletePayload(elementHash: Hash, barrier: boolean, at: Version): Promise<DeleteElmtPayload> {
+    private async createDeletePayload(elementHash: B64Hash, barrier: boolean, at: Version): Promise<DeleteElmtPayload> {
 
         if (!this.acceptRedundantDelete()) {
             const view = await this.getView(at);
@@ -300,7 +300,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
         }        
     }
 
-    private async applyValidatedPayload(payload: Payload, at: Version): Promise<Hash> {
+    private async applyValidatedPayload(payload: Payload, at: Version): Promise<B64Hash> {
         if (!this.selfValidate()) {
             return this.applyPayload(payload, at);
         }
@@ -423,7 +423,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
         }
     } 
 
-    async applyPayload(payload: Payload, at: Version): Promise<Hash> {
+    async applyPayload(payload: Payload, at: Version): Promise<B64Hash> {
 
         const setPayload = payload as unknown as SetPayload;
         
@@ -536,7 +536,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
         return this.resources.getCausalDag();
     }
 
-    createChildProvider(elementHash: Hash, scope: DagScope): RSetProvider {
+    createChildProvider(elementHash: B64Hash, scope: DagScope): RSetProvider {
         return {
             getReplica: () => this.resources.replica,
             getRegistry: () => this.resources.registry,
@@ -547,7 +547,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
     }
 }
 
-const addMetaPropsForSetOp = (payload: SetPayload, meta: MetaProps, elmtHash: Hash): void => {
+const addMetaPropsForSetOp = (payload: SetPayload, meta: MetaProps, elmtHash: B64Hash): void => {
     const elmts = json.toSet([elmtHash]);
     meta['elmts'] = elmts;
     if (payload['action'] === 'add' || payload['action'] === 'delete') {
@@ -590,7 +590,7 @@ export class RSetView<T  extends json.Literal> implements View {
         return this.hasByHash(await hashElement(element));
     }
 
-    async hasByHash(elementHash: Hash): Promise<boolean> {
+    async hasByHash(elementHash: B64Hash): Promise<boolean> {
 
         let barriers = version();
 
@@ -600,7 +600,7 @@ export class RSetView<T  extends json.Literal> implements View {
             barriers = await dag.findConcurrentCoverWithFilter(this.from, this.at, {containsValues: {barrier: ['t'], elmts: [elementHash]}});
         }
 
-        let deleteBarriers = new Set<Hash>();
+        let deleteBarriers = new Set<B64Hash>();
 
         for (const barrierHash of barriers) {
             const barrier = (await dag.loadEntry(barrierHash))!.payload as unknown as SetPayload;
@@ -613,7 +613,7 @@ export class RSetView<T  extends json.Literal> implements View {
         }
 
         const cover = await dag.findCoverWithFilter(this.at, {containsValues: {elmts: [elementHash]}});
-        const adds = new Set<Hash>();
+        const adds = new Set<B64Hash>();
 
         for (const hash of cover) {
             const payload = (await dag.loadEntry(hash))!.payload as unknown as SetPayload;
@@ -640,7 +640,7 @@ export class RSetView<T  extends json.Literal> implements View {
         }
     }
 
-    async loadRObjectByHash(elementHash: Hash): Promise<RObject | undefined> {
+    async loadRObjectByHash(elementHash: B64Hash): Promise<RObject | undefined> {
 
         if (this.target.contentType() === undefined) {
             throw new Error("RSetView.getRObjectByHash is not supported when RSet has no contentType");
@@ -657,11 +657,11 @@ export class RSetView<T  extends json.Literal> implements View {
 class NestedElementScope implements DagScope {
 
     private parent: RSet;
-    private elementHash: Hash;
+    private elementHash: B64Hash;
     private start: Position;
     private executeAddOp?: AddElmtPayload;
 
-    constructor(parent: RSet, elementHash: Hash, startAt: Position, executeAddOp?: AddElmtPayload) {
+    constructor(parent: RSet, elementHash: B64Hash, startAt: Position, executeAddOp?: AddElmtPayload) {
         this.parent = parent;
         this.start = startAt;
         this.elementHash = elementHash;
@@ -780,18 +780,18 @@ class NestedElementScope implements DagScope {
 
 class ElementAddScope extends NestedElementScope implements DagScope {
 
-    constructor(parent: RSet, elementHash: Hash, startAt: Position, executeAddOp: AddElmtPayload) {
+    constructor(parent: RSet, elementHash: B64Hash, startAt: Position, executeAddOp: AddElmtPayload) {
         super(parent, elementHash, startAt, executeAddOp);
     }
 }
 
 class ElementUpdateScope extends NestedElementScope implements DagScope {
 
-    constructor(parent: RSet, elementHash: Hash, startAt: Position) {
+    constructor(parent: RSet, elementHash: B64Hash, startAt: Position) {
         super(parent, elementHash, startAt);
     }
 }
 
-function hashElement<T extends json.Literal>(element: T): Hash {
-    return sha256.hash(stringToUint8Array(json.toStringNormalized(element)));
+function hashElement<T extends json.Literal>(element: T): B64Hash {
+    return sha256.hashToB64(stringToUint8Array(json.toStringNormalized(element)));
 }

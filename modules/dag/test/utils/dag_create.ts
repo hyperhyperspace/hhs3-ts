@@ -1,4 +1,4 @@
-import { Hash, sha256 } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash, sha256 } from "@hyper-hyper-space/hhs3_crypto";
 import { MetaProps, Position } from "../../src/dag_defs.js";
 import { Dag, position } from "../../src/dag.js";
 import { draw, label } from "./dag_diagram.js";
@@ -32,7 +32,7 @@ export async function createD2(dag: Dag): Promise<[Position, Position]> {
     return [new Set([b2]), new Set([c1, c2])];
 }
 
-export async function createD3(dag: Dag): Promise<{ [key: string]: Hash }> {
+export async function createD3(dag: Dag): Promise<{ [key: string]: B64Hash }> {
     const a = await dag.append({'a': 1}, {});
     const b1 = await dag.append({'b1': 1}, {'p1': json.toSet(['1'])}, position(a));
     const b2 = await dag.append({'b2': 1}, {'p1': json.toSet(['1']), 'p2': json.toSet(['2'])}, position(a));
@@ -43,7 +43,7 @@ export async function createD3(dag: Dag): Promise<{ [key: string]: Hash }> {
     return {'a': a, 'b1': b1, 'b2': b2, 'c1': c1, 'd1': d1, 'd2': d2};
 }
 
-export async function createD4(dag: Dag): Promise<{ [key: string]: Hash }> {
+export async function createD4(dag: Dag): Promise<{ [key: string]: B64Hash }> {
     const a = await dag.append({'a': 1}, {});
     const b1 = await dag.append({'b1': 1}, {}, position(a));
     const b2 = await dag.append({'b2': 1}, {}, position(a));
@@ -120,11 +120,11 @@ export async function appendNodesToDag(dag: Dag, seed: number, size: number, sta
 
     while (i<size) {
 
-        let after = new Set<Hash>();
+        let after = new Set<B64Hash>();
 
         if (prng.next() < 0.5) {
             after = frontier;
-            frontier = new Set<Hash>()
+            frontier = new Set<B64Hash>()
         } else {
             for (const f of frontier) {
                 const x = prng.next();
@@ -136,7 +136,7 @@ export async function appendNodesToDag(dag: Dag, seed: number, size: number, sta
 
             if (after.size === 0) {
                 after = frontier;
-                frontier = new Set<Hash>();
+                frontier = new Set<B64Hash>();
             }
         }
 
@@ -233,14 +233,14 @@ export async function createRandomDag(dag: Dag, seed: number, size: number, opti
 
     const prng = new PRNG(seed);
 
-    const preds = new MultiMap<Hash, Hash>();
+    const preds = new MultiMap<B64Hash, B64Hash>();
 
     let i = 0;
-    let nodes = new Array<Hash>();
+    let nodes = new Array<B64Hash>();
     
     while (i<size) {
 
-        let after = new Set<Hash>();
+        let after = new Set<B64Hash>();
 
         if (nodes.length > 0) {
             const fanout = prng.nextInt(1, 5);
@@ -269,8 +269,8 @@ export async function createRandomDag(dag: Dag, seed: number, size: number, opti
     const fanout1 = prng.nextInt(1, 7);
     const fanout2 = prng.nextInt(1, 7);
 
-    const branch1 = new Set<Hash>();
-    const branch2 = new Set<Hash>();
+    const branch1 = new Set<B64Hash>();
+    const branch2 = new Set<B64Hash>();
 
     for (let i=0; i<fanout1; i++) {
         branch1.add(nodes[prng.nextInt(0, nodes.length-1)]);
@@ -284,12 +284,12 @@ export async function createRandomDag(dag: Dag, seed: number, size: number, opti
     return [branch1, branch2]
 }
 
-const minimalCover = (nodes: Set<Hash>, preds: MultiMap<Hash, Hash>) => {
+const minimalCover = (nodes: Set<B64Hash>, preds: MultiMap<B64Hash, B64Hash>) => {
 
-    const maxCover = new Set<Hash>([...nodes]);
+    const maxCover = new Set<B64Hash>([...nodes]);
 
-    const pending = new Set<Hash>([...nodes]);
-    const visited = new Set<Hash>();
+    const pending = new Set<B64Hash>([...nodes]);
+    const visited = new Set<B64Hash>();
     
     while (pending.size > 0) {
         const n = pending.values().next().value!;

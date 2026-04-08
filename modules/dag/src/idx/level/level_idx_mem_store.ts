@@ -1,4 +1,4 @@
-import { Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { MultiMap } from "@hyper-hyper-space/hhs3_util";
 
 import { EntryInfo, LevelIndexStore } from "./level_idx.js";
@@ -10,16 +10,16 @@ export class MemLevelIndexStore implements LevelIndexStore {
     levelFactor: number;
 
     nextTopoIndex: number = 0;
-    props: Map<Hash, EntryInfo> = new Map();
+    props: Map<B64Hash, EntryInfo> = new Map();
 
-    predLevels: Map<number, MultiMap<Hash, Hash>> = new Map();
-    succLevels: Map<number, MultiMap<Hash, Hash>> = new Map();
+    predLevels: Map<number, MultiMap<B64Hash, B64Hash>> = new Map();
+    succLevels: Map<number, MultiMap<B64Hash, B64Hash>> = new Map();
 
     constructor(props?: {levelFactor?: number}) {
         this.levelFactor = props?.levelFactor || 64;
     }
 
-    assignEntryInfo = async (node: Hash, after: Position) => {
+    assignEntryInfo = async (node: B64Hash, after: Position) => {
 
         if (!this.props.has(node)) {
             const topoIndex = this.nextTopoIndex;
@@ -60,7 +60,7 @@ export class MemLevelIndexStore implements LevelIndexStore {
         }
     };
     
-    getEntryInfo = async (node: Hash) => {
+    getEntryInfo = async (node: B64Hash) => {
         const p = this.props.get(node);
         const topoIndex = p?.topoIndex!
         const level = p?.level!;
@@ -69,7 +69,7 @@ export class MemLevelIndexStore implements LevelIndexStore {
         return {topoIndex, level, distanceToARoot};
     }
 
-    addPred = async (level: number, node: Hash, pred: Hash) => {
+    addPred = async (level: number, node: B64Hash, pred: B64Hash) => {
 
         let predLevel = this.predLevels.get(level);
 
@@ -81,9 +81,9 @@ export class MemLevelIndexStore implements LevelIndexStore {
         predLevel.add(node, pred);
     };
 
-    getPreds = async (level:number, node: Hash) => this.predLevels.get(level)?.get(node)||new Set<Hash>();
+    getPreds = async (level:number, node: B64Hash) => this.predLevels.get(level)?.get(node)||new Set<B64Hash>();
 
-    addSucc = async (level: number, node: Hash, succ: Hash) => {
+    addSucc = async (level: number, node: B64Hash, succ: B64Hash) => {
 
         let succLevel = this.succLevels.get(level);
         
@@ -94,5 +94,5 @@ export class MemLevelIndexStore implements LevelIndexStore {
         succLevel.add(node, succ);
     };
 
-    getSuccs = async (level: number, node: Hash) => this.succLevels.get(level)?.get(node)||new Set<Hash>();
+    getSuccs = async (level: number, node: B64Hash) => this.succLevels.get(level)?.get(node)||new Set<B64Hash>();
 }

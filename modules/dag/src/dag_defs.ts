@@ -1,18 +1,18 @@
-import { Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { Literal } from "@hyper-hyper-space/hhs3_json/dist/literal.js";
 import { MultiMap } from "@hyper-hyper-space/hhs3_util";
 
 // basic data types for reasoning about DAGs
 
-export type Position = Set<Hash>; // a point in virtual time, partially ordered
+export type Position = Set<B64Hash>; // a point in virtual time, partially ordered
 
-export const emptyPosition: () => Position = () => new Set<Hash>();
+export const emptyPosition: () => Position = () => new Set<B64Hash>();
 
 // a Header tells us what payload to insert in which position in a DAG.
 
 export type Header = Readonly<{
-    payloadHash: Hash,
+    payloadHash: B64Hash,
     prevEntryHashes: json.Set
 }>;
 
@@ -29,7 +29,7 @@ export type MetaProps = {[key: string]: json.Set};
 // an entry for the DAG:
 
 export type Entry = Readonly<{
-    hash: Hash,
+    hash: B64Hash,
     header: Header,
     payload: json.Literal,
     meta: MetaProps
@@ -43,8 +43,8 @@ export type Fragment = {
     end: Position,
     start: Position,
     
-    prev: MultiMap<Hash, Hash>;
-    next: MultiMap<Hash, Hash>;
+    prev: MultiMap<B64Hash, B64Hash>;
+    next: MultiMap<B64Hash, B64Hash>;
 }
 
 // Function signatures for DAG operations

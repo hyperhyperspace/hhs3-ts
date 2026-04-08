@@ -1,4 +1,4 @@
-import { Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { MultiMap, PriorityQueue, Queue } from "@hyper-hyper-space/hhs3_util";
 import { Entry, EntryMetaFilter, ForkPosition, Position, checkFilter } from "../../dag_defs.js";
 import { DagIndex } from "../../idx/dag_idx.js";
@@ -12,14 +12,14 @@ export type LevelFn = (e: Entry) => number;
 
 export type TopoIndexStore<Tx = void> = {
 
-    assignNextTopoIndex: (node: Hash, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<void>;
-    getTopoIndex: (node: Hash, ...tx: Tx extends void ? [] : [tx: Tx] | []) => Promise<number>;
+    assignNextTopoIndex: (node: B64Hash, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<void>;
+    getTopoIndex: (node: B64Hash, ...tx: Tx extends void ? [] : [tx: Tx] | []) => Promise<number>;
 
-    addPred: (node: Hash, pred: Hash, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<void>;
-    getPreds: (child: Hash, ...tx: Tx extends void ? [] : [tx: Tx] | []) => Promise<Set<Hash>>;
+    addPred: (node: B64Hash, pred: B64Hash, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<void>;
+    getPreds: (child: B64Hash, ...tx: Tx extends void ? [] : [tx: Tx] | []) => Promise<Set<B64Hash>>;
 };
 
-export async function addToTopoIndex<Tx = void>(index: TopoIndexStore<Tx>, n: Hash, preds?: Iterable<Hash>, ...tx: Tx extends void ? [] : [tx: Tx]): Promise<void> {
+export async function addToTopoIndex<Tx = void>(index: TopoIndexStore<Tx>, n: B64Hash, preds?: Iterable<B64Hash>, ...tx: Tx extends void ? [] : [tx: Tx]): Promise<void> {
 
     await index.assignNextTopoIndex(n, ...tx);
 
@@ -32,8 +32,8 @@ export async function findMinimalCoverUsingTopoIndex(index: TopoIndexStore<any>,
     
     //const startTime = performance.now();
 
-    const queue = new PriorityQueue<Hash>();
-    const enqueued = new Set<Hash>();
+    const queue = new PriorityQueue<B64Hash>();
+    const enqueued = new Set<B64Hash>();
     let minTopoIdx = Number.MAX_SAFE_INTEGER;
 
     for (const n of p) {
@@ -47,7 +47,7 @@ export async function findMinimalCoverUsingTopoIndex(index: TopoIndexStore<any>,
         }
     }
 
-    const minCover = new Set<Hash>(p);
+    const minCover = new Set<B64Hash>(p);
 
     while (!queue.isEmpty()) {
         const n = queue.dequeue()!;
@@ -104,32 +104,32 @@ export async function findForkPositionUsingTopoIndex(index: TopoIndexStore<any>,
     const start = performance.now();
 
     // Nodes to visit
-    const queue = new PriorityQueue<Hash>();
-    const enqueued = new Set<Hash>();
+    const queue = new PriorityQueue<B64Hash>();
+    const enqueued = new Set<B64Hash>();
 
     // Which of the nodes to visit is reachable from a purely A, B path
-    const reachFromA = new Set<Hash>();
-    const reachFromB = new Set<Hash>();
+    const reachFromA = new Set<B64Hash>();
+    const reachFromB = new Set<B64Hash>();
 
-    //const reachFromAStrict = new Set<Hash>();
-    //const reachFromBStrict = new Set<Hash>();
+    //const reachFromAStrict = new Set<B64Hash>();
+    //const reachFromBStrict = new Set<B64Hash>();
 
     // Which of the nodes to visit is reachable from a node reachable from A U B
     // (used to only add maximal nodes to maxJoin)
-    const reachFromAB = new Set<Hash>();
+    const reachFromAB = new Set<B64Hash>();
 
     // Which of the nodes to visit have direct successors only in A or only in B
     // (used to construct forkA & forkB)
-    const succsInA = new MultiMap<Hash, Hash>();
-    const succsInB = new MultiMap<Hash, Hash>();
+    const succsInA = new MultiMap<B64Hash, B64Hash>();
+    const succsInB = new MultiMap<B64Hash, B64Hash>();
 
     // What we're actually after:
-    const forkA = new Set<Hash>(); // A nodes pointing directly into A \int B
-    const forkB = new Set<Hash>(); // B nodes pointing directly into A \int B
-    const common = new Set<Hash>(); // nodes in A \int B being pointed at by nodes only in B or only in A
-    const commonFrontier = new Set<Hash>(); // maximal nodes in A \int B
+    const forkA = new Set<B64Hash>(); // A nodes pointing directly into A \int B
+    const forkB = new Set<B64Hash>(); // B nodes pointing directly into A \int B
+    const common = new Set<B64Hash>(); // nodes in A \int B being pointed at by nodes only in B or only in A
+    const commonFrontier = new Set<B64Hash>(); // maximal nodes in A \int B
 
-    const toCover = new Set<Hash>();
+    const toCover = new Set<B64Hash>();
 
     for (const n of a) {
         toCover.add(n);
@@ -253,12 +253,12 @@ export async function findForkPositionUsingTopoIndex(index: TopoIndexStore<any>,
 
 export async function findCoverWithFilterUsingTopoIndex(store: DagStore<any>, index: TopoIndexStore<any>, from: Position, meta: EntryMetaFilter): Promise<Position> {
 
-    const queue = new PriorityQueue<Hash>();
-    const enqueued = new Set<Hash>();
-    const visited = new Set<Hash>();
-    const preCover = new Set<Hash>();
+    const queue = new PriorityQueue<B64Hash>();
+    const enqueued = new Set<B64Hash>();
+    const visited = new Set<B64Hash>();
+    const preCover = new Set<B64Hash>();
 
-    const enqueue = async (node: Hash): Promise<void> => {
+    const enqueue = async (node: B64Hash): Promise<void> => {
         if (enqueued.has(node) || visited.has(node)) {
             return;
         }
@@ -304,10 +304,10 @@ export async function findCoverWithFilterUsingTopoIndex(store: DagStore<any>, in
 export async function findConcurrentCoverWithFilterUsingTopoIndex(store: DagStore<any>, index: TopoIndexStore<any>, from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
     // Create a successor map in forwardMap
 
-    const forwardMap = new MultiMap<Hash, Hash>();
+    const forwardMap = new MultiMap<B64Hash, B64Hash>();
 
-    let pending = new Set<Hash>([...from]);
-    let visited = new Set<Hash>();
+    let pending = new Set<B64Hash>([...from]);
+    let visited = new Set<B64Hash>();
 
     while (pending.size > 0) {
         const n = pending.values().next().value!;
@@ -326,10 +326,10 @@ export async function findConcurrentCoverWithFilterUsingTopoIndex(store: DagStor
 
     // Use the forward map to close the concurrentTo set upwards
 
-    pending = new Set<Hash>([...concurrentTo]);
-    visited = new Set<Hash>();
+    pending = new Set<B64Hash>([...concurrentTo]);
+    visited = new Set<B64Hash>();
 
-    const notConcurrentTo = new Set<Hash>([...concurrentTo]);
+    const notConcurrentTo = new Set<B64Hash>([...concurrentTo]);
 
     while (pending.size > 0) {
         const n = pending.values().next().value!;
@@ -347,8 +347,8 @@ export async function findConcurrentCoverWithFilterUsingTopoIndex(store: DagStor
 
     // And the backwards map to close the concurrentTo set downwards
 
-    pending = new Set<Hash>([...concurrentTo]);
-    visited = new Set<Hash>();
+    pending = new Set<B64Hash>([...concurrentTo]);
+    visited = new Set<B64Hash>();
 
     while (pending.size > 0) {
         const n = pending.values().next().value!;
@@ -366,10 +366,10 @@ export async function findConcurrentCoverWithFilterUsingTopoIndex(store: DagStor
 
     // Do a search for a pre cover, starting at the "from" position backwards, ignoring the nodes in notConcurrentTo
 
-    pending = new Set<Hash>([...from]);
-    visited = new Set<Hash>();
+    pending = new Set<B64Hash>([...from]);
+    visited = new Set<B64Hash>();
 
-    const preConcCover = new Set<Hash>();
+    const preConcCover = new Set<B64Hash>();
 
     while (pending.size > 0) {
         const n = pending.values().next().value!;
@@ -394,7 +394,7 @@ export async function findConcurrentCoverWithFilterUsingTopoIndex(store: DagStor
 export function createDagTopoIndex<Tx = void>(store: DagStore<Tx>, index: TopoIndexStore<Tx>): DagIndex<Tx> {
 
     return {
-        index: function (node: Hash, after?: Position, ...tx: Tx extends void ? [] : [tx: Tx]): Promise<void> {
+        index: function (node: B64Hash, after?: Position, ...tx: Tx extends void ? [] : [tx: Tx]): Promise<void> {
             return addToTopoIndex(index, node, after, ...tx);
         },
 

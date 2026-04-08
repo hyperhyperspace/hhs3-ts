@@ -1,4 +1,4 @@
-import { Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { Dag, Entry, EntryMetaFilter, ForkPosition, joinFilters, MetaProps, position, Position } from "@hyper-hyper-space/hhs3_dag";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { Literal } from "@hyper-hyper-space/hhs3_json/dist/literal.js";
@@ -7,9 +7,9 @@ import { Literal } from "@hyper-hyper-space/hhs3_json/dist/literal.js";
 // For root objects, backed by RootScopedDag; for nested objects, backed by NestedScopedDag.
 
 export type ScopedDag = {
-    append(payload: Literal, meta: MetaProps, after?: Position): Promise<Hash>;
-    computeEntryHash(payload: Literal, after?: Position): Promise<Hash>;
-    loadEntry(h: Hash): Promise<Entry | undefined>;
+    append(payload: Literal, meta: MetaProps, after?: Position): Promise<B64Hash>;
+    computeEntryHash(payload: Literal, after?: Position): Promise<B64Hash>;
+    loadEntry(h: B64Hash): Promise<Entry | undefined>;
     getFrontier(): Promise<Position>;
     findCoverWithFilter(from: Position, meta: EntryMetaFilter): Promise<Position>;
     findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position>;
@@ -33,15 +33,15 @@ export class RootScopedDag implements ScopedDag {
         this.dag = dag;
     }
 
-    append(payload: Literal, meta: MetaProps, after?: Position): Promise<Hash> {
+    append(payload: Literal, meta: MetaProps, after?: Position): Promise<B64Hash> {
         return this.dag.append(payload, meta, after);
     }
 
-    computeEntryHash(payload: Literal, after?: Position): Promise<Hash> {
+    computeEntryHash(payload: Literal, after?: Position): Promise<B64Hash> {
         return this.dag.computeEntryHash(payload, after);
     }
 
-    loadEntry(h: Hash): Promise<Entry | undefined> {
+    loadEntry(h: B64Hash): Promise<Entry | undefined> {
         return this.dag.loadEntry(h);
     }
 
@@ -91,7 +91,7 @@ export class NestedScopedDag implements ScopedDag {
         this.empty = scope.startEmpty();
     }
     
-    async append(payload: Literal, meta: MetaProps, after?: Position): Promise<Hash> {
+    async append(payload: Literal, meta: MetaProps, after?: Position): Promise<B64Hash> {
 
         if (after === undefined) {
             if (this.empty) {
@@ -121,7 +121,7 @@ export class NestedScopedDag implements ScopedDag {
     }
     
 
-    computeEntryHash(payload: Literal, after?: Position): Promise<Hash> {
+    computeEntryHash(payload: Literal, after?: Position): Promise<B64Hash> {
        
         if (after === undefined || after.size === 0) {
             after = this.scope.startAt();
@@ -130,7 +130,7 @@ export class NestedScopedDag implements ScopedDag {
         return this.dag.computeEntryHash(this.scope.wrapPayload(payload, after), after);
     }
 
-    async loadEntry(h: Hash): Promise<Entry | undefined> {
+    async loadEntry(h: B64Hash): Promise<Entry | undefined> {
         let entry = await this.dag.loadEntry(h);
         if (entry === undefined) {
             return undefined;

@@ -1,4 +1,4 @@
-import { Hash, sha256 } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash, sha256 } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, Dag, EntryMetaFilter, MetaProps, position, Position } from "@hyper-hyper-space/hhs3_dag";
 import { set } from "@hyper-hyper-space/hhs3_util";
 import { assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
@@ -49,7 +49,7 @@ async function testMinimalCoverParity(
         const positions: Position[] = [
             b1,
             b2,
-            new Set<Hash>([...b1, ...b2]),
+            new Set<B64Hash>([...b1, ...b2]),
             await gold.getFrontier(),
         ];
 
@@ -80,7 +80,7 @@ async function testMetaFilterParity(factory: DagFactory) {
     const positions: Array<Position> = [
         branchA,
         branchB,
-        new Set<Hash>([...branchA, ...branchB]),
+        new Set<B64Hash>([...branchA, ...branchB]),
         await goldDag.getFrontier(),
     ];
 

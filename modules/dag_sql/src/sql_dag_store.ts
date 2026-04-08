@@ -1,4 +1,4 @@
-import { Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { Entry, Header, Position } from "@hyper-hyper-space/hhs3_dag";
 import { DagStore } from "@hyper-hyper-space/hhs3_dag/dist/store/dag_store.js";
@@ -41,7 +41,7 @@ export class SqlDagStore implements DagStore<SqlConnection> {
         );
     }
 
-    async loadEntry(h: Hash, ...tx: [tx: SqlConnection] | []): Promise<Entry | undefined> {
+    async loadEntry(h: B64Hash, ...tx: [tx: SqlConnection] | []): Promise<Entry | undefined> {
         const c = tx[0] ?? this.conn;
         const rows = await c.query(
             `SELECT hash, payload, meta, header FROM entries WHERE dag_id = ? AND hash = ?`,
@@ -52,14 +52,14 @@ export class SqlDagStore implements DagStore<SqlConnection> {
 
         const row = rows[0];
         return {
-            hash: row.hash as Hash,
+            hash: row.hash as B64Hash,
             payload: JSON.parse(row.payload as string),
             meta: JSON.parse(row.meta as string),
             header: JSON.parse(row.header as string),
         };
     }
 
-    async loadHeader(h: Hash, ...tx: [tx: SqlConnection] | []): Promise<Header | undefined> {
+    async loadHeader(h: B64Hash, ...tx: [tx: SqlConnection] | []): Promise<Header | undefined> {
         const c = tx[0] ?? this.conn;
         const rows = await c.query(
             `SELECT header FROM entries WHERE dag_id = ? AND hash = ?`,
@@ -77,7 +77,7 @@ export class SqlDagStore implements DagStore<SqlConnection> {
             `SELECT hash FROM frontier WHERE dag_id = ?`,
             [this.dagId]
         );
-        return new Set(rows.map(r => r.hash as Hash));
+        return new Set(rows.map(r => r.hash as B64Hash));
     }
 
     loadAllEntries(...tx: [tx: SqlConnection] | []): AsyncIterable<Entry> {
@@ -92,7 +92,7 @@ export class SqlDagStore implements DagStore<SqlConnection> {
                 );
                 for (const row of rows) {
                     yield {
-                        hash: row.hash as Hash,
+                        hash: row.hash as B64Hash,
                         payload: JSON.parse(row.payload as string),
                         meta: JSON.parse(row.meta as string),
                         header: JSON.parse(row.header as string),

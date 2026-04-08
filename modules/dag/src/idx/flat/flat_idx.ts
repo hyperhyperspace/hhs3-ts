@@ -1,4 +1,4 @@
-import { Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { Entry, EntryMetaFilter, ForkPosition, Position, checkFilter } from "../../dag_defs.js";
 import { DagIndex } from "../../idx/dag_idx.js";
 import { DagStore } from "../../store/index.js";
@@ -14,11 +14,11 @@ export * as mem from './flat_idx_mem_store.js';
 export type LevelFn = (e: Entry) => number;
 
 export type FlatIndexStore<Tx = void> = {
-    addPred: (node: Hash, pred: Hash, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<void>;
-    getPreds: (child: Hash, ...tx: Tx extends void ? [] : [tx: Tx] | []) => Promise<Set<Hash>>;
+    addPred: (node: B64Hash, pred: B64Hash, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<void>;
+    getPreds: (child: B64Hash, ...tx: Tx extends void ? [] : [tx: Tx] | []) => Promise<Set<B64Hash>>;
 };
 
-export async function addToFlatIndex<Tx = void>(index: FlatIndexStore<Tx>, n: Hash, preds?: Iterable<Hash>, ...tx: Tx extends void ? [] : [tx: Tx]): Promise<void> {
+export async function addToFlatIndex<Tx = void>(index: FlatIndexStore<Tx>, n: B64Hash, preds?: Iterable<B64Hash>, ...tx: Tx extends void ? [] : [tx: Tx]): Promise<void> {
 
     for (const pred of (preds || [])) {
         await index.addPred(n, pred, ...tx);
@@ -27,10 +27,10 @@ export async function addToFlatIndex<Tx = void>(index: FlatIndexStore<Tx>, n: Ha
 
 export async function findMinimalCoverUsingFlatIndex(index: FlatIndexStore<any>, p: Position): Promise<Position> {
 
-    const minCover = new Set<Hash>([...p]);
+    const minCover = new Set<B64Hash>([...p]);
 
-    const pending = new Set<Hash>([...p]);
-    //const visited = new Set<Hash>(); // un-comment for faster execution, but much worse memory usage
+    const pending = new Set<B64Hash>([...p]);
+    //const visited = new Set<B64Hash>(); // un-comment for faster execution, but much worse memory usage
     
     while (pending.size > 0) {
         const n = pending.values().next().value!;
@@ -50,10 +50,10 @@ export async function findMinimalCoverUsingFlatIndex(index: FlatIndexStore<any>,
     return minCover;
 }
 
-async function findAllPreds(index: FlatIndexStore<any>, p: Position): Promise<Set<Hash>> {
+async function findAllPreds(index: FlatIndexStore<any>, p: Position): Promise<Set<B64Hash>> {
 
-    const pending = new Set<Hash>([...p]);
-    const visited = new Set<Hash>();
+    const pending = new Set<B64Hash>([...p]);
+    const visited = new Set<B64Hash>();
 
     while (pending.size > 0) {
         const n = pending.values().next().value!;
@@ -75,7 +75,7 @@ export async function findForkPositionUsingFlatIndex(index: FlatIndexStore<any>,
     const reachFromA = await findAllPreds(index, a);
     const reachFromB = await findAllPreds(index, b);
 
-    const reachFromAB = new Set<Hash>();
+    const reachFromAB = new Set<B64Hash>();
 
     for (const n of reachFromA) {
         if (reachFromB.has(n)) {
@@ -83,10 +83,10 @@ export async function findForkPositionUsingFlatIndex(index: FlatIndexStore<any>,
         }
     }
 
-    const forkA = new Set<Hash>();
-    const forkB = new Set<Hash>();
+    const forkA = new Set<B64Hash>();
+    const forkB = new Set<B64Hash>();
 
-    const common = new Set<Hash>();
+    const common = new Set<B64Hash>();
 
     for (const n of [...reachFromA]) {
         if (!reachFromB.has(n)) {
@@ -129,12 +129,12 @@ export async function findForkPositionUsingFlatIndex(index: FlatIndexStore<any>,
 
 export async function findCoverWithFilterUsingFlatIndex(dag: DagStore<any>, index: FlatIndexStore<any>, from: Position, filter: EntryMetaFilter): Promise<Position> {
     
-    //const minCover = new Set<Hash>([...from].filter(async (e: Hash) => checkFilter((await dag.loadHeader(e))!.meta, filter)));
+    //const minCover = new Set<B64Hash>([...from].filter(async (e: B64Hash) => checkFilter((await dag.loadHeader(e))!.meta, filter)));
 
-    const preCover = new Set<Hash>();
+    const preCover = new Set<B64Hash>();
 
-    const pending = new Set<Hash>([...from]);
-    const visited = new Set<Hash>();
+    const pending = new Set<B64Hash>([...from]);
+    const visited = new Set<B64Hash>();
     
     while (pending.size > 0) {
         const n = pending.values().next().value!;
@@ -167,10 +167,10 @@ export async function findConcurrentCoverWithFilterUsingFlatIndex(store: DagStor
 
     // Create a successor map in forwardMap
 
-    const forwardMap = new MultiMap<Hash, Hash>();
+    const forwardMap = new MultiMap<B64Hash, B64Hash>();
 
-    let pending = new Set<Hash>([...from]);
-    let visited = new Set<Hash>();
+    let pending = new Set<B64Hash>([...from]);
+    let visited = new Set<B64Hash>();
 
     while (pending.size > 0) {
         const n = pending.values().next().value!;
@@ -189,10 +189,10 @@ export async function findConcurrentCoverWithFilterUsingFlatIndex(store: DagStor
 
     // Use the forward map to close the concurrentTo set upwards
 
-    pending = new Set<Hash>([...concurrentTo]);
-    visited = new Set<Hash>();
+    pending = new Set<B64Hash>([...concurrentTo]);
+    visited = new Set<B64Hash>();
 
-    const notConcurrentTo = new Set<Hash>([...concurrentTo]);
+    const notConcurrentTo = new Set<B64Hash>([...concurrentTo]);
 
     while (pending.size > 0) {
         const n = pending.values().next().value!;
@@ -210,8 +210,8 @@ export async function findConcurrentCoverWithFilterUsingFlatIndex(store: DagStor
 
     // And the backwards map to close the concurrentTo set downwards
 
-    pending = new Set<Hash>([...concurrentTo]);
-    visited = new Set<Hash>();
+    pending = new Set<B64Hash>([...concurrentTo]);
+    visited = new Set<B64Hash>();
 
     while (pending.size > 0) {
         const n = pending.values().next().value!;
@@ -229,10 +229,10 @@ export async function findConcurrentCoverWithFilterUsingFlatIndex(store: DagStor
 
     // Do a search for a pre cover, starting at the "from" position backwards, ignoring the nodes in notConcurrentTo
 
-    pending = new Set<Hash>([...from]);
-    visited = new Set<Hash>();
+    pending = new Set<B64Hash>([...from]);
+    visited = new Set<B64Hash>();
 
-    const preConcCover = new Set<Hash>();
+    const preConcCover = new Set<B64Hash>();
 
     while (pending.size > 0) {
         const n = pending.values().next().value!;
@@ -257,7 +257,7 @@ export async function findConcurrentCoverWithFilterUsingFlatIndex(store: DagStor
 export function createFlatIndex<Tx = void>(store: DagStore<Tx>, indexStore: FlatIndexStore<Tx>): DagIndex<Tx> {
 
     return {
-        index: function (node: Hash, after?: Position, ...tx: Tx extends void ? [] : [tx: Tx]): Promise<void> {
+        index: function (node: B64Hash, after?: Position, ...tx: Tx extends void ? [] : [tx: Tx]): Promise<void> {
             return addToFlatIndex(indexStore, node, after, ...tx);
         },
 

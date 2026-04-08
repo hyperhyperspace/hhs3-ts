@@ -1,20 +1,20 @@
-import { Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { Dag } from "../../src/dag.js";
 
 import { writeFileSync } from 'fs';
 import { exec } from 'child_process';
 
-export function label(h: Hash) { return "_" + h.replace(/[^a-zA-Z0-9]/g, "").slice(-6, -1); }
+export function label(h: B64Hash) { return "_" + h.replace(/[^a-zA-Z0-9]/g, "").slice(-6, -1); }
 
 export type DrawOptions = { 
-    namedSets?: Array<[string, Set<Hash>]>,
-    tags?: Map<Hash, string>,
-    filter?: (n: Hash) => Promise<boolean>,
-    prev?: (n: Hash) => Promise<Set<Hash>>
+    namedSets?: Array<[string, Set<B64Hash>]>,
+    tags?: Map<B64Hash, string>,
+    filter?: (n: B64Hash) => Promise<boolean>,
+    prev?: (n: B64Hash) => Promise<Set<B64Hash>>
  }
 
-export function fullLabel(h: Hash, options?: DrawOptions): string {
+export function fullLabel(h: B64Hash, options?: DrawOptions): string {
     let result = label(h);   
 
     for (const [name, s] of options?.namedSets || []) {
@@ -57,8 +57,8 @@ export async function graph(dag: Dag, name: string, options?: DrawOptions): Prom
     let result = "digraph " + name + " {\n";
 
     /*
-    const done = new Set<Hash>();
-    const queue = new Set<Hash>();
+    const done = new Set<B64Hash>();
+    const queue = new Set<B64Hash>();
 
     for (const h of (await dag.getFrontier())) {
         queue.add(h);

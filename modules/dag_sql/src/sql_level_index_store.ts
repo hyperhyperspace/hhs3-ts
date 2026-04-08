@@ -1,4 +1,4 @@
-import { Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { Position } from "@hyper-hyper-space/hhs3_dag";
 import type { EntryInfo, LevelIndexStore } from "@hyper-hyper-space/hhs3_dag/dist/idx/level/level_idx.js";
 
@@ -16,7 +16,7 @@ export class SqlLevelIndexStore implements LevelIndexStore<SqlConnection> {
         this.levelFactor = opts?.levelFactor ?? 64;
     }
 
-    assignEntryInfo = async (node: Hash, after: Position, tx: SqlConnection): Promise<EntryInfo> => {
+    assignEntryInfo = async (node: B64Hash, after: Position, tx: SqlConnection): Promise<EntryInfo> => {
         const c = tx;
 
         const existing = await c.query(
@@ -77,7 +77,7 @@ export class SqlLevelIndexStore implements LevelIndexStore<SqlConnection> {
         return { topoIndex, level, distanceToARoot };
     };
 
-    getEntryInfo = async (node: Hash, ...tx: [tx: SqlConnection] | []): Promise<EntryInfo> => {
+    getEntryInfo = async (node: B64Hash, ...tx: [tx: SqlConnection] | []): Promise<EntryInfo> => {
         const c = tx[0] ?? this.conn;
         const rows = await c.query(
             `SELECT topo_index, level, distance_to_root FROM entry_info WHERE dag_id = ? AND hash = ?`,
@@ -92,7 +92,7 @@ export class SqlLevelIndexStore implements LevelIndexStore<SqlConnection> {
         };
     };
 
-    addPred = async (level: number, node: Hash, pred: Hash, tx: SqlConnection): Promise<void> => {
+    addPred = async (level: number, node: B64Hash, pred: B64Hash, tx: SqlConnection): Promise<void> => {
         const c = tx;
         await c.execute(
             `INSERT OR IGNORE INTO level_preds (dag_id, level, node, pred) VALUES (?, ?, ?, ?)`,
@@ -100,16 +100,16 @@ export class SqlLevelIndexStore implements LevelIndexStore<SqlConnection> {
         );
     };
 
-    getPreds = async (level: number, node: Hash, ...tx: [tx: SqlConnection] | []): Promise<Set<Hash>> => {
+    getPreds = async (level: number, node: B64Hash, ...tx: [tx: SqlConnection] | []): Promise<Set<B64Hash>> => {
         const c = tx[0] ?? this.conn;
         const rows = await c.query(
             `SELECT pred FROM level_preds WHERE dag_id = ? AND level = ? AND node = ?`,
             [this.dagId, level, node]
         );
-        return new Set(rows.map(r => r.pred as Hash));
+        return new Set(rows.map(r => r.pred as B64Hash));
     };
 
-    addSucc = async (level: number, node: Hash, succ: Hash, tx: SqlConnection): Promise<void> => {
+    addSucc = async (level: number, node: B64Hash, succ: B64Hash, tx: SqlConnection): Promise<void> => {
         const c = tx;
         await c.execute(
             `INSERT OR IGNORE INTO level_succs (dag_id, level, node, succ) VALUES (?, ?, ?, ?)`,
@@ -117,12 +117,12 @@ export class SqlLevelIndexStore implements LevelIndexStore<SqlConnection> {
         );
     };
 
-    getSuccs = async (level: number, node: Hash, ...tx: [tx: SqlConnection] | []): Promise<Set<Hash>> => {
+    getSuccs = async (level: number, node: B64Hash, ...tx: [tx: SqlConnection] | []): Promise<Set<B64Hash>> => {
         const c = tx[0] ?? this.conn;
         const rows = await c.query(
             `SELECT succ FROM level_succs WHERE dag_id = ? AND level = ? AND node = ?`,
             [this.dagId, level, node]
         );
-        return new Set(rows.map(r => r.succ as Hash));
+        return new Set(rows.map(r => r.succ as B64Hash));
     };
 }

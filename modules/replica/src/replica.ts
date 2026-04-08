@@ -1,4 +1,4 @@
-import { Hash, BasicCrypto } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash, BasicCrypto } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, MetaProps } from "@hyper-hyper-space/hhs3_dag";
 
 import { json } from "@hyper-hyper-space/hhs3_json";
@@ -7,7 +7,7 @@ export const MAX_TYPE_LENGTH = 128;
 
 export type Version = dag.Position;
 export const emptyVersion: () => Version = dag.emptyPosition;
-export const version: (...hashes: Hash[]) => Version = dag.position;
+export const version: (...hashes: B64Hash[]) => Version = dag.position;
 export type Payload = json.Literal;
 
 // RObject (Replicable Object): used both to write and interpret changes to a DAG-based history log.
@@ -19,12 +19,12 @@ export type Payload = json.Literal;
 
 export type RObject = {
     
-    getId(): Hash; // by contention, the id of the creation change op
+    getId(): B64Hash; // by contention, the id of the creation change op
     getType(): string;
 
     // for writing
     validatePayload(payload: Payload, at: Version): Promise<boolean>;
-    applyPayload(payload: Payload, at: Version): Promise<Hash>;
+    applyPayload(payload: Payload, at: Version): Promise<B64Hash>;
 
     // for reading: enabled only by explicitly requesting a version
     getView(at?: Version, from?: Version): Promise<View>;
@@ -45,12 +45,12 @@ export type BasicProvider = {
 };
 
 export type RObjectFactory<P extends BasicProvider = BasicProvider> = {
-    computeRootObjectId: (createPayload: Payload, provider: P) => Promise<Hash>;
+    computeRootObjectId: (createPayload: Payload, provider: P) => Promise<B64Hash>;
     
     validateCreationPayload: (createPayload: Payload, provider: P) => Promise<boolean>;
-    executeCreationPayload: (createPayload: Payload, provider: P) => Promise<Hash>;
+    executeCreationPayload: (createPayload: Payload, provider: P) => Promise<B64Hash>;
     
-    loadObject: (id: Hash, provider: P) => Promise<RObject>;
+    loadObject: (id: B64Hash, provider: P) => Promise<RObject>;
 }
 
 // A static view of a replicable object's state at a given version
@@ -62,7 +62,7 @@ export type View = {
 
 // An event that signals a change in the replicable object's state
 export type Event = {
-    getObjectId(): Hash;
+    getObjectId(): B64Hash;
     getType(): string;
     getVersion(): Version;
 }
@@ -94,17 +94,17 @@ export type ReplicaConfig = {
 export class Replica<P extends BasicProvider = BasicProvider> {
 
     private registry: RObjectTypeRegistry<P>;
-    private objects: Map<Hash, RObject> = new Map();
+    private objects: Map<B64Hash, RObject> = new Map();
     config: ReplicaConfig;
 
     // If id is missing, the object creation payload has not yet been validated.
     // In that case yhe provider will refuse to return any resources that consume 
     // significant resources, throwing an exception isntead. This mode is intended
     // for use in validation only.
-    private createProvider: (replica: Replica<P>, id?: Hash) => P;
+    private createProvider: (replica: Replica<P>, id?: B64Hash) => P;
     
 
-    constructor(registry: RObjectTypeRegistry<P>, createProvider: (replica: Replica<P>, id?: Hash) => P, config: ReplicaConfig = {}) {
+    constructor(registry: RObjectTypeRegistry<P>, createProvider: (replica: Replica<P>, id?: B64Hash) => P, config: ReplicaConfig = {}) {
         this.registry = registry;
         this.createProvider = createProvider;
         this.config = config;
@@ -112,11 +112,11 @@ export class Replica<P extends BasicProvider = BasicProvider> {
 
     getRegistry(): RObjectTypeRegistry<P> { return this.registry; }
 
-    async getObject(id: Hash): Promise<RObject> {
+    async getObject(id: B64Hash): Promise<RObject> {
         return this.objects.get(id)!;
     }
 
-    async addObject(init: RObjectInit): Promise<Hash> {
+    async addObject(init: RObjectInit): Promise<B64Hash> {
 
         const factory = await this.registry.lookup(init.type);
 

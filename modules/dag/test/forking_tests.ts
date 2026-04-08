@@ -12,14 +12,14 @@ import {
     createRandomDags,
     createRandomDisconnectedDags
 } from "./utils/dag_create.js";
-import { Hash, sha256 } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash, sha256 } from "@hyper-hyper-space/hhs3_crypto";
 import { set } from "@hyper-hyper-space/hhs3_util";
 import { json } from "@hyper-hyper-space/hhs3_json";
 
 import { draw, graph, label } from "./utils/dag_diagram.js";
 import { MemLevelIndexStore } from "../src/idx/level/level_idx_mem_store.js";
 
-const pp = (ns: Set<Hash>) => Array.from(ns).map(label).sort();
+const pp = (ns: Set<B64Hash>) => Array.from(ns).map(label).sort();
 
 const showForkPosition = (fp: ForkPosition) => {
     console.log("common:        ", pp(fp.common));
@@ -152,7 +152,7 @@ export const testForkingDags = async (
             showForkPosition(f2);
             console.log("saving failing graph to g.dot, g.png");
 
-            const levelTags = new Map<Hash, string>();
+            const levelTags = new Map<B64Hash, string>();
             const levels = new Set<number>();
 
             const idxStore = d2.getIndex().getIndexStore();
@@ -167,9 +167,9 @@ export const testForkingDags = async (
                 }
 
                 for (const level of levels) {
-                    const filter = async (h: Hash) =>
+                    const filter = async (h: B64Hash) =>
                         (await idxStore.getEntryInfo(h)).level >= level;
-                    const prev = async (h: Hash) => idxStore.getPreds(level, h);
+                    const prev = async (h: B64Hash) => idxStore.getPreds(level, h);
 
                     await draw(d1, "d_" + level, { filter: filter, prev: prev });
                 }

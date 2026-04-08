@@ -1,4 +1,4 @@
-import { Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { TopoIndexStore } from "@hyper-hyper-space/hhs3_dag/dist/idx/topo/topo_idx.js";
 
 import { SqlConnection } from "./sql_connection.js";
@@ -13,7 +13,7 @@ export class SqlTopoIndexStore implements TopoIndexStore<SqlConnection> {
         this.dagId = dagId;
     }
 
-    assignNextTopoIndex = async (node: Hash, tx: SqlConnection): Promise<void> => {
+    assignNextTopoIndex = async (node: B64Hash, tx: SqlConnection): Promise<void> => {
         const c = tx;
 
         const existing = await c.query(
@@ -35,7 +35,7 @@ export class SqlTopoIndexStore implements TopoIndexStore<SqlConnection> {
         );
     };
 
-    getTopoIndex = async (node: Hash, ...tx: [tx: SqlConnection] | []): Promise<number> => {
+    getTopoIndex = async (node: B64Hash, ...tx: [tx: SqlConnection] | []): Promise<number> => {
         const c = tx[0] ?? this.conn;
         const rows = await c.query(
             `SELECT topo_order FROM topo_index WHERE dag_id = ? AND hash = ?`,
@@ -44,7 +44,7 @@ export class SqlTopoIndexStore implements TopoIndexStore<SqlConnection> {
         return rows[0].topo_order as number;
     };
 
-    addPred = async (node: Hash, pred: Hash, tx: SqlConnection): Promise<void> => {
+    addPred = async (node: B64Hash, pred: B64Hash, tx: SqlConnection): Promise<void> => {
         const c = tx;
         await c.execute(
             `INSERT OR IGNORE INTO topo_preds (dag_id, node, pred) VALUES (?, ?, ?)`,
@@ -52,12 +52,12 @@ export class SqlTopoIndexStore implements TopoIndexStore<SqlConnection> {
         );
     };
 
-    getPreds = async (node: Hash, ...tx: [tx: SqlConnection] | []): Promise<Set<Hash>> => {
+    getPreds = async (node: B64Hash, ...tx: [tx: SqlConnection] | []): Promise<Set<B64Hash>> => {
         const c = tx[0] ?? this.conn;
         const rows = await c.query(
             `SELECT pred FROM topo_preds WHERE dag_id = ? AND node = ?`,
             [this.dagId, node]
         );
-        return new Set(rows.map(r => r.pred as Hash));
+        return new Set(rows.map(r => r.pred as B64Hash));
     };
 }

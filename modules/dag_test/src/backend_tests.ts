@@ -1,4 +1,3 @@
-import { Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, Dag, position, Position } from "@hyper-hyper-space/hhs3_dag";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { set } from "@hyper-hyper-space/hhs3_util";

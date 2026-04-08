@@ -4,11 +4,11 @@ import { position } from "../src/index.js";
 import { assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 
 import { createRandomDag, createD3 } from "./utils/dag_create.js";
-import { Hash, sha256 } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash, sha256 } from "@hyper-hyper-space/hhs3_crypto";
 import { set } from "@hyper-hyper-space/hhs3_util";
 import { label } from "./utils/dag_diagram.js";
 
-const pp = (ns: Set<Hash>) => Array.from(ns).map(label).sort();
+const pp = (ns: Set<B64Hash>) => Array.from(ns).map(label).sort();
 
 const collectMetas = async (d: dag.Dag): Promise<Array<MetaProps>> => {
     const metas: Array<MetaProps> = [];
@@ -31,7 +31,7 @@ const runMetaParity = async (constrs: [() => dag.Dag, () => dag.Dag], options?: 
     const positions: Array<Position> = [
         branchA,
         branchB,
-        new Set<Hash>([...branchA, ...branchB]),
+        new Set<B64Hash>([...branchA, ...branchB]),
         await dagA.getFrontier()
     ];
 

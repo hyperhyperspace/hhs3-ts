@@ -3,10 +3,10 @@
 // without a separate resolution step. Implementations may use DHT, signalling
 // servers, static bootstrap files, or gossip.
 
-import type { Hash, KeyId } from '@hyper-hyper-space/hhs3_crypto';
+import type { B64Hash, KeyId } from '@hyper-hyper-space/hhs3_crypto';
 import type { NetworkAddress } from './transport.js';
 
-export type TopicId = Hash;
+export type TopicId = B64Hash;
 
 export interface PeerInfo {
     keyId: KeyId;

@@ -1,11 +1,11 @@
-import { Hash, HashSuite } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash, HashSuite } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, Dag } from "@hyper-hyper-space/hhs3_dag";
 
 import { RootScopedDag, ScopedDag, CausalDag } from "./dag_nesting.js";
 
 export type MemDagBackend = {
-    getScopedDag(id: Hash, tag?: string): Promise<ScopedDag>;
-    getCausalDag(id: Hash, tag?: string): Promise<CausalDag>;
+    getScopedDag(id: B64Hash, tag?: string): Promise<ScopedDag>;
+    getCausalDag(id: B64Hash, tag?: string): Promise<CausalDag>;
 };
 
 export function createMemDagBackend(hash: HashSuite): MemDagBackend {

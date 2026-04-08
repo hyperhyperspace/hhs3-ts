@@ -1,4 +1,4 @@
-import { Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { MultiMap, PriorityQueue } from "@hyper-hyper-space/hhs3_util";
 import { checkFilter, EntryMetaFilter, ForkPosition, Position } from "../../dag_defs.js";
 import { DagIndex } from "../../idx/dag_idx.js";
@@ -7,7 +7,7 @@ import { DagStore } from "../../store/index.js";
 
 export * as mem from './level_idx_mem_store.js';
 
-function label(h: Hash) { return "_" + h.replace(/[^a-zA-Z0-9]/g, "").slice(-6, -1); }
+function label(h: B64Hash) { return "_" + h.replace(/[^a-zA-Z0-9]/g, "").slice(-6, -1); }
 
 // Implementation of the fork finding alogrithm using a multi-level index for fast graph traversal.
 
@@ -28,17 +28,17 @@ export type EntryInfo = {
 
 export type LevelIndexStore<Tx = void> = {
 
-    assignEntryInfo: (node: Hash, after: Position, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<EntryInfo>;
-    getEntryInfo: (node: Hash, ...tx: Tx extends void ? [] : [tx: Tx] | []) => Promise<EntryInfo>;
+    assignEntryInfo: (node: B64Hash, after: Position, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<EntryInfo>;
+    getEntryInfo: (node: B64Hash, ...tx: Tx extends void ? [] : [tx: Tx] | []) => Promise<EntryInfo>;
 
-    addPred: (level: number, node: Hash, pred: Hash, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<void>;
-    getPreds: (level: number, node: Hash, ...tx: Tx extends void ? [] : [tx: Tx] | []) => Promise<Set<Hash>>;
+    addPred: (level: number, node: B64Hash, pred: B64Hash, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<void>;
+    getPreds: (level: number, node: B64Hash, ...tx: Tx extends void ? [] : [tx: Tx] | []) => Promise<Set<B64Hash>>;
 
-    addSucc: (level: number, node: Hash, succ: Hash, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<void>;
-    getSuccs: (level: number, node: Hash, ...tx: Tx extends void ? [] : [tx: Tx] | []) => Promise<Set<Hash>>;
+    addSucc: (level: number, node: B64Hash, succ: B64Hash, ...tx: Tx extends void ? [] : [tx: Tx]) => Promise<void>;
+    getSuccs: (level: number, node: B64Hash, ...tx: Tx extends void ? [] : [tx: Tx] | []) => Promise<Set<B64Hash>>;
 }
 
-export async function addToLevelIndex<Tx = void>(index: LevelIndexStore<Tx>, n: Hash, preds: Position, ...tx: Tx extends void ? [] : [tx: Tx]): Promise<void> {
+export async function addToLevelIndex<Tx = void>(index: LevelIndexStore<Tx>, n: B64Hash, preds: Position, ...tx: Tx extends void ? [] : [tx: Tx]): Promise<void> {
 
     const { level } = await index.assignEntryInfo(n, preds, ...tx);
 
@@ -78,7 +78,7 @@ export async function findMinimalCoverUsingLevelIndex(index: LevelIndexStore<any
 
     //const startTime = performance.now();
 
-    const start = new Set<Hash>();
+    const start = new Set<B64Hash>();
 
     for (const n of p) {
         const preds = await index.getPreds(0, n);
@@ -89,7 +89,7 @@ export async function findMinimalCoverUsingLevelIndex(index: LevelIndexStore<any
 
     const reachable = await reachabilityAtLevel(index, 0, start, p);
 
-    const minCover = new Set<Hash>();
+    const minCover = new Set<B64Hash>();
 
     for (const n of p) {
         if (!reachable.has(n)) {
@@ -136,17 +136,17 @@ async function reachabilityAtLevel(index: LevelIndexStore<any>, level: number, s
     //console.log('project into next level from ', level, 'took', (endTime - startTime).toFixed(2), 'ms');
     
     //startTime = performance.now();
-    const projectTarget = projectStart.size > 0 ? await projectForwardIntoNextLevelFaster(index, target, level, {maxTopoIdx: maxTopoIdx}) : new Map<Hash, EntryInfo>();
+    const projectTarget = projectStart.size > 0 ? await projectForwardIntoNextLevelFaster(index, target, level, {maxTopoIdx: maxTopoIdx}) : new Map<B64Hash, EntryInfo>();
     //endTime = performance.now();
     //console.log('project forward into next level from ', level, 'took', (endTime - startTime).toFixed(2), 'ms');
     
 
-    const properProjectTarget = new Set<Hash>(projectTarget.keys());
+    const properProjectTarget = new Set<B64Hash>(projectTarget.keys());
     for (const n of projectStart.keys()) {
         properProjectTarget.delete(n);
     }
 
-    let reachabilityAtNext = new Set<Hash>();
+    let reachabilityAtNext = new Set<B64Hash>();
 
     let minLevel = Number.MAX_SAFE_INTEGER;
 
@@ -172,8 +172,8 @@ async function reachabilityAtLevel(index: LevelIndexStore<any>, level: number, s
 
 
     //startTime = performance.now();
-    const queue = new PriorityQueue<Hash>();
-    const enqueued = new Set<Hash>();
+    const queue = new PriorityQueue<B64Hash>();
+    const enqueued = new Set<B64Hash>();
 
     for (const n of chain(start, projectStart.keys(), reachabilityAtNext)) {
         const info = await index.getEntryInfo(n);
@@ -186,7 +186,7 @@ async function reachabilityAtLevel(index: LevelIndexStore<any>, level: number, s
     }
 
 
-    const reachable = new Set<Hash>();
+    const reachable = new Set<B64Hash>();
 
     //console.log('reach at l=', level, 'from', [...start].map(label), 'to', [...target].map(label), 'queue size is', queue.size(), 'minIdx is', minTopoIdx);
 
@@ -248,17 +248,17 @@ async function reachabilityAtLevel(index: LevelIndexStore<any>, level: number, s
 // returned.
 
 
-async function projectIntoNextLevel(index: LevelIndexStore<any>, nodes :Set<Hash>, level: number, options: {minimal:boolean, minTopoIdx?: number}): Promise<Map<Hash, EntryInfo>> {
+async function projectIntoNextLevel(index: LevelIndexStore<any>, nodes :Set<B64Hash>, level: number, options: {minimal:boolean, minTopoIdx?: number}): Promise<Map<B64Hash, EntryInfo>> {
     
     const start = performance.now();
 
-    const projection = new Map<Hash, EntryInfo>();
+    const projection = new Map<B64Hash, EntryInfo>();
     
-    let queue = new PriorityQueue<Hash>();
-    let enqueued = new Set<Hash>();
+    let queue = new PriorityQueue<B64Hash>();
+    let enqueued = new Set<B64Hash>();
 
-    let covered = new Set<Hash>();
-    let uncoveredPaths = new Set<Hash>();
+    let covered = new Set<B64Hash>();
+    let uncoveredPaths = new Set<B64Hash>();
 
     for (const n of nodes) {
         const topoIndex = (await index.getEntryInfo(n)).topoIndex;
@@ -319,14 +319,14 @@ async function projectIntoNextLevel(index: LevelIndexStore<any>, nodes :Set<Hash
 }
 
 // this can only do minimal: false
-async function projectIntoNextLevelFaster(index: LevelIndexStore<any>, nodes :Set<Hash>, level: number, options: {minTopoIdx?: number}): Promise<Map<Hash, EntryInfo>> {
+async function projectIntoNextLevelFaster(index: LevelIndexStore<any>, nodes :Set<B64Hash>, level: number, options: {minTopoIdx?: number}): Promise<Map<B64Hash, EntryInfo>> {
     
     const start = performance.now();
 
-    const projection = new Map<Hash, EntryInfo>();
+    const projection = new Map<B64Hash, EntryInfo>();
     
-    let queue = new PriorityQueue<Hash>();
-    let enqueued = new Set<Hash>();
+    let queue = new PriorityQueue<B64Hash>();
+    let enqueued = new Set<B64Hash>();
 
     for (const n of nodes) {
         const topoIndex = (await index.getEntryInfo(n)).topoIndex;
@@ -372,14 +372,14 @@ async function projectIntoNextLevelFaster(index: LevelIndexStore<any>, nodes :Se
 }
 
 // this can only do minimal: false
-async function projectForwardIntoNextLevelFaster(index: LevelIndexStore<any>, nodes :Set<Hash>, level: number, options: {maxTopoIdx?: number}): Promise<Map<Hash, EntryInfo>> {
+async function projectForwardIntoNextLevelFaster(index: LevelIndexStore<any>, nodes :Set<B64Hash>, level: number, options: {maxTopoIdx?: number}): Promise<Map<B64Hash, EntryInfo>> {
     
     const start = performance.now();
 
-    const projection = new Map<Hash, EntryInfo>();
+    const projection = new Map<B64Hash, EntryInfo>();
     
-    let queue = new PriorityQueue<Hash>();
-    let enqueued = new Set<Hash>();
+    let queue = new PriorityQueue<B64Hash>();
+    let enqueued = new Set<B64Hash>();
 
     for (const n of nodes) {
         const topoIndex = (await index.getEntryInfo(n)).topoIndex;
@@ -425,17 +425,17 @@ async function projectForwardIntoNextLevelFaster(index: LevelIndexStore<any>, no
 }
 
 
-async function projectForwardIntoNextLevel(index: LevelIndexStore<any>, nodes :Set<Hash>, level: number, options: {minimal:boolean, maxTopoIdx?: number}): Promise<Map<Hash, EntryInfo>> {
+async function projectForwardIntoNextLevel(index: LevelIndexStore<any>, nodes :Set<B64Hash>, level: number, options: {minimal:boolean, maxTopoIdx?: number}): Promise<Map<B64Hash, EntryInfo>> {
     
     const start = performance.now();
 
-    const projection = new Map<Hash, EntryInfo>();
+    const projection = new Map<B64Hash, EntryInfo>();
     
-    let queue = new PriorityQueue<Hash>();
-    let enqueued = new Set<Hash>();
+    let queue = new PriorityQueue<B64Hash>();
+    let enqueued = new Set<B64Hash>();
 
-    let covered = new Set<Hash>();
-    let uncoveredPaths = new Set<Hash>();
+    let covered = new Set<B64Hash>();
+    let uncoveredPaths = new Set<B64Hash>();
 
     for (const n of nodes) {
         const topoIndex = (await index.getEntryInfo(n)).topoIndex;
@@ -531,29 +531,29 @@ export async function findForkPositionUsingLevelIndex(index: LevelIndexStore<any
 
 export async function findForkPositionAtLevel(index: LevelIndexStore<any>, level: number, a: Position, b: Position): Promise<LevelForkPosition> {
 
-    const queue = new PriorityQueue<Hash>();
-    const enqueued = new Set<Hash>();
+    const queue = new PriorityQueue<B64Hash>();
+    const enqueued = new Set<B64Hash>();
 
-    const reachFromA = new Set<Hash>();  // reachable from a node in b
-    const reachFromB = new Set<Hash>();  // reachable from a node in a
-    const reachFromAB = new Set<Hash>(); // reachable from a node that is in h(a) & h(b)
+    const reachFromA = new Set<B64Hash>();  // reachable from a node in b
+    const reachFromB = new Set<B64Hash>();  // reachable from a node in a
+    const reachFromAB = new Set<B64Hash>(); // reachable from a node that is in h(a) & h(b)
 
-    const succsInA = new MultiMap<Hash, Hash>(); // set of succesors of a in reachFromA
-    const succsInB = new MultiMap<Hash, Hash>(); // set of succesors of a in reachFromB
-    const succsInAB = new MultiMap<Hash, Hash>(); // set of successors of a in reachFromAB
+    const succsInA = new MultiMap<B64Hash, B64Hash>(); // set of succesors of a in reachFromA
+    const succsInB = new MultiMap<B64Hash, B64Hash>(); // set of succesors of a in reachFromB
+    const succsInAB = new MultiMap<B64Hash, B64Hash>(); // set of successors of a in reachFromAB
 
     // See defs in dag_defs.ts and above:
-    const commonFrontier = new Set<Hash>();
-    const common = new Set<Hash>();
-    const forkA = new Set<Hash>();
-    const forkB = new Set<Hash>();
-    const forkSiblings = new Set<Hash>();
+    const commonFrontier = new Set<B64Hash>();
+    const common = new Set<B64Hash>();
+    const forkA = new Set<B64Hash>();
+    const forkB = new Set<B64Hash>();
+    const forkSiblings = new Set<B64Hash>();
 
-    const toCover = new Set<Hash>(); // Nodes in aUb, we need to make sure we cover them all.
+    const toCover = new Set<B64Hash>(); // Nodes in aUb, we need to make sure we cover them all.
 
     // Build the initial queue state
 
-    const toEnqueue = new Array<[Hash, number]>;
+    const toEnqueue = new Array<[B64Hash, number]>;
 
     for (const n of chain(a, b)) {
         const idxInfo = await index.getEntryInfo(n);
@@ -572,8 +572,8 @@ export async function findForkPositionAtLevel(index: LevelIndexStore<any>, level
         }
     }
 
-    const nextLevelA = new Set<Hash>(projA.keys());
-    const nextLevelB = new Set<Hash>(projB.keys());
+    const nextLevelA = new Set<B64Hash>(projA.keys());
+    const nextLevelB = new Set<B64Hash>(projB.keys());
     if (nextLevel < Number.MAX_SAFE_INTEGER) {
 
         const nextLevelFP = await findForkPositionAtLevel(index, level+1, nextLevelA, nextLevelB);
@@ -736,12 +736,12 @@ export async function findForkPositionAtLevel(index: LevelIndexStore<any>, level
 }
 
 export async function findCoverWithMetaUsingLevelIndex(store: DagStore<any>, index: LevelIndexStore<any>, from: Position, meta: EntryMetaFilter): Promise<Position> {
-    const queue = new PriorityQueue<Hash>();
-    const enqueued = new Set<Hash>();
-    const visited = new Set<Hash>();
-    const preCover = new Set<Hash>();
+    const queue = new PriorityQueue<B64Hash>();
+    const enqueued = new Set<B64Hash>();
+    const visited = new Set<B64Hash>();
+    const preCover = new Set<B64Hash>();
 
-    const enqueue = async (node: Hash): Promise<void> => {
+    const enqueue = async (node: B64Hash): Promise<void> => {
         if (enqueued.has(node) || visited.has(node)) {
             return;
         }
@@ -787,10 +787,10 @@ export async function findCoverWithMetaUsingLevelIndex(store: DagStore<any>, ind
 export async function findConcurrentCoverWithMetaUsingLevelIndex(store: DagStore<any>, index: LevelIndexStore<any>, from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
     // Create a successor map in forwardMap
 
-    const forwardMap = new MultiMap<Hash, Hash>();
+    const forwardMap = new MultiMap<B64Hash, B64Hash>();
 
-    let pending = new Set<Hash>([...from]);
-    let visited = new Set<Hash>();
+    let pending = new Set<B64Hash>([...from]);
+    let visited = new Set<B64Hash>();
 
     while (pending.size > 0) {
         const n = pending.values().next().value!;
@@ -809,10 +809,10 @@ export async function findConcurrentCoverWithMetaUsingLevelIndex(store: DagStore
 
     // Use the forward map to close the concurrentTo set upwards
 
-    pending = new Set<Hash>([...concurrentTo]);
-    visited = new Set<Hash>();
+    pending = new Set<B64Hash>([...concurrentTo]);
+    visited = new Set<B64Hash>();
 
-    const notConcurrentTo = new Set<Hash>([...concurrentTo]);
+    const notConcurrentTo = new Set<B64Hash>([...concurrentTo]);
 
     while (pending.size > 0) {
         const n = pending.values().next().value!;
@@ -830,8 +830,8 @@ export async function findConcurrentCoverWithMetaUsingLevelIndex(store: DagStore
 
     // And the backwards map to close the concurrentTo set downwards
 
-    pending = new Set<Hash>([...concurrentTo]);
-    visited = new Set<Hash>();
+    pending = new Set<B64Hash>([...concurrentTo]);
+    visited = new Set<B64Hash>();
 
     while (pending.size > 0) {
         const n = pending.values().next().value!;
@@ -849,10 +849,10 @@ export async function findConcurrentCoverWithMetaUsingLevelIndex(store: DagStore
 
     // Do a search for a pre cover, starting at the "from" position backwards, ignoring the nodes in notConcurrentTo
 
-    pending = new Set<Hash>([...from]);
-    visited = new Set<Hash>();
+    pending = new Set<B64Hash>([...from]);
+    visited = new Set<B64Hash>();
 
-    const preConcCover = new Set<Hash>();
+    const preConcCover = new Set<B64Hash>();
 
     while (pending.size > 0) {
         const n = pending.values().next().value!;
@@ -877,7 +877,7 @@ export async function findConcurrentCoverWithMetaUsingLevelIndex(store: DagStore
 export function createDagLevelIndex<Tx = void>(store: DagStore<Tx>, index: LevelIndexStore<Tx>): DagIndex<Tx> {
 
     return {
-        index: function (node: Hash, after?: Position, ...tx: Tx extends void ? [] : [tx: Tx]): Promise<void> {
+        index: function (node: B64Hash, after?: Position, ...tx: Tx extends void ? [] : [tx: Tx]): Promise<void> {
             return addToLevelIndex(index, node, after ?? new Set(), ...tx);
         },
 

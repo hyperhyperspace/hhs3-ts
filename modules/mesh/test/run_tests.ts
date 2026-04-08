@@ -130,7 +130,7 @@ async function testMemTransportProviderConnectListen() {
 // --- mux framing tests ---
 
 async function testMuxTopicEncodeDecode() {
-    const topic = sha256.hash(stringToUint8Array('test-topic'));
+    const topic = sha256.hashToB64(stringToUint8Array('test-topic'));
     const payload = new TextEncoder().encode('hello');
 
     const frame = encodeTopicMessage(topic, payload);
@@ -153,8 +153,8 @@ async function testMuxControlEncodeDecode() {
 }
 
 async function testMuxTopicIsolation() {
-    const topicA = sha256.hash(stringToUint8Array('topic-a'));
-    const topicB = sha256.hash(stringToUint8Array('topic-b'));
+    const topicA = sha256.hashToB64(stringToUint8Array('topic-a'));
+    const topicB = sha256.hashToB64(stringToUint8Array('topic-b'));
     const payloadA = new TextEncoder().encode('for-a');
     const payloadB = new TextEncoder().encode('for-b');
 
@@ -170,7 +170,7 @@ async function testMuxTopicIsolation() {
 }
 
 async function testMuxEmptyPayload() {
-    const topic = sha256.hash(stringToUint8Array('empty-topic'));
+    const topic = sha256.hashToB64(stringToUint8Array('empty-topic'));
     const frame = encodeTopicMessage(topic, new Uint8Array(0));
     const decoded = decodeMessage(frame);
 
@@ -267,7 +267,7 @@ async function testPoolEvents() {
 async function testPoolOpenTopicSendReceive() {
     const pool = new ConnectionPool();
     const peer = makeFakePeer('mem://device-1');
-    const topic = sha256.hash(stringToUint8Array('test-topic'));
+    const topic = sha256.hashToB64(stringToUint8Array('test-topic'));
 
     const { channel, remote } = makeFakeChannel(peer);
     pool.add(channel, peer.endpoint);
@@ -309,8 +309,8 @@ async function testPoolOpenTopicSendReceive() {
 async function testPoolTopicIsolation() {
     const pool = new ConnectionPool();
     const peer = makeFakePeer('mem://device-1');
-    const topicA = sha256.hash(stringToUint8Array('topic-a'));
-    const topicB = sha256.hash(stringToUint8Array('topic-b'));
+    const topicA = sha256.hashToB64(stringToUint8Array('topic-a'));
+    const topicB = sha256.hashToB64(stringToUint8Array('topic-b'));
 
     const { channel, remote } = makeFakeChannel(peer);
     pool.add(channel, peer.endpoint);
@@ -337,7 +337,7 @@ async function testPoolTopicIsolation() {
 async function testPoolTopicChannelCloseDoesNotCloseConnection() {
     const pool = new ConnectionPool();
     const peer = makeFakePeer('mem://device-1');
-    const topic = sha256.hash(stringToUint8Array('test-topic'));
+    const topic = sha256.hashToB64(stringToUint8Array('test-topic'));
 
     const { channel } = makeFakeChannel(peer);
     pool.add(channel, peer.endpoint);
@@ -355,7 +355,7 @@ async function testPoolTopicChannelCloseDoesNotCloseConnection() {
 async function testPoolTopicDedup() {
     const pool = new ConnectionPool();
     const peer = makeFakePeer('mem://device-1');
-    const topic = sha256.hash(stringToUint8Array('test-topic'));
+    const topic = sha256.hashToB64(stringToUint8Array('test-topic'));
 
     const { channel } = makeFakeChannel(peer);
     pool.add(channel, peer.endpoint);
@@ -371,7 +371,7 @@ async function testPoolTopicDedup() {
 async function testPoolConnectionCloseClosesTopics() {
     const pool = new ConnectionPool();
     const peer = makeFakePeer('mem://device-1');
-    const topic = sha256.hash(stringToUint8Array('test-topic'));
+    const topic = sha256.hashToB64(stringToUint8Array('test-topic'));
 
     const { channel } = makeFakeChannel(peer);
     pool.add(channel, peer.endpoint);
@@ -419,7 +419,7 @@ function makeStubAuthenticator(peerMap: Map<string, PublicKey>): PeerAuthenticat
 
 async function testSwarmLifecycle() {
     const pool = new ConnectionPool();
-    const topic = sha256.hash(stringToUint8Array('swarm-topic'));
+    const topic = sha256.hashToB64(stringToUint8Array('swarm-topic'));
 
     const swarm = createSwarm({ topic, mode: 'dormant' }, {
         pool,
@@ -445,7 +445,7 @@ async function testSwarmLifecycle() {
 
 async function testSwarmPeerJoinViaPool() {
     const pool = new ConnectionPool();
-    const topic = sha256.hash(stringToUint8Array('swarm-pool-topic'));
+    const topic = sha256.hashToB64(stringToUint8Array('swarm-pool-topic'));
     const peer = makeFakePeer('mem://device-1');
 
     const swarm = createSwarm({ topic, mode: 'passive' }, {
@@ -472,7 +472,7 @@ async function testSwarmPeerJoinViaPool() {
 
 async function testSwarmPeerLeaveOnDisconnect() {
     const pool = new ConnectionPool();
-    const topic = sha256.hash(stringToUint8Array('swarm-leave-topic'));
+    const topic = sha256.hashToB64(stringToUint8Array('swarm-leave-topic'));
     const peer = makeFakePeer('mem://device-1');
 
     const swarm = createSwarm({ topic, mode: 'passive' }, {
@@ -500,7 +500,7 @@ async function testSwarmPeerLeaveOnDisconnect() {
 
 async function testSwarmDiscoveryAndConnect() {
     const pool = new ConnectionPool();
-    const topic = sha256.hash(stringToUint8Array('swarm-discovery-topic'));
+    const topic = sha256.hashToB64(stringToUint8Array('swarm-discovery-topic'));
 
     const peer1 = makeFakePeer('mem://peer1');
     const peer2 = makeFakePeer('mem://peer2');
@@ -555,8 +555,8 @@ async function testSwarmDiscoveryAndConnect() {
 
 async function testSwarmPoolReuse() {
     const pool = new ConnectionPool();
-    const topic1 = sha256.hash(stringToUint8Array('topic-1'));
-    const topic2 = sha256.hash(stringToUint8Array('topic-2'));
+    const topic1 = sha256.hashToB64(stringToUint8Array('topic-1'));
+    const topic2 = sha256.hashToB64(stringToUint8Array('topic-2'));
     const peer = makeFakePeer('mem://device-1');
 
     const deps = {
@@ -589,7 +589,7 @@ async function testSwarmPoolReuse() {
 
 async function testSwarmDormantIgnoresPool() {
     const pool = new ConnectionPool();
-    const topic = sha256.hash(stringToUint8Array('dormant-topic'));
+    const topic = sha256.hashToB64(stringToUint8Array('dormant-topic'));
     const peer = makeFakePeer('mem://device-1');
 
     const swarm = createSwarm({ topic, mode: 'dormant' }, {
@@ -623,7 +623,7 @@ async function testMeshCreateAndPool() {
 }
 
 async function testMeshCreateSwarm() {
-    const topic = sha256.hash(stringToUint8Array('mesh-swarm-topic'));
+    const topic = sha256.hashToB64(stringToUint8Array('mesh-swarm-topic'));
     const peer = makeFakePeer('mem://device-1');
 
     const mesh = new Mesh({
@@ -645,8 +645,8 @@ async function testMeshCreateSwarm() {
 }
 
 async function testMeshMultipleSwarmsSharePool() {
-    const topicA = sha256.hash(stringToUint8Array('mesh-topic-a'));
-    const topicB = sha256.hash(stringToUint8Array('mesh-topic-b'));
+    const topicA = sha256.hashToB64(stringToUint8Array('mesh-topic-a'));
+    const topicB = sha256.hashToB64(stringToUint8Array('mesh-topic-b'));
     const peer = makeFakePeer('mem://device-1');
 
     const mesh = new Mesh({
@@ -668,8 +668,8 @@ async function testMeshMultipleSwarmsSharePool() {
 }
 
 async function testMeshCloseDestroysAll() {
-    const topicA = sha256.hash(stringToUint8Array('mesh-close-a'));
-    const topicB = sha256.hash(stringToUint8Array('mesh-close-b'));
+    const topicA = sha256.hashToB64(stringToUint8Array('mesh-close-a'));
+    const topicB = sha256.hashToB64(stringToUint8Array('mesh-close-b'));
     const peer = makeFakePeer('mem://device-1');
 
     const mesh = new Mesh({
@@ -693,8 +693,8 @@ async function testMeshCloseDestroysAll() {
 }
 
 async function testMeshSwarmsTracking() {
-    const topicA = sha256.hash(stringToUint8Array('mesh-track-a'));
-    const topicB = sha256.hash(stringToUint8Array('mesh-track-b'));
+    const topicA = sha256.hashToB64(stringToUint8Array('mesh-track-a'));
+    const topicB = sha256.hashToB64(stringToUint8Array('mesh-track-b'));
 
     const mesh = new Mesh({
         transports:    [],

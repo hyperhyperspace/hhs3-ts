@@ -1,4 +1,4 @@
-import { Hash, HashSuite, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash, HashSuite, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { Entry, EntryMetaFilter, ForkPosition, Header, MetaProps, Position } from "./dag_defs.js";
 import { DagIndex } from "./idx/dag_idx.js";
@@ -12,13 +12,13 @@ export * as idx from "./idx/index.js";
 // DAG definition
 
 export type Dag = {
-    append(payload: json.Literal, meta: MetaProps, after?: Position): Promise<Hash>;
+    append(payload: json.Literal, meta: MetaProps, after?: Position): Promise<B64Hash>;
     
     // like append, but just computes the hash (useful for pre-flights, etc.)
-    computeEntryHash(payload: json.Literal, after?: Position): Promise<Hash>;
+    computeEntryHash(payload: json.Literal, after?: Position): Promise<B64Hash>;
     
-    loadEntry(h: Hash): Promise<Entry|undefined>;
-    loadHeader(h: Hash): Promise<Header|undefined>;
+    loadEntry(h: B64Hash): Promise<Entry|undefined>;
+    loadHeader(h: B64Hash): Promise<Header|undefined>;
 
     getFrontier(): Promise<Position>;
 
@@ -41,21 +41,21 @@ export type Dag = {
 };
 
 export function createHeader(payload: json.Literal, after: Position | undefined, hash: HashSuite): Header {
-    const payloadHash: Hash = hash.hash(stringToUint8Array(json.toStringNormalized(payload)));
-    const prevEntryHashes = json.toSet(after ?? new Set<Hash>());
+    const payloadHash: B64Hash = hash.hashToB64(stringToUint8Array(json.toStringNormalized(payload)));
+    const prevEntryHashes = json.toSet(after ?? new Set<B64Hash>());
     const header: Header = { payloadHash, prevEntryHashes};
     return header;
 }
 
 export function createEntry(payload: json.Literal, meta: MetaProps, after: Position | undefined, hash: HashSuite): Entry {
     const header = createHeader(payload, after, hash);
-    const entryHash: Hash = hash.hash(stringToUint8Array(json.toStringNormalized(header)));
+    const entryHash: B64Hash = hash.hashToB64(stringToUint8Array(json.toStringNormalized(header)));
     const entry: Entry = { hash: entryHash, header, payload, meta };
 
     return entry;
 }
 
-export function position(...hashes: Hash[]): Position {
+export function position(...hashes: B64Hash[]): Position {
     return new Set(hashes);
 }
 

@@ -1,7 +1,7 @@
 // Actual payload for RSet operations, and their format validators.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 
 import { MAX_TYPE_LENGTH } from "../../replica.js";
 
@@ -63,7 +63,7 @@ export const addElmtFormat: json.Format = {
 
 export type DeleteElmtPayload = {
     action: 'delete';
-    elementHash: Hash;
+    elementHash: B64Hash;
     barrier?: boolean;
 };
 
@@ -79,7 +79,7 @@ export const deleteElmtFormat: json.Format = {
 
 export type UpdateElmtPayload = {
     action: 'update';
-    elementHash: Hash;
+    elementHash: B64Hash;
     updatePayload: json.Literal;
 }
 

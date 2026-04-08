@@ -1,4 +1,4 @@
-export { Hash, HashSuite, sha256, blake3, stringToUint8Array, uint8ArrayToString } from "./hashing.js";
+export { B64Hash, HashSuite, sha256, blake3, stringToUint8Array, uint8ArrayToString } from "./hashing.js";
 export * as base64 from "./base64.js";
 export * as random from "./random.js";
 

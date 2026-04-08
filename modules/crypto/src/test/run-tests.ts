@@ -236,26 +236,39 @@ async function testEd25519FixedVector() {
 
 async function testHashSuiteRoundTrip() {
     const input = new TextEncoder().encode('hello hhs3');
-    const h1 = sha256.hash(input);
-    const h2 = sha256.hash(input);
-    testing.assertEquals(h1, h2, 'SHA-256 should be deterministic');
-    testing.assertTrue(h1.length > 0, 'SHA-256 hash should be non-empty');
+
+    const raw1 = sha256.hash(input);
+    const raw2 = sha256.hash(input);
+    testing.assertTrue(raw1 instanceof Uint8Array, 'hash() should return Uint8Array');
+    testing.assertEquals(raw1.length, sha256.digestSize, 'hash() output length should equal digestSize');
+    testing.assertTrue(bytesEqual(raw1, raw2), 'SHA-256 hash() should be deterministic');
+
+    const b64_1 = sha256.hashToB64(input);
+    const b64_2 = sha256.hashToB64(input);
+    testing.assertEquals(b64_1, b64_2, 'SHA-256 hashToB64() should be deterministic');
+    testing.assertTrue(b64_1.length > 0, 'SHA-256 hashToB64 should be non-empty');
 
     const different = sha256.hash(new TextEncoder().encode('different'));
-    testing.assertTrue(h1 !== different, 'different inputs should produce different hashes');
+    testing.assertFalse(bytesEqual(raw1, different), 'different inputs should produce different hashes');
 }
 
 async function testBlake3RoundTrip() {
     const input = new TextEncoder().encode('hello hhs3');
-    const h1 = blake3.hash(input);
-    const h2 = blake3.hash(input);
-    testing.assertEquals(h1, h2, 'BLAKE3 should be deterministic');
-    testing.assertEquals(blake3.digestSize, 32, 'BLAKE3 digest size should be 32');
+
+    const raw1 = blake3.hash(input);
+    const raw2 = blake3.hash(input);
+    testing.assertTrue(raw1 instanceof Uint8Array, 'hash() should return Uint8Array');
+    testing.assertEquals(raw1.length, blake3.digestSize, 'hash() output length should equal digestSize');
+    testing.assertTrue(bytesEqual(raw1, raw2), 'BLAKE3 hash() should be deterministic');
+
+    const b64_1 = blake3.hashToB64(input);
+    const b64_2 = blake3.hashToB64(input);
+    testing.assertEquals(b64_1, b64_2, 'BLAKE3 hashToB64() should be deterministic');
 
     const different = blake3.hash(new TextEncoder().encode('different'));
-    testing.assertTrue(h1 !== different, 'different inputs should produce different hashes');
+    testing.assertFalse(bytesEqual(raw1, different), 'different inputs should produce different hashes');
 
-    testing.assertTrue(h1 !== sha256.hash(input), 'BLAKE3 and SHA-256 should produce different hashes');
+    testing.assertFalse(bytesEqual(raw1, sha256.hash(input)), 'BLAKE3 and SHA-256 should produce different hashes');
 }
 
 // ---- Registry tests ----

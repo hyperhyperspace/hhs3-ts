@@ -10,7 +10,7 @@ import type {
 } from '@hyper-hyper-space/hhs3_crypto';
 import {
     serializePublicKey, deserializePublicKey, keyIdFromPublicKey,
-    getSigningSuite, getKemSuite, base64,
+    getSigningSuite, getKemSuite,
     sha256 as sha256Suite, chacha20Poly1305, hkdfSha256,
 } from '@hyper-hyper-space/hhs3_crypto';
 import type { Transport } from './transport.js';
@@ -75,8 +75,7 @@ function concatBytes(...arrays: Uint8Array[]): Uint8Array {
 }
 
 function hashRaw(input: Uint8Array): Uint8Array {
-    const b64 = sha256Suite.hash(input);
-    return new Uint8Array(base64.toArrayBuffer(b64));
+    return sha256Suite.hash(input);
 }
 
 // ---------------------------------------------------------------------------

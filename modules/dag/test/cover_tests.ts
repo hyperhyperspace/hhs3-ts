@@ -2,12 +2,12 @@ import { dag, Position } from "../src/index.js";
 
 import { assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { set } from "@hyper-hyper-space/hhs3_util";
-import { Hash, sha256 } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash, sha256 } from "@hyper-hyper-space/hhs3_crypto";
 
 import { createRandomBranchingDags, createRandomDags } from "./utils/dag_create.js";
 import { draw, label } from "./utils/dag_diagram.js";
 
-const pp = (ns: Set<Hash>) => Array.from(ns).map(label).sort();
+const pp = (ns: Set<B64Hash>) => Array.from(ns).map(label).sort();
 
 function stats(values: number[]): { avg: number; p85: number } {
     if (values.length === 0) {
@@ -43,14 +43,14 @@ export const testMinimalCoverDags = async (
         const positions: Position[] = [
             b1,
             b2,
-            new Set<Hash>([...b1, ...b2]),
+            new Set<B64Hash>([...b1, ...b2]),
             await d1.getFrontier()
         ];
 
         for (let j = 0; j < positions.length; j++) {
             const p = positions[j];
 
-            //console.log('testing case', i, 'position', j, 'with position', pp(p as Set<Hash>));
+            //console.log('testing case', i, 'position', j, 'with position', pp(p as Set<B64Hash>));
 
             //if (i!==7 || j!==0) {
             //    continue;
@@ -75,9 +75,9 @@ export const testMinimalCoverDags = async (
             if (!coversMatch) {
                 console.log("--- minimal cover mismatch ---");
                 console.log("case idx:", i, "position idx:", j);
-                console.log("position:", pp(p as Set<Hash>));
-                console.log("cover1:", pp(cover1 as Set<Hash>));
-                console.log("cover2:", pp(cover2 as Set<Hash>));
+                console.log("position:", pp(p as Set<B64Hash>));
+                console.log("cover1:", pp(cover1 as Set<B64Hash>));
+                console.log("cover2:", pp(cover2 as Set<B64Hash>));
                 await draw(d1, "d1_" + i + "_" + j);
             }
 
