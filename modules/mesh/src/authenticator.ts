@@ -1,8 +1,8 @@
 // Peer authentication: verifies that the entity on the other end of a raw
 // Transport holds the private key corresponding to a claimed public identity.
 // Wraps the raw channel into an AuthenticatedChannel that carries the verified
-// identity. Concrete implementations (challenge-response, KEM-based encrypted
-// sessions) are provided separately; only the interface is defined here.
+// identity. The authenticator is constructed with the local signing key already
+// bound; concrete implementations are provided separately.
 
 import type { PublicKey, KeyId } from '@hyper-hyper-space/hhs3_crypto';
 import type { Transport } from './transport.js';
@@ -20,7 +20,6 @@ export interface AuthenticatedChannel {
 export interface PeerAuthenticator {
     authenticate(
         transport: Transport,
-        localKey: { publicKey: PublicKey; secretKey: Uint8Array },
         expectedRemote?: KeyId
     ): Promise<AuthenticatedChannel>;
 }

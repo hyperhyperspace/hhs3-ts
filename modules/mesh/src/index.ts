@@ -1,6 +1,8 @@
 export { NetworkAddress, Transport, TransportProvider } from './transport.js';
-export { TopicId, PeerDiscovery } from './discovery.js';
-export { PeerResolver } from './resolver.js';
+export { TopicId, PeerInfo, PeerDiscovery } from './discovery.js';
 export { AuthenticatedChannel, PeerAuthenticator } from './authenticator.js';
-export { PooledConnection, ConnectionPool } from './connection_pool.js';
-export { SwarmMode, SwarmConfig, Swarm, SwarmDeps, createSwarm } from './swarm.js';
+export { TopicChannel, encodeTopicMessage, encodeControlMessage, decodeMessage, MSG_TYPE_TOPIC, MSG_TYPE_CONTROL } from './mux.js';
+export { PooledConnection, ConnectionPool, connectionKey } from './connection_pool.js';
+export { SwarmMode, SwarmConfig, SwarmPeer, Swarm, SwarmDeps, createSwarm } from './swarm.js';
+export { MeshConfig, Mesh } from './mesh.js';
+export { NoiseAuthenticatorConfig, createNoiseAuthenticator } from './noise_authenticator.js';

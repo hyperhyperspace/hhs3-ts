@@ -323,67 +323,67 @@ async function testBasicCrypto() {
 // ---- Main ----
 
 const signingTests = {
-    title: 'Signing suites',
+    title: '[SIGN] Signing suites',
     tests: [
-        { name: 'Ed25519 round-trip', invoke: () => testSigningRoundTrip(ed25519) },
-        { name: 'ML-DSA-65 round-trip', invoke: () => testSigningRoundTrip(mlDsa65) },
-        { name: 'Hybrid Ed25519+ML-DSA-65 round-trip', invoke: () => testSigningRoundTrip(ed25519_mlDsa65) },
-        { name: 'Hybrid signing component tampering', invoke: testHybridSigningTampering },
+        { name: '[SIGN_00] Ed25519 round-trip', invoke: () => testSigningRoundTrip(ed25519) },
+        { name: '[SIGN_01] ML-DSA-65 round-trip', invoke: () => testSigningRoundTrip(mlDsa65) },
+        { name: '[SIGN_02] Hybrid Ed25519+ML-DSA-65 round-trip', invoke: () => testSigningRoundTrip(ed25519_mlDsa65) },
+        { name: '[SIGN_03] Hybrid signing component tampering', invoke: testHybridSigningTampering },
     ]
 };
 
 const kemTests = {
-    title: 'KEM suites',
+    title: '[KEM] KEM suites',
     tests: [
-        { name: 'X25519-HKDF round-trip', invoke: () => testKemRoundTrip(x25519Hkdf) },
-        { name: 'ML-KEM-768 round-trip', invoke: () => testKemRoundTrip(mlKem768) },
-        { name: 'Hybrid X25519+ML-KEM-768 round-trip', invoke: () => testKemRoundTrip(x25519Hkdf_mlKem768) },
-        { name: 'Hybrid KEM component tampering', invoke: testHybridKemTampering },
+        { name: '[KEM_00] X25519-HKDF round-trip', invoke: () => testKemRoundTrip(x25519Hkdf) },
+        { name: '[KEM_01] ML-KEM-768 round-trip', invoke: () => testKemRoundTrip(mlKem768) },
+        { name: '[KEM_02] Hybrid X25519+ML-KEM-768 round-trip', invoke: () => testKemRoundTrip(x25519Hkdf_mlKem768) },
+        { name: '[KEM_03] Hybrid KEM component tampering', invoke: testHybridKemTampering },
     ]
 };
 
 const aeadTests = {
-    title: 'AEAD',
+    title: '[AEAD] Authenticated encryption',
     tests: [
-        { name: 'ChaCha20-Poly1305 round-trip', invoke: testAeadRoundTrip },
+        { name: '[AEAD_00] ChaCha20-Poly1305 round-trip', invoke: testAeadRoundTrip },
     ]
 };
 
 const hkdfTests = {
-    title: 'HKDF',
+    title: '[HKDF] Key derivation',
     tests: [
-        { name: 'HKDF-SHA256 determinism', invoke: testHkdfDeterminism },
+        { name: '[HKDF_00] HKDF-SHA256 determinism', invoke: testHkdfDeterminism },
     ]
 };
 
 const identityTests = {
-    title: 'Identity',
+    title: '[IDENT] Identity',
     tests: [
-        { name: 'PublicKey serialize/deserialize round-trip', invoke: testIdentityRoundTrip },
-        { name: 'Suite name affects KeyId', invoke: testIdentitySuiteDistinction },
+        { name: '[IDENT_00] PublicKey serialize/deserialize round-trip', invoke: testIdentityRoundTrip },
+        { name: '[IDENT_01] Suite name affects KeyId', invoke: testIdentitySuiteDistinction },
     ]
 };
 
 const hashTests = {
-    title: 'Hashing',
+    title: '[HASH] Hashing',
     tests: [
-        { name: 'SHA-256 round-trip', invoke: testHashSuiteRoundTrip },
-        { name: 'BLAKE3 round-trip', invoke: testBlake3RoundTrip },
+        { name: '[HASH_00] SHA-256 round-trip', invoke: testHashSuiteRoundTrip },
+        { name: '[HASH_01] BLAKE3 round-trip', invoke: testBlake3RoundTrip },
     ]
 };
 
 const registryTests = {
-    title: 'Registry',
+    title: '[REGISTRY] Suite registry',
     tests: [
-        { name: 'Registry lookups', invoke: testRegistryLookups },
-        { name: 'BasicCrypto typed facade', invoke: testBasicCrypto },
+        { name: '[REGISTRY_00] Registry lookups', invoke: testRegistryLookups },
+        { name: '[REGISTRY_01] BasicCrypto typed facade', invoke: testBasicCrypto },
     ]
 };
 
 const vectorTests = {
-    title: 'Fixed test vectors',
+    title: '[VECTOR] Fixed test vectors',
     tests: [
-        { name: 'Ed25519 RFC 8032 vector', invoke: testEd25519FixedVector },
+        { name: '[VECTOR_00] Ed25519 RFC 8032 vector', invoke: testEd25519FixedVector },
     ]
 };
 

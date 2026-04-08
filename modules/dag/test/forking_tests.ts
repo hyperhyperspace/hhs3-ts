@@ -215,7 +215,7 @@ const createSuite = (tag: string, title: string, constrs: [() => dag.Dag, () => 
     title: "[" + tag + "] " + title,
     tests: [
         {
-            name: "[" + tag + "00] Testing forking on small random branching DAGs",
+            name: "[" + tag + "_00] Testing forking on small random branching DAGs",
             invoke: async () => {
                 const seed = 93;
                 console.log("Generating test cases");
@@ -227,7 +227,7 @@ const createSuite = (tag: string, title: string, constrs: [() => dag.Dag, () => 
             }
         },
         {
-            name: "[" + tag + "01] Testing forking on medium random branching DAGs",
+            name: "[" + tag + "_01] Testing forking on medium random branching DAGs",
             invoke: async () => {
                 console.log("Generating test cases");
                 const seed = 666;
@@ -239,7 +239,7 @@ const createSuite = (tag: string, title: string, constrs: [() => dag.Dag, () => 
             }
         },
         {
-            name: "[" + tag + "02] Testing forking on large random branching DAGs",
+            name: "[" + tag + "_02] Testing forking on large random branching DAGs",
             invoke: async () => {
                 console.log("Generating test cases");
                 const seed = 999;
@@ -251,7 +251,7 @@ const createSuite = (tag: string, title: string, constrs: [() => dag.Dag, () => 
             }
         },
         {
-            name: "[" + tag + "03] Testing forking on small random DAGs",
+            name: "[" + tag + "_03] Testing forking on small random DAGs",
             invoke: async () => {
                 const seed = 33;
                 console.log("Generating test cases");
@@ -263,7 +263,7 @@ const createSuite = (tag: string, title: string, constrs: [() => dag.Dag, () => 
             }
         },
         {
-            name: "[" + tag + "04] Testing forking on medium random DAGs",
+            name: "[" + tag + "_04] Testing forking on medium random DAGs",
             invoke: async () => {
                 console.log("Generating test cases");
                 const seed = 66;
@@ -275,7 +275,7 @@ const createSuite = (tag: string, title: string, constrs: [() => dag.Dag, () => 
             }
         },
         {
-            name: "[" + tag + "05] Testing forking on large random DAGs",
+            name: "[" + tag + "_05] Testing forking on large random DAGs",
             invoke: async () => {
                 console.log("Generating test cases");
                 const seed = 99;
@@ -287,7 +287,7 @@ const createSuite = (tag: string, title: string, constrs: [() => dag.Dag, () => 
             }
         },
         {
-            name: "[" + tag + "06] Testing forking on small disconnected DAGs w/connected branches",
+            name: "[" + tag + "_06] Testing forking on small disconnected DAGs w/connected branches",
             invoke: async () => {
                 console.log("Generating test cases");
                 const seed = 31;
@@ -300,7 +300,7 @@ const createSuite = (tag: string, title: string, constrs: [() => dag.Dag, () => 
             }
         },
         {
-            name: "[" + tag + "07] Testing forking on medium disconnected DAGs w/connected branches",
+            name: "[" + tag + "_07] Testing forking on medium disconnected DAGs w/connected branches",
             invoke: async () => {
                 console.log("Generating test cases");
                 const seed = 61;
@@ -313,7 +313,7 @@ const createSuite = (tag: string, title: string, constrs: [() => dag.Dag, () => 
             }
         },
         {
-            name: "[" + tag + "08] Testing forking on large disconnected DAGs w/connected branches",
+            name: "[" + tag + "_08] Testing forking on large disconnected DAGs w/connected branches",
             invoke: async () => {
                 console.log("Generating test cases");
                 const seed = 91;
@@ -326,7 +326,7 @@ const createSuite = (tag: string, title: string, constrs: [() => dag.Dag, () => 
             }
         },
         {
-            name: "[" + tag + "09] Testing forking on small disconnected DAGs w/disconnected branches",
+            name: "[" + tag + "_09] Testing forking on small disconnected DAGs w/disconnected branches",
             invoke: async () => {
                 console.log("Generating test cases");
                 const seed = 31;
@@ -339,7 +339,7 @@ const createSuite = (tag: string, title: string, constrs: [() => dag.Dag, () => 
             }
         },
         {
-            name: "[" + tag + "10] Testing forking on medium disconnected DAGs w/disconnected branches",
+            name: "[" + tag + "_10] Testing forking on medium disconnected DAGs w/disconnected branches",
             invoke: async () => {
                 console.log("Generating test cases");
                 const seed = 61;
@@ -352,7 +352,7 @@ const createSuite = (tag: string, title: string, constrs: [() => dag.Dag, () => 
             }
         },
         {
-            name: "[" + tag + "11] Testing forking on large disconnected DAGs w/disconnected branches",
+            name: "[" + tag + "_11] Testing forking on large disconnected DAGs w/disconnected branches",
             invoke: async () => {
                 console.log("Generating test cases");
                 const d1 = topoDagPairConstr[0]();
@@ -370,12 +370,12 @@ const createSuite = (tag: string, title: string, constrs: [() => dag.Dag, () => 
 });
 
 const topoSuite = createSuite(
-    "FORK_TOPO_",
+    "FORK_TOPO",
     "Test Topological Fork Analysis Solution",
     topoDagPairConstr
 );
 const levelSuite = createSuite(
-    "FORK_LEVEL_",
+    "FORK_LEVEL",
     "Test Level-index Fork Analysis Solution",
     levelDagPairConstr
 );

@@ -1,58 +1,75 @@
-// Shared pool of authenticated peer connections. Swarms draw from and
-// contribute to this pool so that a single transport connection can serve
-// multiple topics without duplicate handshakes.
+// Shared pool of authenticated peer connections. Keyed on (keyId, endpoint)
+// pairs so multiple devices for the same identity get separate connections.
+// Provides topic-multiplexed channels via openTopic(): callers get a
+// TopicChannel shim that frames/unframes messages on the shared wire.
 
 import type { KeyId, PublicKey } from '@hyper-hyper-space/hhs3_crypto';
+import type { NetworkAddress } from './transport.js';
 import type { AuthenticatedChannel } from './authenticator.js';
 import type { TopicId } from './discovery.js';
+import {
+    TopicChannel, encodeTopicMessage, decodeMessage, MSG_TYPE_TOPIC,
+} from './mux.js';
+
+export function connectionKey(keyId: KeyId, endpoint: NetworkAddress): string {
+    return `${keyId}@${endpoint}`;
+}
 
 export interface PooledConnection {
-    readonly peer: PublicKey;
     readonly peerId: KeyId;
+    readonly peer: PublicKey;
+    readonly endpoint: NetworkAddress;
     readonly channel: AuthenticatedChannel;
 }
 
 type ConnectCallback    = (conn: PooledConnection) => void;
-type DisconnectCallback = (peerId: KeyId) => void;
-type InterestQuery      = (peerId: KeyId, topic: TopicId) => Promise<boolean>;
+type DisconnectCallback = (connKey: string) => void;
 
 export class ConnectionPool {
 
-    private connections = new Map<KeyId, PooledConnection>();
+    private connections = new Map<string, PooledConnection>();
+    private topicChannels = new Map<string, TopicChannelImpl>();
     private connectCallbacks:    ConnectCallback[]    = [];
     private disconnectCallbacks: DisconnectCallback[] = [];
-    private interestQuery?: InterestQuery;
 
-    setInterestQuery(query: InterestQuery): void {
-        this.interestQuery = query;
+    get(keyId: KeyId, endpoint: NetworkAddress): PooledConnection | undefined {
+        return this.connections.get(connectionKey(keyId, endpoint));
     }
 
-    get(peer: KeyId): PooledConnection | undefined {
-        return this.connections.get(peer);
+    getByKeyId(keyId: KeyId): PooledConnection[] {
+        const result: PooledConnection[] = [];
+        for (const conn of this.connections.values()) {
+            if (conn.peerId === keyId) result.push(conn);
+        }
+        return result;
     }
 
     all(): PooledConnection[] {
         return Array.from(this.connections.values());
     }
 
-    add(channel: AuthenticatedChannel): PooledConnection {
-        const existing = this.connections.get(channel.remoteKeyId);
+    add(channel: AuthenticatedChannel, endpoint: NetworkAddress): PooledConnection {
+        const key = connectionKey(channel.remoteKeyId, endpoint);
+        const existing = this.connections.get(key);
         if (existing !== undefined) {
             channel.close();
             return existing;
         }
 
         const conn: PooledConnection = {
-            peer:    channel.remotePeer,
-            peerId:  channel.remoteKeyId,
+            peer:     channel.remotePeer,
+            peerId:   channel.remoteKeyId,
+            endpoint,
             channel,
         };
 
-        this.connections.set(conn.peerId, conn);
+        this.connections.set(key, conn);
+        this.installDispatch(key, channel);
 
         channel.onClose(() => {
-            this.connections.delete(conn.peerId);
-            for (const cb of this.disconnectCallbacks) cb(conn.peerId);
+            this.connections.delete(key);
+            this.closeTopicsForConnection(key);
+            for (const cb of this.disconnectCallbacks) cb(key);
         });
 
         for (const cb of this.connectCallbacks) cb(conn);
@@ -60,28 +77,32 @@ export class ConnectionPool {
         return conn;
     }
 
-    remove(peer: KeyId): void {
-        const conn = this.connections.get(peer);
+    remove(keyId: KeyId, endpoint: NetworkAddress): void {
+        const key = connectionKey(keyId, endpoint);
+        const conn = this.connections.get(key);
         if (conn !== undefined) {
             conn.channel.close();
         }
     }
 
-    async queryInterest(topic: TopicId): Promise<KeyId[]> {
-        if (this.interestQuery === undefined) return [];
+    openTopic(keyId: KeyId, endpoint: NetworkAddress, topic: TopicId): TopicChannel {
+        const connKey = connectionKey(keyId, endpoint);
+        const topicKey = `${connKey}#${topic}`;
 
-        const results: KeyId[] = [];
-        const query = this.interestQuery;
+        const existing = this.topicChannels.get(topicKey);
+        if (existing !== undefined && existing.open) return existing;
 
-        await Promise.all(
-            Array.from(this.connections.keys()).map(async (peerId) => {
-                if (await query(peerId, topic)) {
-                    results.push(peerId);
-                }
-            })
-        );
+        const conn = this.connections.get(connKey);
+        if (conn === undefined) {
+            throw new Error(`no connection for ${connKey}`);
+        }
 
-        return results;
+        const tc = new TopicChannelImpl(topic, keyId, endpoint, conn.channel, () => {
+            this.topicChannels.delete(topicKey);
+        });
+
+        this.topicChannels.set(topicKey, tc);
+        return tc;
     }
 
     onConnect(callback: ConnectCallback): void {
@@ -100,5 +121,94 @@ export class ConnectionPool {
         for (const conn of this.connections.values()) {
             conn.channel.close();
         }
+    }
+
+    // --- internal dispatch ---
+
+    private installDispatch(connKey: string, channel: AuthenticatedChannel): void {
+        channel.onMessage((frame: Uint8Array) => {
+            try {
+                const msg = decodeMessage(frame);
+                if (msg.type === MSG_TYPE_TOPIC && msg.topic !== undefined) {
+                    const topicKey = `${connKey}#${msg.topic}`;
+                    const tc = this.topicChannels.get(topicKey);
+                    if (tc !== undefined && tc.open) {
+                        tc.deliver(msg.payload);
+                    }
+                }
+            } catch {
+                // Malformed frames are silently dropped
+            }
+        });
+    }
+
+    private closeTopicsForConnection(connKey: string): void {
+        for (const [key, tc] of this.topicChannels) {
+            if (key.startsWith(connKey + '#')) {
+                tc.forceClose();
+                this.topicChannels.delete(key);
+            }
+        }
+    }
+}
+
+class TopicChannelImpl implements TopicChannel {
+    readonly topic: TopicId;
+    readonly peerId: KeyId;
+    readonly endpoint: NetworkAddress;
+
+    private channel: AuthenticatedChannel;
+    private onUnregister: () => void;
+    private messageCallbacks: ((msg: Uint8Array) => void)[] = [];
+    private closeCallbacks: (() => void)[] = [];
+    private _open = true;
+
+    constructor(
+        topic: TopicId,
+        peerId: KeyId,
+        endpoint: NetworkAddress,
+        channel: AuthenticatedChannel,
+        onUnregister: () => void,
+    ) {
+        this.topic = topic;
+        this.peerId = peerId;
+        this.endpoint = endpoint;
+        this.channel = channel;
+        this.onUnregister = onUnregister;
+    }
+
+    get open(): boolean {
+        return this._open && this.channel.open;
+    }
+
+    send(message: Uint8Array): void {
+        if (!this.open) throw new Error('topic channel closed');
+        this.channel.send(encodeTopicMessage(this.topic, message));
+    }
+
+    onMessage(callback: (message: Uint8Array) => void): void {
+        this.messageCallbacks.push(callback);
+    }
+
+    onClose(callback: () => void): void {
+        this.closeCallbacks.push(callback);
+    }
+
+    close(): void {
+        if (!this._open) return;
+        this._open = false;
+        this.onUnregister();
+        for (const cb of this.closeCallbacks) cb();
+    }
+
+    deliver(payload: Uint8Array): void {
+        if (!this._open) return;
+        for (const cb of this.messageCallbacks) cb(payload);
+    }
+
+    forceClose(): void {
+        if (!this._open) return;
+        this._open = false;
+        for (const cb of this.closeCallbacks) cb();
     }
 }
