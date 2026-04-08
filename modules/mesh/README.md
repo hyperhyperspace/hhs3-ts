@@ -22,17 +22,17 @@ Application / Sync Engine
     │ Swarm │  ← per-topic peer group with lifecycle modes
     └───┬───┘
         │
-  ┌─────┴───────┐
-  │ TopicChannel│  ← multiplexed, topic-scoped view of a connection
-  └─────┬───────┘
+ ┌──────┴───────┐
+ │ TopicChannel │  ← multiplexed, topic-scoped view of a connection
+ └──────┬───────┘
         │
- ┌──────┴────────┐
- │ConnectionPool │  ← shared authenticated connections, keyed by (KeyId, endpoint)
- └──────┬────────┘
+┌───────┴────────┐
+│ ConnectionPool │  ← shared authenticated connections, keyed by (KeyId, endpoint)
+└───────┬────────┘
         │
- ┌──────┴─────────────┐
- │AuthenticatedChannel│  ← post-handshake encrypted channel with verified identity
- └──────┬─────────────┘
+┌───────┴──────────────┐
+│ AuthenticatedChannel │  ← post-handshake encrypted channel with verified identity
+└───────┬──────────────┘
         │
    ┌────┴──────┐
    │ Transport │  ← raw bidirectional byte channel (WebSocket, WebRTC, TCP, …)
@@ -151,9 +151,9 @@ interface TopicChannel {
 
 Manages a peer group for a single topic. Supports three lifecycle modes:
 
-- **`dormant`**: ignores all pool activity and discovery
-- **`passive`**: accepts peers already in the pool but does not initiate new connections
-- **`active`**: runs discovery and actively connects to new peers
+- `**dormant**`: ignores all pool activity and discovery
+- `**passive**`: accepts peers already in the pool but does not initiate new connections
+- `**active**`: runs discovery and actively connects to new peers
 
 ```typescript
 interface Swarm {
@@ -268,3 +268,4 @@ The test suite covers all layers (transport, mux framing, connection pool, swarm
 ```
 npm run test
 ```
+
