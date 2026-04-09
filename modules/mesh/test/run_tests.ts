@@ -22,6 +22,8 @@ import type { Transport, NetworkAddress } from '../src/transport.js';
 import { createSwarm } from '../src/swarm.js';
 import { Mesh } from '../src/mesh.js';
 import { createNoiseAuthenticator } from '../src/noise_authenticator.js';
+import { StaticDiscovery } from '../src/static_discovery.js';
+import { DiscoveryStack } from '../src/discovery_stack.js';
 import {
     encodeTopicMessage, encodeControlMessage, decodeMessage,
     MSG_TYPE_TOPIC, MSG_TYPE_CONTROL,
@@ -999,6 +1001,238 @@ async function testAuthIndependentSessions() {
     testing.assertTrue(chan1A.remoteKeyId === chan2A.remoteKeyId, 'same remote identity');
 }
 
+// --- [STATIC] StaticDiscovery tests ---
+
+async function collectAll(iter: AsyncIterable<PeerInfo>): Promise<PeerInfo[]> {
+    const out: PeerInfo[] = [];
+    for await (const p of iter) out.push(p);
+    return out;
+}
+
+async function testStaticYieldsMatchingTopic() {
+    const topicA: TopicId = sha256.hashToB64(stringToUint8Array('topic-a'));
+    const peer = makeFakePeer('ws://a:1');
+    const sd = new StaticDiscovery([{ keyId: peer.keyId, addresses: [peer.endpoint] }], [topicA]);
+
+    const results = await collectAll(sd.discover(topicA));
+    testing.assertEquals(results.length, 1, 'should yield one peer');
+    testing.assertEquals(results[0].keyId, peer.keyId, 'keyId matches');
+}
+
+async function testStaticYieldsNothingNonMatchingTopic() {
+    const topicA: TopicId = sha256.hashToB64(stringToUint8Array('topic-a'));
+    const topicB: TopicId = sha256.hashToB64(stringToUint8Array('topic-b'));
+    const peer = makeFakePeer('ws://a:1');
+    const sd = new StaticDiscovery([{ keyId: peer.keyId, addresses: [peer.endpoint] }], [topicA]);
+
+    const results = await collectAll(sd.discover(topicB));
+    testing.assertEquals(results.length, 0, 'should yield nothing for non-matching topic');
+}
+
+async function testStaticFiltersByScheme() {
+    const topic: TopicId = sha256.hashToB64(stringToUint8Array('topic-scheme'));
+    const peer = makeFakePeer('ws://a:1');
+    const info: PeerInfo = { keyId: peer.keyId, addresses: ['ws://a:1', 'tcp://a:2'] };
+    const sd = new StaticDiscovery([info], [topic]);
+
+    const wsOnly = await collectAll(sd.discover(topic, ['ws']));
+    testing.assertEquals(wsOnly.length, 1, 'should yield peer');
+    testing.assertEquals(wsOnly[0].addresses.length, 1, 'one address');
+    testing.assertEquals(wsOnly[0].addresses[0], 'ws://a:1', 'only ws address');
+
+    const tcpOnly = await collectAll(sd.discover(topic, ['tcp']));
+    testing.assertEquals(tcpOnly.length, 1, 'should yield peer for tcp');
+    testing.assertEquals(tcpOnly[0].addresses[0], 'tcp://a:2', 'only tcp address');
+
+    const quicOnly = await collectAll(sd.discover(topic, ['quic']));
+    testing.assertEquals(quicOnly.length, 0, 'no peers with quic');
+}
+
+async function testStaticResultsAreShuffled() {
+    const topic: TopicId = sha256.hashToB64(stringToUint8Array('topic-shuffle'));
+    const peers: PeerInfo[] = [];
+    for (let i = 0; i < 20; i++) {
+        const p = makeFakePeer(`ws://peer-${i}:1`);
+        peers.push({ keyId: p.keyId, addresses: [p.endpoint] });
+    }
+    const sd = new StaticDiscovery(peers, [topic]);
+
+    const orders: string[] = [];
+    for (let trial = 0; trial < 5; trial++) {
+        const result = await collectAll(sd.discover(topic));
+        orders.push(result.map(r => r.keyId).join(','));
+    }
+
+    const allSame = orders.every(o => o === orders[0]);
+    testing.assertTrue(!allSame, 'results should not be in the same order every time (20 peers, 5 trials)');
+}
+
+async function testStaticAnnounceLeaveNoOps() {
+    const topic: TopicId = sha256.hashToB64(stringToUint8Array('topic-noop'));
+    const sd = new StaticDiscovery([], [topic]);
+    const peer = makeFakePeer('ws://a:1');
+
+    await sd.announce(topic, { keyId: peer.keyId, addresses: [peer.endpoint] });
+    await sd.leave(topic, peer.keyId);
+}
+
+async function testStaticEmptyPeerList() {
+    const topic: TopicId = sha256.hashToB64(stringToUint8Array('topic-empty'));
+    const sd = new StaticDiscovery([], [topic]);
+
+    const results = await collectAll(sd.discover(topic));
+    testing.assertEquals(results.length, 0, 'empty peer list yields nothing');
+}
+
+// --- [STACK] DiscoveryStack tests ---
+
+function makeSimpleDiscovery(peers: PeerInfo[]): PeerDiscovery {
+    return {
+        async *discover(_topic: TopicId, _schemes?: string[]): AsyncIterable<PeerInfo> {
+            for (const p of peers) yield p;
+        },
+        async announce(): Promise<void> {},
+        async leave(): Promise<void> {},
+    };
+}
+
+async function testStackSingleLayer() {
+    const topic: TopicId = sha256.hashToB64(stringToUint8Array('stack-single'));
+    const peer = makeFakePeer('ws://s:1');
+    const info: PeerInfo = { keyId: peer.keyId, addresses: [peer.endpoint] };
+    const stack = new DiscoveryStack([
+        { source: makeSimpleDiscovery([info]), priority: 0 },
+    ]);
+
+    const results = await collectAll(stack.discover(topic));
+    testing.assertEquals(results.length, 1, 'single layer yields its peers');
+    testing.assertEquals(results[0].keyId, peer.keyId, 'keyId matches');
+}
+
+async function testStackStopsAtTarget() {
+    const topic: TopicId = sha256.hashToB64(stringToUint8Array('stack-target'));
+    const peers: PeerInfo[] = [];
+    for (let i = 0; i < 10; i++) {
+        const p = makeFakePeer(`ws://t-${i}:1`);
+        peers.push({ keyId: p.keyId, addresses: [p.endpoint] });
+    }
+    const stack = new DiscoveryStack([
+        { source: makeSimpleDiscovery(peers), priority: 0 },
+    ]);
+
+    const results = await collectAll(stack.discover(topic, undefined, 3));
+    testing.assertEquals(results.length, 3, 'should stop at targetPeers');
+}
+
+async function testStackFallsThrough() {
+    const topic: TopicId = sha256.hashToB64(stringToUint8Array('stack-fallthrough'));
+    const peerA = makeFakePeer('ws://ft-a:1');
+    const peerB = makeFakePeer('ws://ft-b:1');
+    const stack = new DiscoveryStack([
+        { source: makeSimpleDiscovery([{ keyId: peerA.keyId, addresses: [peerA.endpoint] }]), priority: 0 },
+        { source: makeSimpleDiscovery([{ keyId: peerB.keyId, addresses: [peerB.endpoint] }]), priority: 10 },
+    ]);
+
+    const results = await collectAll(stack.discover(topic, undefined, 5));
+    testing.assertEquals(results.length, 2, 'falls through to lower priority');
+    const ids = results.map(r => r.keyId);
+    testing.assertTrue(ids.includes(peerA.keyId), 'includes peer from priority 0');
+    testing.assertTrue(ids.includes(peerB.keyId), 'includes peer from priority 10');
+}
+
+async function testStackParallelMerge() {
+    const topic: TopicId = sha256.hashToB64(stringToUint8Array('stack-parallel'));
+    const peerA = makeFakePeer('ws://pm-a:1');
+    const peerB = makeFakePeer('ws://pm-b:1');
+    const stack = new DiscoveryStack([
+        { source: makeSimpleDiscovery([{ keyId: peerA.keyId, addresses: [peerA.endpoint] }]), priority: 0 },
+        { source: makeSimpleDiscovery([{ keyId: peerB.keyId, addresses: [peerB.endpoint] }]), priority: 0 },
+    ]);
+
+    const results = await collectAll(stack.discover(topic, undefined, 10));
+    testing.assertEquals(results.length, 2, 'both sources in same priority merged');
+    const ids = new Set(results.map(r => r.keyId));
+    testing.assertTrue(ids.has(peerA.keyId), 'has peer A');
+    testing.assertTrue(ids.has(peerB.keyId), 'has peer B');
+}
+
+async function testStackDeduplication() {
+    const topic: TopicId = sha256.hashToB64(stringToUint8Array('stack-dedup'));
+    const peer = makeFakePeer('ws://dup:1');
+    const info: PeerInfo = { keyId: peer.keyId, addresses: [peer.endpoint] };
+    const stack = new DiscoveryStack([
+        { source: makeSimpleDiscovery([info]), priority: 0 },
+        { source: makeSimpleDiscovery([info]), priority: 10 },
+    ]);
+
+    const results = await collectAll(stack.discover(topic, undefined, 10));
+    testing.assertEquals(results.length, 1, 'duplicate peer yielded only once');
+}
+
+async function testStackFewerThanTarget() {
+    const topic: TopicId = sha256.hashToB64(stringToUint8Array('stack-fewer'));
+    const peer = makeFakePeer('ws://fewer:1');
+    const info: PeerInfo = { keyId: peer.keyId, addresses: [peer.endpoint] };
+    const stack = new DiscoveryStack([
+        { source: makeSimpleDiscovery([info]), priority: 0 },
+    ]);
+
+    const results = await collectAll(stack.discover(topic, undefined, 100));
+    testing.assertEquals(results.length, 1, 'returns fewer than target without error');
+}
+
+async function testStackAnnounceLeaveBroadcast() {
+    const topic: TopicId = sha256.hashToB64(stringToUint8Array('stack-broadcast'));
+    let announceCalls = 0;
+    let leaveCalls = 0;
+    const source: PeerDiscovery = {
+        async *discover(): AsyncIterable<PeerInfo> {},
+        async announce() { announceCalls++; },
+        async leave() { leaveCalls++; },
+    };
+    const stack = new DiscoveryStack([
+        { source, priority: 0 },
+        { source, priority: 10 },
+    ]);
+    const peer = makeFakePeer('ws://bc:1');
+    await stack.announce(topic, { keyId: peer.keyId, addresses: [peer.endpoint] });
+    await stack.leave(topic, peer.keyId);
+
+    testing.assertEquals(announceCalls, 2, 'announce broadcast to all');
+    testing.assertEquals(leaveCalls, 2, 'leave broadcast to all');
+}
+
+async function testStackAnnounceResilience() {
+    const topic: TopicId = sha256.hashToB64(stringToUint8Array('stack-resilient'));
+    let successCalls = 0;
+    const failing: PeerDiscovery = {
+        async *discover(): AsyncIterable<PeerInfo> {},
+        async announce() { throw new Error('boom'); },
+        async leave() { throw new Error('boom'); },
+    };
+    const succeeding: PeerDiscovery = {
+        async *discover(): AsyncIterable<PeerInfo> {},
+        async announce() { successCalls++; },
+        async leave() { successCalls++; },
+    };
+    const stack = new DiscoveryStack([
+        { source: failing, priority: 0 },
+        { source: succeeding, priority: 10 },
+    ]);
+    const peer = makeFakePeer('ws://res:1');
+    await stack.announce(topic, { keyId: peer.keyId, addresses: [peer.endpoint] });
+    await stack.leave(topic, peer.keyId);
+
+    testing.assertEquals(successCalls, 2, 'succeeding source still called despite failing sibling');
+}
+
+async function testStackEmpty() {
+    const topic: TopicId = sha256.hashToB64(stringToUint8Array('stack-empty'));
+    const stack = new DiscoveryStack([]);
+    const results = await collectAll(stack.discover(topic, undefined, 10));
+    testing.assertEquals(results.length, 0, 'empty stack yields nothing');
+}
+
 // --- main ---
 
 const transportTests = {
@@ -1074,7 +1308,34 @@ const authTests = {
     ],
 };
 
-const allSuites = [transportTests, muxTests, poolTests, swarmTests, meshTests, authTests];
+const staticTests = {
+    title: '[STATIC] StaticDiscovery',
+    tests: [
+        { name: '[STATIC_00] Yields peers for a matching topic', invoke: testStaticYieldsMatchingTopic },
+        { name: '[STATIC_01] Yields nothing for a non-matching topic', invoke: testStaticYieldsNothingNonMatchingTopic },
+        { name: '[STATIC_02] Filters by scheme', invoke: testStaticFiltersByScheme },
+        { name: '[STATIC_03] Results are shuffled', invoke: testStaticResultsAreShuffled },
+        { name: '[STATIC_04] announce/leave are no-ops', invoke: testStaticAnnounceLeaveNoOps },
+        { name: '[STATIC_05] Empty peer list yields nothing', invoke: testStaticEmptyPeerList },
+    ],
+};
+
+const stackTests = {
+    title: '[STACK] DiscoveryStack',
+    tests: [
+        { name: '[STACK_00] Single layer yields its peers', invoke: testStackSingleLayer },
+        { name: '[STACK_01] Stops after reaching targetPeers', invoke: testStackStopsAtTarget },
+        { name: '[STACK_02] Falls through to next priority', invoke: testStackFallsThrough },
+        { name: '[STACK_03] Same-priority layers run in parallel', invoke: testStackParallelMerge },
+        { name: '[STACK_04] Deduplication across layers', invoke: testStackDeduplication },
+        { name: '[STACK_05] Returns fewer than targetPeers when exhausted', invoke: testStackFewerThanTarget },
+        { name: '[STACK_06] announce/leave broadcast to all layers', invoke: testStackAnnounceLeaveBroadcast },
+        { name: '[STACK_07] One failing source does not break others', invoke: testStackAnnounceResilience },
+        { name: '[STACK_08] Empty stack yields nothing', invoke: testStackEmpty },
+    ],
+};
+
+const allSuites = [transportTests, muxTests, poolTests, swarmTests, meshTests, authTests, staticTests, stackTests];
 
 async function main() {
     const filters = process.argv.slice(2);

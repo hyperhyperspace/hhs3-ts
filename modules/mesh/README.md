@@ -77,13 +77,13 @@ interface PeerInfo {
 }
 
 interface PeerDiscovery {
-    discover(topic: TopicId, schemes?: string[]): AsyncIterable<PeerInfo>;
+    discover(topic: TopicId, schemes?: string[], targetPeers?: number): AsyncIterable<PeerInfo>;
     announce(topic: TopicId, self: PeerInfo): Promise<void>;
     leave(topic: TopicId, self: KeyId): Promise<void>;
 }
 ```
 
-The optional `schemes` parameter filters results to peers reachable via specific transport schemes.
+The optional `schemes` parameter filters results to peers reachable via specific transport schemes. The optional `targetPeers` parameter hints how many unique peers the caller wants; composite sources like `DiscoveryStack` use it to stop early.
 
 ### PeerAuthenticator
 
@@ -192,6 +192,58 @@ class Mesh {
 }
 ```
 
+## Discovery
+
+The module ships two concrete `PeerDiscovery` implementations for bootstrapping and composition.
+
+### StaticDiscovery
+
+A read-only source that yields a fixed `PeerInfo[]` provided at construction, **only for matching topics**. Results are shuffled (Fisher-Yates) on each `discover()` call so that epidemic gossip converges effectively. `announce()` and `leave()` are no-ops.
+
+```typescript
+import { StaticDiscovery } from '@hyper-hyper-space/hhs3_mesh';
+
+const bootstrap = new StaticDiscovery(
+    [{ keyId: 'abc…', addresses: ['ws://seed1.example.com:9000'] }],
+    [replicaRootTopic],                  // only yield peers when this topic is requested
+);
+```
+
+- **Topic-scoped**: The `topics` constructor argument is required. Peers are only yielded when the requested topic is in the list, preventing bootstrap peers from leaking into unrelated per-object swarms.
+- **Scheme filtering**: If `schemes` is provided to `discover()`, only peers with at least one matching address are yielded, and their address lists are filtered accordingly.
+
+### DiscoveryStack
+
+A priority-based composite that chains multiple `PeerDiscovery` sources. Layers are grouped by numeric priority (lower = higher priority) and processed in ascending order. Within a priority group, all sources run **in parallel** and their results are merged into a single stream.
+
+```typescript
+import { DiscoveryStack } from '@hyper-hyper-space/hhs3_mesh';
+
+const stack = new DiscoveryStack([
+    { source: replicaDiscovery, priority: 0 },   // best: synced peer set
+    { source: trackerA,         priority: 10 },   // fallback: tracker constellation
+    { source: trackerB,         priority: 10 },   // (parallel with trackerA)
+    { source: bootstrap,        priority: 20 },   // last resort: static bootstrap
+]);
+
+// Request up to 10 unique peers
+for await (const peer of stack.discover(myTopic, undefined, 10)) {
+    // ...
+}
+```
+
+**`discover(topic, schemes?, targetPeers?)` logic:**
+
+- Process priority groups in ascending order
+- Within a group, race all sources in parallel and yield peers as they arrive
+- Deduplicate peers by `(keyId, address)` across all groups
+- If `targetPeers` is given, **stop** as soon as that many unique peers have been yielded
+- If the current group is exhausted but the count is below `targetPeers`, fall through to the next group
+- If all groups are exhausted, return what was found — `targetPeers` is a goal, not a guarantee
+- If `targetPeers` is omitted, defaults to 10
+
+**`announce()` and `leave()`:** Broadcast to **all** layers via `Promise.allSettled`, so one failing source does not break the others.
+
 ## Noise Authenticator
 
 The module includes a concrete `PeerAuthenticator` implementation based on a Noise-like 3-message (1.5 RTT) handshake:
@@ -263,7 +315,7 @@ npm run build
 
 ## Testing
 
-The test suite covers all layers (transport, mux framing, connection pool, swarm lifecycle, mesh facade, and noise authenticator handshake). To run it, first build the workspace and then within `modules/mesh`:
+The test suite covers all layers (transport, mux framing, connection pool, swarm lifecycle, mesh facade, noise authenticator handshake, static discovery, and discovery stack). To run it, first build the workspace and then within `modules/mesh`:
 
 ```
 npm run test

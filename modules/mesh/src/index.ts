@@ -6,3 +6,5 @@ export { PooledConnection, ConnectionPool, connectionKey } from './connection_po
 export { SwarmMode, SwarmConfig, SwarmPeer, Swarm, SwarmDeps, createSwarm } from './swarm.js';
 export { MeshConfig, Mesh } from './mesh.js';
 export { NoiseAuthenticatorConfig, createNoiseAuthenticator } from './noise_authenticator.js';
+export { StaticDiscovery } from './static_discovery.js';
+export { DiscoveryLayer, DiscoveryStack } from './discovery_stack.js';

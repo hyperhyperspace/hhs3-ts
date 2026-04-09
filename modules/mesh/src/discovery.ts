@@ -14,7 +14,7 @@ export interface PeerInfo {
 }
 
 export interface PeerDiscovery {
-    discover(topic: TopicId, schemes?: string[]): AsyncIterable<PeerInfo>;
+    discover(topic: TopicId, schemes?: string[], targetPeers?: number): AsyncIterable<PeerInfo>;
     announce(topic: TopicId, self: PeerInfo): Promise<void>;
     leave(topic: TopicId, self: KeyId): Promise<void>;
 }
