@@ -166,7 +166,7 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
             try {
                 const transport = await provider.connect(addr);
                 const channel   = await authenticator.authenticate(
-                    transport, peerInfo.keyId
+                    transport, 'initiator', peerInfo.keyId
                 );
                 pool.add(channel, addr);
                 adoptPeer(peerInfo.keyId, addr);

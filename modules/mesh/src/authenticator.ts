@@ -20,6 +20,7 @@ export interface AuthenticatedChannel {
 export interface PeerAuthenticator {
     authenticate(
         transport: Transport,
+        role: 'initiator' | 'responder',
         expectedRemote?: KeyId
     ): Promise<AuthenticatedChannel>;
 }

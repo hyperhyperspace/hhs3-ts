@@ -103,6 +103,7 @@ interface AuthenticatedChannel {
 interface PeerAuthenticator {
     authenticate(
         transport: Transport,
+        role: 'initiator' | 'responder',
         expectedRemote?: KeyId
     ): Promise<AuthenticatedChannel>;
 }
@@ -246,11 +247,13 @@ for await (const peer of stack.discover(myTopic, undefined, 10)) {
 
 ## Noise Authenticator
 
-The module includes a concrete `PeerAuthenticator` implementation based on a Noise-like 3-message (1.5 RTT) handshake:
+The module includes a concrete `PeerAuthenticator` implementation based on a Noise-like 3-message (1.5 RTT) handshake with **initiator identity protection**: the initiator's identity is never revealed unless the responder first proves it holds the expected key.
 
-1. **Msg1** (initiator → responder): signing identity + KEM preference list + transcript signature
+1. **Msg1** (initiator → responder): random session nonce + KEM preference list (anonymous -- no identity)
 2. **Msg2** (responder → initiator): signing identity + chosen KEM + ephemeral KEM public key + transcript signature
-3. **Msg3** (initiator → responder): KEM ciphertext + AEAD confirmation
+3. **Msg3** (initiator → responder): KEM ciphertext + AEAD-encrypted initiator identity and transcript signature
+
+The initiator verifies the responder's identity after Msg2. If `expectedRemote` is set and doesn't match, the initiator aborts without sending Msg3 -- its identity is never exposed. This enables a Trust-On-First-Use (TOFU) model: on first contact, omit `expectedRemote` to learn the remote's `KeyId` from the returned `AuthenticatedChannel`, then store it for future connections.
 
 After the handshake, both sides derive independent send/receive session keys via HKDF and encrypt all subsequent traffic with ChaCha20-Poly1305.
 

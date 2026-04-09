@@ -1,8 +1,10 @@
 // Noise-like authenticated key exchange over a raw Transport. Uses a 3-message
-// (1.5 round-trip) handshake: the initiator sends its signing identity and KEM
-// preference list, the responder picks the best common KEM suite and generates
-// an ephemeral keypair, the initiator encapsulates to it, and both derive AEAD
-// session keys. All post-handshake traffic is encrypted with ChaCha20-Poly1305.
+// (1.5 round-trip) handshake with initiator identity protection: the initiator
+// sends only a nonce and KEM preferences in Msg1, the responder proves its
+// identity in Msg2, and the initiator reveals its own identity encrypted under
+// the KEM-derived session key in Msg3. This ensures the initiator's identity
+// is never exposed unless the responder proves possession of the expected key.
+// All post-handshake traffic is encrypted with ChaCha20-Poly1305.
 
 import type {
     PublicKey, KeyId, SigningSuite, KemName, SigningName,
@@ -237,6 +239,8 @@ const LABEL_CONFIRM = toUtf8('hhs3-noise-confirm');
 // Handshake implementation
 // ---------------------------------------------------------------------------
 
+const SESSION_NONCE_SIZE = 32;
+
 async function handshakeAsInitiator(
     transport: Transport,
     queue: MessageQueue,
@@ -248,18 +252,21 @@ async function handshakeAsInitiator(
     expectedRemote?: KeyId,
 ): Promise<AuthenticatedChannel> {
 
-    // --- Msg1: [serialized_pk, kem_prefs_json, sig1] ---
-    const localPkBytes = serializePublicKey(localKey.publicKey);
+    // --- Msg1: [nonce, kem_prefs_json] --- anonymous, no identity
+    // Yield once so that in paired async handshakes (e.g. tests with
+    // synchronous in-memory transports) the responder has time to register
+    // its message handler before we send.
+    await Promise.resolve();
+
+    const nonce = new Uint8Array(SESSION_NONCE_SIZE);
+    globalThis.crypto.getRandomValues(nonce);
     const prefsJson = toUtf8(JSON.stringify(kemPrefs));
 
-    const msg1PreSig = writeFields([localPkBytes, prefsJson]);
-    const transcript1 = hashRaw(msg1PreSig);
-    const sig1 = await signing.sign(transcript1, localKey.secretKey);
-
-    const msg1 = writeFields([localPkBytes, prefsJson, sig1]);
+    const msg1 = writeFields([nonce, prefsJson]);
+    const transcript1 = hashRaw(msg1);
     transport.send(msg1);
 
-    // --- Msg2: [serialized_pk, chosen_kem, eph_kem_pk, sig2] ---
+    // --- Msg2: [responder_pk, chosen_kem, eph_kem_pk, sig2] ---
     const msg2 = await queue.next();
     const msg2Fields = readFields(msg2);
     if (msg2Fields.length < 4) throw new Error('invalid msg2');
@@ -272,6 +279,7 @@ async function handshakeAsInitiator(
     if (expectedRemote !== undefined) {
         const remoteKeyId = keyIdFromPublicKey(remotePk, sha256Suite);
         if (remoteKeyId !== expectedRemote) {
+            transport.close();
             throw new Error('unexpected remote peer identity');
         }
     }
@@ -290,7 +298,7 @@ async function handshakeAsInitiator(
     const kem = getKemSuite(chosenKemName);
     if (!kem) throw new Error(`KEM suite not found: ${chosenKemName}`);
 
-    // --- Msg3: [kem_ciphertext, aead_confirmation] ---
+    // --- Msg3: [kem_ciphertext, encrypted_identity] ---
     const { ciphertext, sharedSecret } = await kem.encapsulate(ephKemPk);
 
     const transcript3 = hashRaw(concatBytes(transcript2, ciphertext));
@@ -298,10 +306,14 @@ async function handshakeAsInitiator(
     const i2rKey = kdf.deriveKey(sharedSecret, transcript3, LABEL_I2R, aead.keySize);
     const r2iKey = kdf.deriveKey(sharedSecret, transcript3, LABEL_R2I, aead.keySize);
 
-    const confirmNonce = new Uint8Array(aead.nonceSize);
-    const confirmCt = aead.encrypt(LABEL_CONFIRM, i2rKey, confirmNonce);
+    const localPkBytes = serializePublicKey(localKey.publicKey);
+    const sig3 = await signing.sign(transcript3, localKey.secretKey);
+    const identityPayload = writeFields([localPkBytes, sig3]);
 
-    const msg3 = writeFields([ciphertext, confirmCt]);
+    const identityNonce = new Uint8Array(aead.nonceSize);
+    const encryptedIdentity = aead.encrypt(identityPayload, i2rKey, identityNonce);
+
+    const msg3 = writeFields([ciphertext, encryptedIdentity]);
     transport.send(msg3);
 
     queue.finish();
@@ -320,22 +332,13 @@ async function handshakeAsResponder(
     aead: AeadSuite,
 ): Promise<AuthenticatedChannel> {
 
-    // --- Msg1: [serialized_pk, kem_prefs_json, sig1] ---
+    // --- Msg1: [nonce, kem_prefs_json] --- anonymous, no identity
     const msg1 = await queue.next();
     const msg1Fields = readFields(msg1);
-    if (msg1Fields.length < 3) throw new Error('invalid msg1');
+    if (msg1Fields.length < 2) throw new Error('invalid msg1');
 
-    const remotePk = deserializePublicKey(msg1Fields[0]);
     const initiatorPrefs: string[] = JSON.parse(fromUtf8(msg1Fields[1]));
-    const sig1 = msg1Fields[2];
-
-    const remoteSigning = getSigningSuite(remotePk.suite);
-    if (!remoteSigning) throw new Error(`unknown signing suite: ${remotePk.suite}`);
-
-    const msg1PreSig = writeFields([msg1Fields[0], msg1Fields[1]]);
-    const transcript1 = hashRaw(msg1PreSig);
-    const sig1Valid = await remoteSigning.verify(transcript1, sig1, remotePk.key);
-    if (!sig1Valid) throw new Error('msg1 signature verification failed');
+    const transcript1 = hashRaw(msg1);
 
     const chosenKemName = negotiate(initiatorPrefs, kemPrefs as string[]);
     if (!chosenKemName) throw new Error('no common KEM suite');
@@ -345,7 +348,7 @@ async function handshakeAsResponder(
 
     const ephKp = await kem.generateKeyPair();
 
-    // --- Msg2: [serialized_pk, chosen_kem, eph_kem_pk, sig2] ---
+    // --- Msg2: [responder_pk, chosen_kem, eph_kem_pk, sig2] ---
     const localPkBytes = serializePublicKey(localKey.publicKey);
     const chosenKemBytes = toUtf8(chosenKemName);
 
@@ -356,13 +359,13 @@ async function handshakeAsResponder(
     const msg2 = writeFields([localPkBytes, chosenKemBytes, ephKp.publicKey, sig2]);
     transport.send(msg2);
 
-    // --- Msg3: [kem_ciphertext, aead_confirmation] ---
+    // --- Msg3: [kem_ciphertext, encrypted_identity] ---
     const msg3 = await queue.next();
     const msg3Fields = readFields(msg3);
     if (msg3Fields.length < 2) throw new Error('invalid msg3');
 
     const ciphertext = msg3Fields[0];
-    const confirmCt = msg3Fields[1];
+    const encryptedIdentity = msg3Fields[1];
 
     const sharedSecret = await kem.decapsulate(ciphertext, ephKp.secretKey);
 
@@ -371,17 +374,25 @@ async function handshakeAsResponder(
     const i2rKey = kdf.deriveKey(sharedSecret, transcript3, LABEL_I2R, aead.keySize);
     const r2iKey = kdf.deriveKey(sharedSecret, transcript3, LABEL_R2I, aead.keySize);
 
-    const confirmNonce = new Uint8Array(aead.nonceSize);
+    const identityNonce = new Uint8Array(aead.nonceSize);
+    let identityPayload: Uint8Array;
     try {
-        const confirmPt = aead.decrypt(confirmCt, i2rKey, confirmNonce);
-        const expected = LABEL_CONFIRM;
-        if (confirmPt.length !== expected.length) throw new Error('bad confirm');
-        for (let i = 0; i < expected.length; i++) {
-            if (confirmPt[i] !== expected[i]) throw new Error('bad confirm');
-        }
+        identityPayload = aead.decrypt(encryptedIdentity, i2rKey, identityNonce);
     } catch {
-        throw new Error('handshake confirmation failed');
+        throw new Error('failed to decrypt initiator identity');
     }
+
+    const identityFields = readFields(identityPayload);
+    if (identityFields.length < 2) throw new Error('invalid identity payload');
+
+    const remotePk = deserializePublicKey(identityFields[0]);
+    const sig3 = identityFields[1];
+
+    const remoteSigning = getSigningSuite(remotePk.suite);
+    if (!remoteSigning) throw new Error(`unknown signing suite: ${remotePk.suite}`);
+
+    const sig3Valid = await remoteSigning.verify(transcript3, sig3, remotePk.key);
+    if (!sig3Valid) throw new Error('initiator identity signature verification failed');
 
     queue.finish();
 
@@ -409,10 +420,11 @@ export function createNoiseAuthenticator(config: NoiseAuthenticatorConfig): Peer
     return {
         async authenticate(
             transport: Transport,
+            role: 'initiator' | 'responder',
             expectedRemote?: KeyId,
         ): Promise<AuthenticatedChannel> {
             const queue = new MessageQueue(transport);
-            if (expectedRemote !== undefined) {
+            if (role === 'initiator') {
                 return handshakeAsInitiator(
                     transport, queue, localKey, signing, kemPrefs, kdf, aead, expectedRemote,
                 );

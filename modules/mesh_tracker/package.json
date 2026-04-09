@@ -1,0 +1,28 @@
+{
+  "name": "@hyper-hyper-space/hhs3_mesh_tracker",
+  "version": "0.1.0",
+  "description": "Tracker server for HHSv3 mesh peer discovery",
+  "type": "module",
+  "source": "src/index.ts",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "scripts": {
+    "test": "node --import ../../register.mjs ./test/run_tests.ts",
+    "debug": "node --import ../../register.mjs ./test/run_tests.ts",
+    "start": "node --import ../../register.mjs ./src/main.ts",
+    "build": "npx tsc"
+  },
+  "author": "Santiago Bazerque",
+  "license": "MIT",
+  "devDependencies": {
+    "@hyper-hyper-space/hhs3_util": "^0.1.0",
+    "@types/node": "^22.2.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.4"
+  },
+  "dependencies": {
+    "@hyper-hyper-space/hhs3_crypto": "^0.1.0",
+    "@hyper-hyper-space/hhs3_mesh": "^0.1.0",
+    "@hyper-hyper-space/hhs3_mesh_tracker_client": "^0.1.0"
+  }
+}

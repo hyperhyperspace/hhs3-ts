@@ -36,6 +36,8 @@ This monorepo is organized as a collection of modules. This is of course WIP.
 
 - `modules/mesh` Peer discovery, authentication, connection pooling, topic multiplexing and swarm management [[local]](modules/mesh) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/mesh)
 - `modules/mesh_ws` WebSocket transport implementation for the mesh module [[local]](modules/mesh_ws) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/mesh_ws)
+- `modules/mesh_tracker_client` Tracker-based peer discovery client (PeerDiscovery implementation) [[local]](modules/mesh_tracker_client) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/mesh_tracker_client)
+- `modules/mesh_tracker` Tracker server for peer discovery with identity management [[local]](modules/mesh_tracker) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/mesh_tracker)
 
 **Libraries**
 

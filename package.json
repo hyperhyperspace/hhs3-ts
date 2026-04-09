@@ -4,7 +4,7 @@
     "modules/*"
   ],
   "scripts": {
-    "build": "npm run build --workspace=modules/crypto && npm run build --workspace=modules/json && npm run build --workspace=modules/util && npm run build --workspace=modules/dag && npm run build --workspace=modules/dag_test && npm run build --workspace=modules/dag_sql && npm run build --workspace=modules/dag_sqlite && npm run build --workspace=modules/replica && npm run build --workspace=modules/mesh && npm run build --workspace=modules/mesh_ws",
-    "test": "npm run test --workspace=modules/crypto && npm run test small --workspace=modules/dag && npm run test --workspace=modules/dag_sql && npm run test --workspace=modules/dag_sqlite && npm run test --workspace=modules/replica && npm run test --workspace=modules/mesh && npm run test --workspace=modules/mesh_ws"
+    "build": "npm run build --workspace=modules/crypto && npm run build --workspace=modules/json && npm run build --workspace=modules/util && npm run build --workspace=modules/dag && npm run build --workspace=modules/dag_test && npm run build --workspace=modules/dag_sql && npm run build --workspace=modules/dag_sqlite && npm run build --workspace=modules/replica && npm run build --workspace=modules/mesh && npm run build --workspace=modules/mesh_ws && npm run build --workspace=modules/mesh_tracker_client && npm run build --workspace=modules/mesh_tracker",
+    "test": "npm run test --workspace=modules/crypto && npm run test small --workspace=modules/dag && npm run test --workspace=modules/dag_sql && npm run test --workspace=modules/dag_sqlite && npm run test --workspace=modules/replica && npm run test --workspace=modules/mesh && npm run test --workspace=modules/mesh_ws && npm run test --workspace=modules/mesh_tracker_client && npm run test --workspace=modules/mesh_tracker"
   }
 }

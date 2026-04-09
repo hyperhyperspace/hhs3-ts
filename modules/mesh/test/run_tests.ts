@@ -412,7 +412,7 @@ function makeStubDiscovery(peers: PeerInfo[]): PeerDiscovery {
 
 function makeStubAuthenticator(peerMap: Map<string, PublicKey>): PeerAuthenticator {
     return {
-        async authenticate(transport: Transport, expectedRemote?: KeyId) {
+        async authenticate(transport: Transport, role: 'initiator' | 'responder', expectedRemote?: KeyId) {
             if (expectedRemote === undefined) throw new Error('expected remote required in tests');
             const pk = peerMap.get(expectedRemote);
             if (!pk) throw new Error('unknown peer in test authenticator');
@@ -531,7 +531,7 @@ async function testSwarmDiscoveryAndConnect() {
     ];
 
     const stubAuth: PeerAuthenticator = {
-        async authenticate(transport: Transport, expectedRemote?: KeyId) {
+        async authenticate(transport: Transport, role: 'initiator' | 'responder', expectedRemote?: KeyId) {
             if (expectedRemote === undefined) throw new Error('expected remote required');
             const pk = peerMap.get(expectedRemote);
             if (!pk) throw new Error('unknown peer');
@@ -752,8 +752,8 @@ async function testAuthHandshakeSuccess() {
     const [tA, tB] = createMemTransportPair();
 
     const [chanA, chanB] = await Promise.all([
-        aliceAuth.authenticate(tA, bob.keyId),
-        bobAuth.authenticate(tB),
+        aliceAuth.authenticate(tA, 'initiator', bob.keyId),
+        bobAuth.authenticate(tB, 'responder'),
     ]);
 
     testing.assertEquals(chanA.remoteKeyId, bob.keyId, 'alice should see bob keyId');
@@ -779,8 +779,8 @@ async function testAuthEncryptedRoundTrip() {
 
     const [tA, tB] = createMemTransportPair();
     const [chanA, chanB] = await Promise.all([
-        aliceAuth.authenticate(tA, bob.keyId),
-        bobAuth.authenticate(tB),
+        aliceAuth.authenticate(tA, 'initiator', bob.keyId),
+        bobAuth.authenticate(tB, 'responder'),
     ]);
 
     const received: Uint8Array[] = [];
@@ -810,8 +810,8 @@ async function testAuthBidirectionalEncryption() {
 
     const [tA, tB] = createMemTransportPair();
     const [chanA, chanB] = await Promise.all([
-        aliceAuth.authenticate(tA, bob.keyId),
-        bobAuth.authenticate(tB),
+        aliceAuth.authenticate(tA, 'initiator', bob.keyId),
+        bobAuth.authenticate(tB, 'responder'),
     ]);
 
     const fromAlice: Uint8Array[] = [];
@@ -845,8 +845,8 @@ async function testAuthKemNegotiation() {
 
     const [tA, tB] = createMemTransportPair();
     const [chanA, chanB] = await Promise.all([
-        aliceAuth.authenticate(tA, bob.keyId),
-        bobAuth.authenticate(tB),
+        aliceAuth.authenticate(tA, 'initiator', bob.keyId),
+        bobAuth.authenticate(tB, 'responder'),
     ]);
 
     testing.assertTrue(chanA.open, 'should negotiate to x25519-hkdf');
@@ -878,8 +878,8 @@ async function testAuthKemNegotiationNoCommon() {
     let failed = false;
     try {
         await Promise.all([
-            aliceAuth.authenticate(tA, bob.keyId),
-            bobAuth.authenticate(tB),
+            aliceAuth.authenticate(tA, 'initiator', bob.keyId),
+            bobAuth.authenticate(tB, 'responder'),
         ]);
     } catch {
         failed = true;
@@ -909,8 +909,8 @@ async function testAuthExpectedRemoteMismatch() {
     let failed = false;
     try {
         await Promise.all([
-            aliceAuth.authenticate(tA, charlie.keyId),
-            bobAuth.authenticate(tB),
+            aliceAuth.authenticate(tA, 'initiator', charlie.keyId),
+            bobAuth.authenticate(tB, 'responder'),
         ]);
     } catch {
         failed = true;
@@ -936,8 +936,8 @@ async function testAuthTamperedCiphertext() {
 
     const [tA, tB] = createMemTransportPair();
     const [chanA, chanB] = await Promise.all([
-        aliceAuth.authenticate(tA, bob.keyId),
-        bobAuth.authenticate(tB),
+        aliceAuth.authenticate(tA, 'initiator', bob.keyId),
+        bobAuth.authenticate(tB, 'responder'),
     ]);
 
     let closeFired = false;
@@ -973,15 +973,15 @@ async function testAuthIndependentSessions() {
     // Session 1
     const [t1A, t1B] = createMemTransportPair();
     const [chan1A, chan1B] = await Promise.all([
-        aliceAuth.authenticate(t1A, bob.keyId),
-        bobAuth.authenticate(t1B),
+        aliceAuth.authenticate(t1A, 'initiator', bob.keyId),
+        bobAuth.authenticate(t1B, 'responder'),
     ]);
 
     // Session 2
     const [t2A, t2B] = createMemTransportPair();
     const [chan2A, chan2B] = await Promise.all([
-        aliceAuth.authenticate(t2A, bob.keyId),
-        bobAuth.authenticate(t2B),
+        aliceAuth.authenticate(t2A, 'initiator', bob.keyId),
+        bobAuth.authenticate(t2B, 'responder'),
     ]);
 
     const recv1: Uint8Array[] = [];
@@ -999,6 +999,79 @@ async function testAuthIndependentSessions() {
 
     // Cross-check: sessions are independent
     testing.assertTrue(chan1A.remoteKeyId === chan2A.remoteKeyId, 'same remote identity');
+}
+
+async function testAuthTofu() {
+    const alice = await makeNoiseKeyPair();
+    const bob = await makeNoiseKeyPair();
+
+    const aliceAuth = createNoiseAuthenticator({
+        localKey: { publicKey: alice.publicKey, secretKey: alice.secretKey },
+        signingName: SIGNING_ED25519,
+        kemPrefs: [KEM_X25519_HKDF],
+    });
+    const bobAuth = createNoiseAuthenticator({
+        localKey: { publicKey: bob.publicKey, secretKey: bob.secretKey },
+        signingName: SIGNING_ED25519,
+        kemPrefs: [KEM_X25519_HKDF],
+    });
+
+    const [tA, tB] = createMemTransportPair();
+
+    // Initiator does NOT pass expectedRemote (TOFU: first contact)
+    const [chanA, chanB] = await Promise.all([
+        aliceAuth.authenticate(tA, 'initiator'),
+        bobAuth.authenticate(tB, 'responder'),
+    ]);
+
+    testing.assertTrue(chanA.open, 'channel should be open');
+    testing.assertEquals(chanA.remoteKeyId, bob.keyId, 'initiator learns remote keyId after handshake');
+    testing.assertEquals(chanB.remoteKeyId, alice.keyId, 'responder learns initiator keyId');
+
+    const received: Uint8Array[] = [];
+    chanB.onMessage((msg) => received.push(msg));
+    chanA.send(new TextEncoder().encode('tofu-hello'));
+    testing.assertEquals(received.length, 1, 'message should arrive');
+    testing.assertTrue(bytesEqual(received[0], new TextEncoder().encode('tofu-hello')), 'payload match');
+}
+
+async function testAuthIdentityProtection() {
+    const alice = await makeNoiseKeyPair();
+    const bob = await makeNoiseKeyPair();
+    const charlie = await makeNoiseKeyPair();
+
+    const aliceAuth = createNoiseAuthenticator({
+        localKey: { publicKey: alice.publicKey, secretKey: alice.secretKey },
+        signingName: SIGNING_ED25519,
+        kemPrefs: [KEM_X25519_HKDF],
+    });
+    const bobAuth = createNoiseAuthenticator({
+        localKey: { publicKey: bob.publicKey, secretKey: bob.secretKey },
+        signingName: SIGNING_ED25519,
+        kemPrefs: [KEM_X25519_HKDF],
+    });
+
+    const [tA, tB] = createMemTransportPair();
+
+    // Track messages sent on the initiator's transport
+    const sentByInitiator: Uint8Array[] = [];
+    const origSend = tA.send.bind(tA);
+    tA.send = (msg: Uint8Array) => { sentByInitiator.push(msg); origSend(msg); };
+
+    // Alice expects charlie but gets bob — should abort before sending Msg3
+    let failed = false;
+    try {
+        await Promise.all([
+            aliceAuth.authenticate(tA, 'initiator', charlie.keyId),
+            bobAuth.authenticate(tB, 'responder'),
+        ]);
+    } catch {
+        failed = true;
+    }
+
+    testing.assertTrue(failed, 'handshake should fail on identity mismatch');
+    // Msg1 is sent (anonymous), but Msg3 (with identity) should NOT have been sent
+    testing.assertEquals(sentByInitiator.length, 1, 'only Msg1 should be sent, not Msg3');
 }
 
 // --- [STATIC] StaticDiscovery tests ---
@@ -1305,6 +1378,8 @@ const authTests = {
         { name: '[AUTH_05] ExpectedRemote mismatch rejects handshake', invoke: testAuthExpectedRemoteMismatch },
         { name: '[AUTH_06] Tampered ciphertext is rejected by AEAD', invoke: testAuthTamperedCiphertext },
         { name: '[AUTH_07] Independent sessions derive different keys', invoke: testAuthIndependentSessions },
+        { name: '[AUTH_08] TOFU mode completes without expectedRemote', invoke: testAuthTofu },
+        { name: '[AUTH_09] Identity protected on expectedRemote mismatch', invoke: testAuthIdentityProtection },
     ],
 };
 
