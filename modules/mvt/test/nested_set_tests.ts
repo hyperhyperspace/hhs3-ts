@@ -1,4 +1,4 @@
-import { ObjectMap, Replica, TypeRegistryMap, version } from "../src/replica.js";
+import { ObjectMap, RObject, RObjectInit, RObjectConfig, TypeRegistryMap, version } from "../src/mvt.js";
 import { RSet, rSetFactory, RSetProvider } from "../src/types/rset.js";
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { createMemDagBackend } from "../src/dag/mem_dag_storage.js";
@@ -7,33 +7,47 @@ import { B64Hash, createBasicCrypto, HASH_SHA256, stringToUint8Array } from "@hy
 
 const crypto = createBasicCrypto();
 
-const createReplica = (): Replica<RSetProvider> => {
+function createTestObjectMap(): ObjectMap {
     const registry = new TypeRegistryMap<RSetProvider>();
+    registry.register(RSet.typeId, rSetFactory);
 
-    registry.register(
-        RSet.typeId,
-        rSetFactory
-    );
-
+    const config: RObjectConfig = { selfValidate: true };
     const dagBackend = createMemDagBackend(crypto.hash(HASH_SHA256));
+    const objects = new Map<B64Hash, RObject>();
 
-    const createProvider = (objectMap: ObjectMap, id?: B64Hash): RSetProvider => ({
-        getObjectMap: () => objectMap,
-        getConfig: () => ({ selfValidate: true }),
-        getRegistry: () => registry,
-        getCrypto: () => crypto,
-        getScopedDag: (tag?: string) => {
-            if (id === undefined) throw new Error("Object ID not yet assigned");
-            return dagBackend.getScopedDag(id, tag);
+    const objectMap: ObjectMap = {
+        getObject: async (id: B64Hash) => objects.get(id)!,
+        addObject: async (init: RObjectInit) => {
+            const factory = await registry.lookup(init.type);
+            const id = await factory.computeRootObjectId(init.payload, createProvider());
+            const provider = createProvider(id);
+            const valid = await factory.validateCreationPayload(init.payload, provider);
+            if (!valid) throw new Error('Invalid creation payload');
+            await factory.executeCreationPayload(init.payload, provider);
+            objects.set(id, await factory.loadObject(id, provider));
+            return id;
         },
-        getCausalDag: (tag?: string) => {
-            if (id === undefined) throw new Error("Object ID not yet assigned");
-            return dagBackend.getCausalDag(id, tag);
-        },
-    });
+    };
 
-    return new Replica(registry, createProvider, { selfValidate: true });
-};
+    function createProvider(id?: B64Hash): RSetProvider {
+        return {
+            getObjectMap: () => objectMap,
+            getConfig: () => config,
+            getRegistry: () => registry,
+            getCrypto: () => crypto,
+            getScopedDag: (tag?: string) => {
+                if (id === undefined) throw new Error("Object ID not yet assigned");
+                return dagBackend.getScopedDag(id, tag);
+            },
+            getCausalDag: (tag?: string) => {
+                if (id === undefined) throw new Error("Object ID not yet assigned");
+                return dagBackend.getCausalDag(id, tag);
+            },
+        };
+    }
+
+    return objectMap;
+}
 
 export const nestedSetTests = {
     title: '[NESTED] Nested set tests',
@@ -41,7 +55,7 @@ export const nestedSetTests = {
         {
             name: '[NES00] Test adding a nested set and inserting elements into it',
             invoke: async () => {
-                const replica = createReplica();
+                const objectMap = createTestObjectMap();
 
                 // Create the outer set that will contain nested sets
                 const outerSetInit = await RSet.create({
@@ -53,8 +67,8 @@ export const nestedSetTests = {
                     supportBarrierDelete: true,
                 });
 
-                const outerSetId = await replica.addObject(outerSetInit);
-                const outerSet = (await replica.getObject(outerSetId)) as RSet;
+                const outerSetId = await objectMap.addObject(outerSetInit);
+                const outerSet = (await objectMap.getObject(outerSetId)) as RSet;
 
 
                 // Add a nested set to the outer set
@@ -97,7 +111,7 @@ export const nestedSetTests = {
         {
             name: '[NES01] Test multiple nested sets with overlapping elements',
             invoke: async () => {
-                const replica = createReplica();
+                const objectMap = createTestObjectMap();
 
                 // Create the outer set that will contain nested sets
                 const outerSetInit = await RSet.create({
@@ -109,8 +123,8 @@ export const nestedSetTests = {
                     supportBarrierDelete: true,
                 });
 
-                const outerSetId = await replica.addObject(outerSetInit);
-                const outerSet = (await replica.getObject(outerSetId)) as RSet;
+                const outerSetId = await objectMap.addObject(outerSetInit);
+                const outerSet = (await objectMap.getObject(outerSetId)) as RSet;
 
 
                 // Helper to create and add a nested set, returning its hash and instance
@@ -170,7 +184,7 @@ export const nestedSetTests = {
         {
             name: '[NES02] Test concurrent additions inside nested sets',
             invoke: async () => {
-                const replica = createReplica();
+                const objectMap = createTestObjectMap();
 
                 // Create the outer set that will contain nested sets
                 const outerSetInit = await RSet.create({
@@ -182,8 +196,8 @@ export const nestedSetTests = {
                     supportBarrierDelete: true,
                 });
 
-                const outerSetId = await replica.addObject(outerSetInit);
-                const outerSet = (await replica.getObject(outerSetId)) as RSet;
+                const outerSetId = await objectMap.addObject(outerSetInit);
+                const outerSet = (await objectMap.getObject(outerSetId)) as RSet;
 
 
                 // Helper to create and add a nested set, returning its hash and instance
@@ -323,7 +337,7 @@ export const nestedSetTests = {
         {
             name: '[NES03] Test barrier operations with nested elements',
             invoke: async () => {
-                const replica = createReplica();
+                const objectMap = createTestObjectMap();
 
                 // Create the outer set that will contain nested sets, with barrier support enabled.
                 const outerSetInit = await RSet.create({
@@ -335,8 +349,8 @@ export const nestedSetTests = {
                     supportBarrierDelete: true,
                 });
 
-                const outerSetId = await replica.addObject(outerSetInit);
-                const outerSet = (await replica.getObject(outerSetId)) as RSet;
+                const outerSetId = await objectMap.addObject(outerSetInit);
+                const outerSet = (await objectMap.getObject(outerSetId)) as RSet;
 
 
                 const makeNestedInit = async (seed: string) => {
@@ -399,7 +413,7 @@ export const nestedSetTests = {
         {
             name: '[NES04] Test deep barrier operations inside multiple nested sets',
             invoke: async () => {
-                const replica = createReplica();
+                const objectMap = createTestObjectMap();
 
                 // Outer container set holding nested sets with barrier support.
                 const outerSetInit = await RSet.create({
@@ -411,8 +425,8 @@ export const nestedSetTests = {
                     supportBarrierDelete: true,
                 });
 
-                const outerSetId = await replica.addObject(outerSetInit);
-                const outerSet = (await replica.getObject(outerSetId)) as RSet;
+                const outerSetId = await objectMap.addObject(outerSetInit);
+                const outerSet = (await objectMap.getObject(outerSetId)) as RSet;
 
 
                 // Helper to create an empty nested set with barrier support, add it to the outer set,
@@ -546,7 +560,7 @@ export const nestedSetTests = {
         {
             name: '[NES05] Nested creation applies initialElements for nested RSet',
             invoke: async () => {
-                const replica = createReplica();
+                const objectMap = createTestObjectMap();
 
                 // Outer set that can hold nested RSet elements.
                 const outerSetInit = await RSet.create({
@@ -558,8 +572,8 @@ export const nestedSetTests = {
                     supportBarrierDelete: true,
                 });
 
-                const outerSetId = await replica.addObject(outerSetInit);
-                const outerSet = (await replica.getObject(outerSetId)) as RSet;
+                const outerSetId = await objectMap.addObject(outerSetInit);
+                const outerSet = (await objectMap.getObject(outerSetId)) as RSet;
 
 
                 // Create a nested RSet payload with initialElements.
@@ -590,7 +604,7 @@ export const nestedSetTests = {
         {
             name: '[NES06] Initial elements survive history; barrier delete propagates to concurrent branch',
             invoke: async () => {
-                const replica = createReplica();
+                const objectMap = createTestObjectMap();
 
                 // Outer set to hold nested RSet elements.
                 const outerSetInit = await RSet.create({
@@ -602,8 +616,8 @@ export const nestedSetTests = {
                     supportBarrierDelete: true,
                 });
 
-                const outerSetId = await replica.addObject(outerSetInit);
-                const outerSet = (await replica.getObject(outerSetId)) as RSet;
+                const outerSetId = await objectMap.addObject(outerSetInit);
+                const outerSet = (await objectMap.getObject(outerSetId)) as RSet;
 
 
                 // Nested RSet with initial elements.
@@ -654,7 +668,7 @@ export const nestedSetTests = {
         {
             name: '[NES07] Test three-level nested sets and deep element isolation',
             invoke: async () => {
-                const replica = createReplica();
+                const objectMap = createTestObjectMap();
 
                 // Outer set that will contain a mid-level nested set.
                 const outerInit = await RSet.create({
@@ -666,8 +680,8 @@ export const nestedSetTests = {
                     supportBarrierDelete: true,
                 });
 
-                const outerId = await replica.addObject(outerInit);
-                const outerSet = (await replica.getObject(outerId)) as RSet;
+                const outerId = await objectMap.addObject(outerInit);
+                const outerSet = (await objectMap.getObject(outerId)) as RSet;
 
 
                 // Mid-level nested set that will itself hold another nested set plus its own literals.
@@ -733,7 +747,7 @@ export const nestedSetTests = {
         {
             name: '[NES08] Regular deleteByHash removes a nested set while siblings remain',
             invoke: async () => {
-                const replica = createReplica();
+                const objectMap = createTestObjectMap();
 
                 const outerSetInit = await RSet.create({
                     seed: 'outer-set-regular-delete',
@@ -744,8 +758,8 @@ export const nestedSetTests = {
                     supportBarrierDelete: true,
                 });
 
-                const outerSetId = await replica.addObject(outerSetInit);
-                const outerSet = (await replica.getObject(outerSetId)) as RSet;
+                const outerSetId = await objectMap.addObject(outerSetInit);
+                const outerSet = (await objectMap.getObject(outerSetId)) as RSet;
 
                 const addNestedSet = async (seed: string) => {
                     const nestedInit = await RSet.create({

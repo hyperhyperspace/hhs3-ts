@@ -1,4 +1,4 @@
-import { ObjectMap, Replica, TypeRegistryMap, version } from "../src/replica.js";
+import { ObjectMap, RObject, RObjectInit, RObjectConfig, TypeRegistryMap, version } from "../src/mvt.js";
 import { RSet, rSetFactory, RSetProvider } from "../src/types/rset.js";
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { createMemDagBackend } from "../src/dag/mem_dag_storage.js";
@@ -7,36 +7,50 @@ import { B64Hash, createBasicCrypto, HASH_SHA256, stringToUint8Array } from "@hy
 
 const crypto = createBasicCrypto();
 
-const createReplica = (): Replica<RSetProvider> => {
+function createTestObjectMap(): ObjectMap {
     const registry = new TypeRegistryMap<RSetProvider>();
+    registry.register(RSet.typeId, rSetFactory);
 
-    registry.register(
-        RSet.typeId,
-        rSetFactory
-    );
-
+    const config: RObjectConfig = { selfValidate: true };
     const dagBackend = createMemDagBackend(crypto.hash(HASH_SHA256));
+    const objects = new Map<B64Hash, RObject>();
 
-    const createProvider = (objectMap: ObjectMap, id?: B64Hash): RSetProvider => ({
-        getObjectMap: () => objectMap,
-        getConfig: () => ({ selfValidate: true }),
-        getRegistry: () => registry,
-        getCrypto: () => crypto,
-        getScopedDag: (tag?: string) => {
-            if (id === undefined) throw new Error("Object ID not yet assigned");
-            return dagBackend.getScopedDag(id, tag);
+    const objectMap: ObjectMap = {
+        getObject: async (id: B64Hash) => objects.get(id)!,
+        addObject: async (init: RObjectInit) => {
+            const factory = await registry.lookup(init.type);
+            const id = await factory.computeRootObjectId(init.payload, createProvider());
+            const provider = createProvider(id);
+            const valid = await factory.validateCreationPayload(init.payload, provider);
+            if (!valid) throw new Error('Invalid creation payload');
+            await factory.executeCreationPayload(init.payload, provider);
+            objects.set(id, await factory.loadObject(id, provider));
+            return id;
         },
-        getCausalDag: (tag?: string) => {
-            if (id === undefined) throw new Error("Object ID not yet assigned");
-            return dagBackend.getCausalDag(id, tag);
-        },
-    });
+    };
 
-    return new Replica(registry, createProvider, { selfValidate: true });
-};
+    function createProvider(id?: B64Hash): RSetProvider {
+        return {
+            getObjectMap: () => objectMap,
+            getConfig: () => config,
+            getRegistry: () => registry,
+            getCrypto: () => crypto,
+            getScopedDag: (tag?: string) => {
+                if (id === undefined) throw new Error("Object ID not yet assigned");
+                return dagBackend.getScopedDag(id, tag);
+            },
+            getCausalDag: (tag?: string) => {
+                if (id === undefined) throw new Error("Object ID not yet assigned");
+                return dagBackend.getCausalDag(id, tag);
+            },
+        };
+    }
+
+    return objectMap;
+}
 
 const createTestEnvironment = async (initialElements: Array<json.Literal> = []) => {
-    const replica = createReplica();
+    const objectMap = createTestObjectMap();
 
     const init = await RSet.create(
         {
@@ -48,10 +62,10 @@ const createTestEnvironment = async (initialElements: Array<json.Literal> = []) 
         }
     );
 
-    const setId = await replica.addObject(init)
-    const set = (await replica.getObject(setId)) as RSet;
+    const setId = await objectMap.addObject(init)
+    const set = (await objectMap.getObject(setId)) as RSet;
 
-    return { replica, set, setId };
+    return { objectMap, set, setId };
 };
 
 export const simpleSetTests = {
@@ -275,7 +289,7 @@ export const simpleSetTests = {
         {
             name: '[SET08] Set without barrier support: basic add and delete work',
             invoke: async () => {
-                const replica = createReplica();
+                const objectMap = createTestObjectMap();
 
                 const init = await RSet.create({
                     seed: 'no-barrier-set',
@@ -283,8 +297,8 @@ export const simpleSetTests = {
                     hashAlgorithm: 'sha256',
                 });
 
-                const setId = await replica.addObject(init);
-                const set = (await replica.getObject(setId)) as RSet;
+                const setId = await objectMap.addObject(init);
+                const set = (await objectMap.getObject(setId)) as RSet;
 
                 const view0 = await set.getView();
                 assertTrue(await view0.has('alpha'), 'initial element alpha should be present');
@@ -308,7 +322,7 @@ export const simpleSetTests = {
         {
             name: '[SET09] Set without barrier support: addWithBarrier throws',
             invoke: async () => {
-                const replica = createReplica();
+                const objectMap = createTestObjectMap();
 
                 const init = await RSet.create({
                     seed: 'no-barrier-add-set',
@@ -316,8 +330,8 @@ export const simpleSetTests = {
                     hashAlgorithm: 'sha256',
                 });
 
-                const setId = await replica.addObject(init);
-                const set = (await replica.getObject(setId)) as RSet;
+                const setId = await objectMap.addObject(init);
+                const set = (await objectMap.getObject(setId)) as RSet;
 
                 let threw = false;
                 try {
@@ -331,7 +345,7 @@ export const simpleSetTests = {
         {
             name: '[SET10] Set without barrier support: deleteWithBarrier throws',
             invoke: async () => {
-                const replica = createReplica();
+                const objectMap = createTestObjectMap();
 
                 const init = await RSet.create({
                     seed: 'no-barrier-delete-set',
@@ -339,8 +353,8 @@ export const simpleSetTests = {
                     hashAlgorithm: 'sha256',
                 });
 
-                const setId = await replica.addObject(init);
-                const set = (await replica.getObject(setId)) as RSet;
+                const setId = await objectMap.addObject(init);
+                const set = (await objectMap.getObject(setId)) as RSet;
 
                 await set.add('alpha');
 

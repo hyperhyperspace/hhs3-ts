@@ -11,7 +11,7 @@ async function main() {
     allTests.set(simpleSetTests.title, simpleSetTests.tests);
     allTests.set(nestedSetTests.title, nestedSetTests.tests);
 
-    console.log('Running tests for Hyper Hyper Space v3 Replica module' + (filters.length > 0? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');    
+    console.log('Running tests for Hyper Hyper Space v3 MVT module' + (filters.length > 0? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');    
 
     for (const [title, tests] of allTests.entries()) {
         console.log(title);

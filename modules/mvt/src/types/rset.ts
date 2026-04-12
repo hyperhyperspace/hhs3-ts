@@ -27,7 +27,7 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, BasicCrypto, HASH_SHA256, sha256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, MetaProps, position, EntryMetaFilter, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
 
-import { Payload, BasicProvider, RObject, RObjectFactory, RObjectTypeRegistry, RObjectInit, ObjectMap, RObjectConfig, version, Version, View } from "../replica.js";
+import { Payload, BasicProvider, RObject, RObjectFactory, RObjectTypeRegistry, RObjectInit, ObjectMap, RObjectConfig, version, Version, View } from "../mvt.js";
 import { DagCapability } from "../dag/dag_resource.js";
 import { DagScope, NestedScopedDag, ScopedDag, CausalDag } from "../dag/dag_nesting.js";
 import { set } from "@hyper-hyper-space/hhs3_util";
