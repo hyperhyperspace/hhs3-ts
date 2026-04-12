@@ -73,13 +73,13 @@ Finally, the operational model with barriers + scoped views generalizes well whe
 
 #### Implementation
 
-We provide an implementation of Monotone View Types over hash-linked DAGs. The **`dag`** module [[local]](../dag) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/dag) provides the fundamental algorithms (see `findForkPosition`, `findMinimalCover`, `findCoverWithFilter` and `findConcurrentCoverWithFilter`) to support MVTs that work by finding filtered minimal covers over the DAG.
+The core MVT interfaces, DAG-based nesting mechanism, and concrete type implementations live in the **`mvt`** module [[local]](../mvt) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/mvt). The **`dag`** module [[local]](../dag) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/dag) provides the fundamental algorithms (see `findForkPosition`, `findMinimalCover`, `findCoverWithFilter` and `findConcurrentCoverWithFilter`) to support MVTs that work by finding filtered minimal covers over the DAG.
 
-As an example, a Monotone View Replicated Set was implemented here [[local]](src/types/rset.ts) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/replica/src/types/rset.ts). It supports both plain and barrier additions and deletions, showcasing how non-monotonic behavior can be transformed through the scoped view mechanism.
+As an example, a Monotone View Replicated Set is provided in the **`mvt`** module [[local]](../mvt/src/types/rset.ts) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/mvt/src/types/rset.ts). It supports both plain and barrier additions and deletions, showcasing how non-monotonic behavior can be transformed through the scoped view mechanism.
 
 #### Nesting
 
-Nesting at the DAG level is supported for MVTs. Operations for the inner instance are wrapped and inserted into the outer instance's DAG. The Monotone View Replicated Set was extended to support nesting (sets of sets of aribtrary depth).
+Nesting at the DAG level is supported for MVTs. Operations for the inner instance are wrapped and inserted into the outer instance's DAG. The Monotone View Replicated Set was extended to support nesting (sets of sets of aribtrary depth). See the **`mvt`** module [[local]](../mvt) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/mvt) for details.
 
 ### Composability: SOaD Architecture
 
@@ -106,18 +106,5 @@ It's interesting to notice how in traditional systems observation is _implicit_ 
 
 ## Testing
 
-A test suite for the Monotone View Replicable Set data type [[local]](src/types/rset.ts) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/replica/src/types/rset.ts) is provided. It tests both barrier add / delete operations, and set nesting.
-
-To run the test suite, first build the workspace by running at the top level:
-
-```
-npm install
-npm run build
-```
-
-And then within the **`modules/replica`** folder:
-
-```
-npm run test
-``` 
+Tests for the Monotone View Replicable Set (barrier add/delete, nesting) now live in the **`mvt`** module [[local]](../mvt) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/mvt). See its README for details on running them. 
  

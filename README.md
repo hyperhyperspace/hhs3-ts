@@ -10,11 +10,11 @@ This new version has two main goals:
 
  - **Greater modularization**. Previous versions of Hyper Hyper Space were bundled as a monolithic JavaScript app for usage in web browsers. While we still see the browser as a possible target, we're now trying to build a collection of modules that can be re-used on any platform. See below for the modules that have been ported to v3 so far.
  
- - **A new data model**. We've developed a new formalism for coordination-free replication, **Monotone View Types**, in which observations are monotonic but explicitly version-scoped, allowing historical views to be refined as additional information becomes available. MVTs are a powerful _monotonic transformation_ mechanism, that helps application developers create coordination-free approximations for applications in any domain. Learn more in the **`replica`** module [[local]](modules/replica) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/replica).
+ - **A new data model**. We've developed a new formalism for coordination-free replication, **Monotone View Types**, in which observations are monotonic but explicitly version-scoped, allowing historical views to be refined as additional information becomes available. MVTs are a powerful _monotonic transformation_ mechanism, that helps application developers create coordination-free approximations for applications in any domain. Learn more in the **`mvt`** module [[local]](modules/mvt) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/mvt).
 
 ### Current status
  
- We're completing the data modeling layer in the **`replica`** module. While the implementation of **Monotone View Types** is complete, we're working on a concurrency model for **Monotone View Type** composition, based on the idea of **State-Observation-as-Data** (SOaD). The networking layer (**`mesh`**) now provides peer discovery, authenticated key exchange (with post-quantum options), connection pooling with topic multiplexing, and swarm management. Once the synchronizer is ported, it will bridge **`replica`** and **`mesh`** to enable live state sync. After that, adapters and tooling for using the synchronizer with existing information systems (mostly RDBMs) will be developed. Please see the **`replica`** module and the [roadmap](https://www.hyperhyperspace.org/work-plan-2025.html) for details.
+ We're completing the data modeling layer in the **`mvt`** and **`replica`** modules. While the implementation of **Monotone View Types** is complete, we're working on a concurrency model for **Monotone View Type** composition, based on the idea of **State-Observation-as-Data** (SOaD). The networking layer (**`mesh`**) now provides peer discovery, authenticated key exchange (with post-quantum options), connection pooling with topic multiplexing, and swarm management. Once the synchronizer is ported, it will bridge **`replica`** and **`mesh`** to enable live state sync. After that, adapters and tooling for using the synchronizer with existing information systems (mostly RDBMs) will be developed. Please see the **`mvt`** module and the [roadmap](https://www.hyperhyperspace.org/work-plan-2025.html) for details.
 
 ### Organization
 
@@ -22,7 +22,8 @@ This monorepo is organized as a collection of modules. This is of course WIP.
 
 **Data**
 
-- `modules/replica` A replica that can synchronize Monotone View Types [[local]](modules/replica) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/replica)
+- `modules/mvt` Monotone-View Types: DAG-based replicable object type system with nesting support [[local]](modules/mvt) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/mvt)
+- `modules/replica` A replica that orchestrates Monotone View Type instances for synchronization [[local]](modules/replica) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/replica)
 - `modules/dag` A DAG-based append-only log with fast fork/merge & covering operations [[local]](modules/dag) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/dag)
 - `modules/dag_sql` SQL-backed storage for DAG entries and indices, using an abstract SQL connection interface [[local]](modules/dag_sql) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/dag_sql)
 - `modules/dag_sqlite` SQLite bindings for the SQL DAG storage layer [[local]](modules/dag_sqlite) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/dag_sqlite)
