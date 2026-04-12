@@ -27,7 +27,7 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, BasicCrypto, HASH_SHA256, sha256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, MetaProps, position, EntryMetaFilter, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
 
-import { Payload, BasicProvider, RObject, RObjectFactory, RObjectTypeRegistry, RObjectInit, Replica, version, Version, View } from "../replica.js";
+import { Payload, BasicProvider, RObject, RObjectFactory, RObjectTypeRegistry, RObjectInit, ObjectMap, RObjectConfig, version, Version, View } from "../replica.js";
 import { DagCapability } from "../dag/dag_resource.js";
 import { DagScope, NestedScopedDag, ScopedDag, CausalDag } from "../dag/dag_nesting.js";
 import { set } from "@hyper-hyper-space/hhs3_util";
@@ -44,7 +44,8 @@ import { SetPayload } from "./rset/payload.js";
 export type RSetProvider = BasicProvider & DagCapability;
 
 type RSetResources = {
-    replica: Replica<any>;
+    objectMap: ObjectMap;
+    config: RObjectConfig;
     registry: RObjectTypeRegistry<any>;
     getCrypto: () => BasicCrypto;
     getScopedDag: (tag?: string) => Promise<ScopedDag>;
@@ -187,7 +188,8 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
         this.createOpId = createOpId;
         this.createOp = createOp;
         this.resources = {
-            replica: provider.getReplica(),
+            objectMap: provider.getObjectMap(),
+            config: provider.getConfig(),
             registry: provider.getRegistry(),
             getCrypto: () => provider.getCrypto(),
             getScopedDag: (tag?) => provider.getScopedDag(tag),
@@ -517,7 +519,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
     }
 
     selfValidate(): boolean {
-        return this.resources.replica.config.selfValidate || false;
+        return this.resources.config.selfValidate || false;
     }
 
     subscribe(callback: (event: RAddEvent | RDeleteEvent) => void): void {
@@ -538,7 +540,8 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
 
     createChildProvider(elementHash: B64Hash, scope: DagScope): RSetProvider {
         return {
-            getReplica: () => this.resources.replica,
+            getObjectMap: () => this.resources.objectMap,
+            getConfig: () => this.resources.config,
             getRegistry: () => this.resources.registry,
             getCrypto: () => this.resources.getCrypto(),
             getScopedDag: async (tag?) => new NestedScopedDag(await this.resources.getScopedDag(tag), scope),

@@ -1,4 +1,4 @@
-import { Replica, TypeRegistryMap, version } from "../src/replica.js";
+import { ObjectMap, Replica, TypeRegistryMap, version } from "../src/replica.js";
 import { RSet, rSetFactory, RSetProvider } from "../src/types/rset.js";
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { createMemDagBackend } from "../src/dag/mem_dag_storage.js";
@@ -17,9 +17,10 @@ const createReplica = (): Replica<RSetProvider> => {
 
     const dagBackend = createMemDagBackend(crypto.hash(HASH_SHA256));
 
-    const createProvider = (replica: Replica<RSetProvider>, id?: B64Hash): RSetProvider => ({
-        getReplica: () => replica,
-        getRegistry: () => replica.getRegistry(),
+    const createProvider = (objectMap: ObjectMap, id?: B64Hash): RSetProvider => ({
+        getObjectMap: () => objectMap,
+        getConfig: () => ({ selfValidate: true }),
+        getRegistry: () => registry,
         getCrypto: () => crypto,
         getScopedDag: (tag?: string) => {
             if (id === undefined) throw new Error("Object ID not yet assigned");

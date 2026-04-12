@@ -38,8 +38,18 @@ export type RObjectInit = {
     payload: Payload;
 }
 
+export type ObjectMap = {
+    getObject(id: B64Hash): Promise<RObject>;
+    addObject(init: RObjectInit): Promise<B64Hash>;
+};
+
+export type RObjectConfig = {
+    selfValidate?: boolean;
+};
+
 export type BasicProvider = {
-    getReplica(): Replica<any>;
+    getObjectMap(): ObjectMap;
+    getConfig(): RObjectConfig;
     getRegistry(): RObjectTypeRegistry<any>;
     getCrypto(): BasicCrypto;
 };
@@ -87,24 +97,20 @@ export class TypeRegistryMap<P extends BasicProvider = BasicProvider> implements
     }
 }
 
-export type ReplicaConfig = {
-    selfValidate?: boolean;
-};
-
-export class Replica<P extends BasicProvider = BasicProvider> {
+export class Replica<P extends BasicProvider = BasicProvider> implements ObjectMap {
 
     private registry: RObjectTypeRegistry<P>;
     private objects: Map<B64Hash, RObject> = new Map();
-    config: ReplicaConfig;
+    config: RObjectConfig;
 
     // If id is missing, the object creation payload has not yet been validated.
-    // In that case yhe provider will refuse to return any resources that consume 
-    // significant resources, throwing an exception isntead. This mode is intended
+    // In that case the provider will refuse to return any resources that consume 
+    // significant resources, throwing an exception instead. This mode is intended
     // for use in validation only.
-    private createProvider: (replica: Replica<P>, id?: B64Hash) => P;
+    private createProvider: (objectMap: ObjectMap, id?: B64Hash) => P;
     
 
-    constructor(registry: RObjectTypeRegistry<P>, createProvider: (replica: Replica<P>, id?: B64Hash) => P, config: ReplicaConfig = {}) {
+    constructor(registry: RObjectTypeRegistry<P>, createProvider: (objectMap: ObjectMap, id?: B64Hash) => P, config: RObjectConfig = {}) {
         this.registry = registry;
         this.createProvider = createProvider;
         this.config = config;
