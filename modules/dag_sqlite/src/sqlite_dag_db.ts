@@ -7,20 +7,22 @@ import {
     checkSchemaVersion,
     getOrCreateDag,
     getDag,
-    SqlDagStore,
     SqlLevelIndexStore,
     SqlTopoIndexStore,
     IdxType,
 } from "@hyper-hyper-space/hhs3_dag_sql";
 
 import { SqliteHandle, openSqliteConnection } from "./sqlite_connection.js";
+import { WatcherSqliteDagStore } from "./watcher_sqlite_dag_store.js";
 
 export class SqliteDagDb {
     private handle: SqliteHandle;
+    private path: string;
     private dagCache: Map<string, Dag>;
 
-    private constructor(handle: SqliteHandle) {
+    private constructor(handle: SqliteHandle, path: string) {
         this.handle = handle;
+        this.path = path;
         this.dagCache = new Map();
     }
 
@@ -28,7 +30,7 @@ export class SqliteDagDb {
         const handle = openSqliteConnection(path);
         await initSchema(handle.conn);
         await checkSchemaVersion(handle.conn);
-        return new SqliteDagDb(handle);
+        return new SqliteDagDb(handle, path);
     }
 
     async createDag(dagHash: string, indexType: IdxType, hash: HashSuite): Promise<Dag> {
@@ -61,7 +63,7 @@ export class SqliteDagDb {
 
     private buildDag(dagId: number, idxType: IdxType, hash: HashSuite): Dag {
         const conn = this.handle.conn;
-        const store = new SqlDagStore(conn, dagId);
+        const store = new WatcherSqliteDagStore(conn, dagId, this.path);
 
         if (idxType === 'level') {
             const indexStore = new SqlLevelIndexStore(conn, dagId);

@@ -2,7 +2,7 @@ import { B64Hash, HashSuite, stringToUint8Array } from "@hyper-hyper-space/hhs3_
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { Entry, EntryMetaFilter, ForkPosition, Header, MetaProps, Position } from "./dag_defs.js";
 import { DagIndex } from "./idx/dag_idx.js";
-import { DagStore } from "./store/dag_store.js";
+import { DagGrowthListener, DagStore } from "./store/dag_store.js";
 
 export { HashSuite } from "@hyper-hyper-space/hhs3_crypto";
 export * from "./dag_defs.js";
@@ -35,6 +35,11 @@ export type Dag = {
     findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position>;
     
     loadAllEntries(): AsyncIterable<Entry>; // in topo order
+
+    // Growth events. See DagStore.addListener for the contract (at-least-once,
+    // no payload -- consumers should re-read getFrontier()).
+    addListener(listener: DagGrowthListener): void;
+    removeListener(listener: DagGrowthListener): void;
 
     getStore(): DagStore<any>;
     getIndex(): DagIndex<any>;
@@ -81,6 +86,7 @@ export function create<Tx = void>(
                 }
                 await index.index(e.hash, after, ...tx);
                 await store.append(e, ...tx);
+                return { fireListeners: true };
             });
             return e.hash;
         },
@@ -102,6 +108,9 @@ export function create<Tx = void>(
         findConcurrentCoverWithFilter: async (from, concurrentTo, filter) => index.findConcurrentCoverWithFilter(from, concurrentTo, filter),
 
         loadAllEntries: () => ro.loadAllEntries(),
+
+        addListener: (cb) => ro.addListener(cb),
+        removeListener: (cb) => ro.removeListener(cb),
 
         getStore: () => store,
         getIndex: () => index

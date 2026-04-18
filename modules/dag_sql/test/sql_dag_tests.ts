@@ -4,7 +4,7 @@ import { assertTrue, assertEquals } from "@hyper-hyper-space/hhs3_util/dist/test
 
 import { createSqliteConnection } from "./sqlite_connection.js";
 import { initSchema, getOrCreateDag } from "../src/sql_schema.js";
-import { SqlDagStore } from "../src/sql_dag_store.js";
+import { PollingSqlDagStore } from "../src/polling_sql_dag_store.js";
 import { SqlLevelIndexStore } from "../src/sql_level_index_store.js";
 import { SqlTopoIndexStore } from "../src/sql_topo_index_store.js";
 import { SqlConnection } from "../src/sql_connection.js";
@@ -12,14 +12,14 @@ import { SqlConnection } from "../src/sql_connection.js";
 import { createDagLevelIndex } from "@hyper-hyper-space/hhs3_dag/dist/idx/level/level_idx.js";
 import { createDagTopoIndex } from "@hyper-hyper-space/hhs3_dag/dist/idx/topo/topo_idx.js";
 
-import { createBackendTestSuite, createParitySuite } from "@hyper-hyper-space/hhs3_dag_test";
+import { createBackendTestSuite, createParitySuite, createGrowthEventSuite } from "@hyper-hyper-space/hhs3_dag_test";
 
 async function createSqlDag(indexType: 'level' | 'topo'): Promise<dag.Dag> {
     const conn = createSqliteConnection(":memory:");
     await initSchema(conn);
     const dagId = await getOrCreateDag(conn, "test-dag-" + Math.random(), indexType);
 
-    const store = new SqlDagStore(conn, dagId);
+    const store = new PollingSqlDagStore(conn, dagId);
 
     if (indexType === 'level') {
         const indexStore = new SqlLevelIndexStore(conn, dagId);
@@ -41,8 +41,8 @@ async function testMultipleDagsInSameDb() {
 
     assertTrue(dagId1 !== dagId2, 'dag ids should be different');
 
-    const store1 = new SqlDagStore(conn, dagId1);
-    const store2 = new SqlDagStore(conn, dagId2);
+    const store1 = new PollingSqlDagStore(conn, dagId1);
+    const store2 = new PollingSqlDagStore(conn, dagId2);
 
     const idx1 = new SqlTopoIndexStore(conn, dagId1);
     const idx2 = new SqlTopoIndexStore(conn, dagId2);
@@ -103,3 +103,45 @@ export const topoParitySuite = createParitySuite(
     "SQL_TOPO_PAR",
     () => createSqlDag('topo')
 );
+
+export const growthEventSuite = createGrowthEventSuite(
+    "SQL_GROW",
+    () => createSqlDag('level')
+);
+
+async function testPollingObserverDetectsExternalWrite() {
+    const conn = createSqliteConnection(":memory:");
+    await initSchema(conn);
+    const dagId = await getOrCreateDag(conn, "polling-test", "topo");
+
+    const storeA = new PollingSqlDagStore(conn, dagId, 50);
+    const storeB = new PollingSqlDagStore(conn, dagId, 50);
+
+    let listenerCalled = 0;
+    const listener = () => { listenerCalled++; };
+    storeA.addListener(listener);
+
+    // Let the first polling tick run so the baseline MAX(rowid) is established
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    const entry = dag.createEntry({ ext: true }, {}, undefined, sha256);
+    await storeB.withTransaction(async (tx) => {
+        await storeB.append(entry, tx);
+        return { fireListeners: true };
+    });
+
+    // Wait for the next polling tick to detect the change
+    await new Promise(resolve => setTimeout(resolve, 200));
+
+    storeA.removeListener(listener);
+
+    // storeA should have detected the write via polling
+    assertTrue(listenerCalled >= 1, 'polling observer on store A should have detected the write (got ' + listenerCalled + ')');
+}
+
+export const pollingObserverSuite = {
+    title: "\n[SQL_POLL] Polling External Observer Tests\n",
+    tests: [
+        { name: "[SQL_POLL_00] Polling observer detects external write", invoke: testPollingObserverDetectsExternalWrite },
+    ],
+};

@@ -1,6 +1,7 @@
 import { topoSuite as topo, levelSuite as level } from "./forking_tests.js";
 import { metaSearchSuite as meta } from "./meta_search_tests.js";
 import { coverTestSuite as cover } from "./cover_tests.js";
+import { growthEventSuite as growth } from "./growth_event_tests.js";
 import { testing } from "@hyper-hyper-space/hhs3_util";
 
 async function main() {
@@ -13,6 +14,7 @@ async function main() {
     allTests.set(level.title, level.tests);
     allTests.set(meta.title, meta.tests);
     allTests.set(cover.title, cover.tests);
+    allTests.set(growth.title, growth.tests);
 
     console.log('Running tests for Hyper Hyper Space v3 DAG module' + (filters.length > 0? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');    
 
