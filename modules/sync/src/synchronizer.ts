@@ -16,6 +16,7 @@ import type {
     NewFrontierMsg,
     SyncMsg,
 } from './protocol.js';
+import type { SendResult, PeerIssue } from './session.js';
 
 const MAX_HEADERS_PER_REQUEST = 1024;
 const MAX_PAYLOAD_REQUESTS_PER_PEER = 2;
@@ -57,6 +58,8 @@ export interface DagSynchronizer {
     removePeer(peerKey: string): void;
     broadcastFrontier(): Promise<void>;
     destroy(): void;
+    onPeerIssue(cb: (peerKey: string, issue: PeerIssue) => void): void;
+    getDiagnostics(): { pendingHeaderRequests: number; pendingPayloadRequests: number };
 }
 
 export function createDagSynchronizer(
@@ -65,7 +68,7 @@ export function createDagSynchronizer(
     rObject: RObject,
     hashSuite: HashSuite,
     getPeers: () => PeerHandle[],
-    sendTo: (peer: PeerHandle, msg: SyncMsg) => void,
+    sendTo: (peer: PeerHandle, msg: SyncMsg) => SendResult,
 ): DagSynchronizer {
 
     // --- accumulative state ---
@@ -83,7 +86,11 @@ export function createDagSynchronizer(
     const pendingHeaderRequests  = new Map<string, HeaderRequestState>();
     const pendingPayloadRequests = new Map<string, PayloadRequestState>();
 
-    const suspectPeers = new Set<string>();
+    const issueCallbacks: Array<(peerKey: string, issue: PeerIssue) => void> = [];
+
+    function reportIssue(peerKey: string, issue: PeerIssue) {
+        for (const cb of issueCallbacks) cb(peerKey, issue);
+    }
 
     let autoPayloadRequestId: string | undefined;
 
@@ -277,8 +284,7 @@ export function createDagSynchronizer(
             }
         }
 
-        // Group needed hashes by which peer can serve them
-        const peersWithSlots = getPeers().filter(p => !suspectPeers.has(p.key));
+        const peersWithSlots = getPeers();
 
         for (const peer of peersWithSlots) {
             const peerFrontier = peerFrontiers.get(peer.key);
@@ -351,7 +357,17 @@ export function createDagSynchronizer(
                 activelyFetching.add(h);
             }
 
-            sendTo(peer, req);
+            const result = sendTo(peer, req);
+            if (result !== 'sent') {
+                clearTimeout(timeout);
+                pendingHeaderRequests.delete(requestId);
+                if (autoPayloadRequestId === requestId) {
+                    autoPayloadRequestId = undefined;
+                }
+                if (result === 'closed') {
+                    removePeer(peer.key);
+                }
+            }
         }
     }
 
@@ -480,7 +496,7 @@ export function createDagSynchronizer(
 
         clearTimeout(state.timeout);
         pendingHeaderRequests.delete(requestId);
-        suspectPeers.add(state.peer.key);
+        reportIssue(state.peer.key, 'timeout');
 
         if (autoPayloadRequestId === requestId) {
             autoPayloadRequestId = undefined;
@@ -495,7 +511,7 @@ export function createDagSynchronizer(
 
         clearTimeout(state.timeout);
         pendingHeaderRequests.delete(requestId);
-        suspectPeers.add(state.peer.key);
+        reportIssue(state.peer.key, 'validation-failed');
 
         if (autoPayloadRequestId === requestId) {
             autoPayloadRequestId = undefined;
@@ -576,7 +592,7 @@ export function createDagSynchronizer(
     }
 
     function dispatchPayloads() {
-        const peers = getPeers().filter(p => !suspectPeers.has(p.key));
+        const peers = getPeers();
 
         const peerInFlight = new Map<string, number>();
         for (const ps of pendingPayloadRequests.values()) {
@@ -626,7 +642,17 @@ export function createDagSynchronizer(
             requestedPayloads.add(h);
         }
 
-        sendTo(peer, req);
+        const result = sendTo(peer, req);
+        if (result !== 'sent') {
+            clearTimeout(timeout);
+            pendingPayloadRequests.delete(requestId);
+            for (const h of hashes) {
+                requestedPayloads.delete(h);
+            }
+            if (result === 'closed') {
+                removePeer(peer.key);
+            }
+        }
     }
 
     // --- payload response handling ---
@@ -693,7 +719,7 @@ export function createDagSynchronizer(
                 receivedPayloads.set(msg.hash, msg.payload);
                 requestedPayloads.delete(msg.hash);
             } else {
-                suspectPeers.add(state.peer.key);
+                reportIssue(state.peer.key, 'validation-failed');
                 requestedPayloads.delete(msg.hash);
             }
         } else {
@@ -716,7 +742,7 @@ export function createDagSynchronizer(
 
         clearTimeout(state.timeout);
         pendingPayloadRequests.delete(requestId);
-        suspectPeers.add(state.peer.key);
+        reportIssue(state.peer.key, 'timeout');
 
         for (const h of state.requestedHashes) {
             if (!receivedPayloads.has(h) && !appliedEntries.has(h)) {
@@ -733,7 +759,7 @@ export function createDagSynchronizer(
 
         clearTimeout(state.timeout);
         pendingPayloadRequests.delete(requestId);
-        suspectPeers.add(state.peer.key);
+        reportIssue(state.peer.key, 'validation-failed');
 
         for (const h of state.requestedHashes) {
             if (!receivedPayloads.has(h) && !appliedEntries.has(h)) {
@@ -782,7 +808,7 @@ export function createDagSynchronizer(
                 const valid = await rObject.validatePayload(payload, version);
                 if (!valid) {
                     const source = hashSourcePeer.get(hash);
-                    if (source !== undefined) suspectPeers.add(source);
+                    if (source !== undefined) reportIssue(source, 'validation-failed');
                     receivedPayloads.delete(hash);
                     readyToApply.delete(hash);
                     discardDependents(hash);
@@ -792,7 +818,7 @@ export function createDagSynchronizer(
                 const resultHash = await rObject.applyPayload(payload, version);
                 if (resultHash !== hash) {
                     const source = hashSourcePeer.get(hash);
-                    if (source !== undefined) suspectPeers.add(source);
+                    if (source !== undefined) reportIssue(source, 'validation-failed');
                     receivedPayloads.delete(hash);
                     readyToApply.delete(hash);
                     discardDependents(hash);
@@ -929,5 +955,16 @@ export function createDagSynchronizer(
         pendingPayloadRequests.clear();
     }
 
-    return { handleMessage, addPeer, removePeer, broadcastFrontier, destroy };
+    function onPeerIssue(cb: (peerKey: string, issue: PeerIssue) => void) {
+        issueCallbacks.push(cb);
+    }
+
+    function getDiagnostics() {
+        return {
+            pendingHeaderRequests: pendingHeaderRequests.size,
+            pendingPayloadRequests: pendingPayloadRequests.size,
+        };
+    }
+
+    return { handleMessage, addPeer, removePeer, broadcastFrontier, destroy, onPeerIssue, getDiagnostics };
 }

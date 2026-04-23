@@ -126,7 +126,7 @@ function wireUpSync(
         rObjectA,
         sha256,
         () => [peerBHandle],
-        (peer, msg) => { try { peer.channel.send(encode(msg)); } catch {} },
+        (peer, msg) => { try { peer.channel.send(encode(msg)); return 'sent' as const; } catch { return 'error' as const; } },
     );
 
     // chBLocal.onMessage: fires when chALocal.send() delivers → A sent to B → provider handles
@@ -539,7 +539,7 @@ async function testMultiPeerSync() {
     const synchronizerA = createDagSynchronizer(
         dagId, dagA, rObjectA, sha256,
         () => [peerBHandle, peerCHandle],
-        (peer, msg) => { try { peer.channel.send(encode(msg)); } catch {} },
+        (peer, msg) => { try { peer.channel.send(encode(msg)); return 'sent' as const; } catch { return 'error' as const; } },
     );
 
     // Wire B's provider

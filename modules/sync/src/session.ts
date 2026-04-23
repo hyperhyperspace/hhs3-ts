@@ -10,6 +10,21 @@ import type { DagProvider } from './provider.js';
 import type { DagSynchronizer } from './synchronizer.js';
 import type { SyncMsg } from './protocol.js';
 
+export type SendResult = 'sent' | 'closed' | 'error';
+
+export type PeerIssue =
+    | 'send-closed'
+    | 'send-error'
+    | 'timeout'
+    | 'validation-failed'
+    | 'decode-failed';
+
+export interface SyncSessionDiagnostics {
+    activePeerCount: number;
+    pendingHeaderRequests: number;
+    pendingPayloadRequests: number;
+}
+
 export type SyncTarget = {
     dagId: B64Hash;
     dag: Dag;
@@ -19,6 +34,8 @@ export type SyncTarget = {
 
 export interface SyncSession {
     destroy(): void;
+    onPeerIssue(cb: (peerKey: string, issue: PeerIssue) => void): void;
+    getDiagnostics(): SyncSessionDiagnostics;
 }
 
 type PeerHandle = {
@@ -33,19 +50,31 @@ const REQUEST_TYPES = new Set([
 export function createSyncSession(target: SyncTarget, swarms: Swarm[]): SyncSession {
 
     const activePeers = new Map<string, PeerHandle>();
+    const issueCallbacks: Array<(peerKey: string, issue: PeerIssue) => void> = [];
+
+    function reportIssue(peerKey: string, issue: PeerIssue) {
+        for (const cb of issueCallbacks) cb(peerKey, issue);
+    }
 
     function getPeers(): PeerHandle[] {
         return [...activePeers.values()];
     }
 
-    function sendTo(peer: PeerHandle, msg: SyncMsg) {
+    function sendTo(peer: PeerHandle, msg: SyncMsg): SendResult {
+        if (!peer.channel.open) return 'closed';
         try {
-            if (peer.channel.open) {
-                peer.channel.send(encode(msg));
-            }
+            peer.channel.send(encode(msg));
+            return 'sent';
         } catch {
-            // channel closed
+            return 'error';
         }
+    }
+
+    function sendToWithReport(peer: PeerHandle, msg: SyncMsg): SendResult {
+        const result = sendTo(peer, msg);
+        if (result === 'closed') reportIssue(peer.key, 'send-closed');
+        if (result === 'error')  reportIssue(peer.key, 'send-error');
+        return result;
     }
 
     const provider: DagProvider = createDagProvider(target.dag);
@@ -55,8 +84,19 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[]): SyncSess
         target.rObject,
         target.hashSuite,
         getPeers,
-        sendTo,
+        sendToWithReport,
     );
+
+    synchronizer.onPeerIssue((peerKey, issue) => {
+        reportIssue(peerKey, issue);
+    });
+
+    function cleanupPeer(key: string) {
+        if (!activePeers.has(key)) return;
+        activePeers.delete(key);
+        provider.cancelPeer(key);
+        synchronizer.removePeer(key);
+    }
 
     function peerKeyOf(sp: SwarmPeer): string {
         return `${sp.keyId}@${sp.endpoint}`;
@@ -74,6 +114,7 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[]): SyncSess
             try {
                 msg = decode(data);
             } catch {
+                reportIssue(key, 'decode-failed');
                 return;
             }
 
@@ -84,9 +125,7 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[]): SyncSess
         });
 
         sp.channel.onClose(() => {
-            activePeers.delete(key);
-            provider.cancelPeer(key);
-            synchronizer.removePeer(key);
+            cleanupPeer(key);
         });
 
         synchronizer.addPeer(handle);
@@ -94,8 +133,7 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[]): SyncSess
 
     function onPeerLeave(sp: SwarmPeer) {
         const key = peerKeyOf(sp);
-        activePeers.delete(key);
-        synchronizer.removePeer(key);
+        cleanupPeer(key);
     }
 
     for (const swarm of swarms) {
@@ -112,5 +150,12 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[]): SyncSess
         activePeers.clear();
     }
 
-    return { destroy };
+    return {
+        destroy,
+        onPeerIssue: (cb) => { issueCallbacks.push(cb); },
+        getDiagnostics: () => ({
+            activePeerCount: activePeers.size,
+            ...synchronizer.getDiagnostics(),
+        }),
+    };
 }

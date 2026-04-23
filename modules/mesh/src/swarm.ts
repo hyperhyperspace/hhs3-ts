@@ -40,6 +40,7 @@ export interface Swarm {
     peers(): SwarmPeer[];
     onPeerJoin(callback: PeerCallback):  void;
     onPeerLeave(callback: PeerCallback): void;
+    blockPeer(keyId: KeyId, endpoint: NetworkAddress): void;
 }
 
 export interface SwarmDeps {
@@ -61,7 +62,8 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
     let mode: SwarmMode     = config.mode ?? 'dormant';
     let destroyed           = false;
 
-    const swarmPeers   = new Map<string, SwarmPeer>();
+    const swarmPeers    = new Map<string, SwarmPeer>();
+    const blockedPeers  = new Set<string>();
     const joinCallbacks:  PeerCallback[] = [];
     const leaveCallbacks: PeerCallback[] = [];
 
@@ -88,9 +90,15 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
 
     // --- peer tracking ---
 
+    function blockPeer(keyId: KeyId, endpoint: NetworkAddress): void {
+        const key = connectionKey(keyId, endpoint);
+        blockedPeers.add(key);
+        removePeer(key);
+    }
+
     function adoptPeer(keyId: KeyId, endpoint: NetworkAddress): boolean {
         const key = connectionKey(keyId, endpoint);
-        if (swarmPeers.has(key) || destroyed) return false;
+        if (swarmPeers.has(key) || destroyed || blockedPeers.has(key)) return false;
 
         const conn = pool.get(keyId, endpoint);
         if (conn === undefined) return false;
@@ -126,7 +134,7 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
 
                 for (const addr of peerInfo.addresses) {
                     const key = connectionKey(peerInfo.keyId, addr);
-                    if (!swarmPeers.has(key)) {
+                    if (!swarmPeers.has(key) && !blockedPeers.has(key)) {
                         // Try to adopt from pool first
                         if (pool.get(peerInfo.keyId, addr) !== undefined) {
                             adoptPeer(peerInfo.keyId, addr);
@@ -224,5 +232,6 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
         peers:       () => Array.from(swarmPeers.values()),
         onPeerJoin:  (cb: PeerCallback) => { joinCallbacks.push(cb); },
         onPeerLeave: (cb: PeerCallback) => { leaveCallbacks.push(cb); },
+        blockPeer,
     };
 }
