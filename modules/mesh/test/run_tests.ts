@@ -20,13 +20,18 @@ import type { TopicId } from '../src/discovery.js';
 import type { PeerAuthenticator } from '../src/authenticator.js';
 import type { Transport, NetworkAddress } from '../src/transport.js';
 import { createSwarm } from '../src/swarm.js';
+import type { PeerAuthorizer } from '../src/swarm.js';
 import { Mesh } from '../src/mesh.js';
 import { createNoiseAuthenticator } from '../src/noise_authenticator.js';
 import { StaticDiscovery } from '../src/static_discovery.js';
 import { DiscoveryStack } from '../src/discovery_stack.js';
+import { PoolReuseDiscovery } from '../src/pool_reuse_discovery.js';
 import {
     encodeTopicMessage, encodeControlMessage, decodeMessage,
     MSG_TYPE_TOPIC, MSG_TYPE_CONTROL,
+    CTRL_TOPIC_INTEREST, CTRL_TOPIC_ACCEPT, CTRL_TOPIC_REJECT,
+    encodeControlTopicInterest, encodeControlTopicAccept, encodeControlTopicReject,
+    decodeControlPayload,
 } from '../src/mux.js';
 
 // --- helpers ---
@@ -1306,6 +1311,508 @@ async function testStackEmpty() {
     testing.assertEquals(results.length, 0, 'empty stack yields nothing');
 }
 
+// --- control channel protocol tests ---
+
+async function testCtrlTopicInterestRoundTrip() {
+    const topic = sha256.hashToB64(stringToUint8Array('ctrl-topic'));
+    const frame = encodeControlTopicInterest(topic);
+    const decoded = decodeMessage(frame);
+    testing.assertEquals(decoded.type, MSG_TYPE_CONTROL, 'type should be control');
+    const ctrl = decodeControlPayload(decoded.payload);
+    testing.assertEquals(ctrl.ctrl, CTRL_TOPIC_INTEREST, 'ctrl should be interest');
+    testing.assertEquals(ctrl.topic, topic, 'topic should match');
+}
+
+async function testCtrlTopicAcceptRoundTrip() {
+    const topic = sha256.hashToB64(stringToUint8Array('ctrl-accept'));
+    const frame = encodeControlTopicAccept(topic);
+    const decoded = decodeMessage(frame);
+    testing.assertEquals(decoded.type, MSG_TYPE_CONTROL, 'type should be control');
+    const ctrl = decodeControlPayload(decoded.payload);
+    testing.assertEquals(ctrl.ctrl, CTRL_TOPIC_ACCEPT, 'ctrl should be accept');
+    testing.assertEquals(ctrl.topic, topic, 'topic should match');
+}
+
+async function testCtrlTopicRejectRoundTrip() {
+    const topic = sha256.hashToB64(stringToUint8Array('ctrl-reject'));
+    const frame = encodeControlTopicReject(topic);
+    const decoded = decodeMessage(frame);
+    testing.assertEquals(decoded.type, MSG_TYPE_CONTROL, 'type should be control');
+    const ctrl = decodeControlPayload(decoded.payload);
+    testing.assertEquals(ctrl.ctrl, CTRL_TOPIC_REJECT, 'ctrl should be reject');
+    testing.assertEquals(ctrl.topic, topic, 'topic should match');
+}
+
+// --- per-swarm authorizer tests ---
+
+async function testAuthorizerWouldAcceptTrue() {
+    const pool = new ConnectionPool();
+    const topic = sha256.hashToB64(stringToUint8Array('authz-accept'));
+    const peer = makeFakePeer('mem://device-1');
+
+    const authorizer: PeerAuthorizer = { authorize: async () => true };
+
+    const swarm = createSwarm({ topic, mode: 'passive', authorizer }, {
+        pool,
+        discovery: makeStubDiscovery([]),
+        authenticator: makeStubAuthenticator(new Map()),
+        transports: [],
+    });
+    swarm.deactivate();
+
+    const result = await swarm.wouldAccept(peer.keyId);
+    testing.assertTrue(result, 'wouldAccept should return true when authorized');
+
+    swarm.destroy();
+}
+
+async function testAuthorizerWouldAcceptFalseDormant() {
+    const pool = new ConnectionPool();
+    const topic = sha256.hashToB64(stringToUint8Array('authz-dormant'));
+    const peer = makeFakePeer('mem://device-1');
+
+    const swarm = createSwarm({ topic, mode: 'dormant' }, {
+        pool,
+        discovery: makeStubDiscovery([]),
+        authenticator: makeStubAuthenticator(new Map()),
+        transports: [],
+    });
+
+    const result = await swarm.wouldAccept(peer.keyId);
+    testing.assertFalse(result, 'wouldAccept should return false when dormant');
+
+    swarm.destroy();
+}
+
+async function testAuthorizerWouldAcceptFalseRejected() {
+    const pool = new ConnectionPool();
+    const topic = sha256.hashToB64(stringToUint8Array('authz-reject'));
+    const peer = makeFakePeer('mem://device-1');
+
+    const authorizer: PeerAuthorizer = { authorize: async () => false };
+
+    const swarm = createSwarm({ topic, mode: 'passive', authorizer }, {
+        pool,
+        discovery: makeStubDiscovery([]),
+        authenticator: makeStubAuthenticator(new Map()),
+        transports: [],
+    });
+    swarm.deactivate();
+
+    const result = await swarm.wouldAccept(peer.keyId);
+    testing.assertFalse(result, 'wouldAccept should return false when authorizer rejects');
+
+    swarm.destroy();
+}
+
+async function testAuthorizerFiltersOutbound() {
+    const pool = new ConnectionPool();
+    const topic = sha256.hashToB64(stringToUint8Array('authz-outbound'));
+
+    const allowedPeer = makeFakePeer('mem://allowed');
+    const blockedPeer = makeFakePeer('mem://blocked');
+
+    const provider = new MemTransportProvider();
+    await provider.listen('mem://allowed', (_t) => {});
+    await provider.listen('mem://blocked', (_t) => {});
+
+    const peerMap = new Map<string, PublicKey>();
+    peerMap.set(allowedPeer.keyId, allowedPeer.publicKey);
+    peerMap.set(blockedPeer.keyId, blockedPeer.publicKey);
+
+    const authorizer: PeerAuthorizer = {
+        authorize: async (keyId) => keyId === allowedPeer.keyId,
+    };
+
+    const discoveredPeers: PeerInfo[] = [
+        { keyId: blockedPeer.keyId, addresses: ['mem://blocked'] },
+        { keyId: allowedPeer.keyId, addresses: ['mem://allowed'] },
+    ];
+
+    const swarm = createSwarm({ topic, targetPeers: 2, authorizer }, {
+        pool,
+        discovery: makeStubDiscovery(discoveredPeers),
+        authenticator: makeStubAuthenticator(peerMap),
+        transports: [provider],
+    });
+
+    swarm.activate();
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    testing.assertEquals(swarm.peers().length, 1, 'should only connect to allowed peer');
+    testing.assertEquals(swarm.peers()[0].keyId, allowedPeer.keyId, 'connected peer should be the allowed one');
+
+    swarm.destroy();
+    provider.close();
+}
+
+async function testTargetPeersCapsInbound() {
+    const pool = new ConnectionPool();
+    const topic = sha256.hashToB64(stringToUint8Array('cap-topic'));
+
+    const swarm = createSwarm({ topic, mode: 'passive', targetPeers: 1 }, {
+        pool,
+        discovery: makeStubDiscovery([]),
+        authenticator: makeStubAuthenticator(new Map()),
+        transports: [],
+    });
+    swarm.deactivate();
+
+    const peer1 = makeFakePeer('mem://p1');
+    const peer2 = makeFakePeer('mem://p2');
+
+    const { channel: ch1 } = makeFakeChannel(peer1);
+    const { channel: ch2 } = makeFakeChannel(peer2);
+
+    pool.add(ch1, peer1.endpoint);
+    pool.add(ch2, peer2.endpoint);
+
+    testing.assertEquals(swarm.peers().length, 1, 'should cap at targetPeers=1');
+
+    swarm.destroy();
+}
+
+// --- announce / leave lifecycle tests ---
+
+async function testAnnounceOnActivate() {
+    const pool = new ConnectionPool();
+    const topic = sha256.hashToB64(stringToUint8Array('announce-topic'));
+    const localPeer: PeerInfo = { keyId: 'local-key' as KeyId, addresses: ['mem://local'] };
+
+    let announcedTopic: TopicId | undefined;
+    let announcedSelf: PeerInfo | undefined;
+    const discovery: PeerDiscovery = {
+        async *discover() {},
+        async announce(t, s) { announcedTopic = t; announcedSelf = s; },
+        async leave() {},
+    };
+
+    const swarm = createSwarm({ topic }, {
+        pool, discovery,
+        authenticator: makeStubAuthenticator(new Map()),
+        transports: [],
+        localPeer,
+    });
+
+    swarm.activate();
+    await new Promise(resolve => setTimeout(resolve, 10));
+
+    testing.assertEquals(announcedTopic, topic, 'announce should be called with topic');
+    testing.assertEquals(announcedSelf?.keyId, localPeer.keyId, 'announce should be called with localPeer');
+
+    swarm.destroy();
+}
+
+async function testLeaveOnSleep() {
+    const pool = new ConnectionPool();
+    const topic = sha256.hashToB64(stringToUint8Array('leave-sleep-topic'));
+    const localPeer: PeerInfo = { keyId: 'local-key' as KeyId, addresses: ['mem://local'] };
+
+    let leftTopic: TopicId | undefined;
+    let leftKeyId: KeyId | undefined;
+    const discovery: PeerDiscovery = {
+        async *discover() {},
+        async announce() {},
+        async leave(t, k) { leftTopic = t; leftKeyId = k; },
+    };
+
+    const swarm = createSwarm({ topic }, {
+        pool, discovery,
+        authenticator: makeStubAuthenticator(new Map()),
+        transports: [],
+        localPeer,
+    });
+
+    swarm.activate();
+    await new Promise(resolve => setTimeout(resolve, 10));
+    swarm.sleep();
+    await new Promise(resolve => setTimeout(resolve, 10));
+
+    testing.assertEquals(leftTopic, topic, 'leave should be called with topic');
+    testing.assertEquals(leftKeyId, localPeer.keyId, 'leave should be called with localPeer keyId');
+
+    swarm.destroy();
+}
+
+async function testLeaveOnDestroy() {
+    const pool = new ConnectionPool();
+    const topic = sha256.hashToB64(stringToUint8Array('leave-destroy-topic'));
+    const localPeer: PeerInfo = { keyId: 'local-key' as KeyId, addresses: ['mem://local'] };
+
+    let leftTopic: TopicId | undefined;
+    const discovery: PeerDiscovery = {
+        async *discover() {},
+        async announce() {},
+        async leave(t) { leftTopic = t; },
+    };
+
+    const swarm = createSwarm({ topic }, {
+        pool, discovery,
+        authenticator: makeStubAuthenticator(new Map()),
+        transports: [],
+        localPeer,
+    });
+
+    swarm.activate();
+    await new Promise(resolve => setTimeout(resolve, 10));
+    swarm.destroy();
+    await new Promise(resolve => setTimeout(resolve, 10));
+
+    testing.assertEquals(leftTopic, topic, 'leave should be called on destroy');
+}
+
+// --- end-to-end listen tests ---
+
+async function testMeshListenEndToEnd() {
+    const alice = await makeNoiseKeyPair();
+    const bob = await makeNoiseKeyPair();
+    const topic = sha256.hashToB64(stringToUint8Array('listen-e2e-topic'));
+
+    const provider = new MemTransportProvider();
+
+    const aliceAuth = createNoiseAuthenticator({
+        localKey: { publicKey: alice.publicKey, secretKey: alice.secretKey },
+        signingName: SIGNING_ED25519,
+        kemPrefs: [KEM_X25519_HKDF],
+    });
+    const bobAuth = createNoiseAuthenticator({
+        localKey: { publicKey: bob.publicKey, secretKey: bob.secretKey },
+        signingName: SIGNING_ED25519,
+        kemPrefs: [KEM_X25519_HKDF],
+    });
+
+    const bobMesh = new Mesh({
+        transports: [provider],
+        discovery: makeStubDiscovery([]),
+        authenticator: bobAuth,
+        localKeyId: bob.keyId,
+        listenAddresses: ['mem://bob'],
+    });
+    const bobSwarm = bobMesh.createSwarm(topic, { mode: 'passive' });
+
+    const aliceMesh = new Mesh({
+        transports: [provider],
+        discovery: makeStubDiscovery([{ keyId: bob.keyId, addresses: ['mem://bob'] }]),
+        authenticator: aliceAuth,
+        localKeyId: alice.keyId,
+    });
+    const aliceSwarm = aliceMesh.createSwarm(topic);
+    aliceSwarm.activate();
+
+    await new Promise(resolve => setTimeout(resolve, 200));
+
+    testing.assertEquals(aliceSwarm.peers().length, 1, 'alice should have bob as peer');
+    testing.assertEquals(aliceSwarm.peers()[0].keyId, bob.keyId, 'alice peer should be bob');
+    testing.assertEquals(bobSwarm.peers().length, 1, 'bob should have alice as peer');
+    testing.assertEquals(bobSwarm.peers()[0].keyId, alice.keyId, 'bob peer should be alice');
+
+    aliceMesh.close();
+    bobMesh.close();
+}
+
+async function testMeshListenRejection() {
+    const alice = await makeNoiseKeyPair();
+    const bob = await makeNoiseKeyPair();
+    const topic = sha256.hashToB64(stringToUint8Array('listen-reject-topic'));
+
+    const provider = new MemTransportProvider();
+
+    const aliceAuth = createNoiseAuthenticator({
+        localKey: { publicKey: alice.publicKey, secretKey: alice.secretKey },
+        signingName: SIGNING_ED25519,
+        kemPrefs: [KEM_X25519_HKDF],
+    });
+    const bobAuth = createNoiseAuthenticator({
+        localKey: { publicKey: bob.publicKey, secretKey: bob.secretKey },
+        signingName: SIGNING_ED25519,
+        kemPrefs: [KEM_X25519_HKDF],
+    });
+
+    const rejectAll: PeerAuthorizer = { authorize: async () => false };
+
+    const bobMesh = new Mesh({
+        transports: [provider],
+        discovery: makeStubDiscovery([]),
+        authenticator: bobAuth,
+        localKeyId: bob.keyId,
+        listenAddresses: ['mem://bob-reject'],
+    });
+    const bobSwarm = bobMesh.createSwarm(topic, { mode: 'passive', authorizer: rejectAll });
+
+    const aliceMesh = new Mesh({
+        transports: [provider],
+        discovery: makeStubDiscovery([{ keyId: bob.keyId, addresses: ['mem://bob-reject'] }]),
+        authenticator: aliceAuth,
+        localKeyId: alice.keyId,
+    });
+    const aliceSwarm = aliceMesh.createSwarm(topic);
+    aliceSwarm.activate();
+
+    await new Promise(resolve => setTimeout(resolve, 200));
+
+    testing.assertEquals(aliceSwarm.peers().length, 0, 'alice should have no peers (rejected)');
+    testing.assertEquals(bobSwarm.peers().length, 0, 'bob should have no peers (rejected)');
+
+    aliceMesh.close();
+    bobMesh.close();
+}
+
+async function testMeshListenTopicData() {
+    const alice = await makeNoiseKeyPair();
+    const bob = await makeNoiseKeyPair();
+    const topic = sha256.hashToB64(stringToUint8Array('listen-data-topic'));
+
+    const provider = new MemTransportProvider();
+
+    const aliceAuth = createNoiseAuthenticator({
+        localKey: { publicKey: alice.publicKey, secretKey: alice.secretKey },
+        signingName: SIGNING_ED25519,
+        kemPrefs: [KEM_X25519_HKDF],
+    });
+    const bobAuth = createNoiseAuthenticator({
+        localKey: { publicKey: bob.publicKey, secretKey: bob.secretKey },
+        signingName: SIGNING_ED25519,
+        kemPrefs: [KEM_X25519_HKDF],
+    });
+
+    const bobMesh = new Mesh({
+        transports: [provider],
+        discovery: makeStubDiscovery([]),
+        authenticator: bobAuth,
+        localKeyId: bob.keyId,
+        listenAddresses: ['mem://bob-data'],
+    });
+    const bobSwarm = bobMesh.createSwarm(topic, { mode: 'passive' });
+
+    const aliceMesh = new Mesh({
+        transports: [provider],
+        discovery: makeStubDiscovery([{ keyId: bob.keyId, addresses: ['mem://bob-data'] }]),
+        authenticator: aliceAuth,
+        localKeyId: alice.keyId,
+    });
+    const aliceSwarm = aliceMesh.createSwarm(topic);
+    aliceSwarm.activate();
+
+    await new Promise(resolve => setTimeout(resolve, 200));
+
+    testing.assertEquals(aliceSwarm.peers().length, 1, 'alice should have bob');
+    testing.assertEquals(bobSwarm.peers().length, 1, 'bob should have alice');
+
+    const received: Uint8Array[] = [];
+    bobSwarm.peers()[0].channel.onMessage((msg) => received.push(msg));
+
+    const payload = new TextEncoder().encode('hello via mesh');
+    aliceSwarm.peers()[0].channel.send(payload);
+
+    testing.assertEquals(received.length, 1, 'bob should receive topic message');
+    testing.assertTrue(bytesEqual(received[0], payload), 'payload should match');
+
+    aliceMesh.close();
+    bobMesh.close();
+}
+
+// --- pool control dispatch test ---
+
+async function testPoolControlMessageDispatch() {
+    const pool = new ConnectionPool();
+    const peer = makeFakePeer('mem://device-1');
+    const topic = sha256.hashToB64(stringToUint8Array('pool-ctrl-topic'));
+
+    const { channel, remote } = makeFakeChannel(peer);
+    pool.add(channel, peer.endpoint);
+
+    const received: { connKey: string; peerId: KeyId; payload: Uint8Array }[] = [];
+    pool.onControlMessage((connKey, peerId, _endpoint, payload) => {
+        received.push({ connKey, peerId, payload });
+    });
+
+    remote.send(encodeControlTopicInterest(topic));
+
+    testing.assertEquals(received.length, 1, 'control callback should fire');
+    testing.assertEquals(received[0].peerId, peer.keyId, 'peerId should match');
+    const ctrl = decodeControlPayload(received[0].payload);
+    testing.assertEquals(ctrl.ctrl, CTRL_TOPIC_INTEREST, 'should be topic_interest');
+    testing.assertEquals(ctrl.topic, topic, 'topic should match');
+
+    pool.close();
+}
+
+// --- pool reuse discovery test ---
+
+async function testPoolReuseDiscovery() {
+    const alice = await makeNoiseKeyPair();
+    const bob = await makeNoiseKeyPair();
+    const topicA = sha256.hashToB64(stringToUint8Array('reuse-topic-a'));
+    const topicB = sha256.hashToB64(stringToUint8Array('reuse-topic-b'));
+
+    const provider = new MemTransportProvider();
+
+    const aliceAuth = createNoiseAuthenticator({
+        localKey: { publicKey: alice.publicKey, secretKey: alice.secretKey },
+        signingName: SIGNING_ED25519,
+        kemPrefs: [KEM_X25519_HKDF],
+    });
+    const bobAuth = createNoiseAuthenticator({
+        localKey: { publicKey: bob.publicKey, secretKey: bob.secretKey },
+        signingName: SIGNING_ED25519,
+        kemPrefs: [KEM_X25519_HKDF],
+    });
+
+    // Bob listens, has swarms for both topics
+    const bobMesh = new Mesh({
+        transports: [provider],
+        discovery: makeStubDiscovery([]),
+        authenticator: bobAuth,
+        localKeyId: bob.keyId,
+        listenAddresses: ['mem://bob-reuse'],
+    });
+    const bobSwarmA = bobMesh.createSwarm(topicA, { mode: 'passive' });
+    const bobSwarmB = bobMesh.createSwarm(topicB, { mode: 'passive' });
+
+    // Alice connects for topic A
+    const aliceMesh = new Mesh({
+        transports: [provider],
+        discovery: makeStubDiscovery([{ keyId: bob.keyId, addresses: ['mem://bob-reuse'] }]),
+        authenticator: aliceAuth,
+        localKeyId: alice.keyId,
+    });
+    const aliceSwarmA = aliceMesh.createSwarm(topicA);
+    aliceSwarmA.activate();
+
+    await new Promise(resolve => setTimeout(resolve, 200));
+
+    testing.assertEquals(aliceSwarmA.peers().length, 1, 'alice swarmA should have bob');
+    testing.assertEquals(aliceMesh.pool.size(), 1, 'alice should have 1 connection');
+
+    // Now alice creates swarmB with PoolReuseDiscovery
+    const reuseDiscovery = new PoolReuseDiscovery(aliceMesh.pool);
+    const aliceDiscoveryB = new DiscoveryStack([{ source: reuseDiscovery, priority: 0 }]);
+
+    const aliceMeshB = new Mesh({
+        transports: [provider],
+        discovery: aliceDiscoveryB,
+        authenticator: aliceAuth,
+        localKeyId: alice.keyId,
+    });
+
+    // Manually share the pool: create a swarm on the original mesh with the reuse discovery
+    // Actually, for simplicity, let's just test PoolReuseDiscovery directly
+    const results: PeerInfo[] = [];
+    for await (const peer of reuseDiscovery.discover(topicB)) {
+        results.push(peer);
+    }
+
+    testing.assertEquals(results.length, 1, 'reuse discovery should yield 1 peer');
+    testing.assertEquals(results[0].keyId, bob.keyId, 'yielded peer should be bob');
+
+    // Verify bob's swarmB got the adoption
+    testing.assertEquals(bobSwarmB.peers().length, 1, 'bob swarmB should have alice via pool reuse');
+
+    aliceMesh.close();
+    aliceMeshB.close();
+    bobMesh.close();
+}
+
 // --- main ---
 
 const transportTests = {
@@ -1410,7 +1917,62 @@ const stackTests = {
     ],
 };
 
-const allSuites = [transportTests, muxTests, poolTests, swarmTests, meshTests, authTests, staticTests, stackTests];
+const ctrlTests = {
+    title: '[CTRL] Control channel protocol',
+    tests: [
+        { name: '[CTRL_00] topic_interest encode/decode round-trip', invoke: testCtrlTopicInterestRoundTrip },
+        { name: '[CTRL_01] topic_accept encode/decode round-trip', invoke: testCtrlTopicAcceptRoundTrip },
+        { name: '[CTRL_02] topic_reject encode/decode round-trip', invoke: testCtrlTopicRejectRoundTrip },
+    ],
+};
+
+const authZTests = {
+    title: '[AUTH_Z] Per-swarm authorizer',
+    tests: [
+        { name: '[AUTH_Z_00] wouldAccept returns true when authorized', invoke: testAuthorizerWouldAcceptTrue },
+        { name: '[AUTH_Z_01] wouldAccept returns false when dormant', invoke: testAuthorizerWouldAcceptFalseDormant },
+        { name: '[AUTH_Z_02] wouldAccept returns false when authorizer rejects', invoke: testAuthorizerWouldAcceptFalseRejected },
+        { name: '[AUTH_Z_03] authorizer filters outbound discovery candidates', invoke: testAuthorizerFiltersOutbound },
+        { name: '[AUTH_Z_04] targetPeers caps inbound adoption', invoke: testTargetPeersCapsInbound },
+    ],
+};
+
+const announceTests = {
+    title: '[ANNOUNCE] Announce/leave lifecycle',
+    tests: [
+        { name: '[ANNOUNCE_00] activate calls announce', invoke: testAnnounceOnActivate },
+        { name: '[ANNOUNCE_01] sleep calls leave', invoke: testLeaveOnSleep },
+        { name: '[ANNOUNCE_02] destroy calls leave', invoke: testLeaveOnDestroy },
+    ],
+};
+
+const listenTests = {
+    title: '[LISTEN] Mesh listen + topic negotiation',
+    tests: [
+        { name: '[LISTEN_00] End-to-end: two meshes, topic negotiation, both sides see peer', invoke: testMeshListenEndToEnd },
+        { name: '[LISTEN_01] Rejection: authorizer refuses, no peers on either side', invoke: testMeshListenRejection },
+        { name: '[LISTEN_02] Topic data flows after negotiation', invoke: testMeshListenTopicData },
+    ],
+};
+
+const poolCtrlTests = {
+    title: '[POOL_CTRL] Pool control message dispatch',
+    tests: [
+        { name: '[POOL_CTRL_00] Control messages dispatched to callbacks', invoke: testPoolControlMessageDispatch },
+    ],
+};
+
+const reuseTests = {
+    title: '[REUSE] Pool-reuse discovery',
+    tests: [
+        { name: '[REUSE_00] Existing connection, new topic via control channel', invoke: testPoolReuseDiscovery },
+    ],
+};
+
+const allSuites = [
+    transportTests, muxTests, poolTests, swarmTests, meshTests, authTests, staticTests, stackTests,
+    ctrlTests, authZTests, announceTests, listenTests, poolCtrlTests, reuseTests,
+];
 
 async function main() {
     const filters = process.argv.slice(2);

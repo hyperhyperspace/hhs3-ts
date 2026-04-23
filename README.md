@@ -14,7 +14,7 @@ This new version has two main goals:
 
 ### Current status
  
- We're completing the data modeling layer in the **`mvt`** and **`replica`** modules. While the implementation of **Monotone View Types** is complete, we're working on a concurrency model for **Monotone View Type** composition, based on the idea of **State-Observation-as-Data** (SOaD). The networking layer (**`mesh`**) now provides peer discovery, authenticated key exchange (with post-quantum options), connection pooling with topic multiplexing, and swarm management. Once the synchronizer is ported, it will bridge **`replica`** and **`mesh`** to enable live state sync. After that, adapters and tooling for using the synchronizer with existing information systems (mostly RDBMs) will be developed. Please see the **`mvt`** module and the [roadmap](https://www.hyperhyperspace.org/work-plan-2025.html) for details.
+ We're completing the data modeling layer in the **`mvt`** and **`replica`** modules. While the implementation of **Monotone View Types** is complete, we're working on a concurrency model for **Monotone View Type** composition, based on the idea of **State-Observation-as-Data** (SOaD). The networking layer (**`mesh`**) now provides peer discovery, authenticated key exchange (with post-quantum options), connection pooling with topic multiplexing, swarm management, incoming connection handling with topic negotiation, and per-swarm authorization. Once the synchronizer is ported, it will bridge **`replica`** and **`mesh`** to enable live state sync. After that, adapters and tooling for using the synchronizer with existing information systems (mostly RDBMs) will be developed. Please see the **`mvt`** module and the [roadmap](https://www.hyperhyperspace.org/work-plan-2025.html) for details.
 
 ### Organization
 
@@ -35,7 +35,7 @@ This monorepo is organized as a collection of modules. This is of course WIP.
 
 **Networking**
 
-- `modules/mesh` Peer discovery, authentication, connection pooling, topic multiplexing and swarm management [[local]](modules/mesh) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/mesh)
+- `modules/mesh` Peer discovery, authentication, connection pooling, topic multiplexing, swarm management, incoming connection handling with topic negotiation, and per-swarm authorization [[local]](modules/mesh) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/mesh)
 - `modules/mesh_ws` WebSocket transport implementation for the mesh module [[local]](modules/mesh_ws) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/mesh_ws)
 - `modules/mesh_tracker_client` Tracker-based peer discovery client (PeerDiscovery implementation) [[local]](modules/mesh_tracker_client) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/mesh_tracker_client)
 - `modules/mesh_tracker` Tracker server for peer discovery with identity management [[local]](modules/mesh_tracker) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/mesh_tracker)

@@ -14,10 +14,15 @@ import { ConnectionPool, PooledConnection, connectionKey } from './connection_po
 
 export type SwarmMode = 'dormant' | 'passive' | 'active';
 
+export interface PeerAuthorizer {
+    authorize(keyId: KeyId): Promise<boolean>;
+}
+
 export interface SwarmConfig {
     topic:        TopicId;
     targetPeers?: number;
     mode?:        SwarmMode;
+    authorizer?:  PeerAuthorizer;
 }
 
 export interface SwarmPeer {
@@ -41,6 +46,8 @@ export interface Swarm {
     onPeerJoin(callback: PeerCallback):  void;
     onPeerLeave(callback: PeerCallback): void;
     blockPeer(keyId: KeyId, endpoint: NetworkAddress): void;
+    wouldAccept(keyId: KeyId): Promise<boolean>;
+    adopt(keyId: KeyId, endpoint: NetworkAddress): boolean;
 }
 
 export interface SwarmDeps {
@@ -48,16 +55,18 @@ export interface SwarmDeps {
     discovery:     PeerDiscovery;
     authenticator: PeerAuthenticator;
     transports:    TransportProvider[];
+    localPeer?:    PeerInfo;
 }
 
 const DEFAULT_TARGET_PEERS = 6;
 
 export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
 
-    const { pool, discovery, authenticator, transports } = deps;
+    const { pool, discovery, authenticator, transports, localPeer } = deps;
 
     const topic       = config.topic;
     const targetPeers = config.targetPeers ?? DEFAULT_TARGET_PEERS;
+    const authorizer  = config.authorizer;
 
     let mode: SwarmMode     = config.mode ?? 'dormant';
     let destroyed           = false;
@@ -75,6 +84,14 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
 
     function onPoolConnect(conn: PooledConnection) {
         if (mode === 'dormant' || destroyed) return;
+        if (authorizer !== undefined) {
+            authorizer.authorize(conn.peerId).then((ok) => {
+                if (ok && !destroyed && mode !== 'dormant') {
+                    adoptPeer(conn.peerId, conn.endpoint);
+                }
+            }).catch(() => {});
+            return;
+        }
         adoptPeer(conn.peerId, conn.endpoint);
     }
 
@@ -90,6 +107,13 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
 
     // --- peer tracking ---
 
+    function isKeyIdBlocked(keyId: KeyId): boolean {
+        for (const blocked of blockedPeers) {
+            if (blocked.startsWith(keyId + '@')) return true;
+        }
+        return false;
+    }
+
     function blockPeer(keyId: KeyId, endpoint: NetworkAddress): void {
         const key = connectionKey(keyId, endpoint);
         blockedPeers.add(key);
@@ -99,6 +123,7 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
     function adoptPeer(keyId: KeyId, endpoint: NetworkAddress): boolean {
         const key = connectionKey(keyId, endpoint);
         if (swarmPeers.has(key) || destroyed || blockedPeers.has(key)) return false;
+        if (swarmPeers.size >= targetPeers) return false;
 
         const conn = pool.get(keyId, endpoint);
         if (conn === undefined) return false;
@@ -119,6 +144,16 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
         return true;
     }
 
+    async function wouldAccept(keyId: KeyId): Promise<boolean> {
+        if (mode === 'dormant' || destroyed) return false;
+        if (isKeyIdBlocked(keyId)) return false;
+        if (swarmPeers.size >= targetPeers) return false;
+        if (authorizer !== undefined) {
+            return authorizer.authorize(keyId);
+        }
+        return true;
+    }
+
     // --- discovery + connect loop ---
 
     async function runDiscovery() {
@@ -132,10 +167,14 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
             for await (const peerInfo of discovery.discover(topic, schemes)) {
                 if (signal.aborted) break;
 
+                if (authorizer !== undefined) {
+                    const ok = await authorizer.authorize(peerInfo.keyId);
+                    if (!ok) continue;
+                }
+
                 for (const addr of peerInfo.addresses) {
                     const key = connectionKey(peerInfo.keyId, addr);
                     if (!swarmPeers.has(key) && !blockedPeers.has(key)) {
-                        // Try to adopt from pool first
                         if (pool.get(peerInfo.keyId, addr) !== undefined) {
                             adoptPeer(peerInfo.keyId, addr);
                         } else {
@@ -192,6 +231,9 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
     function activate() {
         if (destroyed) return;
         mode = 'active';
+        if (localPeer !== undefined) {
+            discovery.announce(topic, localPeer).catch(() => {});
+        }
         runDiscovery();
     }
 
@@ -207,6 +249,9 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
         mode = 'dormant';
         discoveryAbort?.abort();
         discoveryAbort = undefined;
+        if (localPeer !== undefined) {
+            discovery.leave(topic, localPeer.keyId).catch(() => {});
+        }
         for (const key of Array.from(swarmPeers.keys())) {
             removePeer(key);
         }
@@ -217,6 +262,9 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
         destroyed = true;
         discoveryAbort?.abort();
         discoveryAbort = undefined;
+        if (localPeer !== undefined) {
+            discovery.leave(topic, localPeer.keyId).catch(() => {});
+        }
         for (const key of Array.from(swarmPeers.keys())) {
             removePeer(key);
         }
@@ -233,5 +281,7 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
         onPeerJoin:  (cb: PeerCallback) => { joinCallbacks.push(cb); },
         onPeerLeave: (cb: PeerCallback) => { leaveCallbacks.push(cb); },
         blockPeer,
+        wouldAccept,
+        adopt: adoptPeer,
     };
 }

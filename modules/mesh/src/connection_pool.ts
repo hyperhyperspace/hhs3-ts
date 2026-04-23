@@ -8,11 +8,15 @@ import type { NetworkAddress } from './transport.js';
 import type { AuthenticatedChannel } from './authenticator.js';
 import type { TopicId } from './discovery.js';
 import {
-    TopicChannel, encodeTopicMessage, decodeMessage, MSG_TYPE_TOPIC,
+    TopicChannel, encodeTopicMessage, decodeMessage, MSG_TYPE_TOPIC, MSG_TYPE_CONTROL,
 } from './mux.js';
 
 export function connectionKey(keyId: KeyId, endpoint: NetworkAddress): string {
     return `${keyId}@${endpoint}`;
+}
+
+function topicChannelKey(connKey: string, topic: TopicId): string {
+    return `${connKey}#${topic}`;
 }
 
 export interface PooledConnection {
@@ -24,6 +28,7 @@ export interface PooledConnection {
 
 type ConnectCallback    = (conn: PooledConnection) => void;
 type DisconnectCallback = (connKey: string) => void;
+type ControlCallback    = (connKey: string, peerId: KeyId, endpoint: NetworkAddress, payload: Uint8Array) => void;
 
 export class ConnectionPool {
 
@@ -31,6 +36,7 @@ export class ConnectionPool {
     private topicChannels = new Map<string, TopicChannelImpl>();
     private connectCallbacks:    ConnectCallback[]    = [];
     private disconnectCallbacks: DisconnectCallback[] = [];
+    private controlCallbacks:    ControlCallback[]    = [];
 
     get(keyId: KeyId, endpoint: NetworkAddress): PooledConnection | undefined {
         return this.connections.get(connectionKey(keyId, endpoint));
@@ -64,7 +70,7 @@ export class ConnectionPool {
         };
 
         this.connections.set(key, conn);
-        this.installDispatch(key, channel);
+        this.installDispatch(key, conn);
 
         channel.onClose(() => {
             this.connections.delete(key);
@@ -87,7 +93,7 @@ export class ConnectionPool {
 
     openTopic(keyId: KeyId, endpoint: NetworkAddress, topic: TopicId): TopicChannel {
         const connKey = connectionKey(keyId, endpoint);
-        const topicKey = `${connKey}#${topic}`;
+        const topicKey = topicChannelKey(connKey, topic);
 
         const existing = this.topicChannels.get(topicKey);
         if (existing !== undefined && existing.open) return existing;
@@ -105,12 +111,21 @@ export class ConnectionPool {
         return tc;
     }
 
+    hasTopicChannel(keyId: KeyId, endpoint: NetworkAddress, topic: TopicId): boolean {
+        const tc = this.topicChannels.get(topicChannelKey(connectionKey(keyId, endpoint), topic));
+        return tc !== undefined && tc.open;
+    }
+
     onConnect(callback: ConnectCallback): void {
         this.connectCallbacks.push(callback);
     }
 
     onDisconnect(callback: DisconnectCallback): void {
         this.disconnectCallbacks.push(callback);
+    }
+
+    onControlMessage(callback: ControlCallback): void {
+        this.controlCallbacks.push(callback);
     }
 
     size(): number {
@@ -125,15 +140,18 @@ export class ConnectionPool {
 
     // --- internal dispatch ---
 
-    private installDispatch(connKey: string, channel: AuthenticatedChannel): void {
-        channel.onMessage((frame: Uint8Array) => {
+    private installDispatch(connKey: string, conn: PooledConnection): void {
+        conn.channel.onMessage((frame: Uint8Array) => {
             try {
                 const msg = decodeMessage(frame);
                 if (msg.type === MSG_TYPE_TOPIC && msg.topic !== undefined) {
-                    const topicKey = `${connKey}#${msg.topic}`;
-                    const tc = this.topicChannels.get(topicKey);
+                    const tc = this.topicChannels.get(topicChannelKey(connKey, msg.topic));
                     if (tc !== undefined && tc.open) {
                         tc.deliver(msg.payload);
+                    }
+                } else if (msg.type === MSG_TYPE_CONTROL) {
+                    for (const cb of this.controlCallbacks) {
+                        cb(connKey, conn.peerId, conn.endpoint, msg.payload);
                     }
                 }
             } catch {
