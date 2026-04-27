@@ -1,7 +1,8 @@
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { createBasicCrypto, HASH_SHA256 } from "@hyper-hyper-space/hhs3_crypto";
 import { Replica, MemDagBackend } from "../src/index.js";
-import { RSet, rSetFactory, TypeRegistryMap } from "@hyper-hyper-space/hhs3_mvt";
+import { TypeRegistryMap } from "@hyper-hyper-space/hhs3_mvt";
+import { RSet, rSetFactory } from "@hyper-hyper-space/hhs3_std_types";
 
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);

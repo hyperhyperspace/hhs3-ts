@@ -3,7 +3,7 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 
-import { MAX_TYPE_LENGTH } from "../../mvt.js";
+import { MAX_TYPE_LENGTH } from "@hyper-hyper-space/hhs3_mvt";
 
 export const MAX_SEED_LENGTH = 1024;
 export const MAX_HASH_LENGTH = 128;

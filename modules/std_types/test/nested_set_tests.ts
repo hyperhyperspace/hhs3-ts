@@ -1,4 +1,4 @@
-import { RContext, RObject, RObjectInit, RObjectConfig, TypeRegistryMap, version } from "../src/mvt.js";
+import { RContext, RObject, RObjectInit, RObjectConfig, TypeRegistryMap, version } from "@hyper-hyper-space/hhs3_mvt";
 import { RSet, rSetFactory } from "../src/types/rset.js";
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { createMockRContext } from "./mock_rcontext.js";

@@ -27,8 +27,8 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, HASH_SHA256, sha256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, MetaProps, position, EntryMetaFilter, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
 
-import { Payload, RObject, RObjectFactory, RObjectInit, RContext, RObjectConfig, SyncableObject, NestingParent, version, Version, View } from "../mvt.js";
-import { DagScope, NestedScopedDag, RootScopedDag, ScopedDag, CausalDag } from "../dag/dag_nesting.js";
+import { Payload, RObject, RObjectFactory, RObjectInit, RContext, RObjectConfig, SyncableObject, NestingParent, version, Version, View } from "@hyper-hyper-space/hhs3_mvt";
+import { DagScope, NestedScopedDag, RootScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
 import { set } from "@hyper-hyper-space/hhs3_util";
 
 import { RAddEvent, RDeleteEvent, RSetEvent } from "./rset/events.js";

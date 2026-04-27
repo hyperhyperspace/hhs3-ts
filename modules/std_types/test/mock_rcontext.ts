@@ -3,9 +3,8 @@ import { dag, Dag } from "@hyper-hyper-space/hhs3_dag";
 
 import {
     RContext, RObject, RObjectInit, RObjectConfig, RObjectFactory,
-    RObjectTypeRegistry, TypeRegistryMap,
-} from "../src/mvt.js";
-import { RootScopedDag } from "../src/dag/dag_nesting.js";
+    RObjectTypeRegistry, TypeRegistryMap, RootScopedDag,
+} from "@hyper-hyper-space/hhs3_mvt";
 
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
