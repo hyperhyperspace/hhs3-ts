@@ -10,6 +10,7 @@ export const MAX_HASH_LENGTH = 128;
 export const MAX_ELEMENTS_TYPE_ID_LENGTH = 256;
 export const MAX_INITIAL_ELEMENTS = 1024;
 export const MAX_HASH_ALGORITHM_LENGTH = 256;
+export const MAX_LABEL_LENGTH = 128;
 
 export type SetPayload = CreateSetPayload | AddElmtPayload | DeleteElmtPayload | UpdateElmtPayload;
 
@@ -29,6 +30,9 @@ export type CreateSetPayload = {
     supportBarrierAdd?: boolean;
     supportBarrierDelete?: boolean;
     hashAlgorithm?: string;
+    parent?: B64Hash;
+    backendLabel?: string;
+    meshLabel?: string;
 }
  
 export const createSetFormat: json.Format = {
@@ -42,6 +46,9 @@ export const createSetFormat: json.Format = {
     supportBarrierAdd: [json.Type.Option, json.Type.Boolean],
     supportBarrierDelete: [json.Type.Option, json.Type.Boolean],
     hashAlgorithm: [json.Type.Option, [json.Type.BoundedString, MAX_HASH_ALGORITHM_LENGTH]],
+    parent: [json.Type.Option, [json.Type.BoundedString, MAX_HASH_LENGTH]],
+    backendLabel: [json.Type.Option, [json.Type.BoundedString, MAX_LABEL_LENGTH]],
+    meshLabel: [json.Type.Option, [json.Type.BoundedString, MAX_LABEL_LENGTH]],
 };
 
 // Add an element:

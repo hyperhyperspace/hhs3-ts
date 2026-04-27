@@ -1,56 +1,20 @@
-import { ObjectMap, RObject, RObjectInit, RObjectConfig, TypeRegistryMap, version } from "../src/mvt.js";
-import { RSet, rSetFactory, RSetProvider } from "../src/types/rset.js";
+import { RContext, RObject, RObjectInit, RObjectConfig, TypeRegistryMap, version } from "../src/mvt.js";
+import { RSet, rSetFactory } from "../src/types/rset.js";
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.js";
-import { createMemDagBackend } from "../src/dag/mem_dag_storage.js";
+import { createMockRContext } from "./mock_rcontext.js";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, createBasicCrypto, HASH_SHA256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
 
 const crypto = createBasicCrypto();
 
-function createTestObjectMap(): ObjectMap {
-    const registry = new TypeRegistryMap<RSetProvider>();
-    registry.register(RSet.typeId, rSetFactory);
-
-    const config: RObjectConfig = { selfValidate: true };
-    const dagBackend = createMemDagBackend(crypto.hash(HASH_SHA256));
-    const objects = new Map<B64Hash, RObject>();
-
-    const objectMap: ObjectMap = {
-        getObject: async (id: B64Hash) => objects.get(id)!,
-        addObject: async (init: RObjectInit) => {
-            const factory = await registry.lookup(init.type);
-            const id = await factory.computeRootObjectId(init.payload, createProvider());
-            const provider = createProvider(id);
-            const valid = await factory.validateCreationPayload(init.payload, provider);
-            if (!valid) throw new Error('Invalid creation payload');
-            await factory.executeCreationPayload(init.payload, provider);
-            objects.set(id, await factory.loadObject(id, provider));
-            return id;
-        },
-    };
-
-    function createProvider(id?: B64Hash): RSetProvider {
-        return {
-            getObjectMap: () => objectMap,
-            getConfig: () => config,
-            getRegistry: () => registry,
-            getCrypto: () => crypto,
-            getScopedDag: (tag?: string) => {
-                if (id === undefined) throw new Error("Object ID not yet assigned");
-                return dagBackend.getScopedDag(id, tag);
-            },
-            getCausalDag: (tag?: string) => {
-                if (id === undefined) throw new Error("Object ID not yet assigned");
-                return dagBackend.getCausalDag(id, tag);
-            },
-        };
-    }
-
-    return objectMap;
+function createTestCtx(): RContext {
+    const ctx = createMockRContext({ selfValidate: true });
+    ctx.getRegistry().register(RSet.typeId, rSetFactory);
+    return ctx;
 }
 
 const createTestEnvironment = async (initialElements: Array<json.Literal> = []) => {
-    const objectMap = createTestObjectMap();
+    const ctx = createTestCtx();
 
     const init = await RSet.create(
         {
@@ -62,10 +26,9 @@ const createTestEnvironment = async (initialElements: Array<json.Literal> = []) 
         }
     );
 
-    const setId = await objectMap.addObject(init)
-    const set = (await objectMap.getObject(setId)) as RSet;
+    const set = (await ctx.createObject(init)) as RSet;
 
-    return { objectMap, set, setId };
+    return { ctx, set, setId: set.getId() };
 };
 
 export const simpleSetTests = {
@@ -281,7 +244,6 @@ export const simpleSetTests = {
                 const viewAfterReAdd = await set.getView();
                 assertTrue(await viewAfterReAdd.has('alpha'), 'alpha should reappear after re-add following barrier delete');
 
-                // Historical view at the original add should still see alpha
                 const historicalView = await set.getView(addVersion);
                 assertTrue(await historicalView.has('alpha'), 'historical view should still see alpha at its original add');
             }
@@ -289,7 +251,7 @@ export const simpleSetTests = {
         {
             name: '[SET08] Set without barrier support: basic add and delete work',
             invoke: async () => {
-                const objectMap = createTestObjectMap();
+                const ctx = createTestCtx();
 
                 const init = await RSet.create({
                     seed: 'no-barrier-set',
@@ -297,8 +259,7 @@ export const simpleSetTests = {
                     hashAlgorithm: 'sha256',
                 });
 
-                const setId = await objectMap.addObject(init);
-                const set = (await objectMap.getObject(setId)) as RSet;
+                const set = (await ctx.createObject(init)) as RSet;
 
                 const view0 = await set.getView();
                 assertTrue(await view0.has('alpha'), 'initial element alpha should be present');
@@ -322,7 +283,7 @@ export const simpleSetTests = {
         {
             name: '[SET09] Set without barrier support: addWithBarrier throws',
             invoke: async () => {
-                const objectMap = createTestObjectMap();
+                const ctx = createTestCtx();
 
                 const init = await RSet.create({
                     seed: 'no-barrier-add-set',
@@ -330,8 +291,7 @@ export const simpleSetTests = {
                     hashAlgorithm: 'sha256',
                 });
 
-                const setId = await objectMap.addObject(init);
-                const set = (await objectMap.getObject(setId)) as RSet;
+                const set = (await ctx.createObject(init)) as RSet;
 
                 let threw = false;
                 try {
@@ -345,7 +305,7 @@ export const simpleSetTests = {
         {
             name: '[SET10] Set without barrier support: deleteWithBarrier throws',
             invoke: async () => {
-                const objectMap = createTestObjectMap();
+                const ctx = createTestCtx();
 
                 const init = await RSet.create({
                     seed: 'no-barrier-delete-set',
@@ -353,8 +313,7 @@ export const simpleSetTests = {
                     hashAlgorithm: 'sha256',
                 });
 
-                const setId = await objectMap.addObject(init);
-                const set = (await objectMap.getObject(setId)) as RSet;
+                const set = (await ctx.createObject(init)) as RSet;
 
                 await set.add('alpha');
 
@@ -380,7 +339,6 @@ export const simpleSetTests = {
                 }
                 assertTrue(threw, 'delete of non-existent element should throw');
 
-                // Also verify the set is still functional after the failed delete
                 await set.add('alpha');
                 const view = await set.getView();
                 assertTrue(await view.has('alpha'), 'set should remain usable after a failed delete');

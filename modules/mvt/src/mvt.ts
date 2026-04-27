@@ -1,7 +1,9 @@
-import { B64Hash, BasicCrypto } from "@hyper-hyper-space/hhs3_crypto";
-import { dag } from "@hyper-hyper-space/hhs3_dag";
+import { B64Hash, BasicCrypto, HashSuite } from "@hyper-hyper-space/hhs3_crypto";
+import { dag, Dag } from "@hyper-hyper-space/hhs3_dag";
 
 import { json } from "@hyper-hyper-space/hhs3_json";
+
+import { CausalDag, ScopedDag } from "./dag/dag_nesting.js";
 
 export const MAX_TYPE_LENGTH = 128;
 
@@ -10,27 +12,31 @@ export const emptyVersion: () => Version = dag.emptyPosition;
 export const version: (...hashes: B64Hash[]) => Version = dag.position;
 export type Payload = json.Literal;
 
-// RObject (Replicable Object): used both to write and interpret changes to a DAG-based history log.
-
-// An RObject may contain other RObjects within it, that will share its DAG store
-// and use its DAG for their change history. The applyPayload function will handle applying
-// changes to any sub-objects that are being modified, and the createView function will
-// use views from sub-objects when necessary.
-
 export type RObject = {
     
-    getId(): B64Hash; // by contention, the id of the creation change op
+    getId(): B64Hash;
     getType(): string;
 
-    // for writing
     validatePayload(payload: Payload, at: Version): Promise<boolean>;
     applyPayload(payload: Payload, at: Version): Promise<B64Hash>;
 
-    // for reading: enabled only by explicitly requesting a version
     getView(at?: Version, from?: Version): Promise<View>;
 
     subscribe(callback: (event: Event) => void): void;
     unsubscribe(callback: (event: Event) => void): void;
+}
+
+export type NestingParent = {
+    getId(): B64Hash;
+    getScopedDagForChild(childId: B64Hash): Promise<ScopedDag>;
+    getCreationDagForChild(childId: B64Hash, at: Version, addPayload: Payload): Promise<ScopedDag>;
+    getCausalDag(): Promise<CausalDag>;
+}
+
+export type SyncableObject = {
+    startSync(): Promise<void>;
+    stopSync(): Promise<void>;
+    destroy(): Promise<void>;
 }
 
 export type RObjectInit = {
@@ -38,61 +44,68 @@ export type RObjectInit = {
     payload: Payload;
 }
 
-export type ObjectMap = {
-    getObject(id: B64Hash): Promise<RObject>;
-    addObject(init: RObjectInit): Promise<B64Hash>;
-};
-
 export type RObjectConfig = {
     selfValidate?: boolean;
 };
 
-export type BasicProvider = {
-    getObjectMap(): ObjectMap;
-    getConfig(): RObjectConfig;
-    getRegistry(): RObjectTypeRegistry<any>;
+export type RContext = {
     getCrypto(): BasicCrypto;
+    getHashSuite(): HashSuite;
+    getConfig(): RObjectConfig;
+    getRegistry(): RObjectTypeRegistry;
+
+    getObject(id: B64Hash): Promise<RObject | undefined>;
+    getDag(id: B64Hash, backendLabel?: string): Promise<Dag>;
+    getMesh(label: string): any;
+
+    createObject(init: RObjectInit): Promise<RObject>;
 };
 
-export type RObjectFactory<P extends BasicProvider = BasicProvider> = {
-    computeRootObjectId: (createPayload: Payload, provider: P) => Promise<B64Hash>;
+export type RObjectFactory = {
+    defaults?: { backendLabel?: string; meshLabel?: string };
+
+    computeRootObjectId: (createPayload: Payload, ctx: RContext, parent?: NestingParent) => Promise<B64Hash>;
     
-    validateCreationPayload: (createPayload: Payload, provider: P) => Promise<boolean>;
-    executeCreationPayload: (createPayload: Payload, provider: P) => Promise<B64Hash>;
+    validateCreationPayload: (createPayload: Payload, ctx: RContext, parent?: NestingParent) => Promise<boolean>;
+    executeCreationPayload: (createPayload: Payload, ctx: RContext, scopedDag: ScopedDag) => Promise<B64Hash>;
     
-    loadObject: (id: B64Hash, provider: P) => Promise<RObject>;
+    loadObject: (id: B64Hash, ctx: RContext, parent?: NestingParent) => Promise<RObject>;
 }
 
-// A static view of a replicable object's state at a given version
 export type View = {
     getObject(): RObject;
     getVersion(): Version;
     getFromVersion(): Version;
 }
 
-// An event that signals a change in the replicable object's state
 export type Event = {
     getObjectId(): B64Hash;
     getType(): string;
     getVersion(): Version;
 }
 
-// This can be enriched locally with metadata, in which case this type should be extended.
-// However, only the payload is actually replicated.
-
-
-export type RObjectTypeRegistry<P extends BasicProvider = BasicProvider> = {
-    lookup(typeName: string): Promise<RObjectFactory<P>>;
+export type RObjectTypeRegistry = {
+    lookup(typeName: string): Promise<RObjectFactory>;
+    has(typeName: string): boolean;
+    register(typeName: string, factory: RObjectFactory): void;
 }
 
-export class TypeRegistryMap<P extends BasicProvider = BasicProvider> implements RObjectTypeRegistry<P> {
-    private types: Map<string, RObjectFactory<P>> = new Map();
+export class TypeRegistryMap implements RObjectTypeRegistry {
+    private types: Map<string, RObjectFactory> = new Map();
 
-    async register(typeName: string, type: RObjectFactory<P>) {
-        this.types.set(typeName, type);
+    register(typeName: string, factory: RObjectFactory): void {
+        this.types.set(typeName, factory);
     }
     
-    async lookup(typeName: string): Promise<RObjectFactory<P>> {
-        return this.types.get(typeName)!;
+    has(typeName: string): boolean {
+        return this.types.has(typeName);
+    }
+
+    async lookup(typeName: string): Promise<RObjectFactory> {
+        const factory = this.types.get(typeName);
+        if (factory === undefined) {
+            throw new Error(`Type '${typeName}' not found in registry`);
+        }
+        return factory;
     }
 }

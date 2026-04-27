@@ -1,52 +1,16 @@
-import { ObjectMap, RObject, RObjectInit, RObjectConfig, TypeRegistryMap, version } from "../src/mvt.js";
-import { RSet, rSetFactory, RSetProvider } from "../src/types/rset.js";
+import { RContext, RObject, RObjectInit, RObjectConfig, TypeRegistryMap, version } from "../src/mvt.js";
+import { RSet, rSetFactory } from "../src/types/rset.js";
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.js";
-import { createMemDagBackend } from "../src/dag/mem_dag_storage.js";
+import { createMockRContext } from "./mock_rcontext.js";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, createBasicCrypto, HASH_SHA256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
 
 const crypto = createBasicCrypto();
 
-function createTestObjectMap(): ObjectMap {
-    const registry = new TypeRegistryMap<RSetProvider>();
-    registry.register(RSet.typeId, rSetFactory);
-
-    const config: RObjectConfig = { selfValidate: true };
-    const dagBackend = createMemDagBackend(crypto.hash(HASH_SHA256));
-    const objects = new Map<B64Hash, RObject>();
-
-    const objectMap: ObjectMap = {
-        getObject: async (id: B64Hash) => objects.get(id)!,
-        addObject: async (init: RObjectInit) => {
-            const factory = await registry.lookup(init.type);
-            const id = await factory.computeRootObjectId(init.payload, createProvider());
-            const provider = createProvider(id);
-            const valid = await factory.validateCreationPayload(init.payload, provider);
-            if (!valid) throw new Error('Invalid creation payload');
-            await factory.executeCreationPayload(init.payload, provider);
-            objects.set(id, await factory.loadObject(id, provider));
-            return id;
-        },
-    };
-
-    function createProvider(id?: B64Hash): RSetProvider {
-        return {
-            getObjectMap: () => objectMap,
-            getConfig: () => config,
-            getRegistry: () => registry,
-            getCrypto: () => crypto,
-            getScopedDag: (tag?: string) => {
-                if (id === undefined) throw new Error("Object ID not yet assigned");
-                return dagBackend.getScopedDag(id, tag);
-            },
-            getCausalDag: (tag?: string) => {
-                if (id === undefined) throw new Error("Object ID not yet assigned");
-                return dagBackend.getCausalDag(id, tag);
-            },
-        };
-    }
-
-    return objectMap;
+function createTestCtx(): RContext {
+    const ctx = createMockRContext({ selfValidate: true });
+    ctx.getRegistry().register(RSet.typeId, rSetFactory);
+    return ctx;
 }
 
 export const nestedSetTests = {
@@ -55,9 +19,8 @@ export const nestedSetTests = {
         {
             name: '[NES00] Test adding a nested set and inserting elements into it',
             invoke: async () => {
-                const objectMap = createTestObjectMap();
+                const ctx = createTestCtx();
 
-                // Create the outer set that will contain nested sets
                 const outerSetInit = await RSet.create({
                     seed: 'outer-set',
                     contentType: RSet.typeId,
@@ -67,11 +30,8 @@ export const nestedSetTests = {
                     supportBarrierDelete: true,
                 });
 
-                const outerSetId = await objectMap.addObject(outerSetInit);
-                const outerSet = (await objectMap.getObject(outerSetId)) as RSet;
+                const outerSet = (await ctx.createObject(outerSetInit)) as RSet;
 
-
-                // Add a nested set to the outer set
                 const nestedSetPayload = await RSet.create({
                     seed: 'nested-set-1',
                     initialElements: [],
@@ -82,25 +42,20 @@ export const nestedSetTests = {
 
                 const nestedSetHash = await outerSet.add(nestedSetPayload.payload);
                 
-                // Get the outer set view and load the nested set
                 const outerView = await outerSet.getView();
                 const nestedSet = await outerView.loadRObjectByHash(nestedSetHash) as RSet;
 
-                // Add some strings to the nested set
                 await nestedSet.add('alpha');
                 await nestedSet.add('beta');
                 await nestedSet.add('gamma');
 
-                // Verify the nested set contains the expected elements
                 const nestedView = await nestedSet.getView();
                 assertTrue(await nestedView.has('alpha'), 'nested set should contain alpha');
                 assertTrue(await nestedView.has('beta'), 'nested set should contain beta');
                 assertTrue(await nestedView.has('gamma'), 'nested set should contain gamma');
 
-                // Verify the outer set contains the nested set
                 assertTrue(await outerView.hasByHash(nestedSetHash), 'outer set should contain the nested set');
 
-                // Test deletion from nested set
                 await nestedSet.delete('beta');
                 const updatedNestedView = await nestedSet.getView();
                 assertFalse(await updatedNestedView.has('beta'), 'beta should be removed from nested set');
@@ -111,9 +66,8 @@ export const nestedSetTests = {
         {
             name: '[NES01] Test multiple nested sets with overlapping elements',
             invoke: async () => {
-                const objectMap = createTestObjectMap();
+                const ctx = createTestCtx();
 
-                // Create the outer set that will contain nested sets
                 const outerSetInit = await RSet.create({
                     seed: 'outer-set-multi',
                     contentType: RSet.typeId,
@@ -123,11 +77,8 @@ export const nestedSetTests = {
                     supportBarrierDelete: true,
                 });
 
-                const outerSetId = await objectMap.addObject(outerSetInit);
-                const outerSet = (await objectMap.getObject(outerSetId)) as RSet;
+                const outerSet = (await ctx.createObject(outerSetInit)) as RSet;
 
-
-                // Helper to create and add a nested set, returning its hash and instance
                 const addNestedSet = async (seed: string) => {
                     const nestedSetInit = await RSet.create({
                         seed,
@@ -147,7 +98,6 @@ export const nestedSetTests = {
                 const { nested: setB } = await addNestedSet('nested-B');
                 const { nested: setC } = await addNestedSet('nested-C');
 
-                // Sequential operations on each nested set, with overlapping element names
                 await setA.add('shared');
                 await setA.add('a1');
                 await setA.add('a2');
@@ -158,13 +108,12 @@ export const nestedSetTests = {
 
                 await setC.add('shared');
                 await setC.add('c1');
-                await setC.delete('shared'); // remove shared only from C
+                await setC.delete('shared');
 
                 const viewA = await setA.getView();
                 const viewB = await setB.getView();
                 const viewC = await setC.getView();
 
-                // Check independence of sets and overlapping elements
                 assertTrue(await viewA.has('shared'), 'setA should contain shared');
                 assertTrue(await viewB.has('shared'), 'setB should contain shared');
                 assertFalse(await viewC.has('shared'), 'setC should not contain shared after deletion');
@@ -184,9 +133,8 @@ export const nestedSetTests = {
         {
             name: '[NES02] Test concurrent additions inside nested sets',
             invoke: async () => {
-                const objectMap = createTestObjectMap();
+                const ctx = createTestCtx();
 
-                // Create the outer set that will contain nested sets
                 const outerSetInit = await RSet.create({
                     seed: 'outer-set-concurrent',
                     contentType: RSet.typeId,
@@ -196,11 +144,8 @@ export const nestedSetTests = {
                     supportBarrierDelete: true,
                 });
 
-                const outerSetId = await objectMap.addObject(outerSetInit);
-                const outerSet = (await objectMap.getObject(outerSetId)) as RSet;
+                const outerSet = (await ctx.createObject(outerSetInit)) as RSet;
 
-
-                // Helper to create and add a nested set, returning its hash and instance
                 const addNestedSet = async (seed: string) => {
                     const nestedSetInit = await RSet.create({
                         seed,
@@ -219,9 +164,6 @@ export const nestedSetTests = {
                 const { nestedHash: hashA, nested: setA } = await addNestedSet('nested-concurrent-A');
                 const { nestedHash: hashB, nested: setB } = await addNestedSet('nested-concurrent-B');
 
-                // Helper to generate concurrent additions inside a nested set, mirroring [SET01].
-                // Uses the same element names in all nested sets to ensure they remain independent.
-                // `setName` is only used to annotate assertion messages; it does not affect data.
                 const runConcurrentAdds = async (target: RSet, setName: string) => {
                     const alphaLabel = 'alpha';
                     const betaLabel = 'beta';
@@ -236,25 +178,21 @@ export const nestedSetTests = {
                     const gammaHash = await target.add(gammaLabel, alphaVersion);
                     const gammaVersion = version(gammaHash);
 
-                    // Historical view at alpha
                     const ancestorView = await target.getView(alphaVersion);
                     assertTrue(await ancestorView.has(alphaLabel), `${setName}: alpha should be visible at its own version`);
                     assertFalse(await ancestorView.has(betaLabel), `${setName}: beta should not exist before it was added`);
                     assertFalse(await ancestorView.has(gammaLabel), `${setName}: gamma should not exist before it was added`);
 
-                    // Beta branch view
                     const betaView = await target.getView(betaVersion);
                     assertTrue(await betaView.has(alphaLabel), `${setName}: alpha should be visible when reading beta branch`);
                     assertTrue(await betaView.has(betaLabel), `${setName}: beta should be visible when reading beta branch`);
                     assertFalse(await betaView.has(gammaLabel), `${setName}: gamma should not leak into beta branch view`);
 
-                    // Gamma branch view
                     const gammaView = await target.getView(gammaVersion);
                     assertTrue(await gammaView.has(alphaLabel), `${setName}: alpha should be visible when reading gamma branch`);
                     assertTrue(await gammaView.has(gammaLabel), `${setName}: gamma should be visible when reading gamma branch`);
                     assertFalse(await gammaView.has(betaLabel), `${setName}: beta should not leak into gamma branch view`);
 
-                    // Frontier view should see both concurrent additions
                     const frontierView = await target.getView();
                     assertTrue(await frontierView.has(betaLabel), `${setName}: latest view should include beta`);
                     assertTrue(await frontierView.has(gammaLabel), `${setName}: latest view should include gamma`);
@@ -262,11 +200,9 @@ export const nestedSetTests = {
                     return { alphaHash, betaHash, gammaHash };
                 };
 
-                // Run concurrent patterns independently on several nested sets
                 const aHashes = await runConcurrentAdds(setA, 'A');
                 const bHashes = await runConcurrentAdds(setB, 'B');
 
-                // Build a combined version that includes operations from both nested sets
                 const combinedVersion = version(
                     aHashes.betaHash,
                     aHashes.gammaHash,
@@ -274,8 +210,6 @@ export const nestedSetTests = {
                     bHashes.gammaHash
                 );
 
-                // At a version that includes hashes from both sets, each nested set should
-                // still only see its own operations, even though element names are identical.
                 const combinedViewA = await setA.getView(combinedVersion);
                 const combinedViewB = await setB.getView(combinedVersion);
 
@@ -287,9 +221,6 @@ export const nestedSetTests = {
                 assertTrue(await combinedViewB.has('beta'), 'B: combined view should include beta');
                 assertTrue(await combinedViewB.has('gamma'), 'B: combined view should include gamma');
 
-                // Additional mixed versions to further exercise cuts involving both sets.
-
-                // Version where both sets are at their beta branches (no gamma yet).
                 const bothBetaVersion = version(aHashes.betaHash, bHashes.betaHash);
                 const bothBetaViewA = await setA.getView(bothBetaVersion);
                 const bothBetaViewB = await setB.getView(bothBetaVersion);
@@ -302,7 +233,6 @@ export const nestedSetTests = {
                 assertTrue(await bothBetaViewB.has('beta'), 'B @bothBeta: should see beta');
                 assertFalse(await bothBetaViewB.has('gamma'), 'B @bothBeta: should not see gamma');
 
-                // Version where both sets are at their gamma branches (no beta yet).
                 const bothGammaVersion = version(aHashes.gammaHash, bHashes.gammaHash);
                 const bothGammaViewA = await setA.getView(bothGammaVersion);
                 const bothGammaViewB = await setB.getView(bothGammaVersion);
@@ -315,7 +245,6 @@ export const nestedSetTests = {
                 assertFalse(await bothGammaViewB.has('beta'), 'B @bothGamma: should not see beta');
                 assertTrue(await bothGammaViewB.has('gamma'), 'B @bothGamma: should see gamma');
 
-                // Crossed version: A at beta-branch, B at gamma-branch.
                 const crossVersion = version(aHashes.betaHash, bHashes.gammaHash);
                 const crossViewA = await setA.getView(crossVersion);
                 const crossViewB = await setB.getView(crossVersion);
@@ -328,7 +257,6 @@ export const nestedSetTests = {
                 assertFalse(await crossViewB.has('beta'), 'B @cross: should not see beta');
                 assertTrue(await crossViewB.has('gamma'), 'B @cross: should see gamma');
 
-                // Ensure the outer set still contains all nested sets after concurrent inner updates
                 const outerView = await outerSet.getView();
                 assertTrue(await outerView.hasByHash(hashA), 'outer set should still contain nested set A');
                 assertTrue(await outerView.hasByHash(hashB), 'outer set should still contain nested set B');
@@ -337,9 +265,8 @@ export const nestedSetTests = {
         {
             name: '[NES03] Test barrier operations with nested elements',
             invoke: async () => {
-                const objectMap = createTestObjectMap();
+                const ctx = createTestCtx();
 
-                // Create the outer set that will contain nested sets, with barrier support enabled.
                 const outerSetInit = await RSet.create({
                     seed: 'outer-set-barrier',
                     contentType: RSet.typeId,
@@ -349,9 +276,7 @@ export const nestedSetTests = {
                     supportBarrierDelete: true,
                 });
 
-                const outerSetId = await objectMap.addObject(outerSetInit);
-                const outerSet = (await objectMap.getObject(outerSetId)) as RSet;
-
+                const outerSet = (await ctx.createObject(outerSetInit)) as RSet;
 
                 const makeNestedInit = async (seed: string) => {
                     return RSet.create({
@@ -363,7 +288,6 @@ export const nestedSetTests = {
                     });
                 };
 
-                // Add a "root" nested set, then fork into two concurrent nested sets.
                 const rootInit = await makeNestedInit('nested-root');
                 const rootHash = await outerSet.add(rootInit.payload);
                 const rootVersion = version(rootHash);
@@ -377,28 +301,23 @@ export const nestedSetTests = {
                 const leftVersion = version(leftHash);
                 const rightVersion = version(rightHash);
 
-                // Barrier add of another nested set on the left branch.
                 const barrierInit = await makeNestedInit('nested-barrier');
                 const barrierHash = await outerSet.addWithBarrier(barrierInit.payload, leftVersion);
 
-                // The right branch should see the barrier-added nested element as well.
                 const rightViewAfterBarrierAdd = await outerSet.getView(rightVersion);
                 assertTrue(
                     await rightViewAfterBarrierAdd.hasByHash(barrierHash),
                     'barrier add should apply to concurrent branches even with nested elements'
                 );
 
-                // Barrier delete of the root nested set from the left branch.
                 await outerSet.deleteWithBarrierByHash(rootHash, leftVersion);
 
-                // The right branch should no longer see the root nested element.
                 const rightViewAfterBarrierDelete = await outerSet.getView(rightVersion);
                 assertFalse(
                     await rightViewAfterBarrierDelete.hasByHash(rootHash),
                     'barrier delete should remove nested elements from concurrent branches'
                 );
 
-                // Latest frontier view: barrier element remains, root element does not.
                 const latestView = await outerSet.getView();
                 assertTrue(
                     await latestView.hasByHash(barrierHash),
@@ -413,9 +332,8 @@ export const nestedSetTests = {
         {
             name: '[NES04] Test deep barrier operations inside multiple nested sets',
             invoke: async () => {
-                const objectMap = createTestObjectMap();
+                const ctx = createTestCtx();
 
-                // Outer container set holding nested sets with barrier support.
                 const outerSetInit = await RSet.create({
                     seed: 'outer-set-deep-barrier',
                     contentType: RSet.typeId,
@@ -425,12 +343,8 @@ export const nestedSetTests = {
                     supportBarrierDelete: true,
                 });
 
-                const outerSetId = await objectMap.addObject(outerSetInit);
-                const outerSet = (await objectMap.getObject(outerSetId)) as RSet;
+                const outerSet = (await ctx.createObject(outerSetInit)) as RSet;
 
-
-                // Helper to create an empty nested set with barrier support, add it to the outer set,
-                // and load it back as an RSet instance.
                 const addNestedSet = async (seed: string) => {
                     const nestedInit = await RSet.create({
                         seed,
@@ -449,17 +363,11 @@ export const nestedSetTests = {
                 const { nestedHash: hashA, nested: setA } = await addNestedSet('nested-deep-A');
                 const { nestedHash: hashB, nested: setB } = await addNestedSet('nested-deep-B');
 
-                // Helper that runs a barrier delete pattern inside a nested set,
-                // mirroring [SET04] but at the inner level. It seeds the inner set
-                // with 'root' and 'shared' via adds (since initialElements are not
-                // applied when nested), then performs concurrent adds and a barrier delete.
                 const runInnerBarrierDeleteShared = async (target: RSet, setName: string) => {
-                    // Seed the inner set with required elements.
                     const rootAddHash = await target.add('root');
                     const sharedAddHash = await target.add('shared');
                     const baseVersion = version(sharedAddHash);
 
-                    // Concurrent branch adds from the seeded base.
                     const leftHash = await target.add('left', baseVersion);
                     const rightHash = await target.add('right', baseVersion);
 
@@ -507,10 +415,7 @@ export const nestedSetTests = {
                     };
                 };
 
-                // First, run the deep barrier pattern inside setA and confirm setB is unaffected.
                 const aHashes = await runInnerBarrierDeleteShared(setA, 'A');
-
-                // Run the deep barrier pattern inside setB and capture its hashes.
                 const bHashes = await runInnerBarrierDeleteShared(setB, 'B');
 
                 const viewAAfter = await setA.getView();
@@ -523,7 +428,6 @@ export const nestedSetTests = {
                     'A after B barrier run: root should still be present in A'
                 );
 
-                // Outer set should continue to contain both nested sets regardless of inner barrier ops.
                 const outerView = await outerSet.getView();
                 assertTrue(
                     await outerView.hasByHash(hashA),
@@ -534,22 +438,18 @@ export const nestedSetTests = {
                     'outer set should still contain nested set B after deep barrier runs'
                 );
 
-                // Cross-set mixed versions to verify independence with barrier ops.
-                // A delete applied, B still at shared-add (no delete).
                 const versionADelete_BShared = version(aHashes.deleteBarrierHash, bHashes.sharedAddHash);
                 const viewA_Adelete_Bshared = await setA.getView(versionADelete_BShared);
                 const viewB_Adelete_Bshared = await setB.getView(versionADelete_BShared);
                 assertFalse(await viewA_Adelete_Bshared.has('shared'), 'A@Adelete+Bshared: shared deleted in A');
                 assertTrue(await viewB_Adelete_Bshared.has('shared'), 'B@Adelete+Bshared: shared still present in B');
 
-                // B delete applied, A still at shared-add (no delete).
                 const versionBDelete_AShared = version(bHashes.deleteBarrierHash, aHashes.sharedAddHash);
                 const viewA_Bdelete_Ashared = await setA.getView(versionBDelete_AShared);
                 const viewB_Bdelete_Ashared = await setB.getView(versionBDelete_AShared);
                 assertTrue(await viewA_Bdelete_Ashared.has('shared'), 'A@Bdelete+Ashared: shared still present in A');
                 assertFalse(await viewB_Bdelete_Ashared.has('shared'), 'B@Bdelete+Ashared: shared deleted in B');
 
-                // Both deletes applied.
                 const versionBothDeletes = version(aHashes.deleteBarrierHash, bHashes.deleteBarrierHash);
                 const viewA_bothDeletes = await setA.getView(versionBothDeletes);
                 const viewB_bothDeletes = await setB.getView(versionBothDeletes);
@@ -560,9 +460,8 @@ export const nestedSetTests = {
         {
             name: '[NES05] Nested creation applies initialElements for nested RSet',
             invoke: async () => {
-                const objectMap = createTestObjectMap();
+                const ctx = createTestCtx();
 
-                // Outer set that can hold nested RSet elements.
                 const outerSetInit = await RSet.create({
                     seed: 'outer-set-init-elements',
                     contentType: RSet.typeId,
@@ -572,11 +471,8 @@ export const nestedSetTests = {
                     supportBarrierDelete: true,
                 });
 
-                const outerSetId = await objectMap.addObject(outerSetInit);
-                const outerSet = (await objectMap.getObject(outerSetId)) as RSet;
+                const outerSet = (await ctx.createObject(outerSetInit)) as RSet;
 
-
-                // Create a nested RSet payload with initialElements.
                 const nestedInit = await RSet.create({
                     seed: 'nested-with-initials',
                     initialElements: ['alpha', 'beta'],
@@ -585,28 +481,23 @@ export const nestedSetTests = {
                     supportBarrierDelete: true,
                 });
 
-                // Add the nested set into the outer set.
                 const nestedHash = await outerSet.add(nestedInit.payload);
 
-                // Load the nested set via outer view.
                 const outerView = await outerSet.getView();
                 const nestedSet = await outerView.loadRObjectByHash(nestedHash) as RSet;
 
-                // Verify the initial elements are present in the nested set.
                 const nestedView = await nestedSet.getView();
                 assertTrue(await nestedView.has('alpha'), 'nested initialElements should include alpha');
                 assertTrue(await nestedView.has('beta'), 'nested initialElements should include beta');
 
-                // Sanity: outer still contains the nested set.
                 assertTrue(await outerView.hasByHash(nestedHash), 'outer set should contain the nested set with initials');
             }
         },
         {
             name: '[NES06] Initial elements survive history; barrier delete propagates to concurrent branch',
             invoke: async () => {
-                const objectMap = createTestObjectMap();
+                const ctx = createTestCtx();
 
-                // Outer set to hold nested RSet elements.
                 const outerSetInit = await RSet.create({
                     seed: 'outer-set-barrier-initials',
                     contentType: RSet.typeId,
@@ -616,11 +507,8 @@ export const nestedSetTests = {
                     supportBarrierDelete: true,
                 });
 
-                const outerSetId = await objectMap.addObject(outerSetInit);
-                const outerSet = (await objectMap.getObject(outerSetId)) as RSet;
+                const outerSet = (await ctx.createObject(outerSetInit)) as RSet;
 
-
-                // Nested RSet with initial elements.
                 const nestedInit = await RSet.create({
                     seed: 'nested-initial-barrier',
                     initialElements: ['root', 'remove-me', 'keep-me'],
@@ -635,42 +523,35 @@ export const nestedSetTests = {
 
                 const creationVersion = version(nestedSet.getId());
 
-                // Historical view at creation: all initial elements should be present.
                 const creationView = await nestedSet.getView(creationVersion);
                 assertTrue(await creationView.has('root'), 'creation view should see root');
                 assertTrue(await creationView.has('remove-me'), 'creation view should see remove-me');
                 assertTrue(await creationView.has('keep-me'), 'creation view should see keep-me');
 
-                // Apply a barrier delete to one of the initial elements.
                 await nestedSet.deleteWithBarrier('remove-me');
 
-                // Latest view should reflect barrier delete.
                 const latestView = await nestedSet.getView();
                 assertFalse(await latestView.has('remove-me'), 'latest view should not include remove-me after barrier delete');
                 assertTrue(await latestView.has('root'), 'latest view should include root');
                 assertTrue(await latestView.has('keep-me'), 'latest view should include keep-me');
 
-                // Concurrent branch from creationVersion without the barrier in its history.
                 const concurrentHash = await nestedSet.add('concurrent-add', creationVersion);
                 const concurrentVersion = version(concurrentHash);
                 const concurrentView = await nestedSet.getView(concurrentVersion);
 
-                // Barrier delete should still remove the element in the concurrent branch.
                 assertFalse(await concurrentView.has('remove-me'), 'concurrent branch should also lose remove-me due to barrier delete');
                 assertTrue(await concurrentView.has('root'), 'concurrent branch should still see root');
                 assertTrue(await concurrentView.has('keep-me'), 'concurrent branch should still see keep-me');
                 assertTrue(await concurrentView.has('concurrent-add'), 'concurrent branch should see its own addition');
 
-                // Sanity: outer still contains the nested set.
                 assertTrue(await outerView.hasByHash(nestedHash), 'outer set should contain the nested set');
             }
         },
         {
             name: '[NES07] Test three-level nested sets and deep element isolation',
             invoke: async () => {
-                const objectMap = createTestObjectMap();
+                const ctx = createTestCtx();
 
-                // Outer set that will contain a mid-level nested set.
                 const outerInit = await RSet.create({
                     seed: 'outer-set-three-level',
                     contentType: RSet.typeId,
@@ -680,11 +561,8 @@ export const nestedSetTests = {
                     supportBarrierDelete: true,
                 });
 
-                const outerId = await objectMap.addObject(outerInit);
-                const outerSet = (await objectMap.getObject(outerId)) as RSet;
+                const outerSet = (await ctx.createObject(outerInit)) as RSet;
 
-
-                // Mid-level nested set that will itself hold another nested set plus its own literals.
                 const midInit = await RSet.create({
                     seed: 'mid-set-three-level',
                     initialElements: [],
@@ -698,7 +576,6 @@ export const nestedSetTests = {
                 const outerView = await outerSet.getView();
                 const midSet = (await outerView.loadRObjectByHash(midHash)) as RSet;
 
-                // Innermost nested set under the mid-level set.
                 const innerInit = await RSet.create({
                     seed: 'inner-set-three-level',
                     initialElements: [],
@@ -711,7 +588,6 @@ export const nestedSetTests = {
                 const midView = await midSet.getView();
                 const innerSet = (await midView.loadRObjectByHash(innerHash)) as RSet;
 
-                // Operate on the innermost set.
                 await innerSet.add('leaf-alpha');
                 await innerSet.add('leaf-beta');
                 await innerSet.delete('leaf-beta');
@@ -722,17 +598,13 @@ export const nestedSetTests = {
                 assertFalse(await innerView.has('leaf-beta'), 'inner set should not contain deleted leaf-beta');
                 assertTrue(await innerView.has('leaf-gamma'), 'inner set should contain leaf-gamma');
 
-                // Mid-level set keeps reference to inner nested set and its own literals are independent.
                 assertTrue(await midView.hasByHash(innerHash), 'mid set should contain the inner nested set');
-                // midSet has contentType, so it should not expose inner elements as literals.
                 const midLatest = await midSet.getView();
                 assertTrue(await midLatest.hasByHash(innerHash), 'mid set latest view should still contain inner set');
 
-                // Outer set keeps reference to mid-level set and remains isolated from inner literals.
                 const outerLatest = await outerSet.getView();
                 assertTrue(await outerLatest.hasByHash(midHash), 'outer set should contain the mid-level nested set');
 
-                // Reload through the outer view to ensure persistence across levels.
                 const reloadedOuterView = await outerSet.getView();
                 const reloadedMid = (await reloadedOuterView.loadRObjectByHash(midHash)) as RSet;
                 const reloadedMidView = await reloadedMid.getView();
@@ -747,7 +619,7 @@ export const nestedSetTests = {
         {
             name: '[NES08] Regular deleteByHash removes a nested set while siblings remain',
             invoke: async () => {
-                const objectMap = createTestObjectMap();
+                const ctx = createTestCtx();
 
                 const outerSetInit = await RSet.create({
                     seed: 'outer-set-regular-delete',
@@ -758,8 +630,7 @@ export const nestedSetTests = {
                     supportBarrierDelete: true,
                 });
 
-                const outerSetId = await objectMap.addObject(outerSetInit);
-                const outerSet = (await objectMap.getObject(outerSetId)) as RSet;
+                const outerSet = (await ctx.createObject(outerSetInit)) as RSet;
 
                 const addNestedSet = async (seed: string) => {
                     const nestedInit = await RSet.create({
@@ -780,27 +651,22 @@ export const nestedSetTests = {
                 const { nestedHash: hashB, nested: setB } = await addNestedSet('nested-del-B');
                 const { nestedHash: hashC, nested: setC } = await addNestedSet('nested-del-C');
 
-                // Populate each nested set so they are non-trivial
                 await setA.add('a1');
                 await setB.add('b1');
                 await setC.add('c1');
 
-                // Verify all three are present before deletion
                 const viewBefore = await outerSet.getView();
                 assertTrue(await viewBefore.hasByHash(hashA), 'outer set should contain nested set A before delete');
                 assertTrue(await viewBefore.hasByHash(hashB), 'outer set should contain nested set B before delete');
                 assertTrue(await viewBefore.hasByHash(hashC), 'outer set should contain nested set C before delete');
 
-                // Regular delete of set B from the outer set
                 await outerSet.deleteByHash(hashB);
 
-                // B should be gone, A and C should remain
                 const viewAfter = await outerSet.getView();
                 assertTrue(await viewAfter.hasByHash(hashA), 'nested set A should survive deletion of B');
                 assertFalse(await viewAfter.hasByHash(hashB), 'nested set B should be removed after deleteByHash');
                 assertTrue(await viewAfter.hasByHash(hashC), 'nested set C should survive deletion of B');
 
-                // Surviving nested sets should still be functional
                 const reloadedA = await viewAfter.loadRObjectByHash(hashA) as RSet;
                 const reloadedAView = await reloadedA.getView();
                 assertTrue(await reloadedAView.has('a1'), 'nested set A should still contain its elements');

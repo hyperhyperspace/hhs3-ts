@@ -1,12 +1,14 @@
 {
   "name": "@hyper-hyper-space/hhs3_replica",
   "version": "0.1.0",
-  "description": "State materialization and time trvelling over a Merkle-DAG history log",
+  "description": "Replica orchestrator for Merkle-DAG based replicable objects",
   "type": "module",
   "source": "src/index.ts",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
+    "test": "node --import ../../register.mjs ./test/run_tests.ts",
+    "debug": "node --inspect-brk --import ../../register.mjs ./test/run_tests.ts",
     "build": "npx tsc",
     "clean": "rm -rf dist"
   },
@@ -14,9 +16,14 @@
   "license": "MIT",
   "dependencies": {
     "@hyper-hyper-space/hhs3_mvt": "^0.1.0",
-    "@hyper-hyper-space/hhs3_crypto": "^0.1.0"
+    "@hyper-hyper-space/hhs3_dag": "^0.1.0",
+    "@hyper-hyper-space/hhs3_mesh": "^0.1.0",
+    "@hyper-hyper-space/hhs3_sync": "^0.1.0",
+    "@hyper-hyper-space/hhs3_crypto": "^0.1.0",
+    "@hyper-hyper-space/hhs3_json": "^0.1.0"
   },
   "devDependencies": {
+    "@hyper-hyper-space/hhs3_util": "^0.1.0",
     "typescript": "^5.5.4",
     "ts-node": "^10.9.2",
     "@types/node": "^22.2.0"

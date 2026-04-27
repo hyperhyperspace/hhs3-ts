@@ -24,12 +24,11 @@
 // aware of this caveats.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { B64Hash, BasicCrypto, HASH_SHA256, sha256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash, HASH_SHA256, sha256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, MetaProps, position, EntryMetaFilter, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
 
-import { Payload, BasicProvider, RObject, RObjectFactory, RObjectTypeRegistry, RObjectInit, ObjectMap, RObjectConfig, version, Version, View } from "../mvt.js";
-import { DagCapability } from "../dag/dag_resource.js";
-import { DagScope, NestedScopedDag, ScopedDag, CausalDag } from "../dag/dag_nesting.js";
+import { Payload, RObject, RObjectFactory, RObjectInit, RContext, RObjectConfig, SyncableObject, NestingParent, version, Version, View } from "../mvt.js";
+import { DagScope, NestedScopedDag, RootScopedDag, ScopedDag, CausalDag } from "../dag/dag_nesting.js";
 import { set } from "@hyper-hyper-space/hhs3_util";
 
 import { RAddEvent, RDeleteEvent, RSetEvent } from "./rset/events.js";
@@ -41,28 +40,17 @@ import { updateElmtFormat, UpdateElmtPayload } from "./rset/payload.js";
 
 import { SetPayload } from "./rset/payload.js";
 
-export type RSetProvider = BasicProvider & DagCapability;
+export const rSetFactory: RObjectFactory = {
 
-type RSetResources = {
-    objectMap: ObjectMap;
-    config: RObjectConfig;
-    registry: RObjectTypeRegistry<any>;
-    getCrypto: () => BasicCrypto;
-    getScopedDag: (tag?: string) => Promise<ScopedDag>;
-    getCausalDag: (tag?: string) => Promise<CausalDag>;
-};
+    defaults: { backendLabel: 'default', meshLabel: 'default' },
 
-// RSet factory: initial creation and validation of set creation ops.
+    computeRootObjectId: async (payload: json.Literal, ctx: RContext, _parent?: NestingParent) => {
 
-export const rSetFactory: RObjectFactory<RSetProvider> = {
-
-    computeRootObjectId: async (payload: json.Literal, provider: RSetProvider) => {
-
-        const entry = dag.createEntry(payload, {}, position(), provider.getCrypto().hash(HASH_SHA256));
+        const entry = dag.createEntry(payload, {}, position(), ctx.getCrypto().hash(HASH_SHA256));
         return entry.hash;
     },
 
-    validateCreationPayload: async (payload: json.Literal, provider: RSetProvider) => {
+    validateCreationPayload: async (payload: json.Literal, _ctx: RContext, parent?: NestingParent) => {
         
         if (!json.checkFormat(createSetFormat, payload)) {
             console.log('fmt')
@@ -71,22 +59,24 @@ export const rSetFactory: RObjectFactory<RSetProvider> = {
         }
             
         const createPayload = payload as CreateSetPayload;
+
+        if (createPayload['parent'] !== undefined && parent !== undefined) {
+            if (createPayload['parent'] !== parent.getId()) {
+                return false;
+            }
+        }
         
-        // acceptUpdateForDeleted only makes sense if contentType is present
         if (createPayload['contentType'] === undefined && createPayload['acceptUpdateForDeleted'] !== undefined) {
             console.log('acceptUpdateForDeleted only makes sense if contentType is present')
             return false;
         }
 
-        // acceptRedundantAdd only makes sense if contentType is not present
-        // (otherwise, each add creates a new instance rooted in that place in the DAG)
         if (createPayload['contentType'] !== undefined && createPayload['acceptRedundantAdd'] !== undefined) {
             console.log('acceptRedundantAdd only makes sense if contentType is not present')
             return false;
         }
 
         if (createPayload['contentType'] !== undefined) {
-            // TODO: it'd be nice to check that we have a factory for this type.
             if (createPayload['initialElements'].length > 0) {
                 console.log('initialElements must be empty if contentType is present')
                 return false;
@@ -96,9 +86,7 @@ export const rSetFactory: RObjectFactory<RSetProvider> = {
         return true;
     },
 
-    executeCreationPayload: async (payload: json.Literal, provider: RSetProvider) => {
-
-        const scopedDag = await provider.getScopedDag();
+    executeCreationPayload: async (payload: json.Literal, _ctx: RContext, scopedDag: ScopedDag) => {
 
         const meta: MetaProps = {};
         const createPayload = payload as CreateSetPayload;
@@ -107,31 +95,42 @@ export const rSetFactory: RObjectFactory<RSetProvider> = {
             meta['elmts'] = json.toSet(await Promise.all(createPayload['initialElements'].map(async (e: json.Literal) => hashElement(e))));
         }
         
-        
         return await scopedDag.append(createPayload, meta, position());
     },
 
-    loadObject: async (id: B64Hash, provider: RSetProvider) => {
-        const scopedDag = await provider.getScopedDag();
+    loadObject: async (id: B64Hash, ctx: RContext, parent?: NestingParent) => {
+
+        let scopedDag: ScopedDag;
+
+        if (parent !== undefined) {
+            scopedDag = await parent.getScopedDagForChild(id);
+        } else {
+            const rawDag = await ctx.getDag(id);
+            scopedDag = new RootScopedDag(rawDag);
+        }
+
         const createOp = (await scopedDag.loadEntry(id))!.payload as CreateSetPayload;
-        return new RSet(id, createOp, provider);
+        return new RSet(id, createOp, ctx, parent);
     }
 
 }
 
 export type RSetOptions = {
     seed: string;
-    contentType?: string;  // <------------- | If present, literals in elements are treated 
-    initialElements: Array<json.Literal>; // | as creation ops for the given type
+    contentType?: string;
+    initialElements: Array<json.Literal>;
     acceptRedundantAdd?: boolean;
     acceptRedundantDelete?: boolean;
     acceptRedundantUpdate?: boolean;
     supportBarrierAdd?: boolean;
     supportBarrierDelete?: boolean;
     hashAlgorithm?: string;
+    parent?: B64Hash;
+    backendLabel?: string;
+    meshLabel?: string;
 }
 
-export class RSet<T extends json.Literal = json.Literal> implements RObject {
+export class RSet<T extends json.Literal = json.Literal> implements RObject, SyncableObject, NestingParent {
 
     static create = async (options: RSetOptions) => {
 
@@ -175,6 +174,18 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
             createPayload['acceptUpdateForDeleted'] = options.acceptRedundantUpdate || false;
         }
 
+        if (options.parent !== undefined) {
+            createPayload['parent'] = options.parent;
+        }
+
+        if (options.backendLabel !== undefined) {
+            createPayload['backendLabel'] = options.backendLabel;
+        }
+
+        if (options.meshLabel !== undefined) {
+            createPayload['meshLabel'] = options.meshLabel;
+        }
+
         return {type: RSet.typeId, payload: createPayload} as RObjectInit;
     }
 
@@ -182,22 +193,18 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
 
     createOpId: B64Hash;
     createOp: CreateSetPayload;
-    private resources: RSetResources;
+    private ctx: RContext;
+    private parentObj: NestingParent | undefined;
 
-    constructor(createOpId: B64Hash, createOp: CreateSetPayload, provider: RSetProvider) {
+    private _scopedDag: ScopedDag | undefined;
+    private _causalDag: CausalDag | undefined;
+
+    constructor(createOpId: B64Hash, createOp: CreateSetPayload, ctx: RContext, parent?: NestingParent) {
         this.createOpId = createOpId;
         this.createOp = createOp;
-        this.resources = {
-            objectMap: provider.getObjectMap(),
-            config: provider.getConfig(),
-            registry: provider.getRegistry(),
-            getCrypto: () => provider.getCrypto(),
-            getScopedDag: (tag?) => provider.getScopedDag(tag),
-            getCausalDag: (tag?) => provider.getCausalDag(tag),
-        };
+        this.ctx = ctx;
+        this.parentObj = parent;
     }
-
-    // RObject identity and type
 
     getId(): string {
         return this.createOpId;
@@ -210,7 +217,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
     // Set operations
 
     async add(element: T, at?: Version): Promise<B64Hash> {
-        const dag = await this.scopedDag();
+        const dag = await this.getScopedDag();
 
         at = at || await dag.getFrontier();
         const payload = await this.createAddPayload(element, false, at);
@@ -219,7 +226,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
     }
     
     async addWithBarrier(element: T, at?: Version): Promise<B64Hash> {
-        const dag = await this.scopedDag();
+        const dag = await this.getScopedDag();
 
         at = at || await dag.getFrontier();
         const payload = await this.createAddPayload(element, true, at);
@@ -260,7 +267,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
     }
 
     async deleteByHash(elementHash: B64Hash, at?: Version): Promise<B64Hash> {
-        const dag = await this.scopedDag();
+        const dag = await this.getScopedDag();
 
         at = at || await dag.getFrontier();
         const payload: DeleteElmtPayload = await this.createDeletePayload(elementHash, false, at);
@@ -274,7 +281,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
     }
 
     async deleteWithBarrierByHash(elementHash: B64Hash, at?: Version): Promise<B64Hash> {
-        const dag = await this.scopedDag();
+        const dag = await this.getScopedDag();
 
         at = at || await dag.getFrontier();
         const payload: DeleteElmtPayload = await this.createDeletePayload(elementHash, true, at);
@@ -412,10 +419,8 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
             const contentType = this.contentType();
 
             if (contentType !== undefined) {
-                const innerFactory = await this.resources.registry.lookup(contentType);
-                const scope = new ElementUpdateScope(this, updatePayload['elementHash'], position(updatePayload['elementHash']));
-                const innerProvider = this.createChildProvider(updatePayload['elementHash'], scope);
-                const innerRObject = await innerFactory.loadObject(updatePayload['elementHash'], innerProvider);
+                const innerFactory = await this.ctx.getRegistry().lookup(contentType);
+                const innerRObject = await this.loadChildObject(innerFactory, updatePayload['elementHash']);
                 if (!await innerRObject.validatePayload(updatePayload['updatePayload'], at)) {
                     return false;
                 }
@@ -430,10 +435,8 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
         const setPayload = payload as unknown as SetPayload;
         
         if (setPayload['action'] === 'update') {
-            const scope = new ElementUpdateScope(this, setPayload['elementHash'], position(setPayload['elementHash']));
-            const innerProvider = this.createChildProvider(setPayload['elementHash'], scope);
-            const innerFactory = await this.resources.registry.lookup(this.contentType()!);
-            const innerRObject = await innerFactory.loadObject(setPayload['elementHash'], innerProvider);
+            const innerFactory = await this.ctx.getRegistry().lookup(this.contentType()!);
+            const innerRObject = await this.loadChildObject(innerFactory, setPayload['elementHash']);
             return await innerRObject.applyPayload(setPayload['updatePayload'], at);
         } else {
             const meta: MetaProps = {};
@@ -443,16 +446,11 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
                     throw new Error("Create operation is not supposed to be applied _to_ a set");
                 case 'add':
                     if (this.contentType() !== undefined) {
-                        const dag = await this.scopedDag();
-
-                        const elementHash = await dag.computeEntryHash(setPayload, at)
-
-                        const scope = new ElementAddScope(this, elementHash, at, setPayload);
-                        const innerProvider = this.createChildProvider(elementHash, scope);
-                        const innerFactory = await this.resources.registry.lookup(this.contentType()!);
-                
-                        await innerFactory.executeCreationPayload(setPayload['element'], innerProvider);
-
+                        const scopedDag = await this.getScopedDag();
+                        const elementHash = await scopedDag.computeEntryHash(setPayload, at);
+                        const creationDag = await this.getCreationDagForChild(elementHash, at, setPayload);
+                        const innerFactory = await this.ctx.getRegistry().lookup(this.contentType()!);
+                        await innerFactory.executeCreationPayload(setPayload['element'], this.ctx, creationDag);
                         return elementHash;
 
                     } else {
@@ -467,9 +465,9 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
                     throw new Error("Invalid set action in payload: " + setPayload['action']);
             }
             
-            const dag = await this.scopedDag();
+            const scopedDag = await this.getScopedDag();
     
-            return await dag.append(payload, meta, at);
+            return await scopedDag.append(payload, meta, at);
         }
         
         
@@ -477,7 +475,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
 
     async getView(at?: Version, from?: Version): Promise<RSetView<T>> {
         
-        const dag = await this.scopedDag();
+        const dag = await this.getScopedDag();
 
         at = at || await dag.getFrontier();
         from = from || await dag.getFrontier();
@@ -486,8 +484,12 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
         return new RSetView<T>(this, at, from);
     }
 
-    getRegistry(): RObjectTypeRegistry<any> {
-        return this.resources.registry;
+    getContext(): RContext {
+        return this.ctx;
+    }
+
+    async loadChildObject(innerFactory: RObjectFactory, elementHash: B64Hash): Promise<RObject> {
+        return innerFactory.loadObject(elementHash, this.ctx, this);
     }
 
     seed(): string {
@@ -519,7 +521,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
     }
 
     selfValidate(): boolean {
-        return this.resources.config.selfValidate || false;
+        return this.ctx.getConfig().selfValidate || false;
     }
 
     subscribe(callback: (event: RAddEvent | RDeleteEvent) => void): void {
@@ -530,23 +532,63 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject {
         throw new Error("Method not implemented.");
     }
 
-    scopedDag(): Promise<ScopedDag> {
-        return this.resources.getScopedDag();
+    async getScopedDag(): Promise<ScopedDag> {
+        if (this._scopedDag === undefined) {
+            if (this.parentObj !== undefined) {
+                this._scopedDag = await this.parentObj.getScopedDagForChild(this.createOpId);
+            } else {
+                const backendLabel = this.createOp['backendLabel'] ?? rSetFactory.defaults?.backendLabel;
+                const rawDag = await this.ctx.getDag(this.createOpId, backendLabel);
+                this._scopedDag = new RootScopedDag(rawDag);
+            }
+        }
+        return this._scopedDag;
     }
 
-    causalDag(): Promise<CausalDag> {
-        return this.resources.getCausalDag();
+    async getCausalDag(): Promise<CausalDag> {
+        if (this._causalDag === undefined) {
+            if (this.parentObj !== undefined) {
+                this._causalDag = await this.parentObj.getCausalDag();
+            } else {
+                const backendLabel = this.createOp['backendLabel'] ?? rSetFactory.defaults?.backendLabel;
+                const rawDag = await this.ctx.getDag(this.createOpId, backendLabel);
+                this._causalDag = rawDag;
+            }
+        }
+        return this._causalDag;
     }
 
-    createChildProvider(elementHash: B64Hash, scope: DagScope): RSetProvider {
-        return {
-            getObjectMap: () => this.resources.objectMap,
-            getConfig: () => this.resources.config,
-            getRegistry: () => this.resources.registry,
-            getCrypto: () => this.resources.getCrypto(),
-            getScopedDag: async (tag?) => new NestedScopedDag(await this.resources.getScopedDag(tag), scope),
-            getCausalDag: (tag?) => this.resources.getCausalDag(tag),
-        };
+    // NestingParent interface
+
+    async getScopedDagForChild(childId: B64Hash): Promise<ScopedDag> {
+        const parentScopedDag = await this.getScopedDag();
+        const scope = new ElementUpdateScope(this, childId, position(childId));
+        return new NestedScopedDag(parentScopedDag, scope);
+    }
+
+    async getCreationDagForChild(childId: B64Hash, at: Version, addPayload: Payload): Promise<ScopedDag> {
+        const parentScopedDag = await this.getScopedDag();
+        const scope = new ElementAddScope(this, childId, at, addPayload as AddElmtPayload);
+        return new NestedScopedDag(parentScopedDag, scope);
+    }
+
+    // SyncableObject interface
+
+    async startSync(): Promise<void> {
+        if (this.parentObj !== undefined) return;
+        // Sync wiring is done by the concrete SyncableObject implementation at runtime.
+        // The actual createSwarm + createSyncSession logic will be wired here once
+        // the mesh/sync integration is complete.
+    }
+
+    async stopSync(): Promise<void> {
+        if (this.parentObj !== undefined) return;
+    }
+
+    async destroy(): Promise<void> {
+        await this.stopSync();
+        this._scopedDag = undefined;
+        this._causalDag = undefined;
     }
 }
 
@@ -597,7 +639,7 @@ export class RSetView<T  extends json.Literal> implements View {
 
         let barriers = version();
 
-        const dag = await this.target.scopedDag();
+        const dag = await this.target.getScopedDag();
 
         if (this.target.supportBarrierAdd() || this.target.supportBarrierDelete()) {
             barriers = await dag.findConcurrentCoverWithFilter(this.from, this.at, {containsValues: {barrier: ['t'], elmts: [elementHash]}});
@@ -621,7 +663,7 @@ export class RSetView<T  extends json.Literal> implements View {
         for (const hash of cover) {
             const payload = (await dag.loadEntry(hash))!.payload as unknown as SetPayload;
 
-            if (payload['action'] === 'add' || payload['action'] === 'create') { // create is included to handle the initial elements
+            if (payload['action'] === 'add' || payload['action'] === 'create') {
                 if (!this.target.supportBarrierDelete()) {
                     return true;
                 } else {
@@ -634,7 +676,7 @@ export class RSetView<T  extends json.Literal> implements View {
             if (deleteBarriers.size === 0) {
                 return true;
             } else {
-                const causalDag = await this.target.causalDag();
+                const causalDag = await this.target.getCausalDag();
                 const fork = await causalDag.findForkPosition(adds, deleteBarriers);
                 return fork.forkA.size > 0;
             }
@@ -649,11 +691,8 @@ export class RSetView<T  extends json.Literal> implements View {
             throw new Error("RSetView.getRObjectByHash is not supported when RSet has no contentType");
         }
         
-        const scope = new ElementUpdateScope(this.target, elementHash, position(elementHash));
-        const innerProvider = this.target.createChildProvider(elementHash, scope);
-        const innerFactory = await this.target.getRegistry().lookup(this.target.contentType()!);
-
-        return innerFactory.loadObject(elementHash, innerProvider);
+        const innerFactory = await this.target.getContext().getRegistry().lookup(this.target.contentType()!);
+        return innerFactory.loadObject(elementHash, this.target.getContext(), this.target);
     }
 }
 
