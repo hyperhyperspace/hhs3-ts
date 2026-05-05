@@ -31,6 +31,10 @@ import { Payload, RObject, RObjectFactory, RObjectInit, RContext, RObjectConfig,
 import { DagScope, NestedScopedDag, RootScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
 import { set } from "@hyper-hyper-space/hhs3_util";
 
+import type { Mesh, Swarm } from "@hyper-hyper-space/hhs3_mesh";
+import { createSyncSession } from "@hyper-hyper-space/hhs3_sync";
+import type { SyncSession, SyncTarget } from "@hyper-hyper-space/hhs3_sync";
+
 import { RAddEvent, RDeleteEvent, RSetEvent } from "./rset/events.js";
 
 import { createSetFormat, CreateSetPayload } from "./rset/payload.js";
@@ -41,8 +45,6 @@ import { updateElmtFormat, UpdateElmtPayload } from "./rset/payload.js";
 import { SetPayload } from "./rset/payload.js";
 
 export const rSetFactory: RObjectFactory = {
-
-    defaults: { backendLabel: 'default', meshLabel: 'default' },
 
     computeRootObjectId: async (payload: json.Literal, ctx: RContext, _parent?: NestingParent) => {
 
@@ -126,8 +128,11 @@ export type RSetOptions = {
     supportBarrierDelete?: boolean;
     hashAlgorithm?: string;
     parent?: B64Hash;
-    backendLabel?: string;
+}
+
+export type RSetRuntimeConfig = {
     meshLabel?: string;
+    backendLabel?: string;
 }
 
 export class RSet<T extends json.Literal = json.Literal> implements RObject, SyncableObject, NestingParent {
@@ -178,14 +183,6 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
             createPayload['parent'] = options.parent;
         }
 
-        if (options.backendLabel !== undefined) {
-            createPayload['backendLabel'] = options.backendLabel;
-        }
-
-        if (options.meshLabel !== undefined) {
-            createPayload['meshLabel'] = options.meshLabel;
-        }
-
         return {type: RSet.typeId, payload: createPayload} as RObjectInit;
     }
 
@@ -198,6 +195,9 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
 
     private _scopedDag: ScopedDag | undefined;
     private _causalDag: CausalDag | undefined;
+    private _swarm: Swarm | undefined;
+    private _syncSession: SyncSession | undefined;
+    private runtimeConfig: RSetRuntimeConfig = { meshLabel: 'default', backendLabel: 'default' };
 
     constructor(createOpId: B64Hash, createOp: CreateSetPayload, ctx: RContext, parent?: NestingParent) {
         this.createOpId = createOpId;
@@ -488,6 +488,12 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
         return this.ctx;
     }
 
+    configure(config: RSetRuntimeConfig): void {
+        this.runtimeConfig = { ...this.runtimeConfig, ...config };
+        this._scopedDag = undefined;
+        this._causalDag = undefined;
+    }
+
     async loadChildObject(innerFactory: RObjectFactory, elementHash: B64Hash): Promise<RObject> {
         return innerFactory.loadObject(elementHash, this.ctx, this);
     }
@@ -537,8 +543,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
             if (this.parentObj !== undefined) {
                 this._scopedDag = await this.parentObj.getScopedDagForChild(this.createOpId);
             } else {
-                const backendLabel = this.createOp['backendLabel'] ?? rSetFactory.defaults?.backendLabel;
-                const rawDag = await this.ctx.getDag(this.createOpId, backendLabel);
+                const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
                 this._scopedDag = new RootScopedDag(rawDag);
             }
         }
@@ -550,8 +555,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
             if (this.parentObj !== undefined) {
                 this._causalDag = await this.parentObj.getCausalDag();
             } else {
-                const backendLabel = this.createOp['backendLabel'] ?? rSetFactory.defaults?.backendLabel;
-                const rawDag = await this.ctx.getDag(this.createOpId, backendLabel);
+                const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
                 this._causalDag = rawDag;
             }
         }
@@ -576,13 +580,36 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
 
     async startSync(): Promise<void> {
         if (this.parentObj !== undefined) return;
-        // Sync wiring is done by the concrete SyncableObject implementation at runtime.
-        // The actual createSwarm + createSyncSession logic will be wired here once
-        // the mesh/sync integration is complete.
+        if (this._syncSession !== undefined) return;
+
+        const mesh = this.ctx.getMesh(this.runtimeConfig.meshLabel ?? 'default') as Mesh;
+        this._swarm = mesh.createSwarm(this.createOpId);
+
+        const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
+
+        const target: SyncTarget = {
+            dagId: this.createOpId,
+            dag: rawDag,
+            rObject: this,
+            hashSuite: this.ctx.getHashSuite(),
+        };
+
+        this._syncSession = createSyncSession(target, [this._swarm]);
+        this._swarm.activate();
     }
 
     async stopSync(): Promise<void> {
         if (this.parentObj !== undefined) return;
+
+        if (this._syncSession !== undefined) {
+            this._syncSession.destroy();
+            this._syncSession = undefined;
+        }
+
+        if (this._swarm !== undefined) {
+            this._swarm.destroy();
+            this._swarm = undefined;
+        }
     }
 
     async destroy(): Promise<void> {

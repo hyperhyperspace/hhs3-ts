@@ -38,7 +38,7 @@ export function createMockRContext(config: RObjectConfig = { selfValidate: true 
             throw new Error("MockRContext does not support getMesh");
         },
 
-        createObject: async (init: RObjectInit) => {
+        createObject: async (init: RObjectInit, _backendLabel?: string) => {
             const factory = await registry.lookup(init.type);
             const id = await factory.computeRootObjectId(init.payload, ctx, undefined);
 

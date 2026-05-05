@@ -14,15 +14,16 @@ export class MemDagBackend implements DagBackend {
         this.hash = hash;
     }
 
-    async createDag(id: B64Hash, meta: { type: string }): Promise<Dag> {
-        if (this.dags.has(id)) {
-            throw new Error(`DAG '${id}' already exists in this backend`);
+    async getOrCreateDag(id: B64Hash, meta: { type: string }): Promise<{ dag: Dag; created: boolean }> {
+        const existing = this.dags.get(id);
+        if (existing !== undefined) {
+            return { dag: existing, created: false };
         }
 
-        const d = this.makeDag();
-        this.dags.set(id, d);
+        const dag = this.makeDag();
+        this.dags.set(id, dag);
         this.entries.set(id, { id, type: meta.type, createdAt: ++this.counter });
-        return d;
+        return { dag, created: true };
     }
 
     async openDag(id: B64Hash): Promise<Dag> {

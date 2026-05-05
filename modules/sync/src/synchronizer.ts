@@ -23,6 +23,24 @@ const MAX_PAYLOAD_REQUESTS_PER_PEER = 2;
 const PAYLOAD_CHUNK_SIZE = 64;
 const REQUEST_TIMEOUT_MS = 30_000;
 
+/** Set `HHS3_SYNC_FRONTIER_LOG=1` to log new-frontier gossip (dag id + hash prefixes). */
+function frontierLogEnabled(): boolean {
+    try {
+        const proc = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process;
+        return proc?.env?.['HHS3_SYNC_FRONTIER_LOG'] === '1';
+    } catch {
+        return false;
+    }
+}
+
+function shortHash(h: B64Hash): string {
+    return h.length <= 16 ? h : `${h.slice(0, 12)}…`;
+}
+
+function frontierShort(frontier: Iterable<B64Hash>): string[] {
+    return [...frontier].map(shortHash);
+}
+
 type PeerHandle = {
     key: string;
     channel: TopicChannel;
@@ -122,6 +140,15 @@ export function createDagSynchronizer(
             dagId,
             frontier: [...frontier],
         };
+        if (frontierLogEnabled()) {
+            const peers = getPeers();
+            console.debug('[hhs3:sync:frontier] broadcast', {
+                dagId: shortHash(dagId),
+                frontier: frontierShort(frontier),
+                peerCount: peers.length,
+                peerKeys: peers.map(p => p.key),
+            });
+        }
         for (const peer of getPeers()) {
             sendTo(peer, msg);
         }
@@ -134,10 +161,25 @@ export function createDagSynchronizer(
             dagId,
             frontier: [...frontier],
         };
+        if (frontierLogEnabled()) {
+            console.debug('[hhs3:sync:frontier] push-back send', {
+                dagId: shortHash(dagId),
+                toPeer: peer.key,
+                frontier: frontierShort(frontier),
+            });
+        }
         sendTo(peer, msg);
     }
 
     async function handleNewFrontier(msg: NewFrontierMsg, peerKey: string) {
+        if (frontierLogEnabled()) {
+            console.debug('[hhs3:sync:frontier] recv', {
+                dagId: shortHash(msg.dagId),
+                fromPeer: peerKey,
+                remoteFrontier: frontierShort(msg.frontier),
+            });
+        }
+
         peerFrontiers.set(peerKey, new Set(msg.frontier));
 
         for (const h of msg.frontier) {
@@ -173,8 +215,25 @@ export function createDagSynchronizer(
         if (allRemoteKnown && !allMatch) {
             const peer = getPeers().find(p => p.key === peerKey);
             if (peer !== undefined) {
+                if (frontierLogEnabled()) {
+                    console.debug('[hhs3:sync:frontier] push-back trigger', {
+                        dagId: shortHash(dagId),
+                        toPeer: peerKey,
+                        localFrontier: frontierShort(localFrontier),
+                        remoteFrontier: frontierShort(remoteFrontier),
+                    });
+                }
                 sendFrontierTo(peer);
             }
+        } else if (frontierLogEnabled()) {
+            console.debug('[hhs3:sync:frontier] push-back skip', {
+                dagId: shortHash(dagId),
+                fromPeer: peerKey,
+                allRemoteKnown,
+                allMatch,
+                localFrontier: frontierShort(localFrontier),
+                remoteFrontier: frontierShort(remoteFrontier),
+            });
         }
     }
 
@@ -424,6 +483,15 @@ export function createDagSynchronizer(
             }
 
             state.receivedHashes.add(item.hash);
+
+            // If we already have this entry locally (e.g. common ancestor
+            // returned in a divergent-frontier response), do not queue it for
+            // payload fetch/validation again.
+            const localHeader = await dag.loadHeader(item.hash);
+            if (localHeader !== undefined) {
+                addToPeerDiscoveredFrontier(state.peer.key, item.hash);
+                continue;
+            }
 
             // Skip duplicates (another peer may have sent the same header)
             if (!discoveredHeaders.has(item.hash) && !readyToApply.has(item.hash)

@@ -5,6 +5,20 @@ This is HHS v3 **`replica`** module. It provides:
  - Local storage for application state
  - Secure state synchronization accross application instances (BFT)
  - Resolution of concurrent updates, following app-defined rules
+
+## Current usage
+
+In the current architecture, `Replica` acts as an object container and resource provider (`DagBackend`s and meshes). Typical usage is:
+
+1. Create a `Replica`.
+2. Attach backend(s) and mesh(es) by label.
+3. Register type factories.
+4. Call `createObject(init, backendLabel?)` for known root objects (idempotent).
+5. Configure runtime sync labels in the returned object (for example, `RSet.configure(...)`).
+6. Start/stop synchronization directly on objects (`obj.startSync()` / `obj.stopSync()`).
+7. Call `replica.close()` on shutdown for best-effort teardown.
+
+`DagBackend` implementations expose `getOrCreateDag(id, meta) -> { dag, created }`, letting `Replica` execute creation payloads only when a DAG is newly created.
  
 ## Data model
 
@@ -73,13 +87,13 @@ Finally, the operational model with barriers + scoped views generalizes well whe
 
 #### Implementation
 
-The core MVT interfaces, DAG-based nesting mechanism, and concrete type implementations live in the **`mvt`** module [[local]](../mvt) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/mvt). The **`dag`** module [[local]](../dag) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/dag) provides the fundamental algorithms (see `findForkPosition`, `findMinimalCover`, `findCoverWithFilter` and `findConcurrentCoverWithFilter`) to support MVTs that work by finding filtered minimal covers over the DAG.
+The core MVT interfaces and DAG-based nesting mechanism live in the **`mvt`** module [[local]](../mvt) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/mvt). The **`dag`** module [[local]](../dag) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/dag) provides the fundamental algorithms (see `findForkPosition`, `findMinimalCover`, `findCoverWithFilter` and `findConcurrentCoverWithFilter`) to support MVTs that work by finding filtered minimal covers over the DAG.
 
-As an example, a Monotone View Replicated Set is provided in the **`mvt`** module [[local]](../mvt/src/types/rset.ts) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/mvt/src/types/rset.ts). It supports both plain and barrier additions and deletions, showcasing how non-monotonic behavior can be transformed through the scoped view mechanism.
+As an example, a Monotone View Replicated Set is provided in the **`std_types`** module [[local]](../std_types/src/types/rset.ts) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/std_types/src/types/rset.ts). It supports both plain and barrier additions and deletions, showcasing how non-monotonic behavior can be transformed through the scoped view mechanism.
 
 #### Nesting
 
-Nesting at the DAG level is supported for MVTs. Operations for the inner instance are wrapped and inserted into the outer instance's DAG. The Monotone View Replicated Set was extended to support nesting (sets of sets of aribtrary depth). See the **`mvt`** module [[local]](../mvt) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/mvt) for details.
+Nesting at the DAG level is supported for MVTs. Operations for the inner instance are wrapped and inserted into the outer instance's DAG. The Monotone View Replicated Set was extended to support nesting (sets of sets of aribtrary depth). See the **`mvt`** module [[local]](../mvt) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/mvt) and the **`std_types`** implementation [[local]](../std_types/src/types/rset.ts) for details.
 
 ### Composability: SOaD Architecture
 
@@ -102,9 +116,11 @@ It's interesting to notice how in traditional systems observation is _implicit_ 
 
  - Monotone View Type support: **Completed**
  - SOaD Architecture: **In progress**
- - Porting Synchronizer from v2: **Pending**
+ - Synchronization wiring with runtime object configuration: **In progress**
 
 ## Testing
 
-Tests for the Monotone View Replicable Set (barrier add/delete, nesting) now live in the **`mvt`** module [[local]](../mvt) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/mvt). See its README for details on running them. 
+Replica behavior tests live in the **`replica`** module [[local]](./test) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/replica/test).
+
+Monotone View Replicable Set tests (barrier add/delete, nesting) live in the **`std_types`** module [[local]](../std_types/test) [[github]](https://github.com/hyperhyperspace/hhs3-ts/tree/main/modules/std_types/test). See each module's README for details on running them.
  

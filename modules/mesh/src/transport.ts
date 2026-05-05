@@ -6,6 +6,8 @@ export type NetworkAddress = string;
 
 export interface Transport {
     readonly open: boolean;
+    readonly localAddress?: NetworkAddress;
+    readonly remoteAddress?: NetworkAddress;
     send(message: Uint8Array): void;
     close(): void;
     onMessage(callback: (message: Uint8Array) => void): void;
@@ -15,6 +17,6 @@ export interface Transport {
 export interface TransportProvider {
     readonly scheme: string;
     listen(address: NetworkAddress, onConnection: (transport: Transport) => void): Promise<void>;
-    connect(remote: NetworkAddress): Promise<Transport>;
+    connect(remote: NetworkAddress, local?: NetworkAddress): Promise<Transport>;
     close(): void;
 }

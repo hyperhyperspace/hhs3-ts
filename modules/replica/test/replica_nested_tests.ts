@@ -183,14 +183,10 @@ export const replicaNestedTests = {
                 const innerSet = (await view.loadRObjectByHash(innerHash)) as RSet;
                 await innerSet.add('persisted');
 
-                const outerId = outerSet.getId();
-
                 const r2 = new Replica({ crypto, hashSuite, config: { selfValidate: true } });
                 r2.attachBackend('default', backend);
                 r2.registerType(RSet.typeId, rSetFactory);
-                await r2.start();
-
-                const restoredOuter = (await r2.getObject(outerId)) as RSet;
+                const restoredOuter = (await r2.createObject(outerInit)) as RSet;
                 assertTrue(restoredOuter !== undefined, 'outer should be restored');
 
                 const restoredOuterView = await restoredOuter.getView();

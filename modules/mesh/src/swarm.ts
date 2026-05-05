@@ -211,7 +211,10 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
             if (provider === undefined) continue;
 
             try {
-                const transport = await provider.connect(addr);
+                const localAddr = localPeer?.addresses.find(
+                    a => a.startsWith(provider.scheme + '://')
+                );
+                const transport = await provider.connect(addr, localAddr);
                 const channel   = await authenticator.authenticate(
                     transport, 'initiator', peerInfo.keyId
                 );

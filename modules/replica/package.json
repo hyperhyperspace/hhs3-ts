@@ -10,7 +10,7 @@
     "test": "node --import ../../register.mjs ./test/run_tests.ts",
     "debug": "node --inspect-brk --import ../../register.mjs ./test/run_tests.ts",
     "build": "npx tsc",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist test-build"
   },
   "author": "Santiago Bazerque",
   "license": "MIT",

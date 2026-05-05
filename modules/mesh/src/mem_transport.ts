@@ -1,13 +1,20 @@
 // In-memory transport for testing. Creates paired channels that deliver
 // messages synchronously within the same process. No network dependencies.
 
-import type { Transport, TransportProvider, NetworkAddress } from '../src/transport.js';
+import type { Transport, TransportProvider, NetworkAddress } from './transport.js';
 
 export class MemTransport implements Transport {
     private _open = true;
     private messageCallbacks: ((msg: Uint8Array) => void)[] = [];
     private closeCallbacks: (() => void)[] = [];
     peer?: MemTransport;
+    readonly localAddress?: NetworkAddress;
+    readonly remoteAddress?: NetworkAddress;
+
+    constructor(localAddress?: NetworkAddress, remoteAddress?: NetworkAddress) {
+        this.localAddress = localAddress;
+        this.remoteAddress = remoteAddress;
+    }
 
     get open(): boolean { return this._open; }
 
@@ -36,9 +43,12 @@ export class MemTransport implements Transport {
     }
 }
 
-export function createMemTransportPair(): [MemTransport, MemTransport] {
-    const a = new MemTransport();
-    const b = new MemTransport();
+export function createMemTransportPair(
+    clientLocal?: NetworkAddress,
+    serverLocal?: NetworkAddress,
+): [MemTransport, MemTransport] {
+    const a = new MemTransport(clientLocal, serverLocal);
+    const b = new MemTransport(serverLocal, clientLocal);
     a.peer = b;
     b.peer = a;
     return [a, b];
@@ -52,10 +62,10 @@ export class MemTransportProvider implements TransportProvider {
         this.listeners.set(address, onConnection);
     }
 
-    async connect(remote: NetworkAddress): Promise<Transport> {
+    async connect(remote: NetworkAddress, local?: NetworkAddress): Promise<Transport> {
         const listener = this.listeners.get(remote);
         if (!listener) throw new Error(`no listener at ${remote}`);
-        const [client, server] = createMemTransportPair();
+        const [client, server] = createMemTransportPair(local, remote);
         listener(server);
         return client;
     }

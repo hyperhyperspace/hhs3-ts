@@ -158,7 +158,7 @@ export class Mesh {
         }
     }
 
-    private async handleIncoming(transport: Transport, endpoint: NetworkAddress): Promise<void> {
+    private async handleIncoming(transport: Transport, localListenAddress: NetworkAddress): Promise<void> {
         if (this.closed) { transport.close(); return; }
 
         const channel = await this.config.authenticator.authenticate(transport, 'responder');
@@ -184,7 +184,8 @@ export class Mesh {
         }
 
         channel.send(encodeControlTopicAccept(ctrl.topic));
-        this.pool.add(channel, endpoint);
+        const remoteEndpoint = transport.remoteAddress ?? localListenAddress;
+        this.pool.add(channel, remoteEndpoint);
     }
 
     // --- control messages on established connections (for pool reuse) ---

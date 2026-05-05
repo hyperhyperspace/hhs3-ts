@@ -16,3 +16,4 @@ export { NoiseAuthenticatorConfig, createNoiseAuthenticator } from './noise_auth
 export { StaticDiscovery } from './static_discovery.js';
 export { DiscoveryLayer, DiscoveryStack } from './discovery_stack.js';
 export { PoolReuseDiscovery } from './pool_reuse_discovery.js';
+export { MemTransport, MemTransportProvider, createMemTransportPair } from './mem_transport.js';

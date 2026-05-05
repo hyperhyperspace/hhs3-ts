@@ -12,7 +12,7 @@ import {
     KEM_X25519_HKDF_ML_KEM_768,
 } from '@hyper-hyper-space/hhs3_crypto';
 
-import { createMemTransportPair, MemTransportProvider } from './mem_transport.js';
+import { createMemTransportPair, MemTransportProvider } from '../src/mem_transport.js';
 import { ConnectionPool, connectionKey } from '../src/connection_pool.js';
 import type { AuthenticatedChannel } from '../src/authenticator.js';
 import type { PeerDiscovery, PeerInfo } from '../src/discovery.js';

@@ -67,7 +67,7 @@ export const replicaBasicTests = {
             },
         },
         {
-            name: '[REP03] createObject after restart restores from manifest',
+            name: '[REP03] createObject after restart reuses existing DAG',
             invoke: async () => {
                 const backend = new MemDagBackend(hashSuite);
 
@@ -89,10 +89,9 @@ export const replicaBasicTests = {
                 const replica2 = new Replica({ crypto, hashSuite, config: { selfValidate: true } });
                 replica2.attachBackend('default', backend);
                 replica2.registerType(RSet.typeId, rSetFactory);
-                await replica2.start();
-
-                const set2 = (await replica2.getObject(id)) as RSet;
-                assertTrue(set2 !== undefined, 'object should be reconstituted after start');
+                const set2 = (await replica2.createObject(init)) as RSet;
+                assertTrue(set2 !== undefined, 'object should be restored by idempotent createObject');
+                assertTrue(set2.getId() === id, 'restored object should have same id');
 
                 const view = await set2.getView();
                 assertTrue(await view.has('alpha'), 'restored set should have initial element');
@@ -149,7 +148,7 @@ export const replicaBasicTests = {
             },
         },
         {
-            name: '[REP07] start() loads roots in createdAt order',
+            name: '[REP07] createObject on fresh replica loads existing roots',
             invoke: async () => {
                 const backend = new MemDagBackend(hashSuite);
 
@@ -168,11 +167,14 @@ export const replicaBasicTests = {
                 const replica2 = new Replica({ crypto, hashSuite, config: { selfValidate: true } });
                 replica2.attachBackend('default', backend);
                 replica2.registerType(RSet.typeId, rSetFactory);
-                await replica2.start();
 
-                assertTrue((await replica2.getObject(setA.getId())) !== undefined, 'set A should be loaded');
-                assertTrue((await replica2.getObject(setB.getId())) !== undefined, 'set B should be loaded');
-                assertTrue((await replica2.getObject(setC.getId())) !== undefined, 'set C should be loaded');
+                const restoredA = await replica2.createObject(initA);
+                const restoredB = await replica2.createObject(initB);
+                const restoredC = await replica2.createObject(initC);
+
+                assertTrue(restoredA.getId() === setA.getId(), 'set A should be restored');
+                assertTrue(restoredB.getId() === setB.getId(), 'set B should be restored');
+                assertTrue(restoredC.getId() === setC.getId(), 'set C should be restored');
             },
         },
         {

@@ -1,6 +1,7 @@
 import { replicaBasicTests } from "./replica_basic_tests.js";
 import { replicaNestedTests } from "./replica_nested_tests.js";
 import { replicaSyncTests } from "./replica_sync_tests.js";
+import { replicaFullSyncTests } from "./replica_full_sync_tests.js";
 import { testing } from "@hyper-hyper-space/hhs3_util";
 
 async function main() {
@@ -12,6 +13,7 @@ async function main() {
     allTests.set(replicaBasicTests.title, replicaBasicTests.tests);
     allTests.set(replicaNestedTests.title, replicaNestedTests.tests);
     allTests.set(replicaSyncTests.title, replicaSyncTests.tests);
+    allTests.set(replicaFullSyncTests.title, replicaFullSyncTests.tests);
 
     console.log('Running tests for Hyper Hyper Space v3 Replica module' + (filters.length > 0? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');    
 

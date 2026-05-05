@@ -58,12 +58,10 @@ export type RContext = {
     getDag(id: B64Hash, backendLabel?: string): Promise<Dag>;
     getMesh(label: string): any;
 
-    createObject(init: RObjectInit): Promise<RObject>;
+    createObject(init: RObjectInit, backendLabel?: string): Promise<RObject>;
 };
 
 export type RObjectFactory = {
-    defaults?: { backendLabel?: string; meshLabel?: string };
-
     computeRootObjectId: (createPayload: Payload, ctx: RContext, parent?: NestingParent) => Promise<B64Hash>;
     
     validateCreationPayload: (createPayload: Payload, ctx: RContext, parent?: NestingParent) => Promise<boolean>;
