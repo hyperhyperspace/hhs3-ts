@@ -91,7 +91,7 @@ export function checkFormat(format: Format, literal: Literal): boolean {
                         throw new Error('Invalid format (expected 3 elements): ' + JSON.stringify(format));
                     } else if (typeof(format[1]) !== 'number' || typeof(format[2]) !== 'number') {
                         throw new Error('Invalid format (expected number for float bounds in positions 1 and 2): ' + JSON.stringify(format));
-                    } else if (typeof(literal) !== 'number') {
+                    } else if (typeof(literal) !== 'number' || !Number.isFinite(literal)) {
                         return false;
                     } else {
                         return literal >= format[1] && literal <= format[2];
@@ -213,7 +213,7 @@ export function checkFormat(format: Format, literal: Literal): boolean {
             if (typeof(literal) !== 'number') {
                 return false;
             } else {
-                return true;
+                return Number.isFinite(literal);
             }
         } else if (format === Type.Boolean) {
             return typeof(literal) === 'boolean';

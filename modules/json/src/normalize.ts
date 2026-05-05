@@ -27,11 +27,13 @@ function toStringNormalized(literal: Literal): string {
         plain = plain + (arr? ']' : '}');
     } else if (typeof literal === 'string') {
         plain = escapeString(literal);
-    } else if (typeof literal === 'boolean' || typeof literal === 'number') {
+    } else if (typeof literal === 'boolean') {
         plain = literal.toString();
-        // important notice: because of how the javascript number type works, we are sure that
-        //                   integer numbers always get serialized without a fractional part
-        //                   (e.g. '1.0' cannot happen)
+    } else if (typeof literal === 'number') {
+        if (!Number.isFinite(literal)) {
+            throw new Error('Cannot serialize ' + literal + ': NaN and Infinity are not valid Literals.');
+        }
+        plain = Object.is(literal, -0) ? '0' : literal.toString();
     } else {
         throw new Error('Cannot serialize ' + literal + ', its type ' + (typeof literal) + ' is illegal for a literal.');
     }
