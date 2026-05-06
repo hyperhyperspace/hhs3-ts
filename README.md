@@ -28,6 +28,7 @@ This monorepo is organized as a collection of modules. This is of course WIP.
 - [`modules/dag_sql`](modules/dag_sql) SQL-backed storage for DAG entries and indices, using an abstract SQL connection interface
 - [`modules/dag_sqlite`](modules/dag_sqlite) SQLite bindings for the SQL DAG storage layer
 - [`modules/dag_test`](modules/dag_test) Shared test suites (backend parity, DAG creation helpers) reusable across DAG storage backends
+- [`modules/std_types`](modules/std_types) Standard replicable types (RSet for now) built on the MVT framework
 
 **Synchronization**
 
