@@ -7,7 +7,7 @@ SQL-backed persistent storage for the **`dag`** module. Implements `DagStore` an
 The module is split into a database-agnostic layer (this module) and concrete bindings:
 
 - **`dag_sql`** — Schema management, `SqlDagStore`, `SqlTopoIndexStore`, `SqlLevelIndexStore`. Depends only on the `SqlConnection` interface.
-- **`dag_sqlite`** [[local]](../dag_sqlite) — Provides a `SqlConnection` implementation backed by native SQLite.
+- [**dag_sqlite**](../dag_sqlite) — Provides a `SqlConnection` implementation backed by native SQLite.
 
 This separation allows the same SQL storage logic to be reused with other databases (e.g. PostgreSQL, MySQL) by implementing `SqlConnection`.
 

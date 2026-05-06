@@ -1,5 +1,7 @@
 # mesh_tracker
 
+For the protocol specification, see [SPECS.md](./SPECS.md).
+
 Tracker server for HHSv3 mesh peer discovery. Accepts authenticated connections from `mesh_tracker_client` peers, maintains an in-memory registry of topic-to-peer mappings with TTL-based expiry, and responds to ANNOUNCE / QUERY / LEAVE requests.
 
 ## Identity management

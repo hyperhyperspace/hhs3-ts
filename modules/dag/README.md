@@ -1,5 +1,7 @@
 # DAG
 
+For the data format specification, see [SPECS.md](./SPECS.md).
+
 A module for using an append-only DAG as a hash-linked history log. The DAG supports indexing to provide fast analysis of forks / merges and minimal cover finding.
 
 The module uses two storage interfaces: one for the DAG entries, and another for storing the index. Three indexing algorithms are supported: flat (naive, used as a testing baseline), a topological index (a simple, well known algorithm), and a new multi-level indexing algorithm (faster, scales logarithmically over long branches by using progressively smaller projections of the DAG for the search).
@@ -105,8 +107,8 @@ Fork positions have 4 fields:
 
 This module includes only in-memory storage. Persistent backends are provided by companion modules:
 
-- **`dag_sql`** [[local]](../dag_sql) — Implements `DagStore` and index stores over an abstract SQL connection interface, suitable for any SQL database.
-- **`dag_sqlite`** [[local]](../dag_sqlite) — Provides a concrete SQLite connection for `dag_sql`, using native SQLite bindings.
+- [**dag_sql**](../dag_sql) — Implements `DagStore` and index stores over an abstract SQL connection interface, suitable for any SQL database.
+- [**dag_sqlite**](../dag_sqlite) — Provides a concrete SQLite connection for `dag_sql`, using native SQLite bindings.
 
 ## Performance
 
@@ -141,7 +143,7 @@ in `modules/dag`.
 
 ## Testing
 
-We do deterministic testing over families of pseudo-randomly generated DAGs of different sizes. The **`dag_test`** module [[local]](../dag_test) provides shared test suites (backend parity, DAG creation helpers) reusable across storage backends.
+We do deterministic testing over families of pseudo-randomly generated DAGs of different sizes. The [**dag_test** module](../dag_test) provides shared test suites (backend parity, DAG creation helpers) reusable across storage backends.
 
 To run the test suite, first build the workspace and then do:
 

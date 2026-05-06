@@ -1,5 +1,7 @@
 # Mesh
 
+For the protocol specification, see [SPECS.md](./SPECS.md).
+
 Peer-to-peer networking for the HHS v3 sync engine. This module handles peer discovery, authenticated connection establishment, connection pooling with topic-based multiplexing, swarm management, incoming connection handling with topic negotiation, and per-swarm authorization. It defines transport-agnostic interfaces; concrete transport implementations (WebSocket, WebRTC, etc.) live in separate modules.
 
 ## Architecture

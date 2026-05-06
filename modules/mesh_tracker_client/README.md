@@ -1,5 +1,7 @@
 # mesh_tracker_client
 
+For the protocol specification, see [SPECS.md](./SPECS.md).
+
 Tracker-based peer discovery client for HHSv3. Implements the `PeerDiscovery` interface from the `mesh` module by connecting to a remote tracker server over an authenticated Transport channel (Noise handshake).
 
 ## Protocol
