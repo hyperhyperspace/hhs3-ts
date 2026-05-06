@@ -13,8 +13,8 @@ This new version has two main goals:
  - **A new data model**. We've developed a new formalism for coordination-free replication, **Monotone View Types**, in which observations are monotonic but explicitly version-scoped, allowing historical views to be refined as additional information becomes available. MVTs are a powerful _monotonic transformation_ mechanism, that helps application developers create coordination-free approximations for applications in any domain. Learn more in the [**mvt** module](modules/mvt).
 
 ### Current status
- 
- We're completing the data modeling layer in the **`mvt`** and **`replica`** modules. While the implementation of **Monotone View Types** is complete, we're working on a concurrency model for **Monotone View Type** composition, based on the idea of **State-Observation-as-Data** (SOaD). The networking layer (**`mesh`**) now provides peer discovery, authenticated key exchange (with post-quantum options), connection pooling with topic multiplexing, swarm management, incoming connection handling with topic negotiation, and per-swarm authorization. Once the synchronizer is ported, it will bridge **`replica`** and **`mesh`** to enable live state sync. After that, adapters and tooling for using the synchronizer with existing information systems (mostly RDBMs) will be developed. Please see the **`mvt`** module and the [roadmap](https://www.hyperhyperspace.org/work-plan-2025.html) for details.
+
+The core sync engine is complete: the **`mvt`** (Monotone View Types), **`replica`**, **`sync`** (synchronizer), and **`mesh`** (networking) layers are all implemented and working together to enable live peer-to-peer state synchronization. A formal [protocol specification](modules/replica/SPECS.md) covers the full architecture — from authenticated mesh channels through DAG exchange to type-level validation. Standard replicable types (starting with RSet) are available in the **`std_types`** module. We're now developing **`rdb_adapter`**, which keeps a local relational database in sync with an HHS replica, enabling integration with existing information systems. Please see the individual module specs and the [roadmap](https://www.hyperhyperspace.org/work-plan-2025.html) for details.
 
 ### Organization
 
@@ -31,7 +31,7 @@ This monorepo is organized as a collection of modules. This is of course WIP.
 
 **Synchronization**
 
-- [`modules/sync`](modules/sync) Synchronizer for the replica module, using the mesh *(planned)*
+- [`modules/sync`](modules/sync) Synchronizer for the replica module, using the mesh
 
 **Networking**
 
