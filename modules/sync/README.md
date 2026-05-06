@@ -19,8 +19,8 @@ This means there is no client/server distinction. When two peers connect on a to
              SyncSession (per DAG)
             ┌──────┬──────────┐
             │      │          │
-      DagProvider   │   DagSynchronizer
-      (serves)     │   (fetches)
+      DagProvider  │   DagSynchronizer
+      (serves)     │    (fetches)
             │      │          │
             └──────┴──────────┘
                    │
