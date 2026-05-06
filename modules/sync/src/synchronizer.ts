@@ -104,6 +104,9 @@ export function createDagSynchronizer(
     const pendingHeaderRequests  = new Map<string, HeaderRequestState>();
     const pendingPayloadRequests = new Map<string, PayloadRequestState>();
 
+    const lastSentFrontier = new Map<string, { frontier: Set<B64Hash>, timestamp: number }>();
+    const PUSHBACK_INTERVAL_MS = 15_000;
+
     const issueCallbacks: Array<(peerKey: string, issue: PeerIssue) => void> = [];
 
     function reportIssue(peerKey: string, issue: PeerIssue) {
@@ -149,8 +152,10 @@ export function createDagSynchronizer(
                 peerKeys: peers.map(p => p.key),
             });
         }
+        const now = Date.now();
         for (const peer of getPeers()) {
             sendTo(peer, msg);
+            lastSentFrontier.set(peer.key, { frontier: new Set(frontier), timestamp: now });
         }
     }
 
@@ -169,6 +174,7 @@ export function createDagSynchronizer(
             });
         }
         sendTo(peer, msg);
+        lastSentFrontier.set(peer.key, { frontier: new Set(frontier), timestamp: Date.now() });
     }
 
     async function handleNewFrontier(msg: NewFrontierMsg, peerKey: string) {
@@ -190,51 +196,55 @@ export function createDagSynchronizer(
 
         await attemptWork();
 
-        // Push-back: if the peer's frontier is entirely known to us (i.e. the
-        // peer appears to be behind), send our own frontier back so it can
-        // discover it is behind and start fetching. Skip when the frontiers are
-        // identical to avoid a ping-pong loop.
+        // Push-back: send our frontier so the peer can discover it is behind
+        // (or in a fork). Suppress if frontiers are identical, or if we already
+        // sent the same frontier to this peer recently (within PUSHBACK_INTERVAL_MS).
         const localFrontier = await dag.getFrontier();
         const remoteFrontier = new Set(msg.frontier);
 
-        const sameSize = localFrontier.size === remoteFrontier.size;
-        let allRemoteKnown = true;
-        let allMatch = sameSize;
-
-        for (const h of remoteFrontier) {
-            if (!localFrontier.has(h)) {
-                const local = await dag.loadEntry(h);
-                if (local === undefined) {
-                    allRemoteKnown = false;
-                    break;
-                }
-                allMatch = false;
+        if (frontiersEqual(localFrontier, remoteFrontier)) {
+            if (frontierLogEnabled()) {
+                console.debug('[hhs3:sync:frontier] push-back skip (identical)', {
+                    dagId: shortHash(dagId),
+                    fromPeer: peerKey,
+                });
             }
+            return;
         }
 
-        if (allRemoteKnown && !allMatch) {
-            const peer = getPeers().find(p => p.key === peerKey);
-            if (peer !== undefined) {
-                if (frontierLogEnabled()) {
-                    console.debug('[hhs3:sync:frontier] push-back trigger', {
-                        dagId: shortHash(dagId),
-                        toPeer: peerKey,
-                        localFrontier: frontierShort(localFrontier),
-                        remoteFrontier: frontierShort(remoteFrontier),
-                    });
-                }
-                sendFrontierTo(peer);
+        const prev = lastSentFrontier.get(peerKey);
+        if (prev !== undefined
+            && frontiersEqual(prev.frontier, localFrontier)
+            && Date.now() - prev.timestamp < PUSHBACK_INTERVAL_MS) {
+            if (frontierLogEnabled()) {
+                console.debug('[hhs3:sync:frontier] push-back skip (rate-limited)', {
+                    dagId: shortHash(dagId),
+                    fromPeer: peerKey,
+                });
             }
-        } else if (frontierLogEnabled()) {
-            console.debug('[hhs3:sync:frontier] push-back skip', {
-                dagId: shortHash(dagId),
-                fromPeer: peerKey,
-                allRemoteKnown,
-                allMatch,
-                localFrontier: frontierShort(localFrontier),
-                remoteFrontier: frontierShort(remoteFrontier),
-            });
+            return;
         }
+
+        const peer = getPeers().find(p => p.key === peerKey);
+        if (peer !== undefined) {
+            if (frontierLogEnabled()) {
+                console.debug('[hhs3:sync:frontier] push-back trigger', {
+                    dagId: shortHash(dagId),
+                    toPeer: peerKey,
+                    localFrontier: frontierShort(localFrontier),
+                    remoteFrontier: frontierShort(remoteFrontier),
+                });
+            }
+            sendFrontierTo(peer);
+        }
+    }
+
+    function frontiersEqual(a: Set<B64Hash>, b: Set<B64Hash>): boolean {
+        if (a.size !== b.size) return false;
+        for (const h of a) {
+            if (!b.has(h)) return false;
+        }
+        return true;
     }
 
     function addToPeerDiscoveredFrontier(peerKey: string, hash: B64Hash) {
@@ -981,6 +991,7 @@ export function createDagSynchronizer(
     function removePeer(peerKey: string) {
         peerFrontiers.delete(peerKey);
         peerDiscoveredFrontier.delete(peerKey);
+        lastSentFrontier.delete(peerKey);
 
         for (const [rid, state] of pendingHeaderRequests) {
             if (state.peer.key === peerKey) {
