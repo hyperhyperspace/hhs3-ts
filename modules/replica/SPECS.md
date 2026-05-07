@@ -1,11 +1,11 @@
-# HHS v3 Protocol Specification (Master)
+# HHS v3 Protocol Overview Specification
 
 Status: Initial Version v0.1
 
 ## 1. Purpose and Scope
 
-Master specification for the HHS v3 replication protocols. Describes the
-protocol layers, how they compose, and what each one requires for
+Protocol overview specification for the HHS v3 replication protocols. Describes
+the protocol layers, how they compose, and what each one requires for
 interoperability. Low-level protocol details live in module-level
 specifications, referenced from Section 4.
 
@@ -175,34 +175,32 @@ by Sync (for validation). Discovery feeds Mesh with peer addresses.
 
 ## 4. Module Specifications
 
-- [`dag`](https://github.com/hyperhyperspace/hhs3-ts/blob/main/modules/dag/SPECS.md) —
-  canonical JSON, entry format, hash derivation, positions and frontiers.
-- [`sync`](https://github.com/hyperhyperspace/hhs3-ts/blob/main/modules/sync/SPECS.md) —
-  frontier gossip, header/payload fetch, serving algorithm, validation pipeline.
-- [`mesh`](https://github.com/hyperhyperspace/hhs3-ts/blob/main/modules/mesh/SPECS.md) —
-  authenticated handshake, encrypted channel, mux wire format, topic negotiation.
-- [`mesh_tracker_client`](https://github.com/hyperhyperspace/hhs3-ts/blob/main/modules/mesh_tracker_client/SPECS.md) —
-  tracker wire protocol (announce, query, leave).
-- [`mesh_tracker`](https://github.com/hyperhyperspace/hhs3-ts/blob/main/modules/mesh_tracker/SPECS.md) —
-  tracker server behavior (anti-spoofing, TTL clamping, expiry).
+- `[dag](https://github.com/hyperhyperspace/hhs3-ts/blob/main/modules/dag/SPECS.md)` —
+canonical JSON, entry format, hash derivation, positions and frontiers.
+- `[sync](https://github.com/hyperhyperspace/hhs3-ts/blob/main/modules/sync/SPECS.md)` —
+frontier gossip, header/payload fetch, serving algorithm, validation pipeline.
+- `[mesh](https://github.com/hyperhyperspace/hhs3-ts/blob/main/modules/mesh/SPECS.md)` —
+authenticated handshake, encrypted channel, mux wire format, topic negotiation.
+- `[mesh_tracker_client](https://github.com/hyperhyperspace/hhs3-ts/blob/main/modules/mesh_tracker_client/SPECS.md)` —
+tracker wire protocol (announce, query, leave).
+- `[mesh_tracker](https://github.com/hyperhyperspace/hhs3-ts/blob/main/modules/mesh_tracker/SPECS.md)` —
+tracker server behavior (anti-spoofing, TTL clamping, expiry).
 
 ## 5. Conformance
 
 To interoperate, an implementation MUST:
 
 - Implement the `dag` spec: produce identical `B64Hash` values for
-  identical inputs using the same hash algorithm, and construct/verify
-  entries per the hash derivation rules.
+identical inputs using the same hash algorithm, and construct/verify
+entries per the hash derivation rules.
 - Implement the `sync` spec: speak the sync wire protocol, validate
-  received entries per the pipeline, and support `autoPayload`.
+received entries per the pipeline, and support `autoPayload`.
 - Implement the `mesh` spec: complete the authentication handshake,
-  encrypt the channel, and frame topic messages per the mux format.
+encrypt the channel, and frame topic messages per the mux format.
 - Derive `KeyId` from public keys per the identity format in the `mesh`
-  spec.
+spec.
 - Use the object ID (derived from the creation payload) as the sync
-  topic and DAG ID.
+topic and DAG ID.
 
 Discovery (`mesh_tracker_client`, `mesh_tracker`) is optional. Peers
 that rendezvous by other means need not implement the tracker protocol.
-
-
