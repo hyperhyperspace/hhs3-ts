@@ -1,10 +1,10 @@
-# HHS v3 Protocol Overview Specification
+# HHS v3 Protocol Specification Overview
 
 Status: Initial Version v0.1
 
 ## 1. Purpose and Scope
 
-Protocol overview specification for the HHS v3 replication protocols. Describes
+Protocol specification overview for the HHS v3 replication protocols. Describes
 the protocol layers, how they compose, and what each one requires for
 interoperability. Low-level protocol details live in module-level
 specifications, referenced from Section 4.
