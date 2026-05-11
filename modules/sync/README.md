@@ -43,7 +43,7 @@ A `SyncSession` is created with a `SyncTarget` (DAG + replicated object + hash s
 
 3. **Payload fetch** — once headers are known, the synchronizer requests payloads via `payload-request`. If `autoPayload` was set on the header request and the walk completed, payloads are delivered inline.
 
-4. **Validation & apply** — received entries are validated (hash verification, predecessor availability, type-level checks) before being applied to the local DAG.
+4. **Validation & apply** — received entries are validated (hash verification, predecessor availability, type-level checks) before being applied to the local DAG. If the `RObject` reports foreign dependencies via `extractForeignDeps` (entries that must exist in another object's DAG), and a `resolveRefDag` callback is provided on the `SyncTarget`, the synchronizer defers the entry — skipping it and retrying later — rather than rejecting it outright. This supports incremental sync of objects that reference other objects.
 
 ## Usage
 
@@ -51,7 +51,10 @@ A `SyncSession` is created with a `SyncTarget` (DAG + replicated object + hash s
 import { createSyncSession } from '@hyper-hyper-space/hhs3_sync';
 
 const session = createSyncSession(
-    { dagId, dag, rObject, hashSuite },
+    {
+        dagId, dag, rObject, hashSuite,
+        resolveRefDag,  // optional: resolve referenced DAGs for foreign dep deferral
+    },
     [swarm],
 );
 
