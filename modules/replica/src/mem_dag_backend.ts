@@ -26,12 +26,8 @@ export class MemDagBackend implements DagBackend {
         return { dag, created: true };
     }
 
-    async openDag(id: B64Hash): Promise<Dag> {
-        const d = this.dags.get(id);
-        if (d === undefined) {
-            throw new Error(`DAG '${id}' not found in this backend`);
-        }
-        return d;
+    async openDag(id: B64Hash): Promise<Dag | undefined> {
+        return this.dags.get(id);
     }
 
     async listDags(): Promise<DagEntry[]> {

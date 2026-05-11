@@ -18,6 +18,7 @@
   "author": "Santiago Bazerque",
   "license": "MIT",
   "devDependencies": {
+    "@hyper-hyper-space/hhs3_util": "^0.1.0",
     "typescript": "^5.5.4",
     "ts-node": "^10.9.2",
     "@types/node": "^22.2.0"

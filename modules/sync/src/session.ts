@@ -30,6 +30,7 @@ export type SyncTarget = {
     dag: Dag;
     rObject: RObject;
     hashSuite: HashSuite;
+    resolveRefDag?: (refId: B64Hash) => Promise<Dag | undefined>;
 };
 
 export interface SyncSession {
@@ -85,6 +86,7 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[]): SyncSess
         target.hashSuite,
         getPeers,
         sendToWithReport,
+        target.resolveRefDag,
     );
 
     synchronizer.onPeerIssue((peerKey, issue) => {

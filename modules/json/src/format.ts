@@ -52,7 +52,13 @@ function isOptionType(format: OptionFormat): boolean {
     }
 }
 
-export function checkFormat(format: Format, literal: Literal): boolean {
+export type FormatOptions = {
+    strict?: boolean;
+};
+
+export function checkFormat(format: Format, literal: Literal, options?: FormatOptions): boolean {
+
+    const strict = options?.strict ?? true;
 
     if (Array.isArray(format)) {
         if (format.length < 1) {
@@ -104,7 +110,7 @@ export function checkFormat(format: Format, literal: Literal): boolean {
                         if (!Array.isArray(literal)) {
                             return false;
                         } else {
-                            return literal.every((item) => checkFormat(format[1], item));
+                            return literal.every((item) => checkFormat(format[1], item, options));
                         }
                     }
 
@@ -120,7 +126,7 @@ export function checkFormat(format: Format, literal: Literal): boolean {
                     } else if (!Array.isArray(literal)) {
                         return false;
                     }else {
-                        return literal.length <= format[2] && literal.every((item) => checkFormat(format[1], item));
+                        return literal.length <= format[2] && literal.every((item) => checkFormat(format[1], item, options));
                     }
 
                 case Type.FixedArray:
@@ -133,7 +139,7 @@ export function checkFormat(format: Format, literal: Literal): boolean {
                     } else if (!Array.isArray(literal)) {
                         return false;
                     } else {
-                        return literal.length === format[2] && literal.every((item) => checkFormat(format[1], item));
+                        return literal.length === format[2] && literal.every((item) => checkFormat(format[1], item, options));
                     }
 
                 case Type.Constant:
@@ -150,7 +156,7 @@ export function checkFormat(format: Format, literal: Literal): boolean {
                     } else if (!Array.isArray(format[1])) {
                         throw new Error('Invalid format (expected array for union elements in position 1): ' + JSON.stringify(format));
                     } else {
-                        return format[1].some((item) => checkFormat(item, literal));
+                        return format[1].some((item) => checkFormat(item, literal, options));
                     }
                 default:
                     throw new Error('Invalid format (expected format for array elements in position 1): ' + JSON.stringify(format));
@@ -161,6 +167,8 @@ export function checkFormat(format: Format, literal: Literal): boolean {
         if (typeof(literal) !== 'object' || Array.isArray(literal)) {
             return false;
         } else {
+            const formatKeys = new Set(Object.keys(format));
+
             for (const [key, keyFormatOpt] of Object.entries(format)) {
 
                 let keyFormat: Format;
@@ -176,7 +184,7 @@ export function checkFormat(format: Format, literal: Literal): boolean {
 
                 if (literal.hasOwnProperty(key)) {
                     const value = literal[key];
-                    if (!checkFormat(keyFormat, value)) {
+                    if (!checkFormat(keyFormat, value, options)) {
                         return false;
                     }
                 } else {
@@ -185,6 +193,15 @@ export function checkFormat(format: Format, literal: Literal): boolean {
                     }
                 }
             }
+
+            if (strict) {
+                for (const key of Object.keys(literal)) {
+                    if (!formatKeys.has(key)) {
+                        return false;
+                    }
+                }
+            }
+
             return true;
         }
     } else if (typeof(format) === 'string') {

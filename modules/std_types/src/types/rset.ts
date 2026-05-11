@@ -27,7 +27,7 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, HASH_SHA256, sha256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, MetaProps, position, EntryMetaFilter, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
 
-import { Payload, RObject, RObjectFactory, RObjectInit, RContext, RObjectConfig, SyncableObject, NestingParent, version, Version, View } from "@hyper-hyper-space/hhs3_mvt";
+import { Payload, RObject, RObjectFactory, RObjectInit, RContext, RObjectConfig, SyncableObject, NestingParent, version, Version, View, ForeignDep } from "@hyper-hyper-space/hhs3_mvt";
 import { DagScope, NestedScopedDag, RootScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
 import { set } from "@hyper-hyper-space/hhs3_util";
 
@@ -108,6 +108,7 @@ export const rSetFactory: RObjectFactory = {
             scopedDag = await parent.getScopedDagForChild(id);
         } else {
             const rawDag = await ctx.getDag(id);
+            if (rawDag === undefined) throw new Error(`DAG '${id}' not found`);
             scopedDag = new RootScopedDag(rawDag);
         }
 
@@ -530,6 +531,10 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
         return this.ctx.getConfig().selfValidate || false;
     }
 
+    extractForeignDeps(_payload: Payload, _at: Version): ForeignDep[] | undefined {
+        return undefined;
+    }
+
     subscribe(callback: (event: RAddEvent | RDeleteEvent) => void): void {
         throw new Error("Method not implemented.");
     }
@@ -544,6 +549,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
                 this._scopedDag = await this.parentObj.getScopedDagForChild(this.createOpId);
             } else {
                 const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
+                if (rawDag === undefined) throw new Error(`DAG '${this.createOpId}' not found`);
                 this._scopedDag = new RootScopedDag(rawDag);
             }
         }
@@ -556,6 +562,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
                 this._causalDag = await this.parentObj.getCausalDag();
             } else {
                 const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
+                if (rawDag === undefined) throw new Error(`DAG '${this.createOpId}' not found`);
                 this._causalDag = rawDag;
             }
         }
@@ -586,12 +593,14 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
         this._swarm = mesh.createSwarm(this.createOpId);
 
         const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
+        if (rawDag === undefined) throw new Error(`DAG '${this.createOpId}' not found`);
 
         const target: SyncTarget = {
             dagId: this.createOpId,
             dag: rawDag,
             rObject: this,
             hashSuite: this.ctx.getHashSuite(),
+            resolveRefDag: (refId) => this.ctx.getDag(refId),
         };
 
         this._syncSession = createSyncSession(target, [this._swarm]);
@@ -710,6 +719,14 @@ export class RSetView<T  extends json.Literal> implements View {
         } else {
             return false;
         }
+    }
+
+    async getReferences(): Promise<B64Hash[]> {
+        return [];
+    }
+
+    async resolveRefVersion(_refId: B64Hash): Promise<Version> {
+        throw new Error("RSet does not support references");
     }
 
     async loadRObjectByHash(elementHash: B64Hash): Promise<RObject | undefined> {

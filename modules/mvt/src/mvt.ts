@@ -12,6 +12,11 @@ export const emptyVersion: () => Version = dag.emptyPosition;
 export const version: (...hashes: B64Hash[]) => Version = dag.position;
 export type Payload = json.Literal;
 
+export type ForeignDep = {
+    dagId: B64Hash;
+    requiredHashes: B64Hash[];
+}
+
 export type RObject = {
     
     getId(): B64Hash;
@@ -21,6 +26,8 @@ export type RObject = {
     applyPayload(payload: Payload, at: Version): Promise<B64Hash>;
 
     getView(at?: Version, from?: Version): Promise<View>;
+
+    extractForeignDeps(payload: Payload, at: Version): ForeignDep[] | undefined;
 
     subscribe(callback: (event: Event) => void): void;
     unsubscribe(callback: (event: Event) => void): void;
@@ -55,7 +62,7 @@ export type RContext = {
     getRegistry(): RObjectTypeRegistry;
 
     getObject(id: B64Hash): Promise<RObject | undefined>;
-    getDag(id: B64Hash, backendLabel?: string): Promise<Dag>;
+    getDag(id: B64Hash, backendLabel?: string): Promise<Dag | undefined>;
     getMesh(label: string): any;
 
     createObject(init: RObjectInit, backendLabel?: string): Promise<RObject>;
@@ -74,6 +81,9 @@ export type View = {
     getObject(): RObject;
     getVersion(): Version;
     getFromVersion(): Version;
+
+    getReferences(): Promise<B64Hash[]>;
+    resolveRefVersion(refId: B64Hash): Promise<Version>;
 }
 
 export type Event = {

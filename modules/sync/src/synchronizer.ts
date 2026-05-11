@@ -3,7 +3,7 @@ import { random } from '@hyper-hyper-space/hhs3_crypto';
 import type { Dag, Header } from '@hyper-hyper-space/hhs3_dag';
 import { json } from '@hyper-hyper-space/hhs3_json';
 import type { TopicChannel } from '@hyper-hyper-space/hhs3_mesh';
-import type { RObject, Version } from '@hyper-hyper-space/hhs3_mvt';
+import type { RObject, Version, ForeignDep } from '@hyper-hyper-space/hhs3_mvt';
 
 import { stringToUint8Array } from '@hyper-hyper-space/hhs3_crypto';
 import type {
@@ -87,6 +87,7 @@ export function createDagSynchronizer(
     hashSuite: HashSuite,
     getPeers: () => PeerHandle[],
     sendTo: (peer: PeerHandle, msg: SyncMsg) => SendResult,
+    resolveRefDag?: (refId: B64Hash) => Promise<Dag | undefined>,
 ): DagSynchronizer {
 
     // --- accumulative state ---
@@ -155,7 +156,9 @@ export function createDagSynchronizer(
         const now = Date.now();
         for (const peer of getPeers()) {
             sendTo(peer, msg);
-            lastSentFrontier.set(peer.key, { frontier: new Set(frontier), timestamp: now });
+            if (peerFrontiers.has(peer.key)) {
+                lastSentFrontier.set(peer.key, { frontier: new Set(frontier), timestamp: now });
+            }
         }
     }
 
@@ -882,6 +885,22 @@ export function createDagSynchronizer(
                 if (!allPredecessorsReady) continue;
 
                 const version: Version = new Set(prevHashes);
+
+                const foreignDeps = rObject.extractForeignDeps(payload, version);
+                if (foreignDeps !== undefined && resolveRefDag !== undefined) {
+                    let allDepsAvailable = true;
+                    for (const dep of foreignDeps) {
+                        const refDag = await resolveRefDag(dep.dagId);
+                        if (refDag === undefined) { allDepsAvailable = false; break; }
+                        for (const requiredHash of dep.requiredHashes) {
+                            if (await refDag.loadHeader(requiredHash) === undefined) {
+                                allDepsAvailable = false; break;
+                            }
+                        }
+                        if (!allDepsAvailable) break;
+                    }
+                    if (!allDepsAvailable) continue;
+                }
 
                 const valid = await rObject.validatePayload(payload, version);
                 if (!valid) {

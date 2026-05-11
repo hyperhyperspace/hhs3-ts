@@ -7,7 +7,7 @@ import {
 
 export interface DagBackend {
     getOrCreateDag(id: B64Hash, meta: { type: string }): Promise<{ dag: Dag; created: boolean }>;
-    openDag(id: B64Hash): Promise<Dag>;
+    openDag(id: B64Hash): Promise<Dag | undefined>;
     listDags(): Promise<DagEntry[]>;
 }
 
@@ -130,19 +130,21 @@ export class Replica implements RContext {
         return this.roots.get(id);
     }
 
-    async getDag(id: B64Hash, backendLabel?: string): Promise<Dag> {
+    async getDag(id: B64Hash, backendLabel?: string): Promise<Dag | undefined> {
         const cacheKey = backendLabel ? `${backendLabel}:${id}` : id;
 
         const cached = this.dagCache.get(cacheKey);
         if (cached !== undefined) return cached;
 
-        const label = backendLabel ?? this.resolveBackendLabelForId(id);
+        const label = backendLabel ?? this.tryResolveBackendLabelForId(id);
+        if (label === undefined) return undefined;
+
         const backend = this.backends.get(label);
-        if (backend === undefined) {
-            throw new Error(`No backend attached with label '${label}'`);
-        }
+        if (backend === undefined) return undefined;
 
         const d = await backend.openDag(id);
+        if (d === undefined) return undefined;
+
         this.dagCache.set(cacheKey, d);
         this.backendByDagId.set(id, label);
         return d;
@@ -158,7 +160,7 @@ export class Replica implements RContext {
 
     // --- Internal helpers ---
 
-    private resolveBackendLabelForId(id: B64Hash): string {
+    private tryResolveBackendLabelForId(id: B64Hash): string | undefined {
         const label = this.backendByDagId.get(id);
         if (label !== undefined) return label;
 
@@ -168,7 +170,7 @@ export class Replica implements RContext {
 
         if (this.backends.has('default')) return 'default';
 
-        throw new Error(`Cannot resolve backend for DAG '${id}': no backend mapping and no default backend`);
+        return undefined;
     }
 }
 
