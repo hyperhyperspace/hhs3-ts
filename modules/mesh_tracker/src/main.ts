@@ -6,7 +6,7 @@ import {
     SIGNING_ED25519, KEM_X25519_HKDF,
     type SigningName, type KemName,
 } from '@hyper-hyper-space/hhs3_crypto';
-import { createNoiseAuthenticator } from '@hyper-hyper-space/hhs3_mesh';
+import { createAuthenticator } from '@hyper-hyper-space/hhs3_mesh';
 import { WsTransportProvider } from '@hyper-hyper-space/hhs3_mesh_ws';
 import { loadOrCreateIdentity, generateIdentity, saveIdentity, identityKeyId } from './identity.js';
 import { TrackerServer } from './tracker_server.js';
@@ -61,8 +61,8 @@ async function main() {
     const ttlMin = typeof args['ttl-min'] === 'string' ? parseInt(args['ttl-min'], 10) : undefined;
     const ttlMax = typeof args['ttl-max'] === 'string' ? parseInt(args['ttl-max'], 10) : undefined;
 
-    const authenticator = createNoiseAuthenticator({
-        localKey: { publicKey: identity.publicKey, secretKey: identity.secretKey },
+    const authenticator = createAuthenticator({
+        localKey: identity,
         signingName,
         kemPrefs: [kemName],
     });

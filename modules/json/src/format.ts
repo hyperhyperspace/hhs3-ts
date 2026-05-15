@@ -18,6 +18,7 @@ export enum Type {
     Union = 'union',
     Constant = 'literal',
     Something = 'something',
+    BoundedMap = 'bmap',
 }
 
 export type OptionFormat = Format | [Type.Option, Format];
@@ -35,6 +36,7 @@ export type Format =    Type.String |
                         [Type.Union, Array<Format>] |
                         [Type.Constant, string|number|boolean] |
                         Type.Something |
+                        [Type.BoundedMap, Format, Format, number] |
                         {[key: string]: OptionFormat};
 
 //string|number|Array<Literal>|{[key: string]: Literal};
@@ -150,6 +152,23 @@ export function checkFormat(format: Format, literal: Literal, options?: FormatOp
                     } else {
                         return literal === format[1];
                     }
+                case Type.BoundedMap:
+                    if (format.length !== 4) {
+                        throw new Error('Invalid format (expected 4 elements): ' + JSON.stringify(format));
+                    } else if (typeof(format[3]) !== 'number' || !Number.isInteger(format[3])) {
+                        throw new Error('Invalid format (expected integer for max entries in position 3): ' + JSON.stringify(format));
+                    } else if (typeof(literal) !== 'object' || Array.isArray(literal)) {
+                        return false;
+                    } else {
+                        const keys = Object.keys(literal);
+                        if (keys.length > format[3]) return false;
+                        for (const key of keys) {
+                            if (!checkFormat(format[1], key, options)) return false;
+                            if (!checkFormat(format[2], literal[key], options)) return false;
+                        }
+                        return true;
+                    }
+
                 case Type.Union:
                     if (format.length !== 2) {
                         throw new Error('Invalid format (expected 2 elements): ' + JSON.stringify(format));

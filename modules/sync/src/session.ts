@@ -8,7 +8,7 @@ import { createDagProvider } from './provider.js';
 import { createDagSynchronizer } from './synchronizer.js';
 import type { DagProvider } from './provider.js';
 import type { DagSynchronizer } from './synchronizer.js';
-import type { SyncMsg } from './protocol.js';
+import type { SyncMsg, InitResponse } from './protocol.js';
 
 export type SendResult = 'sent' | 'closed' | 'error';
 
@@ -117,6 +117,20 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[]): SyncSess
                 msg = decode(data);
             } catch {
                 reportIssue(key, 'decode-failed');
+                return;
+            }
+
+            if (msg.type === 'init-request' && msg.objectId === target.dagId) {
+                target.dag.loadEntry(target.dagId).then(rootEntry => {
+                    if (rootEntry !== undefined) {
+                        const resp: InitResponse = {
+                            type: 'init-response',
+                            objectId: target.dagId,
+                            init: { type: target.rObject.getType(), payload: rootEntry.payload },
+                        };
+                        sp.channel.send(encode(resp));
+                    }
+                });
                 return;
             }
 

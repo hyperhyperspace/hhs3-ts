@@ -3,6 +3,8 @@
 // serialized PublicKey, used as a stable peer identifier across the system.
 
 import { B64Hash, HashSuite, stringToUint8Array } from './hashing.js';
+import type { SigningName } from './registry.js';
+import { getSigningSuite } from './registry.js';
 
 export type PublicKey = {
     suite: string;
@@ -34,4 +36,25 @@ export function deserializePublicKey(bytes: Uint8Array): PublicKey {
 
 export function keyIdFromPublicKey(pk: PublicKey, hash: HashSuite): KeyId {
     return hash.hashToB64(serializePublicKey(pk));
+}
+
+export type Identity = {
+    publicKey: PublicKey;
+    keyId: KeyId;
+};
+
+export type OwnIdentity = Identity & {
+    secretKey: Uint8Array;
+};
+
+export async function createIdentity(
+    signingName: SigningName,
+    hashSuite: HashSuite,
+): Promise<OwnIdentity> {
+    const suite = getSigningSuite(signingName);
+    if (!suite) throw new Error(`signing suite not found: ${signingName}`);
+    const kp = await suite.generateKeyPair();
+    const publicKey: PublicKey = { suite: signingName, key: kp.publicKey };
+    const keyId = keyIdFromPublicKey(publicKey, hashSuite);
+    return { publicKey, secretKey: kp.secretKey, keyId };
 }

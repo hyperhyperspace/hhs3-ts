@@ -2,16 +2,16 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { testing } from '@hyper-hyper-space/hhs3_util';
-import type { PublicKey, KeyId } from '@hyper-hyper-space/hhs3_crypto';
+import type { OwnIdentity, KeyId } from '@hyper-hyper-space/hhs3_crypto';
 import {
-    ed25519, sha256, keyIdFromPublicKey,
-    SIGNING_ED25519, KEM_X25519_HKDF,
+    sha256,
+    SIGNING_ED25519, KEM_X25519_HKDF, createIdentity,
 } from '@hyper-hyper-space/hhs3_crypto';
 import type {
     Transport, TransportProvider, NetworkAddress,
     PeerAuthenticator, AuthenticatedChannel, PeerInfo, TopicId,
 } from '@hyper-hyper-space/hhs3_mesh';
-import { createNoiseAuthenticator } from '@hyper-hyper-space/hhs3_mesh';
+import { createAuthenticator } from '@hyper-hyper-space/hhs3_mesh';
 import { TrackerClient } from '@hyper-hyper-space/hhs3_mesh_tracker_client';
 import { TrackerServer } from '../src/tracker_server.js';
 import {
@@ -86,16 +86,13 @@ class MemTransportProvider implements TransportProvider {
 // Helpers
 // ---------------------------------------------------------------------------
 
-async function makeKeyPair() {
-    const kp = await ed25519.generateKeyPair();
-    const pk: PublicKey = { suite: SIGNING_ED25519, key: kp.publicKey };
-    const keyId = keyIdFromPublicKey(pk, sha256);
-    return { publicKey: pk, secretKey: kp.secretKey, keyId };
+async function makeKeyPair(): Promise<OwnIdentity> {
+    return createIdentity(SIGNING_ED25519, sha256);
 }
 
-function makeAuth(kp: { publicKey: PublicKey; secretKey: Uint8Array }) {
-    return createNoiseAuthenticator({
-        localKey: { publicKey: kp.publicKey, secretKey: kp.secretKey },
+function makeAuth(kp: OwnIdentity) {
+    return createAuthenticator({
+        localKey: kp,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });

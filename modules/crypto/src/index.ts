@@ -6,7 +6,7 @@ export { SigningSuite, ed25519, mlDsa65, ed25519_mlDsa65 } from "./signing.js";
 export { KemSuite, x25519Hkdf, mlKem768, x25519Hkdf_mlKem768 } from "./kem.js";
 export { AeadSuite, chacha20Poly1305 } from "./aead.js";
 export { KdfSuite, hkdfSha256 } from "./hkdf.js";
-export { PublicKey, KeyId, serializePublicKey, deserializePublicKey, keyIdFromPublicKey } from "./identity.js";
+export { PublicKey, KeyId, Identity, OwnIdentity, serializePublicKey, deserializePublicKey, keyIdFromPublicKey, createIdentity } from "./identity.js";
 export { getSigningSuite, getKemSuite, getAeadSuite, getKdfSuite, getHashSuite } from "./registry.js";
 export {
     HASH_SHA256, HASH_BLAKE3,

@@ -1,9 +1,11 @@
 import { B64Hash, BasicCrypto, HashSuite } from "@hyper-hyper-space/hhs3_crypto";
 import { Dag } from "@hyper-hyper-space/hhs3_dag";
+import type { Mesh, TopicId } from "@hyper-hyper-space/hhs3_mesh";
 import {
     RContext, RObject, RObjectInit, RObjectConfig, RObjectFactory,
     RObjectTypeRegistry, TypeRegistryMap, SyncableObject, RootScopedDag,
 } from "@hyper-hyper-space/hhs3_mvt";
+import { fetchInit } from "@hyper-hyper-space/hhs3_sync";
 
 export interface DagBackend {
     getOrCreateDag(id: B64Hash, meta: { type: string }): Promise<{ dag: Dag; created: boolean }>;
@@ -106,6 +108,30 @@ export class Replica implements RContext {
         this.roots.set(id, obj);
 
         return obj;
+    }
+
+    // --- Remote object fetching ---
+
+    async fetchObject(
+        id: B64Hash,
+        opts?: { meshLabel?: string; backendLabel?: string; timeoutMs?: number },
+    ): Promise<RObject> {
+        const meshLabel = opts?.meshLabel ?? 'default';
+        const backendLabel = opts?.backendLabel ?? 'default';
+
+        const existing = this.roots.get(id);
+        if (existing !== undefined) return existing;
+
+        const mesh = this.getMesh(meshLabel) as Mesh;
+        const swarm = mesh.createSwarm(id as TopicId);
+
+        try {
+            swarm.activate();
+            const init = await fetchInit(id, [swarm], this.hashSuite, opts?.timeoutMs);
+            return await this.createObject(init, backendLabel);
+        } finally {
+            swarm.destroy();
+        }
     }
 
     // --- RContext implementation ---

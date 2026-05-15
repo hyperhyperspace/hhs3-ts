@@ -1,5 +1,4 @@
 import { testing } from '@hyper-hyper-space/hhs3_util';
-import type { KeyId, PublicKey } from '@hyper-hyper-space/hhs3_crypto';
 import {
     sha256,
     stringToUint8Array,
@@ -10,7 +9,9 @@ import {
     KEM_X25519_HKDF,
     KEM_ML_KEM_768,
     KEM_X25519_HKDF_ML_KEM_768,
+    createIdentity,
 } from '@hyper-hyper-space/hhs3_crypto';
+import type { KeyId, PublicKey, OwnIdentity } from '@hyper-hyper-space/hhs3_crypto';
 
 import { createMemTransportPair, MemTransportProvider } from '../src/mem_transport.js';
 import { ConnectionPool, connectionKey } from '../src/connection_pool.js';
@@ -22,7 +23,7 @@ import type { Transport, NetworkAddress } from '../src/transport.js';
 import { createSwarm } from '../src/swarm.js';
 import type { PeerAuthorizer } from '../src/swarm.js';
 import { Mesh } from '../src/mesh.js';
-import { createNoiseAuthenticator } from '../src/noise_authenticator.js';
+import { createAuthenticator } from '../src/kem_authenticator.js';
 import { StaticDiscovery } from '../src/static_discovery.js';
 import { DiscoveryStack } from '../src/discovery_stack.js';
 import { PoolReuseDiscovery } from '../src/pool_reuse_discovery.js';
@@ -732,24 +733,21 @@ async function testMeshSwarmsTracking() {
 
 // --- noise authenticator tests ---
 
-async function makeNoiseKeyPair() {
-    const kp = await ed25519.generateKeyPair();
-    const pk: PublicKey = { suite: SIGNING_ED25519, key: kp.publicKey };
-    const keyId = keyIdFromPublicKey(pk, sha256);
-    return { publicKey: pk, secretKey: kp.secretKey, keyId };
+async function makeNoiseKeyPair(): Promise<OwnIdentity> {
+    return createIdentity(SIGNING_ED25519, sha256);
 }
 
 async function testAuthHandshakeSuccess() {
     const alice = await makeNoiseKeyPair();
     const bob = await makeNoiseKeyPair();
 
-    const aliceAuth = createNoiseAuthenticator({
-        localKey: { publicKey: alice.publicKey, secretKey: alice.secretKey },
+    const aliceAuth = createAuthenticator({
+        localKey: alice,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
-    const bobAuth = createNoiseAuthenticator({
-        localKey: { publicKey: bob.publicKey, secretKey: bob.secretKey },
+    const bobAuth = createAuthenticator({
+        localKey: bob,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
@@ -771,13 +769,13 @@ async function testAuthEncryptedRoundTrip() {
     const alice = await makeNoiseKeyPair();
     const bob = await makeNoiseKeyPair();
 
-    const aliceAuth = createNoiseAuthenticator({
-        localKey: { publicKey: alice.publicKey, secretKey: alice.secretKey },
+    const aliceAuth = createAuthenticator({
+        localKey: alice,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
-    const bobAuth = createNoiseAuthenticator({
-        localKey: { publicKey: bob.publicKey, secretKey: bob.secretKey },
+    const bobAuth = createAuthenticator({
+        localKey: bob,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
@@ -802,13 +800,13 @@ async function testAuthBidirectionalEncryption() {
     const alice = await makeNoiseKeyPair();
     const bob = await makeNoiseKeyPair();
 
-    const aliceAuth = createNoiseAuthenticator({
-        localKey: { publicKey: alice.publicKey, secretKey: alice.secretKey },
+    const aliceAuth = createAuthenticator({
+        localKey: alice,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
-    const bobAuth = createNoiseAuthenticator({
-        localKey: { publicKey: bob.publicKey, secretKey: bob.secretKey },
+    const bobAuth = createAuthenticator({
+        localKey: bob,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
@@ -837,13 +835,13 @@ async function testAuthKemNegotiation() {
     const alice = await makeNoiseKeyPair();
     const bob = await makeNoiseKeyPair();
 
-    const aliceAuth = createNoiseAuthenticator({
-        localKey: { publicKey: alice.publicKey, secretKey: alice.secretKey },
+    const aliceAuth = createAuthenticator({
+        localKey: alice,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF_ML_KEM_768, KEM_X25519_HKDF],
     });
-    const bobAuth = createNoiseAuthenticator({
-        localKey: { publicKey: bob.publicKey, secretKey: bob.secretKey },
+    const bobAuth = createAuthenticator({
+        localKey: bob,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
@@ -867,13 +865,13 @@ async function testAuthKemNegotiationNoCommon() {
     const alice = await makeNoiseKeyPair();
     const bob = await makeNoiseKeyPair();
 
-    const aliceAuth = createNoiseAuthenticator({
-        localKey: { publicKey: alice.publicKey, secretKey: alice.secretKey },
+    const aliceAuth = createAuthenticator({
+        localKey: alice,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_ML_KEM_768],
     });
-    const bobAuth = createNoiseAuthenticator({
-        localKey: { publicKey: bob.publicKey, secretKey: bob.secretKey },
+    const bobAuth = createAuthenticator({
+        localKey: bob,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
@@ -898,13 +896,13 @@ async function testAuthExpectedRemoteMismatch() {
     const bob = await makeNoiseKeyPair();
     const charlie = await makeNoiseKeyPair();
 
-    const aliceAuth = createNoiseAuthenticator({
-        localKey: { publicKey: alice.publicKey, secretKey: alice.secretKey },
+    const aliceAuth = createAuthenticator({
+        localKey: alice,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
-    const bobAuth = createNoiseAuthenticator({
-        localKey: { publicKey: bob.publicKey, secretKey: bob.secretKey },
+    const bobAuth = createAuthenticator({
+        localKey: bob,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
@@ -928,13 +926,13 @@ async function testAuthTamperedCiphertext() {
     const alice = await makeNoiseKeyPair();
     const bob = await makeNoiseKeyPair();
 
-    const aliceAuth = createNoiseAuthenticator({
-        localKey: { publicKey: alice.publicKey, secretKey: alice.secretKey },
+    const aliceAuth = createAuthenticator({
+        localKey: alice,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
-    const bobAuth = createNoiseAuthenticator({
-        localKey: { publicKey: bob.publicKey, secretKey: bob.secretKey },
+    const bobAuth = createAuthenticator({
+        localKey: bob,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
@@ -964,13 +962,13 @@ async function testAuthIndependentSessions() {
     const alice = await makeNoiseKeyPair();
     const bob = await makeNoiseKeyPair();
 
-    const aliceAuth = createNoiseAuthenticator({
-        localKey: { publicKey: alice.publicKey, secretKey: alice.secretKey },
+    const aliceAuth = createAuthenticator({
+        localKey: alice,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
-    const bobAuth = createNoiseAuthenticator({
-        localKey: { publicKey: bob.publicKey, secretKey: bob.secretKey },
+    const bobAuth = createAuthenticator({
+        localKey: bob,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
@@ -1010,13 +1008,13 @@ async function testAuthTofu() {
     const alice = await makeNoiseKeyPair();
     const bob = await makeNoiseKeyPair();
 
-    const aliceAuth = createNoiseAuthenticator({
-        localKey: { publicKey: alice.publicKey, secretKey: alice.secretKey },
+    const aliceAuth = createAuthenticator({
+        localKey: alice,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
-    const bobAuth = createNoiseAuthenticator({
-        localKey: { publicKey: bob.publicKey, secretKey: bob.secretKey },
+    const bobAuth = createAuthenticator({
+        localKey: bob,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
@@ -1045,13 +1043,13 @@ async function testAuthIdentityProtection() {
     const bob = await makeNoiseKeyPair();
     const charlie = await makeNoiseKeyPair();
 
-    const aliceAuth = createNoiseAuthenticator({
-        localKey: { publicKey: alice.publicKey, secretKey: alice.secretKey },
+    const aliceAuth = createAuthenticator({
+        localKey: alice,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
-    const bobAuth = createNoiseAuthenticator({
-        localKey: { publicKey: bob.publicKey, secretKey: bob.secretKey },
+    const bobAuth = createAuthenticator({
+        localKey: bob,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
@@ -1570,13 +1568,13 @@ async function testMeshListenEndToEnd() {
 
     const provider = new MemTransportProvider();
 
-    const aliceAuth = createNoiseAuthenticator({
-        localKey: { publicKey: alice.publicKey, secretKey: alice.secretKey },
+    const aliceAuth = createAuthenticator({
+        localKey: alice,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
-    const bobAuth = createNoiseAuthenticator({
-        localKey: { publicKey: bob.publicKey, secretKey: bob.secretKey },
+    const bobAuth = createAuthenticator({
+        localKey: bob,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
@@ -1617,13 +1615,13 @@ async function testMeshListenRejection() {
 
     const provider = new MemTransportProvider();
 
-    const aliceAuth = createNoiseAuthenticator({
-        localKey: { publicKey: alice.publicKey, secretKey: alice.secretKey },
+    const aliceAuth = createAuthenticator({
+        localKey: alice,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
-    const bobAuth = createNoiseAuthenticator({
-        localKey: { publicKey: bob.publicKey, secretKey: bob.secretKey },
+    const bobAuth = createAuthenticator({
+        localKey: bob,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
@@ -1664,13 +1662,13 @@ async function testMeshListenTopicData() {
 
     const provider = new MemTransportProvider();
 
-    const aliceAuth = createNoiseAuthenticator({
-        localKey: { publicKey: alice.publicKey, secretKey: alice.secretKey },
+    const aliceAuth = createAuthenticator({
+        localKey: alice,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
-    const bobAuth = createNoiseAuthenticator({
-        localKey: { publicKey: bob.publicKey, secretKey: bob.secretKey },
+    const bobAuth = createAuthenticator({
+        localKey: bob,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
@@ -1747,13 +1745,13 @@ async function testPoolReuseDiscovery() {
 
     const provider = new MemTransportProvider();
 
-    const aliceAuth = createNoiseAuthenticator({
-        localKey: { publicKey: alice.publicKey, secretKey: alice.secretKey },
+    const aliceAuth = createAuthenticator({
+        localKey: alice,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
-    const bobAuth = createNoiseAuthenticator({
-        localKey: { publicKey: bob.publicKey, secretKey: bob.secretKey },
+    const bobAuth = createAuthenticator({
+        localKey: bob,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });

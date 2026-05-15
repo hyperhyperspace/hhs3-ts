@@ -54,7 +54,6 @@ export const replicaSyncTests = {
                 });
 
                 const set = (await replica.createObject(init)) as RSet;
-                set.configure({ meshLabel: 'default', backendLabel: 'default' });
 
                 await set.startSync();
                 await set.stopSync();
@@ -74,7 +73,6 @@ export const replicaSyncTests = {
                 });
 
                 const set = (await replica.createObject(init)) as RSet;
-                set.configure({ meshLabel: 'default', backendLabel: 'default' });
                 await set.startSync();
 
                 await replica.close();

@@ -4,13 +4,10 @@
 
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import type { PublicKey, SigningName } from '@hyper-hyper-space/hhs3_crypto';
+import type { PublicKey, SigningName, OwnIdentity } from '@hyper-hyper-space/hhs3_crypto';
 import { getSigningSuite, keyIdFromPublicKey, sha256 } from '@hyper-hyper-space/hhs3_crypto';
 
-export interface TrackerIdentity {
-    publicKey: PublicKey;
-    secretKey: Uint8Array;
-}
+export type TrackerIdentity = OwnIdentity;
 
 interface IdentityFile {
     suite: string;
@@ -30,9 +27,11 @@ export async function generateIdentity(signingName: SigningName): Promise<Tracke
     const suite = getSigningSuite(signingName);
     if (!suite) throw new Error(`signing suite not found: ${signingName}`);
     const kp = await suite.generateKeyPair();
+    const publicKey: PublicKey = { suite: signingName, key: kp.publicKey };
     return {
-        publicKey: { suite: signingName, key: kp.publicKey },
+        publicKey,
         secretKey: kp.secretKey,
+        keyId: keyIdFromPublicKey(publicKey, sha256),
     };
 }
 
@@ -50,9 +49,11 @@ export async function saveIdentity(filePath: string, identity: TrackerIdentity):
 export async function loadIdentity(filePath: string): Promise<TrackerIdentity> {
     const raw = await fs.readFile(filePath, 'utf-8');
     const data: IdentityFile = JSON.parse(raw);
+    const publicKey: PublicKey = { suite: data.suite, key: fromBase64(data.publicKey) };
     return {
-        publicKey: { suite: data.suite, key: fromBase64(data.publicKey) },
+        publicKey,
         secretKey: fromBase64(data.secretKey),
+        keyId: keyIdFromPublicKey(publicKey, sha256),
     };
 }
 
@@ -70,5 +71,5 @@ export async function loadOrCreateIdentity(
 }
 
 export function identityKeyId(identity: TrackerIdentity): string {
-    return keyIdFromPublicKey(identity.publicKey, sha256);
+    return identity.keyId;
 }

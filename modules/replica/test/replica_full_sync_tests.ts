@@ -1,13 +1,13 @@
 import { assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import {
-    createBasicCrypto, HASH_SHA256, ed25519, SIGNING_ED25519, KEM_X25519_HKDF,
-    keyIdFromPublicKey, sha256,
+    createBasicCrypto, HASH_SHA256, SIGNING_ED25519, KEM_X25519_HKDF,
+    sha256, createIdentity,
     stringToUint8Array,
 } from "@hyper-hyper-space/hhs3_crypto";
-import type { PublicKey, KeyId } from "@hyper-hyper-space/hhs3_crypto";
+import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import type { NetworkAddress, PeerInfo, TopicId } from "@hyper-hyper-space/hhs3_mesh";
 import {
-    Mesh, StaticDiscovery, MemTransportProvider, createNoiseAuthenticator,
+    Mesh, StaticDiscovery, MemTransportProvider, createAuthenticator,
 } from "@hyper-hyper-space/hhs3_mesh";
 import { Replica, MemDagBackend } from "../src/index.js";
 import { RSet, rSetFactory } from "@hyper-hyper-space/hhs3_std_types";
@@ -18,11 +18,8 @@ const hashSuite = crypto.hash(HASH_SHA256);
 
 const dummyCtx = { getCrypto: () => crypto } as RContext;
 
-async function makeNoiseKeyPair() {
-    const kp = await ed25519.generateKeyPair();
-    const pk: PublicKey = { suite: SIGNING_ED25519, key: kp.publicKey };
-    const keyId = keyIdFromPublicKey(pk, sha256);
-    return { publicKey: pk, secretKey: kp.secretKey, keyId };
+async function makeNoiseKeyPair(): Promise<OwnIdentity> {
+    return createIdentity(SIGNING_ED25519, sha256);
 }
 
 async function createSyncableReplica(
@@ -33,8 +30,8 @@ async function createSyncableReplica(
 ) {
     const identity = await makeNoiseKeyPair();
 
-    const authenticator = createNoiseAuthenticator({
-        localKey: { publicKey: identity.publicKey, secretKey: identity.secretKey },
+    const authenticator = createAuthenticator({
+        localKey: identity,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
@@ -82,12 +79,12 @@ async function testOneWaySync() {
     const alicePeer: PeerInfo = { keyId: aliceIdentity.keyId, addresses: ['mem://alice-fs00'] };
     const bobPeer: PeerInfo = { keyId: bobIdentity.keyId, addresses: ['mem://bob-fs00'] };
 
-    const aliceAuth = createNoiseAuthenticator({
-        localKey: { publicKey: aliceIdentity.publicKey, secretKey: aliceIdentity.secretKey },
+    const aliceAuth = createAuthenticator({
+        localKey: aliceIdentity,
         signingName: SIGNING_ED25519, kemPrefs: [KEM_X25519_HKDF],
     });
-    const bobAuth = createNoiseAuthenticator({
-        localKey: { publicKey: bobIdentity.publicKey, secretKey: bobIdentity.secretKey },
+    const bobAuth = createAuthenticator({
+        localKey: bobIdentity,
         signingName: SIGNING_ED25519, kemPrefs: [KEM_X25519_HKDF],
     });
 
@@ -121,9 +118,6 @@ async function testOneWaySync() {
     const bobSet = (await bobReplica.createObject(rsetInit)) as RSet;
 
     assertTrue(aliceSet.getId() === bobSet.getId(), 'both sets should have the same ID');
-
-    aliceSet.configure({ meshLabel: 'default', backendLabel: 'default' });
-    bobSet.configure({ meshLabel: 'default', backendLabel: 'default' });
 
     await aliceSet.startSync();
     await bobSet.startSync();
@@ -166,8 +160,8 @@ async function testBidirectionalSync() {
     const aliceMesh = new Mesh({
         transports: [provider],
         discovery: new StaticDiscovery([bobPeer], [topic]),
-        authenticator: createNoiseAuthenticator({
-            localKey: { publicKey: aliceIdentity.publicKey, secretKey: aliceIdentity.secretKey },
+        authenticator: createAuthenticator({
+            localKey: aliceIdentity,
             signingName: SIGNING_ED25519, kemPrefs: [KEM_X25519_HKDF],
         }),
         localKeyId: aliceIdentity.keyId,
@@ -177,8 +171,8 @@ async function testBidirectionalSync() {
     const bobMesh = new Mesh({
         transports: [provider],
         discovery: new StaticDiscovery([alicePeer], [topic]),
-        authenticator: createNoiseAuthenticator({
-            localKey: { publicKey: bobIdentity.publicKey, secretKey: bobIdentity.secretKey },
+        authenticator: createAuthenticator({
+            localKey: bobIdentity,
             signingName: SIGNING_ED25519, kemPrefs: [KEM_X25519_HKDF],
         }),
         localKeyId: bobIdentity.keyId,
@@ -197,9 +191,6 @@ async function testBidirectionalSync() {
 
     const aliceSet = (await aliceReplica.createObject(rsetInit)) as RSet;
     const bobSet = (await bobReplica.createObject(rsetInit)) as RSet;
-
-    aliceSet.configure({ meshLabel: 'default', backendLabel: 'default' });
-    bobSet.configure({ meshLabel: 'default', backendLabel: 'default' });
 
     await aliceSet.startSync();
     await bobSet.startSync();
@@ -245,8 +236,8 @@ async function testLateJoinSync() {
     const aliceMesh = new Mesh({
         transports: [provider],
         discovery: new StaticDiscovery([bobPeer], [topic]),
-        authenticator: createNoiseAuthenticator({
-            localKey: { publicKey: aliceIdentity.publicKey, secretKey: aliceIdentity.secretKey },
+        authenticator: createAuthenticator({
+            localKey: aliceIdentity,
             signingName: SIGNING_ED25519, kemPrefs: [KEM_X25519_HKDF],
         }),
         localKeyId: aliceIdentity.keyId,
@@ -259,7 +250,6 @@ async function testLateJoinSync() {
     aliceReplica.registerType(RSet.typeId, rSetFactory);
 
     const aliceSet = (await aliceReplica.createObject(rsetInit)) as RSet;
-    aliceSet.configure({ meshLabel: 'default', backendLabel: 'default' });
     await aliceSet.startSync();
 
     await aliceSet.add('early-1');
@@ -269,8 +259,8 @@ async function testLateJoinSync() {
     const bobMesh = new Mesh({
         transports: [provider],
         discovery: new StaticDiscovery([alicePeer], [topic]),
-        authenticator: createNoiseAuthenticator({
-            localKey: { publicKey: bobIdentity.publicKey, secretKey: bobIdentity.secretKey },
+        authenticator: createAuthenticator({
+            localKey: bobIdentity,
             signingName: SIGNING_ED25519, kemPrefs: [KEM_X25519_HKDF],
         }),
         localKeyId: bobIdentity.keyId,
@@ -283,7 +273,6 @@ async function testLateJoinSync() {
     bobReplica.registerType(RSet.typeId, rSetFactory);
 
     const bobSet = (await bobReplica.createObject(rsetInit)) as RSet;
-    bobSet.configure({ meshLabel: 'default', backendLabel: 'default' });
     await bobSet.startSync();
 
     await waitUntil(async () => {

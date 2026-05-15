@@ -25,21 +25,28 @@
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, HASH_SHA256, sha256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
+import type { KeyId, PublicKey, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, MetaProps, position, EntryMetaFilter, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
 
 import { Payload, RObject, RObjectFactory, RObjectInit, RContext, RObjectConfig, SyncableObject, NestingParent, version, Version, View, ForeignDep } from "@hyper-hyper-space/hhs3_mvt";
 import { DagScope, NestedScopedDag, RootScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
+import { isRefAdvancePayload, refAdvanceFormat, extractRefVersion, refAdvanceMeta, findRefAdvances, createRefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
+import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 import { set } from "@hyper-hyper-space/hhs3_util";
 
 import type { Mesh, Swarm } from "@hyper-hyper-space/hhs3_mesh";
 import { createSyncSession } from "@hyper-hyper-space/hhs3_sync";
 import type { SyncSession, SyncTarget } from "@hyper-hyper-space/hhs3_sync";
 
+import { verifyPayloadSignature, signPayload as signPayloadHelper, isAuthoredPayload, extractAuthor } from "../authorship.js";
+import { RCap } from "./rcap.js";
+import type { RCapView } from "./rcap.js";
+
 import { RAddEvent, RDeleteEvent, RSetEvent } from "./rset/events.js";
 
 import { createSetFormat, CreateSetPayload } from "./rset/payload.js";
-import { addElmtFormat, AddElmtPayload } from "./rset/payload.js";
-import { deleteElmtFormat, DeleteElmtPayload } from "./rset/payload.js";
+import { addElmtFormat, addElmtAuthoredFormat, AddElmtPayload } from "./rset/payload.js";
+import { deleteElmtFormat, deleteElmtAuthoredFormat, DeleteElmtPayload } from "./rset/payload.js";
 import { updateElmtFormat, UpdateElmtPayload } from "./rset/payload.js";
 
 import { SetPayload } from "./rset/payload.js";
@@ -84,7 +91,15 @@ export const rSetFactory: RObjectFactory = {
                 return false;
             }
         }
-        
+
+        if (createPayload['capabilityRef'] !== undefined) {
+            const reqs = createPayload['capRequirements'];
+            if (reqs === undefined) return false;
+            if (reqs['add'] === undefined && reqs['delete'] === undefined) return false;
+        } else if (createPayload['capRequirements'] !== undefined) {
+            return false;
+        }
+
         return true;
     },
 
@@ -129,6 +144,8 @@ export type RSetOptions = {
     supportBarrierDelete?: boolean;
     hashAlgorithm?: string;
     parent?: B64Hash;
+    capabilityRef?: B64Hash;
+    capRequirements?: { add?: string; delete?: string; refAdvance?: string[]; refAdvanceCreators?: boolean };
 }
 
 export type RSetRuntimeConfig = {
@@ -184,6 +201,11 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
             createPayload['parent'] = options.parent;
         }
 
+        if (options.capabilityRef !== undefined) {
+            createPayload['capabilityRef'] = options.capabilityRef;
+            createPayload['capRequirements'] = options.capRequirements;
+        }
+
         return {type: RSet.typeId, payload: createPayload} as RObjectInit;
     }
 
@@ -218,6 +240,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
     // Set operations
 
     async add(element: T, at?: Version): Promise<B64Hash> {
+        if (this.isPermissioned()) throw new Error("Use addSigned() for permissioned sets");
         const dag = await this.getScopedDag();
 
         at = at || await dag.getFrontier();
@@ -227,6 +250,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
     }
     
     async addWithBarrier(element: T, at?: Version): Promise<B64Hash> {
+        if (this.isPermissioned()) throw new Error("Use addWithBarrierSigned() for permissioned sets");
         const dag = await this.getScopedDag();
 
         at = at || await dag.getFrontier();
@@ -258,6 +282,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
     }
 
     async delete(element: T, at?: Version): Promise<B64Hash> {
+        if (this.isPermissioned()) throw new Error("Use deleteSigned() for permissioned sets");
 
         if (this.contentType() !== undefined) {
             throw new Error("RSet.delete(element) is not well defined when contentType is present, please use deleteByHash");
@@ -268,6 +293,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
     }
 
     async deleteByHash(elementHash: B64Hash, at?: Version): Promise<B64Hash> {
+        if (this.isPermissioned()) throw new Error("Use deleteByHashSigned() for permissioned sets");
         const dag = await this.getScopedDag();
 
         at = at || await dag.getFrontier();
@@ -277,16 +303,74 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
     }
 
     async deleteWithBarrier(element: T, at?: Version): Promise<B64Hash> {
+        if (this.isPermissioned()) throw new Error("Use deleteWithBarrierSigned() for permissioned sets");
         const elementHash = await hashElement(element);
         return this.deleteWithBarrierByHash(elementHash, at);
     }
 
     async deleteWithBarrierByHash(elementHash: B64Hash, at?: Version): Promise<B64Hash> {
+        if (this.isPermissioned()) throw new Error("Use deleteWithBarrierByHashSigned() for permissioned sets");
         const dag = await this.getScopedDag();
 
         at = at || await dag.getFrontier();
         const payload: DeleteElmtPayload = await this.createDeletePayload(elementHash, true, at);
         return this.applyValidatedPayload(payload, at);
+    }
+
+    // Signed convenience methods for permissioned sets
+
+    async addSigned(element: T, author: OwnIdentity, at?: Version): Promise<B64Hash> {
+        const d = await this.getScopedDag();
+        at = at || await d.getFrontier();
+        const base = await this.createAddPayload(element, false, at);
+        const signed = await signPayloadHelper(base as json.LiteralMap, author);
+        return this.applyValidatedPayload(signed, at);
+    }
+
+    async addWithBarrierSigned(element: T, author: OwnIdentity, at?: Version): Promise<B64Hash> {
+        const d = await this.getScopedDag();
+        at = at || await d.getFrontier();
+        const base = await this.createAddPayload(element, true, at);
+        const signed = await signPayloadHelper(base as json.LiteralMap, author);
+        return this.applyValidatedPayload(signed, at);
+    }
+
+    async deleteSigned(element: T, author: OwnIdentity, at?: Version): Promise<B64Hash> {
+        if (this.contentType() !== undefined) {
+            throw new Error("Use deleteByHashSigned for sets with contentType");
+        }
+        const elementHash = await hashElement(element);
+        return this.deleteByHashSigned(elementHash, author, at);
+    }
+
+    async deleteByHashSigned(elementHash: B64Hash, author: OwnIdentity, at?: Version): Promise<B64Hash> {
+        const d = await this.getScopedDag();
+        at = at || await d.getFrontier();
+        const base = await this.createDeletePayload(elementHash, false, at);
+        const signed = await signPayloadHelper(base as json.LiteralMap, author);
+        return this.applyValidatedPayload(signed, at);
+    }
+
+    async deleteWithBarrierSigned(element: T, author: OwnIdentity, at?: Version): Promise<B64Hash> {
+        const elementHash = await hashElement(element);
+        return this.deleteWithBarrierByHashSigned(elementHash, author, at);
+    }
+
+    async deleteWithBarrierByHashSigned(elementHash: B64Hash, author: OwnIdentity, at?: Version): Promise<B64Hash> {
+        const d = await this.getScopedDag();
+        at = at || await d.getFrontier();
+        const base = await this.createDeletePayload(elementHash, true, at);
+        const signed = await signPayloadHelper(base as json.LiteralMap, author);
+        return this.applyValidatedPayload(signed, at);
+    }
+
+    async refAdvance(refVersion: Version, author: OwnIdentity, at?: Version): Promise<B64Hash> {
+        if (!this.isPermissioned()) throw new Error("refAdvance is only for permissioned sets");
+        const d = await this.getScopedDag();
+        at = at || await d.getFrontier();
+        const base = createRefAdvancePayload(this.capabilityRef()!, refVersion);
+        const signed = await signPayloadHelper(base as unknown as json.LiteralMap, author);
+        return this.applyValidatedPayload(signed, at);
     }
 
     private async createDeletePayload(elementHash: B64Hash, barrier: boolean, at: Version): Promise<DeleteElmtPayload> {
@@ -348,53 +432,94 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
             case 'update':
                 valid = await this.validateUpdateElmtPayload(payload, at);
                 break;
+            case 'ref-advance':
+                valid = await this.validateRefAdvancePayload(payload, at);
+                break;
         }
 
         return valid;
     }
 
     private async validateAddElmtPayload(payload: Payload, at: Version): Promise<boolean> {
-        if (!json.checkFormat(addElmtFormat, payload)) {
-            return false;
+        const format = this.isPermissioned() ? addElmtAuthoredFormat : addElmtFormat;
+        if (!json.checkFormat(format, payload)) return false;
+
+        const addPayload = payload as AddElmtPayload;
+        if (!this.acceptRedundantAdd()) {
+            const view = await this.getView(at, at);
+            if (await view.hasByHash(await hashElement(addPayload['element']))) return false;
         } else {
-            const addPayload = payload as AddElmtPayload;
-            if (!this.acceptRedundantAdd()) {
-                const view = await this.getView(at, at);
-                const hasElmt = await view.hasByHash(await hashElement(addPayload['element']));
-                if (hasElmt) {
-                    return false;
-                }
-                return true;
-            }
-
-            if (!this.supportBarrierAdd() && json.hasKey(addPayload, 'barrier')) {
-                return false;
-            }
-
-            return true;
+            if (!this.supportBarrierAdd() && json.hasKey(addPayload, 'barrier')) return false;
         }
+
+        if (this.isPermissioned()) {
+            return this.checkPayloadAuth(payload, at, this.capRequirementForAdd());
+        }
+
+        return true;
     }
 
     private async validateDeleteElmtPayload(payload: Payload, at: Version): Promise<boolean> {
-        if (!json.checkFormat(deleteElmtFormat, payload)) {
-            return false;
+        const format = this.isPermissioned() ? deleteElmtAuthoredFormat : deleteElmtFormat;
+        if (!json.checkFormat(format, payload)) return false;
+
+        const deletePayload = payload as DeleteElmtPayload;
+        if (!this.acceptRedundantDelete()) {
+            const view = await this.getView(at, at);
+            if (!await view.hasByHash(deletePayload['elementHash'])) return false;
         } else {
-            const deletePayload = payload as DeleteElmtPayload;
-            if (!this.acceptRedundantDelete()) {
-                const view = await this.getView(at, at);
-                const hasElmt = await view.hasByHash(deletePayload['elementHash']);
-                if (!hasElmt) {
-                    return false;
-                }
-                return true;
-            }
-
-            if (!this.supportBarrierDelete() && json.hasKey(deletePayload, 'barrier')) {
-                return false;
-            }
-
-            return true;
+            if (!this.supportBarrierDelete() && json.hasKey(deletePayload, 'barrier')) return false;
         }
+
+        if (this.isPermissioned()) {
+            return this.checkPayloadAuth(payload, at, this.capRequirementForDelete());
+        }
+
+        return true;
+    }
+
+    private async validateRefAdvancePayload(payload: Payload, at: Version): Promise<boolean> {
+        if (!this.isPermissioned()) return false;
+        if (!json.checkFormat(refAdvanceFormat, payload, { strict: false })) return false;
+        if (!isAuthoredPayload(payload)) return false;
+
+        const refPayload = payload as unknown as RefAdvancePayload;
+        if (refPayload.refId !== this.capabilityRef()) return false;
+
+        const rcap = await this.loadRCap();
+        if (rcap === undefined) return false;
+
+        if (!await verifyPayloadSignature(payload as json.LiteralMap, (keyId) => rcap.lookupKey(keyId))) return false;
+
+        const authorId = extractAuthor(payload) as KeyId;
+
+        if (this.refAdvanceCreators() && rcap.isCreator(authorId)) return true;
+
+        const rsetView = await this.getView(at, at);
+        const rcapVersion = await rsetView.resolveRefVersion(this.capabilityRef()!);
+        const rcapView = await rcap.getView(rcapVersion, rcapVersion);
+        for (const cap of this.refAdvanceCaps()) {
+            if (await rcapView.hasCapability(authorId, cap)) return true;
+        }
+
+        return false;
+    }
+
+    private async checkPayloadAuth(payload: Payload, at: Version, capName?: string): Promise<boolean> {
+        const rcap = await this.loadRCap();
+        if (rcap === undefined) return false;
+
+        if (!await verifyPayloadSignature(payload as json.LiteralMap, (keyId) => rcap.lookupKey(keyId))) return false;
+
+        if (capName !== undefined) {
+            const authorId = extractAuthor(payload) as KeyId;
+            const rsetView = await this.getView(at, at);
+            const rcapVersion = await rsetView.resolveRefVersion(this.capabilityRef()!);
+            const rcapView = await rcap.getView(rcapVersion, rcapVersion);
+            if (!await rcapView.hasCapability(authorId, capName)) return false;
+        }
+
+        return true;
     }
 
     private async validateUpdateElmtPayload(payload: Payload, at: Version): Promise<boolean> {
@@ -432,6 +557,16 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
     } 
 
     async applyPayload(payload: Payload, at: Version): Promise<B64Hash> {
+
+        if (isRefAdvancePayload(payload)) {
+            const refPayload = payload as unknown as RefAdvancePayload;
+            const meta: MetaProps = {
+                ...refAdvanceMeta(refPayload.refId),
+                barrier: json.toSet(['t']),
+            };
+            const scopedDag = await this.getScopedDag();
+            return await scopedDag.append(payload, meta, at);
+        }
 
         const setPayload = payload as unknown as SetPayload;
         
@@ -527,12 +662,49 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
         return this.createOp['supportBarrierDelete'] || false;
     }
 
+    isPermissioned(): boolean {
+        return this.createOp['capabilityRef'] !== undefined;
+    }
+
+    capabilityRef(): B64Hash | undefined {
+        return this.createOp['capabilityRef'];
+    }
+
+    capRequirementForAdd(): string | undefined {
+        return this.createOp['capRequirements']?.['add'];
+    }
+
+    capRequirementForDelete(): string | undefined {
+        return this.createOp['capRequirements']?.['delete'];
+    }
+
+    refAdvanceCaps(): string[] {
+        return this.createOp['capRequirements']?.['refAdvance'] ?? [];
+    }
+
+    refAdvanceCreators(): boolean {
+        return this.createOp['capRequirements']?.['refAdvanceCreators'] ?? true;
+    }
+
     selfValidate(): boolean {
         return this.ctx.getConfig().selfValidate || false;
     }
 
     extractForeignDeps(_payload: Payload, _at: Version): ForeignDep[] | undefined {
-        return undefined;
+        const ref = this.capabilityRef();
+        if (ref === undefined) return undefined;
+        return [{ dagId: ref, requiredHashes: [] }];
+    }
+
+    async loadRCap(): Promise<RCap | undefined> {
+        const ref = this.capabilityRef();
+        if (ref === undefined) return undefined;
+        try {
+            const factory = await this.ctx.getRegistry().lookup(RCap.typeId);
+            return await factory.loadObject(ref, this.ctx) as RCap;
+        } catch {
+            return undefined;
+        }
     }
 
     subscribe(callback: (event: RAddEvent | RDeleteEvent) => void): void {
@@ -672,6 +844,13 @@ export class RSetView<T  extends json.Literal> implements View {
     }
 
     async hasByHash(elementHash: B64Hash): Promise<boolean> {
+        if (this.target.isPermissioned()) {
+            return this.hasByHashPermissioned(elementHash);
+        }
+        return this.hasByHashUnpermissioned(elementHash);
+    }
+
+    private async hasByHashUnpermissioned(elementHash: B64Hash): Promise<boolean> {
 
         let barriers = version();
 
@@ -721,12 +900,128 @@ export class RSetView<T  extends json.Literal> implements View {
         }
     }
 
-    async getReferences(): Promise<B64Hash[]> {
-        return [];
+    private async hasByHashPermissioned(elementHash: B64Hash): Promise<boolean> {
+        const dag = await this.target.getScopedDag();
+        const rcap = await this.target.loadRCap();
+        if (rcap === undefined) throw new Error("Cannot load referenced RCap");
+
+        const rcapVersion = await this.resolveRefVersion(this.target.capabilityRef()!);
+        const rcapView = await rcap.getView(rcapVersion, rcapVersion) as RCapView;
+
+        // Phase 1: barriers with auth check
+        const deleteBarriers = new Set<B64Hash>();
+
+        if (this.target.supportBarrierAdd() || this.target.supportBarrierDelete()) {
+            const barriers = await dag.findConcurrentCoverWithFilter(
+                this.from, this.at, { containsValues: { barrier: ['t'], elmts: [elementHash] } },
+            );
+
+            for (const barrierHash of barriers) {
+                const entry = await dag.loadEntry(barrierHash);
+                if (entry === undefined) continue;
+                const payload = entry.payload as unknown as SetPayload;
+
+                if (!await this.isEntryAuthorized(entry.payload, rcapView)) continue;
+
+                if (payload['action'] === 'add') return true;
+                if (payload['action'] === 'delete') deleteBarriers.add(barrierHash);
+            }
+        }
+
+        // Phase 2: cover with peeling
+        let candidates: Set<B64Hash> = await dag.findCoverWithFilter(
+            this.at, { containsValues: { elmts: [elementHash] } },
+        );
+        const visited = new Set<B64Hash>();
+        const authorizedAdds = new Set<B64Hash>();
+
+        while (candidates.size > 0) {
+            const nextCandidates = new Set<B64Hash>();
+
+            for (const hash of candidates) {
+                if (visited.has(hash)) continue;
+                visited.add(hash);
+
+                const entry = await dag.loadEntry(hash);
+                if (entry === undefined) continue;
+                const payload = entry.payload as unknown as SetPayload;
+
+                if (!await this.isEntryAuthorized(entry.payload, rcapView)) {
+                    const prevHashes = json.fromSet(entry.header.prevEntryHashes) as B64Hash[];
+                    const parentPos = new Set(prevHashes) as Position;
+                    const predecessors = await dag.findCoverWithFilter(
+                        parentPos, { containsValues: { elmts: [elementHash] } },
+                    );
+                    for (const pred of predecessors) nextCandidates.add(pred);
+                    continue;
+                }
+
+                if (payload['action'] === 'add' || payload['action'] === 'create') {
+                    authorizedAdds.add(hash);
+                } else if (payload['action'] === 'delete') {
+                    return false;
+                }
+            }
+
+            candidates = nextCandidates;
+        }
+
+        // Phase 3: resolve adds vs delete-barriers
+        if (authorizedAdds.size > 0) {
+            if (deleteBarriers.size === 0) return true;
+            const causalDag = await this.target.getCausalDag();
+            const fork = await causalDag.findForkPosition(authorizedAdds, deleteBarriers);
+            return fork.forkA.size > 0;
+        }
+
+        return false;
     }
 
-    async resolveRefVersion(_refId: B64Hash): Promise<Version> {
-        throw new Error("RSet does not support references");
+    private async isEntryAuthorized(payload: json.Literal, rcapView: RCapView): Promise<boolean> {
+        const p = payload as unknown as SetPayload;
+
+        if (p['action'] === 'create') return true;
+
+        const capName = p['action'] === 'add'
+            ? this.target.capRequirementForAdd()
+            : this.target.capRequirementForDelete();
+
+        if (capName === undefined) return true;
+
+        if (!isAuthoredPayload(payload)) return false;
+
+        const authorId = extractAuthor(payload)!;
+        return rcapView.hasCapability(authorId, capName);
+    }
+
+    async getReferences(): Promise<B64Hash[]> {
+        const ref = this.target.capabilityRef();
+        if (ref === undefined) return [];
+        return [ref];
+    }
+
+    async resolveRefVersion(refId: B64Hash): Promise<Version> {
+        if (refId !== this.target.capabilityRef()) {
+            throw new Error("Unknown reference: " + refId);
+        }
+
+        const dag = await this.target.getScopedDag();
+        const refAdvanceEntries = await findRefAdvances(dag, refId, this.at);
+
+        if (refAdvanceEntries.size === 0) {
+            return version(refId);
+        }
+
+        const refVer = version();
+        for (const hash of refAdvanceEntries) {
+            const entry = await dag.loadEntry(hash);
+            if (entry === undefined) continue;
+            if (isRefAdvancePayload(entry.payload)) {
+                for (const h of extractRefVersion(entry.payload as RefAdvancePayload)) refVer.add(h);
+            }
+        }
+
+        return refVer.size > 0 ? refVer : version(refId);
     }
 
     async loadRObjectByHash(elementHash: B64Hash): Promise<RObject | undefined> {

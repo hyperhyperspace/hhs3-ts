@@ -1,5 +1,8 @@
 import { simpleSetTests } from "./simple_set_tests.js";
 import { nestedSetTests } from "./nested_set_tests.js";
+import { authorshipTests } from "./authorship_tests.js";
+import { rcapTests } from "./rcap_tests.js";
+import { permissionedSetTests } from "./permissioned_set_tests.js";
 import { testing } from "@hyper-hyper-space/hhs3_util";
 
 async function main() {
@@ -10,6 +13,9 @@ async function main() {
 
     allTests.set(simpleSetTests.title, simpleSetTests.tests);
     allTests.set(nestedSetTests.title, nestedSetTests.tests);
+    allTests.set(authorshipTests.title, authorshipTests.tests);
+    allTests.set(rcapTests.title, rcapTests.tests);
+    allTests.set(permissionedSetTests.title, permissionedSetTests.tests);
 
     console.log('Running tests for Hyper Hyper Space v3 std_types module' + (filters.length > 0? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');    
 

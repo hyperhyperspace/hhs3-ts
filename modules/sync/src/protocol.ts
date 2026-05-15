@@ -67,6 +67,19 @@ export type CancelRequest = {
     requestId: string;
 };
 
+// --- Init (creation payload bootstrap) ---
+
+export type InitRequest = {
+    type: 'init-request';
+    objectId: B64Hash;
+};
+
+export type InitResponse = {
+    type: 'init-response';
+    objectId: B64Hash;
+    init: { type: string; payload: json.Literal };
+};
+
 // --- Union ---
 
 export type SyncMsg =
@@ -77,4 +90,6 @@ export type SyncMsg =
     | PayloadRequest
     | PayloadResponseMeta
     | PayloadMsg
-    | CancelRequest;
+    | CancelRequest
+    | InitRequest
+    | InitResponse;

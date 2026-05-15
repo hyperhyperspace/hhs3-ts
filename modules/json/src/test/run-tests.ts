@@ -100,6 +100,49 @@ async function testStrictWithUnion() {
     testing.assertTrue(checkFormat(format, extraA, { strict: false }), 'union with extra keys should pass non-strict');
 }
 
+async function testBoundedMapBasic() {
+    const format: Format = [Type.BoundedMap,
+        [Type.BoundedString, 32],
+        { val: Type.Int32 },
+        3,
+    ];
+
+    const valid = { a: { val: 1 }, b: { val: 2 } };
+    const empty = {};
+    const tooMany = { a: { val: 1 }, b: { val: 2 }, c: { val: 3 }, d: { val: 4 } };
+    const badValue = { a: { val: 'not a number' } };
+    const extraField = { a: { val: 1, extra: true } };
+    const keyTooLong = { ['x'.repeat(33)]: { val: 1 } };
+
+    testing.assertTrue(checkFormat(format, valid), 'valid bounded map should pass');
+    testing.assertTrue(checkFormat(format, empty), 'empty map should pass');
+    testing.assertFalse(checkFormat(format, tooMany), 'exceeding max entries should fail');
+    testing.assertFalse(checkFormat(format, badValue as any), 'bad value format should fail');
+    testing.assertFalse(checkFormat(format, extraField), 'extra fields in value should fail strict');
+    testing.assertFalse(checkFormat(format, keyTooLong), 'key exceeding max length should fail');
+}
+
+async function testBoundedMapRejectsNonObjects() {
+    const format: Format = [Type.BoundedMap, Type.String, Type.Int32, 10];
+
+    testing.assertFalse(checkFormat(format, 'not an object'), 'string should fail');
+    testing.assertFalse(checkFormat(format, 42), 'number should fail');
+    testing.assertFalse(checkFormat(format, [1, 2, 3]), 'array should fail');
+    testing.assertFalse(checkFormat(format, true), 'boolean should fail');
+}
+
+async function testBoundedMapNonStrictAllowsExtraFields() {
+    const format: Format = [Type.BoundedMap,
+        Type.String,
+        { val: Type.Int32 },
+        10,
+    ];
+
+    const extra = { a: { val: 1, extra: true } };
+    testing.assertFalse(checkFormat(format, extra), 'extra fields in value should fail strict');
+    testing.assertTrue(checkFormat(format, extra, { strict: false }), 'extra fields should pass non-strict');
+}
+
 async function testStrictPreservesExistingBehavior() {
     testing.assertTrue(checkFormat(Type.String, 'hello'), 'string format should pass');
     testing.assertFalse(checkFormat(Type.String, 42), 'string format should reject number');
@@ -121,6 +164,9 @@ const formatTests = {
         { name: '[FORMAT_05] strict with bounded array', invoke: testStrictWithBoundedArray },
         { name: '[FORMAT_06] strict with union', invoke: testStrictWithUnion },
         { name: '[FORMAT_07] preserves existing non-object behavior', invoke: testStrictPreservesExistingBehavior },
+        { name: '[FORMAT_08] bounded map basic', invoke: testBoundedMapBasic },
+        { name: '[FORMAT_09] bounded map rejects non-objects', invoke: testBoundedMapRejectsNonObjects },
+        { name: '[FORMAT_10] bounded map non-strict allows extra fields', invoke: testBoundedMapNonStrictAllowsExtraFields },
     ]
 };
 

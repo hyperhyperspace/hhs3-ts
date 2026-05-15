@@ -1,4 +1,5 @@
-// Noise-like authenticated key exchange over a raw Transport. Uses a 3-message
+// KEM-based authenticated key exchange over a raw Transport (Noise-like design).
+// Uses a 3-message
 // (1.5 round-trip) handshake with initiator identity protection: the initiator
 // sends only a nonce and KEM preferences in Msg1, the responder proves its
 // identity in Msg2, and the initiator reveals its own identity encrypted under
@@ -8,7 +9,7 @@
 
 import type {
     PublicKey, KeyId, SigningSuite, KemName, SigningName,
-    AeadSuite, KdfSuite,
+    AeadSuite, KdfSuite, OwnIdentity,
 } from '@hyper-hyper-space/hhs3_crypto';
 import {
     serializePublicKey, deserializePublicKey, keyIdFromPublicKey,
@@ -22,8 +23,8 @@ import type { AuthenticatedChannel, PeerAuthenticator } from './authenticator.js
 // Configuration
 // ---------------------------------------------------------------------------
 
-export interface NoiseAuthenticatorConfig {
-    localKey: { publicKey: PublicKey; secretKey: Uint8Array };
+export interface AuthenticatorConfig {
+    localKey: OwnIdentity;
     signingName: SigningName;
     kemPrefs: KemName[];
 }
@@ -231,9 +232,9 @@ function negotiate(initiatorPrefs: string[], responderPrefs: string[]): string |
 // Handshake protocol labels
 // ---------------------------------------------------------------------------
 
-const LABEL_I2R = toUtf8('hhs3-noise-i2r');
-const LABEL_R2I = toUtf8('hhs3-noise-r2i');
-const LABEL_CONFIRM = toUtf8('hhs3-noise-confirm');
+const LABEL_I2R = toUtf8('hhs3-auth-i2r');
+const LABEL_R2I = toUtf8('hhs3-auth-r2i');
+const LABEL_CONFIRM = toUtf8('hhs3-auth-confirm');
 
 // ---------------------------------------------------------------------------
 // Handshake implementation
@@ -404,7 +405,7 @@ async function handshakeAsResponder(
 // Factory
 // ---------------------------------------------------------------------------
 
-export function createNoiseAuthenticator(config: NoiseAuthenticatorConfig): PeerAuthenticator {
+export function createAuthenticator(config: AuthenticatorConfig): PeerAuthenticator {
     const { localKey, signingName, kemPrefs } = config;
 
     const signing = getSigningSuite(signingName);
