@@ -1,6 +1,6 @@
 import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { MultiMap, PriorityQueue, Queue } from "@hyper-hyper-space/hhs3_util";
-import { Entry, EntryMetaFilter, ForkPosition, Position, checkFilter } from "../../dag_defs.js";
+import { Entry, EntryMetaFilter, EntryPredicate, ForkPosition, Position, checkFilter } from "../../dag_defs.js";
 import { DagIndex } from "../../idx/dag_idx.js";
 import { DagStore } from "../../store/index.js";
 
@@ -251,7 +251,7 @@ export async function findForkPositionUsingTopoIndex(index: TopoIndexStore<any>,
     return {commonFrontier, common, forkA, forkB};
 }
 
-export async function findCoverWithFilterUsingTopoIndex(store: DagStore<any>, index: TopoIndexStore<any>, from: Position, meta: EntryMetaFilter): Promise<Position> {
+export async function findCoverWithFilterUsingTopoIndex(store: DagStore<any>, index: TopoIndexStore<any>, from: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
 
     const queue = new PriorityQueue<B64Hash>();
     const enqueued = new Set<B64Hash>();
@@ -286,7 +286,7 @@ export async function findCoverWithFilterUsingTopoIndex(store: DagStore<any>, in
             throw new Error('node ' + node + ' not found');
         }
 
-        if (checkFilter(entry.meta, meta)) {
+        if (checkFilter(entry.meta, meta) && (!predicate || await predicate(node, entry))) {
             preCover.add(node);
             continue;
         }
@@ -301,7 +301,7 @@ export async function findCoverWithFilterUsingTopoIndex(store: DagStore<any>, in
     return findMinimalCoverUsingTopoIndex(index, preCover);
 }
 
-export async function findConcurrentCoverWithFilterUsingTopoIndex(store: DagStore<any>, index: TopoIndexStore<any>, from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
+export async function findConcurrentCoverWithFilterUsingTopoIndex(store: DagStore<any>, index: TopoIndexStore<any>, from: Position, concurrentTo: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
     // Create a successor map in forwardMap
 
     const forwardMap = new MultiMap<B64Hash, B64Hash>();
@@ -375,7 +375,8 @@ export async function findConcurrentCoverWithFilterUsingTopoIndex(store: DagStor
         const n = pending.values().next().value!;
         pending.delete(n);
 
-        if (!notConcurrentTo.has(n) && checkFilter((await store.loadEntry(n))!.meta, meta)) {
+        const entry = (await store.loadEntry(n))!;
+        if (!notConcurrentTo.has(n) && checkFilter(entry.meta, meta) && (!predicate || await predicate(n, entry))) {
             preConcCover.add(n);
         } else {
             for (const pred of await index.getPreds(n)) {
@@ -406,12 +407,12 @@ export function createDagTopoIndex<Tx = void>(store: DagStore<Tx>, index: TopoIn
             return findForkPositionUsingTopoIndex(index, a, b)
         },
 
-        findCoverWithFilter(from: Position, meta: EntryMetaFilter): Promise<Position> {
-            return findCoverWithFilterUsingTopoIndex(store, index, from, meta);
+        findCoverWithFilter(from: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
+            return findCoverWithFilterUsingTopoIndex(store, index, from, meta, predicate);
         },
 
-        findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
-            return findConcurrentCoverWithFilterUsingTopoIndex(store, index, from, concurrentTo, meta);
+        findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
+            return findConcurrentCoverWithFilterUsingTopoIndex(store, index, from, concurrentTo, meta, predicate);
         },
 
         getIndexStore: () => index

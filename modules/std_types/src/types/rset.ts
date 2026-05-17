@@ -26,11 +26,11 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, HASH_SHA256, sha256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
 import type { KeyId, PublicKey, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
-import { dag, MetaProps, position, EntryMetaFilter, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
+import { dag, MetaProps, position, EntryMetaFilter, EntryPredicate, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
 
 import { Payload, RObject, RObjectFactory, RObjectInit, RContext, RObjectConfig, SyncableObject, NestingParent, version, Version, View, ForeignDep } from "@hyper-hyper-space/hhs3_mvt";
 import { DagScope, NestedScopedDag, RootScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
-import { isRefAdvancePayload, refAdvanceFormat, extractRefVersion, refAdvanceMeta, findRefAdvances, createRefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
+import { isRefAdvancePayload, refAdvanceFormat, refAdvanceMeta, createRefAdvancePayload, resolveRefVersionAtPosition } from "@hyper-hyper-space/hhs3_mvt";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 import { set } from "@hyper-hyper-space/hhs3_util";
 
@@ -90,6 +90,10 @@ export const rSetFactory: RObjectFactory = {
                 console.log('initialElements must be empty if contentType is present')
                 return false;
             }
+        }
+
+        if (createPayload['supportBarrierAdd'] && createPayload['supportBarrierDelete']) {
+            return false;
         }
 
         if (createPayload['capabilityRef'] !== undefined) {
@@ -182,6 +186,10 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
 
         if (options.acceptRedundantAdd !== undefined) {
             createPayload.acceptRedundantAdd = options.acceptRedundantAdd;
+        }
+
+        if (options.supportBarrierAdd && options.supportBarrierDelete) {
+            throw new Error("supportBarrierAdd and supportBarrierDelete are mutually exclusive");
         }
 
         if (options.supportBarrierAdd !== undefined) {
@@ -445,11 +453,10 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
         if (!json.checkFormat(format, payload)) return false;
 
         const addPayload = payload as AddElmtPayload;
+        if (!this.supportBarrierAdd() && json.hasKey(addPayload, 'barrier')) return false;
         if (!this.acceptRedundantAdd()) {
             const view = await this.getView(at, at);
             if (await view.hasByHash(await hashElement(addPayload['element']))) return false;
-        } else {
-            if (!this.supportBarrierAdd() && json.hasKey(addPayload, 'barrier')) return false;
         }
 
         if (this.isPermissioned()) {
@@ -464,11 +471,10 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
         if (!json.checkFormat(format, payload)) return false;
 
         const deletePayload = payload as DeleteElmtPayload;
+        if (!this.supportBarrierDelete() && json.hasKey(deletePayload, 'barrier')) return false;
         if (!this.acceptRedundantDelete()) {
             const view = await this.getView(at, at);
             if (!await view.hasByHash(deletePayload['elementHash'])) return false;
-        } else {
-            if (!this.supportBarrierDelete() && json.hasKey(deletePayload, 'barrier')) return false;
         }
 
         if (this.isPermissioned()) {
@@ -844,137 +850,61 @@ export class RSetView<T  extends json.Literal> implements View {
     }
 
     async hasByHash(elementHash: B64Hash): Promise<boolean> {
-        if (this.target.isPermissioned()) {
-            return this.hasByHashPermissioned(elementHash);
-        }
-        return this.hasByHashUnpermissioned(elementHash);
-    }
-
-    private async hasByHashUnpermissioned(elementHash: B64Hash): Promise<boolean> {
-
-        let barriers = version();
-
         const dag = await this.target.getScopedDag();
 
-        if (this.target.supportBarrierAdd() || this.target.supportBarrierDelete()) {
-            barriers = await dag.findConcurrentCoverWithFilter(this.from, this.at, {containsValues: {barrier: ['t'], elmts: [elementHash]}});
+        let predicate: EntryPredicate | undefined;
+        if (this.target.isPermissioned()) {
+            const rcap = await this.target.loadRCap();
+            if (rcap === undefined) throw new Error("Cannot load referenced RCap");
+            const refId = this.target.capabilityRef()!;
+            predicate = async (hash, entry) => {
+                const rcapView = await this.resolveRCapViewForEntry(dag, rcap, refId, hash);
+                return this.isEntryAuthorized(entry.payload, rcapView);
+            };
         }
 
-        let deleteBarriers = new Set<B64Hash>();
-
-        for (const barrierHash of barriers) {
-            const barrier = (await dag.loadEntry(barrierHash))!.payload as unknown as SetPayload;
-
-            if (barrier['action'] === 'add') {
-                return true;
-            } else if (barrier['action'] === 'delete') {
-                deleteBarriers.add(barrierHash);
-            }
-        }
-
-        const cover = await dag.findCoverWithFilter(this.at, {containsValues: {elmts: [elementHash]}});
-        const adds = new Set<B64Hash>();
+        const cover = await dag.findCoverWithFilter(
+            this.at,
+            { containsValues: { elmts: [elementHash] } },
+            predicate,
+        );
 
         for (const hash of cover) {
             const payload = (await dag.loadEntry(hash))!.payload as unknown as SetPayload;
+            if (payload['action'] !== 'add' && payload['action'] !== 'create') continue;
 
-            if (payload['action'] === 'add' || payload['action'] === 'create') {
-                if (!this.target.supportBarrierDelete()) {
-                    return true;
-                } else {
-                    adds.add(hash);
-                }
-            }
-        }
-
-        if (adds.size > 0) {
-            if (deleteBarriers.size === 0) {
+            if (!this.target.supportBarrierDelete()) {
                 return true;
-            } else {
-                const causalDag = await this.target.getCausalDag();
-                const fork = await causalDag.findForkPosition(adds, deleteBarriers);
-                return fork.forkA.size > 0;
             }
-        } else {
-            return false;
-        }
-    }
 
-    private async hasByHashPermissioned(elementHash: B64Hash): Promise<boolean> {
-        const dag = await this.target.getScopedDag();
-        const rcap = await this.target.loadRCap();
-        if (rcap === undefined) throw new Error("Cannot load referenced RCap");
-
-        const rcapVersion = await this.resolveRefVersion(this.target.capabilityRef()!);
-        const rcapView = await rcap.getView(rcapVersion, rcapVersion) as RCapView;
-
-        // Phase 1: barriers with auth check
-        const deleteBarriers = new Set<B64Hash>();
-
-        if (this.target.supportBarrierAdd() || this.target.supportBarrierDelete()) {
-            const barriers = await dag.findConcurrentCoverWithFilter(
-                this.from, this.at, { containsValues: { barrier: ['t'], elmts: [elementHash] } },
+            const concurrentBarriers = await dag.findConcurrentCoverWithFilter(
+                this.from, version(hash),
+                { containsValues: { barrier: ['t'], elmts: [elementHash] } },
+                predicate,
             );
+            if (concurrentBarriers.size === 0) return true;
+        }
 
-            for (const barrierHash of barriers) {
-                const entry = await dag.loadEntry(barrierHash);
-                if (entry === undefined) continue;
-                const payload = entry.payload as unknown as SetPayload;
-
-                if (!await this.isEntryAuthorized(entry.payload, rcapView)) continue;
-
+        if (this.target.supportBarrierAdd()) {
+            const barrierAdds = await dag.findConcurrentCoverWithFilter(
+                this.from, this.at,
+                { containsValues: { barrier: ['t'], elmts: [elementHash] } },
+                predicate,
+            );
+            for (const hash of barrierAdds) {
+                const payload = (await dag.loadEntry(hash))!.payload as unknown as SetPayload;
                 if (payload['action'] === 'add') return true;
-                if (payload['action'] === 'delete') deleteBarriers.add(barrierHash);
             }
-        }
-
-        // Phase 2: cover with peeling
-        let candidates: Set<B64Hash> = await dag.findCoverWithFilter(
-            this.at, { containsValues: { elmts: [elementHash] } },
-        );
-        const visited = new Set<B64Hash>();
-        const authorizedAdds = new Set<B64Hash>();
-
-        while (candidates.size > 0) {
-            const nextCandidates = new Set<B64Hash>();
-
-            for (const hash of candidates) {
-                if (visited.has(hash)) continue;
-                visited.add(hash);
-
-                const entry = await dag.loadEntry(hash);
-                if (entry === undefined) continue;
-                const payload = entry.payload as unknown as SetPayload;
-
-                if (!await this.isEntryAuthorized(entry.payload, rcapView)) {
-                    const prevHashes = json.fromSet(entry.header.prevEntryHashes) as B64Hash[];
-                    const parentPos = new Set(prevHashes) as Position;
-                    const predecessors = await dag.findCoverWithFilter(
-                        parentPos, { containsValues: { elmts: [elementHash] } },
-                    );
-                    for (const pred of predecessors) nextCandidates.add(pred);
-                    continue;
-                }
-
-                if (payload['action'] === 'add' || payload['action'] === 'create') {
-                    authorizedAdds.add(hash);
-                } else if (payload['action'] === 'delete') {
-                    return false;
-                }
-            }
-
-            candidates = nextCandidates;
-        }
-
-        // Phase 3: resolve adds vs delete-barriers
-        if (authorizedAdds.size > 0) {
-            if (deleteBarriers.size === 0) return true;
-            const causalDag = await this.target.getCausalDag();
-            const fork = await causalDag.findForkPosition(authorizedAdds, deleteBarriers);
-            return fork.forkA.size > 0;
         }
 
         return false;
+    }
+
+    private async resolveRCapViewForEntry(
+        dag: ScopedDag, rcap: RCap, refId: B64Hash, entryHash: B64Hash,
+    ): Promise<RCapView> {
+        const v = await resolveRefVersionAtPosition(dag, refId, version(entryHash), this.from);
+        return rcap.getView(v, v) as Promise<RCapView>;
     }
 
     private async isEntryAuthorized(payload: json.Literal, rcapView: RCapView): Promise<boolean> {
@@ -1006,22 +936,7 @@ export class RSetView<T  extends json.Literal> implements View {
         }
 
         const dag = await this.target.getScopedDag();
-        const refAdvanceEntries = await findRefAdvances(dag, refId, this.at);
-
-        if (refAdvanceEntries.size === 0) {
-            return version(refId);
-        }
-
-        const refVer = version();
-        for (const hash of refAdvanceEntries) {
-            const entry = await dag.loadEntry(hash);
-            if (entry === undefined) continue;
-            if (isRefAdvancePayload(entry.payload)) {
-                for (const h of extractRefVersion(entry.payload as RefAdvancePayload)) refVer.add(h);
-            }
-        }
-
-        return refVer.size > 0 ? refVer : version(refId);
+        return resolveRefVersionAtPosition(dag, refId, this.at, this.from);
     }
 
     async loadRObjectByHash(elementHash: B64Hash): Promise<RObject | undefined> {

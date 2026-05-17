@@ -4,7 +4,6 @@ import {
     sha256, createIdentity,
     stringToUint8Array,
 } from "@hyper-hyper-space/hhs3_crypto";
-import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import type { NetworkAddress, PeerInfo, TopicId } from "@hyper-hyper-space/hhs3_mesh";
 import {
     Mesh, StaticDiscovery, MemTransportProvider, createAuthenticator,
@@ -18,17 +17,13 @@ const hashSuite = crypto.hash(HASH_SHA256);
 
 const dummyCtx = { getCrypto: () => crypto } as RContext;
 
-async function makeNoiseKeyPair(): Promise<OwnIdentity> {
-    return createIdentity(SIGNING_ED25519, sha256);
-}
-
 async function createSyncableReplica(
     provider: MemTransportProvider,
     listenAddr: NetworkAddress,
     remotePeer: PeerInfo,
     topic: TopicId,
 ) {
-    const identity = await makeNoiseKeyPair();
+    const identity = await createIdentity(SIGNING_ED25519, sha256);
 
     const authenticator = createAuthenticator({
         localKey: identity,
@@ -73,8 +68,8 @@ async function testOneWaySync() {
 
     const provider = new MemTransportProvider();
 
-    const aliceIdentity = await makeNoiseKeyPair();
-    const bobIdentity = await makeNoiseKeyPair();
+    const aliceIdentity = await await createIdentity(SIGNING_ED25519, sha256);
+    const bobIdentity = await await createIdentity(SIGNING_ED25519, sha256);
 
     const alicePeer: PeerInfo = { keyId: aliceIdentity.keyId, addresses: ['mem://alice-fs00'] };
     const bobPeer: PeerInfo = { keyId: bobIdentity.keyId, addresses: ['mem://bob-fs00'] };
@@ -151,8 +146,8 @@ async function testBidirectionalSync() {
 
     const provider = new MemTransportProvider();
 
-    const aliceIdentity = await makeNoiseKeyPair();
-    const bobIdentity = await makeNoiseKeyPair();
+    const aliceIdentity = await await createIdentity(SIGNING_ED25519, sha256);
+    const bobIdentity = await await createIdentity(SIGNING_ED25519, sha256);
 
     const alicePeer: PeerInfo = { keyId: aliceIdentity.keyId, addresses: ['mem://alice-fs01'] };
     const bobPeer: PeerInfo = { keyId: bobIdentity.keyId, addresses: ['mem://bob-fs01'] };
@@ -227,8 +222,8 @@ async function testLateJoinSync() {
 
     const provider = new MemTransportProvider();
 
-    const aliceIdentity = await makeNoiseKeyPair();
-    const bobIdentity = await makeNoiseKeyPair();
+    const aliceIdentity = await await createIdentity(SIGNING_ED25519, sha256);
+    const bobIdentity = await await createIdentity(SIGNING_ED25519, sha256);
 
     const alicePeer: PeerInfo = { keyId: aliceIdentity.keyId, addresses: ['mem://alice-fs02'] };
     const bobPeer: PeerInfo = { keyId: bobIdentity.keyId, addresses: ['mem://bob-fs02'] };

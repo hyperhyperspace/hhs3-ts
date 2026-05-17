@@ -26,8 +26,6 @@ export const nestedSetTests = {
                     contentType: RSet.typeId,
                     initialElements: [],
                     hashAlgorithm: 'sha256',
-                    supportBarrierAdd: true,
-                    supportBarrierDelete: true,
                 });
 
                 const outerSet = (await ctx.createObject(outerSetInit)) as RSet;
@@ -36,8 +34,6 @@ export const nestedSetTests = {
                     seed: 'nested-set-1',
                     initialElements: [],
                     hashAlgorithm: 'sha256',
-                    supportBarrierAdd: true,
-                    supportBarrierDelete: true,
                 });
 
                 const nestedSetHash = await outerSet.add(nestedSetPayload.payload);
@@ -73,8 +69,6 @@ export const nestedSetTests = {
                     contentType: RSet.typeId,
                     initialElements: [],
                     hashAlgorithm: 'sha256',
-                    supportBarrierAdd: true,
-                    supportBarrierDelete: true,
                 });
 
                 const outerSet = (await ctx.createObject(outerSetInit)) as RSet;
@@ -84,8 +78,6 @@ export const nestedSetTests = {
                         seed,
                         initialElements: [],
                         hashAlgorithm: 'sha256',
-                        supportBarrierAdd: true,
-                        supportBarrierDelete: true,
                     });
 
                     const nestedHash = await outerSet.add(nestedSetInit.payload);
@@ -140,8 +132,6 @@ export const nestedSetTests = {
                     contentType: RSet.typeId,
                     initialElements: [],
                     hashAlgorithm: 'sha256',
-                    supportBarrierAdd: true,
-                    supportBarrierDelete: true,
                 });
 
                 const outerSet = (await ctx.createObject(outerSetInit)) as RSet;
@@ -151,8 +141,6 @@ export const nestedSetTests = {
                         seed,
                         initialElements: [],
                         hashAlgorithm: 'sha256',
-                        supportBarrierAdd: true,
-                        supportBarrierDelete: true,
                     });
 
                     const nestedHash = await outerSet.add(nestedSetInit.payload);
@@ -263,17 +251,16 @@ export const nestedSetTests = {
             }
         },
         {
-            name: '[NES03] Test barrier operations with nested elements',
+            name: '[NES03a] Test barrier add with nested elements',
             invoke: async () => {
                 const ctx = createTestCtx();
 
                 const outerSetInit = await RSet.create({
-                    seed: 'outer-set-barrier',
+                    seed: 'outer-set-barrier-add',
                     contentType: RSet.typeId,
                     initialElements: [],
                     hashAlgorithm: 'sha256',
                     supportBarrierAdd: true,
-                    supportBarrierDelete: true,
                 });
 
                 const outerSet = (await ctx.createObject(outerSetInit)) as RSet;
@@ -283,8 +270,6 @@ export const nestedSetTests = {
                         seed,
                         initialElements: [],
                         hashAlgorithm: 'sha256',
-                        supportBarrierAdd: true,
-                        supportBarrierDelete: true,
                     });
                 };
 
@@ -292,11 +277,8 @@ export const nestedSetTests = {
                 const rootHash = await outerSet.add(rootInit.payload);
                 const rootVersion = version(rootHash);
 
-                const leftInit = await makeNestedInit('nested-left');
-                const rightInit = await makeNestedInit('nested-right');
-
-                const leftHash = await outerSet.add(leftInit.payload, rootVersion);
-                const rightHash = await outerSet.add(rightInit.payload, rootVersion);
+                const leftHash = await outerSet.add((await makeNestedInit('nested-left')).payload, rootVersion);
+                const rightHash = await outerSet.add((await makeNestedInit('nested-right')).payload, rootVersion);
 
                 const leftVersion = version(leftHash);
                 const rightVersion = version(rightHash);
@@ -310,22 +292,58 @@ export const nestedSetTests = {
                     'barrier add should apply to concurrent branches even with nested elements'
                 );
 
-                await outerSet.deleteWithBarrierByHash(rootHash, leftVersion);
-
-                const rightViewAfterBarrierDelete = await outerSet.getView(rightVersion);
-                assertFalse(
-                    await rightViewAfterBarrierDelete.hasByHash(rootHash),
-                    'barrier delete should remove nested elements from concurrent branches'
-                );
-
                 const latestView = await outerSet.getView();
                 assertTrue(
                     await latestView.hasByHash(barrierHash),
                     'latest view should still include the barrier-added nested element'
                 );
+            }
+        },
+        {
+            name: '[NES03b] Test barrier delete with nested elements',
+            invoke: async () => {
+                const ctx = createTestCtx();
+
+                const outerSetInit = await RSet.create({
+                    seed: 'outer-set-barrier-del',
+                    contentType: RSet.typeId,
+                    initialElements: [],
+                    hashAlgorithm: 'sha256',
+                    supportBarrierDelete: true,
+                });
+
+                const outerSet = (await ctx.createObject(outerSetInit)) as RSet;
+
+                const makeNestedInit = async (seed: string) => {
+                    return RSet.create({
+                        seed,
+                        initialElements: [],
+                        hashAlgorithm: 'sha256',
+                    });
+                };
+
+                const rootInit = await makeNestedInit('nested-root');
+                const rootHash = await outerSet.add(rootInit.payload);
+                const rootVersion = version(rootHash);
+
+                const leftHash = await outerSet.add((await makeNestedInit('nested-left')).payload, rootVersion);
+                const rightHash = await outerSet.add((await makeNestedInit('nested-right')).payload, rootVersion);
+
+                const leftVersion = version(leftHash);
+                const rightVersion = version(rightHash);
+
+                await outerSet.deleteWithBarrierByHash(rootHash, leftVersion);
+
+                const rightOnlyView = await outerSet.getView(rightVersion, rightVersion);
+                assertTrue(
+                    await rightOnlyView.hasByHash(rootHash),
+                    'root should still be present in non-merged right branch'
+                );
+
+                const mergedView = await outerSet.getView();
                 assertFalse(
-                    await latestView.hasByHash(rootHash),
-                    'latest view should reflect barrier delete of the nested root element'
+                    await mergedView.hasByHash(rootHash),
+                    'barrier delete should void root once branches merge'
                 );
             }
         },
@@ -339,8 +357,6 @@ export const nestedSetTests = {
                     contentType: RSet.typeId,
                     initialElements: [],
                     hashAlgorithm: 'sha256',
-                    supportBarrierAdd: true,
-                    supportBarrierDelete: true,
                 });
 
                 const outerSet = (await ctx.createObject(outerSetInit)) as RSet;
@@ -350,7 +366,6 @@ export const nestedSetTests = {
                         seed,
                         initialElements: [],
                         hashAlgorithm: 'sha256',
-                        supportBarrierAdd: true,
                         supportBarrierDelete: true,
                     });
 
@@ -377,30 +392,30 @@ export const nestedSetTests = {
                     const sharedLiteralHash = crypto.hash(HASH_SHA256).hashToB64(stringToUint8Array(json.toStringNormalized('shared')));
                     const deleteBarrierHash = await target.deleteWithBarrierByHash(sharedLiteralHash, leftVersion);
 
-                    const concurrentView = await target.getView(rightVersion);
-                    assertFalse(
-                        await concurrentView.has('shared'),
-                        `${setName}: barrier delete should remove shared from concurrent branch`
+                    const rightOnlyView = await target.getView(rightVersion, rightVersion);
+                    assertTrue(
+                        await rightOnlyView.has('shared'),
+                        `${setName}: shared should still be present in non-merged right branch`
                     );
                     assertTrue(
-                        await concurrentView.has('root'),
-                        `${setName}: other initial elements should remain unless deleted`
+                        await rightOnlyView.has('root'),
+                        `${setName}: other elements should remain in non-merged right branch`
                     );
 
-                    const ancestorView = await target.getView(baseVersion);
+                    const ancestorView = await target.getView(baseVersion, baseVersion);
                     assertTrue(
                         await ancestorView.has('shared'),
                         `${setName}: ancestor view should still see shared`
                     );
 
-                    const latestView = await target.getView();
+                    const mergedView = await target.getView();
                     assertFalse(
-                        await latestView.has('shared'),
-                        `${setName}: latest view should reflect barrier delete over shared`
+                        await mergedView.has('shared'),
+                        `${setName}: barrier delete should void shared once branches merge`
                     );
                     assertTrue(
-                        await latestView.has('root'),
-                        `${setName}: root should still be present in latest view`
+                        await mergedView.has('root'),
+                        `${setName}: root should still be present in merged view`
                     );
 
                     return {
@@ -467,8 +482,6 @@ export const nestedSetTests = {
                     contentType: RSet.typeId,
                     initialElements: [],
                     hashAlgorithm: 'sha256',
-                    supportBarrierAdd: true,
-                    supportBarrierDelete: true,
                 });
 
                 const outerSet = (await ctx.createObject(outerSetInit)) as RSet;
@@ -477,8 +490,6 @@ export const nestedSetTests = {
                     seed: 'nested-with-initials',
                     initialElements: ['alpha', 'beta'],
                     hashAlgorithm: 'sha256',
-                    supportBarrierAdd: true,
-                    supportBarrierDelete: true,
                 });
 
                 const nestedHash = await outerSet.add(nestedInit.payload);
@@ -503,8 +514,6 @@ export const nestedSetTests = {
                     contentType: RSet.typeId,
                     initialElements: [],
                     hashAlgorithm: 'sha256',
-                    supportBarrierAdd: true,
-                    supportBarrierDelete: true,
                 });
 
                 const outerSet = (await ctx.createObject(outerSetInit)) as RSet;
@@ -513,7 +522,6 @@ export const nestedSetTests = {
                     seed: 'nested-initial-barrier',
                     initialElements: ['root', 'remove-me', 'keep-me'],
                     hashAlgorithm: 'sha256',
-                    supportBarrierAdd: true,
                     supportBarrierDelete: true,
                 });
 
@@ -537,12 +545,16 @@ export const nestedSetTests = {
 
                 const concurrentHash = await nestedSet.add('concurrent-add', creationVersion);
                 const concurrentVersion = version(concurrentHash);
-                const concurrentView = await nestedSet.getView(concurrentVersion);
 
-                assertFalse(await concurrentView.has('remove-me'), 'concurrent branch should also lose remove-me due to barrier delete');
-                assertTrue(await concurrentView.has('root'), 'concurrent branch should still see root');
-                assertTrue(await concurrentView.has('keep-me'), 'concurrent branch should still see keep-me');
-                assertTrue(await concurrentView.has('concurrent-add'), 'concurrent branch should see its own addition');
+                const concurrentOnlyView = await nestedSet.getView(concurrentVersion, concurrentVersion);
+                assertTrue(await concurrentOnlyView.has('remove-me'), 'remove-me should still be present in non-merged concurrent branch');
+                assertTrue(await concurrentOnlyView.has('root'), 'concurrent branch should still see root');
+                assertTrue(await concurrentOnlyView.has('keep-me'), 'concurrent branch should still see keep-me');
+                assertTrue(await concurrentOnlyView.has('concurrent-add'), 'concurrent branch should see its own addition');
+
+                const mergedView2 = await nestedSet.getView();
+                assertFalse(await mergedView2.has('remove-me'), 'merged view should not include remove-me');
+                assertTrue(await mergedView2.has('concurrent-add'), 'merged view should include concurrent-add');
 
                 assertTrue(await outerView.hasByHash(nestedHash), 'outer set should contain the nested set');
             }
@@ -557,8 +569,6 @@ export const nestedSetTests = {
                     contentType: RSet.typeId,
                     initialElements: [],
                     hashAlgorithm: 'sha256',
-                    supportBarrierAdd: true,
-                    supportBarrierDelete: true,
                 });
 
                 const outerSet = (await ctx.createObject(outerInit)) as RSet;
@@ -568,8 +578,6 @@ export const nestedSetTests = {
                     initialElements: [],
                     contentType: RSet.typeId,
                     hashAlgorithm: 'sha256',
-                    supportBarrierAdd: true,
-                    supportBarrierDelete: true,
                 });
 
                 const midHash = await outerSet.add(midInit.payload);
@@ -580,8 +588,6 @@ export const nestedSetTests = {
                     seed: 'inner-set-three-level',
                     initialElements: [],
                     hashAlgorithm: 'sha256',
-                    supportBarrierAdd: true,
-                    supportBarrierDelete: true,
                 });
 
                 const innerHash = await midSet.add(innerInit.payload);
@@ -626,8 +632,6 @@ export const nestedSetTests = {
                     contentType: RSet.typeId,
                     initialElements: [],
                     hashAlgorithm: 'sha256',
-                    supportBarrierAdd: true,
-                    supportBarrierDelete: true,
                 });
 
                 const outerSet = (await ctx.createObject(outerSetInit)) as RSet;
@@ -637,8 +641,6 @@ export const nestedSetTests = {
                         seed,
                         initialElements: [],
                         hashAlgorithm: 'sha256',
-                        supportBarrierAdd: true,
-                        supportBarrierDelete: true,
                     });
 
                     const nestedHash = await outerSet.add(nestedInit.payload);

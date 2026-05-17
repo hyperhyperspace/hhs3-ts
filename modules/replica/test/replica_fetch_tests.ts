@@ -21,14 +21,6 @@ const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
 const dummyCtx = { getCrypto: () => crypto } as RContext;
 
-async function makeNoiseKeyPair(): Promise<OwnIdentity> {
-    return createIdentity(SIGNING_ED25519, sha256);
-}
-
-async function makeSigningIdentity(): Promise<OwnIdentity> {
-    return createIdentity(SIGNING_ED25519, hashSuite);
-}
-
 function wait(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -69,8 +61,8 @@ async function testFetchAndSync() {
     const setId = await rSetFactory.computeRootObjectId(rsetInit.payload, dummyCtx) as TopicId;
 
     const provider = new MemTransportProvider();
-    const aliceNoise = await makeNoiseKeyPair();
-    const bobNoise = await makeNoiseKeyPair();
+    const aliceNoise = await await createIdentity(SIGNING_ED25519, sha256);
+    const bobNoise = await await createIdentity(SIGNING_ED25519, sha256);
     const alicePeer: PeerInfo = { keyId: aliceNoise.keyId, addresses: ['mem://alice-fo00'] };
     const bobPeer: PeerInfo = { keyId: bobNoise.keyId, addresses: ['mem://bob-fo00'] };
 
@@ -117,7 +109,7 @@ async function testFetchAndSync() {
 // ---------- FO01: Fetch permissioned RCap + RSet ----------
 
 async function testFetchPermissionedPair() {
-    const admin = await makeSigningIdentity();
+    const admin = await await createIdentity(SIGNING_ED25519, sha256);
 
     const capInit = await RCap.create({
         seed: 'fo01-cap',
@@ -133,16 +125,14 @@ async function testFetchPermissionedPair() {
         seed: 'fo01-set',
         initialElements: [],
         hashAlgorithm: 'sha256',
-        supportBarrierAdd: true,
-        supportBarrierDelete: true,
         capabilityRef: capId,
         capRequirements: { add: 'write', delete: 'write' },
     });
     const setId = await rSetFactory.computeRootObjectId(setInit.payload, dummyCtx);
 
     const provider = new MemTransportProvider();
-    const aliceNoise = await makeNoiseKeyPair();
-    const bobNoise = await makeNoiseKeyPair();
+    const aliceNoise = await await createIdentity(SIGNING_ED25519, sha256);
+    const bobNoise = await await createIdentity(SIGNING_ED25519, sha256);
     const alicePeer: PeerInfo = { keyId: aliceNoise.keyId, addresses: ['mem://alice-fo01'] };
     const bobPeer: PeerInfo = { keyId: bobNoise.keyId, addresses: ['mem://bob-fo01'] };
 
@@ -204,8 +194,8 @@ async function testFetchIdempotent() {
     const setId = await rSetFactory.computeRootObjectId(rsetInit.payload, dummyCtx);
 
     const provider = new MemTransportProvider();
-    const aliceNoise = await makeNoiseKeyPair();
-    const bobNoise = await makeNoiseKeyPair();
+    const aliceNoise = await await createIdentity(SIGNING_ED25519, sha256);
+    const bobNoise = await await createIdentity(SIGNING_ED25519, sha256);
     const alicePeer: PeerInfo = { keyId: aliceNoise.keyId, addresses: ['mem://alice-fo02'] };
     const bobPeer: PeerInfo = { keyId: bobNoise.keyId, addresses: ['mem://bob-fo02'] };
 
@@ -243,8 +233,8 @@ async function testFetchUnknownType() {
     const setId = await rSetFactory.computeRootObjectId(rsetInit.payload, dummyCtx);
 
     const provider = new MemTransportProvider();
-    const aliceNoise = await makeNoiseKeyPair();
-    const bobNoise = await makeNoiseKeyPair();
+    const aliceNoise = await await createIdentity(SIGNING_ED25519, sha256);
+    const bobNoise = await await createIdentity(SIGNING_ED25519, sha256);
     const alicePeer: PeerInfo = { keyId: aliceNoise.keyId, addresses: ['mem://alice-fo03'] };
     const bobPeer: PeerInfo = { keyId: bobNoise.keyId, addresses: ['mem://bob-fo03'] };
 
@@ -285,7 +275,7 @@ async function testFetchTimeout() {
     const setId = await rSetFactory.computeRootObjectId(rsetInit.payload, dummyCtx);
 
     const provider = new MemTransportProvider();
-    const bobNoise = await makeNoiseKeyPair();
+    const bobNoise = await await createIdentity(SIGNING_ED25519, sha256);
 
     const fakePeer: PeerInfo = { keyId: bobNoise.keyId, addresses: ['mem://nobody-fo04'] };
     const bobMesh = createMesh(provider, bobNoise, 'mem://bob-fo04', fakePeer, [setId as TopicId]);

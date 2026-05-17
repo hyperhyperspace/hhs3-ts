@@ -13,7 +13,7 @@ function createTestCtx(): RContext {
     return ctx;
 }
 
-const createTestEnvironment = async (initialElements: Array<json.Literal> = []) => {
+const createTestEnvironment = async (initialElements: Array<json.Literal> = [], barrierOpts?: { supportBarrierAdd?: boolean, supportBarrierDelete?: boolean }) => {
     const ctx = createTestCtx();
 
     const init = await RSet.create(
@@ -21,8 +21,8 @@ const createTestEnvironment = async (initialElements: Array<json.Literal> = []) 
             seed: 'set00',
             initialElements: initialElements,
             hashAlgorithm: 'sha256',
-            supportBarrierAdd: true,
-            supportBarrierDelete: true,
+            supportBarrierAdd: barrierOpts?.supportBarrierAdd ?? false,
+            supportBarrierDelete: barrierOpts ? (barrierOpts.supportBarrierDelete ?? false) : true,
         }
     );
 
@@ -40,9 +40,9 @@ export const simpleSetTests = {
                 const { set } = await createTestEnvironment();
 
                 await set.add('alpha');
-                await set.addWithBarrier('beta');
+                await set.add('beta');
                 await set.add('gamma');
-                await set.addWithBarrier('delta');
+                await set.add('delta');
 
                 await set.delete('beta');
                 await set.deleteWithBarrier('gamma');
@@ -94,9 +94,9 @@ export const simpleSetTests = {
             }
         },
         {
-            name: '[SET02] Test barrier operations across concurrent versions',
+            name: '[SET02a] Test barrier add across concurrent versions',
             invoke: async () => {
-                const { set } = await createTestEnvironment();
+                const { set } = await createTestEnvironment([], { supportBarrierAdd: true });
 
                 const rootHash = await set.add('root');
                 const rootVersion = version(rootHash);
@@ -112,15 +112,33 @@ export const simpleSetTests = {
                 const rightViewAfterBarrierAdd = await set.getView(rightVersion);
                 assertTrue(await rightViewAfterBarrierAdd.has('barrier-delta'), 'barrier add should apply to concurrent versions');
 
+                const latestView = await set.getView();
+                assertTrue(await latestView.has('barrier-delta'), 'latest view should still include barrier add');
+                assertTrue(await latestView.has('root'), 'root should still be present');
+            }
+        },
+        {
+            name: '[SET02b] Test barrier delete across concurrent versions',
+            invoke: async () => {
+                const { set } = await createTestEnvironment();
+
+                const rootHash = await set.add('root');
+                const rootVersion = version(rootHash);
+
+                const leftHash = await set.add('left', rootVersion);
+                const rightHash = await set.add('right', rootVersion);
+
+                const leftVersion = version(leftHash);
+                const rightVersion = version(rightHash);
+
                 const rootLiteralHash = crypto.hash(HASH_SHA256).hashToB64(stringToUint8Array(json.toStringNormalized('root')));
                 await set.deleteWithBarrierByHash(rootLiteralHash, leftVersion);
 
-                const rightViewAfterBarrierDelete = await set.getView(rightVersion);
-                assertFalse(await rightViewAfterBarrierDelete.has('root'), 'barrier delete should remove elements from concurrent versions');
+                const rightOnlyView = await set.getView(rightVersion, rightVersion);
+                assertTrue(await rightOnlyView.has('root'), 'root should still be present in non-merged right branch');
 
-                const latestView = await set.getView();
-                assertTrue(await latestView.has('barrier-delta'), 'latest view should still include barrier add');
-                assertFalse(await latestView.has('root'), 'latest view should reflect the barrier delete');
+                const mergedView = await set.getView();
+                assertFalse(await mergedView.has('root'), 'barrier delete should void root once branches merge');
             }
         },
         {
@@ -163,15 +181,16 @@ export const simpleSetTests = {
                 const sharedHash = crypto.hash(HASH_SHA256).hashToB64(stringToUint8Array(json.toStringNormalized('shared')));
                 await set.deleteWithBarrierByHash(sharedHash, leftVersion);
 
-                const concurrentView = await set.getView(rightVersion);
-                assertFalse(await concurrentView.has('shared'), 'barrier delete should remove shared from concurrent branch');
-                assertTrue(await concurrentView.has('root'), 'other initial elements should remain unless deleted');
+                const rightOnlyView = await set.getView(rightVersion, rightVersion);
+                assertTrue(await rightOnlyView.has('shared'), 'shared should still be present in non-merged right branch');
+                assertTrue(await rightOnlyView.has('root'), 'other initial elements should remain');
 
-                const ancestorView = await set.getView(creationVersion);
+                const ancestorView = await set.getView(creationVersion, creationVersion);
                 assertTrue(await ancestorView.has('shared'), 'ancestor view should still see shared');
 
-                const latestView = await set.getView();
-                assertFalse(await latestView.has('shared'), 'latest view should reflect barrier delete over initial element');
+                const mergedView = await set.getView();
+                assertFalse(await mergedView.has('shared'), 'barrier delete should void shared once branches merge');
+                assertTrue(await mergedView.has('root'), 'root should survive in merged view');
             }
         },
         {

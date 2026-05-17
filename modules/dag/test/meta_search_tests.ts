@@ -1,4 +1,4 @@
-import { dag, EntryMetaFilter, MetaProps, Position } from "../src/index.js";
+import { dag, Entry, EntryMetaFilter, MetaProps, Position } from "../src/index.js";
 import { position } from "../src/index.js";
 
 import { assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
@@ -16,6 +16,10 @@ const collectMetas = async (d: dag.Dag): Promise<Array<MetaProps>> => {
         metas.push(entry.meta);
     }
     return metas;
+};
+
+const deterministicPredicate = async (hash: B64Hash, _entry: Entry) => {
+    return hash.charCodeAt(0) % 4 !== 0;
 };
 
 const runMetaParity = async (constrs: [() => dag.Dag, () => dag.Dag], options?: {size?: number, seed?: number}) => {
@@ -65,6 +69,55 @@ const runMetaParity = async (constrs: [() => dag.Dag, () => dag.Dag], options?: 
                 console.log("coverB:", pp(coverB));
             }
             assertTrue(coversMatch, `filter ${i} position ${j} mismatch`);
+
+            const coverAPred = await dagA.findCoverWithFilter(positions[j], filters[i], deterministicPredicate);
+            const coverBPred = await dagB.findCoverWithFilter(positions[j], filters[i], deterministicPredicate);
+
+            const predCoversMatch = set.eq(coverAPred, coverBPred);
+            if (!predCoversMatch) {
+                console.log("--- meta parity mismatch (predicate) ---");
+                console.log("filter idx:", i, "position idx:", j);
+                console.log("filter:", JSON.stringify(filters[i]));
+                console.log("coverA:", pp(coverAPred));
+                console.log("coverB:", pp(coverBPred));
+            }
+            assertTrue(predCoversMatch, `filter ${i} position ${j} mismatch (predicate)`);
+        }
+    }
+
+    const concurrentPairs: Array<[Position, Position]> = [
+        [new Set([...branchA, ...branchB]), branchA],
+        [new Set([...branchA, ...branchB]), branchB],
+        [await dagA.getFrontier(), branchA],
+    ];
+
+    for (let i = 0; i < filters.length; i++) {
+        for (let k = 0; k < concurrentPairs.length; k++) {
+            const [from, concTo] = concurrentPairs[k];
+
+            const concA = await dagA.findConcurrentCoverWithFilter(from, concTo, filters[i]);
+            const concB = await dagB.findConcurrentCoverWithFilter(from, concTo, filters[i]);
+
+            const concMatch = set.eq(concA, concB);
+            if (!concMatch) {
+                console.log("--- concurrent meta parity mismatch ---");
+                console.log("filter idx:", i, "pair idx:", k);
+                console.log("concA:", pp(concA));
+                console.log("concB:", pp(concB));
+            }
+            assertTrue(concMatch, `concurrent filter ${i} pair ${k} mismatch`);
+
+            const concAPred = await dagA.findConcurrentCoverWithFilter(from, concTo, filters[i], deterministicPredicate);
+            const concBPred = await dagB.findConcurrentCoverWithFilter(from, concTo, filters[i], deterministicPredicate);
+
+            const concPredMatch = set.eq(concAPred, concBPred);
+            if (!concPredMatch) {
+                console.log("--- concurrent meta parity mismatch (predicate) ---");
+                console.log("filter idx:", i, "pair idx:", k);
+                console.log("concA:", pp(concAPred));
+                console.log("concB:", pp(concBPred));
+            }
+            assertTrue(concPredMatch, `concurrent filter ${i} pair ${k} mismatch (predicate)`);
         }
     }
 };
@@ -220,8 +273,97 @@ const metaSearchSuite = {
             invoke: async () => {
                 await runMetaParity(topoFlatDagPairConstr, {size: 10000, seed: 1774});
             }
+        },
+        {
+            name: "[META_05] findCoverWithFilter with predicate rejecting a cover entry",
+            invoke: async () => {
+                const store = new dag.store.MemDagStorage();
+                const flatIndex = dag.idx.flat.createFlatIndex(
+                    store,
+                    new dag.idx.flat.mem.MemFlatIndexStore()
+                );
+                const d3 = dag.create(store, flatIndex, sha256);
+                const h = await createD3(d3);
+
+                const coverNoPred = await d3.findCoverWithFilter(
+                    position(h["c1"], h["b2"]),
+                    { containsKeys: ["p1"] }
+                );
+                assertTrue(set.eq(coverNoPred, position(h["c1"], h["b2"])), "baseline cover should be {c1, b2}");
+
+                const coverWithPred = await d3.findCoverWithFilter(
+                    position(h["c1"], h["b2"]),
+                    { containsKeys: ["p1"] },
+                    async (hash, _entry) => hash !== h["c1"]
+                );
+                assertTrue(set.eq(coverWithPred, position(h["b1"], h["b2"])), "predicate rejecting c1 should peel to {b1, b2}");
+            }
+        },
+        {
+            name: "[META_06] findConcurrentCoverWithFilter with predicate rejecting a concurrent entry",
+            invoke: async () => {
+                const store = new dag.store.MemDagStorage();
+                const flatIndex = dag.idx.flat.createFlatIndex(
+                    store,
+                    new dag.idx.flat.mem.MemFlatIndexStore()
+                );
+                const d3 = dag.create(store, flatIndex, sha256);
+                const h = await createD3(d3);
+
+                const concCoverNoPred = await d3.findConcurrentCoverWithFilter(
+                    position(h["d1"], h["d2"], h["b2"]),
+                    position(h["d1"]),
+                    { containsKeys: ["p1"] }
+                );
+                assertTrue(set.eq(concCoverNoPred, position(h["d2"], h["b2"])), "baseline concurrent cover should be {d2, b2}");
+
+                const concCoverWithPred = await d3.findConcurrentCoverWithFilter(
+                    position(h["d1"], h["d2"], h["b2"]),
+                    position(h["d1"]),
+                    { containsKeys: ["p1"] },
+                    async (hash, _entry) => hash !== h["d2"]
+                );
+                assertTrue(set.eq(concCoverWithPred, position(h["b2"])), "predicate rejecting d2 should peel, leaving {b2}");
+            }
+        },
+        {
+            name: "[META_07] Predicate accepting all entries matches no-predicate results",
+            invoke: async () => {
+                const store = new dag.store.MemDagStorage();
+                const flatIndex = dag.idx.flat.createFlatIndex(
+                    store,
+                    new dag.idx.flat.mem.MemFlatIndexStore()
+                );
+                const d3 = dag.create(store, flatIndex, sha256);
+                const h = await createD3(d3);
+
+                const acceptAll = async (_hash: B64Hash, _entry: Entry) => true;
+
+                const coverNoPred = await d3.findCoverWithFilter(
+                    position(h["c1"], h["b2"]),
+                    { containsKeys: ["p1"] }
+                );
+                const coverWithPred = await d3.findCoverWithFilter(
+                    position(h["c1"], h["b2"]),
+                    { containsKeys: ["p1"] },
+                    acceptAll
+                );
+                assertTrue(set.eq(coverNoPred, coverWithPred), "accept-all predicate should match no-predicate for findCoverWithFilter");
+
+                const concNoPred = await d3.findConcurrentCoverWithFilter(
+                    position(h["d1"], h["d2"]),
+                    position(h["d1"]),
+                    { containsKeys: ["p1"] }
+                );
+                const concWithPred = await d3.findConcurrentCoverWithFilter(
+                    position(h["d1"], h["d2"]),
+                    position(h["d1"]),
+                    { containsKeys: ["p1"] },
+                    acceptAll
+                );
+                assertTrue(set.eq(concNoPred, concWithPred), "accept-all predicate should match no-predicate for findConcurrentCoverWithFilter");
+            }
         }
-        
     ]
 };
 

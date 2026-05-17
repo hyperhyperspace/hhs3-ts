@@ -233,6 +233,7 @@ These are thin, generic utilities. Full reference resolution — including autho
 - **Nested object sets**: when a `contentType` is specified, each element is a nested `RObject` whose creation payload is stored as the add operation's content. Updates to nested elements are transparently routed through the parent DAG via `NestedScopedDag`.
 - **Barrier operations**: optional add/delete barriers for fine-grained concurrency control.
 - **Version-scoped views**: `RSetView` computes set membership at any version, correctly handling concurrent adds, deletes, and barriers by querying the causal DAG.
+- **Permissioned mode**: when created with a reference to an `RCap` capabilities object, add/delete operations require signed payloads from authorized identities. Authorization is re-evaluated at view time through an iterative peeling algorithm, ensuring correct behavior across ref-advance revisions.
 
 ```typescript
 const init = await RSet.create({
@@ -262,11 +263,19 @@ const outerInit = await RSet.create({
 
 ## Tests
 
-The test suite covers three areas:
+This module's own tests cover the reference helpers:
 
-- **Simple set tests** (`test/simple_set_tests.ts` in `std_types`): creation with initial elements, add/delete, redundancy policies, barrier add/delete, concurrent add-delete resolution, and payload validation with self-validation enabled.
-- **Nested set tests** (`test/nested_set_tests.ts` in `std_types`): nested `RSet`-within-`RSet` scenarios, including creation of inner sets, adding/deleting elements in inner sets, concurrent operations across nesting levels, and fork detection through the causal DAG.
 - **Reference helper tests** (`test/refs_tests.ts`): payload creation/recognition, format validation (strict and non-strict), metadata construction, and DAG query utilities.
+
+The concrete types that exercise the full MVT machinery are tested in [**std_types**](../std_types):
+
+- **Simple set tests** (`test/simple_set_tests.ts`): creation with initial elements, add/delete, redundancy policies, barrier add/delete, concurrent add-delete resolution, and payload validation.
+- **Nested set tests** (`test/nested_set_tests.ts`): nested `RSet`-within-`RSet` scenarios, concurrent operations across nesting levels, and fork detection through the causal DAG.
+- **Authorship tests** (`test/authorship_tests.ts`): sign/verify round-trips, tampered payloads, and type guards.
+- **RCap tests** (`test/rcap_tests.ts`): all capability operations, barrier semantics, `managedBy` delegation, and transitive revocation.
+- **Permissioned set tests** (`test/permissioned_set_tests.ts`): RCap-gated `RSet` integration — authorization, peeling, ref-advance, and `extractForeignDeps`.
+
+End-to-end sync tests for permissioned types live in [**replica**](../replica) (`test/replica_permissioned_sync_tests.ts`).
 
 To run:
 

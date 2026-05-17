@@ -34,6 +34,13 @@ The data model is based on Monotone View Types (MVTs) and the State-Observation-
 
 ## Testing
 
-Replica behavior tests live in the [**replica** module](./test).
+Replica behavior tests live in [`test/`](./test):
 
-Monotone View Replicable Set tests (barrier add/delete, nesting) live in the [**std_types** module](../std_types/test). See each module's README for details on running them.
+- **Basic tests** (`replica_basic_tests.ts`): backend/mesh attachment, type registration, `createObject` idempotency, restart persistence.
+- **Nested tests** (`replica_nested_tests.ts`): nested `RSet`-within-`RSet` through the Replica stack.
+- **Sync lifecycle tests** (`replica_sync_tests.ts`): `startSync`/`stopSync` wiring and teardown.
+- **Full sync tests** (`replica_full_sync_tests.ts`): two-peer mesh sync — one-way, bidirectional, and late-join scenarios.
+- **Fetch sync tests** (`replica_fetch_tests.ts`): fetch-based synchronization tests.
+- **Permissioned sync tests** (`replica_permissioned_sync_tests.ts`): RCap-gated `RSet` through the full Replica + mesh stack — cross-peer writes, foreign-dep deferral, revocation propagation, and unauthorized payload rejection.
+
+MVT type tests (RSet, RCap, authorship, permissioned sets) live in the [**std_types** module](../std_types/test). See each module's README for details.

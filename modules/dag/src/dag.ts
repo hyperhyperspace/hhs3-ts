@@ -1,6 +1,6 @@
 import { B64Hash, HashSuite, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { Entry, EntryMetaFilter, ForkPosition, Header, MetaProps, Position } from "./dag_defs.js";
+import { Entry, EntryMetaFilter, EntryPredicate, ForkPosition, Header, MetaProps, Position } from "./dag_defs.js";
 import { DagIndex } from "./idx/dag_idx.js";
 import { DagGrowthListener, DagStore } from "./store/dag_store.js";
 
@@ -29,10 +29,10 @@ export type Dag = {
     // The following two are used for finding entries with specific properties
 
     // This one is for reading a value at a specific version, by finding the last changes on that value
-    findCoverWithFilter(from: Position, meta: EntryMetaFilter): Promise<Position>;
+    findCoverWithFilter(from: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position>;
 
     // This is useful for finding barrier ops that should be applied to concurrent changes
-    findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position>;
+    findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position>;
     
     loadAllEntries(): AsyncIterable<Entry>; // in topo order
 
@@ -104,8 +104,8 @@ export function create<Tx = void>(
         findMinimalCover: async(p) => index.findMinimalCover(p),
         findForkPosition: async (first, second) => index.findForkPosition(first, second),
 
-        findCoverWithFilter: async (from, filter) => index.findCoverWithFilter(from, filter),
-        findConcurrentCoverWithFilter: async (from, concurrentTo, filter) => index.findConcurrentCoverWithFilter(from, concurrentTo, filter),
+        findCoverWithFilter: async (from, filter, predicate?) => index.findCoverWithFilter(from, filter, predicate),
+        findConcurrentCoverWithFilter: async (from, concurrentTo, filter, predicate?) => index.findConcurrentCoverWithFilter(from, concurrentTo, filter, predicate),
 
         loadAllEntries: () => ro.loadAllEntries(),
 

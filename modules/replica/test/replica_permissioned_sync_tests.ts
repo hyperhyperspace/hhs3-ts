@@ -20,14 +20,6 @@ const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
 const dummyCtx = { getCrypto: () => crypto } as RContext;
 
-async function makeNoiseKeyPair(): Promise<OwnIdentity> {
-    return createIdentity(SIGNING_ED25519, sha256);
-}
-
-async function makeSigningIdentity(): Promise<OwnIdentity> {
-    return createIdentity(SIGNING_ED25519, hashSuite);
-}
-
 function wait(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -94,8 +86,6 @@ async function createPermissionedPair(admin: OwnIdentity) {
         seed: 'integ-set',
         initialElements: [],
         hashAlgorithm: 'sha256',
-        supportBarrierAdd: true,
-        supportBarrierDelete: true,
         capabilityRef: capId,
         capRequirements: { add: 'write', delete: 'write' },
     });
@@ -114,7 +104,7 @@ async function cleanup(peers: PeerSetup[], provider: MemTransportProvider) {
 // ---------- PS01: One-way sync of permissioned RSet + RCap ----------
 
 async function testOneWaySyncPermissioned() {
-    const admin = await makeSigningIdentity();
+    const admin = await await createIdentity(SIGNING_ED25519, sha256);
     const { capInit, setInit, capId } = await createPermissionedPair(admin);
 
     const capTopic = capId as TopicId;
@@ -122,8 +112,8 @@ async function testOneWaySyncPermissioned() {
     const topics = [capTopic, setTopic];
 
     const provider = new MemTransportProvider();
-    const aliceNoise = await makeNoiseKeyPair();
-    const bobNoise = await makeNoiseKeyPair();
+    const aliceNoise = await await createIdentity(SIGNING_ED25519, sha256);
+    const bobNoise = await await createIdentity(SIGNING_ED25519, sha256);
     const alicePeer: PeerInfo = { keyId: aliceNoise.keyId, addresses: ['mem://alice-ps01'] };
     const bobPeer: PeerInfo = { keyId: bobNoise.keyId, addresses: ['mem://bob-ps01'] };
 
@@ -160,8 +150,8 @@ async function testOneWaySyncPermissioned() {
 // ---------- PS02: Cross-peer write by grantee ----------
 
 async function testCrossPeerWrite() {
-    const admin = await makeSigningIdentity();
-    const bobSigning = await makeSigningIdentity();
+    const admin = await await createIdentity(SIGNING_ED25519, sha256);
+    const bobSigning = await await createIdentity(SIGNING_ED25519, sha256);
     const { capInit, setInit, capId } = await createPermissionedPair(admin);
 
     const capTopic = capId as TopicId;
@@ -169,8 +159,8 @@ async function testCrossPeerWrite() {
     const topics = [capTopic, setTopic];
 
     const provider = new MemTransportProvider();
-    const aliceNoise = await makeNoiseKeyPair();
-    const bobNoise = await makeNoiseKeyPair();
+    const aliceNoise = await await createIdentity(SIGNING_ED25519, sha256);
+    const bobNoise = await await createIdentity(SIGNING_ED25519, sha256);
     const alicePeer: PeerInfo = { keyId: aliceNoise.keyId, addresses: ['mem://alice-ps02'] };
     const bobPeer: PeerInfo = { keyId: bobNoise.keyId, addresses: ['mem://bob-ps02'] };
 
@@ -218,7 +208,7 @@ async function testCrossPeerWrite() {
 // ---------- PS03: Foreign-dep deferral ----------
 
 async function testForeignDepDeferral() {
-    const admin = await makeSigningIdentity();
+    const admin = await await createIdentity(SIGNING_ED25519, sha256);
     const { capInit, setInit, capId } = await createPermissionedPair(admin);
 
     const capTopic = capId as TopicId;
@@ -226,8 +216,8 @@ async function testForeignDepDeferral() {
     const topics = [capTopic, setTopic];
 
     const provider = new MemTransportProvider();
-    const aliceNoise = await makeNoiseKeyPair();
-    const bobNoise = await makeNoiseKeyPair();
+    const aliceNoise = await await createIdentity(SIGNING_ED25519, sha256);
+    const bobNoise = await await createIdentity(SIGNING_ED25519, sha256);
     const alicePeer: PeerInfo = { keyId: aliceNoise.keyId, addresses: ['mem://alice-ps03'] };
     const bobPeer: PeerInfo = { keyId: bobNoise.keyId, addresses: ['mem://bob-ps03'] };
 
@@ -283,11 +273,11 @@ async function testForeignDepDeferral() {
     await cleanup([alice, bob], provider);
 }
 
-// ---------- PS04: Revocation propagates across peers ----------
+// ---------- PS04: Concurrent revocation voids add across peers ----------
 
 async function testRevocationPropagation() {
-    const admin = await makeSigningIdentity();
-    const bobSigning = await makeSigningIdentity();
+    const admin = await await createIdentity(SIGNING_ED25519, sha256);
+    const bobSigning = await await createIdentity(SIGNING_ED25519, sha256);
     const { capInit, setInit, capId } = await createPermissionedPair(admin);
 
     const capTopic = capId as TopicId;
@@ -295,8 +285,8 @@ async function testRevocationPropagation() {
     const topics = [capTopic, setTopic];
 
     const provider = new MemTransportProvider();
-    const aliceNoise = await makeNoiseKeyPair();
-    const bobNoise = await makeNoiseKeyPair();
+    const aliceNoise = await await createIdentity(SIGNING_ED25519, sha256);
+    const bobNoise = await await createIdentity(SIGNING_ED25519, sha256);
     const alicePeer: PeerInfo = { keyId: aliceNoise.keyId, addresses: ['mem://alice-ps04'] };
     const bobPeer: PeerInfo = { keyId: bobNoise.keyId, addresses: ['mem://bob-ps04'] };
 
@@ -322,13 +312,12 @@ async function testRevocationPropagation() {
     const capF1 = await capDag.getFrontier();
     await aliceSet.refAdvance(capF1, admin);
 
-    // Start sync
+    // Sync the grant + ref-advance to Bob
     await aliceCap.startSync();
     await aliceSet.startSync();
     await bobCap.startSync();
     await bobSet.startSync();
 
-    // Wait for RCap grant AND RSet ref-advance to sync to Bob
     await waitUntil(async () => {
         const capView = await bobCap.getView();
         if (!(await capView.hasCapability(bobSigning.keyId, 'write'))) return false;
@@ -337,42 +326,32 @@ async function testRevocationPropagation() {
         return !(refVersion.size === 1 && refVersion.has(capId));
     });
 
-    // Bob adds an element
+    // Save Alice's set frontier (= ref-advance(capF1)) so both operations
+    // fork from this same point, making them concurrent.
+    const aliceSetDag = await aliceSet.getScopedDag();
+    const forkPoint = await aliceSetDag.getFrontier();
+
+    // Bob adds an element (parent = ref-advance(capF1) on Bob's side)
     await bobSet.addSigned('bob-data', bobSigning);
 
-    // Wait for Alice to see the element
-    await waitUntil(async () => {
-        const view = await aliceSet.getView();
-        return view.has('bob-data');
-    });
-
-    assertTrue(await (await aliceSet.getView()).has('bob-data'), 'alice should see bob-data before revocation');
-
-    // Alice revokes Bob's write cap and ref-advances the set
-    await aliceCap.revoke(
-        bobSigning.keyId, 'write',
-        admin,
-    );
+    // Alice revokes Bob and ref-advances from the SAME forkPoint
+    // (concurrent with Bob's add since Alice hasn't received it yet)
+    await aliceCap.revoke(bobSigning.keyId, 'write', admin);
     const capF2 = await capDag.getFrontier();
-    await aliceSet.refAdvance(capF2, admin);
+    await aliceSet.refAdvance(capF2, admin, forkPoint);
 
-    // Wait for the revocation + ref-advance to sync to Bob
+    // Wait for Bob's add to sync to Alice (so both branches are present)
     await waitUntil(async () => {
-        const capView = await bobCap.getView();
-        return !(await capView.hasCapability(bobSigning.keyId, 'write'));
-    });
-
-    // After revocation + ref-advance syncs, bob-data should be absent
-    // (peeling voids Bob's add since his write cap was revoked)
-    await waitUntil(async () => {
-        const view = await aliceSet.getView();
-        return !(await view.has('bob-data'));
+        const dag = await alice.replica.getDag(setTopic);
+        if (dag === undefined) return false;
+        let count = 0;
+        for await (const _ of dag.loadAllEntries()) count++;
+        return count >= 4;
     });
 
     const aliceViewAfter = await aliceSet.getView();
-    assertFalse(await aliceViewAfter.has('bob-data'), 'bob-data should be void after revocation');
+    assertFalse(await aliceViewAfter.has('bob-data'), 'bob-data should be void after concurrent revocation');
 
-    // Bob's replica should converge to the same state
     await waitUntil(async () => {
         const view = await bobSet.getView();
         return !(await view.has('bob-data'));
@@ -387,7 +366,7 @@ async function testRevocationPropagation() {
 // ---------- PS05: Unauthorized payload rejected during sync ----------
 
 async function testUnauthorizedPayloadRejected() {
-    const admin = await makeSigningIdentity();
+    const admin = await await createIdentity(SIGNING_ED25519, sha256);
     const { capInit, setInit, capId } = await createPermissionedPair(admin);
 
     const capTopic = capId as TopicId;
@@ -395,8 +374,8 @@ async function testUnauthorizedPayloadRejected() {
     const topics = [capTopic, setTopic];
 
     const provider = new MemTransportProvider();
-    const rogueNoise = await makeNoiseKeyPair();
-    const honestNoise = await makeNoiseKeyPair();
+    const rogueNoise = await await createIdentity(SIGNING_ED25519, sha256);
+    const honestNoise = await await createIdentity(SIGNING_ED25519, sha256);
     const roguePeer: PeerInfo = { keyId: rogueNoise.keyId, addresses: ['mem://rogue-ps05'] };
     const honestPeer: PeerInfo = { keyId: honestNoise.keyId, addresses: ['mem://honest-ps05'] };
 

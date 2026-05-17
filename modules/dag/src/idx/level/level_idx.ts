@@ -1,6 +1,6 @@
 import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { MultiMap, PriorityQueue } from "@hyper-hyper-space/hhs3_util";
-import { checkFilter, EntryMetaFilter, ForkPosition, Position } from "../../dag_defs.js";
+import { checkFilter, EntryMetaFilter, EntryPredicate, ForkPosition, Position } from "../../dag_defs.js";
 import { DagIndex } from "../../idx/dag_idx.js";
 import { position } from "../../dag.js";
 import { DagStore } from "../../store/index.js";
@@ -735,7 +735,7 @@ export async function findForkPositionAtLevel(index: LevelIndexStore<any>, level
 
 }
 
-export async function findCoverWithMetaUsingLevelIndex(store: DagStore<any>, index: LevelIndexStore<any>, from: Position, meta: EntryMetaFilter): Promise<Position> {
+export async function findCoverWithMetaUsingLevelIndex(store: DagStore<any>, index: LevelIndexStore<any>, from: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
     const queue = new PriorityQueue<B64Hash>();
     const enqueued = new Set<B64Hash>();
     const visited = new Set<B64Hash>();
@@ -769,7 +769,7 @@ export async function findCoverWithMetaUsingLevelIndex(store: DagStore<any>, ind
             throw new Error('node ' + node + ' not found');
         }
 
-        if (checkFilter(entry.meta, meta)) {
+        if (checkFilter(entry.meta, meta) && (!predicate || await predicate(node, entry))) {
             preCover.add(node);
             continue;
         }
@@ -784,7 +784,7 @@ export async function findCoverWithMetaUsingLevelIndex(store: DagStore<any>, ind
     return findMinimalCoverUsingLevelIndex(index, preCover);
 }
 
-export async function findConcurrentCoverWithMetaUsingLevelIndex(store: DagStore<any>, index: LevelIndexStore<any>, from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
+export async function findConcurrentCoverWithMetaUsingLevelIndex(store: DagStore<any>, index: LevelIndexStore<any>, from: Position, concurrentTo: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
     // Create a successor map in forwardMap
 
     const forwardMap = new MultiMap<B64Hash, B64Hash>();
@@ -858,7 +858,8 @@ export async function findConcurrentCoverWithMetaUsingLevelIndex(store: DagStore
         const n = pending.values().next().value!;
         pending.delete(n);
 
-        if (!notConcurrentTo.has(n) && checkFilter((await store.loadEntry(n))!.meta, meta)) {
+        const entry = (await store.loadEntry(n))!;
+        if (!notConcurrentTo.has(n) && checkFilter(entry.meta, meta) && (!predicate || await predicate(n, entry))) {
             preConcCover.add(n);
         } else {
             for (const pred of await index.getPreds(0, n)) {
@@ -889,12 +890,12 @@ export function createDagLevelIndex<Tx = void>(store: DagStore<Tx>, index: Level
             return findForkPositionUsingLevelIndex(index, a, b)
         },
 
-        findCoverWithFilter(from: Position, meta: EntryMetaFilter): Promise<Position> {
-            return findCoverWithMetaUsingLevelIndex(store, index, from, meta);
+        findCoverWithFilter(from: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
+            return findCoverWithMetaUsingLevelIndex(store, index, from, meta, predicate);
         },
 
-        findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
-            return findConcurrentCoverWithMetaUsingLevelIndex(store, index, from, concurrentTo, meta);
+        findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
+            return findConcurrentCoverWithMetaUsingLevelIndex(store, index, from, concurrentTo, meta, predicate);
         },
 
         

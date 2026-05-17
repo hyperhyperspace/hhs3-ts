@@ -1,5 +1,5 @@
 import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { Dag, Entry, EntryMetaFilter, ForkPosition, joinFilters, MetaProps, position, Position } from "@hyper-hyper-space/hhs3_dag";
+import { Dag, Entry, EntryMetaFilter, EntryPredicate, ForkPosition, joinFilters, MetaProps, position, Position } from "@hyper-hyper-space/hhs3_dag";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { Literal } from "@hyper-hyper-space/hhs3_json/dist/literal.js";
 
@@ -11,8 +11,8 @@ export type ScopedDag = {
     computeEntryHash(payload: Literal, after?: Position): Promise<B64Hash>;
     loadEntry(h: B64Hash): Promise<Entry | undefined>;
     getFrontier(): Promise<Position>;
-    findCoverWithFilter(from: Position, meta: EntryMetaFilter): Promise<Position>;
-    findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position>;
+    findCoverWithFilter(from: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position>;
+    findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position>;
     findMinimalCover(p: Position): Promise<Position>;
 };
 
@@ -49,12 +49,12 @@ export class RootScopedDag implements ScopedDag {
         return this.dag.getFrontier();
     }
 
-    findCoverWithFilter(from: Position, meta: EntryMetaFilter): Promise<Position> {
-        return this.dag.findCoverWithFilter(from, meta);
+    findCoverWithFilter(from: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
+        return this.dag.findCoverWithFilter(from, meta, predicate);
     }
 
-    findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
-        return this.dag.findConcurrentCoverWithFilter(from, concurrentTo, meta);
+    findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
+        return this.dag.findConcurrentCoverWithFilter(from, concurrentTo, meta, predicate);
     }
 
     findMinimalCover(p: Position): Promise<Position> {
@@ -155,11 +155,11 @@ export class NestedScopedDag implements ScopedDag {
         return this.dag.findCoverWithFilter(p, this.scope.baseFilter());
     }
     
-    findCoverWithFilter(from: Position, meta: EntryMetaFilter): Promise<Position> {
-        return this.dag.findCoverWithFilter(from, joinFilters(this.scope.baseFilter(), this.scope.wrapFilter(meta)));
+    findCoverWithFilter(from: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
+        return this.dag.findCoverWithFilter(from, joinFilters(this.scope.baseFilter(), this.scope.wrapFilter(meta)), predicate);
     }
     
-    findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
-        return this.dag.findConcurrentCoverWithFilter(from, concurrentTo, joinFilters(this.scope.baseFilter(), this.scope.wrapFilter(meta)));
+    findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
+        return this.dag.findConcurrentCoverWithFilter(from, concurrentTo, joinFilters(this.scope.baseFilter(), this.scope.wrapFilter(meta)), predicate);
     }
 }

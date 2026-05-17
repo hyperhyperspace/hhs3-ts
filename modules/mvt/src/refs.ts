@@ -12,6 +12,7 @@ import type { MetaProps, Position } from "@hyper-hyper-space/hhs3_dag";
 import { json } from "@hyper-hyper-space/hhs3_json";
 
 import type { ScopedDag } from "./dag/dag_nesting.js";
+import { version } from "./mvt.js";
 import type { Version } from "./mvt.js";
 
 export const MAX_REF_ID_LENGTH = 256;
@@ -85,4 +86,43 @@ export async function findConcurrentRefAdvanceBarriers(
         at,
         { containsValues: { ref: [refId], barrier: ['t'] } },
     );
+}
+
+// Resolve the version of a referenced object at a given position in the
+// observer's DAG, incorporating concurrent ref-advance barriers from `from`.
+// Returns a single merged version suitable for querying the observed object
+// with getView(v, v).
+//
+// When from === at (unrevised), only causal ref-advances contribute.
+// When from !== at, concurrent ref-advance barriers widen the result,
+// implementing the BFT revision mechanism.
+export async function resolveRefVersionAtPosition(
+    dag: ScopedDag,
+    refId: B64Hash,
+    at: Version,
+    from: Version,
+): Promise<Version> {
+    const causal = await findRefAdvances(dag, refId, at);
+    const concurrent = await findConcurrentRefAdvanceBarriers(dag, refId, at, from);
+
+    const result = version();
+
+    for (const hash of causal) {
+        const entry = await dag.loadEntry(hash);
+        if (entry === undefined) continue;
+        if (isRefAdvancePayload(entry.payload)) {
+            for (const h of extractRefVersion(entry.payload as RefAdvancePayload)) result.add(h);
+        }
+    }
+
+    for (const hash of concurrent) {
+        if (causal.has(hash)) continue;
+        const entry = await dag.loadEntry(hash);
+        if (entry === undefined) continue;
+        if (isRefAdvancePayload(entry.payload)) {
+            for (const h of extractRefVersion(entry.payload as RefAdvancePayload)) result.add(h);
+        }
+    }
+
+    return result.size > 0 ? result : version(refId);
 }

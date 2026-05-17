@@ -86,8 +86,10 @@ export type MetaKeys = string[];
 export type MetaContainsValues = {[key: string]: Array<string>};
 export type EntryMetaFilter = { containsKeys?: MetaKeys, containsValues?: MetaContainsValues };
 
-export type FindCoverWithFilterFn = (from: Position, filter: EntryMetaFilter) => Promise<Position>;
-export type FindConcurrentCoverWithFilterFn = (from: Position, concurrentTo: Position, filter: EntryMetaFilter) => Promise<Position>;
+export type EntryPredicate = (hash: B64Hash, entry: Entry) => Promise<boolean>;
+
+export type FindCoverWithFilterFn = (from: Position, filter: EntryMetaFilter, predicate?: EntryPredicate) => Promise<Position>;
+export type FindConcurrentCoverWithFilterFn = (from: Position, concurrentTo: Position, filter: EntryMetaFilter, predicate?: EntryPredicate) => Promise<Position>;
 
 export function joinFilters(filter1: EntryMetaFilter, filter2: EntryMetaFilter): EntryMetaFilter {
     const hasKeyFilters = filter1.containsKeys !== undefined || filter2.containsKeys !== undefined;

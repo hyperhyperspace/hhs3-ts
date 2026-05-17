@@ -1,5 +1,5 @@
 import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { Entry, EntryMetaFilter, ForkPosition, Position, checkFilter } from "../../dag_defs.js";
+import { Entry, EntryMetaFilter, EntryPredicate, ForkPosition, Position, checkFilter } from "../../dag_defs.js";
 import { DagIndex } from "../../idx/dag_idx.js";
 import { DagStore } from "../../store/index.js";
 import { MultiMap } from "@hyper-hyper-space/hhs3_util";
@@ -127,9 +127,7 @@ export async function findForkPositionUsingFlatIndex(index: FlatIndexStore<any>,
     return {commonFrontier, common, forkA, forkB};
 }
 
-export async function findCoverWithFilterUsingFlatIndex(dag: DagStore<any>, index: FlatIndexStore<any>, from: Position, filter: EntryMetaFilter): Promise<Position> {
-    
-    //const minCover = new Set<B64Hash>([...from].filter(async (e: B64Hash) => checkFilter((await dag.loadHeader(e))!.meta, filter)));
+export async function findCoverWithFilterUsingFlatIndex(dag: DagStore<any>, index: FlatIndexStore<any>, from: Position, filter: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
 
     const preCover = new Set<B64Hash>();
 
@@ -146,7 +144,8 @@ export async function findCoverWithFilterUsingFlatIndex(dag: DagStore<any>, inde
                 throw new Error('node ' + n + ' not found');
             }
 
-            if (checkFilter((await dag.loadEntry(n))!.meta, filter)) {
+            const entry = (await dag.loadEntry(n))!;
+            if (checkFilter(entry.meta, filter) && (!predicate || await predicate(n, entry))) {
                 preCover.add(n);
             } else {
                 for (const pred of await index.getPreds(n)) {
@@ -162,7 +161,7 @@ export async function findCoverWithFilterUsingFlatIndex(dag: DagStore<any>, inde
 
 }
 
-export async function findConcurrentCoverWithFilterUsingFlatIndex(store: DagStore<any>, index: FlatIndexStore<any>, from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
+export async function findConcurrentCoverWithFilterUsingFlatIndex(store: DagStore<any>, index: FlatIndexStore<any>, from: Position, concurrentTo: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
 
 
     // Create a successor map in forwardMap
@@ -238,7 +237,8 @@ export async function findConcurrentCoverWithFilterUsingFlatIndex(store: DagStor
         const n = pending.values().next().value!;
         pending.delete(n);
 
-        if (!notConcurrentTo.has(n) && checkFilter((await store.loadEntry(n))!.meta, meta)) {
+        const entry = (await store.loadEntry(n))!;
+        if (!notConcurrentTo.has(n) && checkFilter(entry.meta, meta) && (!predicate || await predicate(n, entry))) {
             preConcCover.add(n);
         } else {
             for (const pred of await index.getPreds(n)) {
@@ -269,12 +269,12 @@ export function createFlatIndex<Tx = void>(store: DagStore<Tx>, indexStore: Flat
             return findForkPositionUsingFlatIndex(indexStore, a, b)
         },
         
-        findCoverWithFilter: function (from: Position, meta: EntryMetaFilter): Promise<Position> {
-            return findCoverWithFilterUsingFlatIndex(store, indexStore, from, meta);
+        findCoverWithFilter: function (from: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
+            return findCoverWithFilterUsingFlatIndex(store, indexStore, from, meta, predicate);
         },
 
-        findConcurrentCoverWithFilter: function (from: Position, concurrentTo: Position, meta: EntryMetaFilter): Promise<Position> {
-            return findConcurrentCoverWithFilterUsingFlatIndex(store, indexStore, from, concurrentTo, meta);
+        findConcurrentCoverWithFilter: function (from: Position, concurrentTo: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
+            return findConcurrentCoverWithFilterUsingFlatIndex(store, indexStore, from, concurrentTo, meta, predicate);
         },
 
         getIndexStore: () => indexStore

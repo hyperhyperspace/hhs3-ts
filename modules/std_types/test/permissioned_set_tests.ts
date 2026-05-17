@@ -50,8 +50,8 @@ async function createTestEnv(opts?: {
         seed: 'perm-set-test',
         initialElements: (opts?.initialElements ?? []) as any[],
         hashAlgorithm: 'sha256',
-        supportBarrierAdd: opts?.supportBarrierAdd ?? true,
-        supportBarrierDelete: opts?.supportBarrierDelete ?? true,
+        supportBarrierAdd: opts?.supportBarrierAdd ?? false,
+        supportBarrierDelete: opts ? (opts.supportBarrierDelete ?? false) : true,
         capabilityRef: cap.getId(),
         capRequirements: opts?.capRequirements ?? { add: 'write', delete: 'write' },
     });
@@ -270,9 +270,11 @@ export const permissionedSetTests = {
             }
         },
         {
-            name: '[PSET10] Peeling: all adds void means element absent',
+            name: '[PSET10] Sequential revocation does not void past authorized add',
             invoke: async () => {
-                // Only Bob adds X. Bob's write is revoked. X should disappear.
+                // Bob adds Y (authorized). Then Bob's write is revoked and
+                // ref-advanced sequentially. Since the ref-advance is not
+                // concurrent with Bob's add, Y remains present.
                 const { cap, rset, admin } = await createTestEnv({ capRequirements: { add: 'write', delete: 'write' } });
 
                 const bob = await makeIdentity();
@@ -291,7 +293,7 @@ export const permissionedSetTests = {
                 await rset.refAdvance(capV2, admin);
 
                 const viewAfter = await rset.getView();
-                assertFalse(await viewAfter.has('Y'), 'Y should disappear after revoking only adder');
+                assertTrue(await viewAfter.has('Y'), 'Y should survive sequential revocation');
             }
         },
         {
@@ -325,13 +327,14 @@ export const permissionedSetTests = {
             }
         },
         {
-            name: '[PSET12] Transitive revocation via managedBy chain',
+            name: '[PSET12] Sequential transitive revocation does not void past authorized add',
             invoke: async () => {
                 // Admin grants Manager the 'admin' cap.
                 // Manager grants Alice 'write'.
-                // Admin revokes Manager's 'admin' cap.
-                // After ref-advance, Alice's add should become void because
-                // Manager no longer holds 'admin' to authorize the grant.
+                // Alice adds Z (authorized via delegation chain).
+                // Admin revokes Manager's 'admin' cap, ref-advances sequentially.
+                // Z should survive because the ref-advance is not concurrent
+                // with Alice's add.
                 const { cap, rset, admin } = await createTestEnv({ capRequirements: { add: 'write', delete: 'write' } });
 
                 const manager = await makeIdentity();
@@ -361,7 +364,7 @@ export const permissionedSetTests = {
                 await rset.refAdvance(capV2, admin);
 
                 const viewAfter = await rset.getView();
-                assertFalse(await viewAfter.has('Z'), 'Z should disappear after transitive revocation');
+                assertTrue(await viewAfter.has('Z'), 'Z should survive sequential transitive revocation');
             }
         },
         {
@@ -421,6 +424,109 @@ export const permissionedSetTests = {
                 assertTrue(deps !== undefined, 'should return foreign deps');
                 assertTrue(deps!.length === 1, 'should have one dep');
                 assertTrue(deps![0].dagId === cap.getId(), 'dep should point to the RCap');
+            }
+        },
+        {
+            name: '[PSET17] Concurrent revocation voids unauthorized add',
+            invoke: async () => {
+                // Bob has write. Both the add and the revocation + ref-advance
+                // fork from the same RSet frontier, making them concurrent.
+                // The ref-advance barrier should void Bob's add.
+                const { cap, rset, admin } = await createTestEnv({ capRequirements: { add: 'write', delete: 'write' } });
+
+                const bob = await makeIdentity();
+                await registerAndGrant(cap, bob, 'write', admin);
+
+                const capV1 = await (await cap.getScopedDag()).getFrontier();
+                await rset.refAdvance(capV1, admin);
+
+                const setDag = await rset.getScopedDag();
+                const forkPoint = await setDag.getFrontier();
+
+                // Branch A: Bob adds Y
+                await rset.addSigned('Y', bob, forkPoint);
+
+                // Branch B (concurrent): revoke Bob, ref-advance
+                await cap.revoke(bob.keyId, 'write', admin);
+                const capV2 = await (await cap.getScopedDag()).getFrontier();
+                await rset.refAdvance(capV2, admin, forkPoint);
+
+                const view = await rset.getView();
+                assertFalse(await view.has('Y'), 'Y should be void: concurrent ref-advance revoked Bob');
+            }
+        },
+        {
+            name: '[PSET18] Concurrent transitive revocation voids add',
+            invoke: async () => {
+                // Manager delegates write to Alice. Alice adds Z concurrently
+                // with a ref-advance that carries Manager's admin revocation.
+                // Z should be void.
+                const { cap, rset, admin } = await createTestEnv({ capRequirements: { add: 'write', delete: 'write' } });
+
+                const manager = await makeIdentity();
+                const alice = await makeIdentity();
+
+                await registerAndGrant(cap, manager, 'admin', admin);
+                await registerAndGrant(cap, alice, 'enroll', admin);
+
+                await cap.grant(
+                    alice.keyId, 'write', cap.getId(),
+                    manager,
+                );
+
+                const capV1 = await (await cap.getScopedDag()).getFrontier();
+                await rset.refAdvance(capV1, admin);
+
+                const setDag = await rset.getScopedDag();
+                const forkPoint = await setDag.getFrontier();
+
+                // Branch A: Alice adds Z
+                await rset.addSigned('Z', alice, forkPoint);
+
+                // Branch B (concurrent): revoke Manager's admin, ref-advance
+                await cap.revoke(manager.keyId, 'admin', admin);
+                const capV2 = await (await cap.getScopedDag()).getFrontier();
+                await rset.refAdvance(capV2, admin, forkPoint);
+
+                const view = await rset.getView();
+                assertFalse(await view.has('Z'), 'Z should be void: concurrent transitive revocation');
+            }
+        },
+        {
+            name: '[PSET19] Concurrent non-barrier add survives non-barrier delete',
+            invoke: async () => {
+                // Alice adds X and Bob deletes X concurrently (both from the
+                // same fork point). Barriers are disabled. A non-barrier delete
+                // should only deactivate adds in its causal past, so the
+                // concurrent add should survive.
+                const { cap, rset, admin } = await createTestEnv({
+                    capRequirements: { add: 'write', delete: 'write' },
+                    supportBarrierAdd: false,
+                    supportBarrierDelete: false,
+                });
+
+                const alice = await makeIdentity();
+                const bob = await makeIdentity();
+                await registerAndGrant(cap, alice, 'write', admin);
+                await registerAndGrant(cap, bob, 'write', admin);
+
+                const capV1 = await (await cap.getScopedDag()).getFrontier();
+                await rset.refAdvance(capV1, admin);
+
+                // Alice adds X sequentially (so it exists for Bob to delete)
+                await rset.addSigned('X', alice);
+
+                const setDag = await rset.getScopedDag();
+                const forkPoint = await setDag.getFrontier();
+
+                // Branch A: Alice re-adds X
+                await rset.addSigned('X', alice, forkPoint);
+
+                // Branch B (concurrent): Bob deletes X (non-barrier)
+                await rset.deleteSigned('X', bob, forkPoint);
+
+                const view = await rset.getView();
+                assertTrue(await view.has('X'), 'X should survive: concurrent non-barrier delete cannot void concurrent add');
             }
         },
     ]

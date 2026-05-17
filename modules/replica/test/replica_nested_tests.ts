@@ -27,8 +27,6 @@ export const replicaNestedTests = {
                     contentType: RSet.typeId,
                     initialElements: [],
                     hashAlgorithm: 'sha256',
-                    supportBarrierAdd: true,
-                    supportBarrierDelete: true,
                 });
 
                 const outerSet = (await replica.createObject(outerInit)) as RSet;
@@ -37,8 +35,6 @@ export const replicaNestedTests = {
                     seed: 'inner-1',
                     initialElements: [],
                     hashAlgorithm: 'sha256',
-                    supportBarrierAdd: true,
-                    supportBarrierDelete: true,
                 });
 
                 const innerHash = await outerSet.add(innerInit.payload);
@@ -64,8 +60,6 @@ export const replicaNestedTests = {
                     contentType: RSet.typeId,
                     initialElements: [],
                     hashAlgorithm: 'sha256',
-                    supportBarrierAdd: true,
-                    supportBarrierDelete: true,
                 });
 
                 const outerSet = (await replica.createObject(outerInit)) as RSet;
@@ -75,8 +69,6 @@ export const replicaNestedTests = {
                         seed,
                         initialElements: [],
                         hashAlgorithm: 'sha256',
-                        supportBarrierAdd: true,
-                        supportBarrierDelete: true,
                     });
                     const hash = await outerSet.add(init.payload);
                     const view = await outerSet.getView();
@@ -113,8 +105,6 @@ export const replicaNestedTests = {
                     contentType: RSet.typeId,
                     initialElements: [],
                     hashAlgorithm: 'sha256',
-                    supportBarrierAdd: true,
-                    supportBarrierDelete: true,
                 });
 
                 const outerSet = (await replica.createObject(outerInit)) as RSet;
@@ -124,8 +114,6 @@ export const replicaNestedTests = {
                     contentType: RSet.typeId,
                     initialElements: [],
                     hashAlgorithm: 'sha256',
-                    supportBarrierAdd: true,
-                    supportBarrierDelete: true,
                 });
 
                 const midHash = await outerSet.add(midInit.payload);
@@ -136,8 +124,6 @@ export const replicaNestedTests = {
                     seed: 'inner-leaf',
                     initialElements: [],
                     hashAlgorithm: 'sha256',
-                    supportBarrierAdd: true,
-                    supportBarrierDelete: true,
                 });
 
                 const innerHash = await midSet.add(innerInit.payload);
@@ -166,8 +152,6 @@ export const replicaNestedTests = {
                     contentType: RSet.typeId,
                     initialElements: [],
                     hashAlgorithm: 'sha256',
-                    supportBarrierAdd: true,
-                    supportBarrierDelete: true,
                 });
 
                 const outerSet = (await r1.createObject(outerInit)) as RSet;

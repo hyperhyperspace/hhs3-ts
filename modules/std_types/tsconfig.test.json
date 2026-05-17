@@ -3,5 +3,9 @@
     "compilerOptions": {
         "outDir": "test-build",
         "paths": {"src/*" : ["./src/*"], "test/*" : ["./test/*"]}
-    }
+    },
+    "include": [
+        "src/**/*",
+        "test/**/*"
+    ]
 }
