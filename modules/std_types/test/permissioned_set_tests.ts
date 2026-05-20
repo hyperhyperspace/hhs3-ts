@@ -529,5 +529,41 @@ export const permissionedSetTests = {
                 assertTrue(await view.has('X'), 'X should survive: concurrent non-barrier delete cannot void concurrent add');
             }
         },
+        {
+            name: '[PSET20] Sequential ref-advance with concurrent RCap branch voids add',
+            invoke: async () => {
+                // Bob is granted write on the main RCap branch. RSet ref-advances to V1,
+                // Bob adds Y sequentially. A concurrent RCap branch (forking before the
+                // grant) revokes Bob with a barrier; merged into V2. Sequential ref-advance
+                // to V2 should void Y via RCap.getView(V1, V2) compositional revision.
+                const { cap, rset, admin } = await createTestEnv({ capRequirements: { add: 'write', delete: 'write' } });
+
+                const bob = await makeIdentity();
+                await cap.addIdentity(
+                    bob.keyId, serializePublicKeyToBase64(bob.publicKey),
+                    admin,
+                );
+
+                const capFork = await (await cap.getScopedDag()).getFrontier();
+
+                await cap.grant(bob.keyId, 'write', cap.getId(), admin, capFork);
+
+                const capV1 = await (await cap.getScopedDag()).getFrontier();
+                await rset.refAdvance(capV1, admin);
+
+                await rset.addSigned('Y', bob);
+
+                const viewBefore = await rset.getView();
+                assertTrue(await viewBefore.has('Y'), 'Y should be present before concurrent RCap revoke merges');
+
+                await cap.revoke(bob.keyId, 'write', admin, capFork);
+
+                const capV2 = await (await cap.getScopedDag()).getFrontier();
+                await rset.refAdvance(capV2, admin);
+
+                const viewAfter = await rset.getView();
+                assertFalse(await viewAfter.has('Y'), 'Y should be void: concurrent RCap barrier revoke revises authorization at V1');
+            }
+        },
     ]
 };

@@ -88,14 +88,16 @@ export async function findConcurrentRefAdvanceBarriers(
     );
 }
 
-// Resolve the version of a referenced object at a given position in the
-// observer's DAG, incorporating concurrent ref-advance barriers from `from`.
-// Returns a single merged version suitable for querying the observed object
-// with getView(v, v).
+// Resolve referenced version(s) at `at` in the observer DAG, optionally widened
+// by ref-advance barriers concurrent to `at` when observed from `from`.
+// Observers pass the result as the referenced object's `at`; the referenced
+// object's `from` is typically a separate resolution at the view frontier
+// (call with from === at to get ref-advances in the frontier's history only,
+// without concurrent barrier widening).
 //
-// When from === at (unrevised), only causal ref-advances contribute.
+// When from === at, only ref-advances in the history of `at` contribute.
 // When from !== at, concurrent ref-advance barriers widen the result,
-// implementing the BFT revision mechanism.
+// implementing the BFT revision mechanism in the observer DAG.
 export async function resolveRefVersionAtPosition(
     dag: ScopedDag,
     refId: B64Hash,

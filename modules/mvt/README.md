@@ -221,7 +221,8 @@ An observer `RObject` can hold versioned references to other `RObject`s and adva
 - **`refAdvanceFormat`** — a `json.Format` for validating the ref-advance portion of a payload. Designed for non-strict checking so types can extend it.
 - **Payload utilities** — `isRefAdvancePayload` (type guard), `createRefAdvancePayload` (constructor), `extractRefVersion` (extracts the target version from a payload).
 - **Metadata** — `refAdvanceMeta(refId)` returns the `MetaProps` to attach when appending a ref-advance entry, tagging it for indexed queries.
-- **DAG queries** — `findRefAdvances(dag, refId, at)` finds all ref-advance entries for a reference up to a position; `findConcurrentRefAdvanceBarriers(dag, refId, at, from)` finds ref-advance barrier entries concurrent to a position, used for `(at, from)` revision semantics.
+- **DAG queries** — `findRefAdvances(dag, refId, at)` finds all ref-advance entries for a reference up to a position; `findConcurrentRefAdvanceBarriers(dag, refId, at, from)` finds ref-advance barrier entries concurrent to a position, used for `(at, from)` revision semantics in the observer DAG.
+- **`resolveRefVersionAtPosition(dag, refId, at, from)`** — merges causal ref-advances up to `at` with concurrent ref-advance **barriers** reachable from `from` in the **observer** DAG. Observers use this to decide which target version(s) an entry must be checked against. Permissioned `RSet` uses it twice when querying `RCap`: once for the entry position (with barriers) as the referenced `at`, and once at the view frontier with `from === at` as the referenced `from`.
 
 These are thin, generic utilities. Full reference resolution — including authorization, barrier semantics, and monotonicity enforcement — is the responsibility of each type's `View` implementation, not of MVT generically.
 
@@ -233,7 +234,7 @@ These are thin, generic utilities. Full reference resolution — including autho
 - **Nested object sets**: when a `contentType` is specified, each element is a nested `RObject` whose creation payload is stored as the add operation's content. Updates to nested elements are transparently routed through the parent DAG via `NestedScopedDag`.
 - **Barrier operations**: optional add/delete barriers for fine-grained concurrency control.
 - **Version-scoped views**: `RSetView` computes set membership at any version, correctly handling concurrent adds, deletes, and barriers by querying the causal DAG.
-- **Permissioned mode**: when created with a reference to an `RCap` capabilities object, add/delete operations require signed payloads from authorized identities. Authorization is re-evaluated at view time through an iterative peeling algorithm, ensuring correct behavior across ref-advance revisions.
+- **Permissioned mode**: references `RCap`; authorization at view time is compositional (`RCap.getView(rcapAt, rcapFrom)` per entry) with predicate-aware cover queries peeling void entries.
 
 ```typescript
 const init = await RSet.create({

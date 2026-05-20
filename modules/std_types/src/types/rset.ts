@@ -900,11 +900,14 @@ export class RSetView<T  extends json.Literal> implements View {
         return false;
     }
 
+    // Compositional: rcapAt = which RCap version E is checked against (RSet barrier
+    // ref-advances may widen this); rcapFrom = observation frontier for RCap revision.
     private async resolveRCapViewForEntry(
         dag: ScopedDag, rcap: RCap, refId: B64Hash, entryHash: B64Hash,
     ): Promise<RCapView> {
-        const v = await resolveRefVersionAtPosition(dag, refId, version(entryHash), this.from);
-        return rcap.getView(v, v) as Promise<RCapView>;
+        const rcapAt = await resolveRefVersionAtPosition(dag, refId, version(entryHash), this.from);
+        const rcapFrom = await resolveRefVersionAtPosition(dag, refId, this.from, this.from);
+        return rcap.getView(rcapAt, rcapFrom) as Promise<RCapView>;
     }
 
     private async isEntryAuthorized(payload: json.Literal, rcapView: RCapView): Promise<boolean> {
