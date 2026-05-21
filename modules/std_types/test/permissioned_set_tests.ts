@@ -1,4 +1,4 @@
-import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.js";
+import { assertTrue, assertFalse, assertEquals } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { HASH_SHA256, createBasicCrypto, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { version } from "@hyper-hyper-space/hhs3_mvt";
@@ -563,6 +563,192 @@ export const permissionedSetTests = {
 
                 const viewAfter = await rset.getView();
                 assertFalse(await viewAfter.has('Y'), 'Y should be void: concurrent RCap barrier revoke revises authorization at V1');
+            }
+        },
+        {
+            name: '[PSET21] Admission-vs-view: validated add voided by concurrent RSet barrier ref-advance',
+            invoke: async () => {
+                // Bob is authorized and adds Y at forkPoint (passes selfValidate).
+                // A concurrent branch revokes Bob and ref-advances from the same
+                // forkPoint. The add passed validation (causal check) but the view
+                // voids it via the concurrent barrier.
+                const { cap, rset, admin } = await createTestEnv({ capRequirements: { add: 'write', delete: 'write' } });
+
+                const bob = await makeIdentity();
+                await registerAndGrant(cap, bob, 'write', admin);
+
+                const capV1 = await (await cap.getScopedDag()).getFrontier();
+                await rset.refAdvance(capV1, admin);
+
+                const setDag = await rset.getScopedDag();
+                const forkPoint = await setDag.getFrontier();
+
+                // Branch A: Bob adds Y (succeeds — validation passes at forkPoint)
+                const addHash = await rset.addSigned('Y', bob, forkPoint);
+
+                // Branch B (concurrent): revoke Bob, ref-advance
+                await cap.revoke(bob.keyId, 'write', admin);
+                const capV2 = await (await cap.getScopedDag()).getFrontier();
+                await rset.refAdvance(capV2, admin, forkPoint);
+
+                // Re-check: validatePayload at the add's original position still passes
+                // (causal-only view sees capV1, where Bob is authorized)
+                const addEntry = await setDag.loadEntry(addHash);
+                assertTrue(addEntry !== undefined, 'add entry should exist in the DAG');
+                const valid = await rset.validatePayload(addEntry!.payload, forkPoint);
+                assertTrue(valid, 'validatePayload should pass at admission position (causal-only)');
+
+                // But the frontier view voids it via the concurrent barrier ref-advance
+                const view = await rset.getView();
+                assertFalse(await view.has('Y'), 'Y should be void at frontier despite passing validation');
+            }
+        },
+        {
+            name: '[PSET22] Admission-vs-view: validated add voided by RCap-internal barriers (compositional revision)',
+            invoke: async () => {
+                // Bob is granted write on the main RCap branch. RSet ref-advances
+                // to V1. Bob adds Y sequentially (passes validation). A concurrent
+                // RCap branch (forking before the grant) revokes Bob with a barrier.
+                // Sequential ref-advance to V2 (merged) voids Y via compositional
+                // revision: rcap.getView(V1, V2) exposes the concurrent barrier
+                // revoke inside the RCap.
+                const { cap, rset, admin } = await createTestEnv({ capRequirements: { add: 'write', delete: 'write' } });
+
+                const bob = await makeIdentity();
+                await cap.addIdentity(
+                    bob.keyId, serializePublicKeyToBase64(bob.publicKey),
+                    admin,
+                );
+
+                const capFork = await (await cap.getScopedDag()).getFrontier();
+
+                await cap.grant(bob.keyId, 'write', cap.getId(), admin, capFork);
+
+                const capV1 = await (await cap.getScopedDag()).getFrontier();
+                await rset.refAdvance(capV1, admin);
+
+                // Bob adds Y sequentially (passes validation — causal RCap version
+                // is V1, where Bob is authorized)
+                const setDag = await rset.getScopedDag();
+                const addAt = await setDag.getFrontier();
+                const addHash = await rset.addSigned('Y', bob);
+
+                const viewBefore = await rset.getView();
+                assertTrue(await viewBefore.has('Y'), 'Y should be present before concurrent RCap revoke merges');
+
+                // Concurrent RCap branch: revoke Bob (barrier) from capFork
+                await cap.revoke(bob.keyId, 'write', admin, capFork);
+
+                const capV2 = await (await cap.getScopedDag()).getFrontier();
+                await rset.refAdvance(capV2, admin);
+
+                // Re-check: validatePayload at the add's original position still passes
+                const addEntry = await setDag.loadEntry(addHash);
+                assertTrue(addEntry !== undefined, 'add entry should exist in the DAG');
+                const valid = await rset.validatePayload(addEntry!.payload, addAt);
+                assertTrue(valid, 'validatePayload should pass at admission position (causal RCap V1 authorizes Bob)');
+
+                // But the frontier view voids it via compositional revision
+                const viewAfter = await rset.getView();
+                assertFalse(await viewAfter.has('Y'), 'Y should be void: compositional rcap.getView(V1, V2) exposes concurrent barrier revoke');
+            }
+        },
+        {
+            name: '[PSET23] Explicit getView(at, from) revision changes element visibility',
+            invoke: async () => {
+                // Demonstrates that the `from` parameter directly controls
+                // barrier incorporation: the same `at` yields different element
+                // visibility depending on `from`.
+                const { cap, rset, admin } = await createTestEnv({ capRequirements: { add: 'write', delete: 'write' } });
+
+                const bob = await makeIdentity();
+                await registerAndGrant(cap, bob, 'write', admin);
+
+                const capV1 = await (await cap.getScopedDag()).getFrontier();
+                await rset.refAdvance(capV1, admin);
+
+                const setDag = await rset.getScopedDag();
+                const forkPoint = await setDag.getFrontier();
+
+                // Branch A: Bob adds Y
+                await rset.addSigned('Y', bob, forkPoint);
+
+                // Capture the version that includes only branch A (add)
+                const branchAVersion = await setDag.getFrontier();
+
+                // Branch B (concurrent): revoke Bob, ref-advance
+                await cap.revoke(bob.keyId, 'write', admin);
+                const capV2 = await (await cap.getScopedDag()).getFrontier();
+                await rset.refAdvance(capV2, admin, forkPoint);
+
+                const fullFrontier = await setDag.getFrontier();
+
+                // Unrevised view at branchA: Y is present (Bob authorized in causal history)
+                const unrevisedView = await rset.getView(branchAVersion, branchAVersion);
+                assertTrue(await unrevisedView.has('Y'), 'unrevised view at branchA should show Y');
+
+                // Revised view: same `at` but `from` includes the barrier branch
+                const revisedView = await rset.getView(branchAVersion, fullFrontier);
+                assertFalse(await revisedView.has('Y'), 'revised view (from=fullFrontier) should void Y');
+
+                // Default frontier view should also void Y
+                const defaultView = await rset.getView();
+                assertFalse(await defaultView.has('Y'), 'default frontier view should void Y');
+            }
+        },
+        {
+            name: '[PSET24] resolveRefVersion returns widened version after concurrent barrier ref-advance',
+            invoke: async () => {
+                // After a concurrent barrier ref-advance, resolveRefVersion
+                // should return a widened version that includes the barrier's
+                // RCap hashes — and the unrevised version should not.
+                const { cap, rset, admin } = await createTestEnv({ capRequirements: { add: 'write', delete: 'write' } });
+
+                const bob = await makeIdentity();
+                await registerAndGrant(cap, bob, 'write', admin);
+
+                const capV1 = await (await cap.getScopedDag()).getFrontier();
+                await rset.refAdvance(capV1, admin);
+
+                const setDag = await rset.getScopedDag();
+                const forkPoint = await setDag.getFrontier();
+                const capRef = cap.getId();
+
+                // Branch A: Bob adds Y
+                await rset.addSigned('Y', bob, forkPoint);
+                const branchAVersion = await setDag.getFrontier();
+
+                // Branch B (concurrent): revoke Bob, ref-advance to capV2
+                await cap.revoke(bob.keyId, 'write', admin);
+                const capV2 = await (await cap.getScopedDag()).getFrontier();
+                await rset.refAdvance(capV2, admin, forkPoint);
+
+                const fullFrontier = await setDag.getFrontier();
+
+                // Unrevised: resolveRefVersion should return capV1 hashes only
+                const unrevisedView = await rset.getView(branchAVersion, branchAVersion);
+                const unrevisedRef = await unrevisedView.resolveRefVersion(capRef);
+                for (const h of capV1) {
+                    assertTrue(unrevisedRef.has(h), 'unrevised ref version should contain capV1 hash ' + h);
+                }
+                for (const h of capV2) {
+                    if (!capV1.has(h)) {
+                        assertFalse(unrevisedRef.has(h), 'unrevised ref version should NOT contain capV2-only hash ' + h);
+                    }
+                }
+
+                // Revised: resolveRefVersion should be widened to include capV2 hashes
+                const revisedView = await rset.getView(branchAVersion, fullFrontier);
+                const revisedRef = await revisedView.resolveRefVersion(capRef);
+                for (const h of capV2) {
+                    assertTrue(revisedRef.has(h), 'revised ref version should contain capV2 hash ' + h);
+                }
+
+                // The revised version should be a strict superset of the unrevised
+                assertTrue(revisedRef.size > unrevisedRef.size, 'revised ref version should be strictly larger than unrevised');
+                for (const h of unrevisedRef) {
+                    assertTrue(revisedRef.has(h), 'revised ref version should contain all unrevised hashes');
+                }
             }
         },
     ]
