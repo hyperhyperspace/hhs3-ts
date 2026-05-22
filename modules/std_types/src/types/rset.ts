@@ -28,7 +28,7 @@ import { B64Hash, HASH_SHA256, sha256, stringToUint8Array } from "@hyper-hyper-s
 import type { KeyId, PublicKey, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, MetaProps, position, EntryMetaFilter, EntryPredicate, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
 
-import { Payload, RObject, RObjectFactory, RObjectInit, RContext, RObjectConfig, SyncableObject, NestingParent, version, Version, View, ForeignDep } from "@hyper-hyper-space/hhs3_mvt";
+import { Payload, RObject, RObjectFactory, RObjectInit, RContext, RObjectConfig, SyncableObject, NestingParent, version, Version, View, Delta, ForeignDep } from "@hyper-hyper-space/hhs3_mvt";
 import { DagScope, NestedScopedDag, RootScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
 import { isRefAdvancePayload, refAdvanceFormat, refAdvanceMeta, createRefAdvancePayload, resolveRefVersionAtPosition } from "@hyper-hyper-space/hhs3_mvt";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
@@ -721,6 +721,79 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
         throw new Error("Method not implemented.");
     }
 
+    private deltaStrategy: RSetDeltaStrategy = 'full';
+
+    setDeltaStrategy(strategy: RSetDeltaStrategy): void {
+        this.deltaStrategy = strategy;
+    }
+
+    private async collectAllElementHashes(): Promise<Set<B64Hash>> {
+        const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
+        if (rawDag === undefined) throw new Error("DAG not found");
+        const elmtHashes = new Set<B64Hash>();
+        for await (const entry of rawDag.loadAllEntries()) {
+            const elmts = entry.meta['elmts'];
+            if (elmts !== undefined) {
+                for (const h of json.fromSet(elmts)) elmtHashes.add(h);
+            }
+        }
+        return elmtHashes;
+    }
+
+    async computeDelta(start: Version, end: Version): Promise<RSetDelta> {
+        if (this.parentObj !== undefined) {
+            throw new Error("computeDelta is not supported on nested RSet");
+        }
+
+        const elmtHashes = await this.collectAllElementHashes();
+
+        const startView = await this.getView(start, start) as RSetView<T>;
+        const endView = await this.getView(end, end) as RSetView<T>;
+
+        const added: B64Hash[] = [];
+        const removed: B64Hash[] = [];
+
+        for (const h of elmtHashes) {
+            const inStart = await startView.hasByHash(h);
+            const inEnd = await endView.hasByHash(h);
+            if (!inStart && inEnd) added.push(h);
+            if (inStart && !inEnd) removed.push(h);
+        }
+
+        const validityChanges: ValidityChange[] = [];
+
+        if (this.isPermissioned()) {
+            const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
+            if (rawDag === undefined) throw new Error("DAG not found");
+
+            for await (const entry of rawDag.loadAllEntries()) {
+                const p = entry.payload as unknown as SetPayload;
+                if (p['action'] !== 'add' && p['action'] !== 'delete') continue;
+
+                const wasValid = await startView.checkEntryAuthorization(entry.hash);
+                const nowValid = await endView.checkEntryAuthorization(entry.hash);
+
+                if (wasValid !== nowValid) {
+                    const elmts = entry.meta['elmts'];
+                    if (elmts === undefined) continue;
+
+                    for (const elementHash of json.fromSet(elmts)) {
+                        validityChanges.push({
+                            entryHash: entry.hash,
+                            elementHash,
+                            action: p['action'],
+                            author: isAuthoredPayload(entry.payload) ? extractAuthor(entry.payload) : undefined,
+                            wasValid,
+                            nowValid,
+                        });
+                    }
+                }
+            }
+        }
+
+        return new RSetDelta(start, end, version(), added, removed, validityChanges);
+    }
+
     async getScopedDag(): Promise<ScopedDag> {
         if (this._scopedDag === undefined) {
             if (this.parentObj !== undefined) {
@@ -927,6 +1000,18 @@ export class RSetView<T  extends json.Literal> implements View {
         return rcapView.hasCapability(authorId, capName);
     }
 
+    async checkEntryAuthorization(entryHash: B64Hash): Promise<boolean> {
+        if (!this.target.isPermissioned()) return true;
+        const dag = await this.target.getScopedDag();
+        const rcap = await this.target.loadRCap();
+        if (rcap === undefined) throw new Error("Cannot load referenced RCap");
+        const refId = this.target.capabilityRef()!;
+        const entry = await dag.loadEntry(entryHash);
+        if (entry === undefined) return false;
+        const rcapView = await this.resolveRCapViewForEntry(dag, rcap, refId, entryHash);
+        return this.isEntryAuthorized(entry.payload, rcapView);
+    }
+
     async getReferences(): Promise<B64Hash[]> {
         const ref = this.target.capabilityRef();
         if (ref === undefined) return [];
@@ -1093,4 +1178,30 @@ class ElementUpdateScope extends NestedElementScope implements DagScope {
 
 function hashElement<T extends json.Literal>(element: T): B64Hash {
     return sha256.hashToB64(stringToUint8Array(json.toStringNormalized(element)));
+}
+
+export type RSetDeltaStrategy = 'full' | 'bounded';
+
+export type ValidityChange = {
+    entryHash: B64Hash;
+    elementHash: B64Hash;
+    action: 'add' | 'delete' | 'create';
+    author: KeyId | undefined;
+    wasValid: boolean;
+    nowValid: boolean;
+};
+
+export class RSetDelta implements Delta {
+    constructor(
+        private start: Version,
+        private end: Version,
+        private revisionBound: Version,
+        public readonly added: B64Hash[],
+        public readonly removed: B64Hash[],
+        public readonly validityChanges: ValidityChange[],
+    ) {}
+
+    getStartVersion(): Version { return this.start; }
+    getEndVersion(): Version { return this.end; }
+    getRevisionBound(): Version { return this.revisionBound; }
 }

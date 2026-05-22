@@ -3,7 +3,7 @@ import { B64Hash, HASH_SHA256, KeyId, PublicKey } from "@hyper-hyper-space/hhs3_
 import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, MetaProps, position, Position } from "@hyper-hyper-space/hhs3_dag";
 
-import { Payload, RObject, RObjectFactory, RObjectInit, RContext, SyncableObject, version, Version, View, ForeignDep } from "@hyper-hyper-space/hhs3_mvt";
+import { Payload, RObject, RObjectFactory, RObjectInit, RContext, SyncableObject, version, Version, View, Delta, ForeignDep } from "@hyper-hyper-space/hhs3_mvt";
 import { RootScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { Mesh, Swarm } from "@hyper-hyper-space/hhs3_mesh";
@@ -123,6 +123,7 @@ export class RCap implements RObject, SyncableObject {
     private _swarm: Swarm | undefined;
     private _syncSession: SyncSession | undefined;
     private runtimeConfig: RCapRuntimeConfig = { meshLabel: 'default', backendLabel: 'default' };
+    private deltaStrategy: RCapDeltaStrategy = 'full';
 
     constructor(createOpId: B64Hash, createOp: CreateRCapPayload, ctx: RContext) {
         this.createOpId = createOpId;
@@ -435,6 +436,71 @@ export class RCap implements RObject, SyncableObject {
         throw new Error("Method not implemented.");
     }
 
+    setDeltaStrategy(strategy: RCapDeltaStrategy): void {
+        this.deltaStrategy = strategy;
+    }
+
+    async computeDelta(start: Version, end: Version): Promise<RCapDelta> {
+        const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
+        if (rawDag === undefined) throw new Error("DAG not found");
+
+        const keyIds = new Set<KeyId>();
+        const capNames = new Set<string>(Object.keys(this.createOp.initialCaps));
+        const grantPairs = new Map<string, Set<KeyId>>();
+
+        for await (const entry of rawDag.loadAllEntries()) {
+            const p = entry.payload as CapPayload;
+            switch (p.action) {
+                case 'add-identity':
+                    keyIds.add(p.keyId);
+                    break;
+                case 'create-cap':
+                    capNames.add(p.capName);
+                    break;
+                case 'grant':
+                case 'revoke':
+                    if (!grantPairs.has(p.capName)) grantPairs.set(p.capName, new Set());
+                    grantPairs.get(p.capName)!.add(p.grantee);
+                    break;
+            }
+        }
+
+        const startView = await this.getView(start, start);
+        const endView = await this.getView(end, end);
+
+        const identityChanges: IdentityChange[] = [];
+        for (const keyId of keyIds) {
+            const wasIdentity = await startView.isIdentity(keyId);
+            const nowIdentity = await endView.isIdentity(keyId);
+            if (wasIdentity !== nowIdentity) {
+                identityChanges.push({ keyId, added: nowIdentity });
+            }
+        }
+
+        const capabilityChanges: CapabilityChange[] = [];
+        for (const capName of capNames) {
+            const existed = await startView.capabilityExists(capName);
+            const exists = await endView.capabilityExists(capName);
+            if (existed !== exists) {
+                capabilityChanges.push({ capName, existed, exists });
+            }
+        }
+
+        const grantChanges: GrantChange[] = [];
+        for (const [capName, grantKeyIds] of grantPairs) {
+            for (const keyId of grantKeyIds) {
+                if (this.isCreator(keyId)) continue;
+                const wasGranted = await startView.hasCapability(keyId, capName);
+                const nowGranted = await endView.hasCapability(keyId, capName);
+                if (wasGranted !== nowGranted) {
+                    grantChanges.push({ keyId, capName, wasGranted, nowGranted });
+                }
+            }
+        }
+
+        return new RCapDelta(start, end, version(), identityChanges, capabilityChanges, grantChanges);
+    }
+
     configure(config: RCapRuntimeConfig): void {
         this.runtimeConfig = { ...this.runtimeConfig, ...config };
         this._scopedDag = undefined;
@@ -684,4 +750,39 @@ export class RCapView implements View {
 
         return caps;
     }
+}
+
+export type RCapDeltaStrategy = 'full' | 'bounded';
+
+export type IdentityChange = {
+    keyId: KeyId;
+    added: boolean;
+};
+
+export type CapabilityChange = {
+    capName: string;
+    existed: boolean;
+    exists: boolean;
+};
+
+export type GrantChange = {
+    keyId: KeyId;
+    capName: string;
+    wasGranted: boolean;
+    nowGranted: boolean;
+};
+
+export class RCapDelta implements Delta {
+    constructor(
+        private start: Version,
+        private end: Version,
+        private revisionBound: Version,
+        public readonly identityChanges: IdentityChange[],
+        public readonly capabilityChanges: CapabilityChange[],
+        public readonly grantChanges: GrantChange[],
+    ) {}
+
+    getStartVersion(): Version { return this.start; }
+    getEndVersion(): Version { return this.end; }
+    getRevisionBound(): Version { return this.revisionBound; }
 }

@@ -17,6 +17,12 @@ export type ForeignDep = {
     requiredHashes: B64Hash[];
 }
 
+export type Delta = {
+    getStartVersion(): Version;
+    getEndVersion(): Version;
+    getRevisionBound(): Version;
+}
+
 export type RObject = {
     
     getId(): B64Hash;
@@ -26,6 +32,7 @@ export type RObject = {
     applyPayload(payload: Payload, at: Version): Promise<B64Hash>;
 
     getView(at?: Version, from?: Version): Promise<View>;
+    computeDelta(start: Version, end: Version): Promise<Delta>;
 
     extractForeignDeps(payload: Payload, at: Version): ForeignDep[] | undefined;
 

@@ -100,6 +100,7 @@ function createMockRObject(d: dag.Dag, id: B64Hash, opts?: {
             return await d.append(payload, {}, at);
         },
         getView: async (_at?: Version, _from?: Version): Promise<View> => { throw new Error('not implemented'); },
+        computeDelta: async (_start: Version, _end: Version) => { throw new Error('not implemented'); },
         extractForeignDeps: opts?.extractForeignDeps ?? ((_payload: Payload, _at: Version) => undefined),
         subscribe: (_cb: (event: Event) => void) => {},
         unsubscribe: (_cb: (event: Event) => void) => {},
