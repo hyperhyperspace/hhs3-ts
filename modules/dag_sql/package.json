@@ -23,7 +23,7 @@
     "@hyper-hyper-space/hhs3_dag_test": "^0.1.0",
     "better-sqlite3": "^11.0.0",
     "@types/better-sqlite3": "^7.6.0",
-    "typescript": "^5.5.4",
+    "typescript": "6.0.3",
     "ts-node": "^10.9.2",
     "@types/node": "^22.2.0"
   }

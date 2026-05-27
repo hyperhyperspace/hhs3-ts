@@ -4,8 +4,8 @@
   "description": "WebSocket transport for HHSv3 mesh",
   "type": "module",
   "source": "src/index.ts",
-  "main": "dist/src/index.js",
-  "types": "dist/src/index.d.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "scripts": {
     "test": "node --import ../../register.mjs ./test/run_tests.ts",
     "debug": "node --import ../../register.mjs ./test/run_tests.ts",
@@ -18,7 +18,7 @@
     "@types/node": "^22.2.0",
     "@types/ws": "^8.5.0",
     "ts-node": "^10.9.2",
-    "typescript": "^5.5.4"
+    "typescript": "6.0.3"
   },
   "dependencies": {
     "@hyper-hyper-space/hhs3_mesh": "^0.1.0",

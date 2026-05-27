@@ -53,7 +53,7 @@ function canonicalBytesWithoutSignature(payload: json.LiteralMap): Uint8Array {
 
 export function serializePublicKeyToBase64(pk: PublicKey): string {
     const bytes = serializePublicKey(pk);
-    return base64.fromArrayBuffer(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    return base64.fromArrayBuffer(bytes.slice().buffer);
 }
 
 export function deserializePublicKeyFromBase64(b64: string): PublicKey {
@@ -77,7 +77,7 @@ export async function signPayload<T extends json.LiteralMap>(
     const withAuthor = { ...payload, author: author.keyId, signature: '' };
     const message = canonicalBytesWithoutSignature(withAuthor);
     const sigBytes = await suite.sign(message, author.secretKey);
-    const signature = base64.fromArrayBuffer(sigBytes.buffer.slice(sigBytes.byteOffset, sigBytes.byteOffset + sigBytes.byteLength));
+    const signature = base64.fromArrayBuffer(sigBytes.slice().buffer);
 
     return { ...withAuthor, signature };
 }
