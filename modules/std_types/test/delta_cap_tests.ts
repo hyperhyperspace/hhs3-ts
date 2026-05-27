@@ -31,6 +31,27 @@ async function createTestCap(admin: OwnIdentity) {
     return { ctx, cap };
 }
 
+function normalizeDelta(delta: RCapDelta) {
+    const identityChanges = [...delta.identityChanges].sort((a, b) => a.keyId.localeCompare(b.keyId));
+    const capabilityChanges = [...delta.capabilityChanges].sort((a, b) => a.capName.localeCompare(b.capName));
+    const grantChanges = [...delta.grantChanges].sort((a, b) => {
+        const capCmp = a.capName.localeCompare(b.capName);
+        if (capCmp !== 0) return capCmp;
+        return a.keyId.localeCompare(b.keyId);
+    });
+    return { identityChanges, capabilityChanges, grantChanges };
+}
+
+async function computeWithStrategy(
+    cap: RCap,
+    strategy: 'full' | 'bounded',
+    start: ReturnType<typeof version>,
+    end: ReturnType<typeof version>,
+): Promise<RCapDelta> {
+    cap.setDeltaStrategy(strategy);
+    return await cap.computeDelta(start, end) as RCapDelta;
+}
+
 export const deltaCapTests = {
     title: '[CAP_DELTA] RCap computeDelta tests',
     tests: [
@@ -181,6 +202,175 @@ export const deltaCapTests = {
                 assertFalse(grantToMerge.grantChanges[0].nowGranted, 'now revoked');
                 assertEquals(grantToMerge.grantChanges[0].capName, 'write', 'capName is write');
                 assertEquals(grantToMerge.grantChanges[0].keyId, alice.keyId, 'keyId is Alice');
+            }
+        },
+        {
+            name: '[CAP_DELTA05] Differential: bounded equals full across baseline scenarios',
+            invoke: async () => {
+                // Scenario 1: add identity + grant
+                {
+                    const admin = await makeIdentity();
+                    const bob = await makeIdentity();
+                    const { ctx, cap } = await createTestCap(admin);
+                    const start = version(cap.getId());
+
+                    await cap.addIdentity(bob.keyId, serializePublicKeyToBase64(bob.publicKey), admin);
+                    await cap.grant(bob.keyId, 'write', cap.getId(), admin);
+                    const end = await (await ctx.getDag(cap.getId()))!.getFrontier();
+
+                    const full = await computeWithStrategy(cap, 'full', start, end);
+                    const bounded = await computeWithStrategy(cap, 'bounded', start, end);
+                    assertEquals(
+                        JSON.stringify(normalizeDelta(bounded)),
+                        JSON.stringify(normalizeDelta(full)),
+                        'scenario 1 should match',
+                    );
+                }
+
+                // Scenario 2: grant then revoke
+                {
+                    const admin = await makeIdentity();
+                    const bob = await makeIdentity();
+                    const { ctx, cap } = await createTestCap(admin);
+
+                    await cap.addIdentity(bob.keyId, serializePublicKeyToBase64(bob.publicKey), admin);
+                    const dag = (await ctx.getDag(cap.getId()))!;
+                    const start = await dag.getFrontier();
+
+                    await cap.grant(bob.keyId, 'write', cap.getId(), admin);
+                    await cap.revoke(bob.keyId, 'write', admin);
+                    const end = await dag.getFrontier();
+
+                    const full = await computeWithStrategy(cap, 'full', start, end);
+                    const bounded = await computeWithStrategy(cap, 'bounded', start, end);
+                    assertEquals(
+                        JSON.stringify(normalizeDelta(bounded)),
+                        JSON.stringify(normalizeDelta(full)),
+                        'scenario 2 should match',
+                    );
+                }
+
+                // Scenario 3: create then delete capability
+                {
+                    const admin = await makeIdentity();
+                    const { ctx, cap } = await createTestCap(admin);
+                    const dag = (await ctx.getDag(cap.getId()))!;
+                    const start = await dag.getFrontier();
+
+                    await cap.createCap('deploy', ['admin'], admin);
+                    await cap.deleteCap('deploy', admin);
+                    const end = await dag.getFrontier();
+
+                    const full = await computeWithStrategy(cap, 'full', start, end);
+                    const bounded = await computeWithStrategy(cap, 'bounded', start, end);
+                    assertEquals(
+                        JSON.stringify(normalizeDelta(bounded)),
+                        JSON.stringify(normalizeDelta(full)),
+                        'scenario 3 should match',
+                    );
+                }
+
+                // Scenario 4: concurrent grant/revoke from same fork point
+                {
+                    const admin = await makeIdentity();
+                    const alice = await makeIdentity();
+                    const { ctx, cap } = await createTestCap(admin);
+
+                    await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), admin);
+                    const dag = (await ctx.getDag(cap.getId()))!;
+                    const start = await dag.getFrontier();
+
+                    await cap.grant(alice.keyId, 'write', cap.getId(), admin, start);
+                    await cap.revoke(alice.keyId, 'write', admin, start);
+                    const end = await dag.getFrontier();
+
+                    const full = await computeWithStrategy(cap, 'full', start, end);
+                    const bounded = await computeWithStrategy(cap, 'bounded', start, end);
+                    assertEquals(
+                        JSON.stringify(normalizeDelta(bounded)),
+                        JSON.stringify(normalizeDelta(full)),
+                        'scenario 4 should match',
+                    );
+                }
+            }
+        },
+        {
+            name: '[CAP_DELTA06] bounded revisionBound uses common frontier',
+            invoke: async () => {
+                const admin = await makeIdentity();
+                const bob = await makeIdentity();
+                const { ctx, cap } = await createTestCap(admin);
+
+                const start = version(cap.getId());
+                await cap.addIdentity(bob.keyId, serializePublicKeyToBase64(bob.publicKey), admin);
+                const end = await (await ctx.getDag(cap.getId()))!.getFrontier();
+
+                const full = await computeWithStrategy(cap, 'full', start, end);
+                const bounded = await computeWithStrategy(cap, 'bounded', start, end);
+
+                assertEquals(full.getRevisionBound().size, 0, 'full keeps empty revisionBound');
+                assertTrue(bounded.getRevisionBound().size > 0, 'bounded revisionBound should be non-empty');
+            }
+        },
+        {
+            name: '[CAP_DELTA07] bounded throws when START is not in history(END)',
+            invoke: async () => {
+                const admin = await makeIdentity();
+                const alice = await makeIdentity();
+                const bob = await makeIdentity();
+                const { ctx, cap } = await createTestCap(admin);
+
+                await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), admin);
+                await cap.addIdentity(bob.keyId, serializePublicKeyToBase64(bob.publicKey), admin);
+
+                const dag = (await ctx.getDag(cap.getId()))!;
+                const forkPoint = await dag.getFrontier();
+
+                const grantA = await cap.grant(alice.keyId, 'write', cap.getId(), admin, forkPoint);
+                const grantB = await cap.grant(bob.keyId, 'write', cap.getId(), admin, forkPoint);
+
+                cap.setDeltaStrategy('bounded');
+
+                let threw = false;
+                try {
+                    await cap.computeDelta(version(grantA), version(grantB));
+                } catch (e) {
+                    threw = ((e as Error).message).indexOf('requires END to extend START') >= 0;
+                }
+
+                assertTrue(threw, 'bounded should throw when forkA is non-empty');
+            }
+        },
+        {
+            name: '[CAP_DELTA08] Deleted capability suppresses grant diffs in both strategies',
+            invoke: async () => {
+                const admin = await makeIdentity();
+                const bob = await makeIdentity();
+                const { ctx, cap } = await createTestCap(admin);
+                const dag = (await ctx.getDag(cap.getId()))!;
+
+                await cap.addIdentity(bob.keyId, serializePublicKeyToBase64(bob.publicKey), admin);
+                await cap.createCap('deploy', ['admin'], admin);
+                const start = await dag.getFrontier();
+
+                const deployOrigin = await (await cap.getView()).getActiveCapOrigin('deploy');
+                assertTrue(deployOrigin !== undefined, 'deploy origin should exist after create-cap');
+                await cap.grant(bob.keyId, 'deploy', deployOrigin!, admin);
+                await cap.deleteCap('deploy', admin);
+                const end = await dag.getFrontier();
+
+                const full = await computeWithStrategy(cap, 'full', start, end);
+                const bounded = await computeWithStrategy(cap, 'bounded', start, end);
+
+                assertEquals(full.grantChanges.length, 0, 'full should suppress grant diffs for deleted cap');
+                assertEquals(bounded.grantChanges.length, 0, 'bounded should suppress grant diffs for deleted cap');
+
+                const fullDeployChange = full.capabilityChanges.find(c => c.capName === 'deploy');
+                const boundedDeployChange = bounded.capabilityChanges.find(c => c.capName === 'deploy');
+                assertTrue(fullDeployChange !== undefined, 'full should report deploy capability change');
+                assertTrue(boundedDeployChange !== undefined, 'bounded should report deploy capability change');
+                assertFalse(fullDeployChange!.exists, 'full: deploy should not exist at END');
+                assertFalse(boundedDeployChange!.exists, 'bounded: deploy should not exist at END');
             }
         },
     ]

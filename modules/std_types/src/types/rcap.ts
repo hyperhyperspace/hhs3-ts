@@ -441,14 +441,28 @@ export class RCap implements RObject, SyncableObject {
     }
 
     async computeDelta(start: Version, end: Version): Promise<RCapDelta> {
-        const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
-        if (rawDag === undefined) throw new Error("DAG not found");
+        if (this.deltaStrategy === 'bounded') {
+            return this.computeDeltaBounded(start, end);
+        } else if (this.deltaStrategy === 'full') {
+            return this.computeDeltaFull(start, end);
+        } else {
+            throw new Error("Invalid delta strategy: " + this.deltaStrategy);
+        }
+    }
 
+    private addGrantPair(grantPairs: Map<string, Set<KeyId>>, capName: string, keyId: KeyId): void {
+        if (!grantPairs.has(capName)) grantPairs.set(capName, new Set());
+        grantPairs.get(capName)!.add(keyId);
+    }
+
+    private collectCandidatesFromEntries(
+        entries: Iterable<dag.Entry>,
+    ): { keyIds: Set<KeyId>; capNames: Set<string>; grantPairs: Map<string, Set<KeyId>> } {
         const keyIds = new Set<KeyId>();
         const capNames = new Set<string>(Object.keys(this.createOp.initialCaps));
         const grantPairs = new Map<string, Set<KeyId>>();
 
-        for await (const entry of rawDag.loadAllEntries()) {
+        for (const entry of entries) {
             const p = entry.payload as CapPayload;
             switch (p.action) {
                 case 'add-identity':
@@ -457,14 +471,53 @@ export class RCap implements RObject, SyncableObject {
                 case 'create-cap':
                     capNames.add(p.capName);
                     break;
+                case 'delete-cap':
+                    capNames.add(p.capName);
+                    break;
                 case 'grant':
                 case 'revoke':
-                    if (!grantPairs.has(p.capName)) grantPairs.set(p.capName, new Set());
-                    grantPairs.get(p.capName)!.add(p.grantee);
+                    this.addGrantPair(grantPairs, p.capName, p.grantee);
                     break;
             }
         }
 
+        return { keyIds, capNames, grantPairs };
+    }
+
+    private async walkNewEntries(rawDag: dag.Dag, from: Version, stopAt: Position): Promise<dag.Entry[]> {
+        const visited = new Set<B64Hash>();
+        const queue: B64Hash[] = Array.from(from);
+        const walked: dag.Entry[] = [];
+
+        while (queue.length > 0) {
+            const hash = queue.shift()!;
+            if (visited.has(hash)) continue;
+            visited.add(hash);
+
+            if (stopAt.has(hash)) continue;
+
+            const entry = await rawDag.loadEntry(hash);
+            if (entry === undefined) continue;
+            walked.push(entry);
+
+            for (const prevHash of json.fromSet(entry.header.prevEntryHashes)) {
+                if (!visited.has(prevHash)) {
+                    queue.push(prevHash);
+                }
+            }
+        }
+
+        return walked;
+    }
+
+    private async computeDeltaFromCandidates(
+        start: Version,
+        end: Version,
+        revisionBound: Version,
+        keyIds: Set<KeyId>,
+        capNames: Set<string>,
+        grantPairs: Map<string, Set<KeyId>>,
+    ): Promise<RCapDelta> {
         const startView = await this.getView(start, start);
         const endView = await this.getView(end, end);
 
@@ -487,7 +540,15 @@ export class RCap implements RObject, SyncableObject {
         }
 
         const grantChanges: GrantChange[] = [];
+        const endCapExists = new Map<string, boolean>();
         for (const [capName, grantKeyIds] of grantPairs) {
+            let capExistsInEnd = endCapExists.get(capName);
+            if (capExistsInEnd === undefined) {
+                capExistsInEnd = await endView.capabilityExists(capName);
+                endCapExists.set(capName, capExistsInEnd);
+            }
+            if (!capExistsInEnd) continue;
+
             for (const keyId of grantKeyIds) {
                 if (this.isCreator(keyId)) continue;
                 const wasGranted = await startView.hasCapability(keyId, capName);
@@ -498,7 +559,38 @@ export class RCap implements RObject, SyncableObject {
             }
         }
 
-        return new RCapDelta(start, end, version(), identityChanges, capabilityChanges, grantChanges);
+        return new RCapDelta(start, end, revisionBound, identityChanges, capabilityChanges, grantChanges);
+    }
+
+    private async computeDeltaFull(start: Version, end: Version): Promise<RCapDelta> {
+        const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
+        if (rawDag === undefined) throw new Error("DAG not found");
+
+        const entries: dag.Entry[] = [];
+        for await (const entry of rawDag.loadAllEntries()) {
+            entries.push(entry);
+        }
+        const { keyIds, capNames, grantPairs } = this.collectCandidatesFromEntries(entries);
+
+        return this.computeDeltaFromCandidates(start, end, version(), keyIds, capNames, grantPairs);
+    }
+
+    private async computeDeltaBounded(start: Version, end: Version): Promise<RCapDelta> {
+        const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
+        if (rawDag === undefined) throw new Error("DAG not found");
+
+        const fork = await rawDag.findForkPosition(start, end);
+        if (fork.forkA.size > 0) {
+            throw new Error("bounded computeDelta requires END to extend START");
+        }
+        if (fork.forkB.size === 0) {
+            return new RCapDelta(start, end, fork.commonFrontier, [], [], []);
+        }
+
+        const walkedEntries = await this.walkNewEntries(rawDag, end, fork.commonFrontier);
+        const { keyIds, capNames, grantPairs } = this.collectCandidatesFromEntries(walkedEntries);
+
+        return this.computeDeltaFromCandidates(start, end, fork.commonFrontier, keyIds, capNames, grantPairs);
     }
 
     configure(config: RCapRuntimeConfig): void {
