@@ -25,12 +25,12 @@
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, HASH_SHA256, sha256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
-import type { KeyId, PublicKey, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
+import type { KeyId, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, MetaProps, position, EntryMetaFilter, EntryPredicate, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
 
-import { Payload, RObject, RObjectFactory, RObjectInit, RContext, RObjectConfig, SyncableObject, NestingParent, version, Version, View, Delta, ForeignDep } from "@hyper-hyper-space/hhs3_mvt";
+import { Payload, RObject, RObjectFactory, RObjectInit, RContext, NestingParent, version, Version, Delta, ForeignDep } from "@hyper-hyper-space/hhs3_mvt";
 import { DagScope, NestedScopedDag, RootScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
-import { isRefAdvancePayload, refAdvanceFormat, refAdvanceMeta, createRefAdvancePayload, resolveRefVersionAtPosition } from "@hyper-hyper-space/hhs3_mvt";
+import { isRefAdvancePayload, refAdvanceMeta, createRefAdvancePayload, resolveRefVersionAtPosition } from "@hyper-hyper-space/hhs3_mvt";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 import { set } from "@hyper-hyper-space/hhs3_util";
 
@@ -38,18 +38,20 @@ import type { Mesh, Swarm } from "@hyper-hyper-space/hhs3_mesh";
 import { createSyncSession } from "@hyper-hyper-space/hhs3_sync";
 import type { SyncSession, SyncTarget } from "@hyper-hyper-space/hhs3_sync";
 
-import { verifyPayloadSignature, signPayload as signPayloadHelper, isAuthoredPayload, extractAuthor } from "../authorship.js";
-import { RCap } from "./rcap/rcap.js";
-import type { RCapView } from "./rcap/rcap.js";
+import { signPayload as signPayloadHelper, isAuthoredPayload, extractAuthor } from "../../authorship.js";
+import { RCap } from "../rcap/rcap.js";
+import type { RCapView } from "../rcap/rcap.js";
+import type { RSet as RSetContract, RSetView as RSetViewContract } from "./interfaces.js";
+import { validateRSetPayload } from "./validate.js";
 
-import { RAddEvent, RDeleteEvent, RSetEvent } from "./rset/events.js";
+import { RAddEvent, RDeleteEvent, RSetEvent } from "./events.js";
 
-import { createSetFormat, CreateSetPayload } from "./rset/payload.js";
-import { addElmtFormat, addElmtAuthoredFormat, AddElmtPayload } from "./rset/payload.js";
-import { deleteElmtFormat, deleteElmtAuthoredFormat, DeleteElmtPayload } from "./rset/payload.js";
-import { updateElmtFormat, UpdateElmtPayload } from "./rset/payload.js";
+import { CreateSetPayload } from "./payload.js";
+import { AddElmtPayload } from "./payload.js";
+import { DeleteElmtPayload } from "./payload.js";
+import { UpdateElmtPayload } from "./payload.js";
 
-import { SetPayload } from "./rset/payload.js";
+import { SetPayload } from "./payload.js";
 
 export const rSetFactory: RObjectFactory = {
 
@@ -59,53 +61,8 @@ export const rSetFactory: RObjectFactory = {
         return entry.hash;
     },
 
-    validateCreationPayload: async (payload: json.Literal, _ctx: RContext, parent?: NestingParent) => {
-        
-        if (!json.checkFormat(createSetFormat, payload)) {
-            console.log('fmt')
-            console.log(payload)
-            return false;
-        }
-            
-        const createPayload = payload as CreateSetPayload;
-
-        if (createPayload['parent'] !== undefined && parent !== undefined) {
-            if (createPayload['parent'] !== parent.getId()) {
-                return false;
-            }
-        }
-        
-        if (createPayload['contentType'] === undefined && createPayload['acceptUpdateForDeleted'] !== undefined) {
-            console.log('acceptUpdateForDeleted only makes sense if contentType is present')
-            return false;
-        }
-
-        if (createPayload['contentType'] !== undefined && createPayload['acceptRedundantAdd'] !== undefined) {
-            console.log('acceptRedundantAdd only makes sense if contentType is not present')
-            return false;
-        }
-
-        if (createPayload['contentType'] !== undefined) {
-            if (createPayload['initialElements'].length > 0) {
-                console.log('initialElements must be empty if contentType is present')
-                return false;
-            }
-        }
-
-        if (createPayload['supportBarrierAdd'] && createPayload['supportBarrierDelete']) {
-            return false;
-        }
-
-        if (createPayload['capabilityRef'] !== undefined) {
-            const reqs = createPayload['capRequirements'];
-            if (reqs === undefined) return false;
-            if (reqs['add'] === undefined && reqs['delete'] === undefined) return false;
-        } else if (createPayload['capRequirements'] !== undefined) {
-            return false;
-        }
-
-        return true;
-    },
+    validateCreationPayload: async (payload: json.Literal, _ctx: RContext, parent?: NestingParent) =>
+        validateRSetPayload(payload, { mode: 'create', parent }),
 
     executeCreationPayload: async (payload: json.Literal, _ctx: RContext, scopedDag: ScopedDag) => {
 
@@ -132,7 +89,7 @@ export const rSetFactory: RObjectFactory = {
         }
 
         const createOp = (await scopedDag.loadEntry(id))!.payload as CreateSetPayload;
-        return new RSet(id, createOp, ctx, parent);
+        return new RSetImpl(id, createOp, ctx, parent);
     }
 
 }
@@ -157,7 +114,7 @@ export type RSetRuntimeConfig = {
     backendLabel?: string;
 }
 
-export class RSet<T extends json.Literal = json.Literal> implements RObject, SyncableObject, NestingParent {
+export class RSetImpl<T extends json.Literal = json.Literal> implements RSetContract<T> {
 
     static create = async (options: RSetOptions) => {
 
@@ -214,7 +171,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
             createPayload['capRequirements'] = options.capRequirements;
         }
 
-        return {type: RSet.typeId, payload: createPayload} as RObjectInit;
+        return {type: RSetImpl.typeId, payload: createPayload} as RObjectInit;
     }
 
     static typeId = "hhs/set_v1";
@@ -242,7 +199,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
     }
 
     getType(): string {
-        return RSet.typeId;
+        return RSetImpl.typeId;
     }
 
     // Set operations
@@ -417,150 +374,8 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
     // RObject interface
 
     async validatePayload(payload: json.Literal, at: Version): Promise<boolean> {
-
-        if (typeof(payload) !== 'object' || Array.isArray(payload)) {
-            return false;
-        }
-
-        if (typeof(payload['action']) !== 'string') {
-            return false;
-        }
-
-        const action = payload['action'];
-
-        let valid = false;
-
-        switch (action) {
-            case 'add':
-                valid = await this.validateAddElmtPayload(payload, at);
-                break;
-            case 'delete':
-                valid = await this.validateDeleteElmtPayload(payload, at);
-                break;
-            case 'update':
-                valid = await this.validateUpdateElmtPayload(payload, at);
-                break;
-            case 'ref-advance':
-                valid = await this.validateRefAdvancePayload(payload, at);
-                break;
-        }
-
-        return valid;
+        return validateRSetPayload(payload, { mode: 'op', set: this, at });
     }
-
-    private async validateAddElmtPayload(payload: Payload, at: Version): Promise<boolean> {
-        const format = this.isPermissioned() ? addElmtAuthoredFormat : addElmtFormat;
-        if (!json.checkFormat(format, payload)) return false;
-
-        const addPayload = payload as AddElmtPayload;
-        if (!this.supportBarrierAdd() && json.hasKey(addPayload, 'barrier')) return false;
-        if (!this.acceptRedundantAdd()) {
-            const view = await this.getView(at, at);
-            if (await view.hasByHash(await hashElement(addPayload['element']))) return false;
-        }
-
-        if (this.isPermissioned()) {
-            return this.checkPayloadAuth(payload, at, this.capRequirementForAdd());
-        }
-
-        return true;
-    }
-
-    private async validateDeleteElmtPayload(payload: Payload, at: Version): Promise<boolean> {
-        const format = this.isPermissioned() ? deleteElmtAuthoredFormat : deleteElmtFormat;
-        if (!json.checkFormat(format, payload)) return false;
-
-        const deletePayload = payload as DeleteElmtPayload;
-        if (!this.supportBarrierDelete() && json.hasKey(deletePayload, 'barrier')) return false;
-        if (!this.acceptRedundantDelete()) {
-            const view = await this.getView(at, at);
-            if (!await view.hasByHash(deletePayload['elementHash'])) return false;
-        }
-
-        if (this.isPermissioned()) {
-            return this.checkPayloadAuth(payload, at, this.capRequirementForDelete());
-        }
-
-        return true;
-    }
-
-    private async validateRefAdvancePayload(payload: Payload, at: Version): Promise<boolean> {
-        if (!this.isPermissioned()) return false;
-        if (!json.checkFormat(refAdvanceFormat, payload, { strict: false })) return false;
-        if (!isAuthoredPayload(payload)) return false;
-
-        const refPayload = payload as unknown as RefAdvancePayload;
-        if (refPayload.refId !== this.capabilityRef()) return false;
-
-        const rcap = await this.loadRCap();
-        if (rcap === undefined) return false;
-
-        if (!await verifyPayloadSignature(payload as json.LiteralMap, (keyId) => rcap.lookupKey(keyId))) return false;
-
-        const authorId = extractAuthor(payload) as KeyId;
-
-        if (this.refAdvanceCreators() && rcap.isCreator(authorId)) return true;
-
-        const rsetView = await this.getView(at, at);
-        const rcapVersion = await rsetView.resolveRefVersion(this.capabilityRef()!);
-        const rcapView = await rcap.getView(rcapVersion, rcapVersion);
-        for (const cap of this.refAdvanceCaps()) {
-            if (await rcapView.hasCapability(authorId, cap)) return true;
-        }
-
-        return false;
-    }
-
-    private async checkPayloadAuth(payload: Payload, at: Version, capName?: string): Promise<boolean> {
-        const rcap = await this.loadRCap();
-        if (rcap === undefined) return false;
-
-        if (!await verifyPayloadSignature(payload as json.LiteralMap, (keyId) => rcap.lookupKey(keyId))) return false;
-
-        if (capName !== undefined) {
-            const authorId = extractAuthor(payload) as KeyId;
-            const rsetView = await this.getView(at, at);
-            const rcapVersion = await rsetView.resolveRefVersion(this.capabilityRef()!);
-            const rcapView = await rcap.getView(rcapVersion, rcapVersion);
-            if (!await rcapView.hasCapability(authorId, capName)) return false;
-        }
-
-        return true;
-    }
-
-    private async validateUpdateElmtPayload(payload: Payload, at: Version): Promise<boolean> {
-        
-        if (!json.checkFormat(updateElmtFormat, payload)) {
-            return false;
-        } else {
-
-            if (this.contentType() == undefined) {
-                return false;
-            }
-
-            const updatePayload = payload as UpdateElmtPayload;
-            
-            if (!this.acceptUpdateForDeleted()) {
-                const view = await this.getView(at, at);
-                const hasElmt = await view.hasByHash(updatePayload['elementHash']);
-                if (!hasElmt) {
-                    return false;
-                }
-            }
-
-            const contentType = this.contentType();
-
-            if (contentType !== undefined) {
-                const innerFactory = await this.ctx.getRegistry().lookup(contentType);
-                const innerRObject = await this.loadChildObject(innerFactory, updatePayload['elementHash']);
-                if (!await innerRObject.validatePayload(updatePayload['updatePayload'], at)) {
-                    return false;
-                }
-            }
-
-            return true;
-        }
-    } 
 
     async applyPayload(payload: Payload, at: Version): Promise<B64Hash> {
 
@@ -615,7 +430,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
         
     }
 
-    async getView(at?: Version, from?: Version): Promise<RSetView<T>> {
+    async getView(at?: Version, from?: Version): Promise<RSetViewContract<T>> {
         
         const dag = await this.getScopedDag();
 
@@ -623,7 +438,7 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
         from = from || await dag.getFrontier();
 
 
-        return new RSetView<T>(this, at, from);
+        return new RSetViewImpl<T>(this, at, from);
     }
 
     getContext(): RContext {
@@ -747,8 +562,8 @@ export class RSet<T extends json.Literal = json.Literal> implements RObject, Syn
 
         const elmtHashes = await this.collectAllElementHashes();
 
-        const startView = await this.getView(start, start) as RSetView<T>;
-        const endView = await this.getView(end, end) as RSetView<T>;
+        const startView = await this.getView(start, start) as RSetViewContract<T>;
+        const endView = await this.getView(end, end) as RSetViewContract<T>;
 
         const added: B64Hash[] = [];
         const removed: B64Hash[] = [];
@@ -889,19 +704,19 @@ const addMetaPropsForSetOp = (payload: SetPayload, meta: MetaProps, elmtHash: B6
     }
 }
 
-export class RSetView<T  extends json.Literal> implements View {
+export class RSetViewImpl<T  extends json.Literal> implements RSetViewContract<T> {
 
-    private target: RSet<T>;
+    private target: RSetImpl<T>;
     private at: Version;
     private from: Version;
 
-    constructor(target: RSet<T>, at: Version, from: Version) {
+    constructor(target: RSetImpl<T>, at: Version, from: Version) {
         this.target = target;
         this.at = at;
         this.from = from;
     }
 
-    getObject(): RSet<T> {
+    getObject(): RSetContract<T> {
         return this.target;
     }
 
@@ -1040,12 +855,12 @@ export class RSetView<T  extends json.Literal> implements View {
 
 class NestedElementScope implements DagScope {
 
-    private parent: RSet;
+    private parent: RSetImpl;
     private elementHash: B64Hash;
     private start: Position;
     private executeAddOp?: AddElmtPayload;
 
-    constructor(parent: RSet, elementHash: B64Hash, startAt: Position, executeAddOp?: AddElmtPayload) {
+    constructor(parent: RSetImpl, elementHash: B64Hash, startAt: Position, executeAddOp?: AddElmtPayload) {
         this.parent = parent;
         this.start = startAt;
         this.elementHash = elementHash;
@@ -1164,14 +979,14 @@ class NestedElementScope implements DagScope {
 
 class ElementAddScope extends NestedElementScope implements DagScope {
 
-    constructor(parent: RSet, elementHash: B64Hash, startAt: Position, executeAddOp: AddElmtPayload) {
+    constructor(parent: RSetImpl, elementHash: B64Hash, startAt: Position, executeAddOp: AddElmtPayload) {
         super(parent, elementHash, startAt, executeAddOp);
     }
 }
 
 class ElementUpdateScope extends NestedElementScope implements DagScope {
 
-    constructor(parent: RSet, elementHash: B64Hash, startAt: Position) {
+    constructor(parent: RSetImpl, elementHash: B64Hash, startAt: Position) {
         super(parent, elementHash, startAt);
     }
 }
@@ -1205,3 +1020,8 @@ export class RSetDelta implements Delta {
     getEndVersion(): Version { return this.end; }
     getRevisionBound(): Version { return this.revisionBound; }
 }
+
+export interface RSet<T extends json.Literal = json.Literal> extends RSetContract<T> {}
+export interface RSetView<T extends json.Literal = json.Literal> extends RSetViewContract<T> {}
+export const RSet = RSetImpl;
+export const RSetView = RSetViewImpl;
