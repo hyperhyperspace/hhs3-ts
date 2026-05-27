@@ -72,7 +72,7 @@ async function registerAndGrant(
         admin,
     );
     await cap.grant(
-        identity.keyId, capName, cap.getId(),
+        identity.keyId, capName,
         admin,
     );
 }
@@ -345,7 +345,7 @@ export const permissionedSetTests = {
 
                 // Manager grants Alice 'write' (Manager has 'admin' which managedBy 'write')
                 await cap.grant(
-                    alice.keyId, 'write', cap.getId(),
+                    alice.keyId, 'write',
                     manager,
                 );
 
@@ -470,7 +470,7 @@ export const permissionedSetTests = {
                 await registerAndGrant(cap, alice, 'enroll', admin);
 
                 await cap.grant(
-                    alice.keyId, 'write', cap.getId(),
+                    alice.keyId, 'write',
                     manager,
                 );
 
@@ -546,7 +546,7 @@ export const permissionedSetTests = {
 
                 const capFork = await (await cap.getScopedDag()).getFrontier();
 
-                await cap.grant(bob.keyId, 'write', cap.getId(), admin, capFork);
+                await cap.grant(bob.keyId, 'write', admin, capFork);
 
                 const capV1 = await (await cap.getScopedDag()).getFrontier();
                 await rset.refAdvance(capV1, admin);
@@ -622,7 +622,7 @@ export const permissionedSetTests = {
 
                 const capFork = await (await cap.getScopedDag()).getFrontier();
 
-                await cap.grant(bob.keyId, 'write', cap.getId(), admin, capFork);
+                await cap.grant(bob.keyId, 'write', admin, capFork);
 
                 const capV1 = await (await cap.getScopedDag()).getFrontier();
                 await rset.refAdvance(capV1, admin);

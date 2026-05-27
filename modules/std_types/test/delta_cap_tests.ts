@@ -65,7 +65,7 @@ export const deltaCapTests = {
                 const creationVersion = version(cap.getId());
 
                 await cap.addIdentity(bob.keyId, serializePublicKeyToBase64(bob.publicKey), admin);
-                await cap.grant(bob.keyId, 'write', cap.getId(), admin);
+                await cap.grant(bob.keyId, 'write', admin);
 
                 const dag = (await ctx.getDag(cap.getId()))!;
                 const endVersion = await dag.getFrontier();
@@ -97,7 +97,7 @@ export const deltaCapTests = {
                 const creationVersion = version(cap.getId());
 
                 await cap.addIdentity(bob.keyId, serializePublicKeyToBase64(bob.publicKey), admin);
-                await cap.grant(bob.keyId, 'write', cap.getId(), admin);
+                await cap.grant(bob.keyId, 'write', admin);
 
                 const dag = (await ctx.getDag(cap.getId()))!;
                 const afterGrant = await dag.getFrontier();
@@ -157,7 +157,7 @@ export const deltaCapTests = {
                 const forkPoint = await (await cap.getScopedDag()).getFrontier();
 
                 // Concurrent: grant and revoke from the same fork point
-                await cap.grant(alice.keyId, 'write', cap.getId(), admin, forkPoint);
+                await cap.grant(alice.keyId, 'write', admin, forkPoint);
                 await cap.revoke(alice.keyId, 'write', admin, forkPoint);
 
                 const afterMerge = await dag.getFrontier();
@@ -215,7 +215,7 @@ export const deltaCapTests = {
                     const start = version(cap.getId());
 
                     await cap.addIdentity(bob.keyId, serializePublicKeyToBase64(bob.publicKey), admin);
-                    await cap.grant(bob.keyId, 'write', cap.getId(), admin);
+                    await cap.grant(bob.keyId, 'write', admin);
                     const end = await (await ctx.getDag(cap.getId()))!.getFrontier();
 
                     const full = await computeWithStrategy(cap, 'full', start, end);
@@ -237,7 +237,7 @@ export const deltaCapTests = {
                     const dag = (await ctx.getDag(cap.getId()))!;
                     const start = await dag.getFrontier();
 
-                    await cap.grant(bob.keyId, 'write', cap.getId(), admin);
+                    await cap.grant(bob.keyId, 'write', admin);
                     await cap.revoke(bob.keyId, 'write', admin);
                     const end = await dag.getFrontier();
 
@@ -280,7 +280,7 @@ export const deltaCapTests = {
                     const dag = (await ctx.getDag(cap.getId()))!;
                     const start = await dag.getFrontier();
 
-                    await cap.grant(alice.keyId, 'write', cap.getId(), admin, start);
+                    await cap.grant(alice.keyId, 'write', admin, start);
                     await cap.revoke(alice.keyId, 'write', admin, start);
                     const end = await dag.getFrontier();
 
@@ -326,8 +326,8 @@ export const deltaCapTests = {
                 const dag = (await ctx.getDag(cap.getId()))!;
                 const forkPoint = await dag.getFrontier();
 
-                const grantA = await cap.grant(alice.keyId, 'write', cap.getId(), admin, forkPoint);
-                const grantB = await cap.grant(bob.keyId, 'write', cap.getId(), admin, forkPoint);
+                const grantA = await cap.grant(alice.keyId, 'write', admin, forkPoint);
+                const grantB = await cap.grant(bob.keyId, 'write', admin, forkPoint);
 
                 cap.setDeltaStrategy('bounded');
 
@@ -353,9 +353,9 @@ export const deltaCapTests = {
                 await cap.createCap('deploy', ['admin'], admin);
                 const start = await dag.getFrontier();
 
-                const deployOrigin = await (await cap.getView()).getActiveCapOrigin('deploy');
-                assertTrue(deployOrigin !== undefined, 'deploy origin should exist after create-cap');
-                await cap.grant(bob.keyId, 'deploy', deployOrigin!, admin);
+                const deployOrigins = await (await cap.getView()).getSurvivingCapOrigins('deploy');
+                assertTrue(deployOrigins.size > 0, 'deploy origins should be non-empty after create-cap');
+                await cap.grant(bob.keyId, 'deploy', admin);
                 await cap.deleteCap('deploy', admin);
                 const end = await dag.getFrontier();
 

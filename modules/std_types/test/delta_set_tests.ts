@@ -117,7 +117,7 @@ export const deltaTests = {
                 await cap.addIdentity(bob.keyId, serializePublicKeyToBase64(bob.publicKey), admin);
 
                 const capFork = await (await cap.getScopedDag()).getFrontier();
-                await cap.grant(bob.keyId, 'write', cap.getId(), admin, capFork);
+                await cap.grant(bob.keyId, 'write', admin, capFork);
 
                 const capV1 = await (await cap.getScopedDag()).getFrontier();
                 await rset.refAdvance(capV1, admin);
@@ -182,7 +182,7 @@ export const deltaTests = {
                 await cap.addIdentity(bob.keyId, serializePublicKeyToBase64(bob.publicKey), admin);
 
                 const capFork = await (await cap.getScopedDag()).getFrontier();
-                await cap.grant(bob.keyId, 'write', cap.getId(), admin, capFork);
+                await cap.grant(bob.keyId, 'write', admin, capFork);
 
                 const capV1 = await (await cap.getScopedDag()).getFrontier();
                 await rset.refAdvance(capV1, admin);

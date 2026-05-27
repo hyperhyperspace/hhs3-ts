@@ -88,7 +88,7 @@ export const rcapTests = {
                 let grantFailed = false;
                 try {
                     await cap.grant(
-                        alice.keyId, 'write', cap.getId(),
+                        alice.keyId, 'write',
                         admin,
                     );
                 } catch {
@@ -111,7 +111,7 @@ export const rcapTests = {
                 );
 
                 await cap.grant(
-                    alice.keyId, 'write', cap.getId(),
+                    alice.keyId, 'write',
                     admin,
                 );
 
@@ -132,7 +132,7 @@ export const rcapTests = {
                 );
 
                 await cap.grant(
-                    alice.keyId, 'write', cap.getId(),
+                    alice.keyId, 'write',
                     admin,
                 );
 
@@ -162,7 +162,7 @@ export const rcapTests = {
                 const addIdFrontier = await (await cap.getScopedDag()).getFrontier();
 
                 const grantHash = await cap.grant(
-                    alice.keyId, 'write', cap.getId(),
+                    alice.keyId, 'write',
                     admin,
                     addIdFrontier,
                 );
@@ -206,7 +206,7 @@ export const rcapTests = {
             }
         },
         {
-            name: '[CAP08] Concurrent createCap and deleteCap: deleteCap wins (barrier)',
+            name: '[CAP08] Concurrent createCap and unrelated delete does not void initial origin',
             invoke: async () => {
                 const { cap, admin } = await createTestEnv();
 
@@ -228,8 +228,8 @@ export const rcapTests = {
 
                 const createView = await cap.getView(createVersion);
                 assertTrue(await createView.capabilityExists('deploy'), 'deploy should exist in its own branch');
-                assertFalse(await createView.capabilityExists('write'),
-                    'write should be deleted by concurrent barrier');
+                assertTrue(await createView.capabilityExists('write'),
+                    'write should survive: concurrent delete is not in create origin history');
             }
         },
         {
@@ -244,7 +244,7 @@ export const rcapTests = {
                 );
 
                 await cap.grant(
-                    alice.keyId, 'write', cap.getId(),
+                    alice.keyId, 'write',
                     admin,
                 );
 
@@ -260,7 +260,7 @@ export const rcapTests = {
                 assertFalse(await view2.capabilityExists('write'), 'write should not exist after delete');
                 assertFalse(await view2.hasCapability(alice.keyId, 'write'), 'alice should not have write after delete');
 
-                const reCreateHash = await cap.createCap(
+                await cap.createCap(
                     'write', ['admin'],
                     admin,
                 );
@@ -271,7 +271,7 @@ export const rcapTests = {
                     'old grant should be voided: capOrigin points to stale create entry');
 
                 await cap.grant(
-                    alice.keyId, 'write', reCreateHash,
+                    alice.keyId, 'write',
                     admin,
                 );
 
@@ -311,12 +311,12 @@ export const rcapTests = {
                 );
 
                 await cap.grant(
-                    manager.keyId, 'admin', cap.getId(),
+                    manager.keyId, 'admin',
                     admin,
                 );
 
                 await cap.grant(
-                    alice.keyId, 'write', cap.getId(),
+                    alice.keyId, 'write',
                     manager,
                 );
 
@@ -342,14 +342,14 @@ export const rcapTests = {
                 );
 
                 await cap.grant(
-                    alice.keyId, 'write', cap.getId(),
+                    alice.keyId, 'write',
                     admin,
                 );
 
                 let failed = false;
                 try {
                     await cap.grant(
-                        bob.keyId, 'read', cap.getId(),
+                        bob.keyId, 'read',
                         alice,
                     );
                 } catch {
@@ -399,7 +399,7 @@ export const rcapTests = {
                     admin,
                 );
                 await cap.grant(
-                    enrollManager.keyId, 'enroll', cap.getId(),
+                    enrollManager.keyId, 'enroll',
                     admin,
                 );
 
@@ -416,7 +416,7 @@ export const rcapTests = {
                     admin,
                 );
                 await cap.grant(
-                    bob.keyId, 'write', cap.getId(),
+                    bob.keyId, 'write',
                     admin,
                 );
 
@@ -453,11 +453,11 @@ export const rcapTests = {
                 );
 
                 await cap.grant(
-                    manager.keyId, 'admin', cap.getId(),
+                    manager.keyId, 'admin',
                     admin,
                 );
                 await cap.grant(
-                    alice.keyId, 'write', cap.getId(),
+                    alice.keyId, 'write',
                     manager,
                 );
 
@@ -499,23 +499,23 @@ export const rcapTests = {
                 );
 
                 await cap.grant(
-                    manager1.keyId, 'admin', cap.getId(),
+                    manager1.keyId, 'admin',
                     admin,
                 );
                 await cap.grant(
-                    manager2.keyId, 'admin', cap.getId(),
+                    manager2.keyId, 'admin',
                     admin,
                 );
 
                 const preGrantFrontier = await (await cap.getScopedDag()).getFrontier();
 
                 const grant1Hash = await cap.grant(
-                    alice.keyId, 'write', cap.getId(),
+                    alice.keyId, 'write',
                     manager1,
                     preGrantFrontier,
                 );
                 const grant2Hash = await cap.grant(
-                    alice.keyId, 'write', cap.getId(),
+                    alice.keyId, 'write',
                     manager2,
                     preGrantFrontier,
                 );
@@ -541,6 +541,140 @@ export const rcapTests = {
                 const view3 = await cap.getView();
                 assertFalse(await view3.hasCapability(alice.keyId, 'write'),
                     'alice should lose write: both grantors lost admin');
+            }
+        },
+        {
+            name: '[CAP17] Initial capability origin is discoverable via create-op caps metadata',
+            invoke: async () => {
+                const { cap } = await createTestEnv();
+
+                const view = await cap.getView();
+                assertTrue(await view.capabilityExists('write'), 'write should exist');
+
+                const origins = await view.getSurvivingCapOrigins('write');
+                assertTrue(origins.has(cap.getId()),
+                    'initial capability surviving origins should include create-op hash');
+            }
+        },
+        {
+            name: '[CAP18] Candidate-based delete barriers only void concurrent capability origins',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv();
+
+                const base = await (await cap.getScopedDag()).getFrontier();
+
+                const deleteHash = await cap.deleteCap(
+                    'write',
+                    admin,
+                    base,
+                );
+
+                const createHashB = await cap.createCap(
+                    'write', ['admin'],
+                    admin,
+                    version(deleteHash),
+                );
+
+                const view = await cap.getView();
+                assertTrue(await view.capabilityExists('write'),
+                    'write should survive because re-created origin is not concurrent with delete');
+
+                const origins = await view.getSurvivingCapOrigins('write');
+                assertTrue(origins.has(createHashB),
+                    'surviving origins should include the non-concurrent re-create origin');
+            }
+        },
+        {
+            name: '[CAP19] Active-origin consistency with capability existence',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv();
+
+                const before = await cap.getView();
+                assertTrue(await before.capabilityExists('write'), 'write should exist initially');
+                assertTrue((await before.getSurvivingCapOrigins('write')).size > 0,
+                    'surviving origins should be non-empty when capability exists');
+
+                await cap.deleteCap(
+                    'write',
+                    admin,
+                );
+
+                const after = await cap.getView();
+                assertFalse(await after.capabilityExists('write'), 'write should not exist after delete');
+                assertTrue((await after.getSurvivingCapOrigins('write')).size === 0,
+                    'surviving origins should be empty when capability does not exist');
+            }
+        },
+        {
+            name: '[CAP20] Per-candidate revoke: surviving grant keeps capability',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv();
+                const alice = await makeIdentity();
+
+                await cap.addIdentity(
+                    alice.keyId, serializePublicKeyToBase64(alice.publicKey),
+                    admin,
+                );
+
+                const base = await (await cap.getScopedDag()).getFrontier();
+
+                const earlyGrantHash = await cap.grant(
+                    alice.keyId, 'write',
+                    admin,
+                    base,
+                );
+
+                const revokeHash = await cap.revoke(
+                    alice.keyId, 'write',
+                    admin,
+                    base,
+                );
+
+                await cap.grant(
+                    alice.keyId, 'write',
+                    admin,
+                    version(revokeHash),
+                );
+
+                const view = await cap.getView();
+                assertTrue(await view.hasCapability(alice.keyId, 'write'),
+                    'alice should still have write: re-grant after revoke is not concurrent with it');
+            }
+        },
+        {
+            name: '[CAP21] Per-candidate revoke: all grants barred removes capability',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv();
+                const alice = await makeIdentity();
+
+                await cap.addIdentity(
+                    alice.keyId, serializePublicKeyToBase64(alice.publicKey),
+                    admin,
+                );
+
+                const base = await (await cap.getScopedDag()).getFrontier();
+
+                await cap.grant(
+                    alice.keyId, 'write',
+                    admin,
+                    base,
+                );
+
+                await cap.grant(
+                    alice.keyId, 'write',
+                    admin,
+                    base,
+                );
+
+                await cap.revoke(
+                    alice.keyId, 'write',
+                    admin,
+                    base,
+                );
+
+                const view = await cap.getView();
+                assertFalse(await view.hasCapability(alice.keyId, 'write'),
+                    'alice should not have write: revoke is concurrent with both grants');
             }
         },
     ]

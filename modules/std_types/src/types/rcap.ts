@@ -18,7 +18,7 @@ import {
     addIdentityFormat, AddIdentityPayload,
     createCapabilityFormat, CreateCapabilityPayload,
     deleteCapabilityFormat, DeleteCapabilityPayload,
-    grantFormat, GrantPayload,
+    grantFormat, GrantPayload, MAX_CAP_ORIGINS,
     revokeFormat, RevokePayload,
     CapPayload,
 } from "./rcap/payload.js";
@@ -69,7 +69,11 @@ export const rCapFactory: RObjectFactory = {
     },
 
     executeCreationPayload: async (payload: json.Literal, _ctx: RContext, scopedDag: ScopedDag) => {
-        return await scopedDag.append(payload, {}, position());
+        const createPayload = payload as CreateRCapPayload;
+        const meta: MetaProps = {
+            caps: json.toSet(Object.keys(createPayload.initialCaps)),
+        };
+        return await scopedDag.append(payload, meta, position());
     },
 
     loadObject: async (id: B64Hash, ctx: RContext) => {
@@ -228,16 +232,20 @@ export class RCap implements RObject, SyncableObject {
     }
 
     async grant(
-        grantee: KeyId, capName: string, capOrigin: B64Hash,
+        grantee: KeyId, capName: string,
         author: OwnIdentity,
         at?: Version,
     ): Promise<B64Hash> {
+        const scopedDag = await this.getScopedDag();
+        at = at || await scopedDag.getFrontier();
+        const view = await this.getView(at, at);
+        const capOrigins = Array.from(await view.getSurvivingCapOrigins(capName))
+            .sort()
+            .slice(0, MAX_CAP_ORIGINS);
         const payload: Omit<GrantPayload, 'author' | 'signature'> = {
-            action: 'grant', grantee, capName, capOrigin,
+            action: 'grant', grantee, capName, capOrigins,
         };
         const signed = await signPayloadHelper(payload as json.LiteralMap, author);
-        const dag = await this.getScopedDag();
-        at = at || await dag.getFrontier();
         return this.applyValidatedPayload(signed, at);
     }
 
@@ -354,8 +362,13 @@ export class RCap implements RObject, SyncableObject {
             if (!authorized) return false;
         }
 
-        const activeOrigin = await view.getActiveCapOrigin(p.capName);
-        if (activeOrigin !== p.capOrigin) return false;
+        const expected = Array.from(await view.getSurvivingCapOrigins(p.capName))
+            .sort()
+            .slice(0, MAX_CAP_ORIGINS);
+        if (expected.length !== p.capOrigins.length) return false;
+        for (let i = 0; i < expected.length; i++) {
+            if (expected[i] !== p.capOrigins[i]) return false;
+        }
 
         return true;
     }
@@ -675,51 +688,40 @@ export class RCapView implements View {
         return cover.size > 0;
     }
 
-    async capabilityExists(capName: string): Promise<boolean> {
-        if (capName in this.target.createOp.initialCaps) {
-            const scopedDag = await this.target.getScopedDag();
-            const deleteBarriers = await scopedDag.findConcurrentCoverWithFilter(
-                this.from, this.at, { containsValues: { caps: [capName], barrier: ['t'] } },
-            );
-            if (deleteBarriers.size > 0) return false;
-
-            const cover = await scopedDag.findCoverWithFilter(this.at, { containsValues: { caps: [capName] } });
-            for (const hash of cover) {
-                if (hash === this.target.createOpId) continue;
-                const entry = await scopedDag.loadEntry(hash);
-                if (entry === undefined) continue;
-                const p = entry.payload as CapPayload;
-                if (p.action === 'delete-cap') return false;
-            }
-
-            return true;
-        }
-
+    private async getFirstSurvivingCapOrigin(capName: string): Promise<B64Hash | undefined> {
         const scopedDag = await this.target.getScopedDag();
         const cover = await scopedDag.findCoverWithFilter(this.at, { containsValues: { caps: [capName] } });
-        if (cover.size === 0) return false;
 
         for (const hash of cover) {
             const entry = await scopedDag.loadEntry(hash);
             if (entry === undefined) continue;
             const p = entry.payload as CapPayload;
-            if (p.action === 'delete-cap') return false;
+
+            const isPositiveCandidate =
+                (p.action === 'create-cap' && p.capName === capName) ||
+                (p.action === 'create' && capName in (p as CreateRCapPayload).initialCaps);
+
+            if (!isPositiveCandidate) continue;
+
+            const concurrentDeleteBarriers = await scopedDag.findConcurrentCoverWithFilter(
+                this.from, version(hash), { containsValues: { caps: [capName], barrier: ['t'] } },
+            );
+
+            if (concurrentDeleteBarriers.size === 0) {
+                return hash;
+            }
         }
 
-        const deleteBarriers = await scopedDag.findConcurrentCoverWithFilter(
-            this.from, this.at, { containsValues: { caps: [capName], barrier: ['t'] } },
-        );
-        if (deleteBarriers.size > 0) return false;
+        return undefined;
+    }
 
-        return true;
+    async capabilityExists(capName: string): Promise<boolean> {
+        return (await this.getFirstSurvivingCapOrigin(capName)) !== undefined;
     }
 
     async hasCapability(grantee: KeyId, capName: string, visiting?: Set<string>): Promise<boolean> {
         if (this.target.isCreator(grantee)) return true;
 
-        // Cycle detection: a query like "does A hold X?" may recurse into
-        // "does B hold Y?" if X is managedBy Y, and if Y is managedBy X
-        // we'd loop. Track (grantee, capName) pairs being resolved.
         const visitKey = grantee + '\0' + capName;
         if (visiting !== undefined && visiting.has(visitKey)) return false;
         visiting = new Set(visiting);
@@ -730,23 +732,8 @@ export class RCapView implements View {
         const scopedDag = await this.target.getScopedDag();
         const grantKey = capName + ':' + grantee;
 
-        const revokeBarriers = await scopedDag.findConcurrentCoverWithFilter(
-            this.from, this.at, { containsValues: { grants: [grantKey], barrier: ['t'] } },
-        );
-        if (revokeBarriers.size > 0) return false;
-
         const cover = await scopedDag.findCoverWithFilter(this.at, { containsValues: { grants: [grantKey] } });
         if (cover.size === 0) return false;
-
-        for (const hash of cover) {
-            const entry = await scopedDag.loadEntry(hash);
-            if (entry === undefined) continue;
-            const p = entry.payload as CapPayload;
-            if (p.action === 'revoke') return false;
-        }
-
-        const activeOrigin = await this.getActiveCapOrigin(capName);
-        if (activeOrigin === undefined) return false;
 
         const managedBy = await this.getManagedBy(capName);
 
@@ -754,7 +741,15 @@ export class RCapView implements View {
             const entry = await scopedDag.loadEntry(hash);
             if (entry === undefined) continue;
             const p = entry.payload as CapPayload;
-            if (p.action !== 'grant' || p.capOrigin !== activeOrigin) continue;
+            if (p.action !== 'grant') continue;
+
+            const concurrentRevokes = await scopedDag.findConcurrentCoverWithFilter(
+                this.from, version(hash), { containsValues: { grants: [grantKey], barrier: ['t'] } },
+            );
+            if (concurrentRevokes.size > 0) continue;
+
+            const grantOrigins = new Set((p as GrantPayload).capOrigins);
+            if (!await this.hasAnySurvivingOriginIn(capName, grantOrigins)) continue;
 
             const author = (p as GrantPayload).author as KeyId;
 
@@ -789,35 +784,61 @@ export class RCapView implements View {
         return [];
     }
 
-    async getActiveCapOrigin(capName: string): Promise<B64Hash | undefined> {
-        if (capName in this.target.createOp.initialCaps) {
-            const scopedDag = await this.target.getScopedDag();
-            const cover = await scopedDag.findCoverWithFilter(this.at, { containsValues: { caps: [capName] } });
-
-            for (const hash of cover) {
-                if (hash === this.target.createOpId) continue;
-                const entry = await scopedDag.loadEntry(hash);
-                if (entry === undefined) continue;
-                const p = entry.payload as CapPayload;
-                if (p.action === 'delete-cap') return undefined;
-                if (p.action === 'create-cap') return hash;
-            }
-
-            return this.target.createOpId;
-        }
-
+    async getSurvivingCapOrigins(capName: string): Promise<Set<B64Hash>> {
         const scopedDag = await this.target.getScopedDag();
         const cover = await scopedDag.findCoverWithFilter(this.at, { containsValues: { caps: [capName] } });
+        const surviving = new Set<B64Hash>();
 
         for (const hash of cover) {
             const entry = await scopedDag.loadEntry(hash);
             if (entry === undefined) continue;
             const p = entry.payload as CapPayload;
-            if (p.action === 'delete-cap') return undefined;
-            if (p.action === 'create-cap') return hash;
+
+            const isPositiveCandidate =
+                (p.action === 'create-cap' && p.capName === capName) ||
+                (p.action === 'create' && capName in (p as CreateRCapPayload).initialCaps);
+
+            if (!isPositiveCandidate) continue;
+
+            const concurrentDeleteBarriers = await scopedDag.findConcurrentCoverWithFilter(
+                this.from, version(hash), { containsValues: { caps: [capName], barrier: ['t'] } },
+            );
+
+            if (concurrentDeleteBarriers.size === 0) {
+                surviving.add(hash);
+            }
         }
 
-        return undefined;
+        return surviving;
+    }
+
+    private async hasAnySurvivingOriginIn(capName: string, origins: Set<string>): Promise<boolean> {
+        const scopedDag = await this.target.getScopedDag();
+        const cover = await scopedDag.findCoverWithFilter(this.at, { containsValues: { caps: [capName] } });
+
+        for (const hash of cover) {
+            if (!origins.has(hash)) continue;
+
+            const entry = await scopedDag.loadEntry(hash);
+            if (entry === undefined) continue;
+            const p = entry.payload as CapPayload;
+
+            const isPositiveCandidate =
+                (p.action === 'create-cap' && p.capName === capName) ||
+                (p.action === 'create' && capName in (p as CreateRCapPayload).initialCaps);
+
+            if (!isPositiveCandidate) continue;
+
+            const concurrentDeleteBarriers = await scopedDag.findConcurrentCoverWithFilter(
+                this.from, version(hash), { containsValues: { caps: [capName], barrier: ['t'] } },
+            );
+
+            if (concurrentDeleteBarriers.size === 0) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     async getCapabilities(): Promise<string[]> {

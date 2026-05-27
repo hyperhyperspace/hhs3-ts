@@ -10,6 +10,7 @@ export const MAX_PUBLIC_KEY_LENGTH = 8192;
 export const MAX_CREATORS = 64;
 export const MAX_INITIAL_CAPS = 256;
 export const MAX_MANAGED_BY = 64;
+export const MAX_CAP_ORIGINS = 16;
 
 export type CapPayload = CreateRCapPayload | AddIdentityPayload | CreateCapabilityPayload
                        | DeleteCapabilityPayload | GrantPayload | RevokePayload;
@@ -86,14 +87,14 @@ export type GrantPayload = AuthoredFields & {
     action: 'grant';
     grantee: string;
     capName: string;
-    capOrigin: string;
+    capOrigins: string[];
 };
 
 export const grantFormat: json.Format = {
     action: [json.Type.Constant, 'grant'],
     grantee: [json.Type.BoundedString, MAX_KEY_ID_LENGTH],
     capName: [json.Type.BoundedString, CAP_MAX_CAP_NAME_LENGTH],
-    capOrigin: [json.Type.BoundedString, CAP_MAX_HASH_LENGTH],
+    capOrigins: [json.Type.BoundedArray, [json.Type.BoundedString, CAP_MAX_HASH_LENGTH], MAX_CAP_ORIGINS],
     author: [json.Type.BoundedString, MAX_KEY_ID_LENGTH],
     signature: [json.Type.BoundedString, MAX_SIGNATURE_LENGTH],
 };
