@@ -39,8 +39,8 @@ import { createSyncSession } from "@hyper-hyper-space/hhs3_sync";
 import type { SyncSession, SyncTarget } from "@hyper-hyper-space/hhs3_sync";
 
 import { verifyPayloadSignature, signPayload as signPayloadHelper, isAuthoredPayload, extractAuthor } from "../authorship.js";
-import { RCap } from "./rcap.js";
-import type { RCapView } from "./rcap.js";
+import { RCap } from "./rcap/rcap.js";
+import type { RCapView } from "./rcap/rcap.js";
 
 import { RAddEvent, RDeleteEvent, RSetEvent } from "./rset/events.js";
 

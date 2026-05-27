@@ -4,7 +4,7 @@ import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { version } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
-import { RCap, rCapFactory } from "../src/types/rcap.js";
+import { RCap, rCapFactory } from "../src/types/rcap/rcap.js";
 import { serializePublicKeyToBase64 } from "../src/authorship.js";
 
 const crypto = createBasicCrypto();
@@ -551,7 +551,7 @@ export const rcapTests = {
                 const view = await cap.getView();
                 assertTrue(await view.capabilityExists('write'), 'write should exist');
 
-                const origins = await view.getSurvivingCapOrigins('write');
+                const origins = await view.currentCapCreationVersion('write');
                 assertTrue(origins.has(cap.getId()),
                     'initial capability surviving origins should include create-op hash');
             }
@@ -579,7 +579,7 @@ export const rcapTests = {
                 assertTrue(await view.capabilityExists('write'),
                     'write should survive because re-created origin is not concurrent with delete');
 
-                const origins = await view.getSurvivingCapOrigins('write');
+                const origins = await view.currentCapCreationVersion('write');
                 assertTrue(origins.has(createHashB),
                     'surviving origins should include the non-concurrent re-create origin');
             }
@@ -591,7 +591,7 @@ export const rcapTests = {
 
                 const before = await cap.getView();
                 assertTrue(await before.capabilityExists('write'), 'write should exist initially');
-                assertTrue((await before.getSurvivingCapOrigins('write')).size > 0,
+                assertTrue((await before.currentCapCreationVersion('write')).size > 0,
                     'surviving origins should be non-empty when capability exists');
 
                 await cap.deleteCap(
@@ -601,7 +601,7 @@ export const rcapTests = {
 
                 const after = await cap.getView();
                 assertFalse(await after.capabilityExists('write'), 'write should not exist after delete');
-                assertTrue((await after.getSurvivingCapOrigins('write')).size === 0,
+                assertTrue((await after.currentCapCreationVersion('write')).size === 0,
                     'surviving origins should be empty when capability does not exist');
             }
         },

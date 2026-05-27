@@ -4,7 +4,7 @@ import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { version } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
-import { RCap, rCapFactory } from "../src/types/rcap.js";
+import { RCap, rCapFactory } from "../src/types/rcap/rcap.js";
 import { RSet, rSetFactory } from "../src/types/rset.js";
 import { serializePublicKeyToBase64 } from "../src/authorship.js";
 

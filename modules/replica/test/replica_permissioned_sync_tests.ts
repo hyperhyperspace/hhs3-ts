@@ -177,7 +177,7 @@ async function testCrossPeerWrite() {
         admin,
     );
     await aliceCap.grant(
-        bobSigning.keyId, 'write', aliceCap.getId(),
+        bobSigning.keyId, 'write',
         admin,
     );
 
@@ -304,7 +304,7 @@ async function testRevocationPropagation() {
         admin,
     );
     await aliceCap.grant(
-        bobSigning.keyId, 'write', aliceCap.getId(),
+        bobSigning.keyId, 'write',
         admin,
     );
 

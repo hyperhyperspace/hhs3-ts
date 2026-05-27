@@ -10,20 +10,21 @@ import type { Mesh, Swarm } from "@hyper-hyper-space/hhs3_mesh";
 import { createSyncSession } from "@hyper-hyper-space/hhs3_sync";
 import type { SyncSession, SyncTarget } from "@hyper-hyper-space/hhs3_sync";
 
-import { verifyPayloadSignature, deserializePublicKeyFromBase64, computeKeyId, signPayload as signPayloadHelper } from "../authorship.js";
-import type { KeyLookup } from "../authorship.js";
+import { deserializePublicKeyFromBase64, signPayload as signPayloadHelper } from "../../authorship.js";
 
 import {
-    createRCapFormat, CreateRCapPayload, CapDefinition,
-    addIdentityFormat, AddIdentityPayload,
-    createCapabilityFormat, CreateCapabilityPayload,
-    deleteCapabilityFormat, DeleteCapabilityPayload,
-    grantFormat, GrantPayload, MAX_CAP_ORIGINS,
-    revokeFormat, RevokePayload,
+    CreateRCapPayload, CapDefinition,
+    AddIdentityPayload,
+    CreateCapabilityPayload,
+    DeleteCapabilityPayload,
+    GrantPayload, MAX_CAP_ORIGINS,
+    RevokePayload,
     CapPayload,
-} from "./rcap/payload.js";
+} from "./payload.js";
 
-import type { RCapEvent } from "./rcap/events.js";
+import type { RCapEvent } from "./events.js";
+import type { RCap as RCapContract, RCapView as RCapViewContract } from "./interfaces.js";
+import { validateRCapPayload } from "./validate.js";
 
 const DEFAULT_ENROLL_CAPABILITY = 'enroll';
 
@@ -34,39 +35,8 @@ export const rCapFactory: RObjectFactory = {
         return entry.hash;
     },
 
-    validateCreationPayload: async (payload: json.Literal, _ctx: RContext) => {
-        if (!json.checkFormat(createRCapFormat, payload)) {
-            return false;
-        }
-
-        const cp = payload as CreateRCapPayload;
-
-        if (cp.creators.length === 0) return false;
-        if (cp.creators.length !== cp.creatorKeys.length) return false;
-
-        const hashSuite = _ctx.getHashSuite();
-        for (let i = 0; i < cp.creators.length; i++) {
-            try {
-                const pk = deserializePublicKeyFromBase64(cp.creatorKeys[i]);
-                if (computeKeyId(pk, hashSuite) !== cp.creators[i]) return false;
-            } catch {
-                return false;
-            }
-        }
-
-        const capNames = new Set(Object.keys(cp.initialCaps));
-        for (const def of Object.values(cp.initialCaps)) {
-            for (const mgr of def.managedBy) {
-                if (mgr !== 'creator' && !capNames.has(mgr)) return false;
-            }
-        }
-
-        if (cp.enrollCapability !== undefined) {
-            if (!capNames.has(cp.enrollCapability)) return false;
-        }
-
-        return true;
-    },
+    validateCreationPayload: async (payload: json.Literal, ctx: RContext) =>
+        validateRCapPayload(payload, { mode: "create", ctx }),
 
     executeCreationPayload: async (payload: json.Literal, _ctx: RContext, scopedDag: ScopedDag) => {
         const createPayload = payload as CreateRCapPayload;
@@ -81,7 +51,7 @@ export const rCapFactory: RObjectFactory = {
         if (rawDag === undefined) throw new Error(`DAG '${id}' not found`);
         const scopedDag = new RootScopedDag(rawDag);
         const createOp = (await scopedDag.loadEntry(id))!.payload as CreateRCapPayload;
-        return new RCap(id, createOp, ctx);
+        return new RCapImpl(id, createOp, ctx);
     }
 };
 
@@ -90,7 +60,7 @@ export type RCapRuntimeConfig = {
     backendLabel?: string;
 };
 
-export class RCap implements RObject, SyncableObject {
+export class RCapImpl implements RCapContract {
 
     static create = async (options: {
         seed: string;
@@ -99,7 +69,7 @@ export class RCap implements RObject, SyncableObject {
         enrollCapability?: string;
         hashAlgorithm?: string;
     }): Promise<RObjectInit> => {
-        const { serializePublicKeyToBase64 } = await import("../authorship.js");
+        const { serializePublicKeyToBase64 } = await import("../../authorship.js");
 
         const createPayload: CreateRCapPayload = {
             action: 'create',
@@ -114,7 +84,7 @@ export class RCap implements RObject, SyncableObject {
             createPayload.enrollCapability = options.enrollCapability;
         }
 
-        return { type: RCap.typeId, payload: createPayload };
+        return { type: RCapImpl.typeId, payload: createPayload };
     }
 
     static typeId = "hhs/cap_v1";
@@ -136,9 +106,9 @@ export class RCap implements RObject, SyncableObject {
     }
 
     getId(): string { return this.createOpId; }
-    getType(): string { return RCap.typeId; }
+    getType(): string { return RCapImpl.typeId; }
 
-    enrollCapability(): string {
+    getEnrollCapabilityName(): string {
         return this.createOp.enrollCapability ?? DEFAULT_ENROLL_CAPABILITY;
     }
 
@@ -172,7 +142,9 @@ export class RCap implements RObject, SyncableObject {
         return undefined;
     }
 
-    private keyLookup: KeyLookup = (keyId: KeyId) => this.lookupKey(keyId);
+    getHashSuite() {
+        return this.ctx.getHashSuite();
+    }
 
     selfValidate(): boolean {
         return this.ctx.getConfig().selfValidate || false;
@@ -239,7 +211,7 @@ export class RCap implements RObject, SyncableObject {
         const scopedDag = await this.getScopedDag();
         at = at || await scopedDag.getFrontier();
         const view = await this.getView(at, at);
-        const capOrigins = Array.from(await view.getSurvivingCapOrigins(capName))
+        const capOrigins = Array.from(await view.currentCapCreationVersion(capName))
             .sort()
             .slice(0, MAX_CAP_ORIGINS);
         const payload: Omit<GrantPayload, 'author' | 'signature'> = {
@@ -266,138 +238,7 @@ export class RCap implements RObject, SyncableObject {
     // RObject interface
 
     async validatePayload(payload: json.Literal, at: Version): Promise<boolean> {
-        if (typeof payload !== 'object' || Array.isArray(payload)) return false;
-        if (typeof payload['action'] !== 'string') return false;
-
-        const action = payload['action'];
-
-        switch (action) {
-            case 'add-identity': return this.validateAddIdentity(payload, at);
-            case 'create-cap':   return this.validateCreateCap(payload, at);
-            case 'delete-cap':   return this.validateDeleteCap(payload, at);
-            case 'grant':        return this.validateGrant(payload, at);
-            case 'revoke':       return this.validateRevoke(payload, at);
-            default: return false;
-        }
-    }
-
-    private async validateAddIdentity(payload: Payload, at: Version): Promise<boolean> {
-        if (!json.checkFormat(addIdentityFormat, payload)) return false;
-        const p = payload as AddIdentityPayload;
-
-        try {
-            const pk = deserializePublicKeyFromBase64(p.publicKey);
-            const hashSuite = this.ctx.getHashSuite();
-            if (computeKeyId(pk, hashSuite) !== p.keyId) return false;
-        } catch {
-            return false;
-        }
-
-        if (!await verifyPayloadSignature(payload as json.LiteralMap, this.keyLookup)) return false;
-
-        const authorId = p.author as KeyId;
-        if (!this.isCreator(authorId)) {
-            const view = await this.getView(at, at);
-            if (!await view.hasCapability(authorId, this.enrollCapability())) return false;
-        }
-
-        return true;
-    }
-
-    private async validateCreateCap(payload: Payload, at: Version): Promise<boolean> {
-        if (!json.checkFormat(createCapabilityFormat, payload)) return false;
-        const p = payload as CreateCapabilityPayload;
-
-        if (!await verifyPayloadSignature(payload as json.LiteralMap, this.keyLookup)) return false;
-
-        if (!this.isCreator(p.author as KeyId)) return false;
-
-        const view = await this.getView(at, at);
-        if (await view.capabilityExists(p.capName)) return false;
-
-        for (const mgr of p.managedBy) {
-            if (mgr !== 'creator' && !await view.capabilityExists(mgr)) return false;
-        }
-
-        return true;
-    }
-
-    private async validateDeleteCap(payload: Payload, at: Version): Promise<boolean> {
-        if (!json.checkFormat(deleteCapabilityFormat, payload)) return false;
-        const p = payload as DeleteCapabilityPayload;
-
-        if (!await verifyPayloadSignature(payload as json.LiteralMap, this.keyLookup)) return false;
-
-        if (!this.isCreator(p.author as KeyId)) return false;
-
-        const view = await this.getView(at, at);
-        if (!await view.capabilityExists(p.capName)) return false;
-
-        return true;
-    }
-
-    private async validateGrant(payload: Payload, at: Version): Promise<boolean> {
-        if (!json.checkFormat(grantFormat, payload)) return false;
-        const p = payload as GrantPayload;
-
-        if (!await verifyPayloadSignature(payload as json.LiteralMap, this.keyLookup)) return false;
-
-        const authorId = p.author as KeyId;
-        const view = await this.getView(at, at);
-
-        if (!await view.capabilityExists(p.capName)) return false;
-
-        if (!await view.isIdentity(p.grantee)) return false;
-
-        if (!this.isCreator(authorId)) {
-            const managedBy = await view.getManagedBy(p.capName);
-            let authorized = false;
-            for (const mgr of managedBy) {
-                if (mgr === 'creator') continue;
-                if (await view.hasCapability(authorId, mgr)) {
-                    authorized = true;
-                    break;
-                }
-            }
-            if (!authorized) return false;
-        }
-
-        const expected = Array.from(await view.getSurvivingCapOrigins(p.capName))
-            .sort()
-            .slice(0, MAX_CAP_ORIGINS);
-        if (expected.length !== p.capOrigins.length) return false;
-        for (let i = 0; i < expected.length; i++) {
-            if (expected[i] !== p.capOrigins[i]) return false;
-        }
-
-        return true;
-    }
-
-    private async validateRevoke(payload: Payload, at: Version): Promise<boolean> {
-        if (!json.checkFormat(revokeFormat, payload)) return false;
-        const p = payload as RevokePayload;
-
-        if (!await verifyPayloadSignature(payload as json.LiteralMap, this.keyLookup)) return false;
-
-        const authorId = p.author as KeyId;
-        const view = await this.getView(at, at);
-
-        if (!await view.capabilityExists(p.capName)) return false;
-
-        if (!this.isCreator(authorId)) {
-            const managedBy = await view.getManagedBy(p.capName);
-            let authorized = false;
-            for (const mgr of managedBy) {
-                if (mgr === 'creator') continue;
-                if (await view.hasCapability(authorId, mgr)) {
-                    authorized = true;
-                    break;
-                }
-            }
-            if (!authorized) return false;
-        }
-
-        return true;
+        return validateRCapPayload(payload, { mode: "op", cap: this, at });
     }
 
     async applyPayload(payload: Payload, at: Version): Promise<B64Hash> {
@@ -430,11 +271,11 @@ export class RCap implements RObject, SyncableObject {
         return await scopedDag.append(payload, meta, at);
     }
 
-    async getView(at?: Version, from?: Version): Promise<RCapView> {
+    async getView(at?: Version, from?: Version): Promise<RCapViewContract> {
         const scopedDag = await this.getScopedDag();
         at = at || await scopedDag.getFrontier();
         from = from || await scopedDag.getFrontier();
-        return new RCapView(this, at, from);
+        return new RCapViewImpl(this, at, from);
     }
 
     extractForeignDeps(_payload: Payload, _at: Version): ForeignDep[] | undefined {
@@ -659,19 +500,19 @@ export class RCap implements RObject, SyncableObject {
     }
 }
 
-export class RCapView implements View {
+export class RCapViewImpl implements RCapViewContract {
 
-    private target: RCap;
+    private target: RCapImpl;
     private at: Version;
     private from: Version;
 
-    constructor(target: RCap, at: Version, from: Version) {
+    constructor(target: RCapImpl, at: Version, from: Version) {
         this.target = target;
         this.at = at;
         this.from = from;
     }
 
-    getObject(): RCap { return this.target; }
+    getObject(): RCapContract { return this.target; }
     getVersion(): Version { return this.at; }
     getFromVersion(): Version { return this.from; }
 
@@ -784,7 +625,7 @@ export class RCapView implements View {
         return [];
     }
 
-    async getSurvivingCapOrigins(capName: string): Promise<Set<B64Hash>> {
+    async currentCapCreationVersion(capName: string): Promise<Version> {
         const scopedDag = await this.target.getScopedDag();
         const cover = await scopedDag.findCoverWithFilter(this.at, { containsValues: { caps: [capName] } });
         const surviving = new Set<B64Hash>();
@@ -899,3 +740,8 @@ export class RCapDelta implements Delta {
     getEndVersion(): Version { return this.end; }
     getRevisionBound(): Version { return this.revisionBound; }
 }
+
+export interface RCap extends RCapContract {}
+export interface RCapView extends RCapViewContract {}
+export const RCap = RCapImpl;
+export const RCapView = RCapViewImpl;

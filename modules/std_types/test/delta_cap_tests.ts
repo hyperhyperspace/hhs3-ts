@@ -4,8 +4,8 @@ import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { version } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
-import { RCap, rCapFactory } from "../src/types/rcap.js";
-import type { RCapDelta } from "../src/types/rcap.js";
+import { RCap, rCapFactory } from "../src/types/rcap/rcap.js";
+import type { RCapDelta } from "../src/types/rcap/rcap.js";
 import { serializePublicKeyToBase64 } from "../src/authorship.js";
 
 const crypto = createBasicCrypto();
@@ -353,7 +353,7 @@ export const deltaCapTests = {
                 await cap.createCap('deploy', ['admin'], admin);
                 const start = await dag.getFrontier();
 
-                const deployOrigins = await (await cap.getView()).getSurvivingCapOrigins('deploy');
+                const deployOrigins = await (await cap.getView()).currentCapCreationVersion('deploy');
                 assertTrue(deployOrigins.size > 0, 'deploy origins should be non-empty after create-cap');
                 await cap.grant(bob.keyId, 'deploy', admin);
                 await cap.deleteCap('deploy', admin);
