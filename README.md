@@ -56,3 +56,14 @@ npm install
 npm run build
 ```
 
+The latest LTS versions of Node (v24.16.0) and NPM (11.13.0) are supported.
+
+### Tests
+
+To run all the test suites, run
+
+```
+npm run test
+```
+
+This automatically excludes the large tests cases from the DAG module, that take a significant amount of time / memory tu run (but it does run the same tests on smaller instances).
