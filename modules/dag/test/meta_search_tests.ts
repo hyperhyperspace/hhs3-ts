@@ -145,7 +145,7 @@ const metaSearchSuite = {
     title: "[META] Test Meta Search Solutions",
     tests: [
         {
-            name: "[META_00] Basic meta property covering tests using flat index",
+            name: "[META_00] Basic meta property covering tests using flat index (small DAGs)",
             invoke: async () => {
                 const store = new dag.store.MemDagStorage();
                 const flatIndex = dag.idx.flat.createFlatIndex(
@@ -197,7 +197,7 @@ const metaSearchSuite = {
             }
         },
         {
-            name: "[META_01] Basic meta property concurrent covering tests using flat index",
+            name: "[META_01] Basic meta property concurrent covering tests using flat index (small DAGs)",
             invoke: async () => {
                 const store = new dag.store.MemDagStorage();
                 const flatIndex = dag.idx.flat.createFlatIndex(
@@ -257,25 +257,25 @@ const metaSearchSuite = {
             }
         },
         {
-            name: "[META_02] Pseudo-random cover filters topo vs flat parity on small random DAGs",
+            name: "[META_02] Pseudo-random cover filters topo vs flat parity on small random DAGs (small DAGs)",
             invoke: async () => {
                 await runMetaParity(topoFlatDagPairConstr, {size: 1000, seed: 1771});
             }
         },
         {
-            name: "[META_03] Pseudo-random cover filters topo vs flat parity on medium random DAGs",
+            name: "[META_03] Pseudo-random cover filters topo vs flat parity on medium random DAGs (small DAGs)",
             invoke: async () => {
                 await runMetaParity(topoFlatDagPairConstr, {size: 5000, seed: 1776});
             }
         },
         {
-            name: "[META_04] Pseudo-random cover filters topo vs flat parity on medium random DAGs",
+            name: "[META_04] Pseudo-random cover filters topo vs flat parity on medium random DAGs (small DAGs)",
             invoke: async () => {
                 await runMetaParity(topoFlatDagPairConstr, {size: 10000, seed: 1774});
             }
         },
         {
-            name: "[META_05] findCoverWithFilter with predicate rejecting a cover entry",
+            name: "[META_05] findCoverWithFilter with predicate rejecting a cover entry (small DAGs)",
             invoke: async () => {
                 const store = new dag.store.MemDagStorage();
                 const flatIndex = dag.idx.flat.createFlatIndex(
@@ -300,7 +300,7 @@ const metaSearchSuite = {
             }
         },
         {
-            name: "[META_06] findConcurrentCoverWithFilter with predicate rejecting a concurrent entry",
+            name: "[META_06] findConcurrentCoverWithFilter with predicate rejecting a concurrent entry (small DAGs)",
             invoke: async () => {
                 const store = new dag.store.MemDagStorage();
                 const flatIndex = dag.idx.flat.createFlatIndex(
@@ -327,7 +327,7 @@ const metaSearchSuite = {
             }
         },
         {
-            name: "[META_07] Predicate accepting all entries matches no-predicate results",
+            name: "[META_07] Predicate accepting all entries matches no-predicate results (small DAGs)",
             invoke: async () => {
                 const store = new dag.store.MemDagStorage();
                 const flatIndex = dag.idx.flat.createFlatIndex(

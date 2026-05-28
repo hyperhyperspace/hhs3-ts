@@ -104,11 +104,11 @@ async function testFrontierUpToDateWhenListenerFires() {
 export const growthEventSuite = {
     title: "\n[MEM_GROW] Memory DagStore Growth Event Tests\n",
     tests: [
-        { name: "[MEM_GROW_00] Listener fires on append",                invoke: testListenerFiresOnAppend },
-        { name: "[MEM_GROW_01] Listener not called before first append",  invoke: testListenerNotCalledBeforeAppend },
-        { name: "[MEM_GROW_02] Multiple listeners all fire",              invoke: testMultipleListenersAllFire },
-        { name: "[MEM_GROW_03] removeListener stops delivery",            invoke: testRemoveListenerStopsDelivery },
-        { name: "[MEM_GROW_04] Listener fires once per transaction",      invoke: testListenerFiresOncePerTransaction },
-        { name: "[MEM_GROW_05] Frontier up to date when listener fires",  invoke: testFrontierUpToDateWhenListenerFires },
+        { name: "[MEM_GROW_00] Listener fires on append (small DAGs)",                invoke: testListenerFiresOnAppend },
+        { name: "[MEM_GROW_01] Listener not called before first append (small DAGs)",  invoke: testListenerNotCalledBeforeAppend },
+        { name: "[MEM_GROW_02] Multiple listeners all fire (small DAGs)",              invoke: testMultipleListenersAllFire },
+        { name: "[MEM_GROW_03] removeListener stops delivery (small DAGs)",            invoke: testRemoveListenerStopsDelivery },
+        { name: "[MEM_GROW_04] Listener fires once per transaction (small DAGs)",      invoke: testListenerFiresOncePerTransaction },
+        { name: "[MEM_GROW_05] Frontier up to date when listener fires (small DAGs)",  invoke: testFrontierUpToDateWhenListenerFires },
     ],
 };
