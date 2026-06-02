@@ -73,7 +73,10 @@ export const deltaTests = {
                 assertTrue(delta.added.includes(hashElement('beta')), 'beta should be in added');
                 assertEquals(delta.removed.length, 0, 'should have 0 removed elements');
                 assertEquals(delta.validityChanges.length, 0, 'no validity changes for plain set');
-                assertEquals(delta.getRevisionBound().size, 0, 'brute-force revision bound is empty');
+                assertTrue(
+                    set.eq(delta.getRevisionBound(), creationVersion),
+                    'revision bound is the meet (create op for a linear extension from creation)',
+                );
             }
         },
         {
@@ -97,9 +100,9 @@ export const deltaTests = {
                 await rset.delete('X');
                 const afterDelete = await dag.getFrontier();
 
-                const fullDelta = await rset.computeDelta(creationVersion, afterDelete) as RSetDelta;
-                assertEquals(fullDelta.added.length, 0, 'net-zero: nothing added');
-                assertEquals(fullDelta.removed.length, 0, 'net-zero: nothing removed');
+                const netZeroDelta = await rset.computeDelta(creationVersion, afterDelete) as RSetDelta;
+                assertEquals(netZeroDelta.added.length, 0, 'net-zero: nothing added');
+                assertEquals(netZeroDelta.removed.length, 0, 'net-zero: nothing removed');
 
                 const partialDelta = await rset.computeDelta(afterAdd, afterDelete) as RSetDelta;
                 assertEquals(partialDelta.added.length, 0, 'partial: nothing added');
@@ -170,11 +173,8 @@ export const deltaTests = {
             }
         },
         {
-            name: '[DELTA04] Permissioned RSet: reverse delta shows revalidation',
+            name: '[DELTA04] computeDelta throws when END does not extend START',
             invoke: async () => {
-                // Reuses the same setup as DELTA03 but computes the delta in
-                // reverse (from after-revoke back to before-revoke). Y should
-                // appear in added with a validity change wasValid=false -> nowValid=true.
                 const ctx = createMockRContext({ selfValidate: true });
                 ctx.getRegistry().register(RCap.typeId, rCapFactory);
                 ctx.getRegistry().register(RSet.typeId, rSetFactory);
@@ -202,42 +202,30 @@ export const deltaTests = {
                 const rset = (await ctx.createObject(setInit)) as RSet;
 
                 await cap.addIdentity(bob.keyId, serializePublicKeyToBase64(bob.publicKey), admin);
-
-                const capFork = await (await cap.getScopedDag()).getFrontier();
-                await cap.grant(bob.keyId, 'write', admin, capFork);
-
+                await cap.grant(bob.keyId, 'write', admin);
                 const capV1 = await (await cap.getScopedDag()).getFrontier();
                 await rset.refAdvance(capV1, admin);
-
-                await rset.addSigned('Y', bob);
 
                 const setDag = (await ctx.getDag(rset.getId()))!;
                 const beforeRevoke = await setDag.getFrontier();
 
-                await cap.revoke(bob.keyId, 'write', admin, capFork);
+                await cap.revoke(bob.keyId, 'write', admin);
                 const capV2 = await (await cap.getScopedDag()).getFrontier();
                 await rset.refAdvance(capV2, admin);
 
                 const afterRevoke = await setDag.getFrontier();
 
-                // Reverse delta: from after-revoke back to before-revoke
-                const delta = await rset.computeDelta(afterRevoke, beforeRevoke) as RSetDelta;
-
-                assertEquals(delta.added.length, 1, 'Y should be added (became valid)');
-                assertTrue(delta.added.includes(hashElement('Y')), 'Y hash should be in added');
-                assertEquals(delta.removed.length, 0, 'nothing removed');
-
-                assertTrue(delta.validityChanges.length >= 1, 'should have at least 1 validity change');
-                const bobChange = delta.validityChanges.find(vc => vc.author === bob.keyId);
-                assertTrue(bobChange !== undefined, 'should have a validity change for Bob');
-                assertFalse(bobChange!.wasValid, 'Bob add was invalid at after-revoke');
-                assertTrue(bobChange!.nowValid, 'Bob add is valid at before-revoke');
-                assertEquals(bobChange!.action, 'add', 'action should be add');
-                assertEquals(bobChange!.elementHash, hashElement('Y'), 'element should be Y');
+                let threw = false;
+                try {
+                    await rset.computeDelta(afterRevoke, beforeRevoke);
+                } catch (e) {
+                    threw = ((e as Error).message).indexOf('requires END to extend START') >= 0;
+                }
+                assertTrue(threw, 'should throw when end does not extend start');
             }
         },
         {
-            name: '[DELTA05] Plain RSet: bounded delta equals full and reports a non-empty revision bound',
+            name: '[DELTA05] Plain RSet: default delta reports revision bound at the meet',
             invoke: async () => {
                 const ctx = createMockRContext({ selfValidate: true });
                 ctx.getRegistry().register(RSet.typeId, rSetFactory);
@@ -257,25 +245,24 @@ export const deltaTests = {
                 await rset.delete('alpha');
                 const end = await dag.getFrontier();
 
-                const full = await computeRSetWithStrategy(rset, 'full', start, end);
-                const bounded = await computeRSetWithStrategy(rset, 'bounded', start, end);
+                const delta = await computeRSetWithStrategy(rset, 'bounded', start, end);
+                const reference = await computeRSetWithStrategy(rset, 'full', start, end);
 
                 assertEquals(
-                    JSON.stringify(normalizeRSetDelta(bounded)),
-                    JSON.stringify(normalizeRSetDelta(full)),
-                    'bounded should match full for a plain set',
+                    JSON.stringify(normalizeRSetDelta(delta)),
+                    JSON.stringify(normalizeRSetDelta(reference)),
+                    'default bounded delta should match reference scan on extending interval',
                 );
-                assertTrue(bounded.added.includes(hashElement('beta')), 'beta should be added');
-                assertTrue(bounded.removed.includes(hashElement('alpha')), 'alpha should be removed');
+                assertTrue(delta.added.includes(hashElement('beta')), 'beta should be added');
+                assertTrue(delta.removed.includes(hashElement('alpha')), 'alpha should be removed');
                 assertTrue(
-                    set.eq(bounded.getRevisionBound(), start),
-                    'bounded revision bound equals the meet (== start for a linear extension)',
+                    set.eq(delta.getRevisionBound(), start),
+                    'revision bound equals the meet (== start for a linear extension)',
                 );
-                assertEquals(full.getRevisionBound().size, 0, 'full keeps an empty revision bound');
             }
         },
         {
-            name: '[DELTA06] Permissioned RSet: bounded delta equals full across a concurrent revoke',
+            name: '[DELTA06] Permissioned RSet: woven floor on concurrent revoke',
             invoke: async () => {
                 const ctx = createMockRContext({ selfValidate: true });
                 ctx.getRegistry().register(RCap.typeId, rCapFactory);
@@ -325,27 +312,27 @@ export const deltaTests = {
 
                 const afterRevoke = await setDag.getFrontier();
 
-                const full = await computeRSetWithStrategy(rset, 'full', beforeRevoke, afterRevoke);
-                const bounded = await computeRSetWithStrategy(rset, 'bounded', beforeRevoke, afterRevoke);
+                const delta = await computeRSetWithStrategy(rset, 'bounded', beforeRevoke, afterRevoke);
+                const reference = await computeRSetWithStrategy(rset, 'full', beforeRevoke, afterRevoke);
 
                 assertEquals(
-                    JSON.stringify(normalizeRSetDelta(bounded)),
-                    JSON.stringify(normalizeRSetDelta(full)),
-                    'bounded should match full across the revoke',
+                    JSON.stringify(normalizeRSetDelta(delta)),
+                    JSON.stringify(normalizeRSetDelta(reference)),
+                    'default bounded delta should match reference scan across the revoke',
                 );
                 assertTrue(
-                    set.eq(bounded.getRevisionBound(), afterRa1),
+                    set.eq(delta.getRevisionBound(), afterRa1),
                     'floor descent lands at the ref-advance just below the meet (tight floor)',
                 );
-                assertTrue(bounded.removed.includes(hashElement('Y')), 'Y should be removed');
-                const bobChange = bounded.validityChanges.find(vc => vc.author === bob.keyId);
-                assertTrue(bobChange !== undefined, 'bounded should report Bob validity change');
+                assertTrue(delta.removed.includes(hashElement('Y')), 'Y should be removed');
+                const bobChange = delta.validityChanges.find(vc => vc.author === bob.keyId);
+                assertTrue(bobChange !== undefined, 'should report Bob validity change');
                 assertTrue(bobChange!.wasValid, 'Bob add was valid before revoke');
                 assertFalse(bobChange!.nowValid, 'Bob add is void after revoke');
             }
         },
         {
-            name: '[DELTA07] Bounded delta throws when START is not in the history of END',
+            name: '[DELTA07] computeDelta throws when START is not in the history of END',
             invoke: async () => {
                 const ctx = createMockRContext({ selfValidate: true });
                 ctx.getRegistry().register(RSet.typeId, rSetFactory);
@@ -363,7 +350,6 @@ export const deltaTests = {
                 await rset.add('beta');
                 const late = await dag.getFrontier();
 
-                rset.setDeltaStrategy('bounded');
                 let threw = false;
                 try {
                     // late does not extend early in the START position -> forkA is non-empty.
@@ -371,7 +357,7 @@ export const deltaTests = {
                 } catch {
                     threw = true;
                 }
-                assertTrue(threw, 'bounded should throw when end does not extend start');
+                assertTrue(threw, 'should throw when end does not extend start');
             }
         },
         {
@@ -425,27 +411,27 @@ export const deltaTests = {
 
                 const end = await setDag.getFrontier();
 
-                const full = await computeRSetWithStrategy(rset, 'full', start, end);
-                const bounded = await computeRSetWithStrategy(rset, 'bounded', start, end);
+                const delta = await computeRSetWithStrategy(rset, 'bounded', start, end);
+                const reference = await computeRSetWithStrategy(rset, 'full', start, end);
 
                 assertEquals(
-                    JSON.stringify(normalizeRSetDelta(bounded)),
-                    JSON.stringify(normalizeRSetDelta(full)),
-                    'bounded should match full (Y survives by use-before-revoke)',
+                    JSON.stringify(normalizeRSetDelta(delta)),
+                    JSON.stringify(normalizeRSetDelta(reference)),
+                    'default bounded delta should match reference scan (Y survives by use-before-revoke)',
                 );
-                assertEquals(bounded.removed.length, 0, 'Y is not removed (use-before-revoke)');
+                assertEquals(delta.removed.length, 0, 'Y is not removed (use-before-revoke)');
 
-                assertTrue(bounded.getRevisionBound().size > 0, 'bounded revision bound should be non-empty');
+                assertTrue(delta.getRevisionBound().size > 0, 'revision bound should be non-empty');
 
                 // All ref-advances are stable, so the woven floor is the RSet meet, which sits at
                 // or below start (forkA empty against start).
-                const boundVsStart = await setDag.findForkPosition(bounded.getRevisionBound(), start);
+                const boundVsStart = await setDag.findForkPosition(delta.getRevisionBound(), start);
                 assertEquals(boundVsStart.forkA.size, 0, 'revision bound must be at or below start');
 
                 // ...and strictly above the create op: the meet is a real floor, not the trivial
                 // whole-DAG fallback.
                 assertFalse(
-                    set.eq(bounded.getRevisionBound(), version(rset.getId())),
+                    set.eq(delta.getRevisionBound(), version(rset.getId())),
                     'revision bound should be the meet, above the create op (not the trivial fallback)',
                 );
             }
@@ -495,19 +481,19 @@ export const deltaTests = {
                 await rset.addSigned('W', bob);
                 const end = await setDag.getFrontier();
 
-                const full = await computeRSetWithStrategy(rset, 'full', start, end);
-                const bounded = await computeRSetWithStrategy(rset, 'bounded', start, end);
+                const delta = await computeRSetWithStrategy(rset, 'bounded', start, end);
+                const reference = await computeRSetWithStrategy(rset, 'full', start, end);
 
                 assertEquals(
-                    JSON.stringify(normalizeRSetDelta(bounded)),
-                    JSON.stringify(normalizeRSetDelta(full)),
-                    'bounded should match full when only W is new',
+                    JSON.stringify(normalizeRSetDelta(delta)),
+                    JSON.stringify(normalizeRSetDelta(reference)),
+                    'default bounded delta should match reference scan when only W is new',
                 );
-                assertTrue(bounded.added.includes(hashElement('W')), 'W should be added');
-                assertFalse(bounded.added.includes(hashElement('X')), 'stable X should not be reported as added');
-                assertFalse(bounded.removed.includes(hashElement('X')), 'stable X should not be reported as removed');
-                assertFalse(bounded.added.includes(hashElement('Z')), 'stable Z should not be reported as added');
-                assertEquals(bounded.removed.length, 0, 'nothing should be removed');
+                assertTrue(delta.added.includes(hashElement('W')), 'W should be added');
+                assertFalse(delta.added.includes(hashElement('X')), 'stable X should not be reported as added');
+                assertFalse(delta.removed.includes(hashElement('X')), 'stable X should not be reported as removed');
+                assertFalse(delta.added.includes(hashElement('Z')), 'stable Z should not be reported as added');
+                assertEquals(delta.removed.length, 0, 'nothing should be removed');
             }
         },
         {
@@ -570,23 +556,23 @@ export const deltaTests = {
 
                 const end = await setDag.getFrontier();
 
-                const full = await computeRSetWithStrategy(rset, 'full', start, end);
-                const bounded = await computeRSetWithStrategy(rset, 'bounded', start, end);
+                const delta = await computeRSetWithStrategy(rset, 'bounded', start, end);
+                const reference = await computeRSetWithStrategy(rset, 'full', start, end);
 
                 assertEquals(
-                    JSON.stringify(normalizeRSetDelta(bounded)),
-                    JSON.stringify(normalizeRSetDelta(full)),
-                    'bounded should match full across a multi-level descent',
+                    JSON.stringify(normalizeRSetDelta(delta)),
+                    JSON.stringify(normalizeRSetDelta(reference)),
+                    'default bounded delta should match reference scan across a multi-level descent',
                 );
 
                 // The floor is the lowest unstable ref-advance (ra1), reached by descending past ra2.
                 // A floor stuck at ra2 would skip addX and drop its validity flip, breaking the match.
                 assertTrue(
-                    set.eq(bounded.getRevisionBound(), afterRa1),
+                    set.eq(delta.getRevisionBound(), afterRa1),
                     'descent settles at the lowest unstable ref-advance (ra1), below addX',
                 );
-                assertTrue(bounded.removed.includes(hashElement('X')), 'X is voided by the concurrent revoke');
-                assertTrue(bounded.removed.includes(hashElement('Y')), 'Y is voided by the concurrent revoke');
+                assertTrue(delta.removed.includes(hashElement('X')), 'X is voided by the concurrent revoke');
+                assertTrue(delta.removed.includes(hashElement('Y')), 'Y is voided by the concurrent revoke');
             }
         },
     ]

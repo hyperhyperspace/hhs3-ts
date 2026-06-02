@@ -14,8 +14,6 @@ import {
     Version,
     View,
 } from "@hyper-hyper-space/hhs3_mvt";
-import { CausalDag, ScopedDag } from "@hyper-hyper-space/hhs3_mvt";
-
 import type { RCap } from "../rcap/interfaces.js";
 import type { RAddEvent, RDeleteEvent } from "./events.js";
 
@@ -64,9 +62,6 @@ export interface RSet<T extends json.Literal = json.Literal> extends RObject, Sy
     unsubscribe(callback: (event: RAddEvent | RDeleteEvent) => void): void;
     setDeltaStrategy(strategy: "full" | "bounded"): void;
     computeDelta(start: Version, end: Version): Promise<Delta>;
-
-    getScopedDag(): Promise<ScopedDag>;
-    getCausalDag(): Promise<CausalDag>;
 }
 
 export interface RSetView<T extends json.Literal = json.Literal> extends View {

@@ -1,4 +1,4 @@
-import { B64Hash, KeyId, sha256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash, KeyId } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import type { NestingParent, Payload, Version } from "@hyper-hyper-space/hhs3_mvt";
 import { isRefAdvancePayload, refAdvanceFormat } from "@hyper-hyper-space/hhs3_mvt";
@@ -13,6 +13,7 @@ import {
     updateElmtFormat, UpdateElmtPayload,
 } from "./payload.js";
 import type { RSet } from "./interfaces.js";
+import { hashElement } from "./hash.js";
 
 type CreateValidationContext = {
     mode: "create";
@@ -211,8 +212,4 @@ async function validateUpdatePayload(payload: Payload, rset: RSet, at: Version):
     }
 
     return true;
-}
-
-function hashElement<T extends json.Literal>(element: T): B64Hash {
-    return sha256.hashToB64(stringToUint8Array(json.toStringNormalized(element)));
 }

@@ -34,6 +34,9 @@ export type RObject = {
     getView(at?: Version, from?: Version): Promise<View>;
     computeDelta(start: Version, end: Version): Promise<Delta>;
 
+    getScopedDag(): Promise<ScopedDag>;
+    getCausalDag(): Promise<CausalDag>;
+
     extractForeignDeps(payload: Payload, at: Version): ForeignDep[] | undefined;
 
     subscribe(callback: (event: Event) => void): void;

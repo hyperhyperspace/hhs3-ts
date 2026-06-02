@@ -2,12 +2,13 @@ import { B64Hash, KeyId, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
 import type { OwnIdentity, HashSuite } from "@hyper-hyper-space/hhs3_crypto";
 
 import { Payload, RObject, SyncableObject, Version, View, ForeignDep } from "@hyper-hyper-space/hhs3_mvt";
-import { ScopedDag } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RCapEvent } from "./events.js";
+import type { CapDefinition } from "./payload.js";
 
 export interface RCap extends RObject, SyncableObject {
     getEnrollCapabilityName(): string;
+    getInitialCaps(): { [capName: string]: CapDefinition };
     isCreator(keyId: KeyId): boolean;
     lookupCreatorKey(keyId: KeyId): PublicKey | undefined;
     lookupKey(keyId: KeyId): Promise<PublicKey | undefined>;
@@ -29,7 +30,6 @@ export interface RCap extends RObject, SyncableObject {
 
     setDeltaStrategy(strategy: "full" | "bounded"): void;
     configure(config: { meshLabel?: string; backendLabel?: string }): void;
-    getScopedDag(): Promise<ScopedDag>;
 }
 
 export interface RCapView extends View {

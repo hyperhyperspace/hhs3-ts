@@ -85,11 +85,14 @@ export const deltaCapTests = {
                 assertFalse(delta.grantChanges[0].wasGranted, 'was not granted');
                 assertTrue(delta.grantChanges[0].nowGranted, 'now granted');
 
-                assertEquals(delta.getRevisionBound().size, 0, 'brute-force revision bound is empty');
+                assertTrue(
+                    set.eq(delta.getRevisionBound(), creationVersion),
+                    'revision bound is the meet (create op for a linear extension from creation)',
+                );
             }
         },
         {
-            name: '[CAP_DELTA02] Grant then revoke: partial delta shows flip, full delta is net zero',
+            name: '[CAP_DELTA02] Grant then revoke: partial delta shows flip, from-creation delta is net zero',
             invoke: async () => {
                 const admin = await makeIdentity();
                 const bob = await makeIdentity();
@@ -112,9 +115,9 @@ export const deltaCapTests = {
                 assertTrue(partialDelta.grantChanges[0].wasGranted, 'partial: was granted');
                 assertFalse(partialDelta.grantChanges[0].nowGranted, 'partial: now not granted');
 
-                const fullDelta = await cap.computeDelta(creationVersion, afterRevoke) as RCapDelta;
-                assertEquals(fullDelta.grantChanges.length, 0, 'full: net zero grant changes');
-                assertEquals(fullDelta.identityChanges.length, 1, 'full: Bob identity still added');
+                const fromCreationDelta = await cap.computeDelta(creationVersion, afterRevoke) as RCapDelta;
+                assertEquals(fromCreationDelta.grantChanges.length, 0, 'from creation: net zero grant changes');
+                assertEquals(fromCreationDelta.identityChanges.length, 1, 'from creation: Bob identity still added');
             }
         },
         {
@@ -206,7 +209,7 @@ export const deltaCapTests = {
             }
         },
         {
-            name: '[CAP_DELTA05] Differential: bounded equals full across baseline scenarios',
+            name: '[CAP_DELTA05] Default bounded delta matches reference scan across baseline scenarios',
             invoke: async () => {
                 // Scenario 1: add identity + grant
                 {
@@ -219,12 +222,12 @@ export const deltaCapTests = {
                     await cap.grant(bob.keyId, 'write', admin);
                     const end = await (await ctx.getDag(cap.getId()))!.getFrontier();
 
-                    const full = await computeWithStrategy(cap, 'full', start, end);
-                    const bounded = await computeWithStrategy(cap, 'bounded', start, end);
+                    const delta = await computeWithStrategy(cap, 'bounded', start, end);
+                    const reference = await computeWithStrategy(cap, 'full', start, end);
                     assertEquals(
-                        JSON.stringify(normalizeDelta(bounded)),
-                        JSON.stringify(normalizeDelta(full)),
-                        'scenario 1 should match',
+                        JSON.stringify(normalizeDelta(delta)),
+                        JSON.stringify(normalizeDelta(reference)),
+                        'scenario 1 should match reference scan',
                     );
                 }
 
@@ -242,12 +245,12 @@ export const deltaCapTests = {
                     await cap.revoke(bob.keyId, 'write', admin);
                     const end = await dag.getFrontier();
 
-                    const full = await computeWithStrategy(cap, 'full', start, end);
-                    const bounded = await computeWithStrategy(cap, 'bounded', start, end);
+                    const delta = await computeWithStrategy(cap, 'bounded', start, end);
+                    const reference = await computeWithStrategy(cap, 'full', start, end);
                     assertEquals(
-                        JSON.stringify(normalizeDelta(bounded)),
-                        JSON.stringify(normalizeDelta(full)),
-                        'scenario 2 should match',
+                        JSON.stringify(normalizeDelta(delta)),
+                        JSON.stringify(normalizeDelta(reference)),
+                        'scenario 2 should match reference scan',
                     );
                 }
 
@@ -262,12 +265,12 @@ export const deltaCapTests = {
                     await cap.deleteCap('deploy', admin);
                     const end = await dag.getFrontier();
 
-                    const full = await computeWithStrategy(cap, 'full', start, end);
-                    const bounded = await computeWithStrategy(cap, 'bounded', start, end);
+                    const delta = await computeWithStrategy(cap, 'bounded', start, end);
+                    const reference = await computeWithStrategy(cap, 'full', start, end);
                     assertEquals(
-                        JSON.stringify(normalizeDelta(bounded)),
-                        JSON.stringify(normalizeDelta(full)),
-                        'scenario 3 should match',
+                        JSON.stringify(normalizeDelta(delta)),
+                        JSON.stringify(normalizeDelta(reference)),
+                        'scenario 3 should match reference scan',
                     );
                 }
 
@@ -285,18 +288,18 @@ export const deltaCapTests = {
                     await cap.revoke(alice.keyId, 'write', admin, start);
                     const end = await dag.getFrontier();
 
-                    const full = await computeWithStrategy(cap, 'full', start, end);
-                    const bounded = await computeWithStrategy(cap, 'bounded', start, end);
+                    const delta = await computeWithStrategy(cap, 'bounded', start, end);
+                    const reference = await computeWithStrategy(cap, 'full', start, end);
                     assertEquals(
-                        JSON.stringify(normalizeDelta(bounded)),
-                        JSON.stringify(normalizeDelta(full)),
-                        'scenario 4 should match',
+                        JSON.stringify(normalizeDelta(delta)),
+                        JSON.stringify(normalizeDelta(reference)),
+                        'scenario 4 should match reference scan',
                     );
                 }
             }
         },
         {
-            name: '[CAP_DELTA06] bounded revisionBound equals the fork-point meet',
+            name: '[CAP_DELTA06] revisionBound equals the fork-point meet',
             invoke: async () => {
                 const admin = await makeIdentity();
                 const bob = await makeIdentity();
@@ -306,18 +309,16 @@ export const deltaCapTests = {
                 await cap.addIdentity(bob.keyId, serializePublicKeyToBase64(bob.publicKey), admin);
                 const end = await (await ctx.getDag(cap.getId()))!.getFrontier();
 
-                const full = await computeWithStrategy(cap, 'full', start, end);
-                const bounded = await computeWithStrategy(cap, 'bounded', start, end);
+                const delta = await computeWithStrategy(cap, 'bounded', start, end);
 
-                assertEquals(full.getRevisionBound().size, 0, 'full keeps empty revisionBound');
                 assertTrue(
-                    set.eq(bounded.getRevisionBound(), start),
-                    'bounded revisionBound equals the meet (== start for a linear add)',
+                    set.eq(delta.getRevisionBound(), start),
+                    'revisionBound equals the meet (== start for a linear add)',
                 );
             }
         },
         {
-            name: '[CAP_DELTA07] bounded throws when START is not in history(END)',
+            name: '[CAP_DELTA07] computeDelta throws when START is not in history(END)',
             invoke: async () => {
                 const admin = await makeIdentity();
                 const alice = await makeIdentity();
@@ -333,8 +334,6 @@ export const deltaCapTests = {
                 const grantA = await cap.grant(alice.keyId, 'write', admin, forkPoint);
                 const grantB = await cap.grant(bob.keyId, 'write', admin, forkPoint);
 
-                cap.setDeltaStrategy('bounded');
-
                 let threw = false;
                 try {
                     await cap.computeDelta(version(grantA), version(grantB));
@@ -342,11 +341,11 @@ export const deltaCapTests = {
                     threw = ((e as Error).message).indexOf('requires END to extend START') >= 0;
                 }
 
-                assertTrue(threw, 'bounded should throw when forkA is non-empty');
+                assertTrue(threw, 'should throw when end does not extend start');
             }
         },
         {
-            name: '[CAP_DELTA08] Deleted capability suppresses grant diffs in both strategies',
+            name: '[CAP_DELTA08] Deleted capability suppresses grant diffs',
             invoke: async () => {
                 const admin = await makeIdentity();
                 const bob = await makeIdentity();
@@ -363,18 +362,18 @@ export const deltaCapTests = {
                 await cap.deleteCap('deploy', admin);
                 const end = await dag.getFrontier();
 
-                const full = await computeWithStrategy(cap, 'full', start, end);
-                const bounded = await computeWithStrategy(cap, 'bounded', start, end);
+                const delta = await computeWithStrategy(cap, 'bounded', start, end);
+                const reference = await computeWithStrategy(cap, 'full', start, end);
 
-                assertEquals(full.grantChanges.length, 0, 'full should suppress grant diffs for deleted cap');
-                assertEquals(bounded.grantChanges.length, 0, 'bounded should suppress grant diffs for deleted cap');
+                assertEquals(delta.grantChanges.length, 0, 'should suppress grant diffs for deleted cap');
+                assertEquals(reference.grantChanges.length, 0, 'reference scan should suppress grant diffs for deleted cap');
 
-                const fullDeployChange = full.capabilityChanges.find(c => c.capName === 'deploy');
-                const boundedDeployChange = bounded.capabilityChanges.find(c => c.capName === 'deploy');
-                assertTrue(fullDeployChange !== undefined, 'full should report deploy capability change');
-                assertTrue(boundedDeployChange !== undefined, 'bounded should report deploy capability change');
-                assertFalse(fullDeployChange!.exists, 'full: deploy should not exist at END');
-                assertFalse(boundedDeployChange!.exists, 'bounded: deploy should not exist at END');
+                const deployChange = delta.capabilityChanges.find(c => c.capName === 'deploy');
+                const referenceDeployChange = reference.capabilityChanges.find(c => c.capName === 'deploy');
+                assertTrue(deployChange !== undefined, 'should report deploy capability change');
+                assertTrue(referenceDeployChange !== undefined, 'reference scan should report deploy capability change');
+                assertFalse(deployChange!.exists, 'deploy should not exist at END');
+                assertFalse(referenceDeployChange!.exists, 'reference scan: deploy should not exist at END');
             }
         },
         {
@@ -389,7 +388,7 @@ export const deltaCapTests = {
             //   g2  = grant bob write (via alice's admin)   <-- transitively flips
             //   old = revoke alice admin (after g1, concurrent with g2; barrier)
             //   m   = merge(g2, old) = add identity carol
-            name: '[CAP_DELTA09] bounded matches full when a merged branch transitively voids a trunk grant',
+            name: '[CAP_DELTA09] merged branch transitively voids a trunk grant',
             invoke: async () => {
                 const R = await makeIdentity();
                 const alice = await makeIdentity();
@@ -411,19 +410,19 @@ export const deltaCapTests = {
                 );
                 const end = version(m);
 
-                const full = await computeWithStrategy(cap, 'full', start, end);
-                const bounded = await computeWithStrategy(cap, 'bounded', start, end);
+                const delta = await computeWithStrategy(cap, 'bounded', start, end);
+                const reference = await computeWithStrategy(cap, 'full', start, end);
 
-                const writeFlip = full.grantChanges.find(c => c.keyId === bob.keyId && c.capName === 'write');
+                const writeFlip = delta.grantChanges.find(c => c.keyId === bob.keyId && c.capName === 'write');
                 assertTrue(
                     writeFlip !== undefined && writeFlip.wasGranted && !writeFlip.nowGranted,
                     'bob.write flips true->false transitively',
                 );
 
                 assertEquals(
-                    JSON.stringify(normalizeDelta(bounded)),
-                    JSON.stringify(normalizeDelta(full)),
-                    'CAP_DELTA09 bounded should match full',
+                    JSON.stringify(normalizeDelta(delta)),
+                    JSON.stringify(normalizeDelta(reference)),
+                    'CAP_DELTA09 should match reference scan',
                 );
             }
         },
@@ -440,7 +439,7 @@ export const deltaCapTests = {
             //   b2 = add identity carol  (concurrent branch anchor)
             //   y1 = revoke alice admin (after b2, concurrent with b1; barrier)
             //   m  = merge(b1, y1) = add identity dave
-            name: '[CAP_DELTA10] bounded matches full when the meet sits below concurrent fork roots',
+            name: '[CAP_DELTA10] meet sits below concurrent fork roots',
             invoke: async () => {
                 const R = await makeIdentity();
                 const alice = await makeIdentity();
@@ -466,19 +465,19 @@ export const deltaCapTests = {
                 );
                 const end = version(m);
 
-                const full = await computeWithStrategy(cap, 'full', start, end);
-                const bounded = await computeWithStrategy(cap, 'bounded', start, end);
+                const delta = await computeWithStrategy(cap, 'bounded', start, end);
+                const reference = await computeWithStrategy(cap, 'full', start, end);
 
-                const writeFlip = full.grantChanges.find(c => c.keyId === bob.keyId && c.capName === 'write');
+                const writeFlip = delta.grantChanges.find(c => c.keyId === bob.keyId && c.capName === 'write');
                 assertTrue(
                     writeFlip !== undefined && writeFlip.wasGranted && !writeFlip.nowGranted,
                     'bob.write flips true->false transitively (below the concurrent fork roots)',
                 );
 
                 assertEquals(
-                    JSON.stringify(normalizeDelta(bounded)),
-                    JSON.stringify(normalizeDelta(full)),
-                    'CAP_DELTA10 bounded should match full',
+                    JSON.stringify(normalizeDelta(delta)),
+                    JSON.stringify(normalizeDelta(reference)),
+                    'CAP_DELTA10 should match reference scan',
                 );
             }
         },
@@ -486,8 +485,8 @@ export const deltaCapTests = {
             // Linear chain, no forks. (bob, write) is granted below the meet and never
             // changes; only (alice, write) flips in (start, end]. The admissibility
             // semantics must not spuriously re-evaluate the stable below-meet pair, so
-            // bounded equals full and neither reports a (bob, write) change.
-            name: '[CAP_DELTA11] below-meet sequential grant stays stable; bounded matches full',
+            // default delta and reference scan neither report a (bob, write) change.
+            name: '[CAP_DELTA11] below-meet sequential grant stays stable',
             invoke: async () => {
                 const R = await makeIdentity();
                 const manager = await makeIdentity();
@@ -508,22 +507,22 @@ export const deltaCapTests = {
                 await cap.grant(alice.keyId, 'write', manager);
                 const end = await (await cap.getScopedDag()).getFrontier();
 
-                const full = await computeWithStrategy(cap, 'full', start, end);
-                const bounded = await computeWithStrategy(cap, 'bounded', start, end);
+                const delta = await computeWithStrategy(cap, 'bounded', start, end);
+                const reference = await computeWithStrategy(cap, 'full', start, end);
 
-                const aliceFlip = full.grantChanges.find(c => c.keyId === alice.keyId && c.capName === 'write');
+                const aliceFlip = delta.grantChanges.find(c => c.keyId === alice.keyId && c.capName === 'write');
                 assertTrue(
                     aliceFlip !== undefined && !aliceFlip.wasGranted && aliceFlip.nowGranted,
                     'alice.write flips false->true (the only grant change)',
                 );
 
-                const bobChange = full.grantChanges.find(c => c.keyId === bob.keyId && c.capName === 'write');
+                const bobChange = delta.grantChanges.find(c => c.keyId === bob.keyId && c.capName === 'write');
                 assertTrue(bobChange === undefined, 'bob.write is stable below the meet -> no delta entry');
 
                 assertEquals(
-                    JSON.stringify(normalizeDelta(bounded)),
-                    JSON.stringify(normalizeDelta(full)),
-                    'CAP_DELTA11 bounded should match full',
+                    JSON.stringify(normalizeDelta(delta)),
+                    JSON.stringify(normalizeDelta(reference)),
+                    'CAP_DELTA11 should match reference scan',
                 );
             }
         },

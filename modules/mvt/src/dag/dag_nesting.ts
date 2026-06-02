@@ -1,5 +1,5 @@
 import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { Dag, Entry, EntryMetaFilter, EntryPredicate, ForkPosition, joinFilters, MetaProps, position, Position } from "@hyper-hyper-space/hhs3_dag";
+import { checkFilter, Dag, Entry, EntryMetaFilter, EntryPredicate, ForkPosition, joinFilters, MetaProps, position, Position } from "@hyper-hyper-space/hhs3_dag";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { Literal } from "@hyper-hyper-space/hhs3_json/dist/literal.js";
 
@@ -14,6 +14,7 @@ export type ScopedDag = {
     findCoverWithFilter(from: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position>;
     findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position>;
     findMinimalCover(p: Position): Promise<Position>;
+    loadAllEntries(): AsyncIterable<Entry>; // in topo order
 };
 
 // CausalDag: the broader causal structure, read-only from the object's perspective.
@@ -59,6 +60,10 @@ export class RootScopedDag implements ScopedDag {
 
     findMinimalCover(p: Position): Promise<Position> {
         return this.dag.findMinimalCover(p);
+    }
+
+    loadAllEntries(): AsyncIterable<Entry> {
+        return this.dag.loadAllEntries();
     }
 }
 
@@ -161,5 +166,27 @@ export class NestedScopedDag implements ScopedDag {
     
     findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
         return this.dag.findConcurrentCoverWithFilter(from, concurrentTo, joinFilters(this.scope.baseFilter(), this.scope.wrapFilter(meta)), predicate);
+    }
+
+    loadAllEntries(): AsyncIterable<Entry> {
+        const dag = this.dag;
+        const scope = this.scope;
+        return {
+            async *[Symbol.asyncIterator]() {
+                for await (const entry of dag.loadAllEntries()) {
+                    if (!checkFilter(entry.meta, scope.baseFilter())) {
+                        continue;
+                    }
+                    const at = position(...json.fromSet(entry.header.prevEntryHashes));
+                    const unwrappedPayload = scope.unwrapPayload(entry.payload, at);
+                    const unwrappedMeta = scope.unwrapMeta(entry.meta, unwrappedPayload, at);
+                    yield {
+                        ...entry,
+                        payload: unwrappedPayload,
+                        meta: unwrappedMeta,
+                    };
+                }
+            },
+        };
     }
 }

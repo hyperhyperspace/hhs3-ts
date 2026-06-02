@@ -107,6 +107,11 @@ type RObject = {
 
     // reading (version-scoped)
     getView(at?: Version, from?: Version): Promise<View>;
+    computeDelta(start: Version, end: Version): Promise<Delta>;
+
+    // DAG access (logical history vs broader causal structure)
+    getScopedDag(): Promise<ScopedDag>;
+    getCausalDag(): Promise<CausalDag>;
 
     // inter-DAG dependency discovery (used by the sync layer)
     extractForeignDeps(payload: Payload, at: Version): ForeignDep[] | undefined;
@@ -121,6 +126,9 @@ type RObject = {
 - `View` is a read-only snapshot of the object's state at a given version, when observed from another version (see below).
 - `Event` signals that the object's state has changed.
 - `ForeignDep` identifies entries in another object's DAG that must be present before a payload can be validated. The sync layer uses `extractForeignDeps` to defer (rather than reject) entries whose cross-DAG dependencies are not yet available.
+- `computeDelta` reports what changed between two versions (type-specific `Delta` implementation).
+- `getScopedDag` returns this object's logical history surface (`ScopedDag`), including `loadAllEntries` for full scans at the correct scope.
+- `getCausalDag` returns read-only access to the broader enclosing DAG (`findForkPosition` for concurrent-branch reasoning). For nested objects this is typically the parent's causal DAG.
 
 ## `View`
 
@@ -207,7 +215,7 @@ A concrete `TypeRegistryMap` implementation backed by a `Map` is included.
 
 MVTs support composing objects inside other objects' DAGs through a scoping mechanism. The module provides:
 
-- **`ScopedDag`** — an object's logical history surface, exposing `append`, `loadEntry`, `getFrontier`, and filtered cover queries. Root objects get a `RootScopedDag` backed by a full DAG; nested objects get a `NestedScopedDag` that wraps/unwraps payloads and metadata transparently.
+- **`ScopedDag`** — an object's logical history surface, exposing `append`, `loadEntry`, `getFrontier`, `loadAllEntries` (topo order, logical entries), and filtered cover queries. Root objects get a `RootScopedDag` backed by a full DAG; nested objects get a `NestedScopedDag` that wraps/unwraps payloads and metadata transparently and filters iteration to the nested scope.
 - **`CausalDag`** — read-only access to the broader causal structure (fork position finding), used by objects that need to reason about concurrent branches.
 - **`DagScope`** — the interface a parent object implements to define how a nested object's payloads and metadata are wrapped into the parent DAG and unwrapped on read.
 

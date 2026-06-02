@@ -24,13 +24,13 @@
 // aware of this caveats.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { B64Hash, HASH_SHA256, sha256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash, HASH_SHA256 } from "@hyper-hyper-space/hhs3_crypto";
 import type { KeyId, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
-import { dag, MetaProps, position, EntryMetaFilter, EntryPredicate, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
+import { dag, MetaProps, position, EntryMetaFilter, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
 
-import { Payload, RObject, RObjectFactory, RObjectInit, RContext, NestingParent, version, Version, Delta, ForeignDep } from "@hyper-hyper-space/hhs3_mvt";
+import { Payload, RObject, RObjectFactory, RObjectInit, RContext, NestingParent, Version, ForeignDep } from "@hyper-hyper-space/hhs3_mvt";
 import { DagScope, NestedScopedDag, RootScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
-import { isRefAdvancePayload, refAdvanceMeta, createRefAdvancePayload, resolveRefVersionAtPosition, extractRefVersion } from "@hyper-hyper-space/hhs3_mvt";
+import { isRefAdvancePayload, refAdvanceMeta, createRefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 import { set } from "@hyper-hyper-space/hhs3_util";
 
@@ -38,11 +38,13 @@ import type { Mesh, Swarm } from "@hyper-hyper-space/hhs3_mesh";
 import { createSyncSession } from "@hyper-hyper-space/hhs3_sync";
 import type { SyncSession, SyncTarget } from "@hyper-hyper-space/hhs3_sync";
 
-import { signPayload as signPayloadHelper, isAuthoredPayload, extractAuthor } from "../../authorship.js";
+import { signPayload as signPayloadHelper } from "../../authorship.js";
 import { RCap } from "../rcap/rcap.js";
-import type { RCapView } from "../rcap/rcap.js";
 import type { RSet as RSetContract, RSetView as RSetViewContract } from "./interfaces.js";
 import { validateRSetPayload } from "./validate.js";
+import { hashElement } from "./hash.js";
+import { RSetViewImpl } from "./view.js";
+import { RSetDelta, RSetDeltaStrategy, computeRSetDelta } from "./delta.js";
 
 import { RAddEvent, RDeleteEvent, RSetEvent } from "./events.js";
 
@@ -360,11 +362,7 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
     }
 
     private async applyValidatedPayload(payload: Payload, at: Version): Promise<B64Hash> {
-        if (!this.selfValidate()) {
-            return this.applyPayload(payload, at);
-        }
-
-        if (!await this.validatePayload(payload, at)) {
+        if (this.selfValidate() && !await this.validatePayload(payload, at)) {
             throw new Error("Attempted to apply an invalid payload");
         }
 
@@ -536,7 +534,7 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
         throw new Error("Method not implemented.");
     }
 
-    private deltaStrategy: RSetDeltaStrategy = 'full';
+    private deltaStrategy: RSetDeltaStrategy = 'bounded';
 
     setDeltaStrategy(strategy: RSetDeltaStrategy): void {
         this.deltaStrategy = strategy;
@@ -546,231 +544,9 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
         if (this.parentObj !== undefined) {
             throw new Error("computeDelta is not supported on nested RSet");
         }
-
-        if (this.deltaStrategy === 'bounded') {
-            return this.computeDeltaBounded(start, end);
-        } else if (this.deltaStrategy === 'full') {
-            return this.computeDeltaFull(start, end);
-        } else {
-            throw new Error("Invalid delta strategy: " + this.deltaStrategy);
-        }
-    }
-
-    // BFS back from `from`, stopping at (and excluding) entries in `stopAt`. Returns every
-    // entry strictly above the stop floor -- the candidates whose membership or authorization
-    // can have changed between a start at/below the floor and `from`.
-    private async walkNewEntries(rawDag: dag.Dag, from: Version, stopAt: Position): Promise<dag.Entry[]> {
-        const visited = new Set<B64Hash>();
-        const queue: B64Hash[] = Array.from(from);
-        const walked: dag.Entry[] = [];
-
-        while (queue.length > 0) {
-            const hash = queue.shift()!;
-            if (visited.has(hash)) continue;
-            visited.add(hash);
-
-            if (stopAt.has(hash)) continue;
-
-            const entry = await rawDag.loadEntry(hash);
-            if (entry === undefined) continue;
-            walked.push(entry);
-
-            for (const prevHash of json.fromSet(entry.header.prevEntryHashes)) {
-                if (!visited.has(prevHash)) {
-                    queue.push(prevHash);
-                }
-            }
-        }
-
-        return walked;
-    }
-
-    // Shared comparison core: given the candidate entries, compute element-level membership
-    // changes and (for permissioned sets) authorization changes between `start` and `end`.
-    // Both the full and bounded strategies feed their candidate set through here.
-    private async computeDeltaFromCandidateEntries(
-        start: Version, end: Version, revisionBound: Version, candidateEntries: dag.Entry[],
-    ): Promise<RSetDelta> {
-        const startView = await this.getView(start, start) as RSetViewContract<T>;
-        const endView = await this.getView(end, end) as RSetViewContract<T>;
-
-        const elmtHashes = new Set<B64Hash>();
-        for (const entry of candidateEntries) {
-            const elmts = entry.meta['elmts'];
-            if (elmts !== undefined) {
-                for (const h of json.fromSet(elmts)) elmtHashes.add(h);
-            }
-        }
-
-        const added: B64Hash[] = [];
-        const removed: B64Hash[] = [];
-
-        for (const h of elmtHashes) {
-            const inStart = await startView.hasByHash(h);
-            const inEnd = await endView.hasByHash(h);
-            if (!inStart && inEnd) added.push(h);
-            if (inStart && !inEnd) removed.push(h);
-        }
-
-        const validityChanges: ValidityChange[] = [];
-
-        if (this.isPermissioned()) {
-            for (const entry of candidateEntries) {
-                const p = entry.payload as unknown as SetPayload;
-                if (p['action'] !== 'add' && p['action'] !== 'delete') continue;
-
-                const wasValid = await startView.checkEntryAuthorization(entry.hash);
-                const nowValid = await endView.checkEntryAuthorization(entry.hash);
-
-                if (wasValid !== nowValid) {
-                    const elmts = entry.meta['elmts'];
-                    if (elmts === undefined) continue;
-
-                    for (const elementHash of json.fromSet(elmts)) {
-                        validityChanges.push({
-                            entryHash: entry.hash,
-                            elementHash,
-                            action: p['action'],
-                            author: isAuthoredPayload(entry.payload) ? extractAuthor(entry.payload) : undefined,
-                            wasValid,
-                            nowValid,
-                        });
-                    }
-                }
-            }
-        }
-
-        return new RSetDelta(start, end, revisionBound, added, removed, validityChanges);
-    }
-
-    private async computeDeltaFull(start: Version, end: Version): Promise<RSetDelta> {
         const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
         if (rawDag === undefined) throw new Error("DAG not found");
-
-        const entries: dag.Entry[] = [];
-        for await (const entry of rawDag.loadAllEntries()) {
-            entries.push(entry);
-        }
-
-        return this.computeDeltaFromCandidateEntries(start, end, version(), entries);
-    }
-
-    private async computeDeltaBounded(start: Version, end: Version): Promise<RSetDelta> {
-        const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
-        if (rawDag === undefined) throw new Error("DAG not found");
-
-        const fork = await rawDag.findForkPosition(start, end);
-        if (fork.forkA.size > 0) {
-            throw new Error("bounded computeDelta requires END to extend START");
-        }
-        if (fork.forkB.size === 0) {
-            return new RSetDelta(start, end, fork.commonFrontier, [], [], []);
-        }
-
-        // Meet of the fork points: the floor for a plain set. Folding over fork.common
-        // directly (not an antichain) is correct -- dominated elements never lower the GLB.
-        const rsetMeet = await dag.computeMeet(
-            [...fork.common].map((h) => position(h)),
-            (a, b) => rawDag.findForkPosition(a, b).then((f) => f.commonFrontier),
-        );
-
-        // For a permissioned set, authorization can change below the RSet meet because the
-        // end-view observes the RCap from a later `from` (pulling in concurrent RCap barriers).
-        // Weave in the RCap delta to drop the floor to where the referenced RCap version is
-        // bounded by the RCap revision bound.
-        const floor = this.isPermissioned()
-            ? await this.computeBound(rsetMeet, end)
-            : rsetMeet;
-
-        const candidateEntries = await this.walkNewEntries(rawDag, end, floor);
-
-        return this.computeDeltaFromCandidateEntries(start, end, floor, candidateEntries);
-    }
-
-    // Compute a bound that takes into consideration possible view revisions in the
-    // nested RCap instance, and ensures that all chnages before the bound do NOT 
-    // affect the delta being computed in RSet (see projectRCapBound).
-    private async computeBound(rsetMeet: Version, end: Version): Promise<Version> {
-        const scopedDag = await this.getScopedDag();
-        const refId = this.capabilityRef()!;
-
-        // RCap versions referenced at the RSet meet and at end. rcap_at_end extends
-        // rcap_at_meet whenever ref-advances are monotonic (the expected case).
-        const rcapAtMeet = await resolveRefVersionAtPosition(scopedDag, refId, rsetMeet, rsetMeet);
-        const rcapAtEnd = await resolveRefVersionAtPosition(scopedDag, refId, end, end);
-
-        const rcap = await this.loadRCap();
-        if (rcap === undefined) throw new Error("Cannot load referenced RCap");
-
-        // loadRCap returns a fresh instance, so setting its strategy has no shared side effect.
-        rcap.setDeltaStrategy('bounded');
-        const rcapDelta = await rcap.computeDelta(rcapAtMeet, rcapAtEnd);
-        const rcapBound = rcapDelta.getRevisionBound();
-
-        const rcapRawDag = await this.ctx.getDag(refId);
-        if (rcapRawDag === undefined) throw new Error("Referenced RCap DAG not found");
-
-        return this.projectRCapBound(scopedDag, refId, rcapRawDag, rsetMeet, rcapBound);
-    }
-
-    // RCap bound projetion:t find the lowest unstable ref-advance(s) at or below `rsetMeet`.
-    // A ref-advance is "stable" iff its referenced RCap version is at or below `rcapBound`, 
-    // "unstable" otherwise.
-    //
-    // Starting from the ref-advance cover at `rsetMeet`, descend through unstable ref-advances via
-    // their preds; a branch settles when no unstable ref-advance sits below it. The create op is an
-    // implicit stable ref-advance to version(refId) (the RCap root, always at or below `rcapBound`),
-    // so an empty below-cover settles the branch. Below the returned floor the referenced RCap
-    // version is bounded by `rcapBound`, so RCap authorization is identical observed from start and
-    // from end. If no ref-advance is unstable, return `rsetMeet` (nothing to drop below the meet).
-    //
-    // Assumes monotonic ref-advances: a stable ref-advance has only stable ref-advances below it,
-    // so the descent can stop at the first stable ref-advance on each branch.
-    private async projectRCapBound(
-        scopedDag: ScopedDag, refId: B64Hash, rcapRawDag: dag.Dag, rsetMeet: Version, rcapBound: Version,
-    ): Promise<Version> {
-        const refFilter: EntryMetaFilter = { containsValues: { ref: [refId] } };
-
-        const floor = version();
-        const visited = new Set<B64Hash>();
-        const stabilityCache = new Map<B64Hash, boolean>();
-
-        // The ref filter guarantees every visited entry is a ref-advance, so the payload cast holds.
-        const isStable = async (hash: B64Hash): Promise<boolean> => {
-            const cached = stabilityCache.get(hash);
-            if (cached !== undefined) return cached;
-            const entry = await scopedDag.loadEntry(hash);
-            const refVersion = extractRefVersion(entry!.payload as RefAdvancePayload);
-            const fork = await rcapRawDag.findForkPosition(refVersion, rcapBound);
-            const result = fork.forkA.size === 0;
-            stabilityCache.set(hash, result);
-            return result;
-        };
-
-        const queue: B64Hash[] = [...(await scopedDag.findCoverWithFilter(rsetMeet, refFilter))];
-        while (queue.length > 0) {
-            const r = queue.shift()!;
-            if (visited.has(r)) continue;
-            visited.add(r);
-            if (await isStable(r)) continue;
-
-            const entry = await scopedDag.loadEntry(r);
-            const preds = position(...json.fromSet(entry!.header.prevEntryHashes));
-            const below = await scopedDag.findCoverWithFilter(preds, refFilter);
-
-            const unstableBelow: B64Hash[] = [];
-            for (const b of below) {
-                if (!(await isStable(b))) unstableBelow.push(b);
-            }
-
-            if (unstableBelow.length === 0) {
-                floor.add(r);
-            } else {
-                queue.push(...unstableBelow);
-            }
-        }
-
-        return floor.size > 0 ? floor : rsetMeet;
+        return computeRSetDelta(this, rawDag, this.deltaStrategy, start, end);
     }
 
     async getScopedDag(): Promise<ScopedDag> {
@@ -865,155 +641,6 @@ const addMetaPropsForSetOp = (payload: SetPayload, meta: MetaProps, elmtHash: B6
         if (payload['barrier'] || false) {
             meta['barrier'] = json.toSet(['t']);
         }
-    }
-}
-
-export class RSetViewImpl<T  extends json.Literal> implements RSetViewContract<T> {
-
-    private target: RSetImpl<T>;
-    private at: Version;
-    private from: Version;
-
-    constructor(target: RSetImpl<T>, at: Version, from: Version) {
-        this.target = target;
-        this.at = at;
-        this.from = from;
-    }
-
-    getObject(): RSetContract<T> {
-        return this.target;
-    }
-
-    getVersion(): Version {
-        return this.at;
-    }
-
-    getFromVersion(): Version {
-        return this.from;
-    }
-
-    async has(element: T): Promise<boolean> {
-
-        if (this.target.contentType() !== undefined) {
-            throw new Error("RSetView.has(element) is not well defined when contentType is present, please use hasByHash");
-        }
-
-        return this.hasByHash(await hashElement(element));
-    }
-
-    async hasByHash(elementHash: B64Hash): Promise<boolean> {
-        const dag = await this.target.getScopedDag();
-
-        let predicate: EntryPredicate | undefined;
-        if (this.target.isPermissioned()) {
-            const rcap = await this.target.loadRCap();
-            if (rcap === undefined) throw new Error("Cannot load referenced RCap");
-            const refId = this.target.capabilityRef()!;
-            predicate = async (hash, entry) => {
-                const rcapView = await this.resolveRCapViewForEntry(dag, rcap, refId, hash);
-                return this.isEntryAuthorized(entry.payload, rcapView);
-            };
-        }
-
-        const cover = await dag.findCoverWithFilter(
-            this.at,
-            { containsValues: { elmts: [elementHash] } },
-            predicate,
-        );
-
-        for (const hash of cover) {
-            const payload = (await dag.loadEntry(hash))!.payload as unknown as SetPayload;
-            if (payload['action'] !== 'add' && payload['action'] !== 'create') continue;
-
-            if (!this.target.supportBarrierDelete()) {
-                return true;
-            }
-
-            const concurrentBarriers = await dag.findConcurrentCoverWithFilter(
-                this.from, version(hash),
-                { containsValues: { barrier: ['t'], elmts: [elementHash] } },
-                predicate,
-            );
-            if (concurrentBarriers.size === 0) return true;
-        }
-
-        if (this.target.supportBarrierAdd()) {
-            const barrierAdds = await dag.findConcurrentCoverWithFilter(
-                this.from, this.at,
-                { containsValues: { barrier: ['t'], elmts: [elementHash] } },
-                predicate,
-            );
-            for (const hash of barrierAdds) {
-                const payload = (await dag.loadEntry(hash))!.payload as unknown as SetPayload;
-                if (payload['action'] === 'add') return true;
-            }
-        }
-
-        return false;
-    }
-
-    // Compositional: rcapAt = which RCap version E is checked against (RSet barrier
-    // ref-advances may widen this); rcapFrom = observation frontier for RCap revision.
-    private async resolveRCapViewForEntry(
-        dag: ScopedDag, rcap: RCap, refId: B64Hash, entryHash: B64Hash,
-    ): Promise<RCapView> {
-        const rcapAt = await resolveRefVersionAtPosition(dag, refId, version(entryHash), this.from);
-        const rcapFrom = await resolveRefVersionAtPosition(dag, refId, this.from, this.from);
-        return rcap.getView(rcapAt, rcapFrom) as Promise<RCapView>;
-    }
-
-    private async isEntryAuthorized(payload: json.Literal, rcapView: RCapView): Promise<boolean> {
-        const p = payload as unknown as SetPayload;
-
-        if (p['action'] === 'create') return true;
-
-        const capName = p['action'] === 'add'
-            ? this.target.capRequirementForAdd()
-            : this.target.capRequirementForDelete();
-
-        if (capName === undefined) return true;
-
-        if (!isAuthoredPayload(payload)) return false;
-
-        const authorId = extractAuthor(payload)!;
-        return rcapView.hasCapability(authorId, capName);
-    }
-
-    async checkEntryAuthorization(entryHash: B64Hash): Promise<boolean> {
-        if (!this.target.isPermissioned()) return true;
-        const dag = await this.target.getScopedDag();
-        const rcap = await this.target.loadRCap();
-        if (rcap === undefined) throw new Error("Cannot load referenced RCap");
-        const refId = this.target.capabilityRef()!;
-        const entry = await dag.loadEntry(entryHash);
-        if (entry === undefined) return false;
-        const rcapView = await this.resolveRCapViewForEntry(dag, rcap, refId, entryHash);
-        return this.isEntryAuthorized(entry.payload, rcapView);
-    }
-
-    async getReferences(): Promise<B64Hash[]> {
-        const ref = this.target.capabilityRef();
-        if (ref === undefined) return [];
-        return [ref];
-    }
-
-    async resolveRefVersion(refId: B64Hash): Promise<Version> {
-        if (refId !== this.target.capabilityRef()) {
-            throw new Error("Unknown reference: " + refId);
-        }
-
-        const dag = await this.target.getScopedDag();
-        return resolveRefVersionAtPosition(dag, refId, this.at, this.from);
-    }
-
-    async loadRObjectByHash(elementHash: B64Hash): Promise<RObject | undefined> {
-
-        if (this.target.contentType() === undefined) {
-            throw new Error("RSetView.getRObjectByHash is not supported when RSet has no contentType");
-        }
-        
-        const innerFactory = await this.target.getContext().getRegistry().lookup(this.target.contentType()!);
-        return innerFactory.loadObject(elementHash, this.target.getContext(), this.target);
     }
 }
 
@@ -1155,35 +782,8 @@ class ElementUpdateScope extends NestedElementScope implements DagScope {
     }
 }
 
-function hashElement<T extends json.Literal>(element: T): B64Hash {
-    return sha256.hashToB64(stringToUint8Array(json.toStringNormalized(element)));
-}
-
-export type RSetDeltaStrategy = 'full' | 'bounded';
-
-export type ValidityChange = {
-    entryHash: B64Hash;
-    elementHash: B64Hash;
-    action: 'add' | 'delete' | 'create';
-    author: KeyId | undefined;
-    wasValid: boolean;
-    nowValid: boolean;
-};
-
-export class RSetDelta implements Delta {
-    constructor(
-        private start: Version,
-        private end: Version,
-        private revisionBound: Version,
-        public readonly added: B64Hash[],
-        public readonly removed: B64Hash[],
-        public readonly validityChanges: ValidityChange[],
-    ) {}
-
-    getStartVersion(): Version { return this.start; }
-    getEndVersion(): Version { return this.end; }
-    getRevisionBound(): Version { return this.revisionBound; }
-}
+export { RSetViewImpl } from "./view.js";
+export * from "./delta.js";
 
 export interface RSet<T extends json.Literal = json.Literal> extends RSetContract<T> {}
 export interface RSetView<T extends json.Literal = json.Literal> extends RSetViewContract<T> {}

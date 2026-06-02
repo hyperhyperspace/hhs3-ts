@@ -1,11 +1,12 @@
 import { testing } from "@hyper-hyper-space/hhs3_util";
+import { dagNestingSuite } from "./dag_nesting_tests.js";
 import { refsSuite } from "./refs_tests.js";
 
 async function main() {
     const filters = process.argv.slice(2);
     console.log('Running tests for Hyper Hyper Space v3 MVT module' + (filters.length > 0 ? ` (filter: ${filters})` : '') + '\n');
 
-    const allSuites = [refsSuite];
+    const allSuites = [dagNestingSuite, refsSuite];
 
     for (const suite of allSuites) {
         console.log(suite.title);
