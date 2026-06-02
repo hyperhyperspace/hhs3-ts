@@ -29,9 +29,28 @@ Key features:
 - **Identity registry**: public keys are stored once via `add-identity` operations and looked up by `KeyId`, keeping signed payloads small.
 - **Grant / revoke with barrier semantics**: `revoke` is a barrier operation, ensuring that concurrent uses of a revoked capability are correctly invalidated when observed from later versions.
 - **Mutable capability set**: `create-cap` and `delete-cap` operations allow adding and removing capability names after creation. `delete-cap` is a barrier that voids grants tied to the deleted capability's origin.
-- **Transitive authorization**: `hasCapability` recursively checks the full chain of grantors, with cycle detection, ensuring that revoking a grantor's authority invalidates all nested downstream grants.
+- **Transitive authorization (admissibility)**: `hasCapability(X, cap)` answers whether an operation appended at the view's position that requires `X` to hold `cap` would be *admissible* when observed from the view's `from` frontier. Each grantor's authority is evaluated **at the version where its grant was made** — so revoking a grantor's authority does **not** retroactively void grants it already made (**use-before-revoke**), while a revoke that is *concurrent* with the use still voids it (**concurrent-void**, a use-anchored barrier). The recursive walk uses a **see-through validity predicate** so unauthorized or authority-voided grants *and* revokes are skipped instead of masking the last valid operation. Cycle detection bounds the recursion. When the view position is a multi-hash frontier it is treated as a single **collapsed use point**: the use-anchored barrier voids only if the revoke is concurrent with *every* element, while a revoke that is merely later on one branch defers to the grant-anchored check (**use-before-revoke**).
 
 Source: [`src/types/rcap.ts`](./src/types/rcap.ts), [`src/types/rcap/payload.ts`](./src/types/rcap/payload.ts)
+
+#### Bounded delta computation
+
+`computeDelta(start, end)` reports what observably changed between two versions: identity additions, capability existence changes, and grant flips. Two strategies are selectable via `setDeltaStrategy`:
+
+- **`full`** (default): re-checks every identity / capability / grant pair across the whole DAG. Its `revisionBound` is the empty version, meaning "nothing is excluded -- re-check everything".
+- **`bounded`**: restricts the work to the entries a new (forkB) barrier can affect, and returns a non-empty `revisionBound`. Requires `end` to extend `start` (throws otherwise).
+
+The bounded strategy walks back from `end` only as far as the **meet** (greatest lower bound) of the fork points (`findForkPosition(start, end).common`), computed with `dag.computeMeet`. The meet -- not `common`, not its antichain -- is the correct floor:
+
+- A grant flip is only detected if its own entry is walked, so the walk must reach every shared entry that can be concurrent with a forkB barrier.
+- Stopping at `common` / `commonFrontier` is too shallow when `end` merges an old branch whose barrier voids a grant on the shared trunk below `common` (a transitive flip on a node still in shared history).
+- Stopping at the antichain of `common` is too shallow when there are concurrent fork siblings: their meet is their shared parent, strictly below them.
+
+`revisionBound` is the floor below which the type guarantees no `(start, end)` change can reach. A composing consumer (e.g. a permissioned `RSet`) uses it to bound how far back it must re-evaluate references.
+
+**Known limitations / future work:**
+
+- **Native DAG meet** (performance): `computeMeet` folds `O(k)` indexed `findForkPosition` calls; a native N-ary meet at the index level would compute the greatest lower bound directly.
 
 ### Permissioned RSet: references and compositional authorization
 
@@ -51,6 +70,28 @@ RCap.getView(rcapAt, rcapFrom)
 Insertion-time validation (`validatePayload` / `checkPayloadAuth`) still uses unrevised views (`getView(at, at)` on both objects). View-time membership re-checks use the compositional pair above.
 
 See **PSET10** (sequential revoke does not void past adds), **PSET17–18** (concurrent RSet ref-advance), and **PSET20** (sequential RSet ref-advance + concurrent RCap branch).
+
+#### Bounded delta computation
+
+`computeDelta(start, end)` reports element membership changes (`added` / `removed`) and, for permissioned sets, per-entry authorization flips (`validityChanges`). As with `RCap`, two strategies are selectable via `setDeltaStrategy`:
+
+- **`full`** (default): scans the whole RSet DAG, comparing `hasByHash` (and `checkEntryAuthorization`) at `start` vs `end` for every element. Its `revisionBound` is the empty version.
+- **`bounded`**: walks back from `end` only to a computed **floor**, collecting candidate entries there, and returns that floor as `revisionBound`. Requires `end` to extend `start` (throws otherwise).
+
+For a **plain** set, the floor is the **meet** of the fork points (`dag.computeMeet` over `findForkPosition(start, end).common`) — identical to the `RCap` pattern. Only entries above the meet can change membership.
+
+For a **permissioned** set, an entry's membership can also flip below the RSet meet, because the `end`-view observes the referenced `RCap` from a later `from` (`rcapFrom`), pulling in `RCap` barriers (e.g. a revoke concurrent with a grant) that were not visible from `start`. The floor is therefore **woven** with the `RCap` delta:
+
+1. `rcap_at_meet = resolveRefVersionAtPosition(rset_meet, rset_meet)` and `rcap_at_end = resolveRefVersionAtPosition(end, end)`.
+2. `rcap_bound = rcap.computeDelta(rcap_at_meet, rcap_at_end)` (bounded) `.getRevisionBound()` — the floor below which no `RCap` change can reach.
+3. Descend to the **lowest unstable ref-advance(s)**. Call a ref-advance *stable* iff its referenced `RCap` version is at or below `rcap_bound` (a `findForkPosition` check on the `RCap` DAG with empty `forkA`), *unstable* otherwise. Starting from the ref-advance cover at `rset_meet`, skip stable ref-advances and descend through unstable ones via their preds; a branch settles when no unstable ref-advance sits below it. The create op is an implicit stable ref-advance to `version(refId)` (the `RCap` root, always at or below `rcap_bound`), so a branch that bottoms out there settles too. The floor is the set of lowest unstable ref-advances — excluded from the walk, since ref-advances carry no element or authorization to re-check. Below the floor the referenced `RCap` version is bounded by `rcap_bound`, so authorization is identical observed from `start` and `end`. If no ref-advance is unstable, the floor is `rset_meet`.
+
+`revisionBound` is the floor below which no `(start, end)` change — membership or authorization — can reach; a sync peer can trust shared state below it without re-checking.
+
+**Known limitations / future work:**
+
+- **Monotonic ref-advances**: the floor descent assumes ref-advances are monotonic — a ref-advance never moves the referenced `RCap` version backward. This lets the descent stop at the first stable ref-advance on each branch (everything below is then stable too), so the concurrent-revoke case lands at the lowest unstable ref-advance rather than degrading to a full scan (see **DELTA06** and **DELTA10**). Enforcing monotonicity in `RSet` validation is tracked separately.
+- **Native DAG meet** (performance): shared with `RCap` — `computeMeet` folds `O(k)` `findForkPosition` calls.
 
 ## Authorship helpers
 

@@ -1,4 +1,5 @@
 import { assertTrue, assertFalse, assertEquals } from "@hyper-hyper-space/hhs3_util/dist/test.js";
+import { set } from "@hyper-hyper-space/hhs3_util";
 import { HASH_SHA256, createBasicCrypto, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { version } from "@hyper-hyper-space/hhs3_mvt";
@@ -295,7 +296,7 @@ export const deltaCapTests = {
             }
         },
         {
-            name: '[CAP_DELTA06] bounded revisionBound uses common frontier',
+            name: '[CAP_DELTA06] bounded revisionBound equals the fork-point meet',
             invoke: async () => {
                 const admin = await makeIdentity();
                 const bob = await makeIdentity();
@@ -309,7 +310,10 @@ export const deltaCapTests = {
                 const bounded = await computeWithStrategy(cap, 'bounded', start, end);
 
                 assertEquals(full.getRevisionBound().size, 0, 'full keeps empty revisionBound');
-                assertTrue(bounded.getRevisionBound().size > 0, 'bounded revisionBound should be non-empty');
+                assertTrue(
+                    set.eq(bounded.getRevisionBound(), start),
+                    'bounded revisionBound equals the meet (== start for a linear add)',
+                );
             }
         },
         {
@@ -371,6 +375,156 @@ export const deltaCapTests = {
                 assertTrue(boundedDeployChange !== undefined, 'bounded should report deploy capability change');
                 assertFalse(fullDeployChange!.exists, 'full: deploy should not exist at END');
                 assertFalse(boundedDeployChange!.exists, 'bounded: deploy should not exist at END');
+            }
+        },
+        {
+            // Layer 1: END merges an old branch whose barrier voids a grant on the
+            // shared trunk below `common`. Stopping at common/commonFrontier would
+            // miss the transitive (bob, write) flip; the meet ({g1}) reaches g2.
+            //
+            // createOp -> addAlice -> addBob -> g1 -> g2 ----\
+            //                                    \            m -> END
+            //                                     old -------/
+            //   g1  = grant alice admin
+            //   g2  = grant bob write (via alice's admin)   <-- transitively flips
+            //   old = revoke alice admin (after g1, concurrent with g2; barrier)
+            //   m   = merge(g2, old) = add identity carol
+            name: '[CAP_DELTA09] bounded matches full when a merged branch transitively voids a trunk grant',
+            invoke: async () => {
+                const R = await makeIdentity();
+                const alice = await makeIdentity();
+                const bob = await makeIdentity();
+                const carol = await makeIdentity();
+                const { ctx, cap } = await createTestCap(R);
+                const dag = (await ctx.getDag(cap.getId()))!;
+
+                await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), R);
+                await cap.addIdentity(bob.keyId, serializePublicKeyToBase64(bob.publicKey), R);
+
+                const g1 = await cap.grant(alice.keyId, 'admin', R);
+                const g2 = await cap.grant(bob.keyId, 'write', alice);
+                const start = version(g2);
+
+                const old = await cap.revoke(alice.keyId, 'admin', R, version(g1));
+                const m = await cap.addIdentity(
+                    carol.keyId, serializePublicKeyToBase64(carol.publicKey), R, version(g2, old),
+                );
+                const end = version(m);
+
+                const full = await computeWithStrategy(cap, 'full', start, end);
+                const bounded = await computeWithStrategy(cap, 'bounded', start, end);
+
+                const writeFlip = full.grantChanges.find(c => c.keyId === bob.keyId && c.capName === 'write');
+                assertTrue(
+                    writeFlip !== undefined && writeFlip.wasGranted && !writeFlip.nowGranted,
+                    'bob.write flips true->false transitively',
+                );
+
+                assertEquals(
+                    JSON.stringify(normalizeDelta(bounded)),
+                    JSON.stringify(normalizeDelta(full)),
+                    'CAP_DELTA09 bounded should match full',
+                );
+            }
+        },
+        {
+            // Layer 2: two concurrent fork siblings. The antichain of `common`
+            // ({b1, b2}) would stop the walk at b1 and miss (bob, write); the meet
+            // ({P}, their shared parent) sits strictly below both and reaches b1.
+            //
+            // ... -> P --> b1 ------------------\
+            //         \                          m -> END
+            //          b2 --> y1 ---------------/
+            //   P  = grant alice admin                       (meet of b1, b2)
+            //   b1 = grant bob write (via alice's admin)     <-- transitively flips
+            //   b2 = add identity carol  (concurrent branch anchor)
+            //   y1 = revoke alice admin (after b2, concurrent with b1; barrier)
+            //   m  = merge(b1, y1) = add identity dave
+            name: '[CAP_DELTA10] bounded matches full when the meet sits below concurrent fork roots',
+            invoke: async () => {
+                const R = await makeIdentity();
+                const alice = await makeIdentity();
+                const bob = await makeIdentity();
+                const carol = await makeIdentity();
+                const dave = await makeIdentity();
+                const { ctx, cap } = await createTestCap(R);
+
+                await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), R);
+                await cap.addIdentity(bob.keyId, serializePublicKeyToBase64(bob.publicKey), R);
+
+                const P = await cap.grant(alice.keyId, 'admin', R);
+
+                const b1 = await cap.grant(bob.keyId, 'write', alice, version(P));
+                const b2 = await cap.addIdentity(
+                    carol.keyId, serializePublicKeyToBase64(carol.publicKey), R, version(P),
+                );
+                const start = version(b1, b2);
+
+                const y1 = await cap.revoke(alice.keyId, 'admin', R, version(b2));
+                const m = await cap.addIdentity(
+                    dave.keyId, serializePublicKeyToBase64(dave.publicKey), R, version(b1, y1),
+                );
+                const end = version(m);
+
+                const full = await computeWithStrategy(cap, 'full', start, end);
+                const bounded = await computeWithStrategy(cap, 'bounded', start, end);
+
+                const writeFlip = full.grantChanges.find(c => c.keyId === bob.keyId && c.capName === 'write');
+                assertTrue(
+                    writeFlip !== undefined && writeFlip.wasGranted && !writeFlip.nowGranted,
+                    'bob.write flips true->false transitively (below the concurrent fork roots)',
+                );
+
+                assertEquals(
+                    JSON.stringify(normalizeDelta(bounded)),
+                    JSON.stringify(normalizeDelta(full)),
+                    'CAP_DELTA10 bounded should match full',
+                );
+            }
+        },
+        {
+            // Linear chain, no forks. (bob, write) is granted below the meet and never
+            // changes; only (alice, write) flips in (start, end]. The admissibility
+            // semantics must not spuriously re-evaluate the stable below-meet pair, so
+            // bounded equals full and neither reports a (bob, write) change.
+            name: '[CAP_DELTA11] below-meet sequential grant stays stable; bounded matches full',
+            invoke: async () => {
+                const R = await makeIdentity();
+                const manager = await makeIdentity();
+                const alice = await makeIdentity();
+                const bob = await makeIdentity();
+                const { cap } = await createTestCap(R);
+
+                await cap.addIdentity(manager.keyId, serializePublicKeyToBase64(manager.publicKey), R);
+                await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), R);
+                await cap.addIdentity(bob.keyId, serializePublicKeyToBase64(bob.publicKey), R);
+
+                await cap.grant(manager.keyId, 'admin', R);
+                await cap.grant(bob.keyId, 'write', manager);
+
+                const start = await (await cap.getScopedDag()).getFrontier();
+
+                // The only change after START: manager grants alice write.
+                await cap.grant(alice.keyId, 'write', manager);
+                const end = await (await cap.getScopedDag()).getFrontier();
+
+                const full = await computeWithStrategy(cap, 'full', start, end);
+                const bounded = await computeWithStrategy(cap, 'bounded', start, end);
+
+                const aliceFlip = full.grantChanges.find(c => c.keyId === alice.keyId && c.capName === 'write');
+                assertTrue(
+                    aliceFlip !== undefined && !aliceFlip.wasGranted && aliceFlip.nowGranted,
+                    'alice.write flips false->true (the only grant change)',
+                );
+
+                const bobChange = full.grantChanges.find(c => c.keyId === bob.keyId && c.capName === 'write');
+                assertTrue(bobChange === undefined, 'bob.write is stable below the meet -> no delta entry');
+
+                assertEquals(
+                    JSON.stringify(normalizeDelta(bounded)),
+                    JSON.stringify(normalizeDelta(full)),
+                    'CAP_DELTA11 bounded should match full',
+                );
             }
         },
     ]

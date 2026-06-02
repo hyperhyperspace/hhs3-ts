@@ -437,7 +437,7 @@ export const rcapTests = {
             }
         },
         {
-            name: '[CAP15] Transitive revocation: revoking grantor invalidates downstream grants',
+            name: '[CAP15] Transitive revocation: revoking grantor does not invalidate downstream grants made earlier (use-before-revoke)',
             invoke: async () => {
                 const { cap, admin } = await createTestEnv();
                 const manager = await makeIdentity();
@@ -473,8 +473,8 @@ export const rcapTests = {
                 const view2 = await cap.getView();
                 assertFalse(await view2.hasCapability(manager.keyId, 'admin'),
                     'manager should no longer have admin');
-                assertFalse(await view2.hasCapability(alice.keyId, 'write'),
-                    'alice write should be invalidated: her grantor lost admin');
+                assertTrue(await view2.hasCapability(alice.keyId, 'write'),
+                    'alice should still have write: her grant predates the revoke (use-before-revoke)');
             }
         },
         {
@@ -539,8 +539,8 @@ export const rcapTests = {
                 );
 
                 const view3 = await cap.getView();
-                assertFalse(await view3.hasCapability(alice.keyId, 'write'),
-                    'alice should lose write: both grantors lost admin');
+                assertTrue(await view3.hasCapability(alice.keyId, 'write'),
+                    'alice should still have write: both grants predate their revokes (use-before-revoke)');
             }
         },
         {
@@ -675,6 +675,289 @@ export const rcapTests = {
                 const view = await cap.getView();
                 assertFalse(await view.hasCapability(alice.keyId, 'write'),
                     'alice should not have write: revoke is concurrent with both grants');
+            }
+        },
+        {
+            name: '[CAP22] Masking: an earlier valid grant survives under a later authority-voided grant (see-through cover)',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv();
+                const manager1 = await makeIdentity();
+                const manager2 = await makeIdentity();
+                const alice = await makeIdentity();
+                const carol = await makeIdentity();
+
+                await cap.addIdentity(manager1.keyId, serializePublicKeyToBase64(manager1.publicKey), admin);
+                await cap.addIdentity(manager2.keyId, serializePublicKeyToBase64(manager2.publicKey), admin);
+                await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), admin);
+
+                await cap.grant(manager1.keyId, 'admin', admin);
+                await cap.grant(manager2.keyId, 'admin', admin);
+
+                // Earlier, durable grant of write to alice by manager1 -- stays valid throughout.
+                await cap.grant(alice.keyId, 'write', manager1);
+
+                // Fork: manager2 re-grants write to alice (causally dominates manager1's grant)
+                // concurrently with admin revoking manager2's admin. manager2's grant is
+                // therefore authority-voided when observed from the merge. A naive cover would
+                // stop at this dominating-but-invalid grant and wrongly report no write.
+                const fork = await (await cap.getScopedDag()).getFrontier();
+                const g2 = await cap.grant(alice.keyId, 'write', manager2, fork);
+                const rv = await cap.revoke(manager2.keyId, 'admin', admin, fork);
+                await cap.addIdentity(
+                    carol.keyId, serializePublicKeyToBase64(carol.publicKey),
+                    admin, version(g2, rv),
+                );
+
+                const view = await cap.getView();
+                assertTrue(await view.hasCapability(alice.keyId, 'write'),
+                    'alice keeps write: the see-through cover skips manager2\'s voided grant and reaches manager1\'s valid grant');
+            }
+        },
+        {
+            name: '[CAP23] Authority-voided revoke is seen through: capability survives',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv();
+                const manager = await makeIdentity();
+                const alice = await makeIdentity();
+                const carol = await makeIdentity();
+
+                await cap.addIdentity(manager.keyId, serializePublicKeyToBase64(manager.publicKey), admin);
+                await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), admin);
+
+                await cap.grant(manager.keyId, 'admin', admin);
+
+                // alice's write is granted by the creator -> unconditionally valid.
+                await cap.grant(alice.keyId, 'write', admin);
+
+                // Fork: manager revokes alice's write concurrently with admin revoking
+                // manager's admin. manager's revoke is authority-voided when observed from
+                // the merge and must be seen through, leaving alice's earlier write intact.
+                const fork = await (await cap.getScopedDag()).getFrontier();
+                const rAlice = await cap.revoke(alice.keyId, 'write', manager, fork);
+                const rManager = await cap.revoke(manager.keyId, 'admin', admin, fork);
+                await cap.addIdentity(
+                    carol.keyId, serializePublicKeyToBase64(carol.publicKey),
+                    admin, version(rAlice, rManager),
+                );
+
+                const view = await cap.getView();
+                assertTrue(await view.hasCapability(alice.keyId, 'write'),
+                    'alice keeps write: manager\'s revoke is authority-voided by the concurrent admin revoke and seen through');
+            }
+        },
+        {
+            name: '[CAP24] Merged concurrent grant and revoke: grant-anchored B1 voids at the merge',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv();
+                const alice = await makeIdentity();
+                const carol = await makeIdentity();
+
+                await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), admin);
+
+                const base = await (await cap.getScopedDag()).getFrontier();
+                const g = await cap.grant(alice.keyId, 'write', admin, base);
+                const r = await cap.revoke(alice.keyId, 'write', admin, base);
+
+                // Merge both concurrent ops below a single observation point (at == from).
+                await cap.addIdentity(
+                    carol.keyId, serializePublicKeyToBase64(carol.publicKey),
+                    admin, version(g, r),
+                );
+
+                const view = await cap.getView();
+                assertFalse(await view.hasCapability(alice.keyId, 'write'),
+                    'write is voided at the merge: the revoke is concurrent with the grant (grant-anchored B1)');
+            }
+        },
+        {
+            name: '[CAP25] Three-level delegation: concurrent grandparent revoke does not void the leaf grant',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv({ extraCaps: { post: { managedBy: ['write'] } } });
+                const manager = await makeIdentity();
+                const sub = await makeIdentity();
+                const alice = await makeIdentity();
+                const carol = await makeIdentity();
+
+                await cap.addIdentity(manager.keyId, serializePublicKeyToBase64(manager.publicKey), admin);
+                await cap.addIdentity(sub.keyId, serializePublicKeyToBase64(sub.publicKey), admin);
+                await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), admin);
+
+                // Chain: admin -> manager (admin) -> sub (write) -> alice (post).
+                await cap.grant(manager.keyId, 'admin', admin);
+                await cap.grant(sub.keyId, 'write', manager);
+
+                // Fork: sub grants post to alice (the leaf) concurrently with admin revoking
+                // manager's admin (the grandparent's authority). Each grant in the chain
+                // predates that revoke, so use-before-revoke keeps the whole chain valid.
+                const fork = await (await cap.getScopedDag()).getFrontier();
+                const gPost = await cap.grant(alice.keyId, 'post', sub, fork);
+                const rManager = await cap.revoke(manager.keyId, 'admin', admin, fork);
+                await cap.addIdentity(
+                    carol.keyId, serializePublicKeyToBase64(carol.publicKey),
+                    admin, version(gPost, rManager),
+                );
+
+                const view = await cap.getView();
+                assertTrue(await view.hasCapability(alice.keyId, 'post'),
+                    'alice keeps post: every grant in the chain predates the concurrent grandparent revoke (use-before-revoke at depth)');
+            }
+        },
+        {
+            name: '[CAP26] Use-anchored barrier: a concurrent revoke voids a capability when observed from a wider `from` (from != at)',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv();
+                const alice = await makeIdentity();
+                const bob = await makeIdentity();
+                const carol = await makeIdentity();
+
+                await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), admin);
+                await cap.addIdentity(bob.keyId, serializePublicKeyToBase64(bob.publicKey), admin);
+
+                const g1 = await cap.grant(alice.keyId, 'admin', admin);
+                // alice USES admin here to grant bob write:
+                const g2 = await cap.grant(bob.keyId, 'write', alice, version(g1));
+                // revoke alice's admin, concurrent with g2 (both children of g1, so the
+                // revoke is a DESCENDANT of g1 -- B1 anchored at g1 cannot see it):
+                const old = await cap.revoke(alice.keyId, 'admin', admin, version(g1));
+                const m = await cap.addIdentity(
+                    carol.keyId, serializePublicKeyToBase64(carol.publicKey),
+                    admin, version(g2, old),
+                );
+                const end = version(m);
+
+                // hasCapability is a pure function of (at, from): at the use point itself
+                // (from == at == g2) the concurrent revoke is not yet observed, so alice
+                // holds admin.
+                const atUse = await cap.getView(version(g2), version(g2));
+                assertTrue(await atUse.hasCapability(alice.keyId, 'admin'),
+                    'alice holds admin at the use point (concurrent revoke not yet observed)');
+
+                // Same `at`, wider `from`: observed from the merge, the revoke is visible and
+                // concurrent with the use g2, so it voids. This is a top-level from != at
+                // query that ONLY the use-anchored barrier (B2) catches -- the revoke is a
+                // descendant of g1, so the grant-anchored B1 does not.
+                const fromEnd = await cap.getView(version(g2), end);
+                assertFalse(await fromEnd.hasCapability(alice.keyId, 'admin'),
+                    'alice admin is voided observed from the merge: revoke is concurrent with the use (B2, from != at)');
+
+                // Transitive consequence: bob's write, conferred via alice's now-voided admin,
+                // also falls away when observed from the merge.
+                const bobFromEnd = await cap.getView(end, end);
+                assertFalse(await bobFromEnd.hasCapability(bob.keyId, 'write'),
+                    'bob loses write observed from the merge: alice admin concurrently voided at the use');
+            }
+        },
+        {
+            name: '[CAP27] Multi-hash use point: a revoke concurrent with every element voids (collapse-X, B2)',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv();
+                const alice = await makeIdentity();
+                const d1 = await makeIdentity();
+                const d2 = await makeIdentity();
+
+                await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), admin);
+
+                // alice is granted write by the creator (unconditionally valid).
+                const g = await cap.grant(alice.keyId, 'write', admin);
+
+                // Three concurrent children of g: two filler add-identity ops form the
+                // multi-hash use point, and a revoke of alice:write sits on a third branch
+                // (so the revoke is concurrent with BOTH a1 and a2).
+                const a1 = await cap.addIdentity(d1.keyId, serializePublicKeyToBase64(d1.publicKey), admin, version(g));
+                const a2 = await cap.addIdentity(d2.keyId, serializePublicKeyToBase64(d2.publicKey), admin, version(g));
+                const u = await cap.revoke(alice.keyId, 'write', admin, version(g));
+
+                // Pinned at the multi-hash use point itself: the revoke is on a concurrent
+                // branch, not yet observed, so the collapsed use point still holds write.
+                const atPin = await cap.getView(version(a1, a2), version(a1, a2));
+                assertTrue(await atPin.hasCapability(alice.keyId, 'write'),
+                    'write holds at the multi-hash use point: the concurrent revoke is not yet observed');
+
+                // Same use point, observed from a wider `from` that includes the revoke. The
+                // revoke is concurrent with the collapsed node X (concurrent with every
+                // element of `at`), so the use-anchored barrier (B2) voids it.
+                const fromWide = await cap.getView(version(a1, a2), version(a1, a2, u));
+                assertFalse(await fromWide.hasCapability(alice.keyId, 'write'),
+                    'write is voided: the revoke is concurrent with every element of the use point (collapse-X, B2)');
+            }
+        },
+        {
+            name: '[CAP28] Multi-hash use point: revoke after one branch, grant concurrent with it -> grant-anchored B1 voids',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv();
+                const alice = await makeIdentity();
+                const d1 = await makeIdentity();
+
+                const idA = await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), admin);
+                const b0 = version(idA);
+
+                // Branch 2 carries the grant; branch 1 is a filler add-identity. The two are
+                // concurrent and together form the multi-hash use point.
+                const a2 = await cap.grant(alice.keyId, 'write', admin, b0);
+                const a1 = await cap.addIdentity(d1.keyId, serializePublicKeyToBase64(d1.publicKey), admin, b0);
+
+                // The revoke sits after a1, so it is NOT concurrent with the whole use point
+                // (B2 stays silent), but it IS concurrent with the grant a2.
+                const u = await cap.revoke(alice.keyId, 'write', admin, version(a1));
+
+                const view = await cap.getView(version(a1, a2), version(a2, u));
+                assertFalse(await view.hasCapability(alice.keyId, 'write'),
+                    'write is voided: B2 defers (revoke is after a1) but the grant a2 is concurrent with the revoke (grant-anchored B1)');
+            }
+        },
+        {
+            name: '[CAP29] Multi-hash use point: revoke after one branch but later than the grant -> survives (use-before-revoke)',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv();
+                const alice = await makeIdentity();
+                const d1 = await makeIdentity();
+                const d2 = await makeIdentity();
+
+                const idA = await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), admin);
+
+                // The grant is a common ancestor of the whole fork.
+                const g = await cap.grant(alice.keyId, 'write', admin, version(idA));
+
+                // Fork into two concurrent filler branches -> the multi-hash use point.
+                const a1 = await cap.addIdentity(d1.keyId, serializePublicKeyToBase64(d1.publicKey), admin, version(g));
+                const a2 = await cap.addIdentity(d2.keyId, serializePublicKeyToBase64(d2.publicKey), admin, version(g));
+
+                // Revoke after a1 -- later than the grant on that branch, absent on the other.
+                const u = await cap.revoke(alice.keyId, 'write', admin, version(a1));
+
+                const view = await cap.getView(version(a1, a2), version(a2, u));
+                assertTrue(await view.hasCapability(alice.keyId, 'write'),
+                    'write survives: same fork as CAP28 but the grant precedes the revoke, so the grant-anchored B1 sees no concurrent revoke (use-before-revoke)');
+            }
+        },
+        {
+            name: '[CAP30] Multi-hash use point: revoke after both branches -> survives at the use point (use-before-revoke)',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv();
+                const alice = await makeIdentity();
+                const d1 = await makeIdentity();
+                const d2 = await makeIdentity();
+
+                const idA = await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), admin);
+                const g = await cap.grant(alice.keyId, 'write', admin, version(idA));
+
+                const a1 = await cap.addIdentity(d1.keyId, serializePublicKeyToBase64(d1.publicKey), admin, version(g));
+                const a2 = await cap.addIdentity(d2.keyId, serializePublicKeyToBase64(d2.publicKey), admin, version(g));
+
+                // The revoke merges both branches: strictly after the whole use point.
+                const u = await cap.revoke(alice.keyId, 'write', admin, version(a1, a2));
+
+                // Pinned at the use point, observed from the revoke: the revoke is strictly
+                // later than the collapsed node, so it is concurrent with neither the use
+                // point (B2) nor the grant (B1).
+                const atUse = await cap.getView(version(a1, a2), version(u));
+                assertTrue(await atUse.hasCapability(alice.keyId, 'write'),
+                    'write holds at the use point: the revoke is strictly after the whole frontier (use-before-revoke)');
+
+                // Contrast: once the revoke is in the use's own past, it does revoke.
+                const afterRevoke = await cap.getView(version(u), version(u));
+                assertFalse(await afterRevoke.hasCapability(alice.keyId, 'write'),
+                    'write is gone once the revoke is in the use\'s own past (sequential revoke)');
             }
         },
     ]

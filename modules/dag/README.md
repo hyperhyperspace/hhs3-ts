@@ -103,6 +103,19 @@ Fork positions have 4 fields:
 
 - __commonFrontier__: a minimal covering of the intersection of __A__ and __B__'s histories.
 
+## Meet of positions (`computeMeet`)
+
+`computeMeet` computes the __meet__ (greatest lower bound) of a list of positions: the frontier of the intersection of their histories. It folds a pairwise meet over the inputs, where the pairwise meet of `A` and `B` is `findForkPosition(A, B).commonFrontier`:
+
+```typescript
+const meet = await dag.computeMeet(
+    positions,
+    (a, b) => targetDag.findForkPosition(a, b).then((f) => f.commonFrontier),
+);
+```
+
+Because the meet of a set equals the meet of its causally-minimal elements, you can fold directly over any generating set (for example the `common` field of a `ForkPosition`, taken as singletons) without first reducing it to an antichain -- dominated elements never lower the result. Disconnected positions meet to the empty set. Each fold step uses the indexed `findForkPosition`, so there is no un-indexed predecessor walk; a native N-ary meet at the index level remains a possible future optimization.
+
 ## Storage backends
 
 This module includes only in-memory storage. Persistent backends are provided by companion modules:

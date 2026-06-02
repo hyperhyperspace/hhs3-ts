@@ -6,6 +6,7 @@ import { DagGrowthListener, DagStore } from "./store/dag_store.js";
 
 export { HashSuite } from "@hyper-hyper-space/hhs3_crypto";
 export * from "./dag_defs.js";
+export * from "./dag_meet.js";
 export * as store from "./store/index.js";
 export * as idx from "./idx/index.js";
 

@@ -30,7 +30,7 @@ import { dag, MetaProps, position, EntryMetaFilter, EntryPredicate, Position, Me
 
 import { Payload, RObject, RObjectFactory, RObjectInit, RContext, NestingParent, version, Version, Delta, ForeignDep } from "@hyper-hyper-space/hhs3_mvt";
 import { DagScope, NestedScopedDag, RootScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
-import { isRefAdvancePayload, refAdvanceMeta, createRefAdvancePayload, resolveRefVersionAtPosition } from "@hyper-hyper-space/hhs3_mvt";
+import { isRefAdvancePayload, refAdvanceMeta, createRefAdvancePayload, resolveRefVersionAtPosition, extractRefVersion } from "@hyper-hyper-space/hhs3_mvt";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 import { set } from "@hyper-hyper-space/hhs3_util";
 
@@ -542,28 +542,65 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
         this.deltaStrategy = strategy;
     }
 
-    private async collectAllElementHashes(): Promise<Set<B64Hash>> {
-        const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
-        if (rawDag === undefined) throw new Error("DAG not found");
-        const elmtHashes = new Set<B64Hash>();
-        for await (const entry of rawDag.loadAllEntries()) {
-            const elmts = entry.meta['elmts'];
-            if (elmts !== undefined) {
-                for (const h of json.fromSet(elmts)) elmtHashes.add(h);
-            }
-        }
-        return elmtHashes;
-    }
-
     async computeDelta(start: Version, end: Version): Promise<RSetDelta> {
         if (this.parentObj !== undefined) {
             throw new Error("computeDelta is not supported on nested RSet");
         }
 
-        const elmtHashes = await this.collectAllElementHashes();
+        if (this.deltaStrategy === 'bounded') {
+            return this.computeDeltaBounded(start, end);
+        } else if (this.deltaStrategy === 'full') {
+            return this.computeDeltaFull(start, end);
+        } else {
+            throw new Error("Invalid delta strategy: " + this.deltaStrategy);
+        }
+    }
 
+    // BFS back from `from`, stopping at (and excluding) entries in `stopAt`. Returns every
+    // entry strictly above the stop floor -- the candidates whose membership or authorization
+    // can have changed between a start at/below the floor and `from`.
+    private async walkNewEntries(rawDag: dag.Dag, from: Version, stopAt: Position): Promise<dag.Entry[]> {
+        const visited = new Set<B64Hash>();
+        const queue: B64Hash[] = Array.from(from);
+        const walked: dag.Entry[] = [];
+
+        while (queue.length > 0) {
+            const hash = queue.shift()!;
+            if (visited.has(hash)) continue;
+            visited.add(hash);
+
+            if (stopAt.has(hash)) continue;
+
+            const entry = await rawDag.loadEntry(hash);
+            if (entry === undefined) continue;
+            walked.push(entry);
+
+            for (const prevHash of json.fromSet(entry.header.prevEntryHashes)) {
+                if (!visited.has(prevHash)) {
+                    queue.push(prevHash);
+                }
+            }
+        }
+
+        return walked;
+    }
+
+    // Shared comparison core: given the candidate entries, compute element-level membership
+    // changes and (for permissioned sets) authorization changes between `start` and `end`.
+    // Both the full and bounded strategies feed their candidate set through here.
+    private async computeDeltaFromCandidateEntries(
+        start: Version, end: Version, revisionBound: Version, candidateEntries: dag.Entry[],
+    ): Promise<RSetDelta> {
         const startView = await this.getView(start, start) as RSetViewContract<T>;
         const endView = await this.getView(end, end) as RSetViewContract<T>;
+
+        const elmtHashes = new Set<B64Hash>();
+        for (const entry of candidateEntries) {
+            const elmts = entry.meta['elmts'];
+            if (elmts !== undefined) {
+                for (const h of json.fromSet(elmts)) elmtHashes.add(h);
+            }
+        }
 
         const added: B64Hash[] = [];
         const removed: B64Hash[] = [];
@@ -578,10 +615,7 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
         const validityChanges: ValidityChange[] = [];
 
         if (this.isPermissioned()) {
-            const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
-            if (rawDag === undefined) throw new Error("DAG not found");
-
-            for await (const entry of rawDag.loadAllEntries()) {
+            for (const entry of candidateEntries) {
                 const p = entry.payload as unknown as SetPayload;
                 if (p['action'] !== 'add' && p['action'] !== 'delete') continue;
 
@@ -606,7 +640,137 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
             }
         }
 
-        return new RSetDelta(start, end, version(), added, removed, validityChanges);
+        return new RSetDelta(start, end, revisionBound, added, removed, validityChanges);
+    }
+
+    private async computeDeltaFull(start: Version, end: Version): Promise<RSetDelta> {
+        const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
+        if (rawDag === undefined) throw new Error("DAG not found");
+
+        const entries: dag.Entry[] = [];
+        for await (const entry of rawDag.loadAllEntries()) {
+            entries.push(entry);
+        }
+
+        return this.computeDeltaFromCandidateEntries(start, end, version(), entries);
+    }
+
+    private async computeDeltaBounded(start: Version, end: Version): Promise<RSetDelta> {
+        const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
+        if (rawDag === undefined) throw new Error("DAG not found");
+
+        const fork = await rawDag.findForkPosition(start, end);
+        if (fork.forkA.size > 0) {
+            throw new Error("bounded computeDelta requires END to extend START");
+        }
+        if (fork.forkB.size === 0) {
+            return new RSetDelta(start, end, fork.commonFrontier, [], [], []);
+        }
+
+        // Meet of the fork points: the floor for a plain set. Folding over fork.common
+        // directly (not an antichain) is correct -- dominated elements never lower the GLB.
+        const rsetMeet = await dag.computeMeet(
+            [...fork.common].map((h) => position(h)),
+            (a, b) => rawDag.findForkPosition(a, b).then((f) => f.commonFrontier),
+        );
+
+        // For a permissioned set, authorization can change below the RSet meet because the
+        // end-view observes the RCap from a later `from` (pulling in concurrent RCap barriers).
+        // Weave in the RCap delta to drop the floor to where the referenced RCap version is
+        // bounded by the RCap revision bound.
+        const floor = this.isPermissioned()
+            ? await this.computeBound(rsetMeet, end)
+            : rsetMeet;
+
+        const candidateEntries = await this.walkNewEntries(rawDag, end, floor);
+
+        return this.computeDeltaFromCandidateEntries(start, end, floor, candidateEntries);
+    }
+
+    // Compute a bound that takes into consideration possible view revisions in the
+    // nested RCap instance, and ensures that all chnages before the bound do NOT 
+    // affect the delta being computed in RSet (see projectRCapBound).
+    private async computeBound(rsetMeet: Version, end: Version): Promise<Version> {
+        const scopedDag = await this.getScopedDag();
+        const refId = this.capabilityRef()!;
+
+        // RCap versions referenced at the RSet meet and at end. rcap_at_end extends
+        // rcap_at_meet whenever ref-advances are monotonic (the expected case).
+        const rcapAtMeet = await resolveRefVersionAtPosition(scopedDag, refId, rsetMeet, rsetMeet);
+        const rcapAtEnd = await resolveRefVersionAtPosition(scopedDag, refId, end, end);
+
+        const rcap = await this.loadRCap();
+        if (rcap === undefined) throw new Error("Cannot load referenced RCap");
+
+        // loadRCap returns a fresh instance, so setting its strategy has no shared side effect.
+        rcap.setDeltaStrategy('bounded');
+        const rcapDelta = await rcap.computeDelta(rcapAtMeet, rcapAtEnd);
+        const rcapBound = rcapDelta.getRevisionBound();
+
+        const rcapRawDag = await this.ctx.getDag(refId);
+        if (rcapRawDag === undefined) throw new Error("Referenced RCap DAG not found");
+
+        return this.projectRCapBound(scopedDag, refId, rcapRawDag, rsetMeet, rcapBound);
+    }
+
+    // RCap bound projetion:t find the lowest unstable ref-advance(s) at or below `rsetMeet`.
+    // A ref-advance is "stable" iff its referenced RCap version is at or below `rcapBound`, 
+    // "unstable" otherwise.
+    //
+    // Starting from the ref-advance cover at `rsetMeet`, descend through unstable ref-advances via
+    // their preds; a branch settles when no unstable ref-advance sits below it. The create op is an
+    // implicit stable ref-advance to version(refId) (the RCap root, always at or below `rcapBound`),
+    // so an empty below-cover settles the branch. Below the returned floor the referenced RCap
+    // version is bounded by `rcapBound`, so RCap authorization is identical observed from start and
+    // from end. If no ref-advance is unstable, return `rsetMeet` (nothing to drop below the meet).
+    //
+    // Assumes monotonic ref-advances: a stable ref-advance has only stable ref-advances below it,
+    // so the descent can stop at the first stable ref-advance on each branch.
+    private async projectRCapBound(
+        scopedDag: ScopedDag, refId: B64Hash, rcapRawDag: dag.Dag, rsetMeet: Version, rcapBound: Version,
+    ): Promise<Version> {
+        const refFilter: EntryMetaFilter = { containsValues: { ref: [refId] } };
+
+        const floor = version();
+        const visited = new Set<B64Hash>();
+        const stabilityCache = new Map<B64Hash, boolean>();
+
+        // The ref filter guarantees every visited entry is a ref-advance, so the payload cast holds.
+        const isStable = async (hash: B64Hash): Promise<boolean> => {
+            const cached = stabilityCache.get(hash);
+            if (cached !== undefined) return cached;
+            const entry = await scopedDag.loadEntry(hash);
+            const refVersion = extractRefVersion(entry!.payload as RefAdvancePayload);
+            const fork = await rcapRawDag.findForkPosition(refVersion, rcapBound);
+            const result = fork.forkA.size === 0;
+            stabilityCache.set(hash, result);
+            return result;
+        };
+
+        const queue: B64Hash[] = [...(await scopedDag.findCoverWithFilter(rsetMeet, refFilter))];
+        while (queue.length > 0) {
+            const r = queue.shift()!;
+            if (visited.has(r)) continue;
+            visited.add(r);
+            if (await isStable(r)) continue;
+
+            const entry = await scopedDag.loadEntry(r);
+            const preds = position(...json.fromSet(entry!.header.prevEntryHashes));
+            const below = await scopedDag.findCoverWithFilter(preds, refFilter);
+
+            const unstableBelow: B64Hash[] = [];
+            for (const b of below) {
+                if (!(await isStable(b))) unstableBelow.push(b);
+            }
+
+            if (unstableBelow.length === 0) {
+                floor.add(r);
+            } else {
+                queue.push(...unstableBelow);
+            }
+        }
+
+        return floor.size > 0 ? floor : rsetMeet;
     }
 
     async getScopedDag(): Promise<ScopedDag> {

@@ -456,11 +456,14 @@ export const permissionedSetTests = {
             }
         },
         {
-            name: '[PSET18] Concurrent transitive revocation voids add',
+            name: '[PSET18] Sequential transitive revocation does not void an earlier add (use-before-revoke)',
             invoke: async () => {
                 // Manager delegates write to Alice. Alice adds Z concurrently
                 // with a ref-advance that carries Manager's admin revocation.
-                // Z should be void.
+                // The revoke is causally AFTER Alice's write grant in the RCap DAG,
+                // so Alice's write is valid at use-time (use-before-revoke) and Z
+                // survives: revoking the grantor's admin does not retroactively
+                // void grants the grantor already made.
                 const { cap, rset, admin } = await createTestEnv({ capRequirements: { add: 'write', delete: 'write' } });
 
                 const manager = await makeIdentity();
@@ -489,7 +492,7 @@ export const permissionedSetTests = {
                 await rset.refAdvance(capV2, admin, forkPoint);
 
                 const view = await rset.getView();
-                assertFalse(await view.has('Z'), 'Z should be void: concurrent transitive revocation');
+                assertTrue(await view.has('Z'), 'Z should survive: Alice\'s write predates the admin revoke (use-before-revoke)');
             }
         },
         {
@@ -749,6 +752,45 @@ export const permissionedSetTests = {
                 for (const h of unrevisedRef) {
                     assertTrue(revisedRef.has(h), 'revised ref version should contain all unrevised hashes');
                 }
+            }
+        },
+        {
+            name: '[PSET25] A concurrent RCap revoke pulled in by a later sequential ref-advance voids an earlier add (use-anchored barrier)',
+            invoke: async () => {
+                // The entry's rcapAt is pinned at `{u}` (the ref-advance it sees), which sits
+                // strictly ABOVE alice's write grant. A revoke concurrent with `{u}` -- a
+                // DESCENDANT of the grant, hence invisible to the grant-anchored barrier B1 --
+                // is folded into rcapFrom by a LATER, sequential-in-the-RSet ref-advance, but
+                // not into the entry's rcapAt. Only the always-on use-anchored barrier (B2),
+                // which checks for revokes concurrent with rcapAt observed from rcapFrom, voids
+                // it. (With B2 gated off at the top level this entry would wrongly survive.)
+                const { cap, rset, admin } = await createTestEnv();
+                const alice = await makeIdentity();
+                const dave = await makeIdentity();
+
+                await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), admin);
+                const gAlice = await cap.grant(alice.keyId, 'write', admin);
+
+                // `u`: an unrelated RCap op layered on top of alice's grant. The entry's
+                // ref-advance points here, so the entry is checked at `{u}` (above the grant).
+                const u = await cap.addIdentity(
+                    dave.keyId, serializePublicKeyToBase64(dave.publicKey), admin, version(gAlice),
+                );
+
+                await rset.refAdvance(version(u), admin);
+                await rset.addSigned('E', alice);
+
+                // Concurrent with `u` (both children of the grant): revoke alice's write.
+                await cap.revoke(alice.keyId, 'write', admin, version(gAlice));
+                const capFull = await (await cap.getScopedDag()).getFrontier();   // {u, r}
+
+                // A later, sequential-in-the-RSet-DAG ref-advance pulls the revoke into the
+                // observation frontier (rcapFrom) without folding it into the entry's rcapAt.
+                await rset.refAdvance(capFull, admin);
+
+                const view = await rset.getView();
+                assertFalse(await view.has('E'),
+                    'E is voided: the concurrent revoke, observed via the later ref-advance, is concurrent with the entry\'s rcapAt (B2)');
             }
         },
     ]
