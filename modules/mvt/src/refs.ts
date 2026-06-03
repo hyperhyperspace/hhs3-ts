@@ -2,13 +2,13 @@
 //
 // An observer RObject can hold versioned references to other RObjects and
 // advance those references through ref-advance operations in its own DAG.
-// This module provides the canonical payload shape, metadata tagging, and
-// DAG query utilities for that mechanism. These are thin, generic helpers;
-// full reference resolution -- including authorization checks and barrier
-// semantics -- is the responsibility of each type's View implementation.
+// This module provides the canonical payload shape, metadata tagging, DAG query
+// utilities, and monotonicity validation for that mechanism. These are thin,
+// generic helpers; types still own authorization checks, barrier semantics, and
+// view-time reference resolution.
 
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
-import type { MetaProps, Position } from "@hyper-hyper-space/hhs3_dag";
+import type { Dag, MetaProps, Position } from "@hyper-hyper-space/hhs3_dag";
 import { json } from "@hyper-hyper-space/hhs3_json";
 
 import type { ScopedDag } from "./dag/dag_nesting.js";
@@ -127,4 +127,43 @@ export async function resolveRefVersionAtPosition(
     }
 
     return result.size > 0 ? result : version(refId);
+}
+
+// Returns true iff `newer` is at or above `older` in the referenced object's DAG
+// (older is in newer's causal past, or they denote the same position).
+export async function refVersionAtOrAbove(
+    referencedDag: Dag,
+    newer: Version,
+    older: Version,
+): Promise<boolean> {
+    const fork = await referencedDag.findForkPosition(older, newer);
+    return fork.forkA.size === 0;
+}
+
+// Validates that a proposed ref-advance is monotonic at insertion time. For each
+// predecessor in `at`, resolves the current reference in the observer DAG (causal
+// only, from === at) and requires `newRefVersion` to be at or above that version
+// in the referenced object's DAG. On merge, every branch predecessor must pass.
+export async function validateRefAdvanceMonotonicity(
+    observerDag: ScopedDag,
+    referencedDag: Dag,
+    refId: B64Hash,
+    newRefVersion: Version,
+    at: Version,
+): Promise<boolean> {
+    if (at.size === 0) {
+        const current = await resolveRefVersionAtPosition(observerDag, refId, at, at);
+        return refVersionAtOrAbove(referencedDag, newRefVersion, current);
+    }
+
+    for (const pred of at) {
+        const current = await resolveRefVersionAtPosition(
+            observerDag, refId, version(pred), version(pred),
+        );
+        if (!await refVersionAtOrAbove(referencedDag, newRefVersion, current)) {
+            return false;
+        }
+    }
+
+    return true;
 }

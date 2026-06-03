@@ -1,7 +1,7 @@
 import { B64Hash, KeyId } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import type { NestingParent, Payload, Version } from "@hyper-hyper-space/hhs3_mvt";
-import { isRefAdvancePayload, refAdvanceFormat } from "@hyper-hyper-space/hhs3_mvt";
+import { isRefAdvancePayload, refAdvanceFormat, extractRefVersion, validateRefAdvanceMonotonicity } from "@hyper-hyper-space/hhs3_mvt";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 
 import { verifyPayloadSignature, isAuthoredPayload, extractAuthor } from "../../authorship.js";
@@ -145,6 +145,12 @@ async function validateRefAdvancePayload(payload: Payload, rset: RSet, at: Versi
 
     const refPayload = payload as unknown as RefAdvancePayload;
     if (refPayload.refId !== rset.capabilityRef()) return false;
+
+    const newRefVersion = extractRefVersion(refPayload);
+    const observerDag = await rset.getScopedDag();
+    const referencedDag = await rset.getContext().getDag(refPayload.refId);
+    if (referencedDag === undefined) return false;
+    if (!await validateRefAdvanceMonotonicity(observerDag, referencedDag, refPayload.refId, newRefVersion, at)) return false;
 
     const rcap = await rset.loadRCap();
     if (rcap === undefined) return false;

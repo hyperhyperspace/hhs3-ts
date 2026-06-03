@@ -14,6 +14,8 @@ import {
     refAdvanceMeta,
     findRefAdvances,
     findConcurrentRefAdvanceBarriers,
+    refVersionAtOrAbove,
+    validateRefAdvanceMonotonicity,
 } from '../src/refs.js';
 
 function createTestDag(): dag.Dag {
@@ -173,6 +175,105 @@ async function testFindConcurrentRefAdvanceBarriers() {
     testing.assertFalse(barriers.has(hBranchA), 'should not include non-barrier entry');
 }
 
+async function testRefAdvanceMonotonicity() {
+    const referencedDag = createTestDag();
+    const root = await referencedDag.append({ n: 0 }, {});
+    const v1 = await referencedDag.append({ n: 1 }, {}, version(root));
+    const v2 = await referencedDag.append({ n: 2 }, {}, version(v1));
+    const v2Branch = await referencedDag.append({ n: '2b' }, {}, version(root));
+    const mergeTip = await referencedDag.append({ n: 3 }, {}, version(v2, v2Branch));
+
+    testing.assertTrue(
+        await refVersionAtOrAbove(referencedDag, version(v2), version(v1)),
+        'v2 should be at or above v1',
+    );
+    testing.assertTrue(
+        await refVersionAtOrAbove(referencedDag, version(v1), version(v1)),
+        'equal versions should pass atOrAbove check',
+    );
+    testing.assertFalse(
+        await refVersionAtOrAbove(referencedDag, version(v1), version(v2)),
+        'v1 should not be at or above v2',
+    );
+
+    const refId = root;
+    const meta: MetaProps = { ref: json.toSet([refId]) };
+
+    const observerRaw = createTestDag();
+    const observer = new RootScopedDag(observerRaw);
+
+    const h0 = await observer.append({ action: 'create' }, {}, undefined);
+
+    testing.assertTrue(
+        await validateRefAdvanceMonotonicity(
+            observer, referencedDag, refId, version(v1), version(h0),
+        ),
+        'first advance from implicit root should pass',
+    );
+
+    const h1 = await observer.append(
+        createRefAdvancePayload(refId, version(v1)),
+        meta,
+        version(h0),
+    );
+
+    testing.assertTrue(
+        await validateRefAdvanceMonotonicity(
+            observer, referencedDag, refId, version(v2), version(h1),
+        ),
+        'sequential forward advance should pass',
+    );
+
+    testing.assertTrue(
+        await validateRefAdvanceMonotonicity(
+            observer, referencedDag, refId, version(v1), version(h1),
+        ),
+        'equal re-advance should pass',
+    );
+
+    const h2 = await observer.append(
+        createRefAdvancePayload(refId, version(v2)),
+        meta,
+        version(h1),
+    );
+
+    testing.assertFalse(
+        await validateRefAdvanceMonotonicity(
+            observer, referencedDag, refId, version(v1), version(h2),
+        ),
+        'backward advance should fail',
+    );
+
+    const forkRaw = createTestDag();
+    const forkObserver = new RootScopedDag(forkRaw);
+    const forkRoot = await forkObserver.append({ action: 'create' }, {}, undefined);
+
+    const hBranchA = await forkObserver.append(
+        createRefAdvancePayload(refId, version(v1)),
+        meta,
+        version(forkRoot),
+    );
+    const hBranchB = await forkObserver.append(
+        createRefAdvancePayload(refId, version(v2Branch)),
+        meta,
+        version(forkRoot),
+    );
+
+    testing.assertTrue(
+        await validateRefAdvanceMonotonicity(
+            forkObserver, referencedDag, refId, version(mergeTip), version(hBranchA, hBranchB),
+        ),
+        'merge advance above both branch refs should pass',
+    );
+
+    testing.assertFalse(
+        await validateRefAdvanceMonotonicity(
+            forkObserver, referencedDag, refId, version(v1), version(hBranchA, hBranchB),
+        ),
+        'merge advance below one branch ref should fail',
+    );
+}
+
 export const refsSuite = {
     title: '[REFS] Building-block helpers',
     tests: [
@@ -182,5 +283,6 @@ export const refsSuite = {
         { name: '[REFS_03] refAdvanceMeta structure', invoke: testRefAdvanceMeta },
         { name: '[REFS_04] findRefAdvances DAG query', invoke: testFindRefAdvances },
         { name: '[REFS_05] findConcurrentRefAdvanceBarriers DAG query', invoke: testFindConcurrentRefAdvanceBarriers },
+        { name: '[REFS_06] ref-advance monotonicity validation', invoke: testRefAdvanceMonotonicity },
     ],
 };

@@ -793,5 +793,26 @@ export const permissionedSetTests = {
                     'E is voided: the concurrent revoke, observed via the later ref-advance, is concurrent with the entry\'s rcapAt (B2)');
             }
         },
+        {
+            name: '[PSET26] Backward ref-advance rejected',
+            invoke: async () => {
+                const { cap, rset, admin } = await createTestEnv();
+
+                const capV1 = await (await cap.getScopedDag()).getFrontier();
+                await rset.refAdvance(capV1, admin);
+
+                await registerAndGrant(cap, await makeIdentity(), 'write', admin);
+                const capV2 = await (await cap.getScopedDag()).getFrontier();
+                await rset.refAdvance(capV2, admin);
+
+                let threw = false;
+                try {
+                    await rset.refAdvance(capV1, admin);
+                } catch {
+                    threw = true;
+                }
+                assertTrue(threw, 'backward ref-advance should be rejected');
+            }
+        },
     ]
 };

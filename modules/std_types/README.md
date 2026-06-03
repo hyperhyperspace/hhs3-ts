@@ -110,7 +110,6 @@ For a **permissioned** set, an entry's membership can also flip below the RSet m
 
 **Known limitations / future work:**
 
-- **Monotonic ref-advances**: the floor descent assumes ref-advances are monotonic — a ref-advance never moves the referenced `RCap` version backward. This lets the descent stop at the first stable ref-advance on each branch (everything below is then stable too), so the concurrent-revoke case lands at the lowest unstable ref-advance rather than degrading to a whole-DAG scan (see **DELTA06** and **DELTA10**). Enforcing monotonicity in `RSet` validation is tracked separately.
 - **Native DAG meet** (performance): shared with `RCap` — `computeMeet` folds `O(k)` `findForkPosition` calls.
 
 ## Authorship helpers

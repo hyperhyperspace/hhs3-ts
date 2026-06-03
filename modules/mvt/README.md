@@ -231,8 +231,10 @@ An observer `RObject` can hold versioned references to other `RObject`s and adva
 - **Metadata** — `refAdvanceMeta(refId)` returns the `MetaProps` to attach when appending a ref-advance entry, tagging it for indexed queries.
 - **DAG queries** — `findRefAdvances(dag, refId, at)` finds all ref-advance entries for a reference up to a position; `findConcurrentRefAdvanceBarriers(dag, refId, at, from)` finds ref-advance barrier entries concurrent to a position, used for `(at, from)` revision semantics in the observer DAG.
 - **`resolveRefVersionAtPosition(dag, refId, at, from)`** — merges causal ref-advances up to `at` with concurrent ref-advance **barriers** reachable from `from` in the **observer** DAG. Observers use this to decide which target version(s) an entry must be checked against. Permissioned `RSet` uses it twice when querying `RCap`: once for the entry position (with barriers) as the referenced `at`, and once at the view frontier with `from === at` as the referenced `from`.
+- **`refVersionAtOrAbove(referencedDag, newer, older)`** — returns true iff `newer` is at or above `older` in the referenced object's DAG (via `findForkPosition`).
+- **`validateRefAdvanceMonotonicity(observerDag, referencedDag, refId, newRefVersion, at)`** — insertion-time check that a proposed ref-advance does not move a reference backward. For each predecessor in `at`, resolves the current reference in the observer DAG and requires the new version to be at or above it in the referenced DAG. Types call this from `validatePayload` (e.g. permissioned `RSet`).
 
-These are thin, generic utilities. Full reference resolution — including authorization, barrier semantics, and monotonicity enforcement — is the responsibility of each type's `View` implementation, not of MVT generically.
+These are thin, generic utilities. Types still own authorization, barrier semantics, and view-time reference resolution.
 
 ## Concrete type: `RSet`
 
