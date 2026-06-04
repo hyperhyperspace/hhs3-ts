@@ -29,7 +29,7 @@ export interface RCap extends RObject, SyncableObject {
     unsubscribe(callback: (event: RCapEvent) => void): void;
 
     setDeltaStrategy(strategy: "full" | "bounded"): void;
-    configure(config: { meshLabel?: string; backendLabel?: string }): void;
+    configure(config: { meshLabel?: string }): void;
 }
 
 export interface RCapView extends View {

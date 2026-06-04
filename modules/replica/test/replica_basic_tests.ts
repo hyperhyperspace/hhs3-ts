@@ -1,8 +1,8 @@
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.js";
-import { createBasicCrypto, HASH_SHA256 } from "@hyper-hyper-space/hhs3_crypto";
+import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import { Replica, MemDagBackend } from "../src/index.js";
-import { TypeRegistryMap } from "@hyper-hyper-space/hhs3_mvt";
-import { RSet, rSetFactory } from "@hyper-hyper-space/hhs3_std_types";
+import { TypeRegistryMap, RootScopedDag } from "@hyper-hyper-space/hhs3_mvt";
+import { RSet, rSetFactory, RCap, rCapFactory } from "@hyper-hyper-space/hhs3_std_types";
 
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
@@ -178,7 +178,7 @@ export const replicaBasicTests = {
             },
         },
         {
-            name: '[REP08] close() clears state',
+            name: '[REP08] destroy() clears root objects',
             invoke: async () => {
                 const replica = createTestReplica();
 
@@ -186,11 +186,68 @@ export const replicaBasicTests = {
                 const set = await replica.createObject(init);
                 const id = set.getId();
 
-                assertTrue((await replica.getObject(id)) !== undefined, 'object should exist before close');
+                assertTrue(replica.getRootIds().has(id), 'object should be a root before destroy');
+                assertTrue((await replica.getObject(id)) !== undefined, 'object should exist before destroy');
 
-                await replica.close();
+                await replica.destroy();
 
-                assertTrue((await replica.getObject(id)) === undefined, 'object should not exist after close');
+                assertTrue((await replica.getObject(id)) === undefined, 'object should not exist after destroy');
+                assertTrue(replica.getRootIds().size === 0, 'rootIds should be empty after destroy');
+            },
+        },
+        {
+            name: '[REP09] registerObject and unregisterObject for owned objects',
+            invoke: async () => {
+                const backend = new MemDagBackend(hashSuite);
+                const replica = new Replica({ crypto, hashSuite, config: { selfValidate: true } });
+                replica.attachBackend('default', backend);
+                replica.registerType(RCap.typeId, rCapFactory);
+
+                const capInit = await RCap.create({
+                    seed: 'owned-cap',
+                    creators: [],
+                    initialCaps: { admin: { managedBy: ['creator'] } },
+                });
+
+                const factory = await replica.getRegistry().lookup(RCap.typeId);
+                const id = await factory.computeRootObjectId(capInit.payload, replica, undefined);
+                const { dag, created } = await backend.getOrCreateDag(id, { type: RCap.typeId });
+                if (created) {
+                    await factory.executeCreationPayload(capInit.payload, replica, new RootScopedDag(dag));
+                }
+                const cap = (await factory.loadObject(id, replica, { backendLabel: 'default' })) as RCap;
+                replica.registerObject(cap);
+
+                assertTrue((await replica.getObject(id)) === cap, 'registered object should be retrievable');
+                assertFalse(replica.getRootIds().has(id), 'registered object should not be a root');
+
+                await replica.unregisterObject(id);
+
+                assertTrue((await replica.getObject(id)) === undefined, 'object should be removed after unregister');
+            },
+        },
+        {
+            name: '[REP10] unregisterObject rejects root objects',
+            invoke: async () => {
+                const replica = createTestReplica();
+                replica.registerType(RCap.typeId, rCapFactory);
+
+                const admin = await createIdentity(SIGNING_ED25519, hashSuite);
+                const init = await RCap.create({
+                    seed: 'root-cap',
+                    creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
+                    initialCaps: { admin: { managedBy: ['creator'] } },
+                });
+                const cap = await replica.createObject(init);
+                const id = cap.getId();
+
+                let threw = false;
+                try {
+                    await replica.unregisterObject(id);
+                } catch {
+                    threw = true;
+                }
+                assertTrue(threw, 'unregisterObject should reject root objects');
             },
         },
     ],

@@ -1,8 +1,7 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { EntryPredicate } from "@hyper-hyper-space/hhs3_dag";
-import { version, Version, RObject, resolveRefVersionAtPosition } from "@hyper-hyper-space/hhs3_mvt";
-import { ScopedDag } from "@hyper-hyper-space/hhs3_mvt";
+import { version, Version, RObject, resolveRefVersionAtPosition, resolveRefVersions, ScopedDag } from "@hyper-hyper-space/hhs3_mvt";
 
 import { isAuthoredPayload, extractAuthor } from "../../authorship.js";
 
@@ -54,7 +53,7 @@ export class RSetViewImpl<T extends json.Literal> implements RSetView<T> {
             if (rcap === undefined) throw new Error("Cannot load referenced RCap");
             const refId = this.target.capabilityRef()!;
             predicate = async (hash, entry) => {
-                const rcapView = await this.resolveRCapViewForEntry(dag, rcap, refId, hash);
+                const rcapView = await this.rcapViewForEntry(dag, rcap, refId, hash);
                 return this.isEntryAuthorized(entry.payload, rcapView);
             };
         }
@@ -96,14 +95,11 @@ export class RSetViewImpl<T extends json.Literal> implements RSetView<T> {
         return false;
     }
 
-    // Compositional: rcapAt = which RCap version E is checked against (RSet barrier
-    // ref-advances may widen this); rcapFrom = observation frontier for RCap revision.
-    private async resolveRCapViewForEntry(
+    private async rcapViewForEntry(
         dag: ScopedDag, rcap: RCap, refId: B64Hash, entryHash: B64Hash,
     ): Promise<RCapView> {
-        const rcapAt = await resolveRefVersionAtPosition(dag, refId, version(entryHash), this.from);
-        const rcapFrom = await resolveRefVersionAtPosition(dag, refId, this.from, this.from);
-        return rcap.getView(rcapAt, rcapFrom) as Promise<RCapView>;
+        const { refAt, refFrom } = await resolveRefVersions(dag, refId, entryHash, this.from);
+        return rcap.getView(refAt, refFrom) as Promise<RCapView>;
     }
 
     private async isEntryAuthorized(payload: json.Literal, rcapView: RCapView): Promise<boolean> {
@@ -131,7 +127,7 @@ export class RSetViewImpl<T extends json.Literal> implements RSetView<T> {
         const refId = this.target.capabilityRef()!;
         const entry = await dag.loadEntry(entryHash);
         if (entry === undefined) return false;
-        const rcapView = await this.resolveRCapViewForEntry(dag, rcap, refId, entryHash);
+        const rcapView = await this.rcapViewForEntry(dag, rcap, refId, entryHash);
         return this.isEntryAuthorized(entry.payload, rcapView);
     }
 
@@ -157,6 +153,6 @@ export class RSetViewImpl<T extends json.Literal> implements RSetView<T> {
         }
 
         const innerFactory = await this.target.getContext().getRegistry().lookup(this.target.contentType()!);
-        return innerFactory.loadObject(elementHash, this.target.getContext(), this.target);
+        return innerFactory.loadObject(elementHash, this.target.getContext(), { parent: this.target });
     }
 }

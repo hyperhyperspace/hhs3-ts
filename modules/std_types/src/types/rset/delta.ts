@@ -1,11 +1,10 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, KeyId } from "@hyper-hyper-space/hhs3_crypto";
-import { dag, Position, position, EntryMetaFilter } from "@hyper-hyper-space/hhs3_dag";
+import { dag, Position, position } from "@hyper-hyper-space/hhs3_dag";
 import {
-    version, Version, Delta, ScopedDag,
-    resolveRefVersionAtPosition, extractRefVersion,
+    version, Version, Delta,
+    resolveRefVersionAtPosition, projectForeignBound,
 } from "@hyper-hyper-space/hhs3_mvt";
-import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 
 import { isAuthoredPayload, extractAuthor } from "../../authorship.js";
 
@@ -178,7 +177,7 @@ async function computeDeltaBounded(set: RSet, rawDag: dag.Dag, start: Version, e
 
 // Compute a bound that takes into consideration possible view revisions in the
 // nested RCap instance, and ensures that all chnages before the bound do NOT
-// affect the delta being computed in RSet (see projectRCapBound).
+// affect the delta being computed in RSet (see projectForeignBound).
 async function computeBound(set: RSet, rsetMeet: Version, end: Version): Promise<Version> {
     const scopedDag = await set.getScopedDag();
     const refId = set.capabilityRef()!;
@@ -191,74 +190,11 @@ async function computeBound(set: RSet, rsetMeet: Version, end: Version): Promise
     const rcap = await set.loadRCap();
     if (rcap === undefined) throw new Error("Cannot load referenced RCap");
 
-    // loadRCap returns a fresh instance, so setting its strategy has no shared side effect.
     rcap.setDeltaStrategy('bounded');
     const rcapDelta = await rcap.computeDelta(rcapAtMeet, rcapAtEnd);
     const rcapBound = rcapDelta.getRevisionBound();
 
-    const rcapRawDag = await set.getContext().getDag(refId);
-    if (rcapRawDag === undefined) throw new Error("Referenced RCap DAG not found");
+    const rcapRawDag = await rcap.getCausalDag();
 
-    return projectRCapBound(scopedDag, refId, rcapRawDag, rsetMeet, rcapBound);
-}
-
-// RCap bound projetion:t find the earliest unstable ref-advance(s) at or below `rsetMeet`.
-// A ref-advance is "stable" iff its referenced RCap version is at or below `rcapBound`,
-// "unstable" otherwise.
-//
-// Starting from the ref-advance cover at `rsetMeet`, descend through unstable ref-advances via
-// their preds; a branch settles when no unstable ref-advance sits below it. The create op is an
-// implicit stable ref-advance to version(refId) (the RCap root, always at or below `rcapBound`),
-// so an empty below-cover settles the branch. Below the returned floor the referenced RCap
-// version is bounded by `rcapBound`, so RCap authorization is identical observed from start and
-// from end. If no ref-advance is unstable, return `rsetMeet` (nothing to drop below the meet).
-//
-// Assumes monotonic ref-advances: a stable ref-advance has only stable ref-advances below it,
-// so the descent can stop at the first stable ref-advance on each branch.
-async function projectRCapBound(
-    scopedDag: ScopedDag, refId: B64Hash, rcapRawDag: dag.Dag, rsetMeet: Version, rcapBound: Version,
-): Promise<Version> {
-    const refFilter: EntryMetaFilter = { containsValues: { ref: [refId] } };
-
-    const floor = version();
-    const visited = new Set<B64Hash>();
-    const stabilityCache = new Map<B64Hash, boolean>();
-
-    // The ref filter guarantees every visited entry is a ref-advance, so the payload cast holds.
-    const isStable = async (hash: B64Hash): Promise<boolean> => {
-        const cached = stabilityCache.get(hash);
-        if (cached !== undefined) return cached;
-        const entry = await scopedDag.loadEntry(hash);
-        const refVersion = extractRefVersion(entry!.payload as RefAdvancePayload);
-        const fork = await rcapRawDag.findForkPosition(refVersion, rcapBound);
-        const result = fork.forkA.size === 0;
-        stabilityCache.set(hash, result);
-        return result;
-    };
-
-    const queue: B64Hash[] = [...(await scopedDag.findCoverWithFilter(rsetMeet, refFilter))];
-    while (queue.length > 0) {
-        const r = queue.shift()!;
-        if (visited.has(r)) continue;
-        visited.add(r);
-        if (await isStable(r)) continue;
-
-        const entry = await scopedDag.loadEntry(r);
-        const preds = position(...json.fromSet(entry!.header.prevEntryHashes));
-        // maybe desdending using BFT here directly would be better?
-        const below = await scopedDag.findCoverWithFilter(preds, refFilter);
-
-        const unstableBelow: B64Hash[] = [];
-        for (const b of below) {
-            if (!(await isStable(b))) unstableBelow.push(b);
-        }
-
-        if (unstableBelow.length === 0) {
-            floor.add(r);
-        } else {
-            queue.push(...unstableBelow);
-        }
-    }
-
-    return floor.size > 0 ? floor : rsetMeet;
+    return projectForeignBound(scopedDag, refId, rcapRawDag, rsetMeet, rcapBound);
 }

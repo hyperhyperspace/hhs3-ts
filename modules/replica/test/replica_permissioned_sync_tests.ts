@@ -187,10 +187,20 @@ async function testCrossPeerWrite() {
 
     await aliceCap.startSync();
     await bobCap.startSync();
+
+    await waitUntil(async () => {
+        const capView = await bobCap.getView();
+        return capView.hasCapability(bobSigning.keyId, 'write');
+    });
+
     await aliceSet.startSync();
     await bobSet.startSync();
 
-    await wait(2000);
+    await waitUntil(async () => {
+        const setView = await bobSet.getView();
+        const refVersion = await setView.resolveRefVersion(capId);
+        return !(refVersion.size === 1 && refVersion.has(capId));
+    });
 
     await bobSet.addSigned('from-bob', bobSigning);
 
@@ -312,15 +322,19 @@ async function testRevocationPropagation() {
     const capF1 = await capDag.getFrontier();
     await aliceSet.refAdvance(capF1, admin);
 
-    // Sync the grant + ref-advance to Bob
+    // Sync cap first so ref-advance validation sees the grant on Bob
     await aliceCap.startSync();
-    await aliceSet.startSync();
     await bobCap.startSync();
-    await bobSet.startSync();
 
     await waitUntil(async () => {
         const capView = await bobCap.getView();
-        if (!(await capView.hasCapability(bobSigning.keyId, 'write'))) return false;
+        return capView.hasCapability(bobSigning.keyId, 'write');
+    });
+
+    await aliceSet.startSync();
+    await bobSet.startSync();
+
+    await waitUntil(async () => {
         const setView = await bobSet.getView();
         const refVersion = await setView.resolveRefVersion(capId);
         return !(refVersion.size === 1 && refVersion.has(capId));

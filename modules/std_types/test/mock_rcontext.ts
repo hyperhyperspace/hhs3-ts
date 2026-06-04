@@ -13,6 +13,8 @@ export function createMockRContext(config: RObjectConfig = { selfValidate: true 
 
     const registry = new TypeRegistryMap();
     const objects = new Map<B64Hash, RObject>();
+    const rootIds = new Set<B64Hash>();
+    const backendById = new Map<B64Hash, string>();
     const dags = new Map<string, Dag>();
 
     function getOrCreateDag(key: string): Dag {
@@ -24,6 +26,17 @@ export function createMockRContext(config: RObjectConfig = { selfValidate: true 
         return dags.get(key)!;
     }
 
+    function recordObject(obj: RObject): void {
+        const id = obj.getId();
+        objects.set(id, obj);
+        backendById.set(id, obj.getBackendLabel());
+    }
+
+    function releaseObject(id: B64Hash): void {
+        objects.delete(id);
+        backendById.delete(id);
+    }
+
     const ctx: RContext = {
         getCrypto: () => crypto,
         getHashSuite: () => hashSuite,
@@ -32,18 +45,21 @@ export function createMockRContext(config: RObjectConfig = { selfValidate: true 
 
         getObject: async (id: B64Hash) => objects.get(id),
 
-        getDag: async (id: B64Hash, _backendLabel?: string) => getOrCreateDag(id),
+        getBackendLabel: async (id: B64Hash) => backendById.get(id),
+
+        getDag: async (id: B64Hash, backendLabel?: string) => getOrCreateDag(id),
 
         getMesh: (_label: string) => {
             throw new Error("MockRContext does not support getMesh");
         },
 
-        createObject: async (init: RObjectInit, _backendLabel?: string) => {
+        createObject: async (init: RObjectInit, backendLabel: string = 'default') => {
             const factory = await registry.lookup(init.type);
             const id = await factory.computeRootObjectId(init.payload, ctx, undefined);
 
-            if (objects.has(id)) {
-                return objects.get(id)!;
+            const existing = objects.get(id);
+            if (existing !== undefined) {
+                return existing;
             }
 
             const valid = await factory.validateCreationPayload(init.payload, ctx, undefined);
@@ -51,9 +67,20 @@ export function createMockRContext(config: RObjectConfig = { selfValidate: true 
             const rawDag = getOrCreateDag(id);
             const scopedDag = new RootScopedDag(rawDag);
             await factory.executeCreationPayload(init.payload, ctx, scopedDag);
-            const obj = await factory.loadObject(id, ctx, undefined);
-            objects.set(id, obj);
+            const obj = await factory.loadObject(id, ctx, { backendLabel });
+            recordObject(obj);
+            rootIds.add(id);
             return obj;
+        },
+
+        unregisterObject: async (id: B64Hash) => {
+            if (rootIds.has(id)) {
+                throw new Error(`Cannot unregister root object '${id}'`);
+            }
+            const obj = objects.get(id);
+            if (obj === undefined) return;
+            await obj.destroy();
+            releaseObject(id);
         },
     };
 

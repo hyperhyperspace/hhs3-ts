@@ -3,7 +3,7 @@ import { B64Hash, HASH_SHA256, KeyId, PublicKey } from "@hyper-hyper-space/hhs3_
 import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, MetaProps, position } from "@hyper-hyper-space/hhs3_dag";
 
-import { Payload, RObject, RObjectFactory, RObjectInit, RContext, SyncableObject, Version, View, ForeignDep } from "@hyper-hyper-space/hhs3_mvt";
+import { Payload, RObject, RObjectFactory, RObjectInit, RContext, LoadObjectOptions, Version, View, ForeignDep } from "@hyper-hyper-space/hhs3_mvt";
 import { RootScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { Mesh, Swarm } from "@hyper-hyper-space/hhs3_mesh";
@@ -48,18 +48,18 @@ export const rCapFactory: RObjectFactory = {
         return await scopedDag.append(payload, meta, position());
     },
 
-    loadObject: async (id: B64Hash, ctx: RContext) => {
-        const rawDag = await ctx.getDag(id);
+    loadObject: async (id: B64Hash, ctx: RContext, opts?: LoadObjectOptions) => {
+        const backendLabel = opts?.backendLabel ?? 'default';
+        const rawDag = await ctx.getDag(id, backendLabel);
         if (rawDag === undefined) throw new Error(`DAG '${id}' not found`);
         const scopedDag = new RootScopedDag(rawDag);
         const createOp = (await scopedDag.loadEntry(id))!.payload as CreateRCapPayload;
-        return new RCapImpl(id, createOp, ctx);
+        return new RCapImpl(id, createOp, ctx, backendLabel);
     }
 };
 
 export type RCapRuntimeConfig = {
     meshLabel?: string;
-    backendLabel?: string;
 };
 
 export class RCapImpl implements RCapContract {
@@ -99,13 +99,19 @@ export class RCapImpl implements RCapContract {
     private _causalDag: CausalDag | undefined;
     private _swarm: Swarm | undefined;
     private _syncSession: SyncSession | undefined;
-    private runtimeConfig: RCapRuntimeConfig = { meshLabel: 'default', backendLabel: 'default' };
+    private readonly backendLabel: string;
+    private meshConfig: RCapRuntimeConfig = { meshLabel: 'default' };
     private deltaStrategy: RCapDeltaStrategy = 'bounded';
 
-    constructor(createOpId: B64Hash, createOp: CreateRCapPayload, ctx: RContext) {
+    constructor(createOpId: B64Hash, createOp: CreateRCapPayload, ctx: RContext, backendLabel: string = 'default') {
         this.createOpId = createOpId;
         this.createOp = createOp;
         this.ctx = ctx;
+        this.backendLabel = backendLabel;
+    }
+
+    getBackendLabel(): string {
+        return this.backendLabel;
     }
 
     getId(): string { return this.createOpId; }
@@ -300,20 +306,18 @@ export class RCapImpl implements RCapContract {
     }
 
     async computeDelta(start: Version, end: Version): Promise<RCapDelta> {
-        const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
+        const rawDag = await this.ctx.getDag(this.createOpId, this.backendLabel);
         if (rawDag === undefined) throw new Error("DAG not found");
         return computeRCapDelta(this, rawDag, this.deltaStrategy, start, end);
     }
 
     configure(config: RCapRuntimeConfig): void {
-        this.runtimeConfig = { ...this.runtimeConfig, ...config };
-        this._scopedDag = undefined;
-        this._causalDag = undefined;
+        this.meshConfig = { ...this.meshConfig, ...config };
     }
 
     async getScopedDag(): Promise<ScopedDag> {
         if (this._scopedDag === undefined) {
-            const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
+            const rawDag = await this.ctx.getDag(this.createOpId, this.backendLabel);
             if (rawDag === undefined) throw new Error(`DAG '${this.createOpId}' not found`);
             this._scopedDag = new RootScopedDag(rawDag);
         }
@@ -322,7 +326,7 @@ export class RCapImpl implements RCapContract {
 
     async getCausalDag(): Promise<CausalDag> {
         if (this._causalDag === undefined) {
-            const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
+            const rawDag = await this.ctx.getDag(this.createOpId, this.backendLabel);
             if (rawDag === undefined) throw new Error(`DAG '${this.createOpId}' not found`);
             this._causalDag = rawDag;
         }
@@ -334,10 +338,10 @@ export class RCapImpl implements RCapContract {
     async startSync(): Promise<void> {
         if (this._syncSession !== undefined) return;
 
-        const mesh = this.ctx.getMesh(this.runtimeConfig.meshLabel ?? 'default') as Mesh;
+        const mesh = this.ctx.getMesh(this.meshConfig.meshLabel ?? 'default') as Mesh;
         this._swarm = mesh.createSwarm(this.createOpId);
 
-        const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
+        const rawDag = await this.ctx.getDag(this.createOpId, this.backendLabel);
         if (rawDag === undefined) throw new Error(`DAG '${this.createOpId}' not found`);
 
         const target: SyncTarget = {

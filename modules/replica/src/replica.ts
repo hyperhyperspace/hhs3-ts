@@ -3,7 +3,7 @@ import { Dag } from "@hyper-hyper-space/hhs3_dag";
 import type { Mesh, TopicId } from "@hyper-hyper-space/hhs3_mesh";
 import {
     RContext, RObject, RObjectInit, RObjectConfig, RObjectFactory,
-    RObjectTypeRegistry, TypeRegistryMap, SyncableObject, RootScopedDag,
+    RObjectTypeRegistry, TypeRegistryMap, RootScopedDag,
 } from "@hyper-hyper-space/hhs3_mvt";
 import { fetchInit } from "@hyper-hyper-space/hhs3_sync";
 
@@ -34,7 +34,8 @@ export class Replica implements RContext {
     private backends: Map<string, DagBackend> = new Map();
     private meshes: Map<string, any> = new Map();
     private registry: TypeRegistryMap = new TypeRegistryMap();
-    private roots: Map<B64Hash, RObject> = new Map();
+    private objects: Map<B64Hash, RObject> = new Map();
+    private rootIds: Set<B64Hash> = new Set();
     private backendByDagId: Map<B64Hash, string> = new Map();
 
     private dagCache: Map<string, Dag> = new Map();
@@ -61,16 +62,59 @@ export class Replica implements RContext {
 
     // --- Lifecycle ---
 
-    async close(): Promise<void> {
-        for (const obj of this.roots.values()) {
-            if (isSyncable(obj)) {
-                try { await obj.stopSync(); } catch (_) { /* best effort */ }
-                try { await obj.destroy(); } catch (_) { /* best effort */ }
-            }
+    async destroy(): Promise<void> {
+        for (const id of [...this.rootIds]) {
+            const obj = this.objects.get(id);
+            if (obj === undefined) continue;
+            try { await obj.destroy(); } catch (_) { /* best effort */ }
+            this.releaseObject(id);
         }
-        this.roots.clear();
+        this.rootIds.clear();
+        this.objects.clear();
         this.backendByDagId.clear();
         this.dagCache.clear();
+    }
+
+    /** @deprecated Use destroy() */
+    async close(): Promise<void> {
+        return this.destroy();
+    }
+
+    getRootIds(): ReadonlySet<B64Hash> {
+        return this.rootIds;
+    }
+
+    // --- Object registry ---
+
+    registerObject(obj: RObject): void {
+        this.recordObject(obj);
+    }
+
+    async unregisterObject(id: B64Hash): Promise<void> {
+        if (this.rootIds.has(id)) {
+            throw new Error(`Cannot unregister root object '${id}'`);
+        }
+        const obj = this.objects.get(id);
+        if (obj === undefined) return;
+        await obj.destroy();
+        this.releaseObject(id);
+    }
+
+    private recordObject(obj: RObject): void {
+        const id = obj.getId();
+        this.objects.set(id, obj);
+        const label = obj.getBackendLabel();
+        this.backendByDagId.set(id, label);
+    }
+
+    private releaseObject(id: B64Hash): void {
+        this.objects.delete(id);
+        this.backendByDagId.delete(id);
+        for (const key of [...this.dagCache.keys()]) {
+            if (key === id || key.endsWith(`:${id}`)) {
+                this.dagCache.delete(key);
+            }
+        }
     }
 
     // --- Object creation (idempotent) ---
@@ -80,7 +124,7 @@ export class Replica implements RContext {
 
         const id = await factory.computeRootObjectId(init.payload, this, undefined);
 
-        const cached = this.roots.get(id);
+        const cached = this.objects.get(id);
         if (cached !== undefined) {
             return cached;
         }
@@ -104,8 +148,9 @@ export class Replica implements RContext {
             await factory.executeCreationPayload(init.payload, this, scopedDag);
         }
 
-        const obj = await factory.loadObject(id, this, undefined);
-        this.roots.set(id, obj);
+        const obj = await factory.loadObject(id, this, { backendLabel });
+        this.recordObject(obj);
+        this.rootIds.add(id);
 
         return obj;
     }
@@ -119,7 +164,7 @@ export class Replica implements RContext {
         const meshLabel = opts?.meshLabel ?? 'default';
         const backendLabel = opts?.backendLabel ?? 'default';
 
-        const existing = this.roots.get(id);
+        const existing = this.objects.get(id);
         if (existing !== undefined) return existing;
 
         const mesh = this.getMesh(meshLabel) as Mesh;
@@ -153,7 +198,11 @@ export class Replica implements RContext {
     }
 
     async getObject(id: B64Hash): Promise<RObject | undefined> {
-        return this.roots.get(id);
+        return this.objects.get(id);
+    }
+
+    async getBackendLabel(id: B64Hash): Promise<string | undefined> {
+        return this.backendByDagId.get(id);
     }
 
     async getDag(id: B64Hash, backendLabel?: string): Promise<Dag | undefined> {
@@ -171,7 +220,7 @@ export class Replica implements RContext {
         const d = await backend.openDag(id);
         if (d === undefined) return undefined;
 
-        this.dagCache.set(cacheKey, d);
+        this.dagCache.set(`${label}:${id}`, d);
         this.backendByDagId.set(id, label);
         return d;
     }
@@ -198,8 +247,4 @@ export class Replica implements RContext {
 
         return undefined;
     }
-}
-
-function isSyncable(obj: any): obj is SyncableObject {
-    return typeof obj.startSync === 'function';
 }

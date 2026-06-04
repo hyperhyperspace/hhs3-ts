@@ -41,10 +41,14 @@ export type RObject = {
 
     subscribe(callback: (event: Event) => void): void;
     unsubscribe(callback: (event: Event) => void): void;
+
+    getBackendLabel(): string;
+    destroy(): Promise<void>;
 }
 
 export type NestingParent = {
     getId(): B64Hash;
+    getBackendLabel(): string;
     getScopedDagForChild(childId: B64Hash): Promise<ScopedDag>;
     getCreationDagForChild(childId: B64Hash, at: Version, addPayload: Payload): Promise<ScopedDag>;
     getCausalDag(): Promise<CausalDag>;
@@ -53,8 +57,12 @@ export type NestingParent = {
 export type SyncableObject = {
     startSync(): Promise<void>;
     stopSync(): Promise<void>;
-    destroy(): Promise<void>;
 }
+
+export type LoadObjectOptions = {
+    parent?: NestingParent;
+    backendLabel?: string;
+};
 
 export type RObjectInit = {
     type: string;
@@ -73,9 +81,11 @@ export type RContext = {
 
     getObject(id: B64Hash): Promise<RObject | undefined>;
     getDag(id: B64Hash, backendLabel?: string): Promise<Dag | undefined>;
+    getBackendLabel(id: B64Hash): Promise<string | undefined>;
     getMesh(label: string): any;
 
     createObject(init: RObjectInit, backendLabel?: string): Promise<RObject>;
+    unregisterObject(id: B64Hash): Promise<void>;
 };
 
 export type RObjectFactory = {
@@ -84,7 +94,7 @@ export type RObjectFactory = {
     validateCreationPayload: (createPayload: Payload, ctx: RContext, parent?: NestingParent) => Promise<boolean>;
     executeCreationPayload: (createPayload: Payload, ctx: RContext, scopedDag: ScopedDag) => Promise<B64Hash>;
     
-    loadObject: (id: B64Hash, ctx: RContext, parent?: NestingParent) => Promise<RObject>;
+    loadObject: (id: B64Hash, ctx: RContext, opts?: LoadObjectOptions) => Promise<RObject>;
 }
 
 export type View = {

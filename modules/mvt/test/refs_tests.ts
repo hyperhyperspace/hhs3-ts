@@ -1,6 +1,6 @@
 import { testing } from '@hyper-hyper-space/hhs3_util';
 import { B64Hash, sha256, stringToUint8Array } from '@hyper-hyper-space/hhs3_crypto';
-import { dag, Position, MetaProps } from '@hyper-hyper-space/hhs3_dag';
+import { dag, Position } from '@hyper-hyper-space/hhs3_dag';
 import { json } from '@hyper-hyper-space/hhs3_json';
 
 import { RootScopedDag } from '../src/dag/dag_nesting.js';
@@ -11,10 +11,14 @@ import {
     isRefAdvancePayload,
     createRefAdvancePayload,
     extractRefVersion,
-    refAdvanceMeta,
+    createRefAdvanceMeta,
+    prepareRefAdvance,
     findRefAdvances,
     findConcurrentRefAdvanceBarriers,
     refVersionAtOrAbove,
+    refVersionAtOrBelow,
+    resolveRefVersions,
+    projectForeignBound,
     validateRefAdvanceMonotonicity,
 } from '../src/refs.js';
 
@@ -25,6 +29,16 @@ function createTestDag(): dag.Dag {
         new dag.idx.flat.mem.MemFlatIndexStore()
     );
     return dag.create(store, index, sha256);
+}
+
+function setEq(a: Position, b: Position): boolean {
+    if (a.size !== b.size) return false;
+    for (const h of a) if (!b.has(h)) return false;
+    return true;
+}
+
+function refMetaValues(meta: ReturnType<typeof createRefAdvanceMeta>): B64Hash[] {
+    return [...json.fromSet(meta['ref']!)];
 }
 
 async function testIsRefAdvancePayload() {
@@ -97,14 +111,30 @@ async function testRefAdvanceFormatValidation() {
     );
 }
 
-async function testRefAdvanceMeta() {
+async function testCreateRefAdvanceMeta() {
     const refId = 'myRefId';
-    const meta = refAdvanceMeta(refId);
 
-    testing.assertTrue(meta['ref'] !== undefined, 'meta should have ref key');
-    const refValues = [...json.fromSet(meta['ref'])];
-    testing.assertEquals(refValues.length, 1, 'ref meta should have 1 element');
-    testing.assertEquals(refValues[0], refId, 'ref meta should contain the refId');
+    const defaultMeta = createRefAdvanceMeta(refId);
+    testing.assertEquals(refMetaValues(defaultMeta).length, 1, 'default meta should index one refId');
+    testing.assertEquals(refMetaValues(defaultMeta)[0], refId, 'default meta should index refId');
+    testing.assertEquals([...json.fromSet(defaultMeta['barrier']!)][0], 't', 'barrier tag should be included by default');
+
+    const indexed = createRefAdvanceMeta(refId, { barrier: false });
+    testing.assertEquals(refMetaValues(indexed)[0], refId, 'non-barrier meta should still index refId');
+    testing.assertTrue(indexed['barrier'] === undefined, 'barrier tag should be omitted when disabled');
+}
+
+async function testPrepareRefAdvance() {
+    const refId = 'capRef';
+    const refVersion = version('v1', 'v2');
+    const { payload, meta } = prepareRefAdvance(refId, refVersion);
+
+    testing.assertTrue(isRefAdvancePayload(payload), 'payload should be a ref-advance');
+    testing.assertEquals(payload.refId, refId, 'refId should match');
+    testing.assertTrue(setEq(extractRefVersion(payload), refVersion), 'refVersion should match');
+
+    testing.assertEquals(refMetaValues(meta)[0], refId, 'meta ref index should match');
+    testing.assertEquals([...json.fromSet(meta['barrier']!)][0], 't', 'prepareRefAdvance meta should include barrier tag');
 }
 
 async function testFindRefAdvances() {
@@ -112,7 +142,7 @@ async function testFindRefAdvances() {
     const scopedDag = new RootScopedDag(rawDag);
 
     const refId = 'permissionsObj';
-    const meta: MetaProps = { ref: json.toSet([refId]) };
+    const meta = createRefAdvanceMeta(refId);
 
     const h1 = await scopedDag.append(
         createRefAdvancePayload(refId, version('v1')),
@@ -156,14 +186,9 @@ async function testFindConcurrentRefAdvanceBarriers() {
         version(h1),
     );
 
-    const barrierMeta: MetaProps = {
-        ref: json.toSet([refId]),
-        barrier: json.toSet(['t']),
-    };
-
     const hBranchB = await scopedDag.append(
         createRefAdvancePayload(refId, version('v1')),
-        barrierMeta,
+        createRefAdvanceMeta(refId),
         version(h1),
     );
 
@@ -173,6 +198,88 @@ async function testFindConcurrentRefAdvanceBarriers() {
 
     testing.assertTrue(barriers.has(hBranchB), 'should find the concurrent barrier ref-advance');
     testing.assertFalse(barriers.has(hBranchA), 'should not include non-barrier entry');
+}
+
+async function testRefVersionAtOrBelow() {
+    const referencedDag = createTestDag();
+    const root = await referencedDag.append({ n: 0 }, {});
+    const v1 = await referencedDag.append({ n: 1 }, {}, version(root));
+    const v2 = await referencedDag.append({ n: 2 }, {}, version(v1));
+    const v2Branch = await referencedDag.append({ n: '2b' }, {}, version(root));
+
+    testing.assertTrue(
+        await refVersionAtOrBelow(referencedDag, version(v1), version(v2)),
+        'v1 should be at or below v2',
+    );
+    testing.assertTrue(
+        await refVersionAtOrBelow(referencedDag, version(v1), version(v1)),
+        'equal versions should pass atOrBelow check',
+    );
+    testing.assertFalse(
+        await refVersionAtOrBelow(referencedDag, version(v2), version(v1)),
+        'v2 should not be at or below v1',
+    );
+    testing.assertFalse(
+        await refVersionAtOrBelow(referencedDag, version(v1), version(v2Branch)),
+        'concurrent v1 should not be at or below v2Branch',
+    );
+    testing.assertFalse(
+        await refVersionAtOrAbove(referencedDag, version(v1), version(v2Branch)),
+        'concurrent positions should fail atOrAbove as well',
+    );
+}
+
+async function testResolveRefVersions() {
+    const refId = 'foreignObj';
+    const foreignDag = createTestDag();
+    const fRoot = await foreignDag.append({ n: 0 }, {});
+    const fV1 = await foreignDag.append({ n: 1 }, {}, version(fRoot));
+
+    const observerRaw = createTestDag();
+    const observer = new RootScopedDag(observerRaw);
+
+    const h0 = await observer.append({ action: 'create' }, {}, undefined);
+    const h1 = await observer.append(
+        createRefAdvancePayload(refId, version(fV1)),
+        createRefAdvanceMeta(refId),
+        version(h0),
+    );
+    const h2 = await observer.append({ action: 'add', element: 'x' }, {}, version(h1));
+
+    const observerFrom = version(h2);
+    const { refAt, refFrom } = await resolveRefVersions(observer, refId, h1, observerFrom);
+
+    testing.assertTrue(setEq(refAt, version(fV1)), 'refAt should resolve foreign version at entry');
+    testing.assertTrue(setEq(refFrom, version(fV1)), 'refFrom should resolve at observer frontier without widening');
+}
+
+async function testProjectForeignBound() {
+    const refId = 'foreignObj';
+    const foreignDag = createTestDag();
+    const fRoot = await foreignDag.append({ n: 0 }, {});
+    const fV1 = await foreignDag.append({ n: 1 }, {}, version(fRoot));
+    const fV2 = await foreignDag.append({ n: 2 }, {}, version(fV1));
+
+    const observerRaw = createTestDag();
+    const observer = new RootScopedDag(observerRaw);
+
+    const h0 = await observer.append({ action: 'create' }, {}, undefined);
+    const prepared = prepareRefAdvance(refId, version(fV2));
+    const hRef = await observer.append(prepared.payload, prepared.meta, version(h0));
+    const h2 = await observer.append({ action: 'add', element: 'x' }, {}, version(hRef));
+
+    const localAt = version(h2);
+
+    const floorStable = await projectForeignBound(
+        observer, refId, foreignDag, localAt, version(fV2),
+    );
+    testing.assertTrue(setEq(floorStable, localAt), 'all ref-advances stable should return localAt');
+
+    const floorUnstable = await projectForeignBound(
+        observer, refId, foreignDag, localAt, version(fV1),
+    );
+    testing.assertTrue(floorUnstable.has(hRef), 'unstable ref-advance should lower floor to its hash');
+    testing.assertFalse(floorUnstable.has(h2), 'floor should sit below localAt');
 }
 
 async function testRefAdvanceMonotonicity() {
@@ -197,7 +304,7 @@ async function testRefAdvanceMonotonicity() {
     );
 
     const refId = root;
-    const meta: MetaProps = { ref: json.toSet([refId]) };
+    const meta = createRefAdvanceMeta(refId);
 
     const observerRaw = createTestDag();
     const observer = new RootScopedDag(observerRaw);
@@ -280,9 +387,13 @@ export const refsSuite = {
         { name: '[REFS_00] isRefAdvancePayload recognition', invoke: testIsRefAdvancePayload },
         { name: '[REFS_01] create and extract ref-advance payload', invoke: testCreateAndExtractRefAdvancePayload },
         { name: '[REFS_02] refAdvanceFormat validation', invoke: testRefAdvanceFormatValidation },
-        { name: '[REFS_03] refAdvanceMeta structure', invoke: testRefAdvanceMeta },
+        { name: '[REFS_03] createRefAdvanceMeta default barrier and opt-out', invoke: testCreateRefAdvanceMeta },
+        { name: '[REFS_03b] prepareRefAdvance payload and meta', invoke: testPrepareRefAdvance },
         { name: '[REFS_04] findRefAdvances DAG query', invoke: testFindRefAdvances },
         { name: '[REFS_05] findConcurrentRefAdvanceBarriers DAG query', invoke: testFindConcurrentRefAdvanceBarriers },
-        { name: '[REFS_06] ref-advance monotonicity validation', invoke: testRefAdvanceMonotonicity },
+        { name: '[REFS_06] refVersionAtOrBelow ordering', invoke: testRefVersionAtOrBelow },
+        { name: '[REFS_07] resolveRefVersions for entry', invoke: testResolveRefVersions },
+        { name: '[REFS_08] projectForeignBound floor projection', invoke: testProjectForeignBound },
+        { name: '[REFS_09] ref-advance monotonicity validation', invoke: testRefAdvanceMonotonicity },
     ],
 };

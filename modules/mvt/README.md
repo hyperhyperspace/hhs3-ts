@@ -118,6 +118,9 @@ type RObject = {
 
     subscribe(callback: (event: Event) => void): void;
     unsubscribe(callback: (event: Event) => void): void;
+
+    getBackendLabel(): string;
+    destroy(): Promise<void>;
 }
 ```
 
@@ -168,13 +171,19 @@ type RContext = {
 
     getObject(id: B64Hash): Promise<RObject | undefined>;
     getDag(id: B64Hash, backendLabel?: string): Promise<Dag | undefined>;
+    getBackendLabel(id: B64Hash): Promise<string | undefined>;
     getMesh(label: string): any;
 
     createObject(init: RObjectInit, backendLabel?: string): Promise<RObject>;
+    unregisterObject(id: B64Hash): Promise<void>;
 }
 ```
 
-`getDag` returns `undefined` when the requested DAG is not found, fitting scenarios where a replica is incrementally built up and not all referenced DAGs exist yet.
+`getObject` is the canonical lookup for inter-object references (e.g. permissioned `RSet` resolving its `RCap`). `getBackendLabel` returns the immutable backend label recorded at registration. `unregisterObject` tears down owned (non-root) objects: `destroy()` then registry removal.
+
+### `LoadObjectOptions`
+
+Factory `loadObject` accepts optional `{ parent?: NestingParent; backendLabel?: string }`. Root objects receive `backendLabel` at load time; nested objects inherit the parent's label via `NestingParent.getBackendLabel()`.
 
 ### `RObjectFactory`
 
@@ -185,17 +194,17 @@ type RObjectFactory = {
     computeRootObjectId: (createPayload: Payload, ctx: RContext, parent?: NestingParent) => Promise<B64Hash>;
     validateCreationPayload: (createPayload: Payload, ctx: RContext, parent?: NestingParent) => Promise<boolean>;
     executeCreationPayload: (createPayload: Payload, ctx: RContext, scopedDag: ScopedDag) => Promise<B64Hash>;
-    loadObject: (id: B64Hash, ctx: RContext, parent?: NestingParent) => Promise<RObject>;
+    loadObject: (id: B64Hash, ctx: RContext, opts?: LoadObjectOptions) => Promise<RObject>;
 }
 ```
 
 ### `NestingParent`
 
-The interface a parent object exposes to its nested children, providing scoped DAG access and causal DAG access for the child's operations.
+The interface a parent object exposes to its nested children, providing scoped DAG access, backend label inheritance, and causal DAG access for the child's operations.
 
 ### `SyncableObject`
 
-An object that can participate in network synchronization via `startSync()` / `stopSync()` / `destroy()`.
+An object that can participate in network synchronization via `startSync()` / `stopSync()`. Teardown (`destroy()`) is on `RObject` itself.
 
 ### `RObjectTypeRegistry`
 
@@ -227,11 +236,13 @@ An observer `RObject` can hold versioned references to other `RObject`s and adva
 
 - **`RefAdvancePayload`** — the canonical payload shape for a ref-advance operation (`action: 'ref-advance'`, `refId`, `refVersion`). Types may embed additional fields alongside these.
 - **`refAdvanceFormat`** — a `json.Format` for validating the ref-advance portion of a payload. Designed for non-strict checking so types can extend it.
-- **Payload utilities** — `isRefAdvancePayload` (type guard), `createRefAdvancePayload` (constructor), `extractRefVersion` (extracts the target version from a payload).
-- **Metadata** — `refAdvanceMeta(refId)` returns the `MetaProps` to attach when appending a ref-advance entry, tagging it for indexed queries.
+- **Payload utilities** — `isRefAdvancePayload` (type guard), `createRefAdvancePayload` (constructor), `extractRefVersion` (extracts the target version from a payload), `prepareRefAdvance` (returns `{ payload, meta }` for appending a barrier ref-advance).
+- **Metadata** — `createRefAdvanceMeta(refId, opts?)` returns indexed `MetaProps` for append; barrier-tagged by default. Pass `{ barrier: false }` for a non-barrier ref-advance. `prepareRefAdvance` pairs payload + default meta.
 - **DAG queries** — `findRefAdvances(dag, refId, at)` finds all ref-advance entries for a reference up to a position; `findConcurrentRefAdvanceBarriers(dag, refId, at, from)` finds ref-advance barrier entries concurrent to a position, used for `(at, from)` revision semantics in the observer DAG.
 - **`resolveRefVersionAtPosition(dag, refId, at, from)`** — merges causal ref-advances up to `at` with concurrent ref-advance **barriers** reachable from `from` in the **observer** DAG. Observers use this to decide which target version(s) an entry must be checked against. Permissioned `RSet` uses it twice when querying `RCap`: once for the entry position (with barriers) as the referenced `at`, and once at the view frontier with `from === at` as the referenced `from`.
-- **`refVersionAtOrAbove(referencedDag, newer, older)`** — returns true iff `newer` is at or above `older` in the referenced object's DAG (via `findForkPosition`).
+- **`resolveRefVersions(observerDag, refId, entryHash, observerFrom)`** — compositional helper returning `{ refAt, refFrom }` in the referenced object's DAG for checking an observer entry against a foreign object (see permissioned `RSetView`).
+- **`refVersionAtOrAbove(referencedDag, newer, older)`** / **`refVersionAtOrBelow(referencedDag, v, ceiling)`** — closed `≥` / `≤` comparisons in the referenced DAG (converses, not negations; concurrent positions fail both).
+- **`projectForeignBound(observerDag, refId, referencedDag, localAt, foreignRevisionBound)`** — projects a nested object's revision bound into the observer DAG, lowering the delta floor to the earliest unstable ref-advance(s).
 - **`validateRefAdvanceMonotonicity(observerDag, referencedDag, refId, newRefVersion, at)`** — insertion-time check that a proposed ref-advance does not move a reference backward. For each predecessor in `at`, resolves the current reference in the observer DAG and requires the new version to be at or above it in the referenced DAG. Types call this from `validatePayload` (e.g. permissioned `RSet`).
 
 These are thin, generic utilities. Types still own authorization, barrier semantics, and view-time reference resolution.

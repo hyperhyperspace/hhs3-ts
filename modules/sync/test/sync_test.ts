@@ -96,6 +96,7 @@ function createMockRObject(d: dag.Dag, id: B64Hash, opts?: {
     return {
         getId: () => id,
         getType: () => 'test-object',
+        getBackendLabel: () => 'default',
         validatePayload: async (_payload: Payload, _at: Version) => true,
         applyPayload: async (payload: Payload, at: Version) => {
             return await d.append(payload, {}, at);
@@ -107,6 +108,7 @@ function createMockRObject(d: dag.Dag, id: B64Hash, opts?: {
         extractForeignDeps: opts?.extractForeignDeps ?? ((_payload: Payload, _at: Version) => undefined),
         subscribe: (_cb: (event: Event) => void) => {},
         unsubscribe: (_cb: (event: Event) => void) => {},
+        destroy: async () => {},
     };
 }
 

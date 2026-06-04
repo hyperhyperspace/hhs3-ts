@@ -38,7 +38,7 @@ export interface RSet<T extends json.Literal = json.Literal> extends RObject, Sy
     getView(at?: Version, from?: Version): Promise<RSetView<T>>;
 
     getContext(): RContext;
-    configure(config: { meshLabel?: string; backendLabel?: string }): void;
+    configure(config: { meshLabel?: string }): void;
     loadChildObject(innerFactory: RObjectFactory, elementHash: B64Hash): Promise<RObject>;
 
     seed(): string;

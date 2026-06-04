@@ -81,6 +81,16 @@ export const permissionedSetTests = {
     title: '[PSET] Permissioned RSet tests',
     tests: [
         {
+            name: '[PSET00] loadRCap returns registry object via getObject',
+            invoke: async () => {
+                const { ctx, cap, rset } = await createTestEnv();
+                const loaded = await rset.loadRCap();
+                const fromCtx = await ctx.getObject(cap.getId());
+                assertTrue(loaded !== undefined, 'loadRCap should return the RCap');
+                assertTrue(loaded === fromCtx, 'loadRCap should return the same instance as getObject');
+            },
+        },
+        {
             name: '[PSET01] Authorized add succeeds',
             invoke: async () => {
                 const { cap, rset, admin } = await createTestEnv();

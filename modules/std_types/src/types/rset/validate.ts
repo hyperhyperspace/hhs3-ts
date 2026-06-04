@@ -146,14 +146,13 @@ async function validateRefAdvancePayload(payload: Payload, rset: RSet, at: Versi
     const refPayload = payload as unknown as RefAdvancePayload;
     if (refPayload.refId !== rset.capabilityRef()) return false;
 
-    const newRefVersion = extractRefVersion(refPayload);
-    const observerDag = await rset.getScopedDag();
-    const referencedDag = await rset.getContext().getDag(refPayload.refId);
-    if (referencedDag === undefined) return false;
-    if (!await validateRefAdvanceMonotonicity(observerDag, referencedDag, refPayload.refId, newRefVersion, at)) return false;
-
     const rcap = await rset.loadRCap();
     if (rcap === undefined) return false;
+
+    const newRefVersion = extractRefVersion(refPayload);
+    const observerDag = await rset.getScopedDag();
+    const referencedDag = await rcap.getCausalDag();
+    if (!await validateRefAdvanceMonotonicity(observerDag, referencedDag, refPayload.refId, newRefVersion, at)) return false;
 
     if (!await verifyPayloadSignature(payload as json.LiteralMap, (keyId) => rcap.lookupKey(keyId))) return false;
 

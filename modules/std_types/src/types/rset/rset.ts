@@ -28,9 +28,9 @@ import { B64Hash, HASH_SHA256 } from "@hyper-hyper-space/hhs3_crypto";
 import type { KeyId, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, MetaProps, position, EntryMetaFilter, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
 
-import { Payload, RObject, RObjectFactory, RObjectInit, RContext, NestingParent, Version, ForeignDep } from "@hyper-hyper-space/hhs3_mvt";
+import { Payload, RObject, RObjectFactory, RObjectInit, RContext, NestingParent, Version, ForeignDep, LoadObjectOptions } from "@hyper-hyper-space/hhs3_mvt";
 import { DagScope, NestedScopedDag, RootScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
-import { isRefAdvancePayload, refAdvanceMeta, createRefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
+import { isRefAdvancePayload, prepareRefAdvance, createRefAdvanceMeta } from "@hyper-hyper-space/hhs3_mvt";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 import { set } from "@hyper-hyper-space/hhs3_util";
 
@@ -78,20 +78,22 @@ export const rSetFactory: RObjectFactory = {
         return await scopedDag.append(createPayload, meta, position());
     },
 
-    loadObject: async (id: B64Hash, ctx: RContext, parent?: NestingParent) => {
+    loadObject: async (id: B64Hash, ctx: RContext, opts?: LoadObjectOptions) => {
 
         let scopedDag: ScopedDag;
+        const parent = opts?.parent;
 
         if (parent !== undefined) {
             scopedDag = await parent.getScopedDagForChild(id);
         } else {
-            const rawDag = await ctx.getDag(id);
+            const backendLabel = opts?.backendLabel ?? 'default';
+            const rawDag = await ctx.getDag(id, backendLabel);
             if (rawDag === undefined) throw new Error(`DAG '${id}' not found`);
             scopedDag = new RootScopedDag(rawDag);
         }
 
         const createOp = (await scopedDag.loadEntry(id))!.payload as CreateSetPayload;
-        return new RSetImpl(id, createOp, ctx, parent);
+        return new RSetImpl(id, createOp, ctx, parent, opts?.backendLabel);
     }
 
 }
@@ -113,7 +115,6 @@ export type RSetOptions = {
 
 export type RSetRuntimeConfig = {
     meshLabel?: string;
-    backendLabel?: string;
 }
 
 export class RSetImpl<T extends json.Literal = json.Literal> implements RSetContract<T> {
@@ -187,13 +188,28 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
     private _causalDag: CausalDag | undefined;
     private _swarm: Swarm | undefined;
     private _syncSession: SyncSession | undefined;
-    private runtimeConfig: RSetRuntimeConfig = { meshLabel: 'default', backendLabel: 'default' };
+    private readonly backendLabel: string | undefined;
+    private meshConfig: RSetRuntimeConfig = { meshLabel: 'default' };
 
-    constructor(createOpId: B64Hash, createOp: CreateSetPayload, ctx: RContext, parent?: NestingParent) {
+    constructor(
+        createOpId: B64Hash,
+        createOp: CreateSetPayload,
+        ctx: RContext,
+        parent?: NestingParent,
+        backendLabel?: string,
+    ) {
         this.createOpId = createOpId;
         this.createOp = createOp;
         this.ctx = ctx;
         this.parentObj = parent;
+        this.backendLabel = backendLabel;
+    }
+
+    getBackendLabel(): string {
+        if (this.parentObj !== undefined) {
+            return this.parentObj.getBackendLabel();
+        }
+        return this.backendLabel ?? 'default';
     }
 
     getId(): string {
@@ -335,7 +351,7 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
         if (!this.isPermissioned()) throw new Error("refAdvance is only for permissioned sets");
         const d = await this.getScopedDag();
         at = at || await d.getFrontier();
-        const base = createRefAdvancePayload(this.capabilityRef()!, refVersion);
+        const { payload: base } = prepareRefAdvance(this.capabilityRef()!, refVersion);
         const signed = await signPayloadHelper(base as unknown as json.LiteralMap, author);
         return this.applyValidatedPayload(signed, at);
     }
@@ -379,10 +395,7 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
 
         if (isRefAdvancePayload(payload)) {
             const refPayload = payload as unknown as RefAdvancePayload;
-            const meta: MetaProps = {
-                ...refAdvanceMeta(refPayload.refId),
-                barrier: json.toSet(['t']),
-            };
+            const meta = createRefAdvanceMeta(refPayload.refId);
             const scopedDag = await this.getScopedDag();
             return await scopedDag.append(payload, meta, at);
         }
@@ -444,13 +457,11 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
     }
 
     configure(config: RSetRuntimeConfig): void {
-        this.runtimeConfig = { ...this.runtimeConfig, ...config };
-        this._scopedDag = undefined;
-        this._causalDag = undefined;
+        this.meshConfig = { ...this.meshConfig, ...config };
     }
 
     async loadChildObject(innerFactory: RObjectFactory, elementHash: B64Hash): Promise<RObject> {
-        return innerFactory.loadObject(elementHash, this.ctx, this);
+        return innerFactory.loadObject(elementHash, this.ctx, { parent: this });
     }
 
     seed(): string {
@@ -518,12 +529,9 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
     async loadRCap(): Promise<RCap | undefined> {
         const ref = this.capabilityRef();
         if (ref === undefined) return undefined;
-        try {
-            const factory = await this.ctx.getRegistry().lookup(RCap.typeId);
-            return await factory.loadObject(ref, this.ctx) as RCap;
-        } catch {
-            return undefined;
-        }
+        const obj = await this.ctx.getObject(ref);
+        if (obj === undefined) return undefined;
+        return obj as RCap;
     }
 
     subscribe(callback: (event: RAddEvent | RDeleteEvent) => void): void {
@@ -544,7 +552,7 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
         if (this.parentObj !== undefined) {
             throw new Error("computeDelta is not supported on nested RSet");
         }
-        const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
+        const rawDag = await this.ctx.getDag(this.createOpId, this.getBackendLabel());
         if (rawDag === undefined) throw new Error("DAG not found");
         return computeRSetDelta(this, rawDag, this.deltaStrategy, start, end);
     }
@@ -554,7 +562,7 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
             if (this.parentObj !== undefined) {
                 this._scopedDag = await this.parentObj.getScopedDagForChild(this.createOpId);
             } else {
-                const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
+                const rawDag = await this.ctx.getDag(this.createOpId, this.getBackendLabel());
                 if (rawDag === undefined) throw new Error(`DAG '${this.createOpId}' not found`);
                 this._scopedDag = new RootScopedDag(rawDag);
             }
@@ -567,7 +575,7 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
             if (this.parentObj !== undefined) {
                 this._causalDag = await this.parentObj.getCausalDag();
             } else {
-                const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
+                const rawDag = await this.ctx.getDag(this.createOpId, this.getBackendLabel());
                 if (rawDag === undefined) throw new Error(`DAG '${this.createOpId}' not found`);
                 this._causalDag = rawDag;
             }
@@ -595,10 +603,10 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
         if (this.parentObj !== undefined) return;
         if (this._syncSession !== undefined) return;
 
-        const mesh = this.ctx.getMesh(this.runtimeConfig.meshLabel ?? 'default') as Mesh;
+        const mesh = this.ctx.getMesh(this.meshConfig.meshLabel ?? 'default') as Mesh;
         this._swarm = mesh.createSwarm(this.createOpId);
 
-        const rawDag = await this.ctx.getDag(this.createOpId, this.runtimeConfig.backendLabel);
+        const rawDag = await this.ctx.getDag(this.createOpId, this.getBackendLabel());
         if (rawDag === undefined) throw new Error(`DAG '${this.createOpId}' not found`);
 
         const target: SyncTarget = {
@@ -606,7 +614,10 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
             dag: rawDag,
             rObject: this,
             hashSuite: this.ctx.getHashSuite(),
-            resolveRefDag: (refId) => this.ctx.getDag(refId),
+            resolveRefDag: async (refId) => {
+                const label = await this.ctx.getBackendLabel(refId);
+                return this.ctx.getDag(refId, label);
+            },
         };
 
         this._syncSession = createSyncSession(target, [this._swarm]);
