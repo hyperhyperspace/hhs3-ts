@@ -270,16 +270,16 @@ async function testProjectForeignBound() {
 
     const localAt = version(h2);
 
-    const floorStable = await projectForeignBound(
+    const boundStable = await projectForeignBound(
         observer, refId, foreignDag, localAt, version(fV2),
     );
-    testing.assertTrue(setEq(floorStable, localAt), 'all ref-advances stable should return localAt');
+    testing.assertTrue(setEq(boundStable, localAt), 'all ref-advances stable should return localAt');
 
-    const floorUnstable = await projectForeignBound(
+    const boundUnstable = await projectForeignBound(
         observer, refId, foreignDag, localAt, version(fV1),
     );
-    testing.assertTrue(floorUnstable.has(hRef), 'unstable ref-advance should lower floor to its hash');
-    testing.assertFalse(floorUnstable.has(h2), 'floor should sit below localAt');
+    testing.assertTrue(boundUnstable.has(hRef), 'unstable ref-advance should lower bound to its hash');
+    testing.assertFalse(boundUnstable.has(h2), 'bound should sit below localAt');
 }
 
 async function testRefAdvanceMonotonicity() {
@@ -393,7 +393,7 @@ export const refsSuite = {
         { name: '[REFS_05] findConcurrentRefAdvanceBarriers DAG query', invoke: testFindConcurrentRefAdvanceBarriers },
         { name: '[REFS_06] refVersionAtOrBelow ordering', invoke: testRefVersionAtOrBelow },
         { name: '[REFS_07] resolveRefVersions for entry', invoke: testResolveRefVersions },
-        { name: '[REFS_08] projectForeignBound floor projection', invoke: testProjectForeignBound },
+        { name: '[REFS_08] projectForeignBound bound projection', invoke: testProjectForeignBound },
         { name: '[REFS_09] ref-advance monotonicity validation', invoke: testRefAdvanceMonotonicity },
     ],
 };

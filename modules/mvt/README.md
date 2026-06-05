@@ -242,10 +242,21 @@ An observer `RObject` can hold versioned references to other `RObject`s and adva
 - **`resolveRefVersionAtPosition(dag, refId, at, from)`** — merges causal ref-advances up to `at` with concurrent ref-advance **barriers** reachable from `from` in the **observer** DAG. Observers use this to decide which target version(s) an entry must be checked against. Permissioned `RSet` uses it twice when querying `RCap`: once for the entry position (with barriers) as the referenced `at`, and once at the view frontier with `from === at` as the referenced `from`.
 - **`resolveRefVersions(observerDag, refId, entryHash, observerFrom)`** — compositional helper returning `{ refAt, refFrom }` in the referenced object's DAG for checking an observer entry against a foreign object (see permissioned `RSetView`).
 - **`refVersionAtOrAbove(referencedDag, newer, older)`** / **`refVersionAtOrBelow(referencedDag, v, ceiling)`** — closed `≥` / `≤` comparisons in the referenced DAG (converses, not negations; concurrent positions fail both).
-- **`projectForeignBound(observerDag, refId, referencedDag, localAt, foreignRevisionBound)`** — projects a nested object's revision bound into the observer DAG, lowering the delta floor to the earliest unstable ref-advance(s).
+- **`projectForeignBound(observerDag, refId, referencedDag, localAt, foreignRevisionBound)`** — projects a nested object's revision bound into the observer DAG, lowering the revision bound to the earliest unstable ref-advance(s).
 - **`validateRefAdvanceMonotonicity(observerDag, referencedDag, refId, newRefVersion, at)`** — insertion-time check that a proposed ref-advance does not move a reference backward. For each predecessor in `at`, resolves the current reference in the observer DAG and requires the new version to be at or above it in the referenced DAG. Types call this from `validatePayload` (e.g. permissioned `RSet`).
 
 These are thin, generic utilities. Types still own authorization, barrier semantics, and view-time reference resolution.
+
+## Bounded delta helpers (`delta.ts`)
+
+Shared geometry for bounded `computeDelta` between two versions (`start`, `end`):
+
+- **meet** — fork GLB from `fork.common` via `computeForkMeet(rawDag, forkCommon)`.
+- **revisionBound** — walk stop and `Delta.getRevisionBound()`; equals the meet for plain types, or lowered by `computeObserverRevisionBound` when a referenced object can revise authorization below the meet.
+- **`walkEntriesBackwardsToBound(dag, from, bound)`** — BFS backward from `from`, excluding entries in `bound`; returns delta candidate entries strictly above the revision bound.
+- **`computeObserverRevisionBound(observer, observerMeet, observerEnd, referenced)`** — for an observer with a referenced `RObject`: resolve ref versions at meet/end, run `referenced.computeDelta`, project via `projectForeignBound`. Caller sets `setDeltaStrategy('bounded')` on concrete types when needed (not on `RObject`).
+
+Types keep candidate collection and view diffs; these helpers own fork meet, bound projection, and the backward walk.
 
 ## Concrete type: `RSet`
 

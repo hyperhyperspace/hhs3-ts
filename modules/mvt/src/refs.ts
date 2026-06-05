@@ -194,7 +194,7 @@ export async function refVersionAtOrBelow(
 // via their preds; a branch settles when no unstable ref-advance sits below it. The
 // referenced object's create op is an implicit stable ref-advance to version(refId)
 // (always at or below `foreignRevisionBound`), so an empty below-cover settles the
-// branch. Below the returned floor the referenced version is bounded by
+// branch. Below the returned bound the referenced version is at or below
 // `foreignRevisionBound`. If no ref-advance is unstable, return `localAt`.
 //
 // Assumes monotonic ref-advances: a stable ref-advance has only stable ref-advances
@@ -208,7 +208,7 @@ export async function projectForeignBound(
 ): Promise<Version> {
     const refFilter: EntryMetaFilter = { containsValues: { ref: [refId] } };
 
-    const floor = version();
+    const bound = version();
     const visited = new Set<B64Hash>();
     const stabilityCache = new Map<B64Hash, boolean>();
 
@@ -239,13 +239,13 @@ export async function projectForeignBound(
         }
 
         if (unstableBelow.length === 0) {
-            floor.add(r);
+            bound.add(r);
         } else {
             queue.push(...unstableBelow);
         }
     }
 
-    return floor.size > 0 ? floor : localAt;
+    return bound.size > 0 ? bound : localAt;
 }
 
 // Validates that a proposed ref-advance is monotonic at insertion time. For each

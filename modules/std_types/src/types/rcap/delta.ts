@@ -1,7 +1,10 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, KeyId } from "@hyper-hyper-space/hhs3_crypto";
-import { dag, Position, position } from "@hyper-hyper-space/hhs3_dag";
-import { version, Version, Delta } from "@hyper-hyper-space/hhs3_mvt";
+import { dag } from "@hyper-hyper-space/hhs3_dag";
+import {
+    version, Version, Delta,
+    walkEntriesBackwardsToBound, computeForkMeet,
+} from "@hyper-hyper-space/hhs3_mvt";
 
 import { CapPayload } from "./payload.js";
 
@@ -86,32 +89,6 @@ function collectCandidatesFromEntries(
     return { keyIds, capNames, grantPairs };
 }
 
-async function walkNewEntries(rawDag: dag.Dag, from: Version, stopAt: Position): Promise<dag.Entry[]> {
-    const visited = new Set<B64Hash>();
-    const queue: B64Hash[] = Array.from(from);
-    const walked: dag.Entry[] = [];
-
-    while (queue.length > 0) {
-        const hash = queue.shift()!;
-        if (visited.has(hash)) continue;
-        visited.add(hash);
-
-        if (stopAt.has(hash)) continue;
-
-        const entry = await rawDag.loadEntry(hash);
-        if (entry === undefined) continue;
-        walked.push(entry);
-
-        for (const prevHash of json.fromSet(entry.header.prevEntryHashes)) {
-            if (!visited.has(prevHash)) {
-                queue.push(prevHash);
-            }
-        }
-    }
-
-    return walked;
-}
-
 async function computeDeltaFromCandidates(
     cap: RCap,
     start: Version,
@@ -185,15 +162,11 @@ async function computeDeltaBounded(cap: RCap, rawDag: dag.Dag, start: Version, e
         return new RCapDelta(start, end, fork.commonFrontier, [], [], []);
     }
 
-    // Walk back to the meet of the fork points (fork.common). Folding over common
-    // directly (not an antichain) is correct: dominated elements never lower the GLB.
-    const meet = await dag.computeMeet(
-        [...fork.common].map((h) => position(h)),
-        (a, b) => rawDag.findForkPosition(a, b).then((f) => f.commonFrontier),
-    );
+    const meet = await computeForkMeet(rawDag, fork.common);
+    const revisionBound = meet;
 
-    const walkedEntries = await walkNewEntries(rawDag, end, meet);
+    const walkedEntries = await walkEntriesBackwardsToBound(rawDag, end, revisionBound);
     const { keyIds, capNames, grantPairs } = collectCandidatesFromEntries(cap, walkedEntries);
 
-    return computeDeltaFromCandidates(cap, start, end, meet, keyIds, capNames, grantPairs);
+    return computeDeltaFromCandidates(cap, start, end, revisionBound, keyIds, capNames, grantPairs);
 }

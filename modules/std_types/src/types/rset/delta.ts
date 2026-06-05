@@ -1,9 +1,9 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, KeyId } from "@hyper-hyper-space/hhs3_crypto";
-import { dag, Position, position } from "@hyper-hyper-space/hhs3_dag";
+import { dag, position } from "@hyper-hyper-space/hhs3_dag";
 import {
     version, Version, Delta,
-    resolveRefVersionAtPosition, projectForeignBound,
+    walkEntriesBackwardsToBound, computeForkMeet, computeObserverRevisionBound,
 } from "@hyper-hyper-space/hhs3_mvt";
 
 import { isAuthoredPayload, extractAuthor } from "../../authorship.js";
@@ -45,35 +45,6 @@ export async function computeRSetDelta(
     if (strategy === 'bounded') return computeDeltaBounded(set, rawDag, start, end);
     if (strategy === 'full') return computeDeltaFull(set, rawDag, start, end);
     throw new Error("Invalid delta strategy: " + strategy);
-}
-
-// BFS back from `from`, stopping at (and excluding) entries in `stopAt`. Returns every
-// entry strictly above the stop floor -- the candidates whose membership or authorization
-// can have changed between a start at/below the floor and `from`.
-async function walkNewEntries(rawDag: dag.Dag, from: Version, stopAt: Position): Promise<dag.Entry[]> {
-    const visited = new Set<B64Hash>();
-    const queue: B64Hash[] = Array.from(from);
-    const walked: dag.Entry[] = [];
-
-    while (queue.length > 0) {
-        const hash = queue.shift()!;
-        if (visited.has(hash)) continue;
-        visited.add(hash);
-
-        if (stopAt.has(hash)) continue;
-
-        const entry = await rawDag.loadEntry(hash);
-        if (entry === undefined) continue;
-        walked.push(entry);
-
-        for (const prevHash of json.fromSet(entry.header.prevEntryHashes)) {
-            if (!visited.has(prevHash)) {
-                queue.push(prevHash);
-            }
-        }
-    }
-
-    return walked;
 }
 
 // Shared comparison core: given the candidate entries, compute element-level membership
@@ -155,46 +126,17 @@ async function computeDeltaBounded(set: RSet, rawDag: dag.Dag, start: Version, e
         return new RSetDelta(start, end, fork.commonFrontier, [], [], []);
     }
 
-    // Meet of the fork points: the floor for a plain set. Folding over fork.common
-    // directly (not an antichain) is correct -- dominated elements never lower the GLB.
-    const rsetMeet = await dag.computeMeet(
-        [...fork.common].map((h) => position(h)),
-        (a, b) => rawDag.findForkPosition(a, b).then((f) => f.commonFrontier),
-    );
+    const meet = await computeForkMeet(rawDag, fork.common);
 
-    // For a permissioned set, authorization can change below the RSet meet because the
-    // end-view observes the RCap from a later `from` (pulling in concurrent RCap barriers).
-    // Weave in the RCap delta to drop the floor to where the referenced RCap version is
-    // bounded by the RCap revision bound.
-    const floor = set.isPermissioned()
-        ? await computeBound(set, rsetMeet, end)
-        : rsetMeet;
+    let revisionBound = meet;
+    if (set.isPermissioned()) {
+        const rcap = await set.loadRCap();
+        if (rcap === undefined) throw new Error("Cannot load referenced RCap");
+        rcap.setDeltaStrategy('bounded');
+        revisionBound = await computeObserverRevisionBound(set, meet, end, rcap);
+    }
 
-    const candidateEntries = await walkNewEntries(rawDag, end, floor);
+    const candidateEntries = await walkEntriesBackwardsToBound(rawDag, end, revisionBound);
 
-    return computeDeltaFromCandidateEntries(set, start, end, floor, candidateEntries);
-}
-
-// Compute a bound that takes into consideration possible view revisions in the
-// nested RCap instance, and ensures that all chnages before the bound do NOT
-// affect the delta being computed in RSet (see projectForeignBound).
-async function computeBound(set: RSet, rsetMeet: Version, end: Version): Promise<Version> {
-    const scopedDag = await set.getScopedDag();
-    const refId = set.capabilityRef()!;
-
-    // RCap versions referenced at the RSet meet and at end. rcap_at_end extends
-    // rcap_at_meet whenever ref-advances are monotonic (the expected case).
-    const rcapAtMeet = await resolveRefVersionAtPosition(scopedDag, refId, rsetMeet, rsetMeet);
-    const rcapAtEnd = await resolveRefVersionAtPosition(scopedDag, refId, end, end);
-
-    const rcap = await set.loadRCap();
-    if (rcap === undefined) throw new Error("Cannot load referenced RCap");
-
-    rcap.setDeltaStrategy('bounded');
-    const rcapDelta = await rcap.computeDelta(rcapAtMeet, rcapAtEnd);
-    const rcapBound = rcapDelta.getRevisionBound();
-
-    const rcapRawDag = await rcap.getCausalDag();
-
-    return projectForeignBound(scopedDag, refId, rcapRawDag, rsetMeet, rcapBound);
+    return computeDeltaFromCandidateEntries(set, start, end, revisionBound, candidateEntries);
 }
