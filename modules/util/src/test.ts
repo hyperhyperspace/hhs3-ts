@@ -42,4 +42,8 @@ function assertEquals(received: any, expected: any, msg?: string) {
     if (received !== expected) throw new Error((msg? msg + ' ': '') + 'Received ' + received + ' (expected ' + expected + ')\nFailed assertion at\n' + err.stack)
 }
 
-export { run, skip, assertTrue, assertFalse, assertEquals };
+function exitIfFailed(success: boolean): void {
+    if (!success) process.exit(1);
+}
+
+export { run, skip, assertTrue, assertFalse, assertEquals, exitIfFailed };

@@ -31,11 +31,7 @@ async function main() {
             }
 
             if (match) {
-                const result = await testing.run(test.name, test.invoke);
-
-                if (!result) {
-                    return;
-                }
+                testing.exitIfFailed(await testing.run(test.name, test.invoke));
             } else {
                 await testing.skip(test.name);
             }

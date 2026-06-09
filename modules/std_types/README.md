@@ -124,13 +124,15 @@ Source: [`src/authorship.ts`](./src/authorship.ts)
 
 ## Testing
 
-Six test suites exercise the module:
+Eight test suites exercise the module:
 
 - **Simple set tests** (`test/simple_set_tests.ts`): creation with initial elements, add/delete, redundancy policies, barrier add/delete, concurrent add-delete resolution, and payload validation.
 - **Nested set tests** (`test/nested_set_tests.ts`): nested `RSet`-within-`RSet` scenarios, including creation of inner sets, adding/deleting elements in inner sets, concurrent operations across nesting levels, and fork detection through the causal DAG.
 - **Authorship tests** (`test/authorship_tests.ts`): sign/verify round-trips, tampered payloads, missing keys, and `extractAuthor`/`isAuthoredPayload` type guards.
 - **RCap tests** (`test/rcap_tests.ts`): all RCap operations (create, grant, revoke, create-cap, delete-cap, add-identity), barrier semantics for revoke and delete-cap, `capOrigin` voiding, creator irrevocability, `managedBy` delegation, and transitive revocation.
 - **Permissioned set tests** (`test/permissioned_set_tests.ts`): RCap-gated `RSet` integration covering authorized/unauthorized add and delete, signed convenience methods, ref-advance authorization, predicate-aware peeling for void entries, compositional `RCap.getView(at, from)` for per-entry authorization (PSET20), transitive revocation through `managedBy` chains, and `extractForeignDeps`.
+- **Delta unit tests** (`test/delta_set_tests.ts`, `test/delta_cap_tests.ts`): hand-written scenarios for `computeDelta` semantics and revision-bound behavior.
+- **Delta parity tests** (`test/delta_parity/`): deterministic `computeDelta` parity tests that build pseudo-random RCap/RSet histories from a PRNG seed and assert `bounded` and `full` strategies agree on normalized changes (same check as CAP_DELTA05 / DELTA05). Included in `npm run test` using the **smoke** profile (2 seeds, 20 ops, 40 pairs/seed). A heavier **extended** profile (8 seeds, 80 ops, 200 pairs/seed) runs via `npm run test:parity`. Filter with `DELTA_PARITY` (all), `DELTA_PARITY_RCAP`, `DELTA_PARITY_RSET_PLAIN`, `DELTA_PARITY_RSET_PERM`, or branchy variants `DELTA_PARITY_BRANCHY_*` (branchy suites skip unless `--profile extended`). Override size: `npm run test -- DELTA_PARITY --profile extended`, or `--seeds <seed> --ops <n> --max-pairs <k>`.
 - **Permissioned sync integration tests** (`replica/test/replica_permissioned_sync_tests.ts`): end-to-end tests through the full Replica + mesh stack — see the [replica module](../replica) for details.
 
 To run the unit tests:

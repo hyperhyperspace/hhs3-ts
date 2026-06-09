@@ -17,10 +17,32 @@ export type ForeignDep = {
     requiredHashes: B64Hash[];
 }
 
-export type Delta = {
-    getStartVersion(): Version;
-    getEndVersion(): Version;
-    getRevisionBound(): Version;
+// A recursive, changes-only node. Nested children carry only their changes (no span):
+// versions are identity across nesting, so only the root delta carries start/end/bound.
+// `type` is the producing object's type id, a discriminant for narrowing `changes` when
+// reading values out of the heterogeneous `nested` map.
+export type DeltaChanges<C = unknown> = {
+    type: string;
+    changes: C;
+    nested: ReadonlyMap<B64Hash, DeltaChanges>;
+}
+
+// The root delta is the root DeltaChanges plus the span fields (inlined; there is no
+// separately exported span type). Only the root delta has these fields.
+export type Delta<C = unknown> = DeltaChanges<C> & {
+    start: Version;
+    end: Version;
+    revisionBound: Version;
+}
+
+// The unit of composition for delta computation, produced by every object that supports
+// deltas (root or nested). `ingest` is called once per walked entry and returns whether
+// the entry produced an actual change (own or nested); the boolean is plumbed for the
+// Phase 2 tight bound frontier. `finalize` returns this object's changes plus the nested
+// subtree, recursing through any child accumulators it spawned.
+export type DeltaAccumulator<C = unknown> = {
+    ingest(entry: dag.Entry): Promise<boolean>;
+    finalize(): Promise<DeltaChanges<C>>;
 }
 
 export type RObject = {
@@ -33,6 +55,7 @@ export type RObject = {
 
     getView(at?: Version, from?: Version): Promise<View>;
     computeDelta(start: Version, end: Version): Promise<Delta>;
+    createDeltaAccumulator(start: Version, end: Version): DeltaAccumulator;
 
     getScopedDag(): Promise<ScopedDag>;
     getCausalDag(): Promise<CausalDag>;

@@ -8,6 +8,7 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "test": "node --import ../../register.mjs ./test/run_tests.ts",
+    "test:parity": "node --import ../../register.mjs ./test/run_tests.ts DELTA_PARITY --profile extended",
     "debug": "node --inspect-brk --import ../../register.mjs ./test/run_tests.ts",
     "build": "npx tsc",
     "clean": "rm -rf dist"

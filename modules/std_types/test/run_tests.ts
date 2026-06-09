@@ -5,13 +5,17 @@ import { rcapTests } from "./rcap_tests.js";
 import { permissionedSetTests } from "./permissioned_set_tests.js";
 import { deltaTests } from "./delta_set_tests.js";
 import { deltaCapTests } from "./delta_cap_tests.js";
+import { branchyDeltaParityTests } from "./delta_parity/branchy_parity_tests.js";
+import { rcapDeltaParityTests } from "./delta_parity/rcap_parity_tests.js";
+import { rsetDeltaParityTests } from "./delta_parity/rset_parity_tests.js";
+import { parseTestFilters } from "./delta_parity/parity.js";
 import { testing } from "@hyper-hyper-space/hhs3_util";
 
 async function main() {
 
     const allTests = new Map<string, Array<{name: string, invoke: () => Promise<void>}>>();
 
-    const filters = process.argv.slice(2);
+    const filters = parseTestFilters(process.argv.slice(2));
 
     allTests.set(simpleSetTests.title, simpleSetTests.tests);
     allTests.set(nestedSetTests.title, nestedSetTests.tests);
@@ -20,6 +24,9 @@ async function main() {
     allTests.set(permissionedSetTests.title, permissionedSetTests.tests);
     allTests.set(deltaTests.title, deltaTests.tests);
     allTests.set(deltaCapTests.title, deltaCapTests.tests);
+    allTests.set(rcapDeltaParityTests.title, rcapDeltaParityTests.tests);
+    allTests.set(rsetDeltaParityTests.title, rsetDeltaParityTests.tests);
+    allTests.set(branchyDeltaParityTests.title, branchyDeltaParityTests.tests);
 
     console.log('Running tests for Hyper Hyper Space v3 std_types module' + (filters.length > 0? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');    
 
@@ -34,11 +41,7 @@ async function main() {
             }
 
             if (match) {
-                const result = await testing.run(test.name, test.invoke);
-
-                if (!result) {
-                    return;
-                }
+                testing.exitIfFailed(await testing.run(test.name, test.invoke));
             } else {
                 await testing.skip(test.name);
             }

@@ -26,7 +26,7 @@ import type { RCapEvent } from "./events.js";
 import type { RCap as RCapContract, RCapView as RCapViewContract } from "./interfaces.js";
 import { validateRCapPayload } from "./validate.js";
 import { RCapViewImpl } from "./view.js";
-import { RCapDelta, RCapDeltaStrategy, computeRCapDelta } from "./delta.js";
+import { RCapDelta, RCapDeltaStrategy, RCapDeltaAccumulator, computeRCapDelta } from "./delta.js";
 
 const DEFAULT_ENROLL_CAPABILITY = 'enroll';
 
@@ -309,6 +309,10 @@ export class RCapImpl implements RCapContract {
         const rawDag = await this.ctx.getDag(this.createOpId, this.backendLabel);
         if (rawDag === undefined) throw new Error("DAG not found");
         return computeRCapDelta(this, rawDag, this.deltaStrategy, start, end);
+    }
+
+    createDeltaAccumulator(start: Version, end: Version): RCapDeltaAccumulator {
+        return new RCapDeltaAccumulator(this, start, end);
     }
 
     configure(config: RCapRuntimeConfig): void {

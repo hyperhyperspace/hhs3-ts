@@ -30,7 +30,7 @@ import { dag, MetaProps, position, EntryMetaFilter, Position, MetaContainsValues
 
 import { Payload, RObject, RObjectFactory, RObjectInit, RContext, NestingParent, Version, ForeignDep, LoadObjectOptions } from "@hyper-hyper-space/hhs3_mvt";
 import { DagScope, NestedScopedDag, RootScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
-import { isRefAdvancePayload, prepareRefAdvance, createRefAdvanceMeta } from "@hyper-hyper-space/hhs3_mvt";
+import { isRefAdvancePayload, extractRefVersion, prepareRefAdvance, createRefAdvanceMeta } from "@hyper-hyper-space/hhs3_mvt";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 import { set } from "@hyper-hyper-space/hhs3_util";
 
@@ -44,7 +44,7 @@ import type { RSet as RSetContract, RSetView as RSetViewContract } from "./inter
 import { validateRSetPayload } from "./validate.js";
 import { hashElement } from "./hash.js";
 import { RSetViewImpl } from "./view.js";
-import { RSetDelta, RSetDeltaStrategy, computeRSetDelta } from "./delta.js";
+import { RSetDelta, RSetDeltaStrategy, RSetDeltaAccumulator, computeRSetDelta } from "./delta.js";
 
 import { RAddEvent, RDeleteEvent, RSetEvent } from "./events.js";
 
@@ -520,9 +520,19 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
         return this.ctx.getConfig().selfValidate || false;
     }
 
-    extractForeignDeps(_payload: Payload, _at: Version): ForeignDep[] | undefined {
+    extractForeignDeps(payload: Payload, _at: Version): ForeignDep[] | undefined {
         const ref = this.capabilityRef();
         if (ref === undefined) return undefined;
+
+        if (isRefAdvancePayload(payload)) {
+            const refPayload = payload as RefAdvancePayload;
+            if (refPayload.refId !== ref) return undefined;
+            return [{
+                dagId: ref,
+                requiredHashes: [...extractRefVersion(refPayload)],
+            }];
+        }
+
         return [{ dagId: ref, requiredHashes: [] }];
     }
 
@@ -549,12 +559,18 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
     }
 
     async computeDelta(start: Version, end: Version): Promise<RSetDelta> {
+        // computeDelta is root-only orchestration (bounds analysis + walk + compose). A
+        // nested set does not lead a delta; it participates via createDeltaAccumulator.
         if (this.parentObj !== undefined) {
             throw new Error("computeDelta is not supported on nested RSet");
         }
         const rawDag = await this.ctx.getDag(this.createOpId, this.getBackendLabel());
         if (rawDag === undefined) throw new Error("DAG not found");
         return computeRSetDelta(this, rawDag, this.deltaStrategy, start, end);
+    }
+
+    createDeltaAccumulator(start: Version, end: Version): RSetDeltaAccumulator {
+        return new RSetDeltaAccumulator(this, start, end);
     }
 
     async getScopedDag(): Promise<ScopedDag> {

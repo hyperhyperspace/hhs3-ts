@@ -10,6 +10,7 @@ import { RCap, rCapFactory } from "../src/types/rcap/rcap.js";
 import { RSet, rSetFactory } from "../src/types/rset/rset.js";
 import type { RSetDelta } from "../src/types/rset/rset.js";
 import { serializePublicKeyToBase64 } from "../src/authorship.js";
+import { normalizeRSetDelta } from "./delta_parity/normalize.js";
 
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
@@ -20,17 +21,6 @@ function hashElement(element: string): string {
 
 async function makeIdentity(): Promise<OwnIdentity> {
     return createIdentity(SIGNING_ED25519, hashSuite);
-}
-
-function normalizeRSetDelta(delta: RSetDelta) {
-    const added = [...delta.added].sort();
-    const removed = [...delta.removed].sort();
-    const validityChanges = [...delta.validityChanges].sort((a, b) => {
-        const entryCmp = a.entryHash.localeCompare(b.entryHash);
-        if (entryCmp !== 0) return entryCmp;
-        return a.elementHash.localeCompare(b.elementHash);
-    });
-    return { added, removed, validityChanges };
 }
 
 async function computeRSetWithStrategy(
@@ -573,6 +563,101 @@ export const deltaTests = {
                 );
                 assertTrue(delta.removed.includes(hashElement('X')), 'X is voided by the concurrent revoke');
                 assertTrue(delta.removed.includes(hashElement('Y')), 'Y is voided by the concurrent revoke');
+            }
+        },
+        {
+            name: '[DELTA11] Nested RSet-of-RSet: nested map carries inner changes under a single root span',
+            invoke: async () => {
+                const ctx = createMockRContext({ selfValidate: true });
+                ctx.getRegistry().register(RSet.typeId, rSetFactory);
+
+                const outerInit = await RSet.create({
+                    seed: 'delta-11-outer',
+                    contentType: RSet.typeId,
+                    initialElements: [],
+                    hashAlgorithm: 'sha256',
+                });
+                const outer = (await ctx.createObject(outerInit)) as RSet;
+
+                const dag = (await ctx.getDag(outer.getId()))!;
+                const start = await dag.getFrontier();
+
+                const innerInit = await RSet.create({
+                    seed: 'delta-11-inner',
+                    initialElements: [],
+                    hashAlgorithm: 'sha256',
+                });
+                const innerHash = await outer.add(innerInit.payload);
+
+                const inner = (await (await outer.getView()).loadRObjectByHash(innerHash)) as RSet;
+
+                await inner.add('alpha');
+                await inner.add('beta');
+
+                const end = await dag.getFrontier();
+
+                const delta = await computeRSetWithStrategy(outer, 'bounded', start, end);
+
+                // Single root span.
+                assertTrue(set.eq(delta.start, start), 'delta start matches');
+                assertTrue(set.eq(delta.end, end), 'delta end matches');
+
+                // Outer membership: the inner object was added in the interval.
+                assertTrue(delta.added.includes(innerHash), 'inner object appears as added in the outer set');
+                assertEquals(delta.removed.length, 0, 'nothing removed from the outer set');
+
+                // Nested map carries the inner set's own changes.
+                const innerChanges = delta.nested.get(innerHash);
+                assertTrue(innerChanges !== undefined, 'nested map has an entry for the inner object');
+                assertEquals(innerChanges!.type, RSet.typeId, 'nested entry type is RSet');
+                const innerAdded = (innerChanges!.changes as { added: string[] }).added;
+                assertTrue(innerAdded.includes(hashElement('alpha')), 'inner alpha is added');
+                assertTrue(innerAdded.includes(hashElement('beta')), 'inner beta is added');
+            }
+        },
+        {
+            name: '[DELTA12] Nested RSet-of-RSet: pure inner change reports nested-only delta',
+            invoke: async () => {
+                const ctx = createMockRContext({ selfValidate: true });
+                ctx.getRegistry().register(RSet.typeId, rSetFactory);
+
+                const outerInit = await RSet.create({
+                    seed: 'delta-12-outer',
+                    contentType: RSet.typeId,
+                    initialElements: [],
+                    hashAlgorithm: 'sha256',
+                });
+                const outer = (await ctx.createObject(outerInit)) as RSet;
+
+                const innerInit = await RSet.create({
+                    seed: 'delta-12-inner',
+                    initialElements: [],
+                    hashAlgorithm: 'sha256',
+                });
+                const innerHash = await outer.add(innerInit.payload);
+
+                const inner = (await (await outer.getView()).loadRObjectByHash(innerHash)) as RSet;
+                await inner.add('alpha');
+
+                // Start AFTER the inner object exists and already holds 'alpha'.
+                const dag = (await ctx.getDag(outer.getId()))!;
+                const start = await dag.getFrontier();
+
+                await inner.add('gamma');
+                const end = await dag.getFrontier();
+
+                const delta = await computeRSetWithStrategy(outer, 'bounded', start, end);
+
+                // The outer set's own membership is unchanged across the interval.
+                assertEquals(delta.added.length, 0, 'no outer membership added');
+                assertEquals(delta.removed.length, 0, 'no outer membership removed');
+
+                // Only the inner set changed: gamma added, alpha untouched (stable below start).
+                const innerChanges = delta.nested.get(innerHash);
+                assertTrue(innerChanges !== undefined, 'nested map has an entry for the inner object');
+                const innerAdded = (innerChanges!.changes as { added: string[] }).added;
+                assertTrue(innerAdded.includes(hashElement('gamma')), 'inner gamma is added');
+                assertFalse(innerAdded.includes(hashElement('alpha')), 'stable inner alpha is not reported');
             }
         },
     ]

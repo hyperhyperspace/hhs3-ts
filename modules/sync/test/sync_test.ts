@@ -3,7 +3,7 @@ import { B64Hash, sha256, stringToUint8Array } from '@hyper-hyper-space/hhs3_cry
 import { dag, Position, Header, Entry } from '@hyper-hyper-space/hhs3_dag';
 import { json } from '@hyper-hyper-space/hhs3_json';
 import type { TopicChannel } from '@hyper-hyper-space/hhs3_mesh';
-import type { RObject, Version, Payload, View, Event, ForeignDep, Delta } from '@hyper-hyper-space/hhs3_mvt';
+import type { RObject, Version, Payload, View, Event, ForeignDep, Delta, DeltaAccumulator } from '@hyper-hyper-space/hhs3_mvt';
 import { RootScopedDag } from '@hyper-hyper-space/hhs3_mvt';
 
 import { createDagProvider } from '../src/provider.js';
@@ -103,6 +103,7 @@ function createMockRObject(d: dag.Dag, id: B64Hash, opts?: {
         },
         getView: async (_at?: Version, _from?: Version): Promise<View> => { throw new Error('not implemented'); },
         computeDelta: async (_start: Version, _end: Version): Promise<Delta> => { throw new Error('not implemented'); },
+        createDeltaAccumulator: (_start: Version, _end: Version): DeltaAccumulator => { throw new Error('not implemented'); },
         getScopedDag: async () => new RootScopedDag(d),
         getCausalDag: async () => d,
         extractForeignDeps: opts?.extractForeignDeps ?? ((_payload: Payload, _at: Version) => undefined),

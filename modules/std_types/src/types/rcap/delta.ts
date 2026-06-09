@@ -2,8 +2,8 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, KeyId } from "@hyper-hyper-space/hhs3_crypto";
 import { dag } from "@hyper-hyper-space/hhs3_dag";
 import {
-    version, Version, Delta,
-    walkEntriesBackwardsToBound, computeForkMeet,
+    version, Version, Delta, DeltaChanges, DeltaAccumulator,
+    walkDelta, computeForkMeet,
 } from "@hyper-hyper-space/hhs3_mvt";
 
 import { CapPayload } from "./payload.js";
@@ -30,19 +30,134 @@ export type GrantChange = {
     nowGranted: boolean;
 };
 
-export class RCapDelta implements Delta {
-    constructor(
-        private start: Version,
-        private end: Version,
-        private revisionBound: Version,
-        public readonly identityChanges: IdentityChange[],
-        public readonly capabilityChanges: CapabilityChange[],
-        public readonly grantChanges: GrantChange[],
-    ) {}
+export type RCapChanges = {
+    identityChanges: IdentityChange[];
+    capabilityChanges: CapabilityChange[];
+    grantChanges: GrantChange[];
+};
 
-    getStartVersion(): Version { return this.start; }
-    getEndVersion(): Version { return this.end; }
+export class RCapDelta implements Delta<RCapChanges> {
+    readonly type: string;
+    readonly changes: RCapChanges;
+    readonly nested: ReadonlyMap<B64Hash, DeltaChanges>;
+
+    constructor(
+        public readonly start: Version,
+        public readonly end: Version,
+        public readonly revisionBound: Version,
+        root: DeltaChanges<RCapChanges>,
+    ) {
+        this.type = root.type;
+        this.changes = root.changes;
+        this.nested = root.nested;
+    }
+
     getRevisionBound(): Version { return this.revisionBound; }
+
+    get identityChanges(): IdentityChange[] { return this.changes.identityChanges; }
+    get capabilityChanges(): CapabilityChange[] { return this.changes.capabilityChanges; }
+    get grantChanges(): GrantChange[] { return this.changes.grantChanges; }
+}
+
+function emptyRCapChanges(type: string): DeltaChanges<RCapChanges> {
+    return {
+        type,
+        changes: { identityChanges: [], capabilityChanges: [], grantChanges: [] },
+        nested: new Map(),
+    };
+}
+
+function addGrantPair(grantPairs: Map<string, Set<KeyId>>, capName: string, keyId: KeyId): void {
+    if (!grantPairs.has(capName)) grantPairs.set(capName, new Set());
+    grantPairs.get(capName)!.add(keyId);
+}
+
+// Accumulator for RCap. Collects the candidate subjects (identities, capability names,
+// grant pairs) touched by each ingested entry, then compares the start and end views once
+// per subject in finalize. RCap has no nested objects, so the nested map is always empty.
+export class RCapDeltaAccumulator implements DeltaAccumulator<RCapChanges> {
+
+    private readonly keyIds = new Set<KeyId>();
+    private readonly capNames: Set<string>;
+    private readonly grantPairs = new Map<string, Set<KeyId>>();
+
+    constructor(
+        private readonly cap: RCap,
+        private readonly start: Version,
+        private readonly end: Version,
+    ) {
+        this.capNames = new Set<string>(Object.keys(cap.getInitialCaps()));
+    }
+
+    async ingest(entry: dag.Entry): Promise<boolean> {
+        const p = entry.payload as CapPayload;
+        switch (p.action) {
+            case 'add-identity':
+                this.keyIds.add(p.keyId);
+                return true;
+            case 'create-cap':
+                this.capNames.add(p.capName);
+                return true;
+            case 'delete-cap':
+                this.capNames.add(p.capName);
+                return true;
+            case 'grant':
+            case 'revoke':
+                addGrantPair(this.grantPairs, p.capName, p.grantee);
+                return true;
+        }
+        return false;
+    }
+
+    async finalize(): Promise<DeltaChanges<RCapChanges>> {
+        const cap = this.cap;
+        const startView = await cap.getView(this.start, this.start);
+        const endView = await cap.getView(this.end, this.end);
+
+        const identityChanges: IdentityChange[] = [];
+        for (const keyId of this.keyIds) {
+            const wasIdentity = await startView.isIdentity(keyId);
+            const nowIdentity = await endView.isIdentity(keyId);
+            if (wasIdentity !== nowIdentity) {
+                identityChanges.push({ keyId, added: nowIdentity });
+            }
+        }
+
+        const capabilityChanges: CapabilityChange[] = [];
+        for (const capName of this.capNames) {
+            const existed = await startView.capabilityExists(capName);
+            const exists = await endView.capabilityExists(capName);
+            if (existed !== exists) {
+                capabilityChanges.push({ capName, existed, exists });
+            }
+        }
+
+        const grantChanges: GrantChange[] = [];
+        const endCapExists = new Map<string, boolean>();
+        for (const [capName, grantKeyIds] of this.grantPairs) {
+            let capExistsInEnd = endCapExists.get(capName);
+            if (capExistsInEnd === undefined) {
+                capExistsInEnd = await endView.capabilityExists(capName);
+                endCapExists.set(capName, capExistsInEnd);
+            }
+            if (!capExistsInEnd) continue;
+
+            for (const keyId of grantKeyIds) {
+                if (cap.isCreator(keyId)) continue;
+                const wasGranted = await startView.hasCapability(keyId, capName);
+                const nowGranted = await endView.hasCapability(keyId, capName);
+                if (wasGranted !== nowGranted) {
+                    grantChanges.push({ keyId, capName, wasGranted, nowGranted });
+                }
+            }
+        }
+
+        return {
+            type: cap.getType(),
+            changes: { identityChanges, capabilityChanges, grantChanges },
+            nested: new Map(),
+        };
+    }
 }
 
 export async function computeRCapDelta(
@@ -54,103 +169,10 @@ export async function computeRCapDelta(
     throw new Error("Invalid delta strategy: " + strategy);
 }
 
-function addGrantPair(grantPairs: Map<string, Set<KeyId>>, capName: string, keyId: KeyId): void {
-    if (!grantPairs.has(capName)) grantPairs.set(capName, new Set());
-    grantPairs.get(capName)!.add(keyId);
-}
-
-function collectCandidatesFromEntries(
-    cap: RCap,
-    entries: Iterable<dag.Entry>,
-): { keyIds: Set<KeyId>; capNames: Set<string>; grantPairs: Map<string, Set<KeyId>> } {
-    const keyIds = new Set<KeyId>();
-    const capNames = new Set<string>(Object.keys(cap.getInitialCaps()));
-    const grantPairs = new Map<string, Set<KeyId>>();
-
-    for (const entry of entries) {
-        const p = entry.payload as CapPayload;
-        switch (p.action) {
-            case 'add-identity':
-                keyIds.add(p.keyId);
-                break;
-            case 'create-cap':
-                capNames.add(p.capName);
-                break;
-            case 'delete-cap':
-                capNames.add(p.capName);
-                break;
-            case 'grant':
-            case 'revoke':
-                addGrantPair(grantPairs, p.capName, p.grantee);
-                break;
-        }
-    }
-
-    return { keyIds, capNames, grantPairs };
-}
-
-async function computeDeltaFromCandidates(
-    cap: RCap,
-    start: Version,
-    end: Version,
-    revisionBound: Version,
-    keyIds: Set<KeyId>,
-    capNames: Set<string>,
-    grantPairs: Map<string, Set<KeyId>>,
-): Promise<RCapDelta> {
-    const startView = await cap.getView(start, start);
-    const endView = await cap.getView(end, end);
-
-    const identityChanges: IdentityChange[] = [];
-    for (const keyId of keyIds) {
-        const wasIdentity = await startView.isIdentity(keyId);
-        const nowIdentity = await endView.isIdentity(keyId);
-        if (wasIdentity !== nowIdentity) {
-            identityChanges.push({ keyId, added: nowIdentity });
-        }
-    }
-
-    const capabilityChanges: CapabilityChange[] = [];
-    for (const capName of capNames) {
-        const existed = await startView.capabilityExists(capName);
-        const exists = await endView.capabilityExists(capName);
-        if (existed !== exists) {
-            capabilityChanges.push({ capName, existed, exists });
-        }
-    }
-
-    const grantChanges: GrantChange[] = [];
-    const endCapExists = new Map<string, boolean>();
-    for (const [capName, grantKeyIds] of grantPairs) {
-        let capExistsInEnd = endCapExists.get(capName);
-        if (capExistsInEnd === undefined) {
-            capExistsInEnd = await endView.capabilityExists(capName);
-            endCapExists.set(capName, capExistsInEnd);
-        }
-        if (!capExistsInEnd) continue;
-
-        for (const keyId of grantKeyIds) {
-            if (cap.isCreator(keyId)) continue;
-            const wasGranted = await startView.hasCapability(keyId, capName);
-            const nowGranted = await endView.hasCapability(keyId, capName);
-            if (wasGranted !== nowGranted) {
-                grantChanges.push({ keyId, capName, wasGranted, nowGranted });
-            }
-        }
-    }
-
-    return new RCapDelta(start, end, revisionBound, identityChanges, capabilityChanges, grantChanges);
-}
-
-async function computeDeltaFull(cap: RCap, _rawDag: dag.Dag, start: Version, end: Version): Promise<RCapDelta> {
-    const scopedDag = await cap.getScopedDag();
-    const entries: dag.Entry[] = [];
-    for await (const entry of scopedDag.loadAllEntries()) {
-        entries.push(entry);
-    }
-    const { keyIds, capNames, grantPairs } = collectCandidatesFromEntries(cap, entries);
-
-    return computeDeltaFromCandidates(cap, start, end, version(), keyIds, capNames, grantPairs);
+async function computeDeltaFull(cap: RCap, rawDag: dag.Dag, start: Version, end: Version): Promise<RCapDelta> {
+    // Full scan: empty bound, so the walk visits the entire history of `end`.
+    const root = await walkDelta(rawDag, start, end, version(), cap.createDeltaAccumulator(start, end));
+    return new RCapDelta(start, end, version(), root as DeltaChanges<RCapChanges>);
 }
 
 async function computeDeltaBounded(cap: RCap, rawDag: dag.Dag, start: Version, end: Version): Promise<RCapDelta> {
@@ -159,14 +181,11 @@ async function computeDeltaBounded(cap: RCap, rawDag: dag.Dag, start: Version, e
         throw new Error("bounded computeDelta requires END to extend START");
     }
     if (fork.forkB.size === 0) {
-        return new RCapDelta(start, end, fork.commonFrontier, [], [], []);
+        return new RCapDelta(start, end, fork.commonFrontier, emptyRCapChanges(cap.getType()));
     }
 
-    const meet = await computeForkMeet(rawDag, fork.common);
-    const revisionBound = meet;
+    const revisionBound = await computeForkMeet(rawDag, fork.common);
 
-    const walkedEntries = await walkEntriesBackwardsToBound(rawDag, end, revisionBound);
-    const { keyIds, capNames, grantPairs } = collectCandidatesFromEntries(cap, walkedEntries);
-
-    return computeDeltaFromCandidates(cap, start, end, revisionBound, keyIds, capNames, grantPairs);
+    const root = await walkDelta(rawDag, start, end, revisionBound, cap.createDeltaAccumulator(start, end));
+    return new RCapDelta(start, end, revisionBound, root as DeltaChanges<RCapChanges>);
 }

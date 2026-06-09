@@ -8,6 +8,7 @@ import { createMockRContext } from "./mock_rcontext.js";
 import { RCap, rCapFactory } from "../src/types/rcap/rcap.js";
 import type { RCapDelta } from "../src/types/rcap/rcap.js";
 import { serializePublicKeyToBase64 } from "../src/authorship.js";
+import { normalizeRCapDelta } from "./delta_parity/normalize.js";
 
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
@@ -30,17 +31,6 @@ async function createTestCap(admin: OwnIdentity) {
     });
     const cap = (await ctx.createObject(init)) as RCap;
     return { ctx, cap };
-}
-
-function normalizeDelta(delta: RCapDelta) {
-    const identityChanges = [...delta.identityChanges].sort((a, b) => a.keyId.localeCompare(b.keyId));
-    const capabilityChanges = [...delta.capabilityChanges].sort((a, b) => a.capName.localeCompare(b.capName));
-    const grantChanges = [...delta.grantChanges].sort((a, b) => {
-        const capCmp = a.capName.localeCompare(b.capName);
-        if (capCmp !== 0) return capCmp;
-        return a.keyId.localeCompare(b.keyId);
-    });
-    return { identityChanges, capabilityChanges, grantChanges };
 }
 
 async function computeWithStrategy(
@@ -225,8 +215,8 @@ export const deltaCapTests = {
                     const delta = await computeWithStrategy(cap, 'bounded', start, end);
                     const reference = await computeWithStrategy(cap, 'full', start, end);
                     assertEquals(
-                        JSON.stringify(normalizeDelta(delta)),
-                        JSON.stringify(normalizeDelta(reference)),
+                        JSON.stringify(normalizeRCapDelta(delta)),
+                        JSON.stringify(normalizeRCapDelta(reference)),
                         'scenario 1 should match reference scan',
                     );
                 }
@@ -248,8 +238,8 @@ export const deltaCapTests = {
                     const delta = await computeWithStrategy(cap, 'bounded', start, end);
                     const reference = await computeWithStrategy(cap, 'full', start, end);
                     assertEquals(
-                        JSON.stringify(normalizeDelta(delta)),
-                        JSON.stringify(normalizeDelta(reference)),
+                        JSON.stringify(normalizeRCapDelta(delta)),
+                        JSON.stringify(normalizeRCapDelta(reference)),
                         'scenario 2 should match reference scan',
                     );
                 }
@@ -268,8 +258,8 @@ export const deltaCapTests = {
                     const delta = await computeWithStrategy(cap, 'bounded', start, end);
                     const reference = await computeWithStrategy(cap, 'full', start, end);
                     assertEquals(
-                        JSON.stringify(normalizeDelta(delta)),
-                        JSON.stringify(normalizeDelta(reference)),
+                        JSON.stringify(normalizeRCapDelta(delta)),
+                        JSON.stringify(normalizeRCapDelta(reference)),
                         'scenario 3 should match reference scan',
                     );
                 }
@@ -291,8 +281,8 @@ export const deltaCapTests = {
                     const delta = await computeWithStrategy(cap, 'bounded', start, end);
                     const reference = await computeWithStrategy(cap, 'full', start, end);
                     assertEquals(
-                        JSON.stringify(normalizeDelta(delta)),
-                        JSON.stringify(normalizeDelta(reference)),
+                        JSON.stringify(normalizeRCapDelta(delta)),
+                        JSON.stringify(normalizeRCapDelta(reference)),
                         'scenario 4 should match reference scan',
                     );
                 }
@@ -420,8 +410,8 @@ export const deltaCapTests = {
                 );
 
                 assertEquals(
-                    JSON.stringify(normalizeDelta(delta)),
-                    JSON.stringify(normalizeDelta(reference)),
+                    JSON.stringify(normalizeRCapDelta(delta)),
+                    JSON.stringify(normalizeRCapDelta(reference)),
                     'CAP_DELTA09 should match reference scan',
                 );
             }
@@ -475,8 +465,8 @@ export const deltaCapTests = {
                 );
 
                 assertEquals(
-                    JSON.stringify(normalizeDelta(delta)),
-                    JSON.stringify(normalizeDelta(reference)),
+                    JSON.stringify(normalizeRCapDelta(delta)),
+                    JSON.stringify(normalizeRCapDelta(reference)),
                     'CAP_DELTA10 should match reference scan',
                 );
             }
@@ -520,8 +510,8 @@ export const deltaCapTests = {
                 assertTrue(bobChange === undefined, 'bob.write is stable below the meet -> no delta entry');
 
                 assertEquals(
-                    JSON.stringify(normalizeDelta(delta)),
-                    JSON.stringify(normalizeDelta(reference)),
+                    JSON.stringify(normalizeRCapDelta(delta)),
+                    JSON.stringify(normalizeRCapDelta(reference)),
                     'CAP_DELTA11 should match reference scan',
                 );
             }
