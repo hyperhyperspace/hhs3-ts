@@ -120,3 +120,29 @@ export async function computeObserverRevisionBound(
         observerDag, refId, await referenced.getCausalDag(), observerMeet, referencedRevisionBound,
     );
 }
+
+// Combine the projected revision bounds of SEVERAL referenced objects into a single
+// floor for an observer that watches more than one object (e.g. an Rdb RTableGroup, which
+// observes its RSchema plus every bound foreign group). Each `referenced` object can revise
+// the observer's verdicts below the fork meet, so we project each one into the observer DAG
+// via computeObserverRevisionBound and take their greatest lower bound (along with the meet
+// itself). Below the GLB every referenced object is stable AND the two branches' geometry is
+// common, so it is a safe walk floor. Each projected bound is already at or below the meet,
+// so the GLB is too; an empty `referenced` (or only stable refs) yields the meet unchanged.
+export async function combineObserverRevisionBounds(
+    observer: RObject,
+    observerMeet: Version,
+    observerEnd: Version,
+    referenced: RObject[],
+): Promise<Version> {
+    const bounds: Position[] = [observerMeet];
+    for (const ref of referenced) {
+        bounds.push(await computeObserverRevisionBound(observer, observerMeet, observerEnd, ref));
+    }
+
+    const causalDag = await observer.getCausalDag();
+    return dag.computeMeet(
+        bounds,
+        (a, b) => causalDag.findForkPosition(a, b).then((f) => f.commonFrontier),
+    );
+}

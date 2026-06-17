@@ -109,6 +109,11 @@ export type RContext = {
 
     createObject(init: RObjectInit, backendLabel?: string): Promise<RObject>;
     unregisterObject(id: B64Hash): Promise<void>;
+
+    // Bootstrap a not-yet-present object from the mesh (used by sync roots that
+    // fan out to members / transitive references). Optional: contexts that do
+    // not implement it force callers to handle a missing object as an error.
+    fetchObject?(id: B64Hash, opts?: { meshLabel?: string; backendLabel?: string; timeoutMs?: number }): Promise<RObject>;
 };
 
 export type RObjectFactory = {

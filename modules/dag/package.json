@@ -14,7 +14,7 @@
     "test": "node --import ../../register.mjs ./test/run_tests.ts",
     "bench": "node --import ../../register.mjs ./test/run_benchmark.ts",
     "debug": "node --inspect-brk --import ../../register.mjs ./test/run_tests.ts",
-    "build": "npx tsc",
+    "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist"
   },
   "author": "Santiago Bazerque",
