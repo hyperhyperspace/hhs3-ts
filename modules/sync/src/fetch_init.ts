@@ -1,7 +1,8 @@
 import type { B64Hash, HashSuite } from '@hyper-hyper-space/hhs3_crypto';
 import { dag } from '@hyper-hyper-space/hhs3_dag';
 import type { Swarm, SwarmPeer } from '@hyper-hyper-space/hhs3_mesh';
-import type { RObjectInit } from '@hyper-hyper-space/hhs3_mvt';
+import type { Payload } from '@hyper-hyper-space/hhs3_mvt';
+import { extractCreatePayloadType } from '@hyper-hyper-space/hhs3_mvt';
 
 import { encode, decode } from './codec.js';
 import type { InitRequest, SyncMsg } from './protocol.js';
@@ -14,9 +15,9 @@ export function fetchInit(
     swarms: Swarm[],
     hashSuite: HashSuite,
     timeoutMs: number = DEFAULT_TIMEOUT_MS,
-): Promise<RObjectInit> {
+): Promise<Payload> {
 
-    return new Promise<RObjectInit>((resolve, reject) => {
+    return new Promise<Payload>((resolve, reject) => {
         let settled = false;
         const retryTimers: ReturnType<typeof setInterval>[] = [];
 
@@ -32,11 +33,11 @@ export function fetchInit(
             for (const t of retryTimers) clearInterval(t);
         }
 
-        function finish(init: RObjectInit) {
+        function finish(createPayload: Payload) {
             if (settled) return;
             settled = true;
             cleanup();
-            resolve(init);
+            resolve(createPayload);
         }
 
         function fail(reason: string) {
@@ -73,13 +74,19 @@ export function fetchInit(
 
                 if (msg.type !== 'init-response' || msg.objectId !== objectId) return;
 
-                const entry = dag.createEntry(msg.init.payload, {}, dag.position(), hashSuite);
+                const entry = dag.createEntry(msg.createPayload, {}, dag.position(), hashSuite);
                 if (entry.hash !== objectId) {
                     fail(`Creation payload hash mismatch: expected ${objectId}, got ${entry.hash}`);
                     return;
                 }
 
-                finish({ type: msg.init.type, payload: msg.init.payload });
+                const payloadType = extractCreatePayloadType(msg.createPayload);
+                if (payloadType === undefined) {
+                    fail('Creation payload missing type');
+                    return;
+                }
+
+                finish(msg.createPayload);
             });
         }
 

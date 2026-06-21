@@ -1,11 +1,25 @@
+import * as os from "node:os";
+import * as path from "node:path";
+import * as fs from "node:fs";
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import { Replica, MemDagBackend } from "../src/index.js";
 import { TypeRegistryMap, RootScopedDag } from "@hyper-hyper-space/hhs3_mvt";
 import { RSet, rSetFactory, RCap, rCapFactory } from "@hyper-hyper-space/hhs3_std_types";
+import { SqliteDagDb } from "@hyper-hyper-space/hhs3_dag_sqlite";
 
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
+
+function tmpDbPath(label: string): string {
+    return path.join(os.tmpdir(), `hhs3-replica-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+}
+
+function cleanupDb(path: string): void {
+    for (const suffix of ['', '-wal', '-shm']) {
+        try { fs.unlinkSync(path + suffix); } catch (_e) { /* ignore */ }
+    }
+}
 
 function createTestReplica() {
     const replica = new Replica({ crypto, hashSuite, config: { selfValidate: true } });
@@ -99,6 +113,56 @@ export const replicaBasicTests = {
             },
         },
         {
+            name: '[REP03B] createObject cold-reopens from SqliteDagDb',
+            invoke: async () => {
+                const tmpFile = tmpDbPath('cold-reopen');
+                let backend1: SqliteDagDb | undefined;
+                let backend2: SqliteDagDb | undefined;
+
+                try {
+                    backend1 = await SqliteDagDb.open(tmpFile, { hashSuite });
+
+                    const replica1 = new Replica({ crypto, hashSuite, config: { selfValidate: true } });
+                    replica1.attachBackend('default', backend1);
+                    replica1.registerType(RSet.typeId, rSetFactory);
+
+                    const init = await RSet.create({
+                        seed: 'sqlite-restart-set',
+                        initialElements: ['alpha'],
+                        hashAlgorithm: 'sha256',
+                    });
+
+                    const set1 = (await replica1.createObject(init)) as RSet;
+                    await set1.add('beta');
+                    const id = set1.getId();
+
+                    await replica1.destroy();
+                    backend1.close();
+                    backend1 = undefined;
+
+                    backend2 = await SqliteDagDb.open(tmpFile, { hashSuite });
+
+                    const replica2 = new Replica({ crypto, hashSuite, config: { selfValidate: true } });
+                    replica2.attachBackend('default', backend2);
+                    replica2.registerType(RSet.typeId, rSetFactory);
+
+                    const set2 = (await replica2.createObject(init)) as RSet;
+                    assertTrue(set2 !== undefined, 'object should be restored from sqlite');
+                    assertTrue(set2.getId() === id, 'restored object should have same id');
+
+                    const view = await set2.getView();
+                    assertTrue(await view.has('alpha'), 'restored sqlite set should have initial element');
+                    assertTrue(await view.has('beta'), 'restored sqlite set should have subsequent add');
+
+                    await replica2.destroy();
+                } finally {
+                    if (backend1 !== undefined) backend1.close();
+                    if (backend2 !== undefined) backend2.close();
+                    cleanupDb(tmpFile);
+                }
+            },
+        },
+        {
             name: '[REP04] Missing backend label throws',
             invoke: async () => {
                 const replica = new Replica({ crypto, hashSuite });
@@ -126,7 +190,14 @@ export const replicaBasicTests = {
 
                 let threw = false;
                 try {
-                    await replica.createObject({ type: 'nonexistent/type', payload: {} as any });
+                    await replica.createObject({
+                        action: 'create',
+                        type: 'nonexistent/type',
+                        seed: 'x',
+                        initialElements: [],
+                        acceptRedundantDelete: false,
+                        hashAlgorithm: 'sha256',
+                    } as any);
                 } catch (e) {
                     threw = true;
                 }
@@ -210,10 +281,10 @@ export const replicaBasicTests = {
                 });
 
                 const factory = await replica.getRegistry().lookup(RCap.typeId);
-                const id = await factory.computeRootObjectId(capInit.payload, replica, undefined);
+                const id = await factory.computeRootObjectId(capInit, replica, undefined);
                 const { dag, created } = await backend.getOrCreateDag(id, { type: RCap.typeId });
                 if (created) {
-                    await factory.executeCreationPayload(capInit.payload, replica, new RootScopedDag(dag));
+                    await factory.executeCreationPayload(capInit, replica, new RootScopedDag(dag));
                 }
                 const cap = (await factory.loadObject(id, replica, { backendLabel: 'default' })) as RCap;
                 replica.registerObject(cap);
@@ -248,6 +319,63 @@ export const replicaBasicTests = {
                     threw = true;
                 }
                 assertTrue(threw, 'unregisterObject should reject root objects');
+            },
+        },
+        {
+            name: '[REP11] createObject rejects invalid payload for registered type',
+            invoke: async () => {
+                const replica = createTestReplica();
+                let threw = false;
+                try {
+                    await replica.createObject({
+                        action: 'create',
+                        type: RSet.typeId,
+                        seed: 'x',
+                        initialElements: [],
+                        acceptRedundantDelete: false,
+                        hashAlgorithm: 'sha256',
+                        contentType: RSet.typeId,
+                        acceptRedundantAdd: true,
+                    } as any);
+                } catch {
+                    threw = true;
+                }
+                assertTrue(threw, 'createObject should reject invalid create payload');
+            },
+        },
+        {
+            name: '[REP12] createObject rejects create payload without type',
+            invoke: async () => {
+                const replica = createTestReplica();
+                let threw = false;
+                try {
+                    await replica.createObject({
+                        action: 'create',
+                        seed: 'x',
+                        initialElements: [],
+                        acceptRedundantDelete: false,
+                        hashAlgorithm: 'sha256',
+                    } as any);
+                } catch {
+                    threw = true;
+                }
+                assertTrue(threw, 'createObject should reject create payload missing type');
+            },
+        },
+        {
+            name: '[REP13] genesis entry persists MVT type in create payload',
+            invoke: async () => {
+                const replica = createTestReplica();
+                const init = await RSet.create({
+                    seed: 'genesis-type',
+                    initialElements: ['x'],
+                    hashAlgorithm: 'sha256',
+                });
+                const set = await replica.createObject(init);
+                const entry = await (await set.getScopedDag()).loadEntry(set.getId());
+                assertTrue(entry !== undefined, 'genesis entry should exist');
+                const payload = entry!.payload as { type?: string };
+                assertTrue(payload.type === RSet.typeId, 'genesis payload should carry MVT type');
             },
         },
     ],

@@ -72,7 +72,7 @@ export const rschemaTests = {
                 assertEquals(json.toStringNormalized(view.getRestriction('orders', 'insert')),
                     json.toStringNormalized({ p: 'true' }), 'insert should default to true');
                 assertEquals(json.toStringNormalized(view.getRestriction('orders', 'delete')),
-                    json.toStringNormalized({ p: 'owner', is: '$author' }), 'delete should default to owner');
+                    json.toStringNormalized({ p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: '$author' } }), 'delete should default to author');
             }
         },
         {
@@ -87,7 +87,7 @@ export const rschemaTests = {
                     creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
                     tables: [ordersTable()],
                 });
-                (init.payload as { creators: { keyId: string }[] }).creators[0].keyId = 'bogus-key-id';
+                (init as { creators: { keyId: string }[] }).creators[0].keyId = 'bogus-key-id';
 
                 let failed = false;
                 try {
@@ -144,8 +144,8 @@ export const rschemaTests = {
                     migration: [{ rule: 'set-concurrent-deletes', table: 'orders', value: true }],
                 } as unknown as json.LiteralMap, admin);
 
-                assertTrue(await schema.validatePayload(signed, at), 'intact signed update should validate');
-                assertFalse(await schema.validatePayload({ ...signed, note: 'tampered' }, at),
+                assertTrue((await schema.validatePayload(signed, at)).valid, 'intact signed update should validate');
+                assertFalse((await schema.validatePayload({ ...signed, note: 'tampered' }, at)).valid,
                     'tampered signed update should not validate');
             }
         },
@@ -159,27 +159,27 @@ export const rschemaTests = {
                 const signedUpdate = async (migration: json.Literal) =>
                     signPayload({ action: 'schema-update', migration } as unknown as json.LiteralMap, admin);
 
-                assertFalse(await schema.validatePayload(await signedUpdate(
-                    [{ rule: 'add-table', def: ordersTable() }]), at),
+                assertFalse((await schema.validatePayload(await signedUpdate(
+                    [{ rule: 'add-table', def: ordersTable() }]), at)).valid,
                     'add-table for an existing table should not validate');
-                assertFalse(await schema.validatePayload(await signedUpdate(
-                    [{ rule: 'add-column', table: 'missing', column: 'c', def: { type: 'string', nullable: true } }]), at),
+                assertFalse((await schema.validatePayload(await signedUpdate(
+                    [{ rule: 'add-column', table: 'missing', column: 'c', def: { type: 'string', nullable: true } }]), at)).valid,
                     'add-column on a missing table should not validate');
-                assertFalse(await schema.validatePayload(await signedUpdate(
-                    [{ rule: 'drop-column', table: 'orders', column: 'missing' }]), at),
+                assertFalse((await schema.validatePayload(await signedUpdate(
+                    [{ rule: 'drop-column', table: 'orders', column: 'missing' }]), at)).valid,
                     'drop-column of a missing column should not validate');
-                assertFalse(await schema.validatePayload(await signedUpdate(
-                    [{ rule: 'drop-column', table: 'caps', column: 'label' }]), at),
+                assertFalse((await schema.validatePayload(await signedUpdate(
+                    [{ rule: 'drop-column', table: 'caps', column: 'label' }]), at)).valid,
                     'dropping the last column should not validate');
-                assertFalse(await schema.validatePayload(await signedUpdate(
-                    [{ rule: 'set-fks', table: 'orders', fks: { missing_col: 'caps' } }]), at),
+                assertFalse((await schema.validatePayload(await signedUpdate(
+                    [{ rule: 'set-fks', table: 'orders', fks: { missing_col: 'caps' } }]), at)).valid,
                     'set-fks on a missing column should not validate');
 
                 // sequential rules within one update see the effect of earlier ones
-                assertTrue(await schema.validatePayload(await signedUpdate([
+                assertTrue((await schema.validatePayload(await signedUpdate([
                     { rule: 'drop-table', table: 'orders' },
                     { rule: 'add-table', def: ordersTable() },
-                ]), at), 'drop + re-add of the same table within one update should validate');
+                ]), at)).valid, 'drop + re-add of the same table within one update should validate');
             }
         },
         {

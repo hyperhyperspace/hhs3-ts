@@ -6,12 +6,17 @@
 // rowIds for inserts, live row for updates and deletes) live with the group
 // too, since they need a table view over the group DAG.
 //
-// Restriction / signature enforcement (op authorship + authorization) is the
-// group's concern (rtable_group/validate_ops.ts + computeEntryVoided); this
-// file adds the provider content-integrity check for identity-provider rows.
+// Signature enforcement and restriction authorization are the group's concern:
+// hard validation happens in rtable_group/validate_ops.ts, with view-time
+// restriction rechecks in computeEntryVoided for concurrent barrier effects.
+// This file adds the provider content-integrity check for identity-provider
+// rows.
 
 import type { HashSuite } from "@hyper-hyper-space/hhs3_crypto";
-import { computeKeyId, deserializePublicKeyFromBase64 } from "@hyper-hyper-space/hhs3_mvt";
+import {
+    computeKeyId, deserializePublicKeyFromBase64,
+    validationFailure, validationOk, ValidationResult,
+} from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchemaView } from "../rschema/interfaces.js";
 import { columnValueMatchesType } from "../rschema/validate.js";
@@ -20,44 +25,48 @@ import type { InsertRowPayload, UpdateRowPayload, RowOpPayload } from "./payload
 // An insert conforms to the schema iff the table exists, every carried column
 // exists with a matching value type, and every non-nullable column is covered
 // (carried, or backed by a default).
-export function validateInsertAgainstSchema(insert: InsertRowPayload, view: RSchemaView, table: string): boolean {
+export function validateInsertAgainstSchema(insert: InsertRowPayload, view: RSchemaView, table: string): ValidationResult {
     const def = view.getTable(table);
-    if (def === undefined) return false;
+    if (def === undefined) return validationFailure(`table '${table}' does not exist`);
 
     for (const column of Object.keys(insert.values)) {
         const columnDef = def.columns[column];
-        if (columnDef === undefined) return false;
-        if (!columnValueMatchesType(insert.values[column], columnDef.type)) return false;
+        if (columnDef === undefined) return validationFailure(`column '${column}' does not exist on table '${table}'`);
+        if (!columnValueMatchesType(insert.values[column], columnDef.type)) {
+            return validationFailure(`column '${column}' does not match declared type '${columnDef.type}'`);
+        }
     }
 
     for (const column of Object.keys(def.columns)) {
         const columnDef = def.columns[column];
         if (columnDef.nullable ?? false) continue;
         if (columnDef.default !== undefined) continue;
-        if (insert.values[column] === undefined) return false;
+        if (insert.values[column] === undefined) return validationFailure(`required column '${column}' is missing`);
     }
 
-    return true;
+    return validationOk();
 }
 
 // An update conforms to the schema iff the table exists, at least one column
 // is carried, and every carried column exists with a matching value type and
 // is not readonly (readonly columns are fixed at insert).
-export function validateUpdateAgainstSchema(update: UpdateRowPayload, view: RSchemaView, table: string): boolean {
+export function validateUpdateAgainstSchema(update: UpdateRowPayload, view: RSchemaView, table: string): ValidationResult {
     const def = view.getTable(table);
-    if (def === undefined) return false;
+    if (def === undefined) return validationFailure(`table '${table}' does not exist`);
 
     const columns = Object.keys(update.values);
-    if (columns.length === 0) return false;
+    if (columns.length === 0) return validationFailure("update carries no column values");
 
     for (const column of columns) {
         const columnDef = def.columns[column];
-        if (columnDef === undefined) return false;
-        if (columnDef.readonly ?? false) return false;
-        if (!columnValueMatchesType(update.values[column], columnDef.type)) return false;
+        if (columnDef === undefined) return validationFailure(`column '${column}' does not exist on table '${table}'`);
+        if (columnDef.readonly ?? false) return validationFailure(`column '${column}' is readonly`);
+        if (!columnValueMatchesType(update.values[column], columnDef.type)) {
+            return validationFailure(`column '${column}' does not match declared type '${columnDef.type}'`);
+        }
     }
 
-    return true;
+    return validationOk();
 }
 
 // Provider content-integrity (position-independent given the schema view): a
@@ -70,28 +79,32 @@ export function validateUpdateAgainstSchema(update: UpdateRowPayload, view: RSch
 // with).
 export function validateProviderInsertIntegrity(
     op: RowOpPayload, view: RSchemaView, table: string, hashSuite: HashSuite,
-): boolean {
-    if (op.action !== 'insert') return true;
+): ValidationResult {
+    if (op.action !== 'insert') return validationOk();
     const provider = view.getIdProvider(table);
-    if (provider === undefined) return true;
+    if (provider === undefined) return validationOk();
 
     const keyIdVal = op.values[provider.keyIdColumn];
     const pkVal = op.values[provider.publicKeyColumn];
-    if (typeof keyIdVal !== 'string' || typeof pkVal !== 'string') return false;
+    if (typeof keyIdVal !== 'string' || typeof pkVal !== 'string') {
+        return validationFailure(`provider row must carry string '${provider.keyIdColumn}' and '${provider.publicKeyColumn}' values`);
+    }
 
     let pk;
     try {
         pk = deserializePublicKeyFromBase64(pkVal);
     } catch {
-        return false;
+        return validationFailure("provider public key is not valid base64-encoded key material");
     }
-    return computeKeyId(pk, hashSuite) === keyIdVal;
+    return computeKeyId(pk, hashSuite) === keyIdVal
+        ? validationOk()
+        : validationFailure("provider keyId does not match public key");
 }
 
 // Row op conformance: inserts and updates as above, deletes just need the
 // table (the liveness check is the group's).
-export function validateRowOpAgainstSchema(op: RowOpPayload, view: RSchemaView, table: string): boolean {
-    if (!view.hasTable(table)) return false;
+export function validateRowOpAgainstSchema(op: RowOpPayload, view: RSchemaView, table: string): ValidationResult {
+    if (!view.hasTable(table)) return validationFailure(`table '${table}' does not exist`);
 
     switch (op.action) {
         case 'insert':
@@ -99,8 +112,8 @@ export function validateRowOpAgainstSchema(op: RowOpPayload, view: RSchemaView, 
         case 'update':
             return validateUpdateAgainstSchema(op, view, table);
         case 'delete':
-            return true;
+            return validationOk();
         default:
-            return false;
+            return validationFailure(`unknown row op action '${(op as { action?: unknown }).action}'`);
     }
 }

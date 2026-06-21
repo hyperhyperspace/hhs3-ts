@@ -55,8 +55,9 @@ import type { OwnIdentity, KeyId, PublicKey, HashSuite } from "@hyper-hyper-spac
 import { dag, position } from "@hyper-hyper-space/hhs3_dag";
 
 import {
-    Payload, RObjectFactory, RObjectInit, RContext, LoadObjectOptions, NestingParent,
+    Payload, RObjectFactory, RContext, LoadObjectOptions, NestingParent,
     Version, version, ForeignDep, Event, DeltaAccumulator, RObject,
+    formatValidationFailure, validationFailure, ValidationRejectedError, ValidationResult,
 } from "@hyper-hyper-space/hhs3_mvt";
 import { RootScopedDag, NestedScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
 import {
@@ -76,7 +77,7 @@ import type { RTableView } from "../rtable/interfaces.js";
 import { RTableViewImpl } from "../rtable/view.js";
 
 import type { RTableGroup as RTableGroupContract, RTableGroupView as RTableGroupViewContract, BundleWrite } from "./interfaces.js";
-import { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload } from "./payload.js";
+import { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload, RTABLE_GROUP_TYPE_ID } from "./payload.js";
 import { TableScope, deriveCreateMeta, deriveEnvelopeMeta, deriveBundleMeta } from "./scopes.js";
 import { validateTableGroupPayload } from "./validate_ops.js";
 import { evaluateRowOpRestriction, evaluateRowOpFKReach } from "./predicates.js";
@@ -86,7 +87,7 @@ import {
     computeRTableGroupDelta,
 } from "./delta.js";
 
-export const RTABLE_GROUP_TYPE_ID = 'hhs/rtable_group_v1';
+export { RTABLE_GROUP_TYPE_ID } from "./payload.js";
 
 export const rTableGroupFactory: RObjectFactory = {
 
@@ -96,7 +97,7 @@ export const rTableGroupFactory: RObjectFactory = {
     },
 
     validateCreationPayload: async (payload: Payload, ctx: RContext, parent?: NestingParent) => {
-        if (parent !== undefined) return false;   // groups are root objects
+        if (parent !== undefined) return validationFailure("table groups are root objects");
         return validateTableGroupPayload(payload, { mode: 'create', ctx });
     },
 
@@ -141,10 +142,11 @@ export class RTableGroupImpl implements RTableGroupContract {
         canDeploy?: Predicate;
         idProvider?: string;
         hashAlgorithm?: string;
-    }): Promise<RObjectInit> => {
+    }): Promise<CreateTableGroupPayload> => {
 
         const createPayload: CreateTableGroupPayload = {
             action: 'create',
+            type: RTABLE_GROUP_TYPE_ID,
             seed: options.seed,
             schemaRef: options.schemaRef,
             schemaVersion: json.toSet([...options.schemaVersion]),
@@ -156,7 +158,7 @@ export class RTableGroupImpl implements RTableGroupContract {
         if (options.idProvider !== undefined) createPayload.idProvider = options.idProvider;
         if (options.hashAlgorithm !== undefined) createPayload.hashAlgorithm = options.hashAlgorithm;
 
-        return { type: RTableGroupImpl.typeId, payload: createPayload };
+        return createPayload;
     };
 
     static typeId = RTABLE_GROUP_TYPE_ID;
@@ -379,8 +381,11 @@ export class RTableGroupImpl implements RTableGroupContract {
             ? await signPayloadHelper(base as unknown as json.LiteralMap, author)
             : base as unknown as json.LiteralMap;
 
-        if (this.selfValidate() && !await this.validatePayload(payload, at)) {
-            throw new Error("Attempted to apply an invalid deploy ref-advance");
+        if (this.selfValidate()) {
+            const result = await this.validatePayload(payload, at);
+            if (!result.valid) {
+                throw new ValidationRejectedError(formatValidationFailure(result.why), result.why);
+            }
         }
 
         return scopedDag.append(payload, meta, at);
@@ -404,8 +409,11 @@ export class RTableGroupImpl implements RTableGroupContract {
         const payload = createRefAdvancePayload(groupId, refVersion) as unknown as json.LiteralMap;
         const meta = createRefAdvanceMeta(groupId);   // barrier (default)
 
-        if (this.selfValidate() && !await this.validatePayload(payload, at)) {
-            throw new Error("Attempted to apply an invalid foreign-group observation");
+        if (this.selfValidate()) {
+            const result = await this.validatePayload(payload, at);
+            if (!result.valid) {
+                throw new ValidationRejectedError(formatValidationFailure(result.why), result.why);
+            }
         }
 
         return scopedDag.append(payload, meta, at);
@@ -437,19 +445,21 @@ export class RTableGroupImpl implements RTableGroupContract {
 
         const payload: BundlePayload = { action: 'bundle', writes: signed };
 
-        if (this.selfValidate() && !await this.validatePayload(payload, at)) {
-            throw new Error("Attempted to apply an invalid bundle");
+        const result = await this.validatePayload(payload, at);
+        if (!result.valid) {
+            throw new ValidationRejectedError(formatValidationFailure(result.why), result.why);
         }
 
         const schemaView = await this.resolveSchemaView(at);
         return scopedDag.append(payload, deriveBundleMeta(payload, schemaView), at);
     }
 
-    // Whether an entry is VOID at this `from` horizon: any row op it carries
-    // whose restriction predicate fails OR whose written FK columns do not
-    // reach a live target (both evaluated at the op's own position, observed
-    // from `from`) voids the whole entry — bundles all-or-nothing. The genesis
-    // create entry is fiat (never voided);
+    // Whether an entry is VOID at this `from` horizon: row restrictions already
+    // passed hard validation at the parent frontier, but are rechecked here at
+    // the op's own position observed from `from` so concurrent barrier revokes
+    // or schema/observation revisions can still void the entry. Written FK
+    // columns use the same view-time path. Bundles are all-or-nothing. The
+    // genesis create entry is fiat (never voided);
     // ref-advances carry no row restrictions. Memoized per (entry, from);
     // a cycle on the authorization-recursion stack DENIES (treated as voided —
     // least fixpoint; see the _voidVisiting note above).
@@ -495,11 +505,11 @@ export class RTableGroupImpl implements RTableGroupContract {
         // the entry (not its predecessors) is what makes a barrier revoke
         // CONCURRENT with the op void it (concurrent to the entry, visible
         // from `from`), while a causally-later revoke does not (it is in the
-        // op's future, neither at-or-below nor concurrent). BOTH restriction
-        // failure AND FK reach (a written FK column whose target is not live
-        // at this same position) void the op — FK is at-use op-voiding, not a
-        // continuous view-horizon layer, so a causally-later target delete or
-        // FK declaration change never revises an old write.
+        // op's future, neither at-or-below nor concurrent). BOTH a failed
+        // restriction recheck AND FK reach (a written FK column whose target is
+        // not live at this same position) void the op — FK is at-use
+        // op-voiding, not a continuous view-horizon layer, so a causally-later
+        // target delete or FK declaration change never revises an old write.
         const opPos = version(entryHash);
         const schemaView = await this.resolveSchemaView(opPos, from);
         const getTableView = (table: string) => this.makeTable(table).getView(opPos, from);
@@ -538,7 +548,7 @@ export class RTableGroupImpl implements RTableGroupContract {
 
     // RObject interface
 
-    async validatePayload(payload: Payload, at: Version): Promise<boolean> {
+    async validatePayload(payload: Payload, at: Version): Promise<ValidationResult> {
         return validateTableGroupPayload(payload, { mode: 'op', group: this, at });
     }
 

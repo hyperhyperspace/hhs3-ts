@@ -11,6 +11,7 @@ import {
     RObject,
     RObjectFactory,
     SyncableObject,
+    ValidationResult,
     Version,
     View,
 } from "@hyper-hyper-space/hhs3_mvt";
@@ -33,7 +34,7 @@ export interface RSet<T extends json.Literal = json.Literal> extends RObject, Sy
     deleteWithBarrierByHashSigned(elementHash: B64Hash, author: OwnIdentity, at?: Version): Promise<B64Hash>;
     refAdvance(refVersion: Version, author: OwnIdentity, at?: Version): Promise<B64Hash>;
 
-    validatePayload(payload: Payload, at: Version): Promise<boolean>;
+    validatePayload(payload: Payload, at: Version): Promise<ValidationResult>;
     applyPayload(payload: Payload, at: Version): Promise<B64Hash>;
     getView(at?: Version, from?: Version): Promise<RSetView<T>>;
 

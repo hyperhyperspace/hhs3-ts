@@ -33,7 +33,7 @@ function itemsTable(): TableDef {
             note: { type: 'string', default: 'none' },
         },
         // permit unauthored updates/deletes: the LWW mechanics, not the
-        // default owner-is-author restriction (see [ENF]), are under test
+        // default author-is-author restriction (see [ENF]), are under test
         restrictions: [{ on: 'all', rule: { p: 'true' } }],
     };
 }
@@ -144,8 +144,8 @@ export const rtableLwwTests = {
                 // same rowId (same uuid, anonymous) inserted on two branches
                 // with different non-pub values: one incarnation, hash winner
                 // is the value base
-                const ha = await items.insert('i-1', { sku: 'A1', tag: 'red', qty: 1 }, undefined, undefined, base);
-                const hb = await items.insert('i-1', { sku: 'A1', tag: 'red', qty: 2 }, undefined, undefined, base);
+                const ha = await items.insert('i-1', { sku: 'A1', tag: 'red', qty: 1 }, undefined, base);
+                const hb = await items.insert('i-1', { sku: 'A1', tag: 'red', qty: 2 }, undefined, base);
                 const expectedBase = ha > hb ? 1 : 2;
 
                 const merged = (await (await items.getView()).getRow(rowId))!;
@@ -257,18 +257,18 @@ export const rtableLwwTests = {
             }
         },
         {
-            name: '[LWW10] Signed update by the row owner lands',
+            name: '[LWW10] Signed update by the row author lands',
             invoke: async () => {
                 const { items } = await createTestEnv();
-                const owner = await makeIdentity();
-                const rowId = deriveRowId('i-1', owner.keyId);
+                const author = await makeIdentity();
+                const rowId = deriveRowId('i-1', author.keyId);
 
-                await items.insert('i-1', { sku: 'A1', tag: 'red', qty: 1 }, owner.keyId, owner);
-                await items.update(rowId, { qty: 6 }, owner);
+                await items.insert('i-1', { sku: 'A1', tag: 'red', qty: 1 }, author);
+                await items.update(rowId, { qty: 6 }, author);
 
                 const row = (await (await items.getView()).getRow(rowId))!;
                 assertEquals(row.values['qty'], 6, 'the signed update should land');
-                assertEquals(row.owner, owner.keyId, 'ownership comes from the insert');
+                assertEquals(row.author, author.keyId, 'authorship comes from the insert');
             }
         },
         {

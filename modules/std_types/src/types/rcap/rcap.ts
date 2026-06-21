@@ -3,7 +3,10 @@ import { B64Hash, HASH_SHA256, KeyId, PublicKey } from "@hyper-hyper-space/hhs3_
 import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, MetaProps, position } from "@hyper-hyper-space/hhs3_dag";
 
-import { Payload, RObject, RObjectFactory, RObjectInit, RContext, LoadObjectOptions, Version, View, ForeignDep } from "@hyper-hyper-space/hhs3_mvt";
+import {
+    Payload, RObject, RObjectFactory, RContext, LoadObjectOptions, Version, View, ForeignDep,
+    formatValidationFailure, ValidationRejectedError, ValidationResult,
+} from "@hyper-hyper-space/hhs3_mvt";
 import { RootScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { Mesh, Swarm } from "@hyper-hyper-space/hhs3_mesh";
@@ -13,7 +16,7 @@ import type { SyncSession, SyncTarget } from "@hyper-hyper-space/hhs3_sync";
 import { deserializePublicKeyFromBase64, signPayload as signPayloadHelper } from "../../authorship.js";
 
 import {
-    CreateRCapPayload, CapDefinition,
+    CreateRCapPayload, CapDefinition, RCAP_TYPE_ID,
     AddIdentityPayload,
     CreateCapabilityPayload,
     DeleteCapabilityPayload,
@@ -70,11 +73,12 @@ export class RCapImpl implements RCapContract {
         initialCaps: { [capName: string]: CapDefinition };
         enrollCapability?: string;
         hashAlgorithm?: string;
-    }): Promise<RObjectInit> => {
+    }): Promise<CreateRCapPayload> => {
         const { serializePublicKeyToBase64 } = await import("../../authorship.js");
 
         const createPayload: CreateRCapPayload = {
             action: 'create',
+            type: RCAP_TYPE_ID,
             seed: options.seed,
             creators: options.creators.map(c => c.keyId),
             creatorKeys: options.creators.map(c => serializePublicKeyToBase64(c.publicKey)),
@@ -86,10 +90,10 @@ export class RCapImpl implements RCapContract {
             createPayload.enrollCapability = options.enrollCapability;
         }
 
-        return { type: RCapImpl.typeId, payload: createPayload };
+        return createPayload;
     }
 
-    static typeId = "hhs/cap_v1";
+    static typeId = RCAP_TYPE_ID;
 
     createOpId: B64Hash;
     createOp: CreateRCapPayload;
@@ -163,8 +167,9 @@ export class RCapImpl implements RCapContract {
 
     private async applyValidatedPayload(payload: Payload, at: Version): Promise<B64Hash> {
         if (this.selfValidate()) {
-            if (!await this.validatePayload(payload, at)) {
-                throw new Error("Attempted to apply an invalid payload");
+            const result = await this.validatePayload(payload, at);
+            if (!result.valid) {
+                throw new ValidationRejectedError(formatValidationFailure(result.why), result.why);
             }
         }
         return this.applyPayload(payload, at);
@@ -248,7 +253,7 @@ export class RCapImpl implements RCapContract {
 
     // RObject interface
 
-    async validatePayload(payload: json.Literal, at: Version): Promise<boolean> {
+    async validatePayload(payload: json.Literal, at: Version): Promise<ValidationResult> {
         return validateRCapPayload(payload, { mode: "op", cap: this, at });
     }
 

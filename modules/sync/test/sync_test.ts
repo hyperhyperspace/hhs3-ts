@@ -4,7 +4,7 @@ import { dag, Position, Header, Entry } from '@hyper-hyper-space/hhs3_dag';
 import { json } from '@hyper-hyper-space/hhs3_json';
 import type { TopicChannel } from '@hyper-hyper-space/hhs3_mesh';
 import type { RObject, Version, Payload, View, Event, ForeignDep, Delta, DeltaAccumulator } from '@hyper-hyper-space/hhs3_mvt';
-import { RootScopedDag } from '@hyper-hyper-space/hhs3_mvt';
+import { RootScopedDag, validationOk } from '@hyper-hyper-space/hhs3_mvt';
 
 import { createDagProvider } from '../src/provider.js';
 import { createDagSynchronizer } from '../src/synchronizer.js';
@@ -97,7 +97,7 @@ function createMockRObject(d: dag.Dag, id: B64Hash, opts?: {
         getId: () => id,
         getType: () => 'test-object',
         getBackendLabel: () => 'default',
-        validatePayload: async (_payload: Payload, _at: Version) => true,
+        validatePayload: async (_payload: Payload, _at: Version) => validationOk(),
         applyPayload: async (payload: Payload, at: Version) => {
             return await d.append(payload, {}, at);
         },

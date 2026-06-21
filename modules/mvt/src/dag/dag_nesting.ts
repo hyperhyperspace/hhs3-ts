@@ -3,6 +3,8 @@ import { checkFilter, Dag, Entry, EntryMetaFilter, EntryPredicate, ForkPosition,
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { Literal } from "@hyper-hyper-space/hhs3_json/dist/literal.js";
 
+import { formatValidationFailure, ValidationRejectedError, ValidationResult } from "../validation.js";
+
 // ScopedDag: the object's logical history surface.
 // For root objects, backed by RootScopedDag; for nested objects, backed by NestedScopedDag.
 
@@ -80,7 +82,7 @@ export interface DagScope {
     unwrapMeta(meta: MetaProps, wrappedPayload: Literal, at: Position): MetaProps;
     
     wrapFilter(filter: EntryMetaFilter): EntryMetaFilter;
-    validateWrappedPayload?(wrappedPayload: Literal, wrappedMeta: MetaProps, at: Position): Promise<boolean>;
+    validateWrappedPayload?(wrappedPayload: Literal, wrappedMeta: MetaProps, at: Position): Promise<ValidationResult>;
 }
 
 
@@ -114,9 +116,9 @@ export class NestedScopedDag implements ScopedDag {
         const wrappedMeta = this.scope.wrapMeta(meta, wrappedPayload, after);
 
         if (this.scope.validateWrappedPayload !== undefined) {
-            const valid = await this.scope.validateWrappedPayload(wrappedPayload, wrappedMeta, after);
-            if (!valid) {
-                throw new Error("Attempted to append an invalid wrapped payload");
+            const result = await this.scope.validateWrappedPayload(wrappedPayload, wrappedMeta, after);
+            if (!result.valid) {
+                throw new ValidationRejectedError(formatValidationFailure(result.why), result.why);
             }
         }
 

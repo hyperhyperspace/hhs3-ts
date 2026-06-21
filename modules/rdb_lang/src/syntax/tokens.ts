@@ -1,0 +1,100 @@
+import type { TextSpan } from "../diagnostics.js";
+
+export type TokenKind =
+    | 'identifier'
+    | 'keyword'
+    | 'variable'
+    | 'hash'
+    | 'string'
+    | 'number'
+    | 'operator'
+    | 'punctuation'
+    | 'eof';
+
+export type Token = {
+    kind: TokenKind;
+    text: string;
+    upper: string;
+    span: TextSpan;
+    value?: string | number | boolean | null;
+};
+
+export const KEYWORDS = new Set([
+    'ADD',
+    'ALL',
+    'ALLOW',
+    'ALTER',
+    'AND',
+    'AS',
+    'ASC',
+    'AT',
+    'AUTO',
+    'BIND',
+    'BOOLEAN',
+    'BUNDLE',
+    'BY',
+    'CAN',
+    'COLUMN',
+    'CONCURRENT',
+    'CREATE',
+    'CREATORS',
+    'DATABASE',
+    'DEFAULT',
+    'DELETE',
+    'DELETES',
+    'DEPLOY',
+    'DESC',
+    'DROP',
+    'EXISTS',
+    'FALSE',
+    'FLOAT',
+    'FROM',
+    'FKS',
+    'IDENTITY',
+    'IF',
+    'INSERT',
+    'INTEGER',
+    'IS',
+    'INTO',
+    'JSON',
+    'LATEST',
+    'LIKE',
+    'LIMIT',
+    'LOG',
+    'NO',
+    'NOT',
+    'NULL',
+    'OFFSET',
+    'ON',
+    'OR',
+    'ORDER',
+    'PROVIDER',
+    'PUB',
+    'READONLY',
+    'REFERENCES',
+    'REF',
+    'RULES',
+    'ROWS',
+    'SCHEMA',
+    'SELECT',
+    'SET',
+    'STRING',
+    'TABLE',
+    'TABLEGROUP',
+    'TO',
+    'TRUE',
+    'UPDATE',
+    'USING',
+    'VALUES',
+    'VIEW',
+    'WHERE',
+    'WITH',
+]);
+
+export const PHASE2_KEYWORDS = new Set([
+    'ALTER',
+    'BUNDLE',
+    'DELETE',
+    'DEPLOY',
+    'UPDATE',
+]);

@@ -3,11 +3,11 @@
 // These are grammar-agnostic and pure: they operate over a column lookup
 // callback, so the SAME core serves two callers with different front-ends:
 //
-//   - restriction predicates (BFT, at-use voiding): see ../rtable_group/
-//     predicates.ts. The restriction grammar is a CONSTRAINED subset (positive
-//     logic, readonly-only $row refs, integer-only arithmetic) and its
-//     behavior must not change — this module is a pure extraction of the logic
-//     that already lived in predicates.ts / validate.ts.
+//   - restriction predicates (BFT validation + at-use rechecks): see
+//     ../rtable_group/predicates.ts. The restriction grammar is a CONSTRAINED
+//     subset (positive logic, readonly-only $row refs, integer-only arithmetic)
+//     and its behavior must not change — this module is a pure extraction of
+//     the logic that already lived in predicates.ts / validate.ts.
 //   - single-table queries (local reads, richer grammar): see ../rtable/
 //     query.ts. Queries may filter over any column and add `not`, but reuse
 //     these same operand evaluation and type-check rules.

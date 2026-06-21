@@ -608,7 +608,7 @@ export const permissionedSetTests = {
                 // (causal-only view sees capV1, where Bob is authorized)
                 const addEntry = await setDag.loadEntry(addHash);
                 assertTrue(addEntry !== undefined, 'add entry should exist in the DAG');
-                const valid = await rset.validatePayload(addEntry!.payload, forkPoint);
+                const valid = (await rset.validatePayload(addEntry!.payload, forkPoint)).valid;
                 assertTrue(valid, 'validatePayload should pass at admission position (causal-only)');
 
                 // But the frontier view voids it via the concurrent barrier ref-advance
@@ -658,7 +658,7 @@ export const permissionedSetTests = {
                 // Re-check: validatePayload at the add's original position still passes
                 const addEntry = await setDag.loadEntry(addHash);
                 assertTrue(addEntry !== undefined, 'add entry should exist in the DAG');
-                const valid = await rset.validatePayload(addEntry!.payload, addAt);
+                const valid = (await rset.validatePayload(addEntry!.payload, addAt)).valid;
                 assertTrue(valid, 'validatePayload should pass at admission position (causal RCap V1 authorizes Bob)');
 
                 // But the frontier view voids it via compositional revision

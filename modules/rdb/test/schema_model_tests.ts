@@ -44,6 +44,7 @@ function capsTable(): TableDef {
         name: 'caps',
         columns: {
             label: { type: 'string', pub: true },
+            grantee: { type: 'string', pub: true },
             note: { type: 'string', nullable: true },
         },
         concurrentDeletes: true,
@@ -113,9 +114,9 @@ async function testRestrictionDefaults() {
 
     const updateDefault = defaultRestrictionRule('update');
     const deleteDefault = defaultRestrictionRule('delete');
-    assertTrue(updateDefault.p === 'owner' && (updateDefault as { is: string }).is === '$author'
-        && deleteDefault.p === 'owner' && (deleteDefault as { is: string }).is === '$author',
-        'update/delete should default to author-owned-only (anonymous rows immutable)');
+    assertTrue(json.toStringNormalized(updateDefault) === json.toStringNormalized({ p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: '$author' } })
+        && json.toStringNormalized(deleteDefault) === json.toStringNormalized({ p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: '$author' } }),
+        'update/delete should default to insert-author-only (anonymous rows immutable)');
 }
 
 async function testFKs() {
@@ -131,20 +132,15 @@ async function testFKs() {
 
 async function testPredicates() {
     assertTrue(validatePredicate({ p: 'true' }), 'true should validate');
-    assertTrue(validatePredicate({ p: 'owner', is: '$author' }), 'owner-is-author should validate');
-    assertTrue(validatePredicate({ p: 'owner', is: '$rowOwner' }), 'owner-is-rowOwner should validate (trivially true, but well-formed)');
-    assertFalse(validatePredicate({ p: 'owner' }), 'owner without a term should not validate');
-    assertFalse(validatePredicate({ p: 'owner', is: 'author' }), 'owner with a non-$ term should not validate');
-    assertFalse(validatePredicate({ p: 'owner', is: '$author', extra: 1 }), 'extra keys on atoms should not validate');
+    assertTrue(validatePredicate({ p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: '$author' } }),
+        'author-is-author should validate');
+    assertFalse(validatePredicate({ p: 'owner', is: '$author' }),
+        'owner atom should not validate');
     assertFalse(validatePredicate({ p: 'not', arg: { p: 'true' } }), 'negation should not validate (positive logic only)');
     assertFalse(validatePredicate({ p: 'nope' }), 'unknown predicate should not validate');
 
-    assertTrue(validatePredicate({ p: 'exists', table: 'users.caps', where: { label: 'write' }, owner: '$author' }),
-        'exists with where + owner should validate');
-    assertTrue(validatePredicate({ p: 'exists', table: 'caps', owner: '$author' }),
-        'exists with owner only should validate');
-    assertTrue(validatePredicate({ p: 'exists', table: 'caps', owner: '$rowOwner' }),
-        'exists with owner: $rowOwner should validate in row context');
+    assertTrue(validatePredicate({ p: 'exists', table: 'users.caps', where: { label: 'write', grantee: '$author' } }),
+        'exists with where + author term should validate');
     assertTrue(validatePredicate({ p: 'exists', table: 'caps', where: { label: 'admin' } }),
         'exists with where only should validate');
     assertTrue(validatePredicate({ p: 'exists', table: 'caps', where: { granted_to: '$author' } }),
@@ -156,7 +152,7 @@ async function testPredicates() {
         'exists with a concrete row id should not validate (schemas never name row ids)');
     assertFalse(validatePredicate({ p: 'exists', table: 'orders', pkOf: 'order' }),
         'exists referencing subject row values should not validate');
-    assertFalse(validatePredicate({ p: 'exists', table: 'a.b.c', owner: '$author' }),
+    assertFalse(validatePredicate({ p: 'exists', table: 'a.b.c', where: { grantee: '$author' } }),
         'exists with invalid table ref should not validate');
     assertFalse(validatePredicate({ p: 'exists', table: 'orders', where: { '2bad': 1 } }),
         'where with invalid field name should not validate');
@@ -165,13 +161,13 @@ async function testPredicates() {
     assertFalse(validatePredicate({ p: 'exists', table: 'caps', ownerIs: 'author' }),
         'old ownerIs form should not validate');
 
-    const ownerOrAdmin: Predicate = {
+    const authorOrAdmin: Predicate = {
         p: 'or', args: [
-            { p: 'owner', is: '$author' },
-            { p: 'exists', table: 'users.caps', where: { role: 'admin' }, owner: '$author' },
+            { p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: '$author' } },
+            { p: 'exists', table: 'users.caps', where: { role: 'admin', grantee: '$author' } },
         ],
     };
-    assertTrue(validatePredicate(ownerOrAdmin), 'owner-or-admin disjunction should validate');
+    assertTrue(validatePredicate(authorOrAdmin), 'author-or-admin disjunction should validate');
 
     assertFalse(validatePredicate({ p: 'and', args: [] }), 'empty conjunction should not validate');
 
@@ -207,24 +203,22 @@ async function testPredicates() {
         'add with wrong arity should not validate');
 
     // $row.<col> as an exists where-value (Tier 2 correlation)
-    assertTrue(validatePredicate({ p: 'exists', table: 'grants', where: { resource: '$row.resource' }, owner: '$author' }),
+    assertTrue(validatePredicate({ p: 'exists', table: 'grants', where: { resource: '$row.resource', grantee: '$author' } }),
         'exists correlating a where field to $row.<col> should validate');
     assertFalse(validatePredicate({ p: 'exists', table: 'grants', where: { resource: '$row.2bad' } }),
         'a malformed $row term in a where value should not validate (reserved)');
 }
 
 async function testPredicateContexts() {
-    // 'object' context: no subject row -> no owner atom, no $rowOwner anywhere
-    assertTrue(validatePredicate({ p: 'exists', table: 'users.caps', where: { label: 'deploy' }, owner: '$author' }, 'object'),
+    // 'object' context: no subject-row fields, but $author where-values are valid.
+    assertTrue(validatePredicate({ p: 'exists', table: 'users.caps', where: { label: 'deploy', grantee: '$author' } }, 'object'),
         'canDeploy-style predicate should validate in object context');
     assertFalse(validatePredicate({ p: 'owner', is: '$author' }, 'object'),
-        'owner atom should not validate in object context (no subject row)');
-    assertFalse(validatePredicate({ p: 'exists', table: 'caps', owner: '$rowOwner' }, 'object'),
-        '$rowOwner should not validate in object context');
+        'owner atom should not validate');
     assertFalse(validatePredicate({ p: 'exists', table: 'caps', where: { granted_to: '$rowOwner' } }, 'object'),
-        '$rowOwner in a where value should not validate in object context');
+        '$rowOwner in a where value should not validate');
     assertFalse(validatePredicate({
-        p: 'and', args: [{ p: 'true' }, { p: 'owner', is: '$author' }],
+        p: 'and', args: [{ p: 'true' }, { p: 'cmp', cmp: 'eq', left: { col: 'a' }, right: { lit: 1 } }],
     }, 'object'), 'context should be enforced through and/or nesting');
 
     // $row references have no subject row in object context
@@ -251,14 +245,14 @@ async function testSchemaTables() {
 
     assertFalse(validateSchemaTables([linesTable()]), 'local FK target missing from schema should not validate');
 
-    const crossGroup = docsTable([{ on: 'update', rule: { p: 'exists', table: 'users.caps', where: { label: 'write' }, owner: '$author' } }]);
+    const crossGroup = docsTable([{ on: 'update', rule: { p: 'exists', table: 'users.caps', where: { label: 'write', grantee: '$author' } } }]);
     assertTrue(validateSchemaTables([crossGroup]), 'qualified restriction target should be deferred to binding-time checking');
 
-    const localSearch = docsTable([{ on: 'all', rule: { p: 'exists', table: 'caps', where: { label: 'write' }, owner: '$author' } }]);
+    const localSearch = docsTable([{ on: 'all', rule: { p: 'exists', table: 'caps', where: { label: 'write', grantee: '$author' } } }]);
     assertTrue(validateSchemaTables([localSearch, capsTable()]),
         'local restriction over a pub column should validate');
 
-    const overNonPub = docsTable([{ on: 'insert', rule: { p: 'exists', table: 'caps', where: { note: 'x' }, owner: '$author' } }]);
+    const overNonPub = docsTable([{ on: 'insert', rule: { p: 'exists', table: 'caps', where: { note: 'x', grantee: '$author' } } }]);
     assertFalse(validateSchemaTables([overNonPub, capsTable()]),
         'restriction where over a non-pub column should not validate');
 
@@ -269,10 +263,10 @@ async function testSchemaTables() {
     const nestedAtoms = docsTable([{
         on: 'update',
         rule: { p: 'or', args: [
-            { p: 'owner', is: '$author' },
+            { p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: '$author' } },
             { p: 'and', args: [
-                { p: 'exists', table: 'caps', where: { label: 'write' }, owner: '$author' },
-                { p: 'exists', table: 'caps', owner: '$author' },
+                { p: 'exists', table: 'caps', where: { label: 'write', grantee: '$author' } },
+                { p: 'exists', table: 'caps', where: { grantee: '$author' } },
             ] },
         ] },
     }]);
@@ -282,7 +276,7 @@ async function testSchemaTables() {
     const nestedBadAtom = docsTable([{
         on: 'update',
         rule: { p: 'or', args: [
-            { p: 'owner', is: '$author' },
+            { p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: '$author' } },
             { p: 'exists', table: 'caps', where: { note: 'x' } },
         ] },
     }]);
@@ -325,7 +319,7 @@ async function testSchemaTables() {
             mutableResource: { type: 'string' },
             qty: { type: 'integer', readonly: true },
         },
-        restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'grants', where: { resource: '$row.' + subjectCol }, owner: '$author' } }],
+        restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'grants', where: { resource: '$row.' + subjectCol } } }],
     });
 
     assertTrue(validateSchemaTables([correlate('resource'), grants]),
@@ -378,7 +372,7 @@ async function testSlotWriteRules() {
 
     const setRestrictions: MigrationRule = {
         rule: 'set-restrictions', table: 'caps',
-        restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'caps', where: { label: 'admin' }, owner: '$author' } }],
+        restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'caps', where: { label: 'admin', grantee: '$author' } } }],
     };
     assertTrue(json.checkFormat(migrationRuleFormat, setRestrictions) && validateMigrationRule(setRestrictions),
         'set-restrictions should validate');
@@ -389,7 +383,7 @@ async function testSlotWriteRules() {
 
     const setGates = {
         rule: 'set-gates',
-        gates: { deploy: { p: 'exists', table: 'users.caps', where: { label: 'deploy' }, owner: '$author' } },
+        gates: { deploy: { p: 'exists', table: 'users.caps', where: { label: 'deploy', grantee: '$author' } } },
     };
     assertFalse(json.checkFormat(migrationRuleFormat, setGates as json.Literal),
         'set-gates should not exist (deploy gating is RTableGroup instance policy, not schema)');

@@ -80,7 +80,7 @@ async function createPermissionedPair(admin: OwnIdentity) {
             'write':  { managedBy: ['admin'] },
         },
     });
-    const capId = await rCapFactory.computeRootObjectId(capInit.payload, dummyCtx);
+    const capId = await rCapFactory.computeRootObjectId(capInit, dummyCtx);
 
     const setInit = await RSet.create({
         seed: 'integ-set',
@@ -108,7 +108,7 @@ async function testOneWaySyncPermissioned() {
     const { capInit, setInit, capId } = await createPermissionedPair(admin);
 
     const capTopic = capId as TopicId;
-    const setTopic = await rSetFactory.computeRootObjectId(setInit.payload, dummyCtx) as TopicId;
+    const setTopic = await rSetFactory.computeRootObjectId(setInit, dummyCtx) as TopicId;
     const topics = [capTopic, setTopic];
 
     const provider = new MemTransportProvider();
@@ -155,7 +155,7 @@ async function testCrossPeerWrite() {
     const { capInit, setInit, capId } = await createPermissionedPair(admin);
 
     const capTopic = capId as TopicId;
-    const setTopic = await rSetFactory.computeRootObjectId(setInit.payload, dummyCtx) as TopicId;
+    const setTopic = await rSetFactory.computeRootObjectId(setInit, dummyCtx) as TopicId;
     const topics = [capTopic, setTopic];
 
     const provider = new MemTransportProvider();
@@ -222,7 +222,7 @@ async function testForeignDepDeferral() {
     const { capInit, setInit, capId } = await createPermissionedPair(admin);
 
     const capTopic = capId as TopicId;
-    const setTopic = await rSetFactory.computeRootObjectId(setInit.payload, dummyCtx) as TopicId;
+    const setTopic = await rSetFactory.computeRootObjectId(setInit, dummyCtx) as TopicId;
     const topics = [capTopic, setTopic];
 
     const provider = new MemTransportProvider();
@@ -291,7 +291,7 @@ async function testRevocationPropagation() {
     const { capInit, setInit, capId } = await createPermissionedPair(admin);
 
     const capTopic = capId as TopicId;
-    const setTopic = await rSetFactory.computeRootObjectId(setInit.payload, dummyCtx) as TopicId;
+    const setTopic = await rSetFactory.computeRootObjectId(setInit, dummyCtx) as TopicId;
     const topics = [capTopic, setTopic];
 
     const provider = new MemTransportProvider();
@@ -384,7 +384,7 @@ async function testUnauthorizedPayloadRejected() {
     const { capInit, setInit, capId } = await createPermissionedPair(admin);
 
     const capTopic = capId as TopicId;
-    const setTopic = await rSetFactory.computeRootObjectId(setInit.payload, dummyCtx) as TopicId;
+    const setTopic = await rSetFactory.computeRootObjectId(setInit, dummyCtx) as TopicId;
     const topics = [capTopic, setTopic];
 
     const provider = new MemTransportProvider();

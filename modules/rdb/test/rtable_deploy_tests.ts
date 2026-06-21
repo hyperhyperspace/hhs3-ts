@@ -92,7 +92,7 @@ export const rtableDeployTests = {
                 // the still-permissive v1 schema (valid at its own position)
                 await group.deploy(v2, undefined, base);
                 const itemId = deriveRowId('i-1');
-                await items.insert('i-1', { name: 'thing' }, undefined, undefined, base);
+                await items.insert('i-1', { name: 'thing' }, undefined, base);
 
                 const merged = await groupFrontier(group);
                 assertFalse(await (await viewAt(group, 'items', merged, merged)).hasRow(itemId),
@@ -140,7 +140,7 @@ export const rtableDeployTests = {
                 // under v1 (no FK declared yet), so it is a live row at its position.
                 const ghost = deriveRowId('ghost-order');
                 const lineId = deriveRowId('l-1');
-                const lineEntry = await lines.insert('l-1', { order: ghost, qty: 1 }, undefined, undefined, base);
+                const lineEntry = await lines.insert('l-1', { order: ghost, qty: 1 }, undefined, base);
                 const linePos = version(lineEntry);
 
                 // branch A (concurrent): deploy an FK lines.order -> orders
@@ -172,7 +172,7 @@ export const rtableDeployTests = {
 
                 // branch B: insert an order under v1 (no `status` column)
                 const orderId = deriveRowId('o-1');
-                const orderEntry = await orders.insert('o-1', { customer: 'ada' }, undefined, undefined, base);
+                const orderEntry = await orders.insert('o-1', { customer: 'ada' }, undefined, base);
                 const orderPos = version(orderEntry);
 
                 // branch A (concurrent): deploy add-column status with a default
@@ -219,7 +219,7 @@ export const rtableDeployTests = {
                 const base = await groupFrontier(group);
 
                 await items.delete(itemId, undefined, base);                       // branch A: barrier delete
-                const otherEntry = await items.insert('i-2', { name: 'other' }, undefined, undefined, base);   // branch B
+                const otherEntry = await items.insert('i-2', { name: 'other' }, undefined, base);   // branch B
                 const otherPos = version(otherEntry);
 
                 const merged = await groupFrontier(group);
@@ -251,7 +251,7 @@ export const rtableDeployTests = {
                 await items.delete(itemId, undefined, base);
                 // branch B: a concurrent reader insert (the delete is genuinely
                 // concurrent to this position, not causal).
-                const otherEntry = await items.insert('i-2', { name: 'other' }, undefined, undefined, base);
+                const otherEntry = await items.insert('i-2', { name: 'other' }, undefined, base);
                 const otherPos = version(otherEntry);
 
                 // frontier with the delete + reader but NOT the deploy yet

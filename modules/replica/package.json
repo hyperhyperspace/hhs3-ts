@@ -23,6 +23,7 @@
     "@hyper-hyper-space/hhs3_json": "^0.1.0"
   },
   "devDependencies": {
+    "@hyper-hyper-space/hhs3_dag_sqlite": "^0.1.0",
     "@hyper-hyper-space/hhs3_std_types": "^0.1.0",
     "@hyper-hyper-space/hhs3_util": "^0.1.0",
     "typescript": "6.0.3",

@@ -77,7 +77,7 @@ export type InitRequest = {
 export type InitResponse = {
     type: 'init-response';
     objectId: B64Hash;
-    init: { type: string; payload: json.Literal };
+    createPayload: json.Literal;
 };
 
 // --- Union ---

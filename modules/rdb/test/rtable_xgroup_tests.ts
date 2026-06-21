@@ -195,7 +195,7 @@ export const rtableXGroupTests = {
                 // branch 1: write the order (FK -> the observed live identity)
                 const orders = await a.group.getTable('orders');
                 const orderId = deriveRowId('o-1');
-                await orders.insert('o-1', { customer: uId }, undefined, undefined, base);
+                await orders.insert('o-1', { customer: uId }, undefined, base);
 
                 // branch 2 (concurrent): delete the identity in B and observe the
                 // post-delete version via a BARRIER observe advance
@@ -244,7 +244,7 @@ export const rtableXGroupTests = {
             }
         },
         {
-            name: '[XGROUP06] cross-group exists restriction: void without a witness, valid with an observed one',
+            name: '[XGROUP06] cross-group exists restriction: reject without a witness, valid with an observed one',
             invoke: async () => {
                 const ctx = newCtx();
                 const b = await makeSchemaGroup(ctx, 'xg06-b', [open('caps', { label: { type: 'string', pub: true } })]);
@@ -258,11 +258,9 @@ export const rtableXGroupTests = {
 
                 const items = await a.group.getTable('items');
 
-                // no observed witness: the insert lands at write time but voids at view time
-                const voidId = deriveRowId('i-void');
-                await items.insert('i-void', { name: 'thing' });
-                assertFalse(await (await tableView(a.group, 'items')).hasRow(voidId),
-                    'a cross-group exists-gated insert with no observed witness is void');
+                // no observed witness: the insert fails hard validation
+                await expectThrow(() => items.insert('i-void', { name: 'thing' }),
+                    'a cross-group exists-gated insert with no observed witness is rejected');
 
                 // grant a cap in B and observe it; a later insert is valid
                 const caps = await b.group.getTable('caps');
@@ -273,8 +271,6 @@ export const rtableXGroupTests = {
                 await items.insert('i-ok', { name: 'thing' });
                 assertTrue(await (await tableView(a.group, 'items')).hasRow(okId),
                     'an insert with the cross-group witness observed is valid');
-                assertFalse(await (await tableView(a.group, 'items')).hasRow(voidId),
-                    'the earlier witness-less insert stays void (at-use, not retroactive)');
             }
         },
         {
@@ -385,7 +381,7 @@ export const rtableXGroupTests = {
                 // branch 1: use the (observed) witness
                 const items = await a.group.getTable('items');
                 const itemId = deriveRowId('i-1');
-                await items.insert('i-1', { name: 'thing' }, undefined, undefined, base);
+                await items.insert('i-1', { name: 'thing' }, undefined, base);
 
                 // branch 2 (concurrent): revoke the witness in B and observe the
                 // revoke via a BARRIER observation advance

@@ -1,4 +1,4 @@
-import { levelBackendSuite, topoBackendSuite, levelParitySuite, topoParitySuite, growthEventSuite, walWatcherSuite } from "./sqlite_dag_tests.js";
+import { levelBackendSuite, topoBackendSuite, levelParitySuite, topoParitySuite, growthEventSuite, walWatcherSuite, sqliteDagDbSuite } from "./sqlite_dag_tests.js";
 import { testing } from "@hyper-hyper-space/hhs3_util";
 
 async function main() {
@@ -13,6 +13,7 @@ async function main() {
     allTests.set(topoParitySuite.title, topoParitySuite.tests);
     allTests.set(growthEventSuite.title, growthEventSuite.tests);
     allTests.set(walWatcherSuite.title, walWatcherSuite.tests);
+    allTests.set(sqliteDagDbSuite.title, sqliteDagDbSuite.tests);
 
     console.log('Running tests for HHSv3 SQLite DAG module' + (filters.length > 0 ? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');
 

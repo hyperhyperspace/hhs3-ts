@@ -1,0 +1,112 @@
+import type { json } from "@hyper-hyper-space/hhs3_json";
+import {
+    ColumnDef, CreateRDbPayload, CreateRSchemaPayload, CreateTableGroupPayload, FKs,
+    InsertRowPayload, RDbImpl, RSchemaImpl, RTableGroupImpl, Restriction, TableDef,
+    deriveRowId,
+} from "@hyper-hyper-space/hhs3_rdb";
+
+import type { ColumnDecl, TableDecl, TableOption } from "../syntax/ast.js";
+import type { BoundCreateDatabase, BoundCreateSchema, BoundCreateStatement, BoundCreateTableGroup } from "../bind/bind.js";
+import { lowerRestrictionPredicate } from "./query.js";
+
+export type CreatePlan =
+    | { kind: 'create-database'; name: string; payload: CreateRDbPayload }
+    | { kind: 'create-schema'; name: string; payload: CreateRSchemaPayload }
+    | { kind: 'create-tablegroup'; name: string; payload: CreateTableGroupPayload };
+
+export async function compileCreate(bound: BoundCreateStatement): Promise<CreatePlan> {
+    if (bound.kind === 'create-database') return compileCreateDatabase(bound);
+    if (bound.kind === 'create-schema') return compileCreateSchema(bound);
+    return compileCreateTableGroup(bound);
+}
+
+async function compileCreateDatabase(bound: BoundCreateDatabase): Promise<CreatePlan> {
+    const payload = await RDbImpl.create({
+        seed: bound.seed,
+        name: bound.ast.name,
+    });
+    return { kind: 'create-database', name: bound.ast.name, payload };
+}
+
+async function compileCreateSchema(bound: BoundCreateSchema): Promise<CreatePlan> {
+    const payload = await RSchemaImpl.create({
+        seed: bound.seed,
+        name: bound.ast.name,
+        creators: bound.creators,
+        tables: bound.ast.tables.map(compileTable),
+    });
+    return { kind: 'create-schema', name: bound.ast.name, payload };
+}
+
+async function compileCreateTableGroup(bound: BoundCreateTableGroup): Promise<CreatePlan> {
+    const initialRows: { [table: string]: json.Literal[] } = {};
+    for (const row of bound.initialRows) {
+        const payload: InsertRowPayload = {
+            action: 'insert',
+            rowId: deriveRowId(row.uuid),
+            uuid: row.uuid,
+            values: row.values,
+        };
+        if (initialRows[row.table] === undefined) initialRows[row.table] = [];
+        initialRows[row.table].push(payload as unknown as json.Literal);
+    }
+
+    const payload = await RTableGroupImpl.create({
+        seed: bound.seed,
+        schemaRef: bound.schema.id,
+        schemaVersion: bound.schemaVersion,
+        ...(Object.keys(bound.bindings).length > 0 ? { bindings: bound.bindings } : {}),
+        ...(bound.ast.idProvider !== undefined ? { idProvider: bound.ast.idProvider } : {}),
+        ...(bound.ast.canDeploy !== undefined ? { canDeploy: lowerRestrictionPredicate(bound.ast.canDeploy) } : {}),
+        ...(Object.keys(initialRows).length > 0 ? { initialRows } : {}),
+    });
+
+    return { kind: 'create-tablegroup', name: bound.ast.name, payload };
+}
+
+export function compileTable(table: TableDecl): TableDef {
+    const columns: { [column: string]: ColumnDef } = {};
+    const fks: FKs = {};
+    const restrictions: Restriction[] = [];
+    let concurrentDeletes: boolean | undefined;
+    let idProvider: TableDef['idProvider'];
+
+    for (const column of table.columns) {
+        columns[column.name] = compileColumn(column);
+        if (column.references !== undefined) fks[column.name] = column.references;
+    }
+
+    for (const option of table.options) {
+        switch (option.kind) {
+            case 'concurrent-deletes':
+                concurrentDeletes = option.value;
+                break;
+            case 'identity-provider':
+                idProvider = { keyIdColumn: option.keyIdColumn, publicKeyColumn: option.publicKeyColumn };
+                break;
+            case 'allow-rule':
+                restrictions.push({ on: option.op, rule: lowerRestrictionPredicate(option.predicate) });
+                break;
+        }
+    }
+
+    const def: TableDef = { name: table.name, columns };
+    if (Object.keys(fks).length > 0) def.fks = fks;
+    if (restrictions.length > 0) def.restrictions = restrictions;
+    if (concurrentDeletes !== undefined) def.concurrentDeletes = concurrentDeletes;
+    if (idProvider !== undefined) def.idProvider = idProvider;
+    return def;
+}
+
+export function compileColumn(column: ColumnDecl): ColumnDef {
+    const def: ColumnDef = { type: column.type };
+    if (column.nullable) def.nullable = true;
+    if (column.defaultValue !== undefined) {
+        if (column.defaultValue.kind !== 'literal') throw new Error('column DEFAULT must be a literal');
+        if (column.defaultValue.value === null) throw new Error('column DEFAULT NULL is not supported by RDb json.Literal payloads');
+        def.default = column.defaultValue.value;
+    }
+    if (column.pub) def.pub = true;
+    if (column.readonly) def.readonly = true;
+    return def;
+}

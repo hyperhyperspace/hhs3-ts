@@ -58,7 +58,7 @@ function createMesh(
 
 async function testFetchAndSync() {
     const rsetInit = await RSet.create({ seed: 'fo00-fetch', initialElements: [], hashAlgorithm: 'sha256' });
-    const setId = await rSetFactory.computeRootObjectId(rsetInit.payload, dummyCtx) as TopicId;
+    const setId = await rSetFactory.computeRootObjectId(rsetInit, dummyCtx) as TopicId;
 
     const provider = new MemTransportProvider();
     const aliceNoise = await await createIdentity(SIGNING_ED25519, sha256);
@@ -119,7 +119,7 @@ async function testFetchPermissionedPair() {
             'write':  { managedBy: ['admin'] },
         },
     });
-    const capId = await rCapFactory.computeRootObjectId(capInit.payload, dummyCtx);
+    const capId = await rCapFactory.computeRootObjectId(capInit, dummyCtx);
 
     const setInit = await RSet.create({
         seed: 'fo01-set',
@@ -128,7 +128,7 @@ async function testFetchPermissionedPair() {
         capabilityRef: capId,
         capRequirements: { add: 'write', delete: 'write' },
     });
-    const setId = await rSetFactory.computeRootObjectId(setInit.payload, dummyCtx);
+    const setId = await rSetFactory.computeRootObjectId(setInit, dummyCtx);
 
     const provider = new MemTransportProvider();
     const aliceNoise = await await createIdentity(SIGNING_ED25519, sha256);
@@ -191,7 +191,7 @@ async function testFetchPermissionedPair() {
 
 async function testFetchIdempotent() {
     const rsetInit = await RSet.create({ seed: 'fo02-idem', initialElements: ['alpha'], hashAlgorithm: 'sha256' });
-    const setId = await rSetFactory.computeRootObjectId(rsetInit.payload, dummyCtx);
+    const setId = await rSetFactory.computeRootObjectId(rsetInit, dummyCtx);
 
     const provider = new MemTransportProvider();
     const aliceNoise = await await createIdentity(SIGNING_ED25519, sha256);
@@ -230,7 +230,7 @@ async function testFetchIdempotent() {
 
 async function testFetchUnknownType() {
     const rsetInit = await RSet.create({ seed: 'fo03-unknown', initialElements: [], hashAlgorithm: 'sha256' });
-    const setId = await rSetFactory.computeRootObjectId(rsetInit.payload, dummyCtx);
+    const setId = await rSetFactory.computeRootObjectId(rsetInit, dummyCtx);
 
     const provider = new MemTransportProvider();
     const aliceNoise = await await createIdentity(SIGNING_ED25519, sha256);
@@ -272,7 +272,7 @@ async function testFetchUnknownType() {
 
 async function testFetchTimeout() {
     const rsetInit = await RSet.create({ seed: 'fo04-timeout', initialElements: [], hashAlgorithm: 'sha256' });
-    const setId = await rSetFactory.computeRootObjectId(rsetInit.payload, dummyCtx);
+    const setId = await rSetFactory.computeRootObjectId(rsetInit, dummyCtx);
 
     const provider = new MemTransportProvider();
     const bobNoise = await await createIdentity(SIGNING_ED25519, sha256);

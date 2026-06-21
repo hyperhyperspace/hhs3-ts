@@ -4,6 +4,7 @@ import { dag, Dag } from "@hyper-hyper-space/hhs3_dag";
 import { json } from "@hyper-hyper-space/hhs3_json";
 
 import { CausalDag, ScopedDag } from "./dag/dag_nesting.js";
+import { ValidationResult, validationFailure, validationOk } from "./validation.js";
 
 export const MAX_TYPE_LENGTH = 128;
 
@@ -11,6 +12,32 @@ export type Version = dag.Position;
 export const emptyVersion: () => Version = dag.emptyPosition;
 export const version: (...hashes: B64Hash[]) => Version = dag.position;
 export type Payload = json.Literal;
+
+// Format for the MVT type id on a genesis create payload. Each type's
+// create*Format should pin this to a constant for that type id.
+export function createPayloadTypeFormat(typeId: string): json.Format {
+    return [json.Type.Constant, typeId];
+}
+
+export function createPayloadTypeFieldFormat(): json.Format {
+    return [json.Type.BoundedString, MAX_TYPE_LENGTH];
+}
+
+export function extractCreatePayloadType(payload: Payload): string | undefined {
+    if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+        return undefined;
+    }
+    const p = payload as json.LiteralMap;
+    if (p['action'] !== 'create') return undefined;
+    const type = p['type'];
+    return typeof type === 'string' ? type : undefined;
+}
+
+export function validateCreatePayloadType(payload: Payload, expectedTypeId: string): ValidationResult {
+    return extractCreatePayloadType(payload) === expectedTypeId
+        ? validationOk()
+        : validationFailure(`create payload type is not '${expectedTypeId}'`);
+}
 
 export type ForeignDep = {
     dagId: B64Hash;
@@ -50,7 +77,7 @@ export type RObject = {
     getId(): B64Hash;
     getType(): string;
 
-    validatePayload(payload: Payload, at: Version): Promise<boolean>;
+    validatePayload(payload: Payload, at: Version): Promise<ValidationResult>;
     applyPayload(payload: Payload, at: Version): Promise<B64Hash>;
 
     getView(at?: Version, from?: Version): Promise<View>;
@@ -87,11 +114,6 @@ export type LoadObjectOptions = {
     backendLabel?: string;
 };
 
-export type RObjectInit = {
-    type: string;
-    payload: Payload;
-}
-
 export type RObjectConfig = {
     selfValidate?: boolean;
 };
@@ -107,7 +129,7 @@ export type RContext = {
     getBackendLabel(id: B64Hash): Promise<string | undefined>;
     getMesh(label: string): any;
 
-    createObject(init: RObjectInit, backendLabel?: string): Promise<RObject>;
+    createObject(createPayload: Payload, backendLabel?: string): Promise<RObject>;
     unregisterObject(id: B64Hash): Promise<void>;
 
     // Bootstrap a not-yet-present object from the mesh (used by sync roots that
@@ -119,7 +141,7 @@ export type RContext = {
 export type RObjectFactory = {
     computeRootObjectId: (createPayload: Payload, ctx: RContext, parent?: NestingParent) => Promise<B64Hash>;
     
-    validateCreationPayload: (createPayload: Payload, ctx: RContext, parent?: NestingParent) => Promise<boolean>;
+    validateCreationPayload: (createPayload: Payload, ctx: RContext, parent?: NestingParent) => Promise<ValidationResult>;
     executeCreationPayload: (createPayload: Payload, ctx: RContext, scopedDag: ScopedDag) => Promise<B64Hash>;
     
     loadObject: (id: B64Hash, ctx: RContext, opts?: LoadObjectOptions) => Promise<RObject>;

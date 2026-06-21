@@ -200,7 +200,11 @@ encrypt the channel, and frame topic messages per the mux format.
 - Derive `KeyId` from public keys per the identity format in the `mesh`
 spec.
 - Use the object ID (derived from the creation payload) as the sync
-topic and DAG ID.
+topic and DAG ID. Root-object genesis create payloads MUST include a
+`type` field equal to the object's MVT type id (same string as
+`getType()` and the registry key). `createObject` accepts this payload
+directly; sync init-response sends it as `createPayload`, making persisted roots
+self-describing for cold reopen.
 
 Discovery (`mesh_tracker_client`, `mesh_tracker`) is optional. Peers
 that rendezvous by other means need not implement the tracker protocol.

@@ -28,7 +28,10 @@ import { B64Hash, HASH_SHA256 } from "@hyper-hyper-space/hhs3_crypto";
 import type { KeyId, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, MetaProps, position, EntryMetaFilter, Position, MetaContainsValues } from "@hyper-hyper-space/hhs3_dag";
 
-import { Payload, RObject, RObjectFactory, RObjectInit, RContext, NestingParent, Version, ForeignDep, LoadObjectOptions } from "@hyper-hyper-space/hhs3_mvt";
+import {
+    Payload, RObject, RObjectFactory, RContext, NestingParent, Version, ForeignDep, LoadObjectOptions,
+    formatValidationFailure, validationOk, ValidationRejectedError, ValidationResult,
+} from "@hyper-hyper-space/hhs3_mvt";
 import { DagScope, NestedScopedDag, RootScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
 import { isRefAdvancePayload, extractRefVersion, prepareRefAdvance, createRefAdvanceMeta } from "@hyper-hyper-space/hhs3_mvt";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
@@ -48,7 +51,7 @@ import { RSetDelta, RSetDeltaStrategy, RSetDeltaAccumulator, computeRSetDelta } 
 
 import { RAddEvent, RDeleteEvent, RSetEvent } from "./events.js";
 
-import { CreateSetPayload } from "./payload.js";
+import { CreateSetPayload, RSET_TYPE_ID } from "./payload.js";
 import { AddElmtPayload } from "./payload.js";
 import { DeleteElmtPayload } from "./payload.js";
 import { UpdateElmtPayload } from "./payload.js";
@@ -137,6 +140,7 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
 
         const createPayload: CreateSetPayload = {
             action: 'create',
+            type: RSET_TYPE_ID,
             seed: options.seed,
             initialElements: options.initialElements || [],
             hashAlgorithm: options.hashAlgorithm || 'sha256',
@@ -174,10 +178,10 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
             createPayload['capRequirements'] = options.capRequirements;
         }
 
-        return {type: RSetImpl.typeId, payload: createPayload} as RObjectInit;
+        return createPayload;
     }
 
-    static typeId = "hhs/set_v1";
+    static typeId = RSET_TYPE_ID;
 
     createOpId: B64Hash;
     createOp: CreateSetPayload;
@@ -378,8 +382,11 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
     }
 
     private async applyValidatedPayload(payload: Payload, at: Version): Promise<B64Hash> {
-        if (this.selfValidate() && !await this.validatePayload(payload, at)) {
-            throw new Error("Attempted to apply an invalid payload");
+        if (this.selfValidate()) {
+            const result = await this.validatePayload(payload, at);
+            if (!result.valid) {
+                throw new ValidationRejectedError(formatValidationFailure(result.why), result.why);
+            }
         }
 
         return this.applyPayload(payload, at);
@@ -387,7 +394,7 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
 
     // RObject interface
 
-    async validatePayload(payload: json.Literal, at: Version): Promise<boolean> {
+    async validatePayload(payload: json.Literal, at: Version): Promise<ValidationResult> {
         return validateRSetPayload(payload, { mode: 'op', set: this, at });
     }
 
@@ -786,9 +793,9 @@ class NestedElementScope implements DagScope {
         return wrappedFilter;
     }
 
-    async validateWrappedPayload(wrappedPayload: json.Literal, _wrappedMeta: MetaProps, at: Position): Promise<boolean> {
+    async validateWrappedPayload(wrappedPayload: json.Literal, _wrappedMeta: MetaProps, at: Position): Promise<ValidationResult> {
         if (!this.parent.selfValidate()) {
-            return true;
+            return validationOk();
         }
 
         return this.parent.validatePayload(wrappedPayload, at);

@@ -4,6 +4,7 @@
 //   validate_ops.ts              — position-dependent semantics (signatures, applicability)
 
 import { json } from "@hyper-hyper-space/hhs3_json";
+import { validationFailure, validationOk, ValidationResult } from "@hyper-hyper-space/hhs3_mvt";
 
 import {
     createRSchemaFormat, CreateRSchemaPayload,
@@ -47,12 +48,11 @@ export function columnValueMatchesType(value: json.Literal, type: ColumnType): b
 
 function isValidTerm(value: json.Literal, context: PredicateContext): boolean {
     if (!ID_TERMS.includes(value as IdTerm)) return false;
-    if (value === '$rowOwner' && context === 'object') return false;
     return true;
 }
 
 // A `where` value that is a reserved ($-prefixed) string must be either a valid
-// identity term ($author / $rowOwner) or a subject-row field term ($row.<col>);
+// identity term ($author) or a subject-row field term ($row.<col>);
 // $row.* is row-context only. Non-$ values are plain literals (checked here as
 // "not reserved", i.e. accepted).
 function isValidWhereValue(value: json.Literal, context: PredicateContext): boolean {
@@ -105,28 +105,20 @@ export function validatePredicate(pred: json.Literal, context: PredicateContext 
         case 'true':
         case 'false':
             return keys.length === 1;
-        case 'owner':
-            if (context !== 'row') return false;   // no subject row to own
-            return keys.length === 2 && isValidTerm(e['is'], context);
         case 'exists': {
             if (typeof e['table'] !== 'string' || !isValidTableRef(e['table'])) return false;
-            if (e['where'] !== undefined) {
-                if (typeof e['where'] !== 'object' || e['where'] === null || Array.isArray(e['where'])) return false;
-                const where = e['where'] as json.LiteralMap;
-                const fields = Object.keys(where);
-                if (fields.length > MAX_WHERE_FIELDS) return false;
-                for (const field of fields) {
-                    if (!isValidName(field)) return false;
-                    // strings starting with '$' are reserved for terms
-                    // ($author / $rowOwner / $row.<col>); others are literals
-                    if (!isValidWhereValue(where[field], context)) return false;
-                }
+            if (typeof e['where'] !== 'object' || e['where'] === null || Array.isArray(e['where'])) return false;
+            const where = e['where'] as json.LiteralMap;
+            const fields = Object.keys(where);
+            if (fields.length === 0 || fields.length > MAX_WHERE_FIELDS) return false;
+            for (const field of fields) {
+                if (!isValidName(field)) return false;
+                // strings starting with '$' are reserved for terms
+                // ($author / $row.<col>); others are literals
+                if (!isValidWhereValue(where[field], context)) return false;
             }
-            if (e['owner'] !== undefined && !isValidTerm(e['owner'], context)) return false;
-            // a vacuous exists (no where/owner) is meaningless
-            if (e['where'] === undefined && e['owner'] === undefined) return false;
             for (const key of keys) {
-                if (!['p', 'table', 'where', 'owner'].includes(key)) return false;
+                if (!['p', 'table', 'where'].includes(key)) return false;
             }
             return true;
         }
@@ -209,7 +201,7 @@ export function collectRowFieldRefs(pred: Predicate, out: Set<string> = new Set(
 
 // Column-type lookup for the declaring table (operand type-checking).
 function columnTypeOf(columns: { [c: string]: ColumnDef }): (column: string) => ColumnType | undefined {
-    return (column) => columns[column]?.type;
+    return (column) => column === 'author' ? 'string' : columns[column]?.type;
 }
 
 // Tier 1+2 column-level checks for one restriction rule declared on `def`:
@@ -224,6 +216,7 @@ export function checkPredicateColumns(
     resolveLocalTable: (table: string) => TableDef | undefined,
 ): boolean {
     for (const col of collectRowFieldRefs(rule)) {
+        if (col === 'author') continue;
         const cd = def.columns[col];
         if (cd === undefined || !(cd.readonly ?? false)) return false;
     }
@@ -340,6 +333,7 @@ export function validateSchemaTables(tables: TableDef[]): boolean {
 
         if (atom.where !== undefined) {
             for (const field of Object.keys(atom.where)) {
+                if (field === 'author') continue;
                 const column = target.columns[field];
                 if (column === undefined) return false;
                 if (!(column.pub ?? false)) return false;
@@ -390,27 +384,31 @@ export function validateMigrationRule(rule: MigrationRule): boolean {
     }
 }
 
-export function validateRSchemaPayloadFormat(payload: json.Literal): boolean {
-    if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return false;
+export function validateRSchemaPayloadFormat(payload: json.Literal): ValidationResult {
+    if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+        return validationFailure("RSchema payload must be an object");
+    }
 
     const action = (payload as json.LiteralMap)['action'];
 
     if (action === 'create') {
-        if (!json.checkFormat(createRSchemaFormat, payload)) return false;
+        if (!json.checkFormat(createRSchemaFormat, payload)) return validationFailure("RSchema create payload format is invalid");
         const create = payload as CreateRSchemaPayload;
-        if (create.creators.length === 0) return false;
-        return validateSchemaTables(create.tables);
+        if (create.creators.length === 0) return validationFailure("RSchema create payload must have at least one creator");
+        return validateSchemaTables(create.tables)
+            ? validationOk()
+            : validationFailure("RSchema create tables are invalid");
     }
 
     if (action === 'schema-update') {
-        if (!json.checkFormat(schemaUpdateFormat, payload)) return false;
+        if (!json.checkFormat(schemaUpdateFormat, payload)) return validationFailure("schema-update payload format is invalid");
         const update = payload as SchemaUpdatePayload;
-        if (update.migration.length === 0) return false;
-        for (const rule of update.migration) {
-            if (!validateMigrationRule(rule)) return false;
+        if (update.migration.length === 0) return validationFailure("schema-update migration is empty");
+        for (const [index, rule] of update.migration.entries()) {
+            if (!validateMigrationRule(rule)) return validationFailure(`schema-update migration rule ${index} is invalid`);
         }
-        return true;
+        return validationOk();
     }
 
-    return false;
+    return validationFailure(`unknown RSchema action '${String(action)}'`);
 }

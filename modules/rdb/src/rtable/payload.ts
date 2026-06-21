@@ -28,9 +28,8 @@ export type RowOpPayload = InsertRowPayload | UpdateRowPayload | DeleteRowPayloa
 
 export type InsertRowPayload = {
     action: 'insert';
-    rowId: B64Hash;                               // must equal deriveRowId(uuid, owner)
+    rowId: B64Hash;                               // must equal deriveRowId(uuid, author)
     uuid: string;
-    owner?: KeyId;                                // absent = anonymous row (v1: at most one owner)
     values: { [column: string]: json.Literal };
     author?: KeyId;                               // authored variant (signature verified at validation)
     signature?: string;
@@ -40,7 +39,6 @@ export const insertRowFormat: json.Format = {
     action: [json.Type.Constant, 'insert'],
     rowId: [json.Type.BoundedString, MAX_HASH_LENGTH],
     uuid: [json.Type.BoundedString, MAX_UUID_LENGTH],
-    owner: [json.Type.Option, [json.Type.BoundedString, MAX_KEY_ID_LENGTH]],
     values: [json.Type.BoundedMap, [json.Type.BoundedString, MAX_NAME_LENGTH], json.Type.Something, MAX_COLUMNS],
     author: [json.Type.Option, [json.Type.BoundedString, MAX_KEY_ID_LENGTH]],
     signature: [json.Type.Option, [json.Type.BoundedString, MAX_SIGNATURE_LENGTH]],

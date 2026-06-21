@@ -176,7 +176,7 @@ export const rdbSyncTests = {
                     creators: [],
                     tables: [open('t', { name: { type: 'string' } })],
                 });
-                const absentId = await rSchemaFactory.computeRootObjectId(absentInit.payload, ctx);
+                const absentId = await rSchemaFactory.computeRootObjectId(absentInit, ctx);
 
                 await rdb.addSchema(absentId);
 

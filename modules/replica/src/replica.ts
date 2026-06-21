@@ -2,8 +2,9 @@ import { B64Hash, BasicCrypto, HashSuite } from "@hyper-hyper-space/hhs3_crypto"
 import { Dag } from "@hyper-hyper-space/hhs3_dag";
 import type { Mesh, TopicId } from "@hyper-hyper-space/hhs3_mesh";
 import {
-    RContext, RObject, RObjectInit, RObjectConfig, RObjectFactory,
+    RContext, RObject, Payload, RObjectConfig, RObjectFactory,
     RObjectTypeRegistry, TypeRegistryMap, RootScopedDag,
+    extractCreatePayloadType, formatValidationFailure, ValidationRejectedError,
 } from "@hyper-hyper-space/hhs3_mvt";
 import { fetchInit } from "@hyper-hyper-space/hhs3_sync";
 
@@ -119,10 +120,15 @@ export class Replica implements RContext {
 
     // --- Object creation (idempotent) ---
 
-    async createObject(init: RObjectInit, backendLabel: string = 'default'): Promise<RObject> {
-        const factory = await this.registry.lookup(init.type);
+    async createObject(createPayload: Payload, backendLabel: string = 'default'): Promise<RObject> {
+        const typeId = extractCreatePayloadType(createPayload);
+        if (typeId === undefined) {
+            throw new Error('create payload missing type');
+        }
 
-        const id = await factory.computeRootObjectId(init.payload, this, undefined);
+        const factory = await this.registry.lookup(typeId);
+
+        const id = await factory.computeRootObjectId(createPayload, this, undefined);
 
         const cached = this.objects.get(id);
         if (cached !== undefined) {
@@ -134,18 +140,18 @@ export class Replica implements RContext {
             throw new Error(`No backend attached with label '${backendLabel}'`);
         }
 
-        const valid = await factory.validateCreationPayload(init.payload, this, undefined);
-        if (!valid) {
-            throw new Error('Invalid creation payload');
+        const result = await factory.validateCreationPayload(createPayload, this, undefined);
+        if (!result.valid) {
+            throw new ValidationRejectedError(formatValidationFailure(result.why), result.why);
         }
 
-        const { dag, created } = await backend.getOrCreateDag(id, { type: init.type });
+        const { dag, created } = await backend.getOrCreateDag(id, { type: typeId });
         this.backendByDagId.set(id, backendLabel);
         this.dagCache.set(`${backendLabel}:${id}`, dag);
 
         if (created) {
             const scopedDag = new RootScopedDag(dag);
-            await factory.executeCreationPayload(init.payload, this, scopedDag);
+            await factory.executeCreationPayload(createPayload, this, scopedDag);
         }
 
         const obj = await factory.loadObject(id, this, { backendLabel });
@@ -172,8 +178,8 @@ export class Replica implements RContext {
 
         try {
             swarm.activate();
-            const init = await fetchInit(id, [swarm], this.hashSuite, opts?.timeoutMs);
-            return await this.createObject(init, backendLabel);
+            const createPayload = await fetchInit(id, [swarm], this.hashSuite, opts?.timeoutMs);
+            return await this.createObject(createPayload, backendLabel);
         } finally {
             swarm.destroy();
         }

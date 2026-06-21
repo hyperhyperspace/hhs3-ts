@@ -6,23 +6,23 @@ async function testDeterminism() {
     assertTrue(deriveRowId('uuid-1') === deriveRowId('uuid-1'), 'anonymous derivation should be deterministic');
     assertTrue(
         deriveRowId('uuid-1', 'alice') === deriveRowId('uuid-1', 'alice'),
-        'owned derivation should be deterministic');
+        'authored derivation should be deterministic');
 }
 
-async function testOwnerPartitionsIdSpace() {
+async function testAuthorPartitionsIdSpace() {
     const anonymous = deriveRowId('uuid-1');
-    const aliceOwned = deriveRowId('uuid-1', 'alice');
-    const bobOwned = deriveRowId('uuid-1', 'bob');
+    const aliceAuthored = deriveRowId('uuid-1', 'alice');
+    const bobAuthored = deriveRowId('uuid-1', 'bob');
 
-    assertTrue(anonymous !== aliceOwned, 'anonymous and owned ids should differ');
-    assertTrue(aliceOwned !== bobOwned, 'different owners should produce different ids');
+    assertTrue(anonymous !== aliceAuthored, 'anonymous and authored ids should differ');
+    assertTrue(aliceAuthored !== bobAuthored, 'different authors should produce different ids');
 }
 
 async function testUuidAffectsId() {
     assertTrue(deriveRowId('uuid-1') !== deriveRowId('uuid-2'), 'different uuids should produce different ids');
     assertTrue(
         deriveRowId('uuid-1', 'alice') !== deriveRowId('uuid-2', 'alice'),
-        'different uuids should produce different ids for the same owner');
+        'different uuids should produce different ids for the same author');
 }
 
 async function testCheckRowId() {
@@ -30,19 +30,19 @@ async function testCheckRowId() {
 
     assertTrue(checkRowId(rowId, 'uuid-1', 'alice'), 'matching row id should verify');
     assertFalse(checkRowId(rowId, 'uuid-2', 'alice'), 'wrong uuid should fail verification');
-    assertFalse(checkRowId(rowId, 'uuid-1', 'bob'), 'wrong owner should fail verification');
-    assertFalse(checkRowId(rowId, 'uuid-1'), 'anonymous claim over owned id should fail verification');
+    assertFalse(checkRowId(rowId, 'uuid-1', 'bob'), 'wrong author should fail verification');
+    assertFalse(checkRowId(rowId, 'uuid-1'), 'anonymous claim over authored id should fail verification');
 
     const anonymousId = deriveRowId('uuid-1');
     assertTrue(checkRowId(anonymousId, 'uuid-1'), 'matching anonymous row id should verify');
-    assertFalse(checkRowId(anonymousId, 'uuid-1', 'alice'), 'owned claim over anonymous id should fail verification');
+    assertFalse(checkRowId(anonymousId, 'uuid-1', 'alice'), 'authored claim over anonymous id should fail verification');
 }
 
 export const rowIdTests = {
     title: '[ROWID] Row id derivation tests',
     tests: [
         { name: '[ROWID01] Determinism', invoke: testDeterminism },
-        { name: '[ROWID02] Owner partitions id space', invoke: testOwnerPartitionsIdSpace },
+        { name: '[ROWID02] Author partitions id space', invoke: testAuthorPartitionsIdSpace },
         { name: '[ROWID03] Uuid affects id', invoke: testUuidAffectsId },
         { name: '[ROWID04] Row id verification', invoke: testCheckRowId },
     ],

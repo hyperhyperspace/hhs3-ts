@@ -15,8 +15,6 @@
 // writes.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
-import type { KeyId } from "@hyper-hyper-space/hhs3_crypto";
-
 import type { ColumnType, CmpOp, Operand, StrOp } from "../rschema/payload.js";
 import { CMP_OPS, STR_OPS, ARITH_FNS } from "../rschema/payload.js";
 import { evalOperand, compareOperands, cmpTypesOk, strTypesOk } from "../rschema/expr.js";
@@ -26,14 +24,12 @@ import type { Row, RowValues } from "./interfaces.js";
 
 // Two-valued logic: an operand that does not resolve (missing column value)
 // makes its cmp/str atom false; `not` negates normally (no SQL three-valued
-// NULL). owner / anonymous are first-class atoms so they compose under and/or
-// and the engine can push `owner` down to the owner index.
+// NULL). The implicit `author` system column can be queried like a string
+// column.
 export type RowFilter =
     | { p: 'true' }
     | { p: 'cmp'; cmp: CmpOp; left: Operand; right: Operand }
     | { p: 'str'; str: StrOp; value: Operand; sub: Operand }
-    | { p: 'owner'; is: KeyId }            // row owned by this key
-    | { p: 'anonymous' }                   // row has no owner
     | { p: 'not'; arg: RowFilter }         // query-only (forbidden in restrictions)
     | { p: 'and'; args: RowFilter[] }
     | { p: 'or'; args: RowFilter[] };
@@ -55,8 +51,8 @@ export type ColumnTypes = { [column: string]: ColumnType };
 // Evaluation
 // ---------------------------------------------------------------------------
 
-export function evalRowFilter(filter: RowFilter, row: { values: RowValues; owner?: KeyId }): boolean {
-    const lookup = (column: string): json.Literal | undefined => row.values[column];
+export function evalRowFilter(filter: RowFilter, row: Row): boolean {
+    const lookup = (column: string): json.Literal | undefined => column === 'author' ? row.author : row.values[column];
 
     switch (filter.p) {
         case 'true':
@@ -75,10 +71,6 @@ export function evalRowFilter(filter: RowFilter, row: { values: RowValues; owner
             if (filter.str === 'suffix') return v.endsWith(s);
             return v.includes(s);
         }
-        case 'owner':
-            return row.owner !== undefined && row.owner === filter.is;
-        case 'anonymous':
-            return row.owner === undefined;
         case 'not':
             return !evalRowFilter(filter.arg, row);
         case 'and':
@@ -108,8 +100,8 @@ function compareValues(a: json.Literal, b: json.Literal): number {
 export function orderRows(rows: Row[], orderBy: OrderBy[]): Row[] {
     return rows.slice().sort((x, y) => {
         for (const { column, dir } of orderBy) {
-            const av = x.values[column];
-            const bv = y.values[column];
+            const av = column === 'author' ? x.author : x.values[column];
+            const bv = column === 'author' ? y.author : y.values[column];
             const aMissing = av === undefined;
             const bMissing = bv === undefined;
             if (aMissing || bMissing) {
@@ -124,17 +116,17 @@ export function orderRows(rows: Row[], orderBy: OrderBy[]): Row[] {
     });
 }
 
-// Projection: keep the row's identity (rowId / uuid / owner) and restrict
+// Projection: keep the row's identity (rowId / uuid / author) and restrict
 // `values` to the selected columns. A select naming a column the row does not
 // carry simply omits it (no error — validation already proved the columns
 // exist in the schema).
 export function projectRow(row: Row, select: string[]): Row {
     const values: RowValues = {};
     for (const column of select) {
-        if (row.values[column] !== undefined) values[column] = row.values[column];
+        if (column !== 'author' && row.values[column] !== undefined) values[column] = row.values[column];
     }
     const projected: Row = { rowId: row.rowId, uuid: row.uuid, values };
-    if (row.owner !== undefined) projected.owner = row.owner;
+    if (row.author !== undefined) projected.author = row.author;
     return projected;
 }
 
@@ -156,7 +148,7 @@ function validateOperand(op: Operand, columns: ColumnTypes, depth: number): void
     }
     if ('col' in op) {
         if (typeof op.col !== 'string') throw new Error("query operand column must be a string");
-        if (!(op.col in columns)) throw new Error(`unknown column '${op.col}' in query filter`);
+        if (!(op.col in columns) && op.col !== 'author') throw new Error(`unknown column '${op.col}' in query filter`);
         return;
     }
     if ('fn' in op) {
@@ -186,7 +178,7 @@ function validateRowFilter(filter: RowFilter, columns: ColumnTypes, depth: numbe
         throw new Error("malformed query filter");
     }
 
-    const typeOf = (column: string): ColumnType | undefined => columns[column];
+    const typeOf = (column: string): ColumnType | undefined => column === 'author' ? 'string' : columns[column];
 
     switch (filter.p) {
         case 'true':
@@ -209,11 +201,6 @@ function validateRowFilter(filter: RowFilter, columns: ColumnTypes, depth: numbe
             }
             return;
         }
-        case 'owner':
-            if (typeof filter.is !== 'string') throw new Error("query 'owner' filter requires a key-id string");
-            return;
-        case 'anonymous':
-            return;
         case 'not':
             validateRowFilter(filter.arg, columns, depth + 1);
             return;
@@ -246,7 +233,7 @@ export function validateRowQuery(q: RowQuery, columns: ColumnTypes): void {
     if (q.select !== undefined) {
         if (!Array.isArray(q.select)) throw new Error("query 'select' must be an array of column names");
         for (const column of q.select) {
-            if (typeof column !== 'string' || !(column in columns)) {
+            if (typeof column !== 'string' || (!(column in columns) && column !== 'author')) {
                 throw new Error(`unknown column '${String(column)}' in query select`);
             }
         }
@@ -255,7 +242,7 @@ export function validateRowQuery(q: RowQuery, columns: ColumnTypes): void {
     if (q.orderBy !== undefined) {
         if (!Array.isArray(q.orderBy)) throw new Error("query 'orderBy' must be an array");
         for (const ob of q.orderBy) {
-            if (ob === null || typeof ob !== 'object' || typeof ob.column !== 'string' || !(ob.column in columns)) {
+            if (ob === null || typeof ob !== 'object' || typeof ob.column !== 'string' || (!(ob.column in columns) && ob.column !== 'author')) {
                 throw new Error(`unknown column '${String(ob?.column)}' in query orderBy`);
             }
             if (ob.dir !== undefined && ob.dir !== 'asc' && ob.dir !== 'desc') {

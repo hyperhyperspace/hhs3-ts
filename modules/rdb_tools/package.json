@@ -1,0 +1,39 @@
+{
+  "name": "@hyper-hyper-space/hhs3_rdb_tools",
+  "version": "0.1.0",
+  "description": "REPL and script tooling for HHSv3 RDb",
+  "type": "module",
+  "source": "src/index.ts",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "bin": {
+    "rdb": "./dist/bin/rdb.js"
+  },
+  "scripts": {
+    "test": "node --import ../../register.mjs ./test/run_tests.ts",
+    "debug": "node --inspect-brk --import ../../register.mjs ./test/run_tests.ts",
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist test-build"
+  },
+  "author": "Santiago Bazerque",
+  "license": "MIT",
+  "dependencies": {
+    "@hyper-hyper-space/hhs3_crypto": "^0.1.0",
+    "@hyper-hyper-space/hhs3_dag": "^0.1.0",
+    "@hyper-hyper-space/hhs3_dag_sql": "^0.1.0",
+    "@hyper-hyper-space/hhs3_dag_sqlite": "^0.1.0",
+    "@hyper-hyper-space/hhs3_json": "^0.1.0",
+    "@hyper-hyper-space/hhs3_mvt": "^0.1.0",
+    "@hyper-hyper-space/hhs3_rdb": "^0.1.0",
+    "@hyper-hyper-space/hhs3_rdb_lang": "^0.1.0",
+    "@hyper-hyper-space/hhs3_replica": "^0.1.0",
+    "@hyper-hyper-space/hhs3_std_types": "^0.1.0",
+    "@hyper-hyper-space/hhs3_util": "^0.1.0",
+    "@noble/hashes": "^2.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.2.0",
+    "ts-node": "^10.9.2",
+    "typescript": "6.0.3"
+  }
+}

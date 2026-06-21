@@ -3,7 +3,7 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 
-import { MAX_TYPE_LENGTH } from "@hyper-hyper-space/hhs3_mvt";
+import { MAX_TYPE_LENGTH, createPayloadTypeFormat } from "@hyper-hyper-space/hhs3_mvt";
 import { MAX_KEY_ID_LENGTH, MAX_SIGNATURE_LENGTH } from "../../authorship.js";
 
 export const MAX_SEED_LENGTH = 1024;
@@ -35,8 +35,11 @@ export const capRequirementsFormat: json.Format = {
     refAdvanceCreators: [json.Type.Option, json.Type.Boolean],
 };
 
+export const RSET_TYPE_ID = 'hhs/set_v1';
+
 export type CreateSetPayload = {
     action: 'create';
+    type: string;
     seed: string;
     contentType?: string;
     initialElements: Array<json.Literal>;
@@ -53,6 +56,7 @@ export type CreateSetPayload = {
  
 export const createSetFormat: json.Format = {
     action: [json.Type.Constant, 'create'],
+    type: createPayloadTypeFormat(RSET_TYPE_ID),
     seed: [json.Type.BoundedString, MAX_SEED_LENGTH],
     contentType: [json.Type.Option, [json.Type.BoundedString, MAX_TYPE_LENGTH]],
     initialElements: [json.Type.BoundedArray, json.Type.String, MAX_INITIAL_ELEMENTS],

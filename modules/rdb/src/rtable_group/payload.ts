@@ -17,6 +17,7 @@
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { createPayloadTypeFormat } from "@hyper-hyper-space/hhs3_mvt";
 
 import {
     Predicate,
@@ -55,8 +56,11 @@ export const MAX_BUNDLE_OPS = 1024;
 // provider is a runtime concern). Fixed v1 like bindings / canDeploy. A group
 // with no idProvider performs no authentication (claimed authors are trusted).
 
+export const RTABLE_GROUP_TYPE_ID = 'hhs/rtable_group_v1';
+
 export type CreateTableGroupPayload = {
     action: 'create';
+    type: string;
     seed: string;
     schemaRef: B64Hash;                            // RSchema object id
     schemaVersion: json.Set;                       // pinned initial RSchema version (set of entry hashes)
@@ -69,6 +73,7 @@ export type CreateTableGroupPayload = {
 
 export const createTableGroupFormat: json.Format = {
     action: [json.Type.Constant, 'create'],
+    type: createPayloadTypeFormat(RTABLE_GROUP_TYPE_ID),
     seed: [json.Type.BoundedString, MAX_SEED_LENGTH],
     schemaRef: [json.Type.BoundedString, MAX_HASH_LENGTH],
     schemaVersion: json.Type.Something,

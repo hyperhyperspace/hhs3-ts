@@ -64,7 +64,7 @@ async function waitUntil(predicate: () => Promise<boolean>, intervalMs = 20, tim
 
 async function testOneWaySync() {
     const rsetInit = await RSet.create({ seed: 'fs00-sync', initialElements: [], hashAlgorithm: 'sha256' });
-    const topic = await rSetFactory.computeRootObjectId(rsetInit.payload, dummyCtx) as TopicId;
+    const topic = await rSetFactory.computeRootObjectId(rsetInit, dummyCtx) as TopicId;
 
     const provider = new MemTransportProvider();
 
@@ -142,7 +142,7 @@ async function testOneWaySync() {
 
 async function testBidirectionalSync() {
     const rsetInit = await RSet.create({ seed: 'fs01-bidi', initialElements: [], hashAlgorithm: 'sha256' });
-    const topic = await rSetFactory.computeRootObjectId(rsetInit.payload, dummyCtx) as TopicId;
+    const topic = await rSetFactory.computeRootObjectId(rsetInit, dummyCtx) as TopicId;
 
     const provider = new MemTransportProvider();
 
@@ -218,7 +218,7 @@ async function testBidirectionalSync() {
 
 async function testLateJoinSync() {
     const rsetInit = await RSet.create({ seed: 'fs02-late', initialElements: [], hashAlgorithm: 'sha256' });
-    const topic = await rSetFactory.computeRootObjectId(rsetInit.payload, dummyCtx) as TopicId;
+    const topic = await rSetFactory.computeRootObjectId(rsetInit, dummyCtx) as TopicId;
 
     const provider = new MemTransportProvider();
 

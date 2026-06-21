@@ -31,7 +31,7 @@ async function testRDbDrivenSync() {
         creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
         tables: [openTable('t', { name: { type: 'string' } })],
     });
-    const schemaId = await rSchemaFactory.computeRootObjectId(schemaInit.payload, dummyCtx);
+    const schemaId = await rSchemaFactory.computeRootObjectId(schemaInit, dummyCtx);
     const pinned = computePinnedVersion(schemaId);
 
     const groupInit = await RTableGroupImpl.create({
@@ -39,10 +39,10 @@ async function testRDbDrivenSync() {
         schemaRef: schemaId,
         schemaVersion: pinned,
     });
-    const groupId = await rTableGroupFactory.computeRootObjectId(groupInit.payload, dummyCtx);
+    const groupId = await rTableGroupFactory.computeRootObjectId(groupInit, dummyCtx);
 
     const rdbInit = await RDbImpl.create({ seed: 'rdb-full-db' });
-    const rdbId = await rDbFactory.computeRootObjectId(rdbInit.payload, dummyCtx);
+    const rdbId = await rDbFactory.computeRootObjectId(rdbInit, dummyCtx);
 
     const topics = closureTopicIds(rdbId, [schemaId], [groupId]);
     const { provider, alice, bob } = await createAliceBobPeers('full01', topics);
@@ -96,7 +96,7 @@ async function testBidirectionalWrites() {
         creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
         tables: [openTable('t', { name: { type: 'string' } })],
     });
-    const schemaId = await rSchemaFactory.computeRootObjectId(schemaInit.payload, dummyCtx);
+    const schemaId = await rSchemaFactory.computeRootObjectId(schemaInit, dummyCtx);
     const pinned = computePinnedVersion(schemaId);
 
     const groupInit = await RTableGroupImpl.create({
@@ -104,10 +104,10 @@ async function testBidirectionalWrites() {
         schemaRef: schemaId,
         schemaVersion: pinned,
     });
-    const groupId = await rTableGroupFactory.computeRootObjectId(groupInit.payload, dummyCtx);
+    const groupId = await rTableGroupFactory.computeRootObjectId(groupInit, dummyCtx);
 
     const rdbInit = await RDbImpl.create({ seed: 'rdb-full02-db' });
-    const rdbId = await rDbFactory.computeRootObjectId(rdbInit.payload, dummyCtx);
+    const rdbId = await rDbFactory.computeRootObjectId(rdbInit, dummyCtx);
 
     const topics = closureTopicIds(rdbId, [schemaId], [groupId]);
     const { provider, alice, bob } = await createAliceBobPeers('full02', topics);
@@ -165,7 +165,7 @@ async function testDynamicMembership() {
         creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
         tables: [openTable('t', { name: { type: 'string' } })],
     });
-    const schema1Id = await rSchemaFactory.computeRootObjectId(schema1Init.payload, dummyCtx);
+    const schema1Id = await rSchemaFactory.computeRootObjectId(schema1Init, dummyCtx);
     const pinned1 = computePinnedVersion(schema1Id);
 
     const group1Init = await RTableGroupImpl.create({
@@ -173,14 +173,14 @@ async function testDynamicMembership() {
         schemaRef: schema1Id,
         schemaVersion: pinned1,
     });
-    const group1Id = await rTableGroupFactory.computeRootObjectId(group1Init.payload, dummyCtx);
+    const group1Id = await rTableGroupFactory.computeRootObjectId(group1Init, dummyCtx);
 
     const schema2Init = await RSchemaImpl.create({
         seed: 'rdb-full03-schema2',
         creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
         tables: [openTable('t', { name: { type: 'string' } })],
     });
-    const schema2Id = await rSchemaFactory.computeRootObjectId(schema2Init.payload, dummyCtx);
+    const schema2Id = await rSchemaFactory.computeRootObjectId(schema2Init, dummyCtx);
     const pinned2 = computePinnedVersion(schema2Id);
 
     const group2Init = await RTableGroupImpl.create({
@@ -188,10 +188,10 @@ async function testDynamicMembership() {
         schemaRef: schema2Id,
         schemaVersion: pinned2,
     });
-    const group2Id = await rTableGroupFactory.computeRootObjectId(group2Init.payload, dummyCtx);
+    const group2Id = await rTableGroupFactory.computeRootObjectId(group2Init, dummyCtx);
 
     const rdbInit = await RDbImpl.create({ seed: 'rdb-full03-db' });
-    const rdbId = await rDbFactory.computeRootObjectId(rdbInit.payload, dummyCtx);
+    const rdbId = await rDbFactory.computeRootObjectId(rdbInit, dummyCtx);
 
     const topics = closureTopicIds(rdbId, [schema1Id, schema2Id], [group1Id, group2Id]);
     const { provider, alice, bob } = await createAliceBobPeers('full03', topics);
@@ -261,7 +261,7 @@ async function testCrossGroupFkObserve() {
         creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
         tables: [openTable('identities', { name: { type: 'string' } })],
     });
-    const schemaBId = await rSchemaFactory.computeRootObjectId(schemaBInit.payload, dummyCtx);
+    const schemaBId = await rSchemaFactory.computeRootObjectId(schemaBInit, dummyCtx);
     const pinnedB = computePinnedVersion(schemaBId);
 
     const groupBInit = await RTableGroupImpl.create({
@@ -269,7 +269,7 @@ async function testCrossGroupFkObserve() {
         schemaRef: schemaBId,
         schemaVersion: pinnedB,
     });
-    const groupBId = await rTableGroupFactory.computeRootObjectId(groupBInit.payload, dummyCtx);
+    const groupBId = await rTableGroupFactory.computeRootObjectId(groupBInit, dummyCtx);
 
     const schemaAInit = await RSchemaImpl.create({
         seed: 'rdb-full04-schema-a',
@@ -278,7 +278,7 @@ async function testCrossGroupFkObserve() {
             fks: { customer: 'users.identities' },
         })],
     });
-    const schemaAId = await rSchemaFactory.computeRootObjectId(schemaAInit.payload, dummyCtx);
+    const schemaAId = await rSchemaFactory.computeRootObjectId(schemaAInit, dummyCtx);
     const pinnedA = computePinnedVersion(schemaAId);
 
     const groupAInit = await RTableGroupImpl.create({
@@ -287,10 +287,10 @@ async function testCrossGroupFkObserve() {
         schemaVersion: pinnedA,
         bindings: { users: groupBId },
     });
-    const groupAId = await rTableGroupFactory.computeRootObjectId(groupAInit.payload, dummyCtx);
+    const groupAId = await rTableGroupFactory.computeRootObjectId(groupAInit, dummyCtx);
 
     const rdbInit = await RDbImpl.create({ seed: 'rdb-full04-db' });
-    const rdbId = await rDbFactory.computeRootObjectId(rdbInit.payload, dummyCtx);
+    const rdbId = await rDbFactory.computeRootObjectId(rdbInit, dummyCtx);
 
     const topics = closureTopicIds(rdbId, [schemaAId, schemaBId], [groupAId, groupBId]);
     const { provider, alice, bob } = await createAliceBobPeers('full04', topics);
@@ -352,7 +352,7 @@ async function testSignedOpsMeshSync() {
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables: usersSchemaTables(),
     });
-    const usersSchemaId = await rSchemaFactory.computeRootObjectId(usersSchemaInit.payload, dummyCtx);
+    const usersSchemaId = await rSchemaFactory.computeRootObjectId(usersSchemaInit, dummyCtx);
     const usersPinned = computePinnedVersion(usersSchemaId);
 
     const usersGroupInit = await RTableGroupImpl.create({
@@ -365,14 +365,14 @@ async function testSignedOpsMeshSync() {
             [CAPS_TABLE]: [capRow('root-cap', admin.keyId, 'manager')],
         },
     });
-    const usersGroupId = await rTableGroupFactory.computeRootObjectId(usersGroupInit.payload, dummyCtx);
+    const usersGroupId = await rTableGroupFactory.computeRootObjectId(usersGroupInit, dummyCtx);
 
     const appDocsTable: TableDef = {
         name: 'docs',
         columns: { body: { type: 'string' } },
         restrictions: [{
             on: 'insert',
-            rule: { p: 'exists', table: 'users.caps', where: { label: 'editor' }, owner: '$author' },
+            rule: { p: 'exists', table: 'users.caps', where: { label: 'editor', grantee: '$author' } },
         }],
     };
 
@@ -381,7 +381,7 @@ async function testSignedOpsMeshSync() {
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables: [appDocsTable],
     });
-    const appSchemaId = await rSchemaFactory.computeRootObjectId(appSchemaInit.payload, dummyCtx);
+    const appSchemaId = await rSchemaFactory.computeRootObjectId(appSchemaInit, dummyCtx);
     const appPinned = computePinnedVersion(appSchemaId);
 
     const appGroupInit = await RTableGroupImpl.create({
@@ -391,10 +391,10 @@ async function testSignedOpsMeshSync() {
         bindings: { users: usersGroupId },
         idProvider: USERS_IDENTITIES_PROVIDER,
     });
-    const appGroupId = await rTableGroupFactory.computeRootObjectId(appGroupInit.payload, dummyCtx);
+    const appGroupId = await rTableGroupFactory.computeRootObjectId(appGroupInit, dummyCtx);
 
     const rdbInit = await RDbImpl.create({ seed: 'rdb-full05-db' });
-    const rdbId = await rDbFactory.computeRootObjectId(rdbInit.payload, dummyCtx);
+    const rdbId = await rDbFactory.computeRootObjectId(rdbInit, dummyCtx);
 
     const topics = closureTopicIds(rdbId, [usersSchemaId, appSchemaId], [usersGroupId, appGroupId]);
     const { provider, alice, bob } = await createAliceBobPeers('full05', topics);
@@ -433,7 +433,7 @@ async function testSignedOpsMeshSync() {
     await waitUntil(async () => {
         const usersOnBob = await bob.replica.getObject(usersGroupId) as RTableGroupImpl;
         const capsView = await (await usersOnBob.getView()).getTableView(CAPS_TABLE);
-        return (await capsView.findRowIds({ label: 'editor' }, bobSigning.keyId)).length > 0;
+        return (await capsView.findRowIds({ label: 'editor', grantee: bobSigning.keyId })).length > 0;
     });
 
     await waitUntil(async () => {
@@ -444,7 +444,7 @@ async function testSignedOpsMeshSync() {
 
     const appOnBob = await bob.replica.getObject(appGroupId) as RTableGroupImpl;
     const docsBob = await appOnBob.getTable('docs');
-    await docsBob.insert('doc-1', { body: 'bob wrote this' }, bobSigning.keyId, bobSigning);
+    await docsBob.insert('doc-1', { body: 'bob wrote this' }, bobSigning);
 
     const docRowId = deriveRowId('doc-1', bobSigning.keyId);
     await waitForRowOn(alice.replica, appGroupId, 'docs', docRowId);
@@ -452,7 +452,7 @@ async function testSignedOpsMeshSync() {
     const wrongSigner = await createIdentity(SIGNING_ED25519, hashSuite);
     let badSigThrew = false;
     try {
-        await docsBob.insert('doc-bad', { body: 'bad sig' }, bobSigning.keyId, wrongSigner);
+        await docsBob.insert('doc-bad', { body: 'bad sig' }, wrongSigner);
     } catch {
         badSigThrew = true;
     }
@@ -471,7 +471,7 @@ async function testMultiDagDeployment() {
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables: usersSchemaTables(),
     });
-    const usersSchemaId = await rSchemaFactory.computeRootObjectId(usersSchemaInit.payload, dummyCtx);
+    const usersSchemaId = await rSchemaFactory.computeRootObjectId(usersSchemaInit, dummyCtx);
     const usersPinned = computePinnedVersion(usersSchemaId);
 
     const usersGroupInit = await RTableGroupImpl.create({
@@ -484,14 +484,14 @@ async function testMultiDagDeployment() {
             [CAPS_TABLE]: [capRow('root-cap', admin.keyId, 'manager')],
         },
     });
-    const usersGroupId = await rTableGroupFactory.computeRootObjectId(usersGroupInit.payload, dummyCtx);
+    const usersGroupId = await rTableGroupFactory.computeRootObjectId(usersGroupInit, dummyCtx);
 
     const shopSchemaInit = await RSchemaImpl.create({
         seed: 'rdb-full06-shop-schema',
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables: [openTable('orders', { item: { type: 'string' } })],
     });
-    const shopSchemaId = await rSchemaFactory.computeRootObjectId(shopSchemaInit.payload, dummyCtx);
+    const shopSchemaId = await rSchemaFactory.computeRootObjectId(shopSchemaInit, dummyCtx);
     const shopPinned = computePinnedVersion(shopSchemaId);
 
     const shopGroupInit = await RTableGroupImpl.create({
@@ -499,14 +499,14 @@ async function testMultiDagDeployment() {
         schemaRef: shopSchemaId,
         schemaVersion: shopPinned,
     });
-    const shopGroupId = await rTableGroupFactory.computeRootObjectId(shopGroupInit.payload, dummyCtx);
+    const shopGroupId = await rTableGroupFactory.computeRootObjectId(shopGroupInit, dummyCtx);
 
     const invSchemaInit = await RSchemaImpl.create({
         seed: 'rdb-full06-inv-schema',
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables: [openTable('items', { sku: { type: 'string' } })],
     });
-    const invSchemaId = await rSchemaFactory.computeRootObjectId(invSchemaInit.payload, dummyCtx);
+    const invSchemaId = await rSchemaFactory.computeRootObjectId(invSchemaInit, dummyCtx);
     const invPinned = computePinnedVersion(invSchemaId);
 
     const invGroupInit = await RTableGroupImpl.create({
@@ -516,10 +516,10 @@ async function testMultiDagDeployment() {
         bindings: { users: usersGroupId },
         idProvider: USERS_IDENTITIES_PROVIDER,
     });
-    const invGroupId = await rTableGroupFactory.computeRootObjectId(invGroupInit.payload, dummyCtx);
+    const invGroupId = await rTableGroupFactory.computeRootObjectId(invGroupInit, dummyCtx);
 
     const rdbInit = await RDbImpl.create({ seed: 'rdb-full06-db' });
-    const rdbId = await rDbFactory.computeRootObjectId(rdbInit.payload, dummyCtx);
+    const rdbId = await rDbFactory.computeRootObjectId(rdbInit, dummyCtx);
 
     const topics = closureTopicIds(
         rdbId,

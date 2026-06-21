@@ -18,6 +18,7 @@
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { KeyId } from "@hyper-hyper-space/hhs3_crypto";
+import { createPayloadTypeFormat } from "@hyper-hyper-space/hhs3_mvt";
 
 // Size limits (payload formats)
 
@@ -78,9 +79,9 @@ export const DEFAULT_CONCURRENT_DELETES = true;
 // no reverse index in the data, and coordination-free there cannot be one:
 // the deleter may not have even received the ops that reference the row).
 // So we never PREVENT the delete. Referential integrity is folded into AT-USE
-// op-voiding, exactly like a restriction predicate (see computeEntryVoided in
-// ../rtable_group/group.ts and evaluateRowOpFKReach in
-// ../rtable_group/predicates.ts):
+// op-voiding, on the same view-time path used to recheck restrictions after
+// they pass hard validation (see computeEntryVoided in ../rtable_group/group.ts
+// and evaluateRowOpFKReach in ../rtable_group/predicates.ts):
 //
 //   - a write op whose own FK column points at a target that is not live at
 //     the OP's own position (observed from the view's `from`) is VOID — a
@@ -113,9 +114,9 @@ export const fksFormat: json.Format =
 
 // Restrictions: at-use predicates gating row ops.
 
-export type IdTerm = '$author' | '$rowOwner';
+export type IdTerm = '$author';
 
-export const ID_TERMS: IdTerm[] = ['$author', '$rowOwner'];
+export const ID_TERMS: IdTerm[] = ['$author'];
 
 // A `$row.<column>` term references a readonly column of the subject row (the
 // row being inserted / updated / deleted). Restricted to readonly columns so
@@ -135,7 +136,7 @@ export function parseRowFieldTerm(s: string): string | undefined {
     return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(column) ? column : undefined;
 }
 
-// A `where` value is a literal, an identity term ($author / $rowOwner), or a
+// A `where` value is a literal, an identity term ($author), or a
 // subject-row field term ($row.<col>).
 export type WhereValue = json.Literal | IdTerm | RowFieldTerm;
 
@@ -161,9 +162,7 @@ export const ARITH_FNS = ['add', 'sub', 'mul'] as const;
 export type Predicate =
     | { p: 'true' }
     | { p: 'false' }
-    | { p: 'owner'; is: IdTerm }
-    | { p: 'exists'; table: string;
-        where?: { [field: string]: WhereValue }; owner?: IdTerm }
+    | { p: 'exists'; table: string; where: { [field: string]: WhereValue } }
     | { p: 'cmp'; cmp: CmpOp; left: Operand; right: Operand }
     | { p: 'str'; str: StrOp; value: Operand; sub: Operand }
     | { p: 'and'; args: Predicate[] }
@@ -187,7 +186,9 @@ export const restrictionFormat: json.Format = {
 };
 
 export function defaultRestrictionRule(op: 'insert' | 'update' | 'delete'): Predicate {
-    return op === 'insert' ? { p: 'true' } : { p: 'owner', is: '$author' };
+    return op === 'insert'
+        ? { p: 'true' }
+        : { p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: '$author' } };
 }
 
 // Identity provider: a table whose rows map a keyId to a publicKey, used to
@@ -296,8 +297,11 @@ export const schemaCreatorFormat: json.Format = {
     publicKey: [json.Type.BoundedString, MAX_PUBLIC_KEY_LENGTH],
 };
 
+export const RSCHEMA_TYPE_ID = 'hhs/rschema_v1';
+
 export type CreateRSchemaPayload = {
     action: 'create';
+    type: string;
     seed: string;
     name?: string;
     creators: SchemaCreator[];             // may sign schema-updates; at least one
@@ -307,6 +311,7 @@ export type CreateRSchemaPayload = {
 
 export const createRSchemaFormat: json.Format = {
     action: [json.Type.Constant, 'create'],
+    type: createPayloadTypeFormat(RSCHEMA_TYPE_ID),
     seed: [json.Type.BoundedString, MAX_SEED_LENGTH],
     name: [json.Type.Option, [json.Type.BoundedString, MAX_NAME_LENGTH]],
     creators: [json.Type.BoundedArray, schemaCreatorFormat, MAX_CREATORS],

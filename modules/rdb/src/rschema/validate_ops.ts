@@ -13,7 +13,10 @@
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { KeyId, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
-import { RContext, Version } from "@hyper-hyper-space/hhs3_mvt";
+import {
+    RContext, Version,
+    validationFailure, validationOk, ValidationResult,
+} from "@hyper-hyper-space/hhs3_mvt";
 import { verifyPayloadSignature, deserializePublicKeyFromBase64, computeKeyId } from "@hyper-hyper-space/hhs3_mvt";
 
 import { CreateRSchemaPayload, SchemaUpdatePayload, SchemaCreator } from "./payload.js";
@@ -27,8 +30,9 @@ export type RSchemaValidationContext =
     | { mode: 'create'; ctx: RContext }
     | { mode: 'op'; schema: RSchema; at: Version };
 
-export async function validateRSchemaPayload(payload: json.Literal, context: RSchemaValidationContext): Promise<boolean> {
-    if (!validateRSchemaPayloadFormat(payload)) return false;
+export async function validateRSchemaPayload(payload: json.Literal, context: RSchemaValidationContext): Promise<ValidationResult> {
+    const formatResult = validateRSchemaPayloadFormat(payload);
+    if (!formatResult.valid) return formatResult;
 
     if (context.mode === 'create') {
         return validateCreate(payload as CreateRSchemaPayload, context.ctx);
@@ -37,24 +41,26 @@ export async function validateRSchemaPayload(payload: json.Literal, context: RSc
     return validateUpdate(payload as SchemaUpdatePayload, context.schema, context.at);
 }
 
-function validateCreate(create: CreateRSchemaPayload, ctx: RContext): boolean {
-    if (create.action !== 'create') return false;
+function validateCreate(create: CreateRSchemaPayload, ctx: RContext): ValidationResult {
+    if (create.action !== 'create') return validationFailure("RSchema creation action must be 'create'");
 
     const hashSuite = ctx.getHashSuite();
     const seen = new Set<KeyId>();
 
     for (const creator of create.creators) {
-        if (seen.has(creator.keyId)) return false;
+        if (seen.has(creator.keyId)) return validationFailure(`duplicate schema creator '${creator.keyId}'`);
         seen.add(creator.keyId);
         try {
             const pk = deserializePublicKeyFromBase64(creator.publicKey);
-            if (computeKeyId(pk, hashSuite) !== creator.keyId) return false;
+            if (computeKeyId(pk, hashSuite) !== creator.keyId) {
+                return validationFailure(`schema creator keyId '${creator.keyId}' does not match public key`);
+            }
         } catch {
-            return false;
+            return validationFailure(`schema creator '${creator.keyId}' public key is invalid`);
         }
     }
 
-    return true;
+    return validationOk();
 }
 
 function creatorKeyLookup(creators: SchemaCreator[]): (keyId: KeyId) => Promise<PublicKey | undefined> {
@@ -69,17 +75,19 @@ function creatorKeyLookup(creators: SchemaCreator[]): (keyId: KeyId) => Promise<
     };
 }
 
-async function validateUpdate(update: SchemaUpdatePayload, schema: RSchema, at: Version): Promise<boolean> {
-    if (update.action !== 'schema-update') return false;
+async function validateUpdate(update: SchemaUpdatePayload, schema: RSchema, at: Version): Promise<ValidationResult> {
+    if (update.action !== 'schema-update') return validationFailure("RSchema op action must be 'schema-update'");
 
     const view = await schema.getView(at, at);
 
-    if (!view.isCreator(update.author)) return false;
+    if (!view.isCreator(update.author)) return validationFailure(`schema-update author '${update.author}' is not a creator`);
     if (!await verifyPayloadSignature(update as unknown as json.LiteralMap, creatorKeyLookup(view.getCreators()))) {
-        return false;
+        return validationFailure(`schema-update signature from '${update.author}' could not be verified`);
     }
 
-    return rulesApplicableAt(update.migration, view);
+    return rulesApplicableAt(update.migration, view)
+        ? validationOk()
+        : validationFailure("schema-update migration is not applicable at this version");
 }
 
 // Per-rule applicability, applied sequentially over a working copy of the

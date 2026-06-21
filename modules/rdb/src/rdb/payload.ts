@@ -20,6 +20,7 @@
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { createPayloadTypeFormat } from "@hyper-hyper-space/hhs3_mvt";
 
 import {
     MAX_NAME_LENGTH, MAX_NOTE_LENGTH,
@@ -31,8 +32,11 @@ export type RDbPayload = CreateRDbPayload | AddSchemaPayload | AddGroupPayload;
 
 // Create a database (sync root):
 
+export const RDB_TYPE_ID = 'hhs/rdb_v1';
+
 export type CreateRDbPayload = {
     action: 'create';
+    type: string;
     seed: string;
     name?: string;
     hashAlgorithm?: string;
@@ -40,6 +44,7 @@ export type CreateRDbPayload = {
 
 export const createRDbFormat: json.Format = {
     action: [json.Type.Constant, 'create'],
+    type: createPayloadTypeFormat(RDB_TYPE_ID),
     seed: [json.Type.BoundedString, MAX_SEED_LENGTH],
     name: [json.Type.Option, [json.Type.BoundedString, MAX_NAME_LENGTH]],
     hashAlgorithm: [json.Type.Option, [json.Type.BoundedString, MAX_HASH_ALGORITHM_LENGTH]],

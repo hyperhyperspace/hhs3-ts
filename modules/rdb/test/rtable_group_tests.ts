@@ -19,7 +19,7 @@ async function makeIdentity(): Promise<OwnIdentity> {
 }
 
 // Fixture tables permit unauthored updates/deletes (`on: 'all'` -> true) so
-// these structural tests aren't subject to the default owner-is-author
+// these structural tests aren't subject to the default author-is-author
 // restriction, which the [ENF] suite exercises directly.
 function ordersTable(): TableDef {
     return {
@@ -79,15 +79,13 @@ async function createTestEnv(groupExtras?: {
     return { ctx, schema, group, admin, pinned };
 }
 
-function initialCapRow(uuid: string, label: string, owner?: string): InsertRowPayload {
-    const row: InsertRowPayload = {
+function initialCapRow(uuid: string, label: string): InsertRowPayload {
+    return {
         action: 'insert',
-        rowId: deriveRowId(uuid, owner),
+        rowId: deriveRowId(uuid),
         uuid,
         values: { label },
     };
-    if (owner !== undefined) row.owner = owner;
-    return row;
 }
 
 export const rtableGroupTests = {
@@ -97,7 +95,7 @@ export const rtableGroupTests = {
             name: '[RGROUP01] Create group and view initial rows at genesis',
             invoke: async () => {
                 const { group, admin } = await createTestEnv({
-                    initialRows: { caps: [initialCapRow('seed-admin', 'admin', 'admin-key')] },
+                    initialRows: { caps: [initialCapRow('seed-admin', 'admin')] },
                 });
 
                 assertEquals(group.seed(), 'group-test', 'seed should be set');
@@ -108,13 +106,13 @@ export const rtableGroupTests = {
                     'the effective schema tables should be visible through the group view');
 
                 const caps = await view.getTableView('caps');
-                const initialRowId = deriveRowId('seed-admin', 'admin-key');
+                const initialRowId = deriveRowId('seed-admin');
                 assertTrue(await caps.hasRow(initialRowId), 'the initial row should be live at genesis');
 
                 const row = (await caps.getRow(initialRowId))!;
                 assertEquals(row.values['label'], 'admin', 'initial values should read back');
-                assertEquals(row.owner, 'admin-key', 'initial owner should read back');
-                assertEquals(await caps.getOwner(initialRowId), 'admin-key', 'getOwner should match');
+                assertEquals(row.author, undefined, 'initial row should be unauthored');
+                assertEquals(await caps.getAuthor(initialRowId), undefined, 'getAuthor should match');
             }
         },
         {
@@ -176,15 +174,15 @@ export const rtableGroupTests = {
                 const anonId = deriveRowId('o-1');
                 await orders.insert('o-1', { customer: 'ada', total: 10 });
 
-                const owned = await makeIdentity();
-                const ownedId = deriveRowId('o-2', owned.keyId);
-                await orders.insert('o-2', { customer: 'bob', total: 20 }, owned.keyId, owned);
+                const authored = await makeIdentity();
+                const authoredId = deriveRowId('o-2', authored.keyId);
+                await orders.insert('o-2', { customer: 'bob', total: 20 }, authored);
 
                 const view = await orders.getView();
                 assertTrue(await view.hasRow(anonId), 'anonymous row should be live');
-                assertTrue(await view.hasRow(ownedId), 'owned row should be live');
-                assertEquals(await view.getOwner(anonId), undefined, 'anonymous row should have no owner');
-                assertEquals(await view.getOwner(ownedId), owned.keyId, 'owned row should expose its owner');
+                assertTrue(await view.hasRow(authoredId), 'authored row should be live');
+                assertEquals(await view.getAuthor(anonId), undefined, 'anonymous row should have no author');
+                assertEquals(await view.getAuthor(authoredId), authored.keyId, 'authored row should expose its author');
 
                 const row = (await view.getRow(anonId))!;
                 assertEquals(row.values['customer'], 'ada', 'carried values should read back');
@@ -201,7 +199,7 @@ export const rtableGroupTests = {
                 await orders.delete(anonId);
                 const after = await orders.getView();
                 assertFalse(await after.hasRow(anonId), 'deleted row should not be live');
-                assertTrue(await after.hasRow(ownedId), 'other rows should be unaffected');
+                assertTrue(await after.hasRow(authoredId), 'other rows should be unaffected');
                 assertEquals(await after.getRow(anonId), undefined, 'getRow of a deleted row should be undefined');
 
                 // a delete needs a live row
@@ -243,9 +241,9 @@ export const rtableGroupTests = {
                     // branch A: insert then delete; branch B: a concurrent
                     // duplicate insert of the same rowId (valid there: the
                     // rowId is unseen at branch B's positions)
-                    const insA = await t.insert(uuid, valuesA, undefined, undefined, base);
+                    const insA = await t.insert(uuid, valuesA, undefined, base);
                     await t.delete(rowId, undefined, version(insA));
-                    const insB = await t.insert(uuid, valuesB, undefined, undefined, base);
+                    const insB = await t.insert(uuid, valuesB, undefined, base);
 
                     const frontier = await scopedDag.getFrontier();
 
@@ -385,7 +383,7 @@ export const rtableGroupTests = {
             name: '[RGROUP08] findRowIds returns live rows matching pub column values',
             invoke: async () => {
                 const { group } = await createTestEnv({
-                    initialRows: { caps: [initialCapRow('seed-admin', 'admin', 'admin-key')] },
+                    initialRows: { caps: [initialCapRow('seed-admin', 'admin')] },
                 });
                 const caps = await group.getTable('caps');
 
@@ -394,7 +392,7 @@ export const rtableGroupTests = {
                 const d2 = deriveRowId('d-2');
                 const d3 = deriveRowId('d-3');
 
-                await caps.insert('d-1', { label: 'deploy' }, alice.keyId, alice);
+                await caps.insert('d-1', { label: 'deploy' }, alice);
                 await caps.insert('d-2', { label: 'deploy' });
                 await caps.insert('d-3', { label: 'deploy' });
                 await caps.delete(d3);
@@ -405,7 +403,7 @@ export const rtableGroupTests = {
                     'findRowIds should return exactly the live matching rows');
 
                 const admins = await view.findRowIds({ label: 'admin' });
-                assertEquals(admins.toString(), [deriveRowId('seed-admin', 'admin-key')].toString(),
+                assertEquals(admins.toString(), [deriveRowId('seed-admin')].toString(),
                     'initial rows should be searchable through pub meta');
 
                 const none = await view.findRowIds({ label: 'nope' });

@@ -1,0 +1,260 @@
+import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
+
+import { parseStatement } from "../src/syntax/parser.js";
+
+export const parserTests = {
+    title: '[RDB_LANG:PARSE] Parser',
+    tests: [
+        {
+            name: '[PARSE01] parses phase 1 CREATE SCHEMA',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE SCHEMA shop CREATORS ($admin) AS (
+                      TABLE products (
+                        sku string PUB READONLY,
+                        name string,
+                        price integer DEFAULT 0
+                      ) ALLOW all IF true
+                    );
+                `);
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok) return;
+                assertEquals(result.value.kind, 'create-schema', 'statement kind');
+                if (result.value.kind !== 'create-schema') return;
+                assertEquals(result.value.tables.length, 1, 'one table');
+                assertEquals(result.value.tables[0].columns.length, 3, 'three columns');
+            },
+        },
+        {
+            name: '[PARSE02] parses update/delete/bundle statements',
+            invoke: async () => {
+                const result = parseStatement("UPDATE shop.products SET name = 'x' WHERE rowId = 'row-1';");
+                assertTrue(result.ok, 'UPDATE should parse');
+                if (!result.ok) return;
+                assertEquals(result.value.kind, 'update', 'statement kind');
+            },
+        },
+        {
+            name: '[PARSE03] parses phase 1 EXISTS allow predicates',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE SCHEMA shop AS (
+                      TABLE orders (
+                        buyer string
+                      ) ALLOW insert IF EXISTS users.caps WHERE label = 'buyer' AND grantee = $author
+                    );
+                `);
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok) return;
+                assertEquals(result.value.kind, 'create-schema', 'statement kind');
+                if (result.value.kind !== 'create-schema') return;
+                assertEquals(result.value.tables[0].options[0].kind, 'allow-rule', 'allow rule option');
+            },
+        },
+        {
+            name: '[PARSE04] parses SET VIEW',
+            invoke: async () => {
+                const result = parseStatement('SET VIEW AT {#abc, #def} FROM #abc;');
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok) return;
+                assertEquals(result.value.kind, 'set-view', 'statement kind');
+                if (result.value.kind !== 'set-view') return;
+                assertEquals(result.value.at.kind, 'set', 'AT version');
+                assertEquals(result.value.from?.kind, 'hash', 'FROM version');
+            },
+        },
+        {
+            name: '[PARSE05] parses unqualified table references',
+            invoke: async () => {
+                const select = parseStatement('SELECT * FROM products;');
+                assertTrue(select.ok, 'SELECT should parse');
+                if (select.ok && select.value.kind === 'select') assertEquals(select.value.table.group, undefined, 'SELECT table is unqualified');
+
+                const insert = parseStatement("INSERT INTO products (sku) VALUES ('A');");
+                assertTrue(insert.ok, 'INSERT should parse');
+                if (insert.ok && insert.value.kind === 'insert') assertEquals(insert.value.table.group, undefined, 'INSERT table is unqualified');
+
+                const update = parseStatement("UPDATE products SET sku = 'B' WHERE rowId = 'row-1';");
+                assertTrue(update.ok, 'UPDATE should parse');
+                if (update.ok && update.value.kind === 'update') assertEquals(update.value.table.group, undefined, 'UPDATE table is unqualified');
+
+                const del = parseStatement("DELETE FROM products WHERE rowId = 'row-1';");
+                assertTrue(del.ok, 'DELETE should parse');
+                if (del.ok && del.value.kind === 'delete') assertEquals(del.value.table.group, undefined, 'DELETE table is unqualified');
+            },
+        },
+        {
+            name: '[PARSE06] parses multiple distinct ALLOW rules on one table',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE SCHEMA shop AS (
+                      TABLE products (
+                        sku string PUB READONLY
+                      ) ALLOW insert IF true ALLOW update IF author = $author
+                    );
+                `);
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok || result.value.kind !== 'create-schema') return;
+                assertEquals(result.value.tables[0].options.length, 2, 'two table options');
+                assertEquals(result.value.tables[0].options[0].kind, 'allow-rule', 'first option is allow');
+                assertEquals(result.value.tables[0].options[1].kind, 'allow-rule', 'second option is allow');
+            },
+        },
+        {
+            name: '[PARSE07] rejects duplicate ALLOW rules for the same op',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE SCHEMA shop AS (
+                      TABLE products (
+                        sku string PUB READONLY
+                      ) ALLOW insert IF true ALLOW insert IF author = $author
+                    );
+                `);
+                assertTrue(!result.ok, 'duplicate ALLOW insert should fail');
+                if (!result.ok) assertTrue(result.diagnostics[0].message.includes('Duplicate ALLOW insert'), 'diagnostic mentions duplicate op');
+            },
+        },
+        {
+            name: '[PARSE08] rejects ALLOW all mixed with specific ALLOW rules',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE SCHEMA shop AS (
+                      TABLE products (
+                        sku string PUB READONLY
+                      ) ALLOW all IF true ALLOW insert IF true
+                    );
+                `);
+                assertTrue(!result.ok, 'ALLOW all plus ALLOW insert should fail');
+                if (!result.ok) assertTrue(result.diagnostics[0].message.includes('ALLOW all cannot be combined'), 'diagnostic mentions mixed all');
+            },
+        },
+        {
+            name: '[PARSE09] parses SET ALLOW RULES migration',
+            invoke: async () => {
+                const result = parseStatement(`
+                    ALTER SCHEMA shop AS (
+                      SET ALLOW RULES products (
+                        ALLOW insert IF true,
+                        ALLOW update IF author = $author
+                      )
+                    );
+                `);
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok || result.value.kind !== 'alter-schema') return;
+                assertEquals(result.value.rules[0].kind, 'set-allow-rules', 'migration rule kind');
+                if (result.value.rules[0].kind !== 'set-allow-rules') return;
+                assertEquals(result.value.rules[0].allowRules.length, 2, 'two allow rules');
+            },
+        },
+        {
+            name: '[PARSE10] parses CAN DEPLOY IF predicates',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE TABLEGROUP shop_prod USING SCHEMA shop
+                      CAN DEPLOY IF EXISTS users.caps WHERE label = 'deployer' AND grantee = $author;
+                `);
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok || result.value.kind !== 'create-tablegroup') return;
+                assertTrue(result.value.canDeploy !== undefined, 'canDeploy predicate is present');
+            },
+        },
+        {
+            name: '[PARSE11] parses single UPDATE REF binding',
+            invoke: async () => {
+                const result = parseStatement('UPDATE REF users TO LATEST ON shop_prod;');
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok || result.value.kind !== 'update-ref') return;
+                assertEquals(result.value.ref.kind, 'name', 'ref is a binding name');
+                if (result.value.ref.kind === 'name') assertEquals(result.value.ref.text, 'users', 'ref binding');
+            },
+        },
+        {
+            name: '[PARSE12] rejects table-qualified UPDATE REF',
+            invoke: async () => {
+                const result = parseStatement('UPDATE REF users.caps TO LATEST ON shop_prod;');
+                assertTrue(!result.ok, 'table-qualified ref should fail');
+                if (!result.ok) assertTrue(result.diagnostics[0].message.includes('not group.table'), 'diagnostic mentions group.table');
+            },
+        },
+        {
+            name: '[PARSE13] parses publicKey value calls',
+            invoke: async () => {
+                const result = parseStatement("INSERT INTO users.identities (keyId, publicKey) VALUES ($admin, publicKey($admin));");
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok || result.value.kind !== 'insert') return;
+                assertEquals(result.value.values[1].kind, 'call', 'second value is a function call');
+                if (result.value.values[1].kind === 'call') assertEquals(result.value.values[1].name, 'publicKey', 'function name');
+            },
+        },
+        {
+            name: '[PARSE14] parses default and explicit identity provider tables',
+            invoke: async () => {
+                const defaults = parseStatement(`
+                    CREATE SCHEMA users_schema AS (
+                      TABLE identities (
+                        keyId string PUB READONLY,
+                        publicKey string PUB READONLY
+                      ) IDENTITY PROVIDER ALLOW insert IF true
+                    );
+                `);
+                assertTrue(defaults.ok, 'default provider columns should parse');
+                if (defaults.ok && defaults.value.kind === 'create-schema') {
+                    const provider = defaults.value.tables[0].options[0];
+                    assertEquals(provider.kind, 'identity-provider', 'provider option');
+                    if (provider.kind === 'identity-provider') {
+                        assertEquals(provider.keyIdColumn, 'keyId', 'default key column');
+                        assertEquals(provider.publicKeyColumn, 'publicKey', 'default public key column');
+                    }
+                }
+
+                const explicit = parseStatement(`
+                    CREATE SCHEMA users_schema AS (
+                      TABLE people (
+                        kid string PUB READONLY,
+                        pubkey string PUB READONLY
+                      ) IDENTITY PROVIDER (kid, pubkey)
+                    );
+                `);
+                assertTrue(explicit.ok, 'explicit provider columns should parse');
+                if (explicit.ok && explicit.value.kind === 'create-schema') {
+                    const provider = explicit.value.tables[0].options[0];
+                    assertEquals(provider.kind, 'identity-provider', 'provider option');
+                    if (provider.kind === 'identity-provider') {
+                        assertEquals(provider.keyIdColumn, 'kid', 'explicit key column');
+                        assertEquals(provider.publicKeyColumn, 'pubkey', 'explicit public key column');
+                    }
+                }
+            },
+        },
+        {
+            name: '[PARSE15] parses USING IDENTITIES tablegroup provider selection',
+            invoke: async () => {
+                const local = parseStatement('CREATE TABLEGROUP users USING SCHEMA users_schema USING IDENTITIES identities;');
+                assertTrue(local.ok, 'local provider should parse');
+                if (local.ok && local.value.kind === 'create-tablegroup') assertEquals(local.value.idProvider, 'identities', 'local provider');
+
+                const foreign = parseStatement('CREATE TABLEGROUP app USING SCHEMA app_schema BIND users => users USING IDENTITIES users.identities;');
+                assertTrue(foreign.ok, 'foreign provider should parse');
+                if (foreign.ok && foreign.value.kind === 'create-tablegroup') assertEquals(foreign.value.idProvider, 'users.identities', 'foreign provider');
+            },
+        },
+        {
+            name: '[PARSE16] rejects old tablegroup IDENTITY PROVIDER syntax',
+            invoke: async () => {
+                const result = parseStatement('CREATE TABLEGROUP app USING SCHEMA app_schema IDENTITY PROVIDER users.identities;');
+                assertTrue(!result.ok, 'old tablegroup provider syntax should fail');
+            },
+        },
+        {
+            name: '[PARSE17] rejects removed owner-oriented syntax',
+            invoke: async () => {
+                assertTrue(!parseStatement("INSERT INTO users.caps (label) VALUES ('writer') OWNED BY $alice;").ok,
+                    'INSERT OWNED BY should fail');
+                assertTrue(!parseStatement("CREATE SCHEMA s AS (TABLE t (v string) ALLOW update IF OWNER IS $author);").ok,
+                    'OWNER IS should fail');
+                assertTrue(!parseStatement("CREATE SCHEMA s AS (TABLE t (v string) ALLOW insert IF EXISTS caps WHERE label = 'x' OWNED BY $author);").ok,
+                    'EXISTS OWNED BY should fail');
+            },
+        },
+    ],
+};

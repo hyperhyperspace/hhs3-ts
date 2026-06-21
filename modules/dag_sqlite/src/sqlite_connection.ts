@@ -11,6 +11,25 @@ export function openSqliteConnection(path: string): SqliteHandle {
     db.pragma('journal_mode = WAL');
     db.pragma('busy_timeout = 5000');
 
+    let transactionQueue: Promise<unknown> = Promise.resolve();
+
+    async function runTransaction<T>(fn: (conn: SqlConnection) => Promise<T>): Promise<T> {
+        let began = false;
+        try {
+            db.exec("BEGIN IMMEDIATE");
+            began = true;
+            const result = await fn(makeConn());
+            db.exec("COMMIT");
+            began = false;
+            return result;
+        } catch (e) {
+            if (began) {
+                try { db.exec("ROLLBACK"); } catch (_rollbackError) { /* ignore rollback failure */ }
+            }
+            throw e;
+        }
+    }
+
     function makeConn(): SqlConnection {
         return {
             query(sql: string, params: unknown[] = []): Promise<SqlRow[]> {
@@ -19,16 +38,10 @@ export function openSqliteConnection(path: string): SqliteHandle {
             execute(sql: string, params: unknown[] = []): Promise<number> {
                 return Promise.resolve(db.prepare(sql).run(...params).changes);
             },
-            async transaction<T>(fn: (conn: SqlConnection) => Promise<T>): Promise<T> {
-                db.exec("BEGIN IMMEDIATE");
-                try {
-                    const result = await fn(makeConn());
-                    db.exec("COMMIT");
-                    return result;
-                } catch (e) {
-                    db.exec("ROLLBACK");
-                    throw e;
-                }
+            transaction<T>(fn: (conn: SqlConnection) => Promise<T>): Promise<T> {
+                const run = transactionQueue.then(() => runTransaction(fn));
+                transactionQueue = run.catch(() => undefined);
+                return run;
             }
         };
     }

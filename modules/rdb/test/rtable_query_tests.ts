@@ -59,9 +59,9 @@ async function createItemsGroup() {
 
 const ITEM_COLUMNS: ColumnTypes = { kind: 'string', qty: 'integer', price: 'float', label: 'string' };
 
-function row(rowId: string, values: Row['values'], owner?: string): Row {
+function row(rowId: string, values: Row['values'], author?: string): Row {
     const r: Row = { rowId, uuid: rowId, values };
-    if (owner !== undefined) r.owner = owner;
+    if (author !== undefined) r.author = author;
     return r;
 }
 
@@ -120,12 +120,11 @@ export const rtableQueryTests = {
                 assertFalse(evalRowFilter({ p: 'cmp', cmp: 'eq', left: { col: 'qty' }, right: { lit: 3 } }, missing), 'missing -> false');
                 assertTrue(evalRowFilter({ p: 'not', arg: { p: 'cmp', cmp: 'eq', left: { col: 'qty' }, right: { lit: 3 } } }, missing), 'not missing -> true');
 
-                // owner / anonymous atoms
-                const owned = row('o', { kind: 'apple' }, 'key-1');
-                assertTrue(evalRowFilter({ p: 'owner', is: 'key-1' }, owned), 'owner match');
-                assertFalse(evalRowFilter({ p: 'owner', is: 'key-2' }, owned), 'owner mismatch');
-                assertFalse(evalRowFilter({ p: 'anonymous' }, owned), 'owned is not anonymous');
-                assertTrue(evalRowFilter({ p: 'anonymous' }, r), 'no owner is anonymous');
+                // implicit author system column
+                const authored = row('o', { kind: 'apple' }, 'key-1');
+                assertTrue(evalRowFilter({ p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: 'key-1' } }, authored), 'author match');
+                assertFalse(evalRowFilter({ p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: 'key-2' } }, authored), 'author mismatch');
+                assertFalse(evalRowFilter({ p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: 'key-1' } }, r), 'missing author does not match');
             }
         },
         {
@@ -145,7 +144,7 @@ export const rtableQueryTests = {
                 expectThrow(() => validateRowQuery({ offset: -2 }, ITEM_COLUMNS), 'negative offset');
                 expectThrow(() => validateRowQuery({ orderBy: [{ column: 'qty', dir: 'down' as 'asc' }] }, ITEM_COLUMNS), 'bad orderBy dir');
                 expectThrow(() => validateRowQuery({ where: { p: 'bogus' } as unknown as RowFilter }, ITEM_COLUMNS), 'unknown filter tag');
-                expectThrow(() => validateRowQuery({ where: { p: 'owner', is: 42 as unknown as string } }, ITEM_COLUMNS), 'owner.is must be string');
+                validateRowQuery({ where: { p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: 'key-1' } } }, ITEM_COLUMNS);
             }
         },
         {
@@ -164,9 +163,9 @@ export const rtableQueryTests = {
                 const desc = orderRows(rows, [{ column: 'qty', dir: 'desc' }]);
                 assertEquals(desc.map((r) => r.uuid).join(','), 'a,b,d,c', 'desc: 2 (a<b tiebreak), 1, missing still last');
 
-                const projected = projectRow(row('x', { kind: 'apple', qty: 3, label: 'hi' }, 'owner-key'), ['kind']);
+                const projected = projectRow(row('x', { kind: 'apple', qty: 3, label: 'hi' }, 'author-key'), ['kind']);
                 assertEquals(projected.uuid, 'x', 'projection keeps uuid');
-                assertEquals(projected.owner, 'owner-key', 'projection keeps owner');
+                assertEquals(projected.author, 'author-key', 'projection keeps author');
                 assertEquals(JSON.stringify(projected.values), JSON.stringify({ kind: 'apple' }), 'projection restricts values to select');
             }
         },
@@ -207,29 +206,26 @@ export const rtableQueryTests = {
             }
         },
         {
-            name: '[QRY05] engine: owner / anonymous filters',
+            name: '[QRY05] engine: author system-column filters',
             invoke: async () => {
                 const { group } = await createItemsGroup();
                 const items = await group.getTable('items');
                 const alice = await makeIdentity();
 
                 await items.insert('anon1', { kind: 'fruit', qty: 1 });
-                await items.insert('owned1', { kind: 'fruit', qty: 2 }, alice.keyId, alice);
+                await items.insert('authored1', { kind: 'fruit', qty: 2 }, alice);
                 await items.insert('anon2', { kind: 'veg', qty: 3 });
 
                 const view = await items.getView();
 
-                const owned = await view.query({ where: { p: 'owner', is: alice.keyId } });
-                assertEquals(uuids(owned), 'owned1', 'owner filter returns only alice rows');
+                const authored = await view.query({ where: { p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: alice.keyId } } });
+                assertEquals(uuids(authored), 'authored1', 'author filter returns only alice rows');
 
-                const anon = await view.query({ where: { p: 'anonymous' } });
-                assertEquals(uuids(anon), 'anon1,anon2', 'anonymous filter returns owner-less rows');
-
-                const ownedFruit = await view.query({ where: { p: 'and', args: [
-                    { p: 'owner', is: alice.keyId },
+                const authoredFruit = await view.query({ where: { p: 'and', args: [
+                    { p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: alice.keyId } },
                     { p: 'cmp', cmp: 'eq', left: { col: 'kind' }, right: { lit: 'fruit' } },
                 ] } });
-                assertEquals(uuids(ownedFruit), 'owned1', 'owner pushdown + residual kind filter');
+                assertEquals(uuids(authoredFruit), 'authored1', 'author pushdown + residual kind filter');
             }
         },
         {

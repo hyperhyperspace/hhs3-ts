@@ -2,8 +2,9 @@ import { B64Hash, BasicCrypto, HashSuite, createBasicCrypto, HASH_SHA256 } from 
 import { dag, Dag } from "@hyper-hyper-space/hhs3_dag";
 
 import {
-    RContext, RObject, RObjectInit, RObjectConfig, RObjectFactory,
+    RContext, RObject, Payload, RObjectConfig, RObjectFactory,
     RObjectTypeRegistry, TypeRegistryMap, RootScopedDag,
+    extractCreatePayloadType, formatValidationFailure, ValidationRejectedError,
 } from "@hyper-hyper-space/hhs3_mvt";
 
 const crypto = createBasicCrypto();
@@ -67,20 +68,22 @@ export function createMockRContext(
             return opts.mesh;
         },
 
-        createObject: async (init: RObjectInit, backendLabel: string = 'default') => {
-            const factory = await registry.lookup(init.type);
-            const id = await factory.computeRootObjectId(init.payload, ctx, undefined);
+        createObject: async (createPayload: Payload, backendLabel: string = 'default') => {
+            const typeId = extractCreatePayloadType(createPayload);
+            if (typeId === undefined) throw new Error('create payload missing type');
+            const factory = await registry.lookup(typeId);
+            const id = await factory.computeRootObjectId(createPayload, ctx, undefined);
 
             const existing = objects.get(id);
             if (existing !== undefined) {
                 return existing;
             }
 
-            const valid = await factory.validateCreationPayload(init.payload, ctx, undefined);
-            if (!valid) throw new Error('Invalid creation payload');
+            const result = await factory.validateCreationPayload(createPayload, ctx, undefined);
+            if (!result.valid) throw new ValidationRejectedError(formatValidationFailure(result.why), result.why);
             const rawDag = getOrCreateDag(id);
             const scopedDag = new RootScopedDag(rawDag);
-            await factory.executeCreationPayload(init.payload, ctx, scopedDag);
+            await factory.executeCreationPayload(createPayload, ctx, scopedDag);
             const obj = await factory.loadObject(id, ctx, { backendLabel });
             recordObject(obj);
             rootIds.add(id);

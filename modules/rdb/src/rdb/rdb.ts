@@ -43,9 +43,9 @@ import { B64Hash, HASH_SHA256 } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, Entry, position } from "@hyper-hyper-space/hhs3_dag";
 
 import {
-    Payload, RObjectFactory, RObjectInit, RContext, LoadObjectOptions,
+    Payload, RObjectFactory, RContext, LoadObjectOptions,
     Version, version, ForeignDep, Event, Delta, DeltaAccumulator, View, RObject,
-    SyncableObject,
+    SyncableObject, formatValidationFailure, validationFailure, ValidationRejectedError, ValidationResult,
 } from "@hyper-hyper-space/hhs3_mvt";
 import { RootScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
 
@@ -54,12 +54,12 @@ import { createSyncSession } from "@hyper-hyper-space/hhs3_sync";
 import type { SyncSession, SyncTarget } from "@hyper-hyper-space/hhs3_sync";
 
 import type { RDb as RDbContract } from "./interfaces.js";
-import { CreateRDbPayload, AddSchemaPayload, AddGroupPayload } from "./payload.js";
+import { CreateRDbPayload, AddSchemaPayload, AddGroupPayload, RDB_TYPE_ID } from "./payload.js";
 import { validateRDbPayloadFormat } from "./validate.js";
 import { resolveMembers } from "./resolve.js";
 import { RTableGroupImpl, RTABLE_GROUP_TYPE_ID } from "../rtable_group/group.js";
 
-export const RDB_TYPE_ID = 'hhs/rdb_v1';
+export { RDB_TYPE_ID } from "./payload.js";
 
 export type RDbRuntimeConfig = {
     meshLabel?: string;
@@ -75,8 +75,10 @@ export const rDbFactory: RObjectFactory = {
     },
 
     validateCreationPayload: async (payload: Payload, _ctx: RContext) => {
-        if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return false;
-        if ((payload as json.LiteralMap)['action'] !== 'create') return false;
+        if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+            return validationFailure("RDb create payload must be an object");
+        }
+        if ((payload as json.LiteralMap)['action'] !== 'create') return validationFailure("RDb creation action must be 'create'");
         return validateRDbPayloadFormat(payload);
     },
 
@@ -105,16 +107,17 @@ export class RDbImpl implements RDbContract, SyncableObject {
         seed: string;
         name?: string;
         hashAlgorithm?: string;
-    }): Promise<RObjectInit> => {
+    }): Promise<CreateRDbPayload> => {
 
         const createPayload: CreateRDbPayload = {
             action: 'create',
+            type: RDB_TYPE_ID,
             seed: options.seed,
         };
         if (options.name !== undefined) createPayload.name = options.name;
         if (options.hashAlgorithm !== undefined) createPayload.hashAlgorithm = options.hashAlgorithm;
 
-        return { type: RDbImpl.typeId, payload: createPayload };
+        return createPayload;
     };
 
     static typeId = RDB_TYPE_ID;
@@ -172,8 +175,11 @@ export class RDbImpl implements RDbContract, SyncableObject {
         const scopedDag = await this.getScopedDag();
         at = at ?? await scopedDag.getFrontier();
 
-        if (this.selfValidate() && !await this.validatePayload(payload, at)) {
-            throw new Error("Attempted to apply an invalid RDb membership op");
+        if (this.selfValidate()) {
+            const result = await this.validatePayload(payload, at);
+            if (!result.valid) {
+                throw new ValidationRejectedError(formatValidationFailure(result.why), result.why);
+            }
         }
         return this.applyPayload(payload, at);
     }
@@ -200,11 +206,15 @@ export class RDbImpl implements RDbContract, SyncableObject {
 
     // --- RObject interface ---
 
-    async validatePayload(payload: Payload, _at: Version): Promise<boolean> {
-        if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return false;
+    async validatePayload(payload: Payload, _at: Version): Promise<ValidationResult> {
+        if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+            return validationFailure("RDb membership payload must be an object", { objectHash: this.createOpId });
+        }
         const action = (payload as json.LiteralMap)['action'];
         // genesis-only action; never a valid post-creation op
-        if (action !== 'add-schema' && action !== 'add-group') return false;
+        if (action !== 'add-schema' && action !== 'add-group') {
+            return validationFailure(`action '${String(action)}' is not an RDb membership op`, { objectHash: this.createOpId });
+        }
         return validateRDbPayloadFormat(payload);
     }
 

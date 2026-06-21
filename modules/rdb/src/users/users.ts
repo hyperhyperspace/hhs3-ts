@@ -19,14 +19,22 @@
 //               registered to author with) — self-certifying via the keyId ==
 //               hash(publicKey) integrity check. A coherent future variant is
 //               enroll-gated registration (out of scope for v1).
-//   caps        label (pub+readonly), owner = grantee. concurrentDeletes so a
+//   caps        label (pub+readonly), grantee (pub+readonly). concurrentDeletes so a
 //               revoke reaches concurrent uses. Each grant is a write-once
 //               witness with a random uuid (re-grant after revoke uses a fresh
 //               uuid). Revoke looks up live witnesses via findRowIds and
 //               bundles all matching deletes into one atomic group op.
 //               Delegation: insert/revoke gated by `exists caps where
-//               owner=$author and label=<manager>`; the root manager cap is
+//               grantee=$author and label=<manager>`; the root manager cap is
 //               fiat at genesis.
+//   endpoints   address (pub+readonly), identity (pub+readonly). Mesh listen addresses
+//               for the RDb directory mode (see peer_directory.ts). Insert gated
+//               by `exists caps where label=<peerCap>`; publish via
+//               publishEndpoints (announce on UsersPeerDirectory is a no-op).
+//
+// Peer discovery (two modes, see README):
+//   - Tracker + caps: any PeerDiscovery + createUsersPeerAuthorizer (connect-time)
+//   - RDb directory: UsersPeerDirectory.discover reads endpoints + cap filter
 
 import { B64Hash, KeyId, OwnIdentity, random, base64 } from "@hyper-hyper-space/hhs3_crypto";
 import { serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
@@ -41,7 +49,9 @@ import type { RowValues } from "../rtable/interfaces.js";
 
 export const IDENTITIES_TABLE = 'identities';
 export const CAPS_TABLE = 'caps';
+export const ENDPOINTS_TABLE = 'endpoints';
 export const USERS_MANAGER_LABEL = 'manager';
+export const USERS_PEER_CAP = 'member';
 
 // Conventional binding name + provider ref for app groups that point at a
 // Users group: `bindings: { users: <id> }`, `idProvider: 'users.identities'`.
@@ -59,8 +69,12 @@ async function capsViewAt(group: RTableGroupImpl, at?: Version) {
 }
 
 // The reusable Users RSchema tables. `managerLabel` is the label of the cap
-// that authorizes granting / revoking caps (delegation).
-export function usersSchemaTables(managerLabel: string = USERS_MANAGER_LABEL): TableDef[] {
+// that authorizes granting / revoking caps (delegation). `peerCapLabel` gates
+// endpoint publish and RDb-directory peer discovery.
+export function usersSchemaTables(
+    managerLabel: string = USERS_MANAGER_LABEL,
+    peerCapLabel: string = USERS_PEER_CAP,
+): TableDef[] {
     return [
         {
             name: IDENTITIES_TABLE,
@@ -77,15 +91,29 @@ export function usersSchemaTables(managerLabel: string = USERS_MANAGER_LABEL): T
             name: CAPS_TABLE,
             columns: {
                 label: { type: 'string', pub: true, readonly: true },
+                grantee: { type: 'string', pub: true, readonly: true },
             },
             concurrentDeletes: true,
             restrictions: [
                 // grant: the author must hold a manager cap (delegation)
-                { on: 'insert', rule: { p: 'exists', table: CAPS_TABLE, where: { label: managerLabel }, owner: '$author' } },
-                // revoke: a manager, or the cap's own owner
+                { on: 'insert', rule: { p: 'exists', table: CAPS_TABLE, where: { label: managerLabel, grantee: '$author' } } },
+                // revoke: a manager, or the cap's grantee
                 { on: 'delete', rule: { p: 'or', args: [
-                    { p: 'exists', table: CAPS_TABLE, where: { label: managerLabel }, owner: '$author' },
-                    { p: 'owner', is: '$author' },
+                    { p: 'exists', table: CAPS_TABLE, where: { label: managerLabel, grantee: '$author' } },
+                    { p: 'cmp', cmp: 'eq', left: { col: 'grantee' }, right: { lit: '$author' } },
+                ] } },
+            ],
+        },
+        {
+            name: ENDPOINTS_TABLE,
+            columns: {
+                address: { type: 'string', pub: true, readonly: true },
+                identity: { type: 'string', pub: true, readonly: true },
+            },
+            restrictions: [
+                { on: 'insert', rule: { p: 'and', args: [
+                    { p: 'cmp', cmp: 'eq', left: { col: 'identity' }, right: { lit: '$author' } },
+                    { p: 'exists', table: CAPS_TABLE, where: { label: peerCapLabel, grantee: '$author' } },
                 ] } },
             ],
         },
@@ -102,9 +130,9 @@ export function identityRow(uuid: string, identity: OwnIdentity, name?: string):
     return { action: 'insert', rowId: deriveRowId(uuid), uuid, values };
 }
 
-// A cap row owned by `grantee` carrying `label`.
+// A cap row granted to `grantee` carrying `label`.
 export function capRow(uuid: string, grantee: KeyId, label: string): InsertRowPayload {
-    return { action: 'insert', rowId: deriveRowId(uuid, grantee), uuid, owner: grantee, values: { label } };
+    return { action: 'insert', rowId: deriveRowId(uuid), uuid, values: { label, grantee } };
 }
 
 export type UsersGroup = {
@@ -115,7 +143,7 @@ export type UsersGroup = {
 };
 
 // Build a Users group: the RSchema plus the RTableGroup with the genesis admin
-// identity row + the root manager cap (owned by admin). The admin can then
+// identity row + the root manager cap (granted to admin). The admin can then
 // grant further caps (including more manager caps) by authoring cap inserts.
 export async function createUsersGroup(
     ctx: RContext,
@@ -156,7 +184,7 @@ export async function registerIdentity(
 ): Promise<B64Hash> {
     const identities = await group.getTable(IDENTITIES_TABLE);
     const row = identityRow('id-' + identity.keyId, identity, name);
-    return identities.insert(row.uuid, row.values, undefined, undefined, at);
+    return identities.insert(row.uuid, row.values, undefined, at);
 }
 
 // Live cap witness rowIds for `(grantee, label)` at `at`.
@@ -164,30 +192,30 @@ export async function findCapGrants(
     group: RTableGroupImpl, grantee: KeyId, label: string, at?: Version,
 ): Promise<B64Hash[]> {
     const { view } = await capsViewAt(group, at);
-    return view.findRowIds({ label }, grantee);
+    return view.findRowIds({ label, grantee });
 }
 
-// Grant a cap: insert a random-uuid witness owned by `grantee`, authored by
+// Grant a cap: insert a random-uuid witness for `grantee`, authored by
 // `granter` (who must hold a manager cap). No-op if a live grant already
 // exists (best-effort; concurrency may still produce duplicates).
 export async function grantCap(
     group: RTableGroupImpl, granter: OwnIdentity, grantee: KeyId, label: string, at?: Version,
 ): Promise<B64Hash | undefined> {
     const { at: resolvedAt, view } = await capsViewAt(group, at);
-    if ((await view.findRowIds({ label }, grantee)).length > 0) return undefined;
+    if ((await view.findRowIds({ label, grantee })).length > 0) return undefined;
 
     const caps = await group.getTable(CAPS_TABLE);
-    return caps.insert(newCapUuid(), { label }, grantee, granter, resolvedAt);
+    return caps.insert(newCapUuid(), { label, grantee }, granter, resolvedAt);
 }
 
 // Revoke all live cap witnesses for `(grantee, label)`, bundled into one
 // atomic group op. No-op if none are live. Authored by `revoker` (a manager
-// or the cap's owner).
+// or the cap's grantee).
 export async function revokeCap(
     group: RTableGroupImpl, revoker: OwnIdentity, grantee: KeyId, label: string, at?: Version,
 ): Promise<B64Hash | undefined> {
     const { at: resolvedAt, view } = await capsViewAt(group, at);
-    const rowIds = await view.findRowIds({ label }, grantee);
+    const rowIds = await view.findRowIds({ label, grantee });
     if (rowIds.length === 0) return undefined;
 
     return group.bundle(

@@ -80,15 +80,14 @@ async function makeAppGroup(ctx: RContext, seed: string, tables: TableDef[], use
 
 // A signed row-envelope payload (for direct validatePayload assertions).
 async function authoredInsertEnvelope(
-    table: string, uuid: string, values: { [c: string]: json.Literal }, owner: KeyId | undefined, author: OwnIdentity,
+    table: string, uuid: string, values: { [c: string]: json.Literal }, author: OwnIdentity,
 ): Promise<json.LiteralMap> {
-    const base: { [k: string]: json.Literal } = { action: 'insert', rowId: deriveRowId(uuid, owner), uuid, values };
-    if (owner !== undefined) base.owner = owner;
+    const base: { [k: string]: json.Literal } = { action: 'insert', rowId: deriveRowId(uuid, author.keyId), uuid, values };
     const op = await signPayload(base, author);
     return { action: 'row', table, op: op as unknown as json.Literal };
 }
 
-// docs: insert open (default true), update/delete owner-is-author (defaults)
+// docs: insert open (default true), update/delete author-is-author (defaults)
 const docsTable: TableDef = { name: 'docs', columns: { body: { type: 'string' } } };
 
 export const rtablePermTests = {
@@ -107,14 +106,14 @@ export const rtablePermTests = {
                 await app.group.observe('users', await frontier(users.group));
 
                 const at = await frontier(app.group);
-                const env = await authoredInsertEnvelope('docs', 'd-1', { body: 'x' }, undefined, alice);
-                assertTrue(await app.group.validatePayload(env, at),
+                const env = await authoredInsertEnvelope('docs', 'd-1', { body: 'x' }, alice);
+                assertTrue((await app.group.validatePayload(env, at)).valid,
                     "a registered author's signed insert validates");
 
                 const sig = (env.op as json.LiteralMap).signature as string;
                 const tamperedSig = (sig[0] === 'A' ? 'B' : 'A') + sig.slice(1);
                 const tampered: json.LiteralMap = { ...env, op: { ...(env.op as json.LiteralMap), signature: tamperedSig } };
-                assertFalse(await app.group.validatePayload(tampered, at),
+                assertFalse((await app.group.validatePayload(tampered, at)).valid,
                     'a tampered signature is rejected at validation (never enters the DAG)');
             }
         },
@@ -137,8 +136,11 @@ export const rtablePermTests = {
                         values: { keyId: alice.keyId, publicKey: serializePublicKeyToBase64(mallory.publicKey) },
                     },
                 };
-                assertFalse(await users.group.validatePayload(bad, at),
+                const badResult = await users.group.validatePayload(bad, at);
+                assertFalse(badResult.valid,
                     'a provider row whose keyId is not the hash of its publicKey is rejected');
+                assertTrue(!badResult.valid && badResult.why.parent?.parent?.reason === 'provider keyId does not match public key',
+                    'provider integrity failure includes the nested direct cause');
 
                 // the self-consistent registration validates
                 const good: json.LiteralMap = {
@@ -148,7 +150,7 @@ export const rtablePermTests = {
                         values: { keyId: alice.keyId, publicKey: serializePublicKeyToBase64(alice.publicKey) },
                     },
                 };
-                assertTrue(await users.group.validatePayload(good, at), 'a self-certifying registration validates');
+                assertTrue((await users.group.validatePayload(good, at)).valid, 'a self-certifying registration validates');
             }
         },
         {
@@ -179,18 +181,18 @@ export const rtablePermTests = {
                 await app.group.observe('users', await frontier(users.group));
 
                 const at = await frontier(app.group);
-                const env = await authoredInsertEnvelope('docs', 'd-1', { body: 'x' }, undefined, bob);
-                assertFalse(await app.group.validatePayload(env, at),
+                const env = await authoredInsertEnvelope('docs', 'd-1', { body: 'x' }, bob);
+                assertFalse((await app.group.validatePayload(env, at)).valid,
                     'a signed op whose author is unresolvable is rejected (no anonymous downgrade)');
 
                 // the high-level writer throws (reject), confirming it never lands
                 const docs = await app.group.getTable('docs');
-                await expectThrow(() => docs.insert('d-1', { body: 'x' }, undefined, bob),
+                await expectThrow(() => docs.insert('d-1', { body: 'x' }, bob),
                     'writing an op by an unresolvable author is rejected');
             }
         },
         {
-            name: '[PERM05] authentication is validation, authorization is voiding: a registered-but-unauthorized update VOIDS (not rejected)',
+            name: '[PERM05] authentication and authorization are validation: registered-but-unauthorized update rejects',
             invoke: async () => {
                 const ctx = newCtx();
                 const admin = await makeIdentity();
@@ -205,19 +207,19 @@ export const rtablePermTests = {
 
                 const docs = await app.group.getTable('docs');
                 const rowId = deriveRowId('d-1', alice.keyId);
-                await docs.insert('d-1', { body: 'v1' }, alice.keyId, alice);
+                await docs.insert('d-1', { body: 'v1' }, alice);
 
-                // bob is registered, so his signature verifies and the update
-                // LANDS (validation passes) — but owner-is-author fails, so it
-                // voids at view (the value stays v1)
-                await docs.update(rowId, { body: 'by-bob' }, bob);
+                // bob is registered, so his signature verifies, but
+                // author-is-author fails hard validation.
+                await expectThrow(() => docs.update(rowId, { body: 'by-bob' }, bob),
+                    "a registered non-author's update rejects at validation");
                 assertEquals((await (await tableView(app.group, 'docs')).getRow(rowId))!.values['body'], 'v1',
-                    "a registered non-owner's update voids at view (authorization), it is not rejected");
+                    "a rejected non-author update leaves the row unchanged");
 
-                // the owner's update passes both authentication and authorization
+                // the insert author's update passes both authentication and authorization
                 await docs.update(rowId, { body: 'v3' }, alice);
                 assertEquals((await (await tableView(app.group, 'docs')).getRow(rowId))!.values['body'], 'v3',
-                    "the owner's signed update resolves");
+                    "the author's signed update resolves");
             }
         },
         {
@@ -229,7 +231,7 @@ export const rtablePermTests = {
                 // a group with a LOCAL provider + admins table, canDeploy gated
                 const tables: TableDef[] = [
                     ...usersSchemaTables(),   // identities (provider) + caps
-                    { name: 'admins', columns: { label: { type: 'string', pub: true, readonly: true } } },
+                    { name: 'admins', columns: { label: { type: 'string', pub: true, readonly: true }, grantee: { type: 'string', pub: true, readonly: true } } },
                     { name: 'orders', columns: { customer: { type: 'string' } } },
                 ];
                 const schemaInit = await RSchemaImpl.create({
@@ -245,10 +247,10 @@ export const rtablePermTests = {
                     schemaRef: schema.getId(),
                     schemaVersion: pinned,
                     idProvider: IDENTITIES_TABLE,   // LOCAL provider
-                    canDeploy: { p: 'exists', table: 'admins', owner: '$author' },
+                    canDeploy: { p: 'exists', table: 'admins', where: { grantee: '$author' } },
                     initialRows: {
                         [IDENTITIES_TABLE]: [{ action: 'insert', rowId: deriveRowId('admin'), uuid: 'admin', values: { keyId: admin.keyId, publicKey: serializePublicKeyToBase64(admin.publicKey) } }],
-                        admins: [{ action: 'insert', rowId: deriveRowId('a-admin', admin.keyId), uuid: 'a-admin', owner: admin.keyId, values: { label: 'root' } }],
+                        admins: [{ action: 'insert', rowId: deriveRowId('a-admin'), uuid: 'a-admin', values: { label: 'root', grantee: admin.keyId } }],
                     },
                 });
                 const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
@@ -276,7 +278,7 @@ export const rtablePermTests = {
             }
         },
         {
-            name: '[PERM07] authorization cycle is DENIED: mutually-gated caps in one bundle both void',
+            name: '[PERM07] authorization cycle is DENIED: mutually-gated caps in one bundle reject',
             invoke: async () => {
                 const ctx = newCtx();
                 const admin = await makeIdentity();
@@ -284,10 +286,10 @@ export const rtablePermTests = {
 
                 // ca insert gated by `exists cb owned by $author`, and vice versa
                 const tables: TableDef[] = [
-                    { name: 'ca', columns: { v: { type: 'string' } },
-                      restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'cb', owner: '$author' } }] },
-                    { name: 'cb', columns: { v: { type: 'string' } },
-                      restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'ca', owner: '$author' } }] },
+                    { name: 'ca', columns: { v: { type: 'string' }, grantee: { type: 'string', pub: true } },
+                      restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'cb', where: { grantee: '$author' } } }] },
+                    { name: 'cb', columns: { v: { type: 'string' }, grantee: { type: 'string', pub: true } },
+                      restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'ca', where: { grantee: '$author' } } }] },
                 ];
                 const app = await makeAppGroup(ctx, 'perm07', tables, users.group.getId());
 
@@ -297,16 +299,17 @@ export const rtablePermTests = {
 
                 const caId = deriveRowId('ca-1', alice.keyId);
                 const cbId = deriveRowId('cb-1', alice.keyId);
-                // a single bundle so both rows sit at one position (a true cycle)
-                await app.group.bundle([
-                    { table: 'ca', op: { action: 'insert', rowId: caId, uuid: 'ca-1', owner: alice.keyId, values: { v: 'a' } } },
-                    { table: 'cb', op: { action: 'insert', rowId: cbId, uuid: 'cb-1', owner: alice.keyId, values: { v: 'b' } } },
-                ], alice);
+                // Bundle siblings cannot authorize each other; both grants
+                // would need to exist at the parent frontier.
+                await expectThrow(() => app.group.bundle([
+                    { table: 'ca', op: { action: 'insert', rowId: caId, uuid: 'ca-1', values: { v: 'a', grantee: alice.keyId } } },
+                    { table: 'cb', op: { action: 'insert', rowId: cbId, uuid: 'cb-1', values: { v: 'b', grantee: alice.keyId } } },
+                ], alice), 'a self-supporting authorization cycle is rejected at validation');
 
                 assertFalse(await (await tableView(app.group, 'ca')).hasRow(caId),
-                    'a self-supporting authorization cycle is denied (ca voids)');
+                    'a self-supporting authorization cycle never appends ca');
                 assertFalse(await (await tableView(app.group, 'cb')).hasRow(cbId),
-                    'a self-supporting authorization cycle is denied (cb voids)');
+                    'a self-supporting authorization cycle never appends cb');
             }
         },
         {
@@ -335,13 +338,13 @@ export const rtablePermTests = {
                 const admin = await makeIdentity();
 
                 // a single group with a LOCAL provider, an open caps table, and a
-                // docs table gated by `exists caps where owner=$author, label=writer`
+                // docs table gated by `exists caps where grantee=$author, label=writer`
                 const tables: TableDef[] = [
                     ...usersSchemaTables(),
-                    { name: 'wcaps', columns: { label: { type: 'string', pub: true, readonly: true } },
+                    { name: 'wcaps', columns: { label: { type: 'string', pub: true, readonly: true }, grantee: { type: 'string', pub: true, readonly: true } },
                       concurrentDeletes: true, restrictions: [{ on: 'all', rule: { p: 'true' } }] },
                     { name: 'docs', columns: { body: { type: 'string' } },
-                      restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'wcaps', where: { label: 'writer' }, owner: '$author' } }] },
+                      restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'wcaps', where: { label: 'writer', grantee: '$author' } } }] },
                 ];
                 const schemaInit = await RSchemaImpl.create({
                     seed: 'perm09-schema',
@@ -362,17 +365,17 @@ export const rtablePermTests = {
                 const alice = await makeIdentity();
                 await registerIdentity(group, alice);
 
-                // alice gets a writer cap (open insert), owned by alice
+                // alice gets a writer cap (open insert), granted to alice
                 const wcaps = await group.getTable('wcaps');
-                const capId = deriveRowId('w-alice', alice.keyId);
-                await wcaps.insert('w-alice', { label: 'writer' }, alice.keyId);
+                const capId = deriveRowId('w-alice');
+                await wcaps.insert('w-alice', { label: 'writer', grantee: alice.keyId });
 
                 const base = await frontier(group);
                 const docs = await group.getTable('docs');
 
                 // branch 1: alice uses the cap (authored) at base
                 const dId = deriveRowId('d-1', alice.keyId);
-                await docs.insert('d-1', { body: 'x' }, alice.keyId, alice, base);
+                await docs.insert('d-1', { body: 'x' }, alice, base);
 
                 // branch 2 (concurrent): revoke the cap (barrier) at base
                 await wcaps.delete(capId, undefined, base);
@@ -383,7 +386,7 @@ export const rtablePermTests = {
             }
         },
         {
-            name: '[USERS01] cap delegation chain: admin -> manager(alice) -> editor(bob); an unauthorized grant voids',
+            name: '[USERS01] cap delegation chain: admin -> manager(alice) -> editor(bob); an unauthorized grant rejects',
             invoke: async () => {
                 const ctx = newCtx();
                 const admin = await makeIdentity();
@@ -398,18 +401,20 @@ export const rtablePermTests = {
 
                 // admin (holds the genesis manager cap) grants a manager cap to alice
                 await grantCap(users.group, admin, alice.keyId, users.managerLabel);
-                assertTrue((await (await tableView(users.group, CAPS_TABLE)).findRowIds({ label: users.managerLabel }, alice.keyId)).length === 1,
+                assertTrue((await (await tableView(users.group, CAPS_TABLE)).findRowIds({ label: users.managerLabel, grantee: alice.keyId })).length === 1,
                     'alice now holds a manager cap (granted by admin)');
 
                 // alice (now a manager) grants an editor cap to bob
                 await grantCap(users.group, alice, bob.keyId, 'editor');
-                assertTrue((await (await tableView(users.group, CAPS_TABLE)).findRowIds({ label: 'editor' }, bob.keyId)).length === 1,
+                assertTrue((await (await tableView(users.group, CAPS_TABLE)).findRowIds({ label: 'editor', grantee: bob.keyId })).length === 1,
                     'bob holds an editor cap (granted by manager alice)');
 
-                // bob (only an editor, not a manager) tries to grant: it lands but voids
-                await grantCap(users.group, bob, carol.keyId, 'editor');
-                assertTrue((await (await tableView(users.group, CAPS_TABLE)).findRowIds({ label: 'editor' }, carol.keyId)).length === 0,
-                    "a non-manager's grant voids (no manager cap owned by the author)");
+                // bob (only an editor, not a manager) tries to grant: it fails
+                // hard validation.
+                await expectThrow(() => grantCap(users.group, bob, carol.keyId, 'editor'),
+                    "a non-manager's grant rejects (no manager cap granted to the author)");
+                assertTrue((await (await tableView(users.group, CAPS_TABLE)).findRowIds({ label: 'editor', grantee: carol.keyId })).length === 0,
+                    "a rejected non-manager grant leaves carol without an editor cap");
             }
         },
         {
@@ -426,8 +431,8 @@ export const rtablePermTests = {
 
                 // while the provider is present, alice's authored op validates
                 const at1 = await frontier(app.group);
-                const env1 = await authoredInsertEnvelope('docs', 'd-1', { body: 'x' }, undefined, alice);
-                assertTrue(await app.group.validatePayload(env1, at1), 'authored op validates while the provider is present');
+                const env1 = await authoredInsertEnvelope('docs', 'd-1', { body: 'x' }, alice);
+                assertTrue((await app.group.validatePayload(env1, at1)).valid, 'authored op validates while the provider is present');
 
                 // drop the identities table in the Users schema, deploy, observe
                 await users.schema.updateSchema([{ rule: 'drop-table', table: IDENTITIES_TABLE }], admin);
@@ -439,8 +444,8 @@ export const rtablePermTests = {
                 // foreign group -> the authored op is REJECTED at validation, and
                 // crucially this is `false`, not a throw (the object IS present)
                 const at2 = await frontier(app.group);
-                const env2 = await authoredInsertEnvelope('docs', 'd-2', { body: 'y' }, undefined, alice);
-                assertFalse(await app.group.validatePayload(env2, at2),
+                const env2 = await authoredInsertEnvelope('docs', 'd-2', { body: 'y' }, alice);
+                assertFalse((await app.group.validatePayload(env2, at2)).valid,
                     'a present-but-unresolvable provider fail-closes (reject), without throwing');
             }
         },
@@ -548,11 +553,11 @@ export const rtablePermTests = {
                 await registerIdentity(users.group, bob);
 
                 const base = await frontier(users.group);
-                const capId1 = deriveRowId('dup-cap-a', bob.keyId);
-                const capId2 = deriveRowId('dup-cap-b', bob.keyId);
+                const capId1 = deriveRowId('dup-cap-a', admin.keyId);
+                const capId2 = deriveRowId('dup-cap-b', admin.keyId);
                 await users.group.bundle([
-                    { table: CAPS_TABLE, op: { action: 'insert', rowId: capId1, uuid: 'dup-cap-a', owner: bob.keyId, values: { label: 'editor' } } },
-                    { table: CAPS_TABLE, op: { action: 'insert', rowId: capId2, uuid: 'dup-cap-b', owner: bob.keyId, values: { label: 'editor' } } },
+                    { table: CAPS_TABLE, op: { action: 'insert', rowId: capId1, uuid: 'dup-cap-a', values: { label: 'editor', grantee: bob.keyId } } },
+                    { table: CAPS_TABLE, op: { action: 'insert', rowId: capId2, uuid: 'dup-cap-b', values: { label: 'editor', grantee: bob.keyId } } },
                 ], admin, base);
 
                 assertEquals((await findCapGrants(users.group, bob.keyId, 'editor')).length, 2,
@@ -599,11 +604,11 @@ export const rtablePermTests = {
                 await registerIdentity(users.group, bob);
 
                 const base = await frontier(users.group);
-                const capId1 = deriveRowId('atomic-a', bob.keyId);
-                const capId2 = deriveRowId('atomic-b', bob.keyId);
+                const capId1 = deriveRowId('atomic-a', admin.keyId);
+                const capId2 = deriveRowId('atomic-b', admin.keyId);
                 await users.group.bundle([
-                    { table: CAPS_TABLE, op: { action: 'insert', rowId: capId1, uuid: 'atomic-a', owner: bob.keyId, values: { label: 'writer' } } },
-                    { table: CAPS_TABLE, op: { action: 'insert', rowId: capId2, uuid: 'atomic-b', owner: bob.keyId, values: { label: 'writer' } } },
+                    { table: CAPS_TABLE, op: { action: 'insert', rowId: capId1, uuid: 'atomic-a', values: { label: 'writer', grantee: bob.keyId } } },
+                    { table: CAPS_TABLE, op: { action: 'insert', rowId: capId2, uuid: 'atomic-b', values: { label: 'writer', grantee: bob.keyId } } },
                 ], admin, base);
 
                 await revokeCap(users.group, admin, bob.keyId, 'writer');
@@ -614,7 +619,7 @@ export const rtablePermTests = {
             }
         },
         {
-            name: '[PERM10] Tier 1: an insert gated by cmp/str over the subject row voids when the predicate fails',
+            name: '[PERM10] Tier 1: an insert gated by cmp/str over the subject row rejects when the predicate fails',
             invoke: async () => {
                 const ctx = newCtx();
                 const admin = await makeIdentity();
@@ -650,16 +655,18 @@ export const rtablePermTests = {
                 // name and level are readonly -> $row reads the insert values.
                 // No author needed (the rule names no identity).
                 await docs.insert('d-ok', { body: 'hello', name: 'ok-1', level: 2 });
-                await docs.insert('d-badname', { body: 'hello', name: 'nope', level: 2 });
-                await docs.insert('d-highlevel', { body: 'hello', name: 'ok-2', level: 9 });
+                await expectThrow(() => docs.insert('d-badname', { body: 'hello', name: 'nope', level: 2 }),
+                    'an insert failing the str prefix rejects');
+                await expectThrow(() => docs.insert('d-highlevel', { body: 'hello', name: 'ok-2', level: 9 }),
+                    'an insert failing the cmp on the readonly level rejects');
 
                 const view = await tableView(group, 'docs');
                 assertTrue(await view.hasRow(deriveRowId('d-ok')),
                     'an insert satisfying both cmp and str survives');
                 assertFalse(await view.hasRow(deriveRowId('d-badname')),
-                    'an insert failing the str prefix voids');
+                    'an insert failing the str prefix never appends');
                 assertFalse(await view.hasRow(deriveRowId('d-highlevel')),
-                    'an insert failing the cmp on the readonly level voids');
+                    'an insert failing the cmp on the readonly level never appends');
             }
         },
         {
@@ -668,17 +675,17 @@ export const rtablePermTests = {
                 const ctx = newCtx();
                 const admin = await makeIdentity();
 
-                // grants: open insert, owner = grantee, resource pub+readonly,
+                // grants: open insert, explicit grantee, resource pub+readonly,
                 // concurrentDeletes so a revoke reaches concurrent uses.
-                // docs: insert allowed only if the author owns a grant for the
+                // docs: insert allowed only if the author is grantee on a grant for the
                 // SAME resource (correlated via $row.resource).
                 const tables: TableDef[] = [
                     ...usersSchemaTables(),
-                    { name: 'grants', columns: { resource: { type: 'string', pub: true, readonly: true } },
+                    { name: 'grants', columns: { resource: { type: 'string', pub: true, readonly: true }, grantee: { type: 'string', pub: true, readonly: true } },
                       concurrentDeletes: true, restrictions: [{ on: 'all', rule: { p: 'true' } }] },
                     { name: 'docs', columns: { body: { type: 'string' }, resource: { type: 'string', readonly: true } },
                       restrictions: [{ on: 'insert', rule: {
-                          p: 'exists', table: 'grants', where: { resource: '$row.resource' }, owner: '$author',
+                          p: 'exists', table: 'grants', where: { resource: '$row.resource', grantee: '$author' },
                       } }] },
                 ];
                 const schemaInit = await RSchemaImpl.create({
@@ -700,27 +707,29 @@ export const rtablePermTests = {
                 const alice = await makeIdentity();
                 await registerIdentity(group, alice);
 
-                // alice holds a grant for resource 'R1' (owned by alice)
+                // alice holds a grant for resource 'R1'
                 const grants = await group.getTable('grants');
-                const grantId = deriveRowId('g-R1', alice.keyId);
-                await grants.insert('g-R1', { resource: 'R1' }, alice.keyId);
+                const grantId = deriveRowId('g-R1');
+                await grants.insert('g-R1', { resource: 'R1', grantee: alice.keyId });
 
                 const docs = await group.getTable('docs');
 
-                // attenuation: a doc for R1 survives, a doc for R2 (no grant) voids
-                await docs.insert('d-R1', { body: 'x', resource: 'R1' }, alice.keyId, alice);
-                await docs.insert('d-R2', { body: 'y', resource: 'R2' }, alice.keyId, alice);
+                // attenuation: a doc for R1 survives, a doc for R2 (no grant)
+                // rejects at validation.
+                await docs.insert('d-R1', { body: 'x', resource: 'R1' }, alice);
+                await expectThrow(() => docs.insert('d-R2', { body: 'y', resource: 'R2' }, alice),
+                    'a doc whose resource has no matching grant rejects (attenuation)');
 
                 const v1 = await tableView(group, 'docs');
                 assertTrue(await v1.hasRow(deriveRowId('d-R1', alice.keyId)),
-                    'a doc whose resource matches an owned grant survives ($row correlation)');
+                    'a doc whose resource matches a grant survives ($row correlation)');
                 assertFalse(await v1.hasRow(deriveRowId('d-R2', alice.keyId)),
-                    'a doc whose resource has no matching grant voids (attenuation)');
+                    'a doc whose resource has no matching grant never appends');
 
                 // at-use: a use of the grant concurrent with a barrier revoke voids
                 const base = await frontier(group);
                 const dId = deriveRowId('d-concurrent', alice.keyId);
-                await docs.insert('d-concurrent', { body: 'z', resource: 'R1' }, alice.keyId, alice, base);
+                await docs.insert('d-concurrent', { body: 'z', resource: 'R1' }, alice, base);
                 await grants.delete(grantId, undefined, base);   // concurrent barrier revoke
 
                 const merged = await frontier(group);

@@ -37,7 +37,7 @@ export const replicaNestedTests = {
                     hashAlgorithm: 'sha256',
                 });
 
-                const innerHash = await outerSet.add(innerInit.payload);
+                const innerHash = await outerSet.add(innerInit);
                 const outerView = await outerSet.getView();
                 const innerSet = (await outerView.loadRObjectByHash(innerHash)) as RSet;
 
@@ -70,7 +70,7 @@ export const replicaNestedTests = {
                         initialElements: [],
                         hashAlgorithm: 'sha256',
                     });
-                    const hash = await outerSet.add(init.payload);
+                    const hash = await outerSet.add(init);
                     const view = await outerSet.getView();
                     return (await view.loadRObjectByHash(hash)) as RSet;
                 };
@@ -116,7 +116,7 @@ export const replicaNestedTests = {
                     hashAlgorithm: 'sha256',
                 });
 
-                const midHash = await outerSet.add(midInit.payload);
+                const midHash = await outerSet.add(midInit);
                 const outerView = await outerSet.getView();
                 const midSet = (await outerView.loadRObjectByHash(midHash)) as RSet;
 
@@ -126,7 +126,7 @@ export const replicaNestedTests = {
                     hashAlgorithm: 'sha256',
                 });
 
-                const innerHash = await midSet.add(innerInit.payload);
+                const innerHash = await midSet.add(innerInit);
                 const midView = await midSet.getView();
                 const innerSet = (await midView.loadRObjectByHash(innerHash)) as RSet;
 
@@ -162,7 +162,7 @@ export const replicaNestedTests = {
                     hashAlgorithm: 'sha256',
                 });
 
-                const innerHash = await outerSet.add(innerInit.payload);
+                const innerHash = await outerSet.add(innerInit);
                 const view = await outerSet.getView();
                 const innerSet = (await view.loadRObjectByHash(innerHash)) as RSet;
                 await innerSet.add('persisted');

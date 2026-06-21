@@ -1,5 +1,7 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
 
+import { createPayloadTypeFormat } from "@hyper-hyper-space/hhs3_mvt";
+
 import { AuthoredFields, authoredFormat, MAX_KEY_ID_LENGTH, MAX_SIGNATURE_LENGTH } from "../../authorship.js";
 
 export const CAP_MAX_SEED_LENGTH = 1024;
@@ -19,8 +21,11 @@ export type CapDefinition = {
     managedBy: string[];
 };
 
+export const RCAP_TYPE_ID = 'hhs/cap_v1';
+
 export type CreateRCapPayload = {
     action: 'create';
+    type: string;
     seed: string;
     creators: string[];
     creatorKeys: string[];
@@ -31,6 +36,7 @@ export type CreateRCapPayload = {
 
 export const createRCapFormat: json.Format = {
     action: [json.Type.Constant, 'create'],
+    type: createPayloadTypeFormat(RCAP_TYPE_ID),
     seed: [json.Type.BoundedString, CAP_MAX_SEED_LENGTH],
     creators: [json.Type.BoundedArray, [json.Type.BoundedString, MAX_KEY_ID_LENGTH], MAX_CREATORS],
     creatorKeys: [json.Type.BoundedArray, [json.Type.BoundedString, MAX_PUBLIC_KEY_LENGTH], MAX_CREATORS],

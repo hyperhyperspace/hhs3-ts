@@ -37,21 +37,22 @@ import type { KeyId, OwnIdentity, PublicKey } from "@hyper-hyper-space/hhs3_cryp
 import { dag, Entry, position } from "@hyper-hyper-space/hhs3_dag";
 
 import {
-    Payload, RObjectFactory, RObjectInit, RContext, LoadObjectOptions,
+    Payload, RObjectFactory, RContext, LoadObjectOptions,
     Version, ForeignDep, Event, Delta, DeltaAccumulator,
+    formatValidationFailure, ValidationRejectedError, ValidationResult,
 } from "@hyper-hyper-space/hhs3_mvt";
 import { RootScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
 import { signPayload as signPayloadHelper, serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchema as RSchemaContract, RSchemaView as RSchemaViewContract } from "./interfaces.js";
-import { CreateRSchemaPayload, SchemaUpdatePayload } from "./payload.js";
+import { CreateRSchemaPayload, SchemaUpdatePayload, RSCHEMA_TYPE_ID } from "./payload.js";
 import { TableDef, MigrationRule } from "./payload.js";
 import { validateRSchemaPayload } from "./validate_ops.js";
 import { resolveSchemaState, positionKey, SchemaState } from "./resolve.js";
 import { RSchemaViewImpl } from "./view.js";
 import { RSchemaDelta, RSchemaDeltaAccumulator, computeRSchemaDelta } from "./delta.js";
 
-export const RSCHEMA_TYPE_ID = 'hhs/rschema_v1';
+export { RSCHEMA_TYPE_ID } from "./payload.js";
 
 export const rSchemaFactory: RObjectFactory = {
 
@@ -90,10 +91,11 @@ export class RSchemaImpl implements RSchemaContract {
         creators: { keyId: KeyId; publicKey: PublicKey }[];
         tables: TableDef[];
         hashAlgorithm?: string;
-    }): Promise<RObjectInit> => {
+    }): Promise<CreateRSchemaPayload> => {
 
         const createPayload: CreateRSchemaPayload = {
             action: 'create',
+            type: RSCHEMA_TYPE_ID,
             seed: options.seed,
             creators: options.creators.map((c) => ({
                 keyId: c.keyId,
@@ -105,7 +107,7 @@ export class RSchemaImpl implements RSchemaContract {
         if (options.name !== undefined) createPayload.name = options.name;
         if (options.hashAlgorithm !== undefined) createPayload.hashAlgorithm = options.hashAlgorithm;
 
-        return { type: RSchemaImpl.typeId, payload: createPayload };
+        return createPayload;
     };
 
     static typeId = RSCHEMA_TYPE_ID;
@@ -155,8 +157,11 @@ export class RSchemaImpl implements RSchemaContract {
 
         const signed = await signPayloadHelper(base as unknown as json.LiteralMap, author);
 
-        if (this.selfValidate() && !await this.validatePayload(signed, at)) {
-            throw new Error("Attempted to apply an invalid schema-update");
+        if (this.selfValidate()) {
+            const result = await this.validatePayload(signed, at);
+            if (!result.valid) {
+                throw new ValidationRejectedError(formatValidationFailure(result.why), result.why);
+            }
         }
 
         return this.applyPayload(signed, at);
@@ -164,7 +169,7 @@ export class RSchemaImpl implements RSchemaContract {
 
     // RObject interface
 
-    async validatePayload(payload: Payload, at: Version): Promise<boolean> {
+    async validatePayload(payload: Payload, at: Version): Promise<ValidationResult> {
         return validateRSchemaPayload(payload, { mode: 'op', schema: this, at });
     }
 

@@ -45,9 +45,9 @@ function linesTable(): TableDef {
     };
 }
 
-function insertOp(uuid: string, values: json.LiteralMap, owner?: string): InsertRowPayload {
-    const op: InsertRowPayload = { action: 'insert', rowId: deriveRowId(uuid, owner), uuid, values };
-    if (owner !== undefined) op.owner = owner;
+function insertOp(uuid: string, values: json.LiteralMap, author?: string): InsertRowPayload {
+    const op: InsertRowPayload = { action: 'insert', rowId: deriveRowId(uuid, author), uuid, values };
+    if (author !== undefined) op.author = author;
     return op;
 }
 
@@ -59,8 +59,8 @@ function updateOp(rowId: string, values: json.LiteralMap): UpdateRowPayload {
     return { action: 'update', rowId, values };
 }
 
-async function createTestEnv(opts?: { ordersConcurrentDeletes?: boolean }) {
-    const ctx = createMockRContext({ selfValidate: true });
+async function createTestEnv(opts?: { ordersConcurrentDeletes?: boolean; selfValidate?: boolean }) {
+    const ctx = createMockRContext({ selfValidate: opts?.selfValidate ?? true });
     ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
     ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
 
@@ -140,6 +140,22 @@ export const rtableBundleTests = {
                 const orders = await group.getTable('orders');
                 assertFalse(await (await orders.getView()).hasRow(orderId),
                     'a rejected bundle must not land its valid ops');
+            }
+        },
+        {
+            name: '[BUNDLE02b] Public bundle API rejects invalid ops even without selfValidate',
+            invoke: async () => {
+                const { group } = await createTestEnv({ selfValidate: false });
+                const orderId = deriveRowId('o-1');
+
+                await expectBundleFailure(group, [
+                    { table: 'orders', op: insertOp('o-1', { customer: 'ada', total: 1 }) },
+                    { table: 'lines', op: insertOp('l-1', { order: orderId, qty: 'lots' }) },
+                ], 'the public bundle API should reject invalid ops even when context selfValidate is off');
+
+                const orders = await group.getTable('orders');
+                assertFalse(await (await orders.getView()).hasRow(orderId),
+                    'a rejected bundle must not land any sibling ops');
             }
         },
         {
@@ -233,9 +249,9 @@ export const rtableBundleTests = {
                 const rowId = deriveRowId('cc-1');
                 const base = await scopedDag.getFrontier();
 
-                const insA = await orders.insert('cc-1', { customer: 'x', total: 1 }, undefined, undefined, base);
+                const insA = await orders.insert('cc-1', { customer: 'x', total: 1 }, undefined, base);
                 await group.bundle([{ table: 'orders', op: deleteOp(rowId) }], undefined, version(insA));
-                const insB = await orders.insert('cc-1', { customer: 'x', total: 2 }, undefined, undefined, base);
+                const insB = await orders.insert('cc-1', { customer: 'x', total: 2 }, undefined, base);
 
                 const frontier = await scopedDag.getFrontier();
 

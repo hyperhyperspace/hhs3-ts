@@ -102,7 +102,7 @@ type RObject = {
     getType(): string;
 
     // writing
-    validatePayload(payload: Payload, at: Version): Promise<boolean>;
+    validatePayload(payload: Payload, at: Version): Promise<ValidationResult>;
     applyPayload(payload: Payload, at: Version): Promise<B64Hash>;
 
     // reading (version-scoped)
@@ -174,7 +174,7 @@ type RContext = {
     getBackendLabel(id: B64Hash): Promise<string | undefined>;
     getMesh(label: string): any;
 
-    createObject(init: RObjectInit, backendLabel?: string): Promise<RObject>;
+    createObject(createPayload: Payload, backendLabel?: string): Promise<RObject>;
     unregisterObject(id: B64Hash): Promise<void>;
 }
 ```
@@ -192,11 +192,13 @@ Defines how to compute IDs, validate creation payloads, execute creation, and lo
 ```typescript
 type RObjectFactory = {
     computeRootObjectId: (createPayload: Payload, ctx: RContext, parent?: NestingParent) => Promise<B64Hash>;
-    validateCreationPayload: (createPayload: Payload, ctx: RContext, parent?: NestingParent) => Promise<boolean>;
+    validateCreationPayload: (createPayload: Payload, ctx: RContext, parent?: NestingParent) => Promise<ValidationResult>;
     executeCreationPayload: (createPayload: Payload, ctx: RContext, scopedDag: ScopedDag) => Promise<B64Hash>;
     loadObject: (id: B64Hash, ctx: RContext, opts?: LoadObjectOptions) => Promise<RObject>;
 }
 ```
+
+Genesis create payloads (the DAG entry written by `executeCreationPayload`) MUST include `action: 'create'` and a `type` field equal to the object's MVT type id (the same string as `getType()` and the registry key). `createObject` accepts this payload directly and derives the type via `extractCreatePayloadType`. This makes persisted roots self-describing for cold reopen. Helpers: `validateCreatePayloadType`, `extractCreatePayloadType`, `createPayloadTypeFormat`.
 
 ### `NestingParent`
 

@@ -1,4 +1,4 @@
-import { RContext, RObject, RObjectInit, RObjectConfig, TypeRegistryMap, version } from "@hyper-hyper-space/hhs3_mvt";
+import { RContext, RObject, RObjectConfig, TypeRegistryMap, version } from "@hyper-hyper-space/hhs3_mvt";
 import { RSet, rSetFactory } from "../src/types/rset/rset.js";
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { createMockRContext } from "./mock_rcontext.js";
@@ -36,7 +36,7 @@ export const nestedSetTests = {
                     hashAlgorithm: 'sha256',
                 });
 
-                const nestedSetHash = await outerSet.add(nestedSetPayload.payload);
+                const nestedSetHash = await outerSet.add(nestedSetPayload);
                 
                 const outerView = await outerSet.getView();
                 const nestedSet = await outerView.loadRObjectByHash(nestedSetHash) as RSet;
@@ -80,7 +80,7 @@ export const nestedSetTests = {
                         hashAlgorithm: 'sha256',
                     });
 
-                    const nestedHash = await outerSet.add(nestedSetInit.payload);
+                    const nestedHash = await outerSet.add(nestedSetInit);
                     const outerView = await outerSet.getView();
                     const nested = await outerView.loadRObjectByHash(nestedHash) as RSet;
                     return { nestedHash, nested };
@@ -143,7 +143,7 @@ export const nestedSetTests = {
                         hashAlgorithm: 'sha256',
                     });
 
-                    const nestedHash = await outerSet.add(nestedSetInit.payload);
+                    const nestedHash = await outerSet.add(nestedSetInit);
                     const outerViewForLoad = await outerSet.getView();
                     const nested = await outerViewForLoad.loadRObjectByHash(nestedHash) as RSet;
                     return { nestedHash: nestedHash, nested };
@@ -274,17 +274,17 @@ export const nestedSetTests = {
                 };
 
                 const rootInit = await makeNestedInit('nested-root');
-                const rootHash = await outerSet.add(rootInit.payload);
+                const rootHash = await outerSet.add(rootInit);
                 const rootVersion = version(rootHash);
 
-                const leftHash = await outerSet.add((await makeNestedInit('nested-left')).payload, rootVersion);
-                const rightHash = await outerSet.add((await makeNestedInit('nested-right')).payload, rootVersion);
+                const leftHash = await outerSet.add((await makeNestedInit('nested-left')), rootVersion);
+                const rightHash = await outerSet.add((await makeNestedInit('nested-right')), rootVersion);
 
                 const leftVersion = version(leftHash);
                 const rightVersion = version(rightHash);
 
                 const barrierInit = await makeNestedInit('nested-barrier');
-                const barrierHash = await outerSet.addWithBarrier(barrierInit.payload, leftVersion);
+                const barrierHash = await outerSet.addWithBarrier(barrierInit, leftVersion);
 
                 const rightViewAfterBarrierAdd = await outerSet.getView(rightVersion);
                 assertTrue(
@@ -323,11 +323,11 @@ export const nestedSetTests = {
                 };
 
                 const rootInit = await makeNestedInit('nested-root');
-                const rootHash = await outerSet.add(rootInit.payload);
+                const rootHash = await outerSet.add(rootInit);
                 const rootVersion = version(rootHash);
 
-                const leftHash = await outerSet.add((await makeNestedInit('nested-left')).payload, rootVersion);
-                const rightHash = await outerSet.add((await makeNestedInit('nested-right')).payload, rootVersion);
+                const leftHash = await outerSet.add((await makeNestedInit('nested-left')), rootVersion);
+                const rightHash = await outerSet.add((await makeNestedInit('nested-right')), rootVersion);
 
                 const leftVersion = version(leftHash);
                 const rightVersion = version(rightHash);
@@ -369,7 +369,7 @@ export const nestedSetTests = {
                         supportBarrierDelete: true,
                     });
 
-                    const nestedHash = await outerSet.add(nestedInit.payload);
+                    const nestedHash = await outerSet.add(nestedInit);
                     const outerViewForLoad = await outerSet.getView();
                     const nested = await outerViewForLoad.loadRObjectByHash(nestedHash) as RSet;
                     return { nestedHash, nested };
@@ -492,7 +492,7 @@ export const nestedSetTests = {
                     hashAlgorithm: 'sha256',
                 });
 
-                const nestedHash = await outerSet.add(nestedInit.payload);
+                const nestedHash = await outerSet.add(nestedInit);
 
                 const outerView = await outerSet.getView();
                 const nestedSet = await outerView.loadRObjectByHash(nestedHash) as RSet;
@@ -525,7 +525,7 @@ export const nestedSetTests = {
                     supportBarrierDelete: true,
                 });
 
-                const nestedHash = await outerSet.add(nestedInit.payload);
+                const nestedHash = await outerSet.add(nestedInit);
                 const outerView = await outerSet.getView();
                 const nestedSet = await outerView.loadRObjectByHash(nestedHash) as RSet;
 
@@ -580,7 +580,7 @@ export const nestedSetTests = {
                     hashAlgorithm: 'sha256',
                 });
 
-                const midHash = await outerSet.add(midInit.payload);
+                const midHash = await outerSet.add(midInit);
                 const outerView = await outerSet.getView();
                 const midSet = (await outerView.loadRObjectByHash(midHash)) as RSet;
 
@@ -590,7 +590,7 @@ export const nestedSetTests = {
                     hashAlgorithm: 'sha256',
                 });
 
-                const innerHash = await midSet.add(innerInit.payload);
+                const innerHash = await midSet.add(innerInit);
                 const midView = await midSet.getView();
                 const innerSet = (await midView.loadRObjectByHash(innerHash)) as RSet;
 
@@ -643,7 +643,7 @@ export const nestedSetTests = {
                         hashAlgorithm: 'sha256',
                     });
 
-                    const nestedHash = await outerSet.add(nestedInit.payload);
+                    const nestedHash = await outerSet.add(nestedInit);
                     const outerView = await outerSet.getView();
                     const nested = await outerView.loadRObjectByHash(nestedHash) as RSet;
                     return { nestedHash, nested };

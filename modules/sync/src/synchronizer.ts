@@ -902,8 +902,8 @@ export function createDagSynchronizer(
                     if (!allDepsAvailable) continue;
                 }
 
-                const valid = await rObject.validatePayload(payload, version);
-                if (!valid) {
+                const result = await rObject.validatePayload(payload, version);
+                if (!result.valid) {
                     const source = hashSourcePeer.get(hash);
                     if (source !== undefined) reportIssue(source, 'validation-failed');
                     receivedPayloads.delete(hash);

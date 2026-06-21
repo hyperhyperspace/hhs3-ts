@@ -587,7 +587,7 @@ export const deltaTests = {
                     initialElements: [],
                     hashAlgorithm: 'sha256',
                 });
-                const innerHash = await outer.add(innerInit.payload);
+                const innerHash = await outer.add(innerInit);
 
                 const inner = (await (await outer.getView()).loadRObjectByHash(innerHash)) as RSet;
 
@@ -634,7 +634,7 @@ export const deltaTests = {
                     initialElements: [],
                     hashAlgorithm: 'sha256',
                 });
-                const innerHash = await outer.add(innerInit.payload);
+                const innerHash = await outer.add(innerInit);
 
                 const inner = (await (await outer.getView()).loadRObjectByHash(innerHash)) as RSet;
                 await inner.add('alpha');

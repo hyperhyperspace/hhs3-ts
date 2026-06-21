@@ -16,17 +16,17 @@ export type RowValues = { [column: string]: json.Literal };
 export type Row = {
     rowId: B64Hash;
     uuid: string;
-    owner?: KeyId;        // absent = anonymous (v1: at most one owner per row)
+    author?: KeyId;       // insert author; absent for unauthored/genesis rows
     values: RowValues;    // per-field LWW-resolved at the view position
 };
 
-// Delta support (see src/rtable/delta.ts): a row's enforced liveness + owner +
+// Delta support (see src/rtable/delta.ts): a row's enforced liveness + author +
 // LWW-resolved WRITTEN column values, with NO schema-default fallback. `written`
-// holds only columns carrying an actual write; `live === false` => owner
+// holds only columns carrying an actual write; `live === false` => author
 // undefined and written empty.
 export type DeltaRowState = {
     live: boolean;
-    owner: KeyId | undefined;
+    author: KeyId | undefined;
     written: RowValues;
 };
 
@@ -34,15 +34,15 @@ export interface RTable extends RObject {
     getTableName(): string;
     getGroupId(): B64Hash;
 
-    // Row writers. Returns the entry hash; the rowId is deriveRowId(uuid, owner).
+    // Row writers. Returns the entry hash; the rowId is deriveRowId(uuid).
     // rowIds are WRITE-ONCE identities: deletes are permanent, and a deleted
     // rowId can never be re-inserted (insert a new row with a fresh uuid
     // instead). `author` is optional: an unauthored op is anonymous and passes
-    // authentication trivially, but cannot satisfy $author/owner restrictions
+    // authentication trivially, but cannot satisfy $author restrictions
     // (when the group has a provider, an authored op's signature is verified at
     // validation). `at` defaults to the GROUP frontier (not the table-scope
     // frontier): by default a write extends the group's consistent snapshot.
-    insert(uuid: string, values: RowValues, owner?: KeyId, author?: OwnIdentity, at?: Version): Promise<B64Hash>;
+    insert(uuid: string, values: RowValues, author?: OwnIdentity, at?: Version): Promise<B64Hash>;
     // partial update: only the changed values; per-field LWW with entry-hash
     // tiebreak; the row must be live at `at`; readonly columns rejected
     update(rowId: B64Hash, values: RowValues, author?: OwnIdentity, at?: Version): Promise<B64Hash>;
@@ -63,32 +63,32 @@ export interface RTableView extends View {
     // See src/rtable/view.ts.
     hasRow(rowId: B64Hash): Promise<boolean>;
     getRow(rowId: B64Hash): Promise<Row | undefined>;
-    getOwner(rowId: B64Hash): Promise<KeyId | undefined>;   // undefined: anonymous or not live
+    getAuthor(rowId: B64Hash): Promise<KeyId | undefined>;   // undefined: anonymous or not live
 
     // Every live rowId at this view's horizon (full enforced liveness). The
     // unfiltered row enumeration behind the add-fk deploy prerequisite; prefer
-    // findRowIds when a pub/owner filter is available.
+    // findRowIds when a pub/author filter is available.
     liveRowIds(): Promise<B64Hash[]>;
 
     // Search over pub columns via meta-indexed cover queries — the machinery
     // behind exists predicates. All `where` fields must be pub columns of
-    // this table; matches are exact (normalized value equality) against the
-    // RESOLVED values at the view position (pub columns are mutable unless
-    // also readonly; stale meta hits are filtered). `owner` additionally
-    // requires the row's owner; `where` may be empty iff `owner` is given.
-    findRowIds(where: { [pubColumn: string]: json.Literal }, owner?: KeyId): Promise<B64Hash[]>;
+    // this table or the implicit `author` system field; matches are exact
+    // (normalized value equality) against the RESOLVED values at the view
+    // position (pub columns are mutable unless also readonly; stale meta hits
+    // are filtered).
+    findRowIds(where: { [pubColumn: string]: json.Literal }): Promise<B64Hash[]>;
 
     // Single-table SELECT-style read at this view's horizon (no joins). A
     // local read: voids nothing, agrees with no replica. Validates the query
     // against the schema (throws on user mistakes — unknown columns, malformed
     // filters, type-incoherent comparisons, bad limit/offset), selects
-    // candidates (pub-eq / owner index pushdown, else full scan), re-checks the
+    // candidates (pub-eq / author index pushdown, else full scan), re-checks the
     // FULL filter over enforced-live RESOLVED rows, then applies
     // orderBy / offset / limit / select. See src/rtable/query.ts.
     query(q: RowQuery): Promise<Row[]>;
 
     // Delta support (see src/rtable/delta.ts). getColumns: the schema column
-    // names at this horizon. deltaRowState: a row's enforced liveness, owner,
+    // names at this horizon. deltaRowState: a row's enforced liveness, author,
     // and LWW-resolved WRITTEN values (no default fallback) for `columns`.
     // Written values resolve schema-independently (a dropped column still
     // yields its frozen value), so the caller diffs over the UNION of both

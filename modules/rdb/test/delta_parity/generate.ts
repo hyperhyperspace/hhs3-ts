@@ -113,7 +113,7 @@ export async function generateSingleGroupHistory(seed: number, ops: number): Pro
                 if (await (await (await group.getView(atV, atV)).getTableView('orders')).hasRow(orderRowId(i))) continue;
                 const vals: { [c: string]: string } = { customer: `c-${prng.nextInt(0, 5)}` };
                 if (hasStatus && prng.next() < 0.5) vals['status'] = `s-${prng.nextInt(0, 3)}`;
-                await orders.insert(orderUuid(i), vals, undefined, undefined, at);
+                await orders.insert(orderUuid(i), vals, undefined, at);
             } else if (roll < 44) {
                 // insert line referencing a live order (FK)
                 const live = await liveOrders(group, atV);
@@ -121,7 +121,7 @@ export async function generateSingleGroupHistory(seed: number, ops: number): Pro
                 if (target === undefined) continue;
                 const i = prng.nextInt(0, LINE_POOL - 1);
                 if (await (await (await group.getView(atV, atV)).getTableView('lines')).hasRow(lineRowId(i))) continue;
-                await lines.insert(lineUuid(i), { order: orderRowId(target), qty: prng.nextInt(1, 9) }, undefined, undefined, at);
+                await lines.insert(lineUuid(i), { order: orderRowId(target), qty: prng.nextInt(1, 9) }, undefined, at);
             } else if (roll < 56) {
                 // update order customer
                 const target = pick(prng, await liveOrders(group, atV));
@@ -292,7 +292,7 @@ export async function generateCrossGroupHistory(seed: number, ops: number): Prom
                 if (target === undefined) continue;
                 const li = prng.nextInt(0, LINE_POOL - 1);
                 if (await linesView.hasRow(lineRowId(li))) continue;
-                await linesA.insert(lineUuid(li), { order: orderRowId(target), qty: prng.nextInt(1, 9) }, undefined, undefined, at);
+                await linesA.insert(lineUuid(li), { order: orderRowId(target), qty: prng.nextInt(1, 9) }, undefined, at);
             } else if (roll < 85) {
                 // A: delete a line at atV
                 const linesView = await (await groupA.getView(atV, atV)).getTableView('lines');

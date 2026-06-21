@@ -162,10 +162,10 @@ export class RTableViewImpl implements RTableView {
     // The winning insert by BASE delete-state liveness only: inserted at or
     // below `at`, not deleted (deletes are permanent and count whether voided
     // or not), no concurrent delete barrier (concurrentDeletes tables). This
-    // ignores restriction voiding and FK reach — it is the write-time
-    // identity check (an FK-hidden but undeleted row is still a valid update
-    // target, so it can be repaired; restrictions are enforced at-use/view, not
-    // at write time). Reads use the enforced `liveInsert` instead.
+    // ignores view-time restriction rechecks and FK reach — it is the
+    // write-time identity check (an FK-hidden but undeleted row is still a
+    // valid update target, so it can be repaired). Reads use the enforced
+    // `liveInsert` instead.
     private async baseLiveInsert(rowId: B64Hash): Promise<InsertRowPayload | undefined> {
         const dag = await this.target.getScopedDag();
         const table = this.target.getTableName();
@@ -191,8 +191,8 @@ export class RTableViewImpl implements RTableView {
         if (winner === undefined) return undefined;
 
         // concurrentDeletes is resolved AT-USE, per delete barrier (base
-        // liveness ignores restriction/FK voiding — deletes count whether
-        // voided or not).
+        // liveness ignores view-time restriction/FK rechecks — deletes count
+        // whether voided or not).
         if (await this.killedByConcurrentDelete(rowId, table, false)) return undefined;
 
         return winner;
@@ -229,8 +229,8 @@ export class RTableViewImpl implements RTableView {
     // is not live. Implements both liveness layers (see header): valid
     // permanent-delete state (incl. at-use concurrentDeletes) and drop-on-void
     // op filtering (restriction + FK reach, folded into entry voiding).
-    // Duplicate concurrent inserts of the same rowId (same uuid + owner) are
-    // the SAME incarnation; the largest entry hash provides uuid/owner
+    // Duplicate concurrent inserts of the same rowId (same uuid + author) are
+    // the SAME incarnation; the largest entry hash provides uuid/author
     // deterministically (their column writes participate in per-column
     // resolution like any other write).
     private async liveInsert(rowId: B64Hash): Promise<InsertRowPayload | undefined> {
@@ -373,12 +373,12 @@ export class RTableViewImpl implements RTableView {
         if (resolved === undefined) return undefined;
 
         const row: Row = { rowId: resolved.insert.rowId, uuid: resolved.insert.uuid, values: resolved.values };
-        if (resolved.insert.owner !== undefined) row.owner = resolved.insert.owner;
+        if (resolved.insert.author !== undefined) row.author = resolved.insert.author;
         return row;
     }
 
-    async getOwner(rowId: B64Hash): Promise<KeyId | undefined> {
-        return (await this.liveInsert(rowId))?.owner;
+    async getAuthor(rowId: B64Hash): Promise<KeyId | undefined> {
+        return (await this.liveInsert(rowId))?.author;
     }
 
     // Delta support (see ./delta.ts). The schema columns at this horizon.
@@ -388,7 +388,7 @@ export class RTableViewImpl implements RTableView {
         return Object.keys(def?.columns ?? {});
     }
 
-    // Delta support (see ./delta.ts). Enforced liveness + owner + the LWW
+    // Delta support (see ./delta.ts). Enforced liveness + author + the LWW
     // WRITTEN value of each requested column, with NO schema-default fallback:
     // resolveColumn scans `cols` write-meta and is schema-independent, so a
     // column dropped between horizons still yields its frozen written value
@@ -396,19 +396,19 @@ export class RTableViewImpl implements RTableView {
     // per-row write. Callers pass the union of both horizons' columns.
     async deltaRowState(rowId: B64Hash, columns: string[]): Promise<DeltaRowState> {
         const insert = await this.liveInsert(rowId);
-        if (insert === undefined) return { live: false, owner: undefined, written: {} };
+        if (insert === undefined) return { live: false, author: undefined, written: {} };
 
         const written: RowValues = {};
         for (const column of columns) {
             const value = await this.resolveColumn(rowId, column);
             if (value !== undefined) written[column] = value;
         }
-        return { live: true, owner: insert.owner, written };
+        return { live: true, author: insert.author, written };
     }
 
     // Every live rowId at this horizon: enumerate the table's row entries,
     // collect candidate insert rowIds, then re-check enforced liveness. No
-    // pub/owner index is available, so this is a full table scan (used by the
+    // pub/author index is available, so this is a full table scan (used by the
     // one-time add-fk deploy prerequisite).
     async liveRowIds(): Promise<B64Hash[]> {
         const dag = await this.target.getScopedDag();
@@ -476,17 +476,17 @@ export class RTableViewImpl implements RTableView {
         return undefined;
     }
 
-    async findRowIds(where: { [pubColumn: string]: json.Literal }, owner?: KeyId): Promise<B64Hash[]> {
+    async findRowIds(where: { [pubColumn: string]: json.Literal }): Promise<B64Hash[]> {
         const schemaView = await this.schemaView();
         const table = this.target.getTableName();
         const pubColumns = new Set(schemaView.getPubColumns(table));
 
         const fields = Object.keys(where);
-        if (fields.length === 0 && owner === undefined) {
-            throw new Error("findRowIds requires at least one where field or an owner");
+        if (fields.length === 0) {
+            throw new Error("findRowIds requires at least one where field");
         }
         for (const field of fields) {
-            if (!pubColumns.has(field)) {
+            if (field !== 'author' && !pubColumns.has(field)) {
                 throw new Error(`'${field}' is not a pub column of table '${table}'`);
             }
         }
@@ -494,18 +494,20 @@ export class RTableViewImpl implements RTableView {
         const dag = await this.target.getScopedDag();
         const candidateRowIds = new Set<B64Hash>();
 
-        if (fields.length > 0) {
-            // Indexed candidates via pub meta. Pub values are mutable, so a
-            // multi-field filter would miss rows whose current values come
-            // from different entries: ONE field drives the index query (a
-            // matching row's resolved write for that field is in its history
-            // at `at`, tagged with the matching meta), and the RESOLVED
-            // values are re-checked for ALL fields before a row qualifies.
-            // Stale meta hits (old values, losing concurrent writes, voided
-            // entries) are filtered the same way.
-            const indexField = fields[0];
+        {
+            // Indexed candidates via pub meta, or author system meta. Pub
+            // values are mutable, so a multi-field filter would miss rows
+            // whose current values come from different entries: ONE field
+            // drives the index query, and resolved values are re-checked.
+            const indexField = fields.includes('author') ? 'author' : fields[0];
+            if (indexField === 'author' && typeof where[indexField] !== 'string') {
+                throw new Error("'author' search requires a key-id string");
+            }
+            const indexValue = indexField === 'author'
+                ? where[indexField] as string
+                : json.toStringNormalized(where[indexField]);
             const filter: EntryMetaFilter = { containsValues: {
-                ['pub-' + indexField]: [json.toStringNormalized(where[indexField])],
+                [indexField === 'author' ? 'author' : 'pub-' + indexField]: [indexValue],
             } };
 
             const candidates = await findAllWithFilter(dag, this.at, filter);
@@ -521,37 +523,18 @@ export class RTableViewImpl implements RTableView {
 
                 for (const op of ops) {
                     if (op.action !== 'insert' && op.action !== 'update') continue;
-                    const carried = op.values[indexField];
+                    const carried = indexField === 'author' && op.action === 'insert'
+                        ? op.author
+                        : op.values[indexField];
                     if (carried !== undefined &&
                         json.toStringNormalized(carried) === json.toStringNormalized(where[indexField])) {
                         candidateRowIds.add(op.rowId);
                     }
                 }
             }
-        } else {
-            // owner-only search: enumerate the table's row entries and
-            // collect inserts carried by the requested owner (rowIds are
-            // owner-derived, so the owner is fixed at insert)
-            const candidates = await findAllWithFilter(dag, this.at, { containsKeys: ['rows'] });
-
-            for (const hash of candidates) {
-                const entry = await dag.loadEntry(hash);
-                if (entry === undefined) continue;
-
-                const p = entry.payload as json.LiteralMap;
-                const ops: RowOpPayload[] = p['action'] === 'rows'
-                    ? (p as RowsSlicePayload).ops
-                    : [p as RowOpPayload];
-
-                for (const op of ops) {
-                    if (op.action === 'insert' && op.owner === owner) {
-                        candidateRowIds.add(op.rowId);
-                    }
-                }
-            }
         }
 
-        // re-check: liveness (enforced), owner, then per-field resolved
+        // re-check: liveness (enforced), author, then per-field resolved
         // values (only the searched fields are resolved)
         const def = schemaView.getTable(table);
         const rowIds = new Set<B64Hash>();
@@ -559,11 +542,12 @@ export class RTableViewImpl implements RTableView {
         for (const rowId of candidateRowIds) {
             const insert = await this.liveInsert(rowId);
             if (insert === undefined) continue;
-            if (owner !== undefined && insert.owner !== owner) continue;
 
             let matchesAll = true;
             for (const field of fields) {
-                const value = (await this.resolveColumn(rowId, field)) ?? def?.columns[field]?.default;
+                const value = field === 'author'
+                    ? insert.author
+                    : (await this.resolveColumn(rowId, field)) ?? def?.columns[field]?.default;
                 if (value === undefined ||
                     json.toStringNormalized(value) !== json.toStringNormalized(where[field])) {
                     matchesAll = false;
@@ -592,7 +576,7 @@ export class RTableViewImpl implements RTableView {
         validateRowQuery(q, columns);
 
         // Candidate selection: push ONE top-level AND conjunct down to an
-        // index (pub-eq or owner), else full scan. findRowIds / liveRowIds
+        // index (pub-eq or author), else full scan. findRowIds / liveRowIds
         // already apply enforced liveness + resolved re-check; the residual
         // evalRowFilter below re-checks the FULL filter, so an index hit that
         // is stale for the OTHER conjuncts is dropped, exactly like findRowIds
@@ -603,8 +587,8 @@ export class RTableViewImpl implements RTableView {
         let candidates: B64Hash[];
         if (pushable?.kind === 'pub') {
             candidates = await this.findRowIds({ [pushable.column]: pushable.value });
-        } else if (pushable?.kind === 'owner') {
-            candidates = await this.findRowIds({}, pushable.owner);
+        } else if (pushable?.kind === 'author') {
+            candidates = await this.findRowIds({ author: pushable.author });
         } else {
             candidates = await this.liveRowIds();
         }
@@ -628,20 +612,21 @@ export class RTableViewImpl implements RTableView {
     }
 
     // Pick one pushable conjunct from the top-level AND (or the whole filter):
-    // a `cmp eq` of a pub column against a literal -> pub-meta index; a
-    // `{p:'owner',is}` atom -> owner enumeration. undefined -> full scan. The
+    // a `cmp eq` of a pub/system column against a literal -> index. undefined -> full scan. The
     // residual filter re-check makes any choice here safe (it never changes the
     // result, only the candidate set).
     private pushableConjunct(
         where: RowFilter | undefined, pubColumns: Set<string>,
-    ): { kind: 'pub'; column: string; value: json.Literal } | { kind: 'owner'; owner: KeyId } | undefined {
+    ): { kind: 'pub'; column: string; value: json.Literal } | { kind: 'author'; author: string } | undefined {
         if (where === undefined) return undefined;
         const conjuncts = where.p === 'and' ? where.args : [where];
 
         for (const c of conjuncts) {
-            if (c.p === 'owner') return { kind: 'owner', owner: c.is };
             if (c.p === 'cmp' && c.cmp === 'eq') {
                 const pair = colLitPair(c.left, c.right);
+                if (pair !== undefined && pair.column === 'author' && typeof pair.value === 'string') {
+                    return { kind: 'author', author: pair.value };
+                }
                 if (pair !== undefined && pubColumns.has(pair.column)) {
                     return { kind: 'pub', column: pair.column, value: pair.value };
                 }

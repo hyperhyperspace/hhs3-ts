@@ -18,8 +18,13 @@ async function makeIdentity(): Promise<OwnIdentity> {
     return createIdentity(SIGNING_ED25519, hashSuite);
 }
 
-async function createEnv(tables: TableDef[], opts?: { canDeploy?: Predicate; initialRows?: { [t: string]: json.Literal[] }; admin?: OwnIdentity }) {
-    const ctx = createMockRContext({ selfValidate: true });
+async function createEnv(tables: TableDef[], opts?: {
+    canDeploy?: Predicate;
+    initialRows?: { [t: string]: json.Literal[] };
+    admin?: OwnIdentity;
+    selfValidate?: boolean;
+}) {
+    const ctx = createMockRContext({ selfValidate: opts?.selfValidate ?? true });
     ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
     ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
 
@@ -65,6 +70,16 @@ async function expectInsertFailure(table: { insert: (...a: never[]) => Promise<u
     let failed = false;
     try {
         await (table.insert as (...a: unknown[]) => Promise<unknown>)(...args);
+    } catch {
+        failed = true;
+    }
+    assertTrue(failed, why);
+}
+
+async function expectFailure(fn: () => Promise<unknown>, why: string): Promise<void> {
+    let failed = false;
+    try {
+        await fn();
     } catch {
         failed = true;
     }
@@ -195,7 +210,7 @@ export const rtableEnforceTests = {
                 // with the delete, so the barrier voids it at the merge.
                 await orders.delete(orderId, undefined, base);
                 const lineId = deriveRowId('l-1');
-                await lines.insert('l-1', { order: orderId, qty: 1 }, undefined, undefined, base);
+                await lines.insert('l-1', { order: orderId, qty: 1 }, undefined, base);
 
                 const frontier = await groupFrontier(group);
                 assertFalse(await (await tableView(group, 'lines', frontier)).hasRow(lineId),
@@ -218,7 +233,7 @@ export const rtableEnforceTests = {
 
                 await orders.delete(orderId, undefined, base);
                 const lineId = deriveRowId('l-1');
-                await lines.insert('l-1', { order: orderId, qty: 1 }, undefined, undefined, base);
+                await lines.insert('l-1', { order: orderId, qty: 1 }, undefined, base);
 
                 const frontier = await groupFrontier(group);
                 assertTrue(await (await tableView(group, 'lines', frontier)).hasRow(lineId),
@@ -226,7 +241,7 @@ export const rtableEnforceTests = {
             }
         },
         {
-            name: '[ENF06] Exists-gated insert without a witness lands at write but is void at view time',
+            name: '[ENF06] Exists-gated insert without a witness rejects at validation',
             invoke: async () => {
                 const { group } = await createEnv([
                     open('caps', { label: { type: 'string', pub: true } }),
@@ -239,11 +254,9 @@ export const rtableEnforceTests = {
                 const items = await group.getTable('items');
                 const caps = await group.getTable('caps');
 
-                // no witness yet: the op lands at write time but is void at view time
-                const voidId = deriveRowId('i-void');
-                await items.insert('i-void', { name: 'thing' });
-                assertFalse(await (await tableView(group, 'items')).hasRow(voidId),
-                    'the exists-gated insert is void at view time (no witness)');
+                // no witness yet: restrictions are hard validation at `(at, at)`
+                await expectFailure(() => items.insert('i-void', { name: 'thing' }),
+                    'the exists-gated insert is rejected with no witness');
 
                 // a witness present at-or-before the use validates a later use
                 // (at-use semantics: the witness must exist at the op position)
@@ -252,8 +265,22 @@ export const rtableEnforceTests = {
                 await items.insert('i-ok', { name: 'thing' });
                 assertTrue(await (await tableView(group, 'items')).hasRow(okId),
                     'an insert with the witness already present is valid');
-                assertFalse(await (await tableView(group, 'items')).hasRow(voidId),
-                    'the earlier witness-less insert stays void (at-use, not retroactive)');
+            }
+        },
+        {
+            name: '[ENF06b] Public row writers reject invalid ops even without selfValidate',
+            invoke: async () => {
+                const { group } = await createEnv([
+                    open('caps', { label: { type: 'string', pub: true } }),
+                    {
+                        name: 'items',
+                        columns: { name: { type: 'string' } },
+                        restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'caps', where: { label: 'grant' } } }],
+                    },
+                ], { selfValidate: false });
+                const items = await group.getTable('items');
+                await expectFailure(() => items.insert('i-void', { name: 'thing' }),
+                    'the public insert API should reject invalid ops even when context selfValidate is off');
             }
         },
         {
@@ -302,7 +329,7 @@ export const rtableEnforceTests = {
                 // concurrent: branch A revokes the witness (barrier), branch B uses it
                 await caps.delete(capId, undefined, base);
                 const itemId = deriveRowId('i-1');
-                await items.insert('i-1', { name: 'thing' }, undefined, undefined, base);
+                await items.insert('i-1', { name: 'thing' }, undefined, base);
 
                 const frontier = await groupFrontier(group);
                 assertFalse(await (await tableView(group, 'items', frontier)).hasRow(itemId),
@@ -329,7 +356,7 @@ export const rtableEnforceTests = {
 
                 await caps.delete(capId, undefined, base);
                 const itemId = deriveRowId('i-1');
-                await items.insert('i-1', { name: 'thing' }, undefined, undefined, base);
+                await items.insert('i-1', { name: 'thing' }, undefined, base);
 
                 const frontier = await groupFrontier(group);
                 assertTrue(await (await tableView(group, 'items', frontier)).hasRow(itemId),
@@ -337,44 +364,49 @@ export const rtableEnforceTests = {
             }
         },
         {
-            name: '[ENF10] Defaults: unauthored update/delete of an owned row void; authored-by-owner pass',
+            name: '[ENF10] Defaults: unauthored update/delete of an authored row reject; authored-by-author pass',
             invoke: async () => {
                 // default restrictions (no `restrictions` declared): insert
-                // true, update/delete owner-is-author
+                // true, update/delete author-is-author
                 const { group } = await createEnv([
                     { name: 'docs', columns: { body: { type: 'string' } } },
                 ]);
                 const docs = await group.getTable('docs');
-                const owner = await makeIdentity();
-                const rowId = deriveRowId('d-1', owner.keyId);
+                const author = await makeIdentity();
+                const rowId = deriveRowId('d-1', author.keyId);
 
-                await docs.insert('d-1', { body: 'v1' }, owner.keyId, owner);
+                await docs.insert('d-1', { body: 'v1' }, author);
 
-                // unauthored update: lands at write (signature not verified without provider),
-                // but voids at view time (owner-is-author fails)
-                await docs.update(rowId, { body: 'v2' });
+                // unauthored writes fail the default author-is-author restriction
+                // during validation.
+                await expectFailure(() => docs.update(rowId, { body: 'v2' }),
+                    'an unauthored update of an authored row rejects at validation');
+                await expectFailure(() => docs.delete(rowId),
+                    'an unauthored delete of an authored row rejects at validation');
                 assertEquals((await (await tableView(group, 'docs')).getRow(rowId))!.values['body'], 'v1',
-                    'an unauthored update of an owned row voids at view time');
+                    'failed unauthored writes leave the row unchanged');
 
-                // authored by the owner: it lands and resolves
-                await docs.update(rowId, { body: 'v3' }, owner);
+                // authored by the insert author: it lands and resolves
+                await docs.update(rowId, { body: 'v3' }, author);
                 assertEquals((await (await tableView(group, 'docs')).getRow(rowId))!.values['body'], 'v3',
-                    'an owner-authored update passes the default restriction');
+                    'an author-authored update passes the default restriction');
+                await docs.delete(rowId, author);
+                assertFalse(await (await tableView(group, 'docs')).hasRow(rowId),
+                    'an author-authored delete passes the default restriction');
             }
         },
         {
-            name: '[ENF11] $rowOwner / owner-term exists predicates resolve correctly',
+            name: '[ENF11] grantee-based exists predicates resolve correctly',
             invoke: async () => {
-                // items may be updated only by someone who owns a caps row
-                // (exists caps where owner = $author)
+                // items may be updated only by someone named as a cap grantee
                 const { group } = await createEnv([
-                    open('caps', { label: { type: 'string', pub: true } }),
+                    open('caps', { label: { type: 'string', pub: true }, grantee: { type: 'string', pub: true } }),
                     {
                         name: 'items',
                         columns: { name: { type: 'string' } },
                         restrictions: [
                             { on: 'insert', rule: { p: 'true' } },
-                            { on: 'update', rule: { p: 'exists', table: 'caps', owner: '$author' } },
+                            { on: 'update', rule: { p: 'exists', table: 'caps', where: { grantee: '$author' } } },
                         ],
                     },
                 ]);
@@ -384,28 +416,29 @@ export const rtableEnforceTests = {
                 const alice = await makeIdentity();
                 const bob = await makeIdentity();
 
-                // alice owns a caps row; bob does not
-                await caps.insert('c-alice', { label: 'x' }, alice.keyId, alice);
+                // alice is named as a caps grantee; bob is not
+                await caps.insert('c-alice', { label: 'x', grantee: alice.keyId }, alice);
 
                 const itemId = deriveRowId('i-1');
                 await items.insert('i-1', { name: 'v1' });
 
-                // bob's update: no caps row owned by bob -> void
-                await items.update(itemId, { name: 'by-bob' }, bob);
+                // bob's update: no caps row owned by bob -> rejected
+                await expectFailure(() => items.update(itemId, { name: 'by-bob' }, bob),
+                    'an update by a non-cap-holder rejects');
                 assertEquals((await (await tableView(group, 'items')).getRow(itemId))!.values['name'], 'v1',
-                    'an update by a non-cap-holder voids');
+                    'a rejected non-cap-holder update leaves the row unchanged');
 
                 // alice's update: she owns a caps row -> passes
                 await items.update(itemId, { name: 'by-alice' }, alice);
                 assertEquals((await (await tableView(group, 'items')).getRow(itemId))!.values['name'], 'by-alice',
-                    'an update by a cap-holder passes the exists/owner predicate');
+                    'an update by a cap-holder passes the exists/grantee predicate');
             }
         },
         {
-            name: '[ENF12] A voided op inside a bundle voids the sibling ops (all-or-nothing visibility)',
+            name: '[ENF12] An unauthorized op inside a bundle rejects the whole bundle',
             invoke: async () => {
                 // bundle of two inserts; one is exists-gated with no witness ->
-                // the whole bundle voids
+                // the whole bundle rejects before append
                 const { group } = await createEnv([
                     open('caps', { label: { type: 'string', pub: true } }),
                     open('free', { v: { type: 'string' } }),
@@ -418,29 +451,29 @@ export const rtableEnforceTests = {
 
                 const freeId = deriveRowId('f-1');
                 const gatedId = deriveRowId('g-1');
-                await group.bundle([
+                await expectFailure(() => group.bundle([
                     { table: 'free', op: { action: 'insert', rowId: freeId, uuid: 'f-1', values: { v: 'a' } } },
                     { table: 'gated', op: { action: 'insert', rowId: gatedId, uuid: 'g-1', values: { v: 'b' } } },
-                ]);
+                ]), 'a bundle with an unauthorized op rejects at validation');
 
-                assertFalse(await (await tableView(group, 'gated')).hasRow(gatedId), 'the gated op voids (no witness)');
+                assertFalse(await (await tableView(group, 'gated')).hasRow(gatedId), 'the gated op never appends');
                 assertFalse(await (await tableView(group, 'free')).hasRow(freeId),
-                    'its bundle sibling voids too (all-or-nothing)');
+                    'its bundle sibling never appends either (all-or-nothing)');
             }
         },
         {
             name: '[ENF13] canDeploy predicate evaluated on deploy: passing and failing authors',
             invoke: async () => {
-                // canDeploy: exists admins where owner = $author
-                const admins = open('admins', { label: { type: 'string', pub: true } });
+                // canDeploy: exists admins where grantee = $author
+                const admins = open('admins', { label: { type: 'string', pub: true }, grantee: { type: 'string', pub: true } });
                 const admin = await makeIdentity();
                 const { group, schema } = await createEnv(
                     [admins, open('orders', { customer: { type: 'string' } })],
                     {
                         admin,
-                        canDeploy: { p: 'exists', table: 'admins', owner: '$author' },
+                        canDeploy: { p: 'exists', table: 'admins', where: { grantee: '$author' } },
                         initialRows: {
-                            admins: [{ action: 'insert', rowId: deriveRowId('seed-admin', admin.keyId), uuid: 'seed-admin', owner: admin.keyId, values: { label: 'root' } }],
+                            admins: [{ action: 'insert', rowId: deriveRowId('seed-admin'), uuid: 'seed-admin', values: { label: 'root', grantee: admin.keyId } }],
                         },
                     },
                 );
@@ -459,7 +492,7 @@ export const rtableEnforceTests = {
 
                 await group.deploy(v2, admin);
                 assertTrue((await group.getView()).getTableNames().includes('notes'),
-                    'a deploy by an admin (owns an admins row) should pass canDeploy');
+                    'a deploy by an admin grantee should pass canDeploy');
             }
         },
     ],

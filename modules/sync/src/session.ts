@@ -2,6 +2,7 @@ import type { B64Hash, HashSuite } from '@hyper-hyper-space/hhs3_crypto';
 import type { Dag } from '@hyper-hyper-space/hhs3_dag';
 import type { Swarm, SwarmPeer } from '@hyper-hyper-space/hhs3_mesh';
 import type { RObject } from '@hyper-hyper-space/hhs3_mvt';
+import { extractCreatePayloadType } from '@hyper-hyper-space/hhs3_mvt';
 
 import { decode, encode } from './codec.js';
 import { createDagProvider } from './provider.js';
@@ -123,10 +124,15 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[]): SyncSess
             if (msg.type === 'init-request' && msg.objectId === target.dagId) {
                 target.dag.loadEntry(target.dagId).then(rootEntry => {
                     if (rootEntry !== undefined) {
+                        const payloadType = extractCreatePayloadType(rootEntry.payload);
+                        if (payloadType !== target.rObject.getType()) {
+                            reportIssue(key, 'validation-failed');
+                            return;
+                        }
                         const resp: InitResponse = {
                             type: 'init-response',
                             objectId: target.dagId,
-                            init: { type: target.rObject.getType(), payload: rootEntry.payload },
+                            createPayload: rootEntry.payload,
                         };
                         sp.channel.send(encode(resp));
                     }

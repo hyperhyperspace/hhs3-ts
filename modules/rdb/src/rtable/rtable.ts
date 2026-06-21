@@ -8,9 +8,8 @@
 // group-level envelope tags it):
 //
 //   insert
-//     Creates a row. Carries: `rowId` (must equal deriveRowId(uuid, owner)),
-//     `uuid`, optional `owner` (absent = anonymous row; v1 allows at most
-//     one owner), column `values`, optional author/signature. Values of
+//     Creates a row. Carries: `rowId` (must equal deriveRowId(uuid, author)),
+//     `uuid`, column `values`, optional author/signature. Values of
 //     `pub` columns are exported to entry meta (derived, re-checked at
 //     validation).
 //
@@ -37,18 +36,17 @@
 // Provides insert + update + delete writers, permanent-delete liveness
 // (causal + at-use concurrentDeletes barriers), per-field LWW value resolution,
 // pub meta export (inserts and updates), views, plus the enforcement layers in
-// view.ts. An entry is VOID when any op it carries fails its restriction
-// predicate OR writes an FK column whose target is not live, both evaluated
-// AT-USE at the op's own position observed from the view horizon (a concurrent
-// barrier delete of a witness / FK target voids the use; a causally-later one
-// does not). Voided ops are invisible (a voided insert never lives; a voided
-// FK-update reverts via LWW); FK reference cycles resolve to DENY. Cross-group
-// FK / exists targets resolve through bound foreign groups. When the group
-// selects an identity provider, an authored op's signature is verified AT
-// VALIDATION (hard reject / defer), so view-time evaluation trusts op.author.
-// Write-time validation rejects dangling FKs (local and cross-group); the
-// subject-row liveness check for update/delete is BASE delete-state only (an
-// undeleted row stays repairable). Delta is the group's (a table never leads
+// view.ts. Validation hard-rejects row ops whose restriction predicate fails at
+// the parent frontier `(at, at)`. Entries are still rechecked at-use in views:
+// a concurrent barrier delete of a witness / FK target voids the use, while a
+// causally-later one does not. Voided ops are invisible (a voided insert never
+// lives; a voided FK-update reverts via LWW); FK reference cycles resolve to
+// DENY. Cross-group FK / exists targets resolve through bound foreign groups.
+// When the group selects an identity provider, an authored op's signature is
+// verified AT VALIDATION (hard reject / defer), so view-time evaluation trusts
+// op.author. Write-time validation rejects dangling FKs (local and cross-group);
+// the subject-row liveness check for update/delete is BASE delete-state only
+// (an undeleted row stays repairable). Delta is the group's (a table never leads
 // one): a member table contributes a per-table row-change accumulator
 // (createDeltaAccumulator -> ./delta.ts) that the group routes walked entries
 // to; computeDelta throws here.
@@ -59,6 +57,7 @@ import type { KeyId, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 
 import {
     Payload, Version, ForeignDep, Event, Delta, DeltaAccumulator,
+    formatValidationFailure, ValidationRejectedError, ValidationResult,
 } from "@hyper-hyper-space/hhs3_mvt";
 import type { ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
 import { signPayload as signPayloadHelper } from "@hyper-hyper-space/hhs3_mvt";
@@ -85,7 +84,7 @@ export type TableGroupHost = {
     getCausalDag(): Promise<CausalDag>;
     resolveSchemaView(at: Version, from?: Version): Promise<RSchemaView>;
     selfValidate(): boolean;
-    validatePayload(payload: Payload, at: Version): Promise<boolean>;
+    validatePayload(payload: Payload, at: Version): Promise<ValidationResult>;
     makeTable(name: string): RTableImpl;
     isEntryVoided(entryHash: B64Hash, from: Version): Promise<boolean>;
     resolveForeignTableView(
@@ -138,8 +137,8 @@ export class RTableImpl implements RTableContract {
     }
 
     // Write-time identity check: base delete-state liveness (no FK reach, no
-    // restriction voiding — see view.ts). An undeleted but FK-hidden row is
-    // still a valid update target (it can be repaired).
+    // view-time restriction recheck — see view.ts). An undeleted but FK-hidden
+    // row is still a valid update target (it can be repaired).
     async baseHasRow(rowId: B64Hash, at: Version): Promise<boolean> {
         return new RTableViewImpl(this, at, at).hasRowBase(rowId);
     }
@@ -147,16 +146,15 @@ export class RTableImpl implements RTableContract {
     // Row writers. `at` defaults to the GROUP frontier: by default a write
     // extends the group's consistent snapshot (not just this table's scope).
 
-    async insert(uuid: string, values: RowValues, owner?: KeyId, author?: OwnIdentity, at?: Version): Promise<B64Hash> {
+    async insert(uuid: string, values: RowValues, author?: OwnIdentity, at?: Version): Promise<B64Hash> {
         at = at ?? await (await this.group.getScopedDag()).getFrontier();
 
         const base: InsertRowPayload = {
             action: 'insert',
-            rowId: deriveRowId(uuid, owner),
+            rowId: deriveRowId(uuid, author?.keyId),
             uuid,
             values,
         };
-        if (owner !== undefined) base.owner = owner;
 
         const payload = author !== undefined
             ? await signPayloadHelper(base as unknown as json.LiteralMap, author) as unknown as InsertRowPayload
@@ -196,6 +194,11 @@ export class RTableImpl implements RTableContract {
             throw new Error(`Table '${this.tableName}' does not exist in the effective schema at this position`);
         }
 
+        const result = await this.validatePayload(op, at);
+        if (!result.valid) {
+            throw new ValidationRejectedError(formatValidationFailure(result.why), result.why);
+        }
+
         const innerMeta = deriveRowOpInnerMeta(op, schemaView.getPubColumns(this.tableName));
 
         const scopedDag = await this.getScopedDag();
@@ -204,7 +207,7 @@ export class RTableImpl implements RTableContract {
 
     // RObject interface
 
-    async validatePayload(payload: Payload, at: Version): Promise<boolean> {
+    async validatePayload(payload: Payload, at: Version): Promise<ValidationResult> {
         const envelope: RowEnvelopePayload = { action: 'row', table: this.tableName, op: payload };
         return this.group.validatePayload(envelope, at);
     }
@@ -213,11 +216,22 @@ export class RTableImpl implements RTableContract {
         return this.appendRowOp(payload as RowOpPayload, at);
     }
 
+    // Default horizon is the GROUP frontier, not this table's scoped frontier.
+    // The table scope's frontier projects the group tip down through
+    // baseFilter (tables=this table), which drops trailing ref-advance
+    // barriers (schema deploys, foreign observe ops). Those barriers are
+    // exactly what at-use voiding must see: a concurrent cap revoke observed
+    // via UPDATE REF lives in a barrier entry above this table's last row
+    // write. Anchoring at the group frontier keeps those barriers in scope
+    // (the extra non-barrier other-table entries it also drags in are inert
+    // under this table's cover queries), and matches what RTableGroup.getView
+    // / RTableGroupView.getTableView already pass down.
     async getView(at?: Version, from?: Version): Promise<RTableViewContract> {
-        const scopedDag = await this.getScopedDag();
+        const groupDag = await this.group.getScopedDag();
+        const frontier = await groupDag.getFrontier();
 
-        at = at ?? await scopedDag.getFrontier();
-        from = from ?? await scopedDag.getFrontier();
+        at = at ?? frontier;
+        from = from ?? frontier;
 
         return new RTableViewImpl(this, at, from);
     }

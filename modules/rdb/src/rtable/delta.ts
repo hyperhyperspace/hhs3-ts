@@ -34,7 +34,7 @@ export type RowChange = {
     rowId: B64Hash;
     liveBefore: boolean;
     liveAfter: boolean;
-    owner: KeyId | undefined;          // from the live insert (stable across the row's life)
+    author: KeyId | undefined;         // from the live insert (stable across the row's life)
     columnChanges: ColumnValueChange[]; // written-value diffs only, sorted by column
 };
 
@@ -101,7 +101,7 @@ export class RTableDeltaAccumulator implements DeltaAccumulator<RTableChanges> {
                 rowId,
                 liveBefore: before.live,
                 liveAfter: after.live,
-                owner: after.live ? after.owner : before.owner,
+                author: after.live ? after.author : before.author,
                 columnChanges,
             });
         }

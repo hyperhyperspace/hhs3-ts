@@ -29,6 +29,9 @@ export * from "./rtable_group/group.js";
 
 // Users: a standard identities-provider + capabilities RTableGroup
 export * from "./users/users.js";
+export * from "./users/peer_authorizer.js";
+export * from "./users/endpoints.js";
+export * from "./users/peer_directory.js";
 
 // RDb: the sync root / orchestrator (advisory; never validity-bearing)
 export * from "./rdb/payload.js";

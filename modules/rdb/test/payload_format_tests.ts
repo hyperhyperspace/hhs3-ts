@@ -1,18 +1,28 @@
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { json } from "@hyper-hyper-space/hhs3_json";
 
-import { validateRSchemaPayloadFormat } from "../src/rschema/validate.js";
-import { CreateRSchemaPayload, SchemaUpdatePayload } from "../src/rschema/payload.js";
+import { validateRSchemaPayloadFormat as validateRSchemaPayloadFormatResult } from "../src/rschema/validate.js";
+import { CreateRSchemaPayload, SchemaUpdatePayload, RSCHEMA_TYPE_ID } from "../src/rschema/payload.js";
 import { TableDef } from "../src/rschema/payload.js";
 
-import { validateRowOpFormat } from "../src/rtable/validate.js";
+import { validateRowOpFormat as validateRowOpFormatResult } from "../src/rtable/validate.js";
 import { InsertRowPayload, UpdateRowPayload, DeleteRowPayload } from "../src/rtable/payload.js";
 import { deriveRowId } from "../src/rtable/hash.js";
 
-import { validateTableGroupPayloadFormat } from "../src/rtable_group/validate.js";
-import { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload } from "../src/rtable_group/payload.js";
+import { validateTableGroupPayloadFormat as validateTableGroupPayloadFormatResult } from "../src/rtable_group/validate.js";
+import { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload, RTABLE_GROUP_TYPE_ID } from "../src/rtable_group/payload.js";
 
-import { validateRDbPayloadFormat } from "../src/rdb/validate.js";
+import { validateRDbPayloadFormat as validateRDbPayloadFormatResult } from "../src/rdb/validate.js";
+import { RDB_TYPE_ID } from "../src/rdb/payload.js";
+
+const validateRSchemaPayloadFormat = (payload: json.Literal): boolean =>
+    validateRSchemaPayloadFormatResult(payload).valid;
+const validateRowOpFormat = (payload: json.Literal): boolean =>
+    validateRowOpFormatResult(payload).valid;
+const validateTableGroupPayloadFormat = (payload: json.Literal): boolean =>
+    validateTableGroupPayloadFormatResult(payload).valid;
+const validateRDbPayloadFormat = (payload: json.Literal): boolean =>
+    validateRDbPayloadFormatResult(payload).valid;
 
 function ordersTable(): TableDef {
     return {
@@ -31,12 +41,12 @@ function linesTable(): TableDef {
 
 function validInsert(): InsertRowPayload {
     const uuid = 'uuid-1';
-    const owner = 'alice';
+    const author = 'alice';
     return {
         action: 'insert',
-        rowId: deriveRowId(uuid, owner),
+        rowId: deriveRowId(uuid, author),
         uuid,
-        owner,
+        author,
         values: { customer: 'c#7', total: 90 },
     };
 }
@@ -46,6 +56,7 @@ function validInsert(): InsertRowPayload {
 async function testRSchemaCreate() {
     const create: CreateRSchemaPayload = {
         action: 'create',
+        type: RSCHEMA_TYPE_ID,
         seed: 'seed-1',
         name: 'shop',
         creators: [{ keyId: 'alice', publicKey: 'pem...' }],
@@ -53,13 +64,17 @@ async function testRSchemaCreate() {
     };
     assertTrue(validateRSchemaPayloadFormat(create), 'well-formed schema create should validate');
 
+    assertFalse(validateRSchemaPayloadFormat({ ...create, type: 'wrong/type' }),
+        'schema create with wrong type should not validate');
+    assertFalse(validateRSchemaPayloadFormat({ action: 'create', seed: 'seed-1', creators: [{ keyId: 'alice', publicKey: 'pem...' }], tables: [ordersTable()] } as json.Literal),
+        'schema create without type should not validate');
     assertFalse(validateRSchemaPayloadFormat({ ...create, action: 'nope' }), 'unknown action should not validate');
     assertFalse(validateRSchemaPayloadFormat({ ...create, extra: 1 } as json.Literal), 'extra keys should not validate (strict format)');
     assertFalse(validateRSchemaPayloadFormat({ ...create, creators: [] }),
         'schema create without creators should not validate');
     assertFalse(validateRSchemaPayloadFormat({
         ...create,
-        gates: { deploy: { p: 'exists', table: 'users.caps', where: { label: 'deploy' }, owner: '$author' } },
+        gates: { deploy: { p: 'exists', table: 'users.caps', where: { label: 'deploy', grantee: '$author' } } },
     } as json.Literal), 'schema create with gates should not validate (deploy gating moved to the group)');
     assertFalse(
         validateRSchemaPayloadFormat({ ...create, tables: [linesTable()] }),
@@ -113,12 +128,10 @@ async function testInsertRowOp() {
     };
     assertTrue(validateRowOpFormat(anonymous), 'anonymous insert should validate');
 
-    assertFalse(validateRowOpFormat({ ...insert, rowId: deriveRowId('other-uuid', insert.owner) }),
-        'rowId not matching (uuid, owner) should not validate');
-    assertFalse(validateRowOpFormat({ ...insert, owner: 'bob' }),
-        'rowId not matching claimed owner should not validate');
-    assertFalse(validateRowOpFormat({ ...insert, owner: ['alice'] }),
-        'owner as an array should not validate (v1: single owner)');
+    assertFalse(validateRowOpFormat({ ...insert, rowId: deriveRowId('other-uuid', insert.author) }),
+        'rowId not matching (uuid, author) should not validate');
+    assertFalse(validateRowOpFormat({ ...insert, owner: 'bob' } as unknown as json.Literal),
+        'settable owner field should not validate');
     assertFalse(validateRowOpFormat({ ...insert, values: { '2bad': 1 } }),
         'invalid column name should not validate');
 }
@@ -143,14 +156,14 @@ async function testUpdateAndDeleteRowOps() {
 async function testGroupCreate() {
     const initialAdminCap: InsertRowPayload = {
         action: 'insert',
-        rowId: deriveRowId('seed-admin', 'alice'),
+        rowId: deriveRowId('seed-admin'),
         uuid: 'seed-admin',
-        owner: 'alice',
-        values: { label: 'admin' },
+        values: { label: 'admin', grantee: 'alice' },
     };
 
     const create: CreateTableGroupPayload = {
         action: 'create',
+        type: RTABLE_GROUP_TYPE_ID,
         seed: 'seed-1',
         schemaRef: 'schemaObjectId',
         schemaVersion: json.toSet(['hash1', 'hash2']),
@@ -179,19 +192,19 @@ async function testGroupCreate() {
 
     const withDeploy: CreateTableGroupPayload = {
         ...create,
-        canDeploy: { p: 'exists', table: 'users.caps', where: { label: 'deploy' }, owner: '$author' },
+        canDeploy: { p: 'exists', table: 'users.caps', where: { label: 'deploy', grantee: '$author' } },
     };
     assertTrue(validateTableGroupPayloadFormat(withDeploy), 'group create with canDeploy should validate');
 
     assertFalse(validateTableGroupPayloadFormat({
         ...create,
         canDeploy: { p: 'owner', is: '$author' },
-    } as json.Literal), 'canDeploy with an owner atom should not validate (object context: no subject row)');
+    } as json.Literal), 'canDeploy with an owner atom should not validate');
 
     assertFalse(validateTableGroupPayloadFormat({
         ...create,
-        canDeploy: { p: 'exists', table: 'users.caps', owner: '$rowOwner' },
-    } as json.Literal), 'canDeploy using $rowOwner should not validate (object context)');
+        canDeploy: { p: 'exists', table: 'users.caps', where: { grantee: '$rowOwner' } },
+    } as json.Literal), 'canDeploy using $rowOwner should not validate');
 }
 
 async function testRowEnvelope() {
@@ -211,7 +224,7 @@ async function testBundle() {
         action: 'insert',
         rowId: deriveRowId('uuid-3', 'alice'),
         uuid: 'uuid-3',
-        owner: 'alice',
+        author: 'alice',
         values: { order: 'someRowId', qty: 2 },
     };
 
@@ -246,8 +259,10 @@ async function testGroupRefAdvance() {
 // RDb payloads
 
 async function testRDbPayloads() {
-    assertTrue(validateRDbPayloadFormat({ action: 'create', seed: 'seed-1', name: 'mydb' }),
+    assertTrue(validateRDbPayloadFormat({ action: 'create', type: RDB_TYPE_ID, seed: 'seed-1', name: 'mydb' }),
         'well-formed rdb create should validate');
+    assertFalse(validateRDbPayloadFormat({ action: 'create', seed: 'seed-1', name: 'mydb' }),
+        'rdb create without type should not validate');
 
     assertTrue(validateRDbPayloadFormat({ action: 'add-schema', schemaId: 'schemaObjectId', note: 'the shop schema' }),
         'well-formed add-schema should validate');

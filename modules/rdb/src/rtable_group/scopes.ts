@@ -24,6 +24,7 @@
 //                                              candidate noise, filtered by the
 //                                              resolved-value re-check in
 //                                              findRowIds)
+//   t-<table>-author: [keyId]                - insert author system field
 //   barrier: ['t']                           - deletes in concurrentDeletes
 //                                              tables (and schema deploys;
 //                                              tagged in group.ts)
@@ -35,6 +36,7 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { EntryMetaFilter, MetaContainsValues, MetaProps, Position, position } from "@hyper-hyper-space/hhs3_dag";
+import { validationFailure, validationOk, ValidationResult, wrapValidationFailure } from "@hyper-hyper-space/hhs3_mvt";
 import type { DagScope, Version } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchemaView } from "../rschema/interfaces.js";
@@ -53,7 +55,7 @@ export type RowsSlicePayload = {
 export type TableScopeHost = {
     getId(): B64Hash;
     selfValidate(): boolean;
-    validatePayload(payload: json.Literal, at: Version): Promise<boolean>;
+    validatePayload(payload: json.Literal, at: Version): Promise<ValidationResult>;
     resolveSchemaView(at: Version, from?: Version): Promise<RSchemaView>;
 };
 
@@ -113,6 +115,10 @@ export function deriveRowOpInnerMeta(op: RowOpPayload, pubColumns: string[]): Me
                 meta['pub-' + column] = json.toSet([json.toStringNormalized(value)]);
             }
         }
+    }
+
+    if (op.action === 'insert' && op.author !== undefined) {
+        meta['author'] = json.toSet([op.author]);
     }
 
     if (op.action === 'delete') {
@@ -304,17 +310,21 @@ export class TableScope implements DagScope {
     // Local-append check: the payload is validated through the group (when
     // selfValidate is on), and the carried meta must equal the re-derived
     // meta (meta is unhashed; a divergence here would forge visibility).
-    async validateWrappedPayload(wrappedPayload: json.Literal, wrappedMeta: MetaProps, at: Position): Promise<boolean> {
+    async validateWrappedPayload(wrappedPayload: json.Literal, wrappedMeta: MetaProps, at: Position): Promise<ValidationResult> {
         const envelope = wrappedPayload as RowEnvelopePayload;
-        if (envelope.action !== 'row') return false;
+        if (envelope.action !== 'row') return validationFailure("table scope can only append row envelopes");
 
         const schemaView = await this.host.resolveSchemaView(at);
         const expected = deriveEnvelopeMeta(envelope, schemaView);
         if (json.toStringNormalized(wrappedMeta as json.Literal) !== json.toStringNormalized(expected as json.Literal)) {
-            return false;
+            return validationFailure(`row envelope meta for table '${this.table}' does not match derived meta`);
         }
 
-        if (!this.host.selfValidate()) return true;
-        return this.host.validatePayload(wrappedPayload, at);
+        if (!this.host.selfValidate()) return validationOk();
+        return wrapValidationFailure(
+            `table scope append for '${this.table}' rejected by group validation`,
+            await this.host.validatePayload(wrappedPayload, at),
+            this.host.getId(),
+        );
     }
 }
