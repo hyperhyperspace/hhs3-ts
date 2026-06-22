@@ -3,6 +3,7 @@ import {
     BundlePayload, ColumnDef, CreateRDbPayload, CreateRSchemaPayload,
     CreateTableGroupPayload, DeleteRowPayload, InsertRowPayload, MigrationRule,
     RowEnvelopePayload, RowOpPayload, SchemaUpdatePayload, TableDef, UpdateRowPayload,
+    parseRowFieldTerm,
 } from "@hyper-hyper-space/hhs3_rdb";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 
@@ -19,7 +20,7 @@ export function renderCreateSchema(payload: CreateRSchemaPayload): string {
         ? ` CREATORS (${payload.creators.map((c) => sqlString(c.keyId)).join(', ')})`
         : '';
     const tables = payload.tables.map(renderTableDef).join(',\n  ');
-    return `CREATE SCHEMA ${payload.name ?? payload.seed}${creators} AS (\n  ${tables}\n);`;
+    return `CREATE SCHEMA ${payload.name}${creators} AS (\n  ${tables}\n);`;
 }
 
 export function renderCreateTableGroup(payload: CreateTableGroupPayload): string {
@@ -83,19 +84,37 @@ export function renderOp(payload: json.Literal, options?: RenderOptions): string
 }
 
 function renderTableDef(table: TableDef): string {
-    const cols = Object.entries(table.columns).map(([name, def]) => renderColumnDef(name, def, table.fks?.[name])).join(', ');
-    const options: string[] = [];
-    if (table.concurrentDeletes !== undefined) options.push(table.concurrentDeletes ? 'CONCURRENT DELETES' : 'NO CONCURRENT DELETES');
+    const colIndent = '    ';
+    const colLines = Object.entries(table.columns)
+        .map(([name, def]) => `${colIndent}${renderColumnDef(name, def, table.fks?.[name])}`);
+    const cols = colLines.length === 0 ? '' : `\n${colLines.join(',\n')}\n  `;
+
+    const structural: string[] = [];
+    if (table.concurrentDeletes !== undefined) {
+        structural.push(table.concurrentDeletes ? 'CONCURRENT DELETES' : 'NO CONCURRENT DELETES');
+    }
     if (table.idProvider !== undefined) {
         const provider = table.idProvider.keyIdColumn === 'keyId' && table.idProvider.publicKeyColumn === 'publicKey'
             ? 'IDENTITY PROVIDER'
             : `IDENTITY PROVIDER (${table.idProvider.keyIdColumn}, ${table.idProvider.publicKeyColumn})`;
-        options.push(provider);
+        structural.push(provider);
     }
-    for (const restriction of table.restrictions ?? []) {
-        options.push(`ALLOW ${restriction.on} IF ${renderPredicate(restriction.rule)}`);
+
+    const allows = (table.restrictions ?? [])
+        .map((r) => `ALLOW ${r.on} IF ${renderPredicate(r.rule)}`);
+    const multilineAllows = table.concurrentDeletes !== undefined && allows.length > 0;
+
+    let suffix = '';
+    if (structural.length > 0 || allows.length > 0) {
+        if (multilineAllows) {
+            if (structural.length > 0) suffix = ` ${structural.join(' ')}`;
+            suffix += allows.map((allow) => `\n    ${allow}`).join('');
+        } else {
+            suffix = ` ${[...structural, ...allows].join(' ')}`;
+        }
     }
-    return `TABLE ${table.name} (${cols})${options.length > 0 ? ' ' + options.join(' ') : ''}`;
+
+    return `TABLE ${table.name} (${cols})${suffix}`;
 }
 
 function renderColumnDef(name: string, def: ColumnDef, fk?: string): string {
@@ -141,7 +160,7 @@ function renderPredicate(predicate: unknown): string {
             return 'false';
         case 'exists': {
             const where = isObject(predicate['where'])
-                ? ` WHERE ${Object.entries(predicate['where']).map(([k, v]) => `${k} = ${renderLiteral(v as json.Literal)}`).join(' AND ')}`
+                ? ` WHERE ${Object.entries(predicate['where']).map(([k, v]) => `${k} = ${renderTermOrLiteral(v)}`).join(' AND ')}`
                 : '';
             return `EXISTS ${String(predicate['table'])}${where}`;
         }
@@ -161,8 +180,16 @@ function renderPredicate(predicate: unknown): string {
 function renderOperand(operand: unknown): string {
     if (!isObject(operand)) return 'NULL';
     if ('col' in operand) return String(operand['col']);
-    if ('lit' in operand) return renderLiteral(operand['lit'] as json.Literal);
+    if ('lit' in operand) return renderTermOrLiteral(operand['lit']);
     return 'NULL';
+}
+
+function renderTermOrLiteral(value: unknown): string {
+    if (typeof value === 'string' && value.startsWith('$')) {
+        if (value === '$author') return '$author';
+        if (parseRowFieldTerm(value) !== undefined) return value;
+    }
+    return renderLiteral(value as json.Literal);
 }
 
 function renderCmp(cmp: string): string {

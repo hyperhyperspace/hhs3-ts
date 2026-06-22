@@ -6,7 +6,8 @@ import { formatTableResult } from "../format/table.js";
 import { runLanguageText } from "../session/adapter.js";
 import { WorkspaceSession } from "../session/session.js";
 import { runMetaCommand } from "./meta.js";
-import { promptForSession, promptSecret } from "./prompt.js";
+import { fulfillKeyPassphrase } from "./passphrase.js";
+import { promptForSession } from "./prompt.js";
 
 export async function startRepl(session: WorkspaceSession): Promise<void> {
     const rl = createInterface({ input, output });
@@ -19,15 +20,7 @@ export async function startRepl(session: WorkspaceSession): Promise<void> {
                 try {
                     const meta = await runMetaCommand(session, line);
                     if (meta.needsPassphrase !== undefined) {
-                        if (meta.needsPassphrase.kind === 'create') {
-                            const passphrase = await promptNewPassphrase(rl);
-                            const identity = await session.keystore!.create(meta.needsPassphrase.label, passphrase);
-                            output.write(`created ${meta.needsPassphrase.label} ${identity.keyId}\n`);
-                        } else {
-                            const passphrase = await promptSecret(rl, 'passphrase: ');
-                            const identity = await session.keystore!.unlock(meta.needsPassphrase.label, passphrase);
-                            output.write(`unlocked ${identity.keyId}\n`);
-                        }
+                        output.write(await fulfillKeyPassphrase(session, meta.needsPassphrase, rl) + '\n');
                     } else if (meta.output !== undefined && meta.output.length > 0) {
                         output.write(meta.output + '\n');
                     }
@@ -62,13 +55,4 @@ export async function startRepl(session: WorkspaceSession): Promise<void> {
 
 function isComplete(text: string): boolean {
     return text.trimEnd().endsWith(';');
-}
-
-async function promptNewPassphrase(rl: ReturnType<typeof createInterface>): Promise<string> {
-    while (true) {
-        const passphrase = await promptSecret(rl, 'passphrase: ');
-        const repeat = await promptSecret(rl, 'repeat: ');
-        if (passphrase === repeat) return passphrase;
-        output.write('passphrases do not match\n');
-    }
 }

@@ -56,7 +56,6 @@ export type BoundCreateDatabase = {
 export type BoundCreateSchema = {
     kind: 'create-schema';
     ast: CreateSchemaStatement;
-    seed: string;
     creators: { keyId: KeyId; publicKey: PublicKey }[];
 };
 
@@ -217,7 +216,7 @@ async function bindCreateSchema(ast: CreateSchemaStatement, context: LangBindCon
         if (!isCreatorValue(value)) throw new Error('CREATORS values must resolve to identities or creator records');
         creators.push({ keyId: value.keyId, publicKey: value.publicKey });
     }
-    return { kind: 'create-schema', ast, seed: context.createSeed('schema', ast.name), creators };
+    return { kind: 'create-schema', ast, creators };
 }
 
 async function bindCreateTableGroup(ast: CreateTableGroupStatement, context: LangBindContext): Promise<BoundCreateTableGroup> {

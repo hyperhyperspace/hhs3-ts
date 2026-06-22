@@ -39,7 +39,7 @@ async function createEnv() {
     const lang = createTestBindContext(ctx, { admin, me: admin });
 
     const usersSchemaInit = await RSchemaImpl.create({
-        seed: 'users-schema',
+        name: 'test:users_schema',
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables: [{
             name: 'caps',
@@ -197,6 +197,8 @@ export const restPhaseTests = {
                 const renderedSchema = renderCreateSchema(schema.createOp);
                 assertTrue(parseStatement(renderedSchema).ok, 'rendered schema parses');
                 assertTrue(renderedSchema.includes('ALLOW all IF true'), 'rendered schema uses ALLOW IF syntax');
+                assertTrue(renderedSchema.includes('TABLE products (\n    sku string PUB READONLY,\n    name string\n  ) ALLOW all IF true'),
+                    'rendered schema uses multiline column layout');
                 const renderedMigration = renderSchemaUpdate({
                     action: 'schema-update',
                     migration: [{
@@ -219,6 +221,16 @@ export const restPhaseTests = {
                 assertTrue(renderedGroup.includes('USING IDENTITIES users.identities'), 'rendered tablegroup uses USING IDENTITIES syntax');
                 assertTrue(renderedGroup.includes('CAN DEPLOY IF true'), 'rendered tablegroup uses CAN DEPLOY IF syntax');
                 assertTrue(parseStatement(renderedGroup).ok, 'rendered tablegroup parses');
+                const renderedCorrelated = renderCreateTableGroup({
+                    action: 'create',
+                    type: RTableGroupImpl.typeId,
+                    seed: 'shop_prod',
+                    schemaRef: 'schema',
+                    schemaVersion: json.toSet(['schemaVersion']),
+                    canDeploy: { p: 'exists', table: 'grants', where: { resource: '$row.resource', grantee: '$author' } },
+                } as CreateTableGroupPayload);
+                assertTrue(renderedCorrelated.includes('resource = $row.resource AND grantee = $author'),
+                    'rendered correlated predicate uses unquoted $-terms');
                 assertTrue(renderRowOp({ action: 'update', rowId: 'row', values: { name: 'x' } }, 'shop_prod.products').startsWith('UPDATE'), 'row op renders');
 
                 const insert = await execute(await parseBind("INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');", lang));
@@ -268,6 +280,15 @@ export const restPhaseTests = {
                 const schema = await ctx.createObject(schemaPlan.value.plan.payload) as RSchemaImpl;
                 lang.registerSchema('users_schema', schema);
 
+                const renderedSchema = renderCreateSchema(schema.createOp);
+                assertTrue(parseStatement(renderedSchema).ok, 'rendered users schema parses');
+                assertTrue(renderedSchema.includes(`TABLE identities (\n    keyId string PUB READONLY,\n    publicKey string PUB READONLY,\n    name string NULL PUB\n  ) IDENTITY PROVIDER ALLOW insert IF true`),
+                    'rendered identities table uses multiline columns');
+                assertTrue(renderedSchema.includes(`TABLE caps (\n    label string PUB READONLY,\n    grantee string PUB READONLY\n  ) CONCURRENT DELETES\n    ALLOW insert IF`),
+                    'rendered caps table indents ALLOW rules after CONCURRENT DELETES');
+                assertTrue(renderedSchema.includes('grantee = $author'), 'rendered schema uses unquoted $author');
+                assertTrue(!renderedSchema.includes("grantee = '$author'"), 'rendered schema does not quote $author');
+
                 const groupPlan = await execute(await parseBind(`
                     CREATE TABLEGROUP users
                       USING SCHEMA users_schema
@@ -300,7 +321,7 @@ export const restPhaseTests = {
                 const lang = createTestBindContext(ctx, { bare: { kind: 'key-id', keyId: admin.keyId } });
 
                 const schemaInit = await RSchemaImpl.create({
-                    seed: 'bare-schema',
+                    name: 'test:bare_schema',
                     creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
                     tables: [{
                         name: 'identities',

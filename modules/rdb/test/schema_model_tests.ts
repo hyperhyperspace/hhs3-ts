@@ -12,7 +12,7 @@ import {
     validatePredicate, validateFKs, validateRestrictions,
     validateMigrationRule,
     columnValueMatchesType,
-    isValidName, isValidTableRef,
+    isValidName, isValidSchemaName, isValidTableRef,
     MAX_EXPR_DEPTH,
 } from "../src/rschema/validate.js";
 
@@ -60,6 +60,14 @@ async function testNames() {
     assertFalse(isValidName(''), 'empty name should be invalid');
     assertFalse(isValidName('a.b'), 'qualified name should not be a plain name');
 
+    assertTrue(isValidSchemaName('shop'), 'plain schema name should be valid');
+    assertTrue(isValidSchemaName('hhs:users'), 'colon-qualified schema name should be valid');
+    assertTrue(isValidSchemaName('acme:shop_v2'), 'multi-segment schema name should allow underscores and digits');
+    assertFalse(isValidSchemaName('hhs:'), 'trailing colon should be invalid');
+    assertFalse(isValidSchemaName(':users'), 'leading colon should be invalid');
+    assertFalse(isValidSchemaName('hhs:2users'), 'colon segment must start with identifier start');
+    assertFalse(isValidSchemaName('hhs.users'), 'dot-qualified schema name should be invalid');
+
     assertTrue(isValidTableRef('orders'), 'local ref should be valid');
     assertTrue(isValidTableRef('users.capabilities'), 'qualified ref should be valid');
     assertFalse(isValidTableRef('a.b.c'), 'doubly-qualified ref should be invalid');
@@ -83,20 +91,25 @@ async function testColumnTypes() {
 async function testTableDefFormatAndValidation() {
     const orders = ordersTable();
     assertTrue(json.checkFormat(tableDefFormat, orders), 'well-formed table def should pass format');
-    assertTrue(validateTableDef(orders), 'well-formed table def should validate');
+    assertTrue(validateTableDef(orders) === undefined, 'well-formed table def should validate');
 
     const badType = { name: 'orders', columns: { x: { type: 'varchar' } } };
     assertFalse(json.checkFormat(tableDefFormat, badType as json.Literal), 'unknown column type should fail format');
 
     const noColumns: TableDef = { name: 'orders', columns: {} };
     assertTrue(json.checkFormat(tableDefFormat, noColumns), 'empty columns is structurally fine');
-    assertFalse(validateTableDef(noColumns), 'table without columns should not validate');
+    assertTrue(validateTableDef(noColumns) !== undefined, 'table without columns should not validate');
 
     const badDefault: TableDef = { name: 'orders', columns: { x: { type: 'integer', default: 'nope' } } };
-    assertFalse(validateTableDef(badDefault), 'default not matching column type should not validate');
+    assertTrue(validateTableDef(badDefault) !== undefined, 'default not matching column type should not validate');
 
     const badColumnName: TableDef = { name: 'orders', columns: { '2x': { type: 'string' } } };
-    assertFalse(validateTableDef(badColumnName), 'invalid column name should not validate');
+    assertTrue(validateTableDef(badColumnName) !== undefined, 'invalid column name should not validate');
+
+    const colonTableName: TableDef = { name: 'my:table', columns: { x: { type: 'string' } } };
+    assertTrue(
+        validateTableDef(colonTableName)?.includes("invalid table name 'my:table'") ?? false,
+        'colon in table name should produce a specific reason');
 
     // pub and readonly are independent ColumnDef modifiers
     const withModifiers: TableDef = { name: 'caps', columns: {
@@ -104,7 +117,7 @@ async function testTableDefFormatAndValidation() {
         tag: { type: 'string', pub: true },
         code: { type: 'string', readonly: true },
     } };
-    assertTrue(json.checkFormat(tableDefFormat, withModifiers) && validateTableDef(withModifiers),
+    assertTrue(json.checkFormat(tableDefFormat, withModifiers) && validateTableDef(withModifiers) === undefined,
         'pub/readonly modifiers in any combination should pass format and validate');
 }
 
@@ -114,25 +127,25 @@ async function testRestrictionDefaults() {
 
     const updateDefault = defaultRestrictionRule('update');
     const deleteDefault = defaultRestrictionRule('delete');
-    assertTrue(json.toStringNormalized(updateDefault) === json.toStringNormalized({ p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: '$author' } })
-        && json.toStringNormalized(deleteDefault) === json.toStringNormalized({ p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: '$author' } }),
+    assertTrue(json.toStringNormalized(updateDefault) === json.toStringNormalized({ p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: '$author' } })
+        && json.toStringNormalized(deleteDefault) === json.toStringNormalized({ p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: '$author' } }),
         'update/delete should default to insert-author-only (anonymous rows immutable)');
 }
 
 async function testFKs() {
     const columns = linesTable().columns;
 
-    assertTrue(validateFKs({ order: 'orders' }, columns), 'FK over existing column should validate');
-    assertTrue(validateFKs({ order: 'users.identities' }, columns), 'qualified FK target should validate');
+    assertTrue(validateFKs({ order: 'orders' }, columns) === undefined, 'FK over existing column should validate');
+    assertTrue(validateFKs({ order: 'users.identities' }, columns) === undefined, 'qualified FK target should validate');
 
-    assertFalse(validateFKs({ nope: 'orders' }, columns), 'FK over missing column should not validate');
-    assertFalse(validateFKs({ order: 'a.b.c' }, columns), 'FK with invalid target ref should not validate');
-    assertFalse(validateFKs({ '2bad': 'orders' }), 'FK with invalid column name should not validate');
+    assertTrue(validateFKs({ nope: 'orders' }, columns) !== undefined, 'FK over missing column should not validate');
+    assertTrue(validateFKs({ order: 'a.b.c' }, columns) !== undefined, 'FK with invalid target ref should not validate');
+    assertTrue(validateFKs({ '2bad': 'orders' }) !== undefined, 'FK with invalid column name should not validate');
 }
 
 async function testPredicates() {
     assertTrue(validatePredicate({ p: 'true' }), 'true should validate');
-    assertTrue(validatePredicate({ p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: '$author' } }),
+    assertTrue(validatePredicate({ p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: '$author' } }),
         'author-is-author should validate');
     assertFalse(validatePredicate({ p: 'owner', is: '$author' }),
         'owner atom should not validate');
@@ -163,7 +176,7 @@ async function testPredicates() {
 
     const authorOrAdmin: Predicate = {
         p: 'or', args: [
-            { p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: '$author' } },
+            { p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: '$author' } },
             { p: 'exists', table: 'users.caps', where: { role: 'admin', grantee: '$author' } },
         ],
     };
@@ -239,48 +252,48 @@ function docsTable(restrictions: Restriction[]): TableDef {
 }
 
 async function testSchemaTables() {
-    assertTrue(validateSchemaTables([ordersTable(), linesTable()]), 'consistent schema should validate');
+    assertTrue(validateSchemaTables([ordersTable(), linesTable()]) === undefined, 'consistent schema should validate');
 
-    assertFalse(validateSchemaTables([ordersTable(), ordersTable()]), 'duplicate table names should not validate');
+    assertTrue(validateSchemaTables([ordersTable(), ordersTable()]) !== undefined, 'duplicate table names should not validate');
 
-    assertFalse(validateSchemaTables([linesTable()]), 'local FK target missing from schema should not validate');
+    assertTrue(validateSchemaTables([linesTable()]) !== undefined, 'local FK target missing from schema should not validate');
 
     const crossGroup = docsTable([{ on: 'update', rule: { p: 'exists', table: 'users.caps', where: { label: 'write', grantee: '$author' } } }]);
-    assertTrue(validateSchemaTables([crossGroup]), 'qualified restriction target should be deferred to binding-time checking');
+    assertTrue(validateSchemaTables([crossGroup]) === undefined, 'qualified restriction target should be deferred to binding-time checking');
 
     const localSearch = docsTable([{ on: 'all', rule: { p: 'exists', table: 'caps', where: { label: 'write', grantee: '$author' } } }]);
-    assertTrue(validateSchemaTables([localSearch, capsTable()]),
+    assertTrue(validateSchemaTables([localSearch, capsTable()]) === undefined,
         'local restriction over a pub column should validate');
 
     const overNonPub = docsTable([{ on: 'insert', rule: { p: 'exists', table: 'caps', where: { note: 'x', grantee: '$author' } } }]);
-    assertFalse(validateSchemaTables([overNonPub, capsTable()]),
+    assertTrue(validateSchemaTables([overNonPub, capsTable()]) !== undefined,
         'restriction where over a non-pub column should not validate');
 
     const overMissingField = docsTable([{ on: 'insert', rule: { p: 'exists', table: 'caps', where: { nope: 'x' } } }]);
-    assertFalse(validateSchemaTables([overMissingField, capsTable()]),
+    assertTrue(validateSchemaTables([overMissingField, capsTable()]) !== undefined,
         'restriction where over a missing column should not validate');
 
     const nestedAtoms = docsTable([{
         on: 'update',
         rule: { p: 'or', args: [
-            { p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: '$author' } },
+            { p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: '$author' } },
             { p: 'and', args: [
                 { p: 'exists', table: 'caps', where: { label: 'write', grantee: '$author' } },
                 { p: 'exists', table: 'caps', where: { grantee: '$author' } },
             ] },
         ] },
     }]);
-    assertTrue(validateSchemaTables([nestedAtoms, capsTable()]),
+    assertTrue(validateSchemaTables([nestedAtoms, capsTable()]) === undefined,
         'exists atoms nested under and/or should be checked and validate');
 
     const nestedBadAtom = docsTable([{
         on: 'update',
         rule: { p: 'or', args: [
-            { p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: '$author' } },
+            { p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: '$author' } },
             { p: 'exists', table: 'caps', where: { note: 'x' } },
         ] },
     }]);
-    assertFalse(validateSchemaTables([nestedBadAtom, capsTable()]),
+    assertTrue(validateSchemaTables([nestedBadAtom, capsTable()]) !== undefined,
         'a non-pub where nested under and/or should not validate');
 
     // Tier 1: cmp/str over the declaring table's own columns ($row.<col>),
@@ -295,15 +308,15 @@ async function testSchemaTables() {
         restrictions: [{ on: 'insert', rule }],
     });
 
-    assertTrue(validateSchemaTables([itemsWith({ p: 'cmp', cmp: 'lt', left: { col: 'priority' }, right: { lit: 3 } })]),
+    assertTrue(validateSchemaTables([itemsWith({ p: 'cmp', cmp: 'lt', left: { col: 'priority' }, right: { lit: 3 } })]) === undefined,
         'cmp over a readonly integer column vs an integer literal should validate');
-    assertFalse(validateSchemaTables([itemsWith({ p: 'cmp', cmp: 'eq', left: { col: 'status' }, right: { lit: 'open' } })]),
+    assertTrue(validateSchemaTables([itemsWith({ p: 'cmp', cmp: 'eq', left: { col: 'status' }, right: { lit: 'open' } })]) !== undefined,
         'cmp over a mutable (non-readonly) column should not validate');
-    assertFalse(validateSchemaTables([itemsWith({ p: 'cmp', cmp: 'eq', left: { col: 'missing' }, right: { lit: 1 } })]),
+    assertTrue(validateSchemaTables([itemsWith({ p: 'cmp', cmp: 'eq', left: { col: 'missing' }, right: { lit: 1 } })]) !== undefined,
         'cmp over a missing column should not validate');
-    assertFalse(validateSchemaTables([itemsWith({ p: 'cmp', cmp: 'eq', left: { col: 'priority' }, right: { lit: 'x' } })]),
+    assertTrue(validateSchemaTables([itemsWith({ p: 'cmp', cmp: 'eq', left: { col: 'priority' }, right: { lit: 'x' } })]) !== undefined,
         'cmp comparing an integer column to a string literal should not validate (type mismatch)');
-    assertFalse(validateSchemaTables([itemsWith({ p: 'cmp', cmp: 'eq', left: { fn: 'add', args: [{ col: 'resource' }, { lit: 1 }] }, right: { lit: 2 } })]),
+    assertTrue(validateSchemaTables([itemsWith({ p: 'cmp', cmp: 'eq', left: { fn: 'add', args: [{ col: 'resource' }, { lit: 1 }] }, right: { lit: 2 } })]) !== undefined,
         'arithmetic over a string column should not validate');
 
     // Tier 2: $row.<col> correlated to a pub field of the target table; the
@@ -322,30 +335,30 @@ async function testSchemaTables() {
         restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'grants', where: { resource: '$row.' + subjectCol } } }],
     });
 
-    assertTrue(validateSchemaTables([correlate('resource'), grants]),
+    assertTrue(validateSchemaTables([correlate('resource'), grants]) === undefined,
         'exists correlating a readonly subject column to a matching pub target field should validate');
-    assertFalse(validateSchemaTables([correlate('mutableResource'), grants]),
+    assertTrue(validateSchemaTables([correlate('mutableResource'), grants]) !== undefined,
         'a $row correlation over a mutable subject column should not validate');
-    assertFalse(validateSchemaTables([correlate('qty'), grants]),
+    assertTrue(validateSchemaTables([correlate('qty'), grants]) !== undefined,
         'a $row correlation with mismatched column types should not validate');
 }
 
 async function testMigrationRules() {
     const addTable: MigrationRule = { rule: 'add-table', def: ordersTable() };
     assertTrue(json.checkFormat(migrationRuleFormat, addTable), 'add-table should pass format');
-    assertTrue(validateMigrationRule(addTable), 'add-table should validate');
+    assertTrue(validateMigrationRule(addTable) === undefined, 'add-table should validate');
 
     const dropTable: MigrationRule = { rule: 'drop-table', table: 'orders' };
-    assertTrue(json.checkFormat(migrationRuleFormat, dropTable) && validateMigrationRule(dropTable), 'drop-table should validate');
+    assertTrue(json.checkFormat(migrationRuleFormat, dropTable) && validateMigrationRule(dropTable) === undefined, 'drop-table should validate');
 
     const addNullable: MigrationRule = { rule: 'add-column', table: 'orders', column: 'tag', def: { type: 'string', nullable: true } };
-    assertTrue(validateMigrationRule(addNullable), 'adding a nullable column should validate');
+    assertTrue(validateMigrationRule(addNullable) === undefined, 'adding a nullable column should validate');
 
     const addWithDefault: MigrationRule = { rule: 'add-column', table: 'orders', column: 'status', def: { type: 'string', default: 'new' } };
-    assertTrue(validateMigrationRule(addWithDefault), 'adding a non-nullable column with default should validate');
+    assertTrue(validateMigrationRule(addWithDefault) === undefined, 'adding a non-nullable column with default should validate');
 
     const addNoDefault: MigrationRule = { rule: 'add-column', table: 'orders', column: 'status', def: { type: 'string' } };
-    assertFalse(validateMigrationRule(addNoDefault), 'adding a non-nullable column without default should not validate (old rows cannot be revised)');
+    assertTrue(validateMigrationRule(addNoDefault) !== undefined, 'adding a non-nullable column without default should not validate (old rows cannot be revised)');
 
     const rename = { rule: 'rename-column', table: 'orders', from: 'notes', to: 'comments' };
     assertFalse(json.checkFormat(migrationRuleFormat, rename as json.Literal),
@@ -361,25 +374,25 @@ async function testMigrationRules() {
 
 async function testSlotWriteRules() {
     const setMode: MigrationRule = { rule: 'set-concurrent-deletes', table: 'orders', value: false };
-    assertTrue(json.checkFormat(migrationRuleFormat, setMode) && validateMigrationRule(setMode),
+    assertTrue(json.checkFormat(migrationRuleFormat, setMode) && validateMigrationRule(setMode) === undefined,
         'set-concurrent-deletes should validate');
 
     const setFKs: MigrationRule = { rule: 'set-fks', table: 'lines', fks: { order: 'orders' } };
-    assertTrue(json.checkFormat(migrationRuleFormat, setFKs) && validateMigrationRule(setFKs),
+    assertTrue(json.checkFormat(migrationRuleFormat, setFKs) && validateMigrationRule(setFKs) === undefined,
         'set-fks should validate');
-    assertFalse(validateMigrationRule({ rule: 'set-fks', table: 'lines', fks: { order: 'a.b.c' } }),
+    assertTrue(validateMigrationRule({ rule: 'set-fks', table: 'lines', fks: { order: 'a.b.c' } }) !== undefined,
         'set-fks with invalid target should not validate');
 
     const setRestrictions: MigrationRule = {
         rule: 'set-restrictions', table: 'caps',
         restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'caps', where: { label: 'admin', grantee: '$author' } } }],
     };
-    assertTrue(json.checkFormat(migrationRuleFormat, setRestrictions) && validateMigrationRule(setRestrictions),
+    assertTrue(json.checkFormat(migrationRuleFormat, setRestrictions) && validateMigrationRule(setRestrictions) === undefined,
         'set-restrictions should validate');
-    assertFalse(validateMigrationRule({
+    assertTrue(validateMigrationRule({
         rule: 'set-restrictions', table: 'caps',
         restrictions: [{ on: 'insert', rule: { p: 'nope' } }],
-    } as unknown as MigrationRule), 'set-restrictions with invalid predicate should not validate');
+    } as unknown as MigrationRule) !== undefined, 'set-restrictions with invalid predicate should not validate');
 
     const setGates = {
         rule: 'set-gates',

@@ -27,7 +27,7 @@ async function testRDbDrivenSync() {
     const creator = await createIdentity(SIGNING_ED25519, hashSuite);
 
     const schemaInit = await RSchemaImpl.create({
-        seed: 'rdb-full-schema',
+        name: 'rdb:full:schema',
         creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
         tables: [openTable('t', { name: { type: 'string' } })],
     });
@@ -92,7 +92,7 @@ async function testBidirectionalWrites() {
     const creator = await createIdentity(SIGNING_ED25519, hashSuite);
 
     const schemaInit = await RSchemaImpl.create({
-        seed: 'rdb-full02-schema',
+        name: 'rdb:full02:schema',
         creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
         tables: [openTable('t', { name: { type: 'string' } })],
     });
@@ -161,7 +161,7 @@ async function testDynamicMembership() {
     const creator = await createIdentity(SIGNING_ED25519, hashSuite);
 
     const schema1Init = await RSchemaImpl.create({
-        seed: 'rdb-full03-schema1',
+        name: 'rdb:full03:schema1',
         creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
         tables: [openTable('t', { name: { type: 'string' } })],
     });
@@ -176,7 +176,7 @@ async function testDynamicMembership() {
     const group1Id = await rTableGroupFactory.computeRootObjectId(group1Init, dummyCtx);
 
     const schema2Init = await RSchemaImpl.create({
-        seed: 'rdb-full03-schema2',
+        name: 'rdb:full03:schema2',
         creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
         tables: [openTable('t', { name: { type: 'string' } })],
     });
@@ -257,7 +257,7 @@ async function testCrossGroupFkObserve() {
     const creator = await createIdentity(SIGNING_ED25519, hashSuite);
 
     const schemaBInit = await RSchemaImpl.create({
-        seed: 'rdb-full04-schema-b',
+        name: 'rdb:full04:schema_b',
         creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
         tables: [openTable('identities', { name: { type: 'string' } })],
     });
@@ -272,7 +272,7 @@ async function testCrossGroupFkObserve() {
     const groupBId = await rTableGroupFactory.computeRootObjectId(groupBInit, dummyCtx);
 
     const schemaAInit = await RSchemaImpl.create({
-        seed: 'rdb-full04-schema-a',
+        name: 'rdb:full04:schema_a',
         creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
         tables: [openTable('orders', { customer: { type: 'string' } }, {
             fks: { customer: 'users.identities' },
@@ -348,7 +348,7 @@ async function testSignedOpsMeshSync() {
     const bobSigning = await createIdentity(SIGNING_ED25519, hashSuite);
 
     const usersSchemaInit = await RSchemaImpl.create({
-        seed: 'rdb-full05-users-schema',
+        name: 'rdb:full05:users_schema',
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables: usersSchemaTables(),
     });
@@ -377,7 +377,7 @@ async function testSignedOpsMeshSync() {
     };
 
     const appSchemaInit = await RSchemaImpl.create({
-        seed: 'rdb-full05-app-schema',
+        name: 'rdb:full05:app_schema',
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables: [appDocsTable],
     });
@@ -467,7 +467,7 @@ async function testMultiDagDeployment() {
     const admin = await createIdentity(SIGNING_ED25519, hashSuite);
 
     const usersSchemaInit = await RSchemaImpl.create({
-        seed: 'rdb-full06-users-schema',
+        name: 'rdb:full06:users_schema',
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables: usersSchemaTables(),
     });
@@ -487,7 +487,7 @@ async function testMultiDagDeployment() {
     const usersGroupId = await rTableGroupFactory.computeRootObjectId(usersGroupInit, dummyCtx);
 
     const shopSchemaInit = await RSchemaImpl.create({
-        seed: 'rdb-full06-shop-schema',
+        name: 'rdb:full06:shop_schema',
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables: [openTable('orders', { item: { type: 'string' } })],
     });
@@ -502,7 +502,7 @@ async function testMultiDagDeployment() {
     const shopGroupId = await rTableGroupFactory.computeRootObjectId(shopGroupInit, dummyCtx);
 
     const invSchemaInit = await RSchemaImpl.create({
-        seed: 'rdb-full06-inv-schema',
+        name: 'rdb:full06:inv_schema',
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables: [openTable('items', { sku: { type: 'string' } })],
     });

@@ -1,5 +1,6 @@
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { json } from "@hyper-hyper-space/hhs3_json";
+import { formatValidationFailure } from "@hyper-hyper-space/hhs3_mvt";
 
 import { validateRSchemaPayloadFormat as validateRSchemaPayloadFormatResult } from "../src/rschema/validate.js";
 import { CreateRSchemaPayload, SchemaUpdatePayload, RSCHEMA_TYPE_ID } from "../src/rschema/payload.js";
@@ -57,7 +58,6 @@ async function testRSchemaCreate() {
     const create: CreateRSchemaPayload = {
         action: 'create',
         type: RSCHEMA_TYPE_ID,
-        seed: 'seed-1',
         name: 'shop',
         creators: [{ keyId: 'alice', publicKey: 'pem...' }],
         tables: [ordersTable(), linesTable()],
@@ -66,8 +66,10 @@ async function testRSchemaCreate() {
 
     assertFalse(validateRSchemaPayloadFormat({ ...create, type: 'wrong/type' }),
         'schema create with wrong type should not validate');
-    assertFalse(validateRSchemaPayloadFormat({ action: 'create', seed: 'seed-1', creators: [{ keyId: 'alice', publicKey: 'pem...' }], tables: [ordersTable()] } as json.Literal),
+    assertFalse(validateRSchemaPayloadFormat({ action: 'create', name: 'shop', creators: [{ keyId: 'alice', publicKey: 'pem...' }], tables: [ordersTable()] } as json.Literal),
         'schema create without type should not validate');
+    assertFalse(validateRSchemaPayloadFormat({ action: 'create', type: RSCHEMA_TYPE_ID, creators: [{ keyId: 'alice', publicKey: 'pem...' }], tables: [ordersTable()] } as json.Literal),
+        'schema create without name should not validate');
     assertFalse(validateRSchemaPayloadFormat({ ...create, action: 'nope' }), 'unknown action should not validate');
     assertFalse(validateRSchemaPayloadFormat({ ...create, extra: 1 } as json.Literal), 'extra keys should not validate (strict format)');
     assertFalse(validateRSchemaPayloadFormat({ ...create, creators: [] }),
@@ -82,6 +84,12 @@ async function testRSchemaCreate() {
     assertFalse(
         validateRSchemaPayloadFormat({ ...create, tables: [ordersTable(), ordersTable()] }),
         'duplicate table names should not validate');
+
+    const colonTable: TableDef = { name: 'my:table', columns: { x: { type: 'string' } } };
+    const colonResult = validateRSchemaPayloadFormatResult({ ...create, tables: [colonTable] });
+    assertTrue(
+        !colonResult.valid && formatValidationFailure(colonResult.why).includes("invalid table name 'my:table'"),
+        'colon in table name should produce a specific validation message');
 }
 
 async function testRSchemaUpdate() {

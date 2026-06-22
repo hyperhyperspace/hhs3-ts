@@ -90,7 +90,7 @@ export class WorkspaceSession {
         return randomUUID();
     }
 
-    createSeed(kind: 'rdb' | 'schema' | 'group', name?: string): string {
+    createSeed(kind: 'rdb' | 'group', name?: string): string {
         const hash = this.workspace.replica.getHashSuite();
         return hash.hashToB64(new TextEncoder().encode(`${kind}:${name ?? ''}:${randomUUID()}`));
     }

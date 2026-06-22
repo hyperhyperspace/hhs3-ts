@@ -30,7 +30,6 @@ async function compileCreateDatabase(bound: BoundCreateDatabase): Promise<Create
 
 async function compileCreateSchema(bound: BoundCreateSchema): Promise<CreatePlan> {
     const payload = await RSchemaImpl.create({
-        seed: bound.seed,
         name: bound.ast.name,
         creators: bound.creators,
         tables: bound.ast.tables.map(compileTable),

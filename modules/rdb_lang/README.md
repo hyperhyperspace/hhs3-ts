@@ -40,7 +40,7 @@ ALTER SCHEMA shop AS (
   SET CONCURRENT DELETES products true,
   SET ALLOW RULES products (
     ALLOW insert IF EXISTS users.caps WHERE label = 'writer' AND grantee = $author,
-    ALLOW update IF author = $author
+    ALLOW update IF rowAuthor = $author
   )
 );
 
@@ -81,7 +81,7 @@ ALLOW insert IF EXISTS users.caps
 
 The operation is allowed only when its predicate is true. Each table or `SET ALLOW RULES` block accepts at most one expression per operation. Use `ALLOW all IF ...` for a shared insert/update/delete rule; do not combine it with operation-specific rules in the same block.
 
-Omitted rules use RDb defaults: inserts are allowed, while updates and deletes require the row's implicit `author` to equal `$author`. To explicitly open every operation, write `ALLOW all IF true`.
+Omitted rules use RDb defaults: inserts are allowed, while updates and deletes require `rowAuthor = $author` (the row's insert author must equal the op signer). To explicitly open every operation, write `ALLOW all IF true`.
 
 ## Deploy Gates
 

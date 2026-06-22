@@ -81,7 +81,7 @@ async function makeSchemaGroup(ctx: RContext, seed: string, opts?: {
 }): Promise<{ schema: RSchemaImpl; group: RTableGroupImpl }> {
     const creator = await makeIdentity();
     const schemaInit = await RSchemaImpl.create({
-        seed: seed + '-schema',
+        name: `${seed.replace(/[^a-zA-Z0-9_]+/g, '_')}:schema`,
         creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
         tables: [open('t', { name: { type: 'string' } })],
     });
@@ -172,7 +172,7 @@ export const rdbSyncTests = {
 
                 // a real-looking id that was never created in this replica
                 const absentInit = await RSchemaImpl.create({
-                    seed: 'rdb03-absent',
+                    name: 'rdb03:absent',
                     creators: [],
                     tables: [open('t', { name: { type: 'string' } })],
                 });

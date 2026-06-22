@@ -40,7 +40,7 @@ async function makeSchemaGroup(ctx: RContext, seed: string, tables: TableDef[], 
 }): Promise<{ schema: RSchemaImpl; group: RTableGroupImpl; creator: OwnIdentity }> {
     const creator = opts?.creator ?? await makeIdentity();
     const schemaInit = await RSchemaImpl.create({
-        seed: seed + '-schema',
+        name: `${seed.replace(/[^a-zA-Z0-9_]+/g, '_')}:schema`,
         creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
         tables,
     });
@@ -283,7 +283,7 @@ export const rtableXGroupTests = {
                 // with NO binding for 'users' -> the create is invalid
                 const creator = await makeIdentity();
                 const schemaInit = await RSchemaImpl.create({
-                    seed: 'xg07-a-schema',
+                    name: 'xg07:a_schema',
                     creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
                     tables: [open('orders', { customer: { type: 'string' } }, { fks: { customer: 'users.identities' } })],
                 });
@@ -311,7 +311,7 @@ export const rtableXGroupTests = {
                 const ctx = newCtx();
                 const creator = await makeIdentity();
                 const schemaInit = await RSchemaImpl.create({
-                    seed: 'xg08-a-schema',
+                    name: 'xg08:a_schema',
                     creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
                     tables: [open('orders', { customer: { type: 'string' } }, { fks: { customer: 'users.identities' } })],
                 });

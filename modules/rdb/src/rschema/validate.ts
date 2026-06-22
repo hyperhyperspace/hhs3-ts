@@ -27,13 +27,31 @@ export const MAX_EXPR_ARGS = 64;
 // with an RDb-namespace group name: 'group.table'.
 const NAME_REGEX = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 const QUALIFIED_NAME_REGEX = /^([a-zA-Z_][a-zA-Z0-9_]*\.)?[a-zA-Z_][a-zA-Z0-9_]*$/;
+const SCHEMA_NAME_REGEX = /^[a-zA-Z_][a-zA-Z0-9_]*(:[a-zA-Z_][a-zA-Z0-9_]*)*$/;
 
 export function isValidName(name: string): boolean {
     return name.length <= MAX_NAME_LENGTH && NAME_REGEX.test(name);
 }
 
+export function isValidSchemaName(name: string): boolean {
+    return name.length <= MAX_NAME_LENGTH && SCHEMA_NAME_REGEX.test(name);
+}
+
 export function isValidTableRef(ref: string): boolean {
     return ref.length <= MAX_QUALIFIED_NAME_LENGTH && QUALIFIED_NAME_REGEX.test(ref);
+}
+
+// undefined = valid; string = human-readable reason
+export type ValidateReason = string | undefined;
+
+function invalidNameReason(name: string, kind: 'table' | 'column'): string {
+    if (name.includes(':')) {
+        return `invalid ${kind} name '${name}' (':' is only allowed in schema names)`;
+    }
+    if (name.length > MAX_NAME_LENGTH) {
+        return `invalid ${kind} name '${name}' (exceeds max length of ${MAX_NAME_LENGTH})`;
+    }
+    return `invalid ${kind} name '${name}'`;
 }
 
 export function columnValueMatchesType(value: json.Literal, type: ColumnType): boolean {
@@ -201,7 +219,7 @@ export function collectRowFieldRefs(pred: Predicate, out: Set<string> = new Set(
 
 // Column-type lookup for the declaring table (operand type-checking).
 function columnTypeOf(columns: { [c: string]: ColumnDef }): (column: string) => ColumnType | undefined {
-    return (column) => column === 'author' ? 'string' : columns[column]?.type;
+    return (column) => column === 'rowAuthor' ? 'string' : columns[column]?.type;
 }
 
 // Tier 1+2 column-level checks for one restriction rule declared on `def`:
@@ -214,19 +232,22 @@ export function checkPredicateColumns(
     def: TableDef,
     rule: Predicate,
     resolveLocalTable: (table: string) => TableDef | undefined,
-): boolean {
+): ValidateReason {
     for (const col of collectRowFieldRefs(rule)) {
-        if (col === 'author') continue;
+        if (col === 'rowAuthor') continue;
         const cd = def.columns[col];
-        if (cd === undefined || !(cd.readonly ?? false)) return false;
+        if (cd === undefined) return `$row field '${col}' not found in table '${def.name}'`;
+        if (!(cd.readonly ?? false)) return `$row field '${col}' in table '${def.name}' is not readonly`;
     }
 
     const typeOf = columnTypeOf(def.columns);
     for (const atom of collectCmpStrAtoms(rule)) {
         if (atom.p === 'cmp') {
-            if (!cmpTypesOk(atom.cmp, atom.left, atom.right, typeOf)) return false;
+            if (!cmpTypesOk(atom.cmp, atom.left, atom.right, typeOf)) {
+                return `cmp operand types are incompatible in table '${def.name}'`;
+            }
         } else if (!strTypesOk(atom.value, atom.sub, typeOf)) {
-            return false;
+            return `str operand types are incompatible in table '${def.name}'`;
         }
     }
 
@@ -234,43 +255,48 @@ export function checkPredicateColumns(
         const [group, table] = splitTableRef(atom.table);
         if (group !== undefined) continue;
         const target = resolveLocalTable(table);
-        if (target === undefined) return false;
+        if (target === undefined) return `exists target table '${table}' not found in schema`;
         for (const [field, value] of Object.entries(atom.where ?? {})) {
             if (typeof value !== 'string') continue;
             const col = parseRowFieldTerm(value);
             if (col === undefined) continue;
             const subjectCol = def.columns[col];
             const targetCol = target.columns[field];
-            if (subjectCol === undefined || targetCol === undefined) return false;
-            if (subjectCol.type !== targetCol.type) return false;
+            if (subjectCol === undefined) return `$row field '${col}' not found in table '${def.name}'`;
+            if (targetCol === undefined) return `exists where field '${field}' not found in table '${table}'`;
+            if (subjectCol.type !== targetCol.type) {
+                return `$row field '${col}' type '${subjectCol.type}' does not match exists where field '${field}' type '${targetCol.type}'`;
+            }
         }
     }
 
-    return true;
+    return undefined;
 }
 
-export function validateColumnDef(def: ColumnDef): boolean {
-    if (def.default !== undefined && !columnValueMatchesType(def.default, def.type)) return false;
-    return true;
+export function validateColumnDef(def: ColumnDef): ValidateReason {
+    if (def.default !== undefined && !columnValueMatchesType(def.default, def.type)) {
+        return `default value does not match column type '${def.type}'`;
+    }
+    return undefined;
 }
 
 // `columns` is the declaring (subject) table's columns: FK columns must exist in it.
-export function validateFKs(fks: FKs, columns?: { [column: string]: ColumnDef }): boolean {
+export function validateFKs(fks: FKs, columns?: { [column: string]: ColumnDef }): ValidateReason {
     const entries = Object.entries(fks);
-    if (entries.length > MAX_FKS) return false;
+    if (entries.length > MAX_FKS) return `too many foreign keys (max ${MAX_FKS})`;
     for (const [column, target] of entries) {
-        if (!isValidName(column)) return false;
-        if (!isValidTableRef(target)) return false;
-        if (columns !== undefined && columns[column] === undefined) return false;
+        if (!isValidName(column)) return invalidNameReason(column, 'column');
+        if (!isValidTableRef(target)) return `invalid FK target '${target}'`;
+        if (columns !== undefined && columns[column] === undefined) return `FK column '${column}' does not exist`;
     }
-    return true;
+    return undefined;
 }
 
-export function validateRestrictions(restrictions: Restriction[]): boolean {
-    for (const restriction of restrictions) {
-        if (!validatePredicate(restriction.rule)) return false;
+export function validateRestrictions(restrictions: Restriction[]): ValidateReason {
+    for (const [index, restriction] of restrictions.entries()) {
+        if (!validatePredicate(restriction.rule)) return `invalid restriction predicate at index ${index}`;
     }
-    return true;
+    return undefined;
 }
 
 // An identity provider designates two columns of the SAME table as the keyId
@@ -278,109 +304,142 @@ export function validateRestrictions(restrictions: Restriction[]): boolean {
 // (a mutable provider key would make at-append signature verification depend
 // on resolution order; pub so the keyId is searchable in the cover read), and
 // be distinct.
-export function validateIdProvider(provider: IdProvider, columns: { [column: string]: ColumnDef }): boolean {
-    if (!isValidName(provider.keyIdColumn) || !isValidName(provider.publicKeyColumn)) return false;
-    if (provider.keyIdColumn === provider.publicKeyColumn) return false;
+export function validateIdProvider(provider: IdProvider, columns: { [column: string]: ColumnDef }): ValidateReason {
+    if (!isValidName(provider.keyIdColumn)) return invalidNameReason(provider.keyIdColumn, 'column');
+    if (!isValidName(provider.publicKeyColumn)) return invalidNameReason(provider.publicKeyColumn, 'column');
+    if (provider.keyIdColumn === provider.publicKeyColumn) return 'idProvider keyIdColumn and publicKeyColumn must differ';
 
     for (const column of [provider.keyIdColumn, provider.publicKeyColumn]) {
         const def = columns[column];
-        if (def === undefined) return false;
-        if (def.type !== 'string') return false;
-        if (!(def.pub ?? false)) return false;
-        if (!(def.readonly ?? false)) return false;
+        if (def === undefined) return `idProvider column '${column}' does not exist`;
+        if (def.type !== 'string') return `idProvider column '${column}' must be string-typed`;
+        if (!(def.pub ?? false)) return `idProvider column '${column}' must be pub`;
+        if (!(def.readonly ?? false)) return `idProvider column '${column}' must be readonly`;
     }
-    return true;
+    return undefined;
 }
 
-export function validateTableDef(def: TableDef): boolean {
-    if (!isValidName(def.name)) return false;
+export function validateTableDef(def: TableDef): ValidateReason {
+    if (!isValidName(def.name)) return invalidNameReason(def.name, 'table');
 
     const columnNames = Object.keys(def.columns);
-    if (columnNames.length === 0) return false;
+    if (columnNames.length === 0) return `table '${def.name}' has no columns`;
 
     for (const column of columnNames) {
-        if (!isValidName(column)) return false;
-        if (!validateColumnDef(def.columns[column])) return false;
+        if (!isValidName(column)) return `${invalidNameReason(column, 'column')} in table '${def.name}'`;
+        const colReason = validateColumnDef(def.columns[column]);
+        if (colReason !== undefined) return `column '${column}' in table '${def.name}': ${colReason}`;
     }
 
-    if (def.fks !== undefined && !validateFKs(def.fks, def.columns)) return false;
-    if (def.restrictions !== undefined && !validateRestrictions(def.restrictions)) return false;
-    if (def.idProvider !== undefined && !validateIdProvider(def.idProvider, def.columns)) return false;
+    if (def.fks !== undefined) {
+        const fkReason = validateFKs(def.fks, def.columns);
+        if (fkReason !== undefined) return `table '${def.name}': ${fkReason}`;
+    }
+    if (def.restrictions !== undefined) {
+        const restReason = validateRestrictions(def.restrictions);
+        if (restReason !== undefined) return `table '${def.name}': ${restReason}`;
+    }
+    if (def.idProvider !== undefined) {
+        const idReason = validateIdProvider(def.idProvider, def.columns);
+        if (idReason !== undefined) return `table '${def.name}': ${idReason}`;
+    }
 
-    return true;
+    return undefined;
 }
 
 // Validates a full set of table defs: each def is valid, names are unique,
 // local (unqualified) FK and exists-atom targets exist in the set, and exists
 // `where` fields are pub columns of the local target.
-export function validateSchemaTables(tables: TableDef[]): boolean {
+export function validateSchemaTables(tables: TableDef[]): ValidateReason {
     const names = new Set<string>();
     const byName = new Map<string, TableDef>();
 
     for (const def of tables) {
-        if (!validateTableDef(def)) return false;
-        if (names.has(def.name)) return false;
+        const defReason = validateTableDef(def);
+        if (defReason !== undefined) return defReason;
+        if (names.has(def.name)) return `duplicate table name '${def.name}'`;
         names.add(def.name);
         byName.set(def.name, def);
     }
 
-    const checkExistsAtom = (atom: ExistsAtom): boolean => {
+    const checkExistsAtom = (atom: ExistsAtom): ValidateReason => {
         const [group, table] = splitTableRef(atom.table);
-        if (group !== undefined) return true;   // checked at binding time
+        if (group !== undefined) return undefined;   // checked at binding time
 
         const target = byName.get(table);
-        if (target === undefined) return false;
+        if (target === undefined) return `exists target table '${table}' not found in schema`;
 
         if (atom.where !== undefined) {
             for (const field of Object.keys(atom.where)) {
-                if (field === 'author') continue;
+                if (field === 'rowAuthor') continue;
                 const column = target.columns[field];
-                if (column === undefined) return false;
-                if (!(column.pub ?? false)) return false;
+                if (column === undefined) return `exists where field '${field}' not found in table '${table}'`;
+                if (!(column.pub ?? false)) return `exists where field '${field}' in table '${table}' is not pub`;
             }
         }
-        return true;
+        return undefined;
     };
 
     for (const def of tables) {
         for (const target of Object.values(def.fks ?? {})) {
             const [group, table] = splitTableRef(target);
-            if (group === undefined && !names.has(table)) return false;
+            if (group === undefined && !names.has(table)) {
+                return `FK target '${table}' not found in schema (referenced from table '${def.name}')`;
+            }
         }
 
         for (const restriction of def.restrictions ?? []) {
             for (const atom of collectExistsAtoms(restriction.rule)) {
-                if (!checkExistsAtom(atom)) return false;
+                const atomReason = checkExistsAtom(atom);
+                if (atomReason !== undefined) return `table '${def.name}': ${atomReason}`;
             }
-            if (!checkPredicateColumns(def, restriction.rule, (t) => byName.get(t))) return false;
+            const predReason = checkPredicateColumns(def, restriction.rule, (t) => byName.get(t));
+            if (predReason !== undefined) return `table '${def.name}': ${predReason}`;
         }
     }
 
-    return true;
+    return undefined;
 }
 
-export function validateMigrationRule(rule: MigrationRule): boolean {
+export function validateMigrationRule(rule: MigrationRule): ValidateReason {
     switch (rule.rule) {
-        case 'add-table':
+        case 'add-table': {
             return validateTableDef(rule.def);
-        case 'drop-table':
-            return isValidName(rule.table);
-        case 'add-column':
-            if (!isValidName(rule.table) || !isValidName(rule.column)) return false;
-            if (!validateColumnDef(rule.def)) return false;
+        }
+        case 'drop-table': {
+            if (!isValidName(rule.table)) return invalidNameReason(rule.table, 'table');
+            return undefined;
+        }
+        case 'add-column': {
+            if (!isValidName(rule.table)) return invalidNameReason(rule.table, 'table');
+            if (!isValidName(rule.column)) return invalidNameReason(rule.column, 'column');
+            const colReason = validateColumnDef(rule.def);
+            if (colReason !== undefined) return `column '${rule.column}': ${colReason}`;
             // a new non-nullable column needs a default to revise old rows
-            if (!(rule.def.nullable ?? false) && rule.def.default === undefined) return false;
-            return true;
-        case 'drop-column':
-            return isValidName(rule.table) && isValidName(rule.column);
-        case 'set-concurrent-deletes':
-            return isValidName(rule.table);
-        case 'set-fks':
-            return isValidName(rule.table) && validateFKs(rule.fks);
-        case 'set-restrictions':
-            return isValidName(rule.table) && validateRestrictions(rule.restrictions);
+            if (!(rule.def.nullable ?? false) && rule.def.default === undefined) {
+                return `adding non-nullable column '${rule.column}' without default is not allowed`;
+            }
+            return undefined;
+        }
+        case 'drop-column': {
+            if (!isValidName(rule.table)) return invalidNameReason(rule.table, 'table');
+            if (!isValidName(rule.column)) return invalidNameReason(rule.column, 'column');
+            return undefined;
+        }
+        case 'set-concurrent-deletes': {
+            if (!isValidName(rule.table)) return invalidNameReason(rule.table, 'table');
+            return undefined;
+        }
+        case 'set-fks': {
+            if (!isValidName(rule.table)) return invalidNameReason(rule.table, 'table');
+            return validateFKs(rule.fks);
+        }
+        case 'set-restrictions': {
+            if (!isValidName(rule.table)) return invalidNameReason(rule.table, 'table');
+            return validateRestrictions(rule.restrictions);
+        }
         default:
-            return false;
+            return `unknown migration rule '${String((rule as MigrationRule).rule)}'`;
     }
 }
 
@@ -395,9 +454,11 @@ export function validateRSchemaPayloadFormat(payload: json.Literal): ValidationR
         if (!json.checkFormat(createRSchemaFormat, payload)) return validationFailure("RSchema create payload format is invalid");
         const create = payload as CreateRSchemaPayload;
         if (create.creators.length === 0) return validationFailure("RSchema create payload must have at least one creator");
-        return validateSchemaTables(create.tables)
-            ? validationOk()
-            : validationFailure("RSchema create tables are invalid");
+        const tablesReason = validateSchemaTables(create.tables);
+        if (tablesReason !== undefined) {
+            return validationFailure(`RSchema create tables are invalid: ${tablesReason}`);
+        }
+        return validationOk();
     }
 
     if (action === 'schema-update') {
@@ -405,7 +466,10 @@ export function validateRSchemaPayloadFormat(payload: json.Literal): ValidationR
         const update = payload as SchemaUpdatePayload;
         if (update.migration.length === 0) return validationFailure("schema-update migration is empty");
         for (const [index, rule] of update.migration.entries()) {
-            if (!validateMigrationRule(rule)) return validationFailure(`schema-update migration rule ${index} is invalid`);
+            const ruleReason = validateMigrationRule(rule);
+            if (ruleReason !== undefined) {
+                return validationFailure(`schema-update migration rule ${index} is invalid: ${ruleReason}`);
+            }
         }
         return validationOk();
     }

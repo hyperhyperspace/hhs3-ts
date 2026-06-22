@@ -26,6 +26,21 @@ export const parserTests = {
             },
         },
         {
+            name: '[PARSE01b] parses colon-qualified schema names',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE SCHEMA hhs:users AS (
+                      TABLE identities (
+                        keyId string
+                      )
+                    );
+                `);
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok || result.value.kind !== 'create-schema') return;
+                assertEquals(result.value.name, 'hhs:users', 'schema name should preserve colon hierarchy');
+            },
+        },
+        {
             name: '[PARSE02] parses update/delete/bundle statements',
             invoke: async () => {
                 const result = parseStatement("UPDATE shop.products SET name = 'x' WHERE rowId = 'row-1';");
@@ -90,7 +105,7 @@ export const parserTests = {
                     CREATE SCHEMA shop AS (
                       TABLE products (
                         sku string PUB READONLY
-                      ) ALLOW insert IF true ALLOW update IF author = $author
+                      ) ALLOW insert IF true ALLOW update IF rowAuthor = $author
                     );
                 `);
                 assertTrue(result.ok, 'parse should succeed');
@@ -107,7 +122,7 @@ export const parserTests = {
                     CREATE SCHEMA shop AS (
                       TABLE products (
                         sku string PUB READONLY
-                      ) ALLOW insert IF true ALLOW insert IF author = $author
+                      ) ALLOW insert IF true ALLOW insert IF rowAuthor = $author
                     );
                 `);
                 assertTrue(!result.ok, 'duplicate ALLOW insert should fail');
@@ -135,7 +150,7 @@ export const parserTests = {
                     ALTER SCHEMA shop AS (
                       SET ALLOW RULES products (
                         ALLOW insert IF true,
-                        ALLOW update IF author = $author
+                        ALLOW update IF rowAuthor = $author
                       )
                     );
                 `);

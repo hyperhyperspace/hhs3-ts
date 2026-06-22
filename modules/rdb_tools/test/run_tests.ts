@@ -1,4 +1,5 @@
 import { mkdtemp, rm } from "node:fs/promises";
+import { stdin as input } from "node:process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -272,7 +273,7 @@ const tests = [
                 assertEquals(createPending.needsPassphrase?.label, 'bob', 'create prompt keeps label');
                 assertEquals(createPending.output, undefined, 'create without passphrase has no immediate output');
 
-                const createMissing = await runCommand(session, '\\key create bob');
+                const createMissing = await runCommandNonInteractive(session, '\\key create bob');
                 assertEquals(createMissing.exitCode, 1, 'non-interactive create requires passphrase');
                 assertTrue(createMissing.output.includes('passphrase required'), 'non-interactive create error');
 
@@ -285,7 +286,7 @@ const tests = [
                 assertEquals(pending.needsPassphrase?.label, 'alice', 'unlock without passphrase requests prompt');
                 assertEquals(pending.output, undefined, 'unlock without passphrase has no immediate output');
 
-                const missing = await runCommand(session, '\\key unlock alice');
+                const missing = await runCommandNonInteractive(session, '\\key unlock alice');
                 assertEquals(missing.exitCode, 1, 'non-interactive unlock requires passphrase');
                 assertTrue(missing.output.includes('passphrase required'), 'non-interactive unlock error');
 
@@ -297,6 +298,16 @@ const tests = [
         },
     },
 ];
+
+async function runCommandNonInteractive(session: WorkspaceSession, command: string) {
+    const wasTty = input.isTTY;
+    try {
+        (input as NodeJS.ReadStream & { isTTY?: boolean }).isTTY = false;
+        return await runCommand(session, command);
+    } finally {
+        (input as NodeJS.ReadStream & { isTTY?: boolean }).isTTY = wasTty;
+    }
+}
 
 async function withSession(fn: (session: WorkspaceSession, dbPath: string) => Promise<void>): Promise<void> {
     const dir = await mkdtemp(join(tmpdir(), 'rdb-tools-'));

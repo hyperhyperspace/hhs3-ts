@@ -58,7 +58,7 @@ async function makeAppGroup(ctx: RContext, seed: string, tables: TableDef[], use
 }): Promise<{ schema: RSchemaImpl; group: RTableGroupImpl; creator: OwnIdentity }> {
     const creator = opts?.creator ?? await makeIdentity();
     const schemaInit = await RSchemaImpl.create({
-        seed: seed + '-schema',
+        name: `${seed.replace(/[^a-zA-Z0-9_]+/g, '_')}:schema`,
         creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
         tables,
     });
@@ -235,7 +235,7 @@ export const rtablePermTests = {
                     { name: 'orders', columns: { customer: { type: 'string' } } },
                 ];
                 const schemaInit = await RSchemaImpl.create({
-                    seed: 'perm06-schema',
+                    name: 'perm06:schema',
                     creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
                     tables,
                 });
@@ -347,7 +347,7 @@ export const rtablePermTests = {
                       restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'wcaps', where: { label: 'writer', grantee: '$author' } } }] },
                 ];
                 const schemaInit = await RSchemaImpl.create({
-                    seed: 'perm09-schema',
+                    name: 'perm09:schema',
                     creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
                     tables,
                 });
@@ -464,7 +464,7 @@ export const rtablePermTests = {
                 // object is an infrastructure (defer) condition, not data
                 const creator = await makeIdentity();
                 const schemaInit = await RSchemaImpl.create({
-                    seed: 'users03-schema',
+                    name: 'users03:schema',
                     creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
                     tables: [docsTable],
                 });
@@ -639,7 +639,7 @@ export const rtablePermTests = {
                       ] } }] },
                 ];
                 const schemaInit = await RSchemaImpl.create({
-                    seed: 'perm10-schema',
+                    name: 'perm10:schema',
                     creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
                     tables,
                 });
@@ -689,7 +689,7 @@ export const rtablePermTests = {
                       } }] },
                 ];
                 const schemaInit = await RSchemaImpl.create({
-                    seed: 'perm11-schema',
+                    name: 'perm11:schema',
                     creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
                     tables,
                 });

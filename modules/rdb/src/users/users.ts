@@ -52,6 +52,7 @@ export const CAPS_TABLE = 'caps';
 export const ENDPOINTS_TABLE = 'endpoints';
 export const USERS_MANAGER_LABEL = 'manager';
 export const USERS_PEER_CAP = 'member';
+export const USERS_SCHEMA_NAME = 'hhs:users';
 
 // Conventional binding name + provider ref for app groups that point at a
 // Users group: `bindings: { users: <id> }`, `idProvider: 'users.identities'`.
@@ -154,8 +155,7 @@ export async function createUsersGroup(
     const managerLabel = opts?.managerLabel ?? USERS_MANAGER_LABEL;
 
     const schemaInit = await RSchemaImpl.create({
-        seed: seed + '-schema',
-        name: 'users',
+        name: USERS_SCHEMA_NAME,
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables: usersSchemaTables(managerLabel),
     });

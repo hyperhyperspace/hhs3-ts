@@ -188,7 +188,7 @@ export const restrictionFormat: json.Format = {
 export function defaultRestrictionRule(op: 'insert' | 'update' | 'delete'): Predicate {
     return op === 'insert'
         ? { p: 'true' }
-        : { p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: '$author' } };
+        : { p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: '$author' } };
 }
 
 // Identity provider: a table whose rows map a keyId to a publicKey, used to
@@ -302,8 +302,7 @@ export const RSCHEMA_TYPE_ID = 'hhs/rschema_v1';
 export type CreateRSchemaPayload = {
     action: 'create';
     type: string;
-    seed: string;
-    name?: string;
+    name: string;
     creators: SchemaCreator[];             // may sign schema-updates; at least one
     tables: TableDef[];
     hashAlgorithm?: string;
@@ -312,8 +311,7 @@ export type CreateRSchemaPayload = {
 export const createRSchemaFormat: json.Format = {
     action: [json.Type.Constant, 'create'],
     type: createPayloadTypeFormat(RSCHEMA_TYPE_ID),
-    seed: [json.Type.BoundedString, MAX_SEED_LENGTH],
-    name: [json.Type.Option, [json.Type.BoundedString, MAX_NAME_LENGTH]],
+    name: [json.Type.BoundedString, MAX_NAME_LENGTH],
     creators: [json.Type.BoundedArray, schemaCreatorFormat, MAX_CREATORS],
     tables: [json.Type.BoundedArray, tableDefFormat, MAX_TABLES],
     hashAlgorithm: [json.Type.Option, [json.Type.BoundedString, MAX_HASH_ALGORITHM_LENGTH]],

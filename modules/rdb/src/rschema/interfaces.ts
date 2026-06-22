@@ -16,7 +16,7 @@ export interface RSchema extends RObject {
 
     getView(at?: Version, from?: Version): Promise<RSchemaView>;
 
-    seed(): string;
+    getName(): string;
     hashAlgorithm(): string | undefined;
 }
 
@@ -34,7 +34,7 @@ export interface RSchemaView extends View {
     getObject(): RSchema;
 
     // Immutable create-time facts
-    getName(): string | undefined;
+    getName(): string;
     getCreators(): SchemaCreator[];
     isCreator(keyId: KeyId): boolean;
 

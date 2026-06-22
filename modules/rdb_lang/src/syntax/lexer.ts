@@ -72,6 +72,11 @@ export function lex(source: string): Result<Token[]> {
                     while (i < source.length && isIdentPart(source[i])) i += 1;
                     continue;
                 }
+                if (source[i] === ':' && i + 1 < source.length && isIdentStart(source[i + 1])) {
+                    i += 2;
+                    while (i < source.length && isIdentPart(source[i])) i += 1;
+                    continue;
+                }
                 break;
             }
             const text = source.substring(start, i);

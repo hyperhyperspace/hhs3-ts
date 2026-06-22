@@ -108,7 +108,7 @@ export function createTestBindContext(_ctx: RContext, vars: { [name: string]: La
             return uuid;
         },
 
-        createSeed(kind: 'rdb' | 'schema' | 'group', name?: string): string {
+        createSeed(kind: 'rdb' | 'group', name?: string): string {
             return hashSuite.hashToB64(new TextEncoder().encode(`${kind}:${name ?? ''}`));
         },
     };

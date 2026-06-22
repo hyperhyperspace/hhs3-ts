@@ -40,8 +40,7 @@ async function createTestEnv(tables?: TableDef[]) {
     const admin = await makeIdentity();
 
     const init = await RSchemaImpl.create({
-        seed: 'rschema-test',
-        name: 'test-schema',
+        name: 'test_schema',
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables: tables ?? [ordersTable(), capsTable()],
     });
@@ -60,7 +59,7 @@ export const rschemaTests = {
                 const { schema, admin } = await createTestEnv();
 
                 const view = await schema.getView();
-                assertEquals(view.getName(), 'test-schema', 'name should be set');
+                assertEquals(view.getName(), 'test_schema', 'name should be set');
                 assertTrue(view.isCreator(admin.keyId), 'admin should be a creator');
                 assertFalse(view.isCreator('someone-else'), 'unknown keyId should not be a creator');
 
@@ -72,7 +71,7 @@ export const rschemaTests = {
                 assertEquals(json.toStringNormalized(view.getRestriction('orders', 'insert')),
                     json.toStringNormalized({ p: 'true' }), 'insert should default to true');
                 assertEquals(json.toStringNormalized(view.getRestriction('orders', 'delete')),
-                    json.toStringNormalized({ p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: '$author' } }), 'delete should default to author');
+                    json.toStringNormalized({ p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: '$author' } }), 'delete should default to author');
             }
         },
         {
@@ -83,7 +82,7 @@ export const rschemaTests = {
                 const admin = await makeIdentity();
 
                 const init = await RSchemaImpl.create({
-                    seed: 'rschema-bad-creator',
+                    name: 'rschema:bad_creator',
                     creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
                     tables: [ordersTable()],
                 });

@@ -24,7 +24,7 @@ import type { Row, RowValues } from "./interfaces.js";
 
 // Two-valued logic: an operand that does not resolve (missing column value)
 // makes its cmp/str atom false; `not` negates normally (no SQL three-valued
-// NULL). The implicit `author` system column can be queried like a string
+// NULL). The implicit `rowAuthor` system column can be queried like a string
 // column.
 export type RowFilter =
     | { p: 'true' }
@@ -52,7 +52,7 @@ export type ColumnTypes = { [column: string]: ColumnType };
 // ---------------------------------------------------------------------------
 
 export function evalRowFilter(filter: RowFilter, row: Row): boolean {
-    const lookup = (column: string): json.Literal | undefined => column === 'author' ? row.author : row.values[column];
+    const lookup = (column: string): json.Literal | undefined => column === 'rowAuthor' ? row.author : row.values[column];
 
     switch (filter.p) {
         case 'true':
@@ -100,8 +100,8 @@ function compareValues(a: json.Literal, b: json.Literal): number {
 export function orderRows(rows: Row[], orderBy: OrderBy[]): Row[] {
     return rows.slice().sort((x, y) => {
         for (const { column, dir } of orderBy) {
-            const av = column === 'author' ? x.author : x.values[column];
-            const bv = column === 'author' ? y.author : y.values[column];
+            const av = column === 'rowAuthor' ? x.author : x.values[column];
+            const bv = column === 'rowAuthor' ? y.author : y.values[column];
             const aMissing = av === undefined;
             const bMissing = bv === undefined;
             if (aMissing || bMissing) {
@@ -123,7 +123,7 @@ export function orderRows(rows: Row[], orderBy: OrderBy[]): Row[] {
 export function projectRow(row: Row, select: string[]): Row {
     const values: RowValues = {};
     for (const column of select) {
-        if (column !== 'author' && row.values[column] !== undefined) values[column] = row.values[column];
+        if (column !== 'rowAuthor' && row.values[column] !== undefined) values[column] = row.values[column];
     }
     const projected: Row = { rowId: row.rowId, uuid: row.uuid, values };
     if (row.author !== undefined) projected.author = row.author;
@@ -148,7 +148,7 @@ function validateOperand(op: Operand, columns: ColumnTypes, depth: number): void
     }
     if ('col' in op) {
         if (typeof op.col !== 'string') throw new Error("query operand column must be a string");
-        if (!(op.col in columns) && op.col !== 'author') throw new Error(`unknown column '${op.col}' in query filter`);
+        if (!(op.col in columns) && op.col !== 'rowAuthor') throw new Error(`unknown column '${op.col}' in query filter`);
         return;
     }
     if ('fn' in op) {
@@ -178,7 +178,7 @@ function validateRowFilter(filter: RowFilter, columns: ColumnTypes, depth: numbe
         throw new Error("malformed query filter");
     }
 
-    const typeOf = (column: string): ColumnType | undefined => column === 'author' ? 'string' : columns[column];
+    const typeOf = (column: string): ColumnType | undefined => column === 'rowAuthor' ? 'string' : columns[column];
 
     switch (filter.p) {
         case 'true':
@@ -233,7 +233,7 @@ export function validateRowQuery(q: RowQuery, columns: ColumnTypes): void {
     if (q.select !== undefined) {
         if (!Array.isArray(q.select)) throw new Error("query 'select' must be an array of column names");
         for (const column of q.select) {
-            if (typeof column !== 'string' || (!(column in columns) && column !== 'author')) {
+            if (typeof column !== 'string' || (!(column in columns) && column !== 'rowAuthor')) {
                 throw new Error(`unknown column '${String(column)}' in query select`);
             }
         }
@@ -242,7 +242,7 @@ export function validateRowQuery(q: RowQuery, columns: ColumnTypes): void {
     if (q.orderBy !== undefined) {
         if (!Array.isArray(q.orderBy)) throw new Error("query 'orderBy' must be an array");
         for (const ob of q.orderBy) {
-            if (ob === null || typeof ob !== 'object' || typeof ob.column !== 'string' || (!(ob.column in columns) && ob.column !== 'author')) {
+            if (ob === null || typeof ob !== 'object' || typeof ob.column !== 'string' || (!(ob.column in columns) && ob.column !== 'rowAuthor')) {
                 throw new Error(`unknown column '${String(ob?.column)}' in query orderBy`);
             }
             if (ob.dir !== undefined && ob.dir !== 'asc' && ob.dir !== 'desc') {

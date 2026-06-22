@@ -72,7 +72,7 @@ export interface RTableView extends View {
 
     // Search over pub columns via meta-indexed cover queries — the machinery
     // behind exists predicates. All `where` fields must be pub columns of
-    // this table or the implicit `author` system field; matches are exact
+    // this table or the implicit `rowAuthor` system field; matches are exact
     // (normalized value equality) against the RESOLVED values at the view
     // position (pub columns are mutable unless also readonly; stale meta hits
     // are filtered).

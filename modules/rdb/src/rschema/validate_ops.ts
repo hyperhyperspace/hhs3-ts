@@ -22,7 +22,7 @@ import { verifyPayloadSignature, deserializePublicKeyFromBase64, computeKeyId } 
 import { CreateRSchemaPayload, SchemaUpdatePayload, SchemaCreator } from "./payload.js";
 import { validateRSchemaPayloadFormat } from "./validate.js";
 import { TableDef, MigrationRule } from "./payload.js";
-import { collectExistsAtoms, collectRowFieldRefs, checkPredicateColumns } from "./validate.js";
+import { collectExistsAtoms, collectRowFieldRefs, checkPredicateColumns, isValidSchemaName } from "./validate.js";
 import { splitTableRef } from "./payload.js";
 import type { RSchema, RSchemaView } from "./interfaces.js";
 
@@ -43,6 +43,7 @@ export async function validateRSchemaPayload(payload: json.Literal, context: RSc
 
 function validateCreate(create: CreateRSchemaPayload, ctx: RContext): ValidationResult {
     if (create.action !== 'create') return validationFailure("RSchema creation action must be 'create'");
+    if (!isValidSchemaName(create.name)) return validationFailure(`invalid schema name '${create.name}'`);
 
     const hashSuite = ctx.getHashSuite();
     const seen = new Set<KeyId>();
@@ -127,7 +128,7 @@ function checkLocalPredicateTargets(def: TableDef, tables: Map<string, TableDef>
                 if (column === undefined || !(column.pub ?? false)) return false;
             }
         }
-        if (!checkPredicateColumns(def, restriction.rule, (t) => tables.get(t))) return false;
+        if (checkPredicateColumns(def, restriction.rule, (t) => tables.get(t)) !== undefined) return false;
     }
 
     return true;

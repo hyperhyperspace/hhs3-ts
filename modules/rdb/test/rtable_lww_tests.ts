@@ -46,7 +46,7 @@ async function createTestEnv() {
     const admin = await makeIdentity();
 
     const schemaInit = await RSchemaImpl.create({
-        seed: 'lww-test-schema',
+        name: 'lww:test_schema',
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables: [itemsTable()],
     });

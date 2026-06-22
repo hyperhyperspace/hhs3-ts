@@ -30,7 +30,7 @@ async function createEnv(tables: TableDef[], opts?: {
 
     const admin = opts?.admin ?? await makeIdentity();
     const schemaInit = await RSchemaImpl.create({
-        seed: 'enf-test-schema',
+        name: 'enf:test_schema',
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables,
     });

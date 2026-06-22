@@ -41,7 +41,6 @@ async function createItemsGroup() {
 
     const admin = await makeIdentity();
     const schemaInit = await RSchemaImpl.create({
-        seed: 'query-test-schema',
         name: 'inventory',
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables: [itemsTable()],
@@ -122,9 +121,9 @@ export const rtableQueryTests = {
 
                 // implicit author system column
                 const authored = row('o', { kind: 'apple' }, 'key-1');
-                assertTrue(evalRowFilter({ p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: 'key-1' } }, authored), 'author match');
-                assertFalse(evalRowFilter({ p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: 'key-2' } }, authored), 'author mismatch');
-                assertFalse(evalRowFilter({ p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: 'key-1' } }, r), 'missing author does not match');
+                assertTrue(evalRowFilter({ p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: 'key-1' } }, authored), 'author match');
+                assertFalse(evalRowFilter({ p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: 'key-2' } }, authored), 'author mismatch');
+                assertFalse(evalRowFilter({ p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: 'key-1' } }, r), 'missing author does not match');
             }
         },
         {
@@ -144,7 +143,7 @@ export const rtableQueryTests = {
                 expectThrow(() => validateRowQuery({ offset: -2 }, ITEM_COLUMNS), 'negative offset');
                 expectThrow(() => validateRowQuery({ orderBy: [{ column: 'qty', dir: 'down' as 'asc' }] }, ITEM_COLUMNS), 'bad orderBy dir');
                 expectThrow(() => validateRowQuery({ where: { p: 'bogus' } as unknown as RowFilter }, ITEM_COLUMNS), 'unknown filter tag');
-                validateRowQuery({ where: { p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: 'key-1' } } }, ITEM_COLUMNS);
+                validateRowQuery({ where: { p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: 'key-1' } } }, ITEM_COLUMNS);
             }
         },
         {
@@ -218,11 +217,11 @@ export const rtableQueryTests = {
 
                 const view = await items.getView();
 
-                const authored = await view.query({ where: { p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: alice.keyId } } });
+                const authored = await view.query({ where: { p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: alice.keyId } } });
                 assertEquals(uuids(authored), 'authored1', 'author filter returns only alice rows');
 
                 const authoredFruit = await view.query({ where: { p: 'and', args: [
-                    { p: 'cmp', cmp: 'eq', left: { col: 'author' }, right: { lit: alice.keyId } },
+                    { p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: alice.keyId } },
                     { p: 'cmp', cmp: 'eq', left: { col: 'kind' }, right: { lit: 'fruit' } },
                 ] } });
                 assertEquals(uuids(authoredFruit), 'authored1', 'author pushdown + residual kind filter');

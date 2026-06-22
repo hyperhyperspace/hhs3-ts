@@ -59,7 +59,6 @@ async function createTestEnv(groupExtras?: {
     const admin = await makeIdentity();
 
     const schemaInit = await RSchemaImpl.create({
-        seed: 'group-test-schema',
         name: 'shop',
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables: [ordersTable(), capsTable()],
@@ -128,7 +127,7 @@ export const rtableGroupTests = {
                         ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
                         const admin = await makeIdentity();
                         const schemaInit = await RSchemaImpl.create({
-                            seed: 's', creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
+                            name: 's', creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
                             tables: [ordersTable(), capsTable()],
                         });
                         const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;

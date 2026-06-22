@@ -16,7 +16,7 @@
 // Identity terms resolve from the op's author (already signature-verified at
 // validation when the group has a provider, so op.author is trusted here). The
 // subject row's insert author is exposed as the readonly system column
-// `author`.
+// `rowAuthor`.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import type { KeyId, B64Hash } from "@hyper-hyper-space/hhs3_crypto";
@@ -159,7 +159,7 @@ export async function evaluateRowOpRestriction(
     if (op.action === 'insert') {
         // op values plus schema defaults (the row's resolved state at insert)
         const def = schemaView.getTable(table);
-        subjectRow = op.author === undefined ? {} : { author: op.author };
+        subjectRow = op.author === undefined ? {} : { rowAuthor: op.author };
         for (const [column, cdef] of Object.entries(def?.columns ?? {})) {
             const value = op.values[column] ?? cdef.default;
             if (value !== undefined) subjectRow[column] = value;
@@ -172,7 +172,7 @@ export async function evaluateRowOpRestriction(
         const row = await view.getRow(op.rowId);
         if (row !== undefined) {
             subjectRow = op.action === 'update' ? { ...row.values, ...op.values } : row.values;
-            if (row.author !== undefined) subjectRow = { ...subjectRow, author: row.author };
+            if (row.author !== undefined) subjectRow = { ...subjectRow, rowAuthor: row.author };
         }
     }
 

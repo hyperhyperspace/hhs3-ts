@@ -39,7 +39,7 @@ export function formatTableResult(result: LangExecutionResult, mode: Exclude<Out
 function selectRowToRecord(row: Row): Record<string, unknown> {
     return {
         rowId: row.rowId,
-        ...(row.author !== undefined ? { author: row.author } : {}),
+        ...(row.author !== undefined ? { rowAuthor: row.author } : {}),
         ...row.values,
     };
 }

@@ -54,5 +54,5 @@ export interface LangBindContext {
     resolveLogTarget(ref: NameOrHashRef): Promise<ResolvedLogTarget>;
     currentAuthor(): Promise<OwnIdentity | undefined>;
     createUuid(): string;
-    createSeed(kind: 'rdb' | 'schema' | 'group', name?: string): string;
+    createSeed(kind: 'rdb' | 'group', name?: string): string;
 }

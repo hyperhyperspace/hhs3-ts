@@ -4,7 +4,7 @@
 // ACTIONS (see payload.ts for formats):
 //
 //   create
-//     Genesis of a schema. Carries: seed, optional human-readable name,
+//     Genesis of a schema. Carries: name,
 //     `creators` (keyId + publicKey pairs; spec authority — they may sign
 //     schema-updates), the initial TableDef[] (columns with types /
 //     nullable / default / pub, concurrentDeletes, fks: column -> table with
@@ -86,8 +86,7 @@ export const rSchemaFactory: RObjectFactory = {
 export class RSchemaImpl implements RSchemaContract {
 
     static create = async (options: {
-        seed: string;
-        name?: string;
+        name: string;
         creators: { keyId: KeyId; publicKey: PublicKey }[];
         tables: TableDef[];
         hashAlgorithm?: string;
@@ -96,7 +95,7 @@ export class RSchemaImpl implements RSchemaContract {
         const createPayload: CreateRSchemaPayload = {
             action: 'create',
             type: RSCHEMA_TYPE_ID,
-            seed: options.seed,
+            name: options.name,
             creators: options.creators.map((c) => ({
                 keyId: c.keyId,
                 publicKey: serializePublicKeyToBase64(c.publicKey),
@@ -104,7 +103,6 @@ export class RSchemaImpl implements RSchemaContract {
             tables: options.tables,
         };
 
-        if (options.name !== undefined) createPayload.name = options.name;
         if (options.hashAlgorithm !== undefined) createPayload.hashAlgorithm = options.hashAlgorithm;
 
         return createPayload;
@@ -134,7 +132,7 @@ export class RSchemaImpl implements RSchemaContract {
     getType(): string { return RSchemaImpl.typeId; }
     getBackendLabel(): string { return this.backendLabel; }
 
-    seed(): string { return this.createOp.seed; }
+    getName(): string { return this.createOp.name; }
     hashAlgorithm(): string | undefined { return this.createOp.hashAlgorithm; }
 
     getContext(): RContext { return this.ctx; }

@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { createBasicCrypto, createIdentity, HASH_SHA256, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
@@ -19,7 +20,7 @@ import { createTestBindContext, TestBindContext } from "./mock_bind_context.js";
 
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
-const SCRIPT_DIR = new URL("./scripts/users_permissions/", import.meta.url);
+const SCRIPT_DIR = resolve("test/scripts/users_permissions");
 
 type Vars = { [name: string]: LangValue };
 
@@ -63,7 +64,7 @@ async function setupAliceWriter(env: ScriptEnv): Promise<void> {
 }
 
 async function runScriptFile(name: string, env: ScriptEnv): Promise<LangExecutionResult[]> {
-    const sql = await readFile(new URL(name, SCRIPT_DIR), 'utf8');
+    const sql = await readFile(resolve(SCRIPT_DIR, name), 'utf8');
     return runScriptText(sql, env, name);
 }
 

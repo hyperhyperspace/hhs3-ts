@@ -66,7 +66,7 @@ async function createTestEnv(opts?: { ordersConcurrentDeletes?: boolean; selfVal
 
     const admin = await makeIdentity();
     const schemaInit = await RSchemaImpl.create({
-        seed: 'bundle-test-schema',
+        name: 'bundle:test_schema',
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables: [ordersTable(opts?.ordersConcurrentDeletes), linesTable()],
     });

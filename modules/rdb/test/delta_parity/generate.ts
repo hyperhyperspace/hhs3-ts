@@ -70,7 +70,7 @@ export async function generateSingleGroupHistory(seed: number, ops: number): Pro
 
     const admin = await makeIdentity();
     const schemaInit = await RSchemaImpl.create({
-        seed: `parity-schema-${seed}`,
+        name: `parity:schema_${seed}`,
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables: [
             open('orders', { customer: { type: 'string' } }),
@@ -207,7 +207,7 @@ export async function generateCrossGroupHistory(seed: number, ops: number): Prom
 
     // foreign schema/group B: orders
     const schemaBInit = await RSchemaImpl.create({
-        seed: `parity-xschemaB-${seed}`,
+        name: `parity:xschemaB_${seed}`,
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables: [open('orders', { customer: { type: 'string' } })],
     });
@@ -220,7 +220,7 @@ export async function generateCrossGroupHistory(seed: number, ops: number): Prom
 
     // dependent schema/group A: lines with a cross-group FK to B.orders
     const schemaAInit = await RSchemaImpl.create({
-        seed: `parity-xschemaA-${seed}`,
+        name: `parity:xschemaA_${seed}`,
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables: [open('lines', { order: { type: 'string' }, qty: { type: 'integer' } }, { fks: { order: 'B.orders' } })],
     });

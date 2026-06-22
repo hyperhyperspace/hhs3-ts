@@ -50,7 +50,7 @@ export class RSchemaViewImpl implements RSchemaView {
 
     // Immutable create-time facts
 
-    getName(): string | undefined {
+    getName(): string {
         return this.state.name;
     }
 

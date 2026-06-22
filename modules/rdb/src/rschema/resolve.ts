@@ -40,8 +40,7 @@ import { CreateRSchemaPayload, SchemaUpdatePayload, SchemaCreator } from "./payl
 // The resolved, effective schema at a position.
 
 export type SchemaState = {
-    seed: string;
-    name?: string;
+    name: string;
     creators: SchemaCreator[];
     hashAlgorithm?: string;
     tables: Map<string, TableDef>;
@@ -333,11 +332,10 @@ export function resolveSchemaState(entries: Entry[], at: Position): SchemaState 
     }
 
     const state: SchemaState = {
-        seed: create.seed,
+        name: create.name,
         creators: create.creators,
         tables,
     };
-    if (create.name !== undefined) state.name = create.name;
     if (create.hashAlgorithm !== undefined) state.hashAlgorithm = create.hashAlgorithm;
 
     return state;

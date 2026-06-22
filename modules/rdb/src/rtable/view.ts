@@ -486,7 +486,7 @@ export class RTableViewImpl implements RTableView {
             throw new Error("findRowIds requires at least one where field");
         }
         for (const field of fields) {
-            if (field !== 'author' && !pubColumns.has(field)) {
+            if (field !== 'rowAuthor' && !pubColumns.has(field)) {
                 throw new Error(`'${field}' is not a pub column of table '${table}'`);
             }
         }
@@ -495,19 +495,20 @@ export class RTableViewImpl implements RTableView {
         const candidateRowIds = new Set<B64Hash>();
 
         {
-            // Indexed candidates via pub meta, or author system meta. Pub
+            // Indexed candidates via pub meta, or rowAuthor system meta. Pub
             // values are mutable, so a multi-field filter would miss rows
             // whose current values come from different entries: ONE field
             // drives the index query, and resolved values are re-checked.
-            const indexField = fields.includes('author') ? 'author' : fields[0];
-            if (indexField === 'author' && typeof where[indexField] !== 'string') {
-                throw new Error("'author' search requires a key-id string");
+            const indexField = fields.includes('rowAuthor') ? 'rowAuthor' : fields[0];
+            if (indexField === 'rowAuthor' && typeof where[indexField] !== 'string') {
+                throw new Error("'rowAuthor' search requires a key-id string");
             }
-            const indexValue = indexField === 'author'
+            const indexValue = indexField === 'rowAuthor'
                 ? where[indexField] as string
                 : json.toStringNormalized(where[indexField]);
             const filter: EntryMetaFilter = { containsValues: {
-                [indexField === 'author' ? 'author' : 'pub-' + indexField]: [indexValue],
+                // surfaced `rowAuthor` indexes the internal meta key `author`
+                [indexField === 'rowAuthor' ? 'author' : 'pub-' + indexField]: [indexValue],
             } };
 
             const candidates = await findAllWithFilter(dag, this.at, filter);
@@ -523,7 +524,7 @@ export class RTableViewImpl implements RTableView {
 
                 for (const op of ops) {
                     if (op.action !== 'insert' && op.action !== 'update') continue;
-                    const carried = indexField === 'author' && op.action === 'insert'
+                    const carried = indexField === 'rowAuthor' && op.action === 'insert'
                         ? op.author
                         : op.values[indexField];
                     if (carried !== undefined &&
@@ -545,7 +546,7 @@ export class RTableViewImpl implements RTableView {
 
             let matchesAll = true;
             for (const field of fields) {
-                const value = field === 'author'
+                const value = field === 'rowAuthor'
                     ? insert.author
                     : (await this.resolveColumn(rowId, field)) ?? def?.columns[field]?.default;
                 if (value === undefined ||
@@ -588,7 +589,7 @@ export class RTableViewImpl implements RTableView {
         if (pushable?.kind === 'pub') {
             candidates = await this.findRowIds({ [pushable.column]: pushable.value });
         } else if (pushable?.kind === 'author') {
-            candidates = await this.findRowIds({ author: pushable.author });
+            candidates = await this.findRowIds({ rowAuthor: pushable.author });
         } else {
             candidates = await this.liveRowIds();
         }
@@ -624,7 +625,7 @@ export class RTableViewImpl implements RTableView {
         for (const c of conjuncts) {
             if (c.p === 'cmp' && c.cmp === 'eq') {
                 const pair = colLitPair(c.left, c.right);
-                if (pair !== undefined && pair.column === 'author' && typeof pair.value === 'string') {
+                if (pair !== undefined && pair.column === 'rowAuthor' && typeof pair.value === 'string') {
                     return { kind: 'author', author: pair.value };
                 }
                 if (pair !== undefined && pubColumns.has(pair.column)) {
