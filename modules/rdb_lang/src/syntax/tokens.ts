@@ -63,6 +63,7 @@ export const KEYWORDS = new Set([
     'LOG',
     'NO',
     'NOT',
+    'NOTE',
     'NULL',
     'OFFSET',
     'ON',

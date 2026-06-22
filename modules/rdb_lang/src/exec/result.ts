@@ -40,6 +40,14 @@ export type SetViewLangResult = {
     from?: VersionExpr;
 };
 
+export type AddMemberLangResult = {
+    kind: 'add-member';
+    member: 'schema' | 'tablegroup';
+    entryHash: B64Hash;
+    database: B64Hash;
+    memberId: B64Hash;
+};
+
 export type AlterSchemaLangResult = {
     kind: 'alter-schema';
     entryHash: B64Hash;
@@ -90,6 +98,7 @@ export type CreatePlanResult = {
 
 export type LangExecutionResult =
     | CreatePlanResult
+    | AddMemberLangResult
     | AlterSchemaLangResult
     | DeploySchemaLangResult
     | UpdateRefLangResult

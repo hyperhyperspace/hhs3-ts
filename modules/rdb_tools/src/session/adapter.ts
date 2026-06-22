@@ -27,6 +27,7 @@ export function createBindContext(session: WorkspaceSession): LangBindContext {
     return {
         resolveSchema: (ref) => session.workspace.roots.resolveSchema(ref),
         resolveGroup: (ref) => session.workspace.roots.resolveGroup(ref),
+        resolveDatabase: (ref) => session.workspace.roots.resolveDatabase(ref),
         resolveTable: (ref) => session.workspace.roots.resolveTable(ref),
         resolveDefaultGroup: async () => session.currentGroup === undefined
             ? undefined

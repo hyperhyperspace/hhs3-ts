@@ -11,6 +11,8 @@ export function formatTableResult(result: LangExecutionResult, mode: Exclude<Out
     switch (result.kind) {
         case 'create-plan':
             return `create ${result.plan.kind} ${result.plan.name}`;
+        case 'add-member':
+            return `added ${result.member} ${result.memberId} to ${result.database} (${result.entryHash})`;
         case 'select': {
             const records = result.rows.map(selectRowToRecord);
             return mode === 'vertical' ? formatRowsVertical(records) : formatRows(records);

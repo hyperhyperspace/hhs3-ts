@@ -12,6 +12,7 @@ export type AstStatement =
     | CreateDatabaseStatement
     | CreateSchemaStatement
     | CreateTableGroupStatement
+    | AddMemberStatement
     | AlterSchemaStatement
     | DeploySchemaStatement
     | UpdateRefStatement
@@ -116,6 +117,15 @@ export type CreateTableGroupStatement = {
     idProvider?: string;
     canDeploy?: PredicateExpr;
     initialRows: InitialRow[];
+    span: TextSpan;
+};
+
+export type AddMemberStatement = {
+    kind: 'add-member';
+    member: 'schema' | 'tablegroup';
+    target: NameOrHashRef;
+    database: NameOrHashRef;
+    note?: string;
     span: TextSpan;
 };
 

@@ -6,7 +6,7 @@ import type { InsertRowPayload, MigrationRule, RowOpPayload, RowQuery } from "@h
 
 import { DiagnosticBag, err, ok, Result } from "../diagnostics.js";
 import type {
-    AlterSchemaStatement, AstStatement, BundleStatement, BundleWriteStatement,
+    AddMemberStatement, AlterSchemaStatement, AstStatement, BundleStatement, BundleWriteStatement,
     CreateDatabaseStatement, CreateSchemaStatement, CreateTableGroupStatement,
     DeleteStatement, DeploySchemaStatement, InsertStatement, LogStatement,
     NameOrHashRef, SelectStatement, SetViewStatement, TableRef, UpdateRefStatement, UpdateStatement,
@@ -14,7 +14,7 @@ import type {
 import { compileMigrationRules } from "../compile/ddl.js";
 import { lowerSelectQuery } from "../compile/query.js";
 import type {
-    LangBindContext, LangValue, ResolvedGroupRef, ResolvedLogTarget, ResolvedSchemaRef,
+    LangBindContext, LangValue, ResolvedDatabaseRef, ResolvedGroupRef, ResolvedLogTarget, ResolvedSchemaRef,
     ResolvedTableRef,
 } from "./context.js";
 import { asIdentity, asJsonLiteral, asKeyId, resolveValue } from "./values.js";
@@ -23,6 +23,7 @@ export type BoundStatement =
     | BoundCreateDatabase
     | BoundCreateSchema
     | BoundCreateTableGroup
+    | BoundAddMember
     | BoundAlterSchema
     | BoundDeploySchema
     | BoundUpdateRef
@@ -36,6 +37,7 @@ export type BoundStatement =
 
 export type BoundCreateStatement = BoundCreateDatabase | BoundCreateSchema | BoundCreateTableGroup;
 export type BoundExecutableStatement =
+    | BoundAddMember
     | BoundAlterSchema
     | BoundDeploySchema
     | BoundUpdateRef
@@ -73,6 +75,16 @@ export type BoundInitialRow = {
     table: string;
     uuid: string;
     values: { [column: string]: json.Literal };
+};
+
+export type BoundAddMember = {
+    kind: 'add-member';
+    ast: AddMemberStatement;
+    member: 'schema' | 'tablegroup';
+    database: ResolvedDatabaseRef;
+    memberId: B64Hash;
+    note?: string;
+    at: Version;
 };
 
 export type BoundInsert = {
@@ -178,6 +190,8 @@ export async function bind(statement: AstStatement, context: LangBindContext): P
                 return ok(await bindCreateSchema(statement, context));
             case 'create-tablegroup':
                 return ok(await bindCreateTableGroup(statement, context));
+            case 'add-member':
+                return ok(await bindAddMember(statement, context));
             case 'alter-schema':
                 return ok(await bindAlterSchema(statement, context));
             case 'deploy-schema':
@@ -242,6 +256,17 @@ async function bindCreateTableGroup(ast: CreateTableGroupStatement, context: Lan
         bindings,
         initialRows,
     };
+}
+
+async function bindAddMember(ast: AddMemberStatement, context: LangBindContext): Promise<BoundAddMember> {
+    const database = await context.resolveDatabase(ast.database);
+    const memberId = ast.member === 'schema'
+        ? (await context.resolveSchema(ast.target)).id
+        : (await context.resolveGroup(ast.target)).id;
+    const at = await context.resolveVersion(undefined, { kind: 'object', id: database.id, object: database.db });
+    const bound: BoundAddMember = { kind: 'add-member', ast, member: ast.member, database, memberId, at };
+    if (ast.note !== undefined) bound.note = ast.note;
+    return bound;
 }
 
 async function bindInsert(ast: InsertStatement, context: LangBindContext): Promise<BoundInsert> {

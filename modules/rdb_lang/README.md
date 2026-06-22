@@ -48,6 +48,17 @@ DEPLOY SCHEMA shop AT {#schemaVersion} ON shop_prod;
 UPDATE REF users TO LATEST ON shop_prod;
 ```
 
+Deployment membership (advisory, monotonic add-only on the RDb):
+
+```sql
+ADD SCHEMA shop TO mydb;
+ADD TABLEGROUP shop_prod TO mydb NOTE 'main deployment';
+```
+
+A schema or tablegroup can belong to several databases; `ADD ... TO <db>` records
+the membership link by id (it never moves or copies the object). The optional
+`NOTE` is free-form bookkeeping, never resolved.
+
 DML and bundles:
 
 ```sql
@@ -160,6 +171,8 @@ Reverse helpers render known payloads and DAG histories:
 - `renderCreateDatabase`
 - `renderCreateSchema`
 - `renderCreateTableGroup`
+- `renderAddSchema`
+- `renderAddGroup`
 - `renderSchemaUpdate`
 - `renderRowOp`
 - `renderRefOp`

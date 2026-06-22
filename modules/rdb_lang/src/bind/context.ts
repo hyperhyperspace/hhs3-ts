@@ -24,6 +24,7 @@ export type LangValue =
 
 export type ResolvedSchemaRef = { id: B64Hash; schema?: RSchema };
 export type ResolvedGroupRef = { id: B64Hash; group?: RTableGroup };
+export type ResolvedDatabaseRef = { id: B64Hash; db?: RDb };
 export type ResolvedTableRef = {
     groupId: B64Hash;
     group: RTableGroup;
@@ -44,6 +45,7 @@ export type ResolvedLogTarget =
 export interface LangBindContext {
     resolveSchema(ref: NameOrHashRef): Promise<ResolvedSchemaRef>;
     resolveGroup(ref: NameOrHashRef): Promise<ResolvedGroupRef>;
+    resolveDatabase(ref: NameOrHashRef): Promise<ResolvedDatabaseRef>;
     resolveTable(ref: TableRef): Promise<ResolvedTableRef>;
     resolveDefaultGroup?(): Promise<NameOrHashRef | undefined>;
     resolveHash(ref: NameOrHashRef, scope: HashScope): Promise<B64Hash>;

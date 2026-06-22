@@ -5,7 +5,7 @@ import type { RObject } from "@hyper-hyper-space/hhs3_mvt";
 import type { RDb, RSchema, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 
 import type {
-    HashScope, LangBindContext, LangValue, ResolvedGroupRef, ResolvedLogTarget,
+    HashScope, LangBindContext, LangValue, ResolvedDatabaseRef, ResolvedGroupRef, ResolvedLogTarget,
     ResolvedSchemaRef, ResolvedTableRef, VersionScope,
 } from "../src/bind/context.js";
 import type { NameOrHashRef, TableRef, VersionExpr } from "../src/syntax/ast.js";
@@ -51,6 +51,13 @@ export function createTestBindContext(_ctx: RContext, vars: { [name: string]: La
             const group = groups.get(name) ?? [...groups.values()].find((g) => g.getId() === name);
             if (group === undefined) throw new Error(`Unknown group '${name}'`);
             return { id: group.getId(), group };
+        },
+
+        async resolveDatabase(ref: NameOrHashRef): Promise<ResolvedDatabaseRef> {
+            const name = refText(ref);
+            const db = dbs.get(name) ?? [...dbs.values()].find((d) => d.getId() === name);
+            if (db === undefined) throw new Error(`Unknown database '${name}'`);
+            return { id: db.getId(), db };
         },
 
         async resolveTable(ref: TableRef): Promise<ResolvedTableRef> {

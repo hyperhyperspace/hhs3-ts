@@ -1,6 +1,6 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
 import {
-    BundlePayload, ColumnDef, CreateRDbPayload, CreateRSchemaPayload,
+    AddGroupPayload, AddSchemaPayload, BundlePayload, ColumnDef, CreateRDbPayload, CreateRSchemaPayload,
     CreateTableGroupPayload, DeleteRowPayload, InsertRowPayload, MigrationRule,
     RowEnvelopePayload, RowOpPayload, SchemaUpdatePayload, TableDef, UpdateRowPayload,
     parseRowFieldTerm,
@@ -40,6 +40,14 @@ export function renderCreateTableGroup(payload: CreateTableGroupPayload): string
     return `${parts.join('\n  ')};`;
 }
 
+export function renderAddSchema(payload: AddSchemaPayload): string {
+    return `ADD SCHEMA #${payload.schemaId} TO <database>${renderNote(payload.note)};`;
+}
+
+export function renderAddGroup(payload: AddGroupPayload): string {
+    return `ADD TABLEGROUP #${payload.groupId} TO <database>${renderNote(payload.note)};`;
+}
+
 export function renderSchemaUpdate(payload: SchemaUpdatePayload, options?: RenderOptions): string {
     const rules = payload.migration.map(renderMigrationRule).join(',\n  ');
     return `ALTER SCHEMA #unknown AS (\n  ${rules}\n)${renderAt(options)};`;
@@ -73,6 +81,8 @@ export function renderOp(payload: json.Literal, options?: RenderOptions): string
     if (payload['action'] === 'create' && payload['type'] === 'hhs/rdb_v1') return renderCreateDatabase(payload as CreateRDbPayload);
     if (payload['action'] === 'create' && payload['type'] === 'hhs/rschema_v1') return renderCreateSchema(payload as CreateRSchemaPayload);
     if (payload['action'] === 'create' && payload['type'] === 'hhs/rtable_group_v1') return renderCreateTableGroup(payload as CreateTableGroupPayload);
+    if (payload['action'] === 'add-schema') return renderAddSchema(payload as unknown as AddSchemaPayload);
+    if (payload['action'] === 'add-group') return renderAddGroup(payload as unknown as AddGroupPayload);
     if (payload['action'] === 'schema-update') return renderSchemaUpdate(payload as unknown as SchemaUpdatePayload, options);
     if (payload['action'] === 'row') {
         const row = payload as unknown as RowEnvelopePayload;
@@ -210,6 +220,10 @@ function renderLiteral(value: json.Literal): string {
 
 function sqlString(value: string): string {
     return `'${value.replace(/'/g, "''")}'`;
+}
+
+function renderNote(note?: string): string {
+    return note === undefined ? '' : ` NOTE ${sqlString(note)}`;
 }
 
 function renderAt(options?: RenderOptions): string {

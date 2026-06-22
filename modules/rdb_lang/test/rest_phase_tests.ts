@@ -13,7 +13,7 @@ import { bind, BoundStatement } from "../src/bind/bind.js";
 import { execute } from "../src/exec/execute.js";
 import { parseStatement } from "../src/syntax/parser.js";
 import { renderCreateSchema, renderCreateTableGroup, renderRowOp, renderSchemaUpdate } from "../src/reverse/render.js";
-import { dumpGroup } from "../src/reverse/dump.js";
+import { dumpDatabase, dumpGroup } from "../src/reverse/dump.js";
 import { createTestBindContext, TestBindContext } from "./mock_bind_context.js";
 
 const crypto = createBasicCrypto();
@@ -93,6 +93,31 @@ export const restPhaseTests = {
                 const db = await ctx.createObject(result.value.plan.payload) as RDbImpl;
                 lang.registerDatabase('app', db);
                 assertTrue(db.getId().length > 0, 'created db has id');
+            },
+        },
+        {
+            name: '[REST01b] ADD SCHEMA / ADD TABLEGROUP register members and dump round-trips',
+            invoke: async () => {
+                const { ctx, lang, schema, group } = await createEnv();
+                const dbPlan = await execute(await parseBind('CREATE DATABASE app;', lang));
+                if (!dbPlan.ok || dbPlan.value.kind !== 'create-plan') throw new Error('database create failed');
+                const db = await ctx.createObject(dbPlan.value.plan.payload) as RDbImpl;
+                lang.registerDatabase('app', db);
+
+                const addSchema = await execute(await parseBind('ADD SCHEMA shop TO app NOTE \'shop schema\';', lang));
+                assertTrue(addSchema.ok && addSchema.value.kind === 'add-member', 'ADD SCHEMA returns add-member');
+                const addGroup = await execute(await parseBind('ADD TABLEGROUP shop_prod TO app;', lang));
+                assertTrue(addGroup.ok && addGroup.value.kind === 'add-member', 'ADD TABLEGROUP returns add-member');
+
+                const memberSchemas = await db.getMemberSchemas();
+                const memberGroups = await db.getMemberGroups();
+                assertTrue(memberSchemas.includes(schema.getId()), 'schema is a member');
+                assertTrue(memberGroups.includes(group.getId()), 'group is a member');
+
+                const dump = await dumpDatabase(db);
+                assertTrue(!dump.includes('-- unknown payload'), 'membership ops render to SQL');
+                assertTrue(dump.includes(`ADD SCHEMA #${schema.getId()} TO <database> NOTE 'shop schema';`), 'ADD SCHEMA round-trips');
+                assertTrue(dump.includes(`ADD TABLEGROUP #${group.getId()} TO <database>;`), 'ADD TABLEGROUP round-trips');
             },
         },
         {

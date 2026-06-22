@@ -2,7 +2,7 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 
 import { combineSpans, DiagnosticBag, err, ok, Result, TextSpan } from "../diagnostics.js";
 import {
-    AllowOp, AllowRuleExpr, AlterSchemaStatement, AstScript, AstStatement, BundleStatement, BundleWriteStatement,
+    AddMemberStatement, AllowOp, AllowRuleExpr, AlterSchemaStatement, AstScript, AstStatement, BundleStatement, BundleWriteStatement,
     ColumnDecl, ColumnTypeName, CreateDatabaseStatement, CreateSchemaStatement,
     CreateTableGroupStatement, DeleteStatement, DeploySchemaStatement, HashRef, InitialRow,
     InsertStatement, LogStatement, MigrationRuleExpr, NameOrHashRef, NameRef, OperandExpr,
@@ -50,6 +50,13 @@ class Parser {
             return undefined;
         }
 
+        if (this.matchKeyword('ADD')) {
+            const start = this.previous().span;
+            if (this.matchKeyword('SCHEMA')) return this.parseAddMember(start, 'schema');
+            if (this.matchKeyword('TABLEGROUP')) return this.parseAddMember(start, 'tablegroup');
+            this.expected('SCHEMA or TABLEGROUP');
+            return undefined;
+        }
         if (this.matchKeyword('ALTER')) return this.parseAlterSchema(this.previous().span);
         if (this.matchKeyword('DEPLOY')) return this.parseDeploySchema(this.previous().span);
         if (this.matchKeyword('UPDATE')) {
@@ -277,6 +284,27 @@ class Parser {
         }
         const end = this.expectPunctuation(')').span;
         return { table: startTok.text, values, span: combineSpans(startTok.span, end) };
+    }
+
+    private parseAddMember(start: TextSpan, member: 'schema' | 'tablegroup'): AddMemberStatement {
+        const target = this.parseNameOrHash();
+        this.expectKeyword('TO');
+        const database = this.parseNameOrHash();
+        let end = database.span;
+        let note: string | undefined;
+        while (!this.isEof() && !this.checkPunctuation(';')) {
+            if (this.matchKeyword('NOTE')) {
+                const tok = this.expectKind('string', 'NOTE text');
+                note = tok.value as string;
+                end = tok.span;
+            } else {
+                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected ADD clause '${this.peek().text}'`, this.peek().span);
+                this.advance();
+            }
+        }
+        const stmt: AddMemberStatement = { kind: 'add-member', member, target, database, span: combineSpans(start, end) };
+        if (note !== undefined) stmt.note = note;
+        return stmt;
     }
 
     private parseAlterSchema(start: TextSpan): AlterSchemaStatement {
