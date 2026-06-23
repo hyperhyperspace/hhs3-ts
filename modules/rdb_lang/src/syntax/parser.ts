@@ -2,7 +2,7 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 
 import { combineSpans, DiagnosticBag, err, ok, Result, TextSpan } from "../diagnostics.js";
 import {
-    AddMemberStatement, AllowOp, AllowRuleExpr, AlterSchemaStatement, AstScript, AstStatement, BundleStatement, BundleWriteStatement,
+    AddMemberStatement, AllowOp, AllowRuleExpr, AlterSchemaStatement, AstScript, AstStatement, AuthorExpr, BundleStatement, BundleWriteStatement,
     ColumnDecl, ColumnTypeName, CreateDatabaseStatement, CreateSchemaStatement,
     CreateTableGroupStatement, DeleteStatement, DeploySchemaStatement, HashRef, InitialRow,
     InsertStatement, LogStatement, MigrationRuleExpr, NameOrHashRef, NameRef, OperandExpr,
@@ -319,16 +319,21 @@ class Parser {
         }
         let end = this.expectPunctuation(')').span;
         let at: VersionExpr | undefined;
+        let author: AuthorExpr | undefined;
         while (!this.isEof() && !this.checkPunctuation(';')) {
             if (this.matchKeyword('AT')) {
                 at = this.parseVersion();
                 end = at.span;
+            } else if (this.matchKeyword('BY')) {
+                author = this.parseAuthor();
+                end = author.span;
             } else {
                 this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected ALTER SCHEMA clause '${this.peek().text}'`, this.peek().span);
                 this.advance();
             }
         }
         const stmt: AlterSchemaStatement = { kind: 'alter-schema', schema, rules, span: combineSpans(start, end) };
+        if (author !== undefined) stmt.author = author;
         if (at !== undefined) stmt.at = at;
         return stmt;
     }
@@ -430,16 +435,21 @@ class Parser {
         const group = this.parseNameOrHash();
         let end = group.span;
         let at: VersionExpr | undefined;
+        let author: AuthorExpr | undefined;
         while (!this.isEof() && !this.checkPunctuation(';')) {
             if (this.matchKeyword('AT')) {
                 at = this.parseVersion();
                 end = at.span;
+            } else if (this.matchKeyword('BY')) {
+                author = this.parseAuthor();
+                end = author.span;
             } else {
                 this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected DEPLOY clause '${this.peek().text}'`, this.peek().span);
                 this.advance();
             }
         }
         const stmt: DeploySchemaStatement = { kind: 'deploy-schema', schema, version, group, span: combineSpans(start, end) };
+        if (author !== undefined) stmt.author = author;
         if (at !== undefined) stmt.at = at;
         return stmt;
     }
@@ -480,16 +490,21 @@ class Parser {
         }
         let end = this.expectPunctuation(')').span;
         let at: VersionExpr | undefined;
-        while (!this.isEof() && !this.checkPunctuation(';')) {
+        let author: AuthorExpr | undefined;
+        while (!this.isEof() && !this.checkPunctuation(';') && !this.checkPunctuation(')')) {
             if (this.matchKeyword('AT')) {
                 at = this.parseVersion();
                 end = at.span;
+            } else if (this.matchKeyword('BY')) {
+                author = this.parseAuthor();
+                end = author.span;
             } else {
                 this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected INSERT clause '${this.peek().text}'`, this.peek().span);
                 this.advance();
             }
         }
         const stmt: InsertStatement = { kind: 'insert', table, columns, values, span: combineSpans(start, end) };
+        if (author !== undefined) stmt.author = author;
         if (at !== undefined) stmt.at = at;
         return stmt;
     }
@@ -507,11 +522,21 @@ class Parser {
         const rowId = this.parseRowIdPredicate();
         let end = rowId.span;
         let at: VersionExpr | undefined;
-        if (this.matchKeyword('AT')) {
-            at = this.parseVersion();
-            end = at.span;
+        let author: AuthorExpr | undefined;
+        while (!this.isEof() && !this.checkPunctuation(';') && !this.checkPunctuation(')')) {
+            if (this.matchKeyword('AT')) {
+                at = this.parseVersion();
+                end = at.span;
+            } else if (this.matchKeyword('BY')) {
+                author = this.parseAuthor();
+                end = author.span;
+            } else {
+                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected UPDATE clause '${this.peek().text}'`, this.peek().span);
+                this.advance();
+            }
         }
         const stmt: UpdateStatement = { kind: 'update', table, values, rowId, span: combineSpans(start, end) };
+        if (author !== undefined) stmt.author = author;
         if (at !== undefined) stmt.at = at;
         return stmt;
     }
@@ -523,11 +548,21 @@ class Parser {
         const rowId = this.parseRowIdPredicate();
         let end = rowId.span;
         let at: VersionExpr | undefined;
-        if (this.matchKeyword('AT')) {
-            at = this.parseVersion();
-            end = at.span;
+        let author: AuthorExpr | undefined;
+        while (!this.isEof() && !this.checkPunctuation(';') && !this.checkPunctuation(')')) {
+            if (this.matchKeyword('AT')) {
+                at = this.parseVersion();
+                end = at.span;
+            } else if (this.matchKeyword('BY')) {
+                author = this.parseAuthor();
+                end = author.span;
+            } else {
+                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected DELETE clause '${this.peek().text}'`, this.peek().span);
+                this.advance();
+            }
         }
         const stmt: DeleteStatement = { kind: 'delete', table, rowId, span: combineSpans(start, end) };
+        if (author !== undefined) stmt.author = author;
         if (at !== undefined) stmt.at = at;
         return stmt;
     }
@@ -538,22 +573,42 @@ class Parser {
         this.expectPunctuation('(');
         const writes: BundleWriteStatement[] = [];
         while (!this.checkPunctuation(')') && !this.isEof()) {
-            if (this.matchKeyword('INSERT')) writes.push(this.parseInsert(this.previous().span, group));
-            else if (this.matchKeyword('UPDATE')) writes.push(this.parseUpdate(this.previous().span, group));
-            else if (this.matchKeyword('DELETE')) writes.push(this.parseDelete(this.previous().span, group));
+            let write: BundleWriteStatement | undefined;
+            if (this.matchKeyword('INSERT')) write = this.parseInsert(this.previous().span, group);
+            else if (this.matchKeyword('UPDATE')) write = this.parseUpdate(this.previous().span, group);
+            else if (this.matchKeyword('DELETE')) write = this.parseDelete(this.previous().span, group);
             else {
                 this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected BUNDLE statement '${this.peek().text}'`, this.peek().span);
                 this.advance();
+            }
+            if (write !== undefined) {
+                // A bundle is a single signed op with one author; put BY on the
+                // BUNDLE, not on individual writes.
+                if (write.author !== undefined) {
+                    this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', 'BY is not allowed on a bundle inner write; put BY on the BUNDLE', write.author.span);
+                    delete write.author;
+                }
+                writes.push(write);
             }
             this.matchPunctuation(';');
         }
         let end = this.expectPunctuation(')').span;
         let at: VersionExpr | undefined;
-        if (this.matchKeyword('AT')) {
-            at = this.parseVersion();
-            end = at.span;
+        let author: AuthorExpr | undefined;
+        while (!this.isEof() && !this.checkPunctuation(';')) {
+            if (this.matchKeyword('AT')) {
+                at = this.parseVersion();
+                end = at.span;
+            } else if (this.matchKeyword('BY')) {
+                author = this.parseAuthor();
+                end = author.span;
+            } else {
+                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected BUNDLE clause '${this.peek().text}'`, this.peek().span);
+                this.advance();
+            }
         }
         const stmt: BundleStatement = { kind: 'bundle', group, writes, span: combineSpans(start, end) };
+        if (author !== undefined) stmt.author = author;
         if (at !== undefined) stmt.at = at;
         return stmt;
     }
@@ -806,6 +861,21 @@ class Parser {
             this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', 'Invalid JSON literal', combineSpans(start.span, end));
             return { kind: 'literal', value: null, span: combineSpans(start.span, end) };
         }
+    }
+
+    private parseAuthor(): AuthorExpr {
+        const start = this.peek().span;
+        if (this.matchKeyword('NOBODY')) return { kind: 'nobody', span: this.previous().span };
+        if (this.checkKind('variable')) {
+            const tok = this.advance();
+            return { kind: 'variable', name: tok.text.substring(1), span: tok.span };
+        }
+        if (this.checkKind('hash')) {
+            const tok = this.advance();
+            return { kind: 'hash', prefix: tok.text.substring(1), span: tok.span };
+        }
+        this.diagnostics.add('PARSE_EXPECTED_TOKEN', 'Expected $identity, #keyid or NOBODY after BY', start);
+        return { kind: 'nobody', span: start };
     }
 
     private parseVersion(): VersionExpr {

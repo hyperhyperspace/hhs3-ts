@@ -44,6 +44,7 @@ export function createBindContext(session: WorkspaceSession): LangBindContext {
         resolveVariable: (name) => session.resolveVariable(name),
         resolveLogTarget: (ref) => session.workspace.roots.resolveLogTarget(ref),
         currentAuthor: () => session.currentAuthor(),
+        resolveAuthor: (ref) => session.resolveAuthor(ref),
         createUuid: () => session.createUuid(),
         createSeed: (kind, name) => session.createSeed(kind, name),
     };

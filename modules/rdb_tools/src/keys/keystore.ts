@@ -67,17 +67,25 @@ export class KeyStore {
         return this.data.selected === undefined ? undefined : this.unlocked.get(this.data.selected);
     }
 
+    isUnlocked(keyId: KeyId): boolean {
+        return this.unlocked.has(keyId);
+    }
+
+    // Create and unlock a key, adding it to the active (unlocked) set. It does
+    // NOT become the default author: selecting a default is a deliberate act
+    // (see select / clearSelection), so authorship is never implicit.
     async create(label: string, passphrase: string, signingName: SigningName = SIGNING_ED25519): Promise<OwnIdentity> {
         if (this.data.keys.some((key) => key.label === label)) throw new Error(`Key label '${label}' already exists`);
         const identity = await createIdentity(signingName, this.hashSuite);
         const record = this.encryptRecord(label, identity, passphrase);
         this.data.keys.push(record);
         this.unlocked.set(identity.keyId, identity);
-        this.data.selected = identity.keyId;
         await this.save();
         return identity;
     }
 
+    // Unlock a key into the active set. Like create, this does NOT select it as
+    // the default author.
     async unlock(labelOrPrefix: string, passphrase: string): Promise<OwnIdentity> {
         const record = this.resolveRecord(labelOrPrefix);
         const key = deriveKey(passphrase, record.kdf);
@@ -87,17 +95,25 @@ export class KeyStore {
         const secret = JSON.parse(new TextDecoder().decode(plaintext));
         const identity = decodeIdentitySecret(record.keyId, secret);
         this.unlocked.set(identity.keyId, identity);
+        await this.save();
+        return identity;
+    }
+
+    // Set the default author. The key must already be in the active set.
+    async select(labelOrPrefix: string): Promise<OwnIdentity> {
+        const record = this.resolveRecord(labelOrPrefix);
+        const identity = this.unlocked.get(record.keyId);
+        if (identity === undefined) throw new Error(`Key '${record.label}' is locked`);
         this.data.selected = identity.keyId;
         await this.save();
         return identity;
     }
 
-    select(labelOrPrefix: string): OwnIdentity {
-        const record = this.resolveRecord(labelOrPrefix);
-        const identity = this.unlocked.get(record.keyId);
-        if (identity === undefined) throw new Error(`Key '${record.label}' is locked`);
-        this.data.selected = identity.keyId;
-        return identity;
+    // Clear the default author (write statements become anonymous unless they
+    // carry an explicit BY clause).
+    async clearSelection(): Promise<void> {
+        this.data.selected = undefined;
+        await this.save();
     }
 
     resolvePublic(labelOrPrefix: string): { keyId: KeyId; publicKey: ReturnType<typeof decodePublicKey> } {

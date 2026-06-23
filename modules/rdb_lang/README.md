@@ -94,6 +94,23 @@ The operation is allowed only when its predicate is true. Each table or `SET ALL
 
 Omitted rules use RDb defaults: inserts are allowed, while updates and deletes require `rowAuthor = $author` (the row's insert author must equal the op signer). To explicitly open every operation, write `ALLOW all IF true`.
 
+## Authorship
+
+Authored statements — `INSERT`, `UPDATE`, `DELETE`, `BUNDLE`, `DEPLOY SCHEMA`, and `ALTER SCHEMA` — sign as an author identity. The author is chosen in this order:
+
+1. an explicit trailing `BY` clause, if present;
+2. otherwise the host's default author (`currentAuthor()`), which may itself be unset.
+
+```sql
+INSERT INTO users.caps (label, grantee) VALUES ('writer', $bob) BY $alice;
+UPDATE docs SET title = 'x' WHERE rowId = #ab BY #c0ffee AT LATEST;
+DELETE FROM docs WHERE rowId = #ab BY NOBODY;   -- explicitly unauthored
+```
+
+The author is `$name` (an unlocked identity, resolved by the host) or `#keyid` (by key-id prefix). The bareword `NOBODY` forces an unauthored op even when a default author is set — useful for anonymous writes. Because `NOBODY` is a keyword, an identity literally named `nobody` is still referenced as `$nobody`.
+
+`BY` sits alongside the optional `AT <version>` clause and is written before it. `$author` and `$me` in value position resolve to the statement's effective author, so `VALUES ($author)` agrees with the identity chosen by `BY`. A `BUNDLE` is a single signed op: put `BY` on the `BUNDLE`, not on its inner writes (a `BY` on an inner write is a parse error). `ALTER SCHEMA` requires an author (explicit or default); the others fall back to an unauthored op when neither is present.
+
 ## Deploy Gates
 
 Tablegroup deploy authority uses a positive deploy gate:
@@ -159,7 +176,8 @@ CREATE TABLEGROUP users
 - workspace name resolution for schemas, groups, tables, and log targets,
 - hash-prefix and version resolution,
 - session variables such as `$me`, `$admin`, and `$author`,
-- default author identity,
+- default author identity (`currentAuthor`),
+- explicit `BY` author resolution to an unlocked signing identity (`resolveAuthor`),
 - UUID and seed generation.
 
 The language layer validates and applies language semantics, but it does not persist workspace metadata or manage keys.

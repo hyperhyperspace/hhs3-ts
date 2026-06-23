@@ -270,9 +270,12 @@ export const restPhaseTests = {
 
                 const dump = await dumpGroup(group);
                 assertTrue(dump.indexOf('CREATE TABLEGROUP') >= 0, 'group dump includes create statement');
-                assertTrue(dump.includes("INSERT INTO products (sku, name) VALUES ('A', 'Widget') AT {#"), 'dumped insert includes causal AT');
-                assertTrue(dump.includes(`UPDATE products SET name = 'Widget 2' WHERE rowId = #${insert.value.rowId} AT {#`), 'dumped update includes causal AT');
-                assertTrue(dump.includes(`DELETE FROM products WHERE rowId = #${insert.value.rowId} AT {#`), 'dumped delete includes causal AT');
+                const dumpLines = dump.split('\n');
+                const hasLine = (needle: string) => dumpLines.some((line) =>
+                    line.includes(needle) && line.includes(' BY #') && line.includes(' AT {#'));
+                assertTrue(hasLine("INSERT INTO products (sku, name) VALUES ('A', 'Widget')"), 'dumped insert includes BY author and causal AT');
+                assertTrue(hasLine(`UPDATE products SET name = 'Widget 2' WHERE rowId = #${insert.value.rowId}`), 'dumped update includes BY author and causal AT');
+                assertTrue(hasLine(`DELETE FROM products WHERE rowId = #${insert.value.rowId}`), 'dumped delete includes BY author and causal AT');
             },
         },
         {

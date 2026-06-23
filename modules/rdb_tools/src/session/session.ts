@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
-import type { LangValue } from "@hyper-hyper-space/hhs3_rdb_lang";
+import type { AuthorRef, LangValue } from "@hyper-hyper-space/hhs3_rdb_lang";
 
 import { KeyStore } from "../keys/keystore.js";
 import { Workspace } from "../workspace/workspace.js";
@@ -63,6 +63,14 @@ export class WorkspaceSession {
 
     async currentAuthor(): Promise<OwnIdentity | undefined> {
         return this.keystore?.selected();
+    }
+
+    async resolveAuthor(ref: AuthorRef): Promise<OwnIdentity> {
+        if (this.keystore === undefined) throw new Error('No keystore configured');
+        const labelOrPrefix = ref.kind === 'variable' ? ref.name : `#${ref.prefix}`;
+        const identity = this.keystore.resolveIdentity(labelOrPrefix);
+        if (identity === undefined) throw new Error(`Key '${labelOrPrefix}' is not unlocked`);
+        return identity;
     }
 
     async resolveVariable(name: string): Promise<LangValue> {

@@ -7,7 +7,7 @@ export type MetaCommandResult = {
     handled: boolean;
     output?: string;
     quit?: boolean;
-    needsPassphrase?: { kind: 'create' | 'unlock'; label: string };
+    needsPassphrase?: { kind: 'create' | 'unlock' | 'author'; label: string };
 };
 
 export async function runMetaCommand(session: WorkspaceSession, line: string): Promise<MetaCommandResult> {
@@ -26,6 +26,7 @@ export async function runMetaCommand(session: WorkspaceSession, line: string): P
         case 'd': return { handled: true, output: await describeTable(session, args[0]) };
         case 'keys': return { handled: true, output: listKeys(session) };
         case 'key': return { handled: true, ...await keyCommand(session, args) };
+        case 'author': return { handled: true, ...await authorCommand(session, args) };
         case 'whoami': return { handled: true, output: session.keystore?.selected()?.keyId ?? '(no identity selected)' };
         case 'use': return { handled: true, output: await useCommand(session, args) };
         case 'view': return { handled: true, output: session.defaultView === undefined ? 'VIEW LATEST' : formatView(session) };
@@ -77,6 +78,7 @@ function listKeys(session: WorkspaceSession): string {
     return formatRows(session.keystore.list().map((key) => ({
         label: key.label,
         keyId: key.keyId,
+        unlocked: session.keystore?.isUnlocked(key.keyId) === true,
         selected: session.keystore?.selected()?.keyId === key.keyId,
     })));
 }
@@ -99,6 +101,35 @@ async function keyCommand(session: WorkspaceSession, args: string[]): Promise<Ke
         return { output: `unlocked ${identity.keyId}` };
     }
     throw new Error('Usage: \\key create|unlock ...');
+}
+
+// Manage the default author: who writes are signed as when a statement omits a
+// BY clause. Selecting a key that is still locked unlocks it first (prompting
+// for the passphrase, or accepting one inline for scripts).
+async function authorCommand(session: WorkspaceSession, args: string[]): Promise<KeyCommandResult> {
+    if (session.keystore === undefined) throw new Error('No keystore configured');
+    const [target, passphrase] = args;
+    if (target === undefined) {
+        const identity = session.keystore.selected();
+        return { output: identity === undefined ? 'nobody' : labelFor(session, identity.keyId) };
+    }
+    // A key literally labelled "nobody" is selected via its #keyid prefix.
+    if (target.toLowerCase() === 'nobody') {
+        await session.keystore.clearSelection();
+        return { output: 'author nobody' };
+    }
+    // resolveIdentity throws on an unknown/ambiguous key, and returns undefined
+    // only when the key is known but still locked.
+    if (session.keystore.resolveIdentity(target) === undefined) {
+        if (passphrase === undefined) return { needsPassphrase: { kind: 'author', label: target } };
+        await session.keystore.unlock(target, passphrase);
+    }
+    const identity = await session.keystore.select(target);
+    return { output: `author ${labelFor(session, identity.keyId)}` };
+}
+
+function labelFor(session: WorkspaceSession, keyId: string): string {
+    return session.keystore?.list().find((key) => key.keyId === keyId)?.label ?? keyId;
 }
 
 async function useCommand(session: WorkspaceSession, args: string[]): Promise<string> {
@@ -172,6 +203,7 @@ function helpText(): string {
     return [
         '\\dbs, \\schemas, \\groups, \\dt [group], \\d group.table',
         '\\key create <label> [passphrase], \\key unlock <label|#prefix> [passphrase], \\keys, \\whoami',
+        '\\author [<label|#prefix> [passphrase]|nobody]  (set/show default author; unlocks if needed; \\author nobody clears it)',
         '\\use database <name>, \\use group <name>, \\view, \\frontier [group]',
         '\\alias <name> <root|#prefix>, \\output table|json|vertical, \\dump schema|group|database <name>',
         '\\quit',

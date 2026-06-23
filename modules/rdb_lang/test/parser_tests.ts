@@ -271,5 +271,52 @@ export const parserTests = {
                     'EXISTS OWNED BY should fail');
             },
         },
+        {
+            name: '[PARSE18] parses BY author clause on authored statements',
+            invoke: async () => {
+                const insert = parseStatement("INSERT INTO shop.products (sku) VALUES ('A') BY $alice;");
+                assertTrue(insert.ok, 'INSERT BY $alice should parse');
+                if (insert.ok && insert.value.kind === 'insert') {
+                    assertEquals(insert.value.author?.kind, 'variable', 'insert author is a variable ref');
+                    if (insert.value.author?.kind === 'variable') assertEquals(insert.value.author.name, 'alice', 'insert author name');
+                }
+
+                const update = parseStatement("UPDATE shop.products SET sku = 'B' WHERE rowId = #ab BY #c0ffee AT LATEST;");
+                assertTrue(update.ok, 'UPDATE BY #prefix AT LATEST should parse');
+                if (update.ok && update.value.kind === 'update') {
+                    assertEquals(update.value.author?.kind, 'hash', 'update author is a hash ref');
+                    if (update.value.author?.kind === 'hash') assertEquals(update.value.author.prefix, 'c0ffee', 'update author prefix');
+                    assertEquals(update.value.at?.kind, 'latest', 'update keeps AT clause alongside BY');
+                }
+
+                const anon = parseStatement("DELETE FROM shop.products WHERE rowId = #ab BY NOBODY;");
+                assertTrue(anon.ok, 'DELETE BY NOBODY should parse');
+                if (anon.ok && anon.value.kind === 'delete') assertEquals(anon.value.author?.kind, 'nobody', 'delete author is nobody');
+
+                const deploy = parseStatement('DEPLOY SCHEMA s AT LATEST ON g BY $deployer;');
+                assertTrue(deploy.ok, 'DEPLOY BY should parse');
+                if (deploy.ok && deploy.value.kind === 'deploy-schema') assertEquals(deploy.value.author?.kind, 'variable', 'deploy author ref');
+
+                const alter = parseStatement('ALTER SCHEMA s AS (DROP TABLE t) BY $admin;');
+                assertTrue(alter.ok, 'ALTER BY should parse');
+                if (alter.ok && alter.value.kind === 'alter-schema') assertEquals(alter.value.author?.kind, 'variable', 'alter author ref');
+            },
+        },
+        {
+            name: '[PARSE19] BY clause requires an identity and is rejected on bundle inner writes',
+            invoke: async () => {
+                assertTrue(!parseStatement("INSERT INTO shop.products (sku) VALUES ('A') BY;").ok,
+                    'BY without an identity should fail');
+                assertTrue(!parseStatement("INSERT INTO shop.products (sku) VALUES ('A') BY 'alice';").ok,
+                    'BY with a string literal should fail');
+
+                const bundleOk = parseStatement("BUNDLE ON g (INSERT INTO g.t (v) VALUES ('x');) BY $alice;");
+                assertTrue(bundleOk.ok, 'BUNDLE-level BY should parse');
+                if (bundleOk.ok && bundleOk.value.kind === 'bundle') assertEquals(bundleOk.value.author?.kind, 'variable', 'bundle author ref');
+
+                assertTrue(!parseStatement("BUNDLE ON g (INSERT INTO g.t (v) VALUES ('x') BY $alice;);").ok,
+                    'BY on a bundle inner write should fail');
+            },
+        },
     ],
 };

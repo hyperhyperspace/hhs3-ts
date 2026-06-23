@@ -44,6 +44,15 @@ export type VersionExpr =
     | { kind: 'hash'; hash: HashRef; span: TextSpan }
     | { kind: 'set'; hashes: HashRef[]; span: TextSpan };
 
+// The author of an authored statement, written with a trailing `BY` clause.
+// `$name` / `#prefix` name an unlocked identity to sign as; `NOBODY` forces an
+// explicitly unauthored op even when the session has a default author. Absence
+// of the clause (an undefined `author` field) falls back to the default author.
+export type AuthorExpr =
+    | { kind: 'nobody'; span: TextSpan }
+    | { kind: 'variable'; name: string; span: TextSpan }
+    | { kind: 'hash'; prefix: string; span: TextSpan };
+
 export type ValueExpr =
     | { kind: 'literal'; value: json.Literal | null; span: TextSpan }
     | { kind: 'variable'; name: string; span: TextSpan }
@@ -134,6 +143,7 @@ export type InsertStatement = {
     table: TableRef;
     columns: string[];
     values: ValueExpr[];
+    author?: AuthorExpr;
     at?: VersionExpr;
     span: TextSpan;
 };
@@ -143,6 +153,7 @@ export type UpdateStatement = {
     table: TableRef;
     values: { column: string; value: ValueExpr }[];
     rowId: NameOrHashRef | ValueExpr;
+    author?: AuthorExpr;
     at?: VersionExpr;
     span: TextSpan;
 };
@@ -151,6 +162,7 @@ export type DeleteStatement = {
     kind: 'delete';
     table: TableRef;
     rowId: NameOrHashRef | ValueExpr;
+    author?: AuthorExpr;
     at?: VersionExpr;
     span: TextSpan;
 };
@@ -161,6 +173,7 @@ export type BundleStatement = {
     kind: 'bundle';
     group: NameOrHashRef;
     writes: BundleWriteStatement[];
+    author?: AuthorExpr;
     at?: VersionExpr;
     span: TextSpan;
 };
@@ -185,6 +198,7 @@ export type AlterSchemaStatement = {
     kind: 'alter-schema';
     schema: NameOrHashRef;
     rules: MigrationRuleExpr[];
+    author?: AuthorExpr;
     at?: VersionExpr;
     span: TextSpan;
 };
@@ -194,6 +208,7 @@ export type DeploySchemaStatement = {
     schema: NameOrHashRef;
     version: VersionExpr;
     group: NameOrHashRef;
+    author?: AuthorExpr;
     at?: VersionExpr;
     span: TextSpan;
 };

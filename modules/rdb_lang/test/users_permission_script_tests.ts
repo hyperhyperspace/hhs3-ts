@@ -241,5 +241,39 @@ export const usersPermissionScriptTests = {
                 assertTrue(!await docsView.hasRow(insert.rowId), 'concurrent revoke voids the permitted doc insert');
             },
         },
+        {
+            name: '[USERS_SCRIPT05] BY clause overrides the default author',
+            invoke: async () => {
+                const env = await createEnv();
+                await setupUsersAndDocs(env);
+                await setupAliceWriter(env);
+                await runScriptFile('observe_users.sql', env);
+
+                // The default author is admin (who is not a docs writer), but
+                // `BY $alice` signs as alice, who holds the writer cap that gates
+                // docs inserts.
+                env.vars['me'] = env.admin;
+                await runScriptText(
+                    "INSERT INTO docs_group.docs (body) VALUES ('signed by alice') BY $alice;",
+                    env,
+                    'insert by alice',
+                );
+
+                const docs = await group(env, 'docs_group');
+                const rows = await (await (await docs.getTable('docs')).getView()).query({
+                    where: { p: 'cmp', cmp: 'eq', left: { col: 'body' }, right: { lit: 'signed by alice' } },
+                });
+                assertEquals(rows.length, 1, 'BY $alice insert is permitted by the alice writer cap');
+                assertEquals(rows[0].author, env.alice.keyId, 'row author is alice, not the default admin');
+
+                // BY NOBODY forces an unauthored op even though a default author
+                // is set; the writer gate rejects it.
+                await expectScriptFailure(
+                    "INSERT INTO docs_group.docs (body) VALUES ('anon') BY NOBODY;",
+                    env,
+                    false,
+                );
+            },
+        },
     ],
 };

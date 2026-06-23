@@ -6,7 +6,7 @@ import type { InsertRowPayload, MigrationRule, RowOpPayload, RowQuery } from "@h
 
 import { DiagnosticBag, err, ok, Result } from "../diagnostics.js";
 import type {
-    AddMemberStatement, AlterSchemaStatement, AstStatement, BundleStatement, BundleWriteStatement,
+    AddMemberStatement, AlterSchemaStatement, AstStatement, AuthorExpr, BundleStatement, BundleWriteStatement,
     CreateDatabaseStatement, CreateSchemaStatement, CreateTableGroupStatement,
     DeleteStatement, DeploySchemaStatement, InsertStatement, LogStatement,
     NameOrHashRef, SelectStatement, SetViewStatement, TableRef, UpdateRefStatement, UpdateStatement,
@@ -269,16 +269,43 @@ async function bindAddMember(ast: AddMemberStatement, context: LangBindContext):
     return bound;
 }
 
+// Resolve the effective author of an authored statement: an explicit `BY`
+// clause wins (`NOBODY` forces unauthored), otherwise the session's default
+// author is used (which may itself be undefined / anonymous).
+async function resolveEffectiveAuthor(expr: AuthorExpr | undefined, context: LangBindContext): Promise<OwnIdentity | undefined> {
+    if (expr === undefined) return context.currentAuthor();
+    if (expr.kind === 'nobody') return undefined;
+    if (expr.kind === 'variable') return context.resolveAuthor({ kind: 'variable', name: expr.name });
+    return context.resolveAuthor({ kind: 'hash', prefix: expr.prefix });
+}
+
+// A context view in which `$author` / `$me` resolve to the statement's effective
+// author rather than the session default, so values like `VALUES ($author)`
+// agree with the signer chosen by `BY`.
+function contextWithAuthor(context: LangBindContext, author: OwnIdentity | undefined): LangBindContext {
+    return {
+        ...context,
+        resolveVariable: (name: string): Promise<LangValue> => {
+            if (name === 'me' || name === 'author') {
+                if (author !== undefined) return Promise.resolve(author);
+                throw new Error(`$${name} has no value: the statement has no author (BY NOBODY or no default author)`);
+            }
+            return context.resolveVariable(name);
+        },
+    };
+}
+
 async function bindInsert(ast: InsertStatement, context: LangBindContext): Promise<BoundInsert> {
     if (ast.columns.length !== ast.values.length) {
         throw new Error(`INSERT column count (${ast.columns.length}) does not match value count (${ast.values.length})`);
     }
     const table = await resolveTableRef(ast.table, context);
+    const author = await resolveEffectiveAuthor(ast.author, context);
+    const valueContext = contextWithAuthor(context, author);
     const values: { [column: string]: json.Literal } = {};
     for (let i = 0; i < ast.columns.length; i += 1) {
-        values[ast.columns[i]] = asJsonLiteral(await resolveValue(ast.values[i], context));
+        values[ast.columns[i]] = asJsonLiteral(await resolveValue(ast.values[i], valueContext));
     }
-    const author = await context.currentAuthor();
     const at = await context.resolveVersion(ast.at, { kind: 'group', id: table.groupId, group: table.group });
     const bound: BoundInsert = { kind: 'insert', ast, table, values, at, uuid: context.createUuid() };
     if (author !== undefined) bound.author = author;
@@ -287,9 +314,10 @@ async function bindInsert(ast: InsertStatement, context: LangBindContext): Promi
 
 async function bindUpdate(ast: UpdateStatement, context: LangBindContext): Promise<BoundUpdate> {
     const table = await resolveTableRef(ast.table, context);
+    const author = await resolveEffectiveAuthor(ast.author, context);
+    const valueContext = contextWithAuthor(context, author);
     const values: { [column: string]: json.Literal } = {};
-    for (const v of ast.values) values[v.column] = asJsonLiteral(await resolveValue(v.value, context));
-    const author = await context.currentAuthor();
+    for (const v of ast.values) values[v.column] = asJsonLiteral(await resolveValue(v.value, valueContext));
     const at = await context.resolveVersion(ast.at, { kind: 'group', id: table.groupId, group: table.group });
     const rowId = await bindRowId(ast.rowId, context, table, at);
     const bound: BoundUpdate = { kind: 'update', ast, table, values, rowId, at };
@@ -299,7 +327,7 @@ async function bindUpdate(ast: UpdateStatement, context: LangBindContext): Promi
 
 async function bindDelete(ast: DeleteStatement, context: LangBindContext): Promise<BoundDelete> {
     const table = await resolveTableRef(ast.table, context);
-    const author = await context.currentAuthor();
+    const author = await resolveEffectiveAuthor(ast.author, context);
     const at = await context.resolveVersion(ast.at, { kind: 'group', id: table.groupId, group: table.group });
     const rowId = await bindRowId(ast.rowId, context, table, at);
     const bound: BoundDelete = { kind: 'delete', ast, table, rowId, at };
@@ -310,10 +338,11 @@ async function bindDelete(ast: DeleteStatement, context: LangBindContext): Promi
 async function bindBundle(ast: BundleStatement, context: LangBindContext): Promise<BoundBundle> {
     const group = await context.resolveGroup(ast.group);
     if (group.group === undefined) throw new Error('BUNDLE target group is not loaded');
-    const author = await context.currentAuthor();
+    const author = await resolveEffectiveAuthor(ast.author, context);
+    const valueContext = contextWithAuthor(context, author);
     const at = await context.resolveVersion(ast.at, { kind: 'group', id: group.id, group: group.group });
     const writes: BoundBundleWrite[] = [];
-    for (const write of ast.writes) writes.push(await bindBundleWrite(write, context, at, author?.keyId));
+    for (const write of ast.writes) writes.push(await bindBundleWrite(write, valueContext, at, author?.keyId));
     const bound: BoundBundle = { kind: 'bundle', ast, group, writes, at };
     if (author !== undefined) bound.author = author;
     return bound;
@@ -347,7 +376,7 @@ function bindSetView(ast: SetViewStatement): BoundSetView {
 async function bindAlterSchema(ast: AlterSchemaStatement, context: LangBindContext): Promise<BoundAlterSchema> {
     const schema = await context.resolveSchema(ast.schema);
     if (schema.schema === undefined) throw new Error('ALTER SCHEMA target is not loaded');
-    const author = await context.currentAuthor();
+    const author = await resolveEffectiveAuthor(ast.author, context);
     if (author === undefined) throw new Error('ALTER SCHEMA requires an author identity');
     const at = await context.resolveVersion(ast.at, { kind: 'schema', id: schema.id, schema: schema.schema });
     return { kind: 'alter-schema', ast, schema, rules: compileMigrationRules(ast.rules), author, at };
@@ -358,7 +387,7 @@ async function bindDeploySchema(ast: DeploySchemaStatement, context: LangBindCon
     if (group.group === undefined) throw new Error('DEPLOY SCHEMA target group is not loaded');
     const schema = await context.resolveSchema(ast.schema);
     const version = await context.resolveVersion(ast.version, { kind: 'schema', id: schema.id, schema: schema.schema });
-    const author = await context.currentAuthor();
+    const author = await resolveEffectiveAuthor(ast.author, context);
     const at = await context.resolveVersion(ast.at, { kind: 'group', id: group.id, group: group.group });
     const bound: BoundDeploySchema = { kind: 'deploy-schema', ast, group, version, at };
     if (author !== undefined) bound.author = author;

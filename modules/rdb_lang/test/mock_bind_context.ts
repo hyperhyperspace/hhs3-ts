@@ -109,6 +109,13 @@ export function createTestBindContext(_ctx: RContext, vars: { [name: string]: La
             return typeof me === 'object' && me !== null && 'secretKey' in me ? me as OwnIdentity : undefined;
         },
 
+        async resolveAuthor(ref): Promise<OwnIdentity> {
+            const key = ref.kind === 'variable' ? ref.name : ref.prefix;
+            const v = vars[key];
+            if (typeof v === 'object' && v !== null && 'secretKey' in v) return v as OwnIdentity;
+            throw new Error(`Unknown or locked identity '${key}'`);
+        },
+
         createUuid(): string {
             const uuid = `rdb-lang-test-${nextUuid}`;
             nextUuid += 1;

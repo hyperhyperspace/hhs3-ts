@@ -6,7 +6,7 @@ import { promptSecret } from "./prompt.js";
 
 export async function fulfillKeyPassphrase(
     session: WorkspaceSession,
-    needs: { kind: 'create' | 'unlock'; label: string },
+    needs: { kind: 'create' | 'unlock' | 'author'; label: string },
     rl: Interface,
 ): Promise<string> {
     if (session.keystore === undefined) throw new Error('No keystore configured');
@@ -18,6 +18,10 @@ export async function fulfillKeyPassphrase(
     }
     const passphrase = await promptSecret(rl, `passphrase (${displayName}): `);
     const identity = await session.keystore.unlock(needs.label, passphrase);
+    if (needs.kind === 'author') {
+        await session.keystore.select(needs.label);
+        return `author ${displayName} (${identity.keyId})`;
+    }
     return `unlocked ${identity.keyId}`;
 }
 

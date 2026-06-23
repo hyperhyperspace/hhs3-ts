@@ -66,7 +66,9 @@ const tests = [
             await withSession(async (session, dbPath) => {
                 if (session.keystore === undefined) throw new Error('missing keystore');
                 const identity = await session.keystore.create('alice', 'correct');
-                assertEquals(session.keystore.selected()?.keyId, identity.keyId, 'created key selected');
+                assertEquals(session.keystore.selected(), undefined, 'create unlocks but does not select a default author');
+                await session.keystore.select('alice');
+                assertEquals(session.keystore.selected()?.keyId, identity.keyId, 'select sets the default author');
 
                 const reopened = await KeyStore.open(`${dbPath}.keys.json`, session.workspace.replica.getHashSuite());
                 let failed = false;
@@ -293,7 +295,49 @@ const tests = [
                 const unlocked = await runCommand(session, '\\key unlock alice correct');
                 assertEquals(unlocked.exitCode, 0, unlocked.output);
                 assertTrue(unlocked.output.includes('unlocked'), 'inline passphrase unlock works');
-                assertEquals(session.keystore?.selected()?.keyId, identity.keyId, 'inline unlock selects key');
+                assertEquals(session.keystore?.selected(), undefined, 'unlock does not select a default author');
+
+                const author = await runCommand(session, '\\author alice');
+                assertEquals(author.exitCode, 0, author.output);
+                assertTrue(author.output.includes('author alice'), '\\author selects the default author');
+                assertEquals(session.keystore?.selected()?.keyId, identity.keyId, '\\author sets default to alice');
+
+                const cleared = await runCommand(session, '\\author nobody');
+                assertEquals(cleared.exitCode, 0, cleared.output);
+                assertTrue(cleared.output.includes('author nobody'), '\\author nobody clears the default');
+                assertEquals(session.keystore?.selected(), undefined, '\\author nobody makes writes anonymous');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS12] \\author unlocks a locked key and \\keys reports unlocked state',
+        invoke: async () => {
+            await withSession(async (session, dbPath) => {
+                if (session.keystore === undefined) throw new Error('missing keystore');
+                const alice = await session.keystore.create('alice', 'correct');
+                await session.keystore.create('bob', 'secret');
+
+                // Reopen the keystore so both keys are locked again.
+                const keystore = await KeyStore.open(`${dbPath}.keys.json`, session.workspace.replica.getHashSuite());
+                const reopened = new WorkspaceSession({ workspace: session.workspace, keystore });
+
+                const lockedKeys = await runMetaCommand(reopened, '\\keys');
+                assertTrue(lockedKeys.output?.includes('unlocked') === true, '\\keys has an unlocked column');
+                assertTrue(lockedKeys.output?.includes('false') === true, 'locked keys report unlocked false');
+
+                const missing = await runCommandNonInteractive(reopened, '\\author alice');
+                assertEquals(missing.exitCode, 1, 'selecting a locked key without a passphrase fails non-interactively');
+                assertTrue(missing.output.includes('passphrase required'), 'locked \\author requests a passphrase');
+                assertEquals(keystore.selected(), undefined, 'failed \\author leaves the default unset');
+
+                const selected = await runCommand(reopened, '\\author alice correct');
+                assertEquals(selected.exitCode, 0, selected.output);
+                assertTrue(selected.output.includes('author alice'), 'inline passphrase \\author unlocks and selects');
+                assertEquals(keystore.selected()?.keyId, alice.keyId, '\\author unlocked and selected alice');
+                assertTrue(keystore.isUnlocked(alice.keyId), 'alice is now in the unlocked set');
+
+                const unlockedKeys = await runMetaCommand(reopened, '\\keys');
+                assertTrue(unlockedKeys.output?.includes('true') === true, '\\keys reports the unlocked key as true');
             });
         },
     },
@@ -326,6 +370,7 @@ async function withSession(fn: (session: WorkspaceSession, dbPath: string) => Pr
 function setupScript(): string {
     return `
 \\key create alice correct
+\\author alice
 CREATE SCHEMA shop CREATORS ($me) AS (
   TABLE products (
     sku string PUB READONLY,

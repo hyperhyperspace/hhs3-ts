@@ -5,6 +5,12 @@ import type { RDb, RSchema, RTable, RTableGroup } from "@hyper-hyper-space/hhs3_
 
 import type { HashRef, NameOrHashRef, TableRef, VersionExpr } from "../syntax/ast.js";
 
+// The identity forms of a `BY` clause (the `NOBODY` case never reaches the
+// host: the binder maps it to an unauthored op directly).
+export type AuthorRef =
+    | { kind: 'variable'; name: string }
+    | { kind: 'hash'; prefix: string };
+
 export type HashScope =
     | { kind: 'global' }
     | { kind: 'object'; objectId: B64Hash };
@@ -55,6 +61,9 @@ export interface LangBindContext {
     resolveVariable(name: string): Promise<LangValue>;
     resolveLogTarget(ref: NameOrHashRef): Promise<ResolvedLogTarget>;
     currentAuthor(): Promise<OwnIdentity | undefined>;
+    // Resolve an explicit `BY $name` / `BY #prefix` author to an unlocked
+    // identity able to sign. Throws if the identity is unknown or still locked.
+    resolveAuthor(ref: AuthorRef): Promise<OwnIdentity>;
     createUuid(): string;
     createSeed(kind: 'rdb' | 'group', name?: string): string;
 }

@@ -58,13 +58,13 @@ export function renderRowOp(payload: RowOpPayload, table?: string, options?: Ren
     if (payload.action === 'insert') {
         const cols = Object.keys(payload.values);
         const vals = cols.map((c) => renderLiteral(payload.values[c]));
-        return `INSERT INTO ${target} (${cols.join(', ')}) VALUES (${vals.join(', ')})${renderAt(options)};`;
+        return `INSERT INTO ${target} (${cols.join(', ')}) VALUES (${vals.join(', ')})${renderBy(payload.author)}${renderAt(options)};`;
     }
     if (payload.action === 'update') {
         const values = Object.entries(payload.values).map(([k, v]) => `${k} = ${renderLiteral(v)}`).join(', ');
-        return `UPDATE ${target} SET ${values} WHERE rowId = #${payload.rowId}${renderAt(options)};`;
+        return `UPDATE ${target} SET ${values} WHERE rowId = #${payload.rowId}${renderBy(payload.author)}${renderAt(options)};`;
     }
-    return `DELETE FROM ${target} WHERE rowId = #${payload.rowId}${renderAt(options)};`;
+    return `DELETE FROM ${target} WHERE rowId = #${payload.rowId}${renderBy(payload.author)}${renderAt(options)};`;
 }
 
 export function renderRefOp(payload: RefAdvancePayload, options?: RenderOptions): string {
@@ -73,7 +73,8 @@ export function renderRefOp(payload: RefAdvancePayload, options?: RenderOptions)
 
 export function renderBundle(payload: BundlePayload, options?: RenderOptions): string {
     const writes = payload.writes.map((w) => renderRowOp(w.op as unknown as RowOpPayload, w.table)).join('\n  ');
-    return `BUNDLE ON <group> (\n  ${writes}\n)${renderAt(options)};`;
+    const author = (payload as { author?: string }).author;
+    return `BUNDLE ON <group> (\n  ${writes}\n)${renderBy(author)}${renderAt(options)};`;
 }
 
 export function renderOp(payload: json.Literal, options?: RenderOptions): string {
@@ -228,6 +229,10 @@ function renderNote(note?: string): string {
 
 function renderAt(options?: RenderOptions): string {
     return options?.at === undefined ? '' : ` AT ${renderVersionSet(options.at)}`;
+}
+
+function renderBy(author?: string): string {
+    return author === undefined ? '' : ` BY #${author}`;
 }
 
 function renderVersionSet(set: json.Set): string {
