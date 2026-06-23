@@ -1,5 +1,8 @@
 import { stdin as input, stdout as output } from "node:process";
+import { emitKeypressEvents } from "node:readline";
 import { createInterface } from "node:readline/promises";
+
+import { scanStatement } from "@hyper-hyper-space/hhs3_rdb_lang";
 
 import { formatJson } from "../format/json.js";
 import { formatTableResult } from "../format/table.js";
@@ -13,46 +16,104 @@ export async function startRepl(session: WorkspaceSession): Promise<void> {
     const rl = createInterface({ input, output });
     let buffer = '';
 
-    try {
-        while (true) {
-            const line = await rl.question(promptForSession(session, buffer.length > 0));
-            if (buffer.length === 0 && line.trimStart().startsWith('\\')) {
-                try {
-                    const meta = await runMetaCommand(session, line);
-                    if (meta.needsPassphrase !== undefined) {
-                        output.write(await fulfillKeyPassphrase(session, meta.needsPassphrase, rl) + '\n');
-                    } else if (meta.output !== undefined && meta.output.length > 0) {
-                        output.write(meta.output + '\n');
-                    }
-                    if (meta.quit === true) break;
-                } catch (e) {
-                    output.write((e instanceof Error ? e.message : String(e)) + '\n');
-                }
-                continue;
-            }
+    // Event-driven design: readline owns all prompt rendering. We never write the
+    // prompt out of band, which is what previously raced readline's terminal-mode
+    // line editor and corrupted the display during multi-line paste. Lines are
+    // handled in arrival order via a small queue so async work (statement
+    // execution, passphrase prompts) is fully serialized.
+    let isPasting = false;
+    let busy = false;
+    const pending: string[] = [];
 
-            buffer += (buffer.length === 0 ? '' : '\n') + line;
-            if (!isComplete(buffer)) continue;
+    if (input.isTTY) {
+        emitKeypressEvents(input, rl);
+        input.on('keypress', (_s: string, key: { name?: string } | undefined) => {
+            if (key?.name === 'paste-start') isPasting = true;
+            if (key?.name === 'paste-end') isPasting = false;
+        });
+        // Enable bracketed paste so the terminal brackets the paste and readline
+        // coalesces it; combined with isPasting this suppresses continuation
+        // prompts mid-paste.
+        output.write('\x1b[?2004h');
+    }
 
+    const drawPrompt = (): void => {
+        if (isPasting) return;
+        rl.setPrompt(promptForSession(session, buffer.length > 0));
+        rl.prompt();
+    };
+
+    const handleLine = async (line: string): Promise<{ quit: boolean }> => {
+        if (buffer.length === 0 && line.trim().length === 0) return { quit: false };
+
+        if (buffer.length === 0 && line.trimStart().startsWith('\\')) {
             try {
-                const run = await runLanguageText(session, buffer);
-                for (const item of run.results) {
-                    const rendered = session.outputMode === 'json'
-                        ? formatJson(item.result)
-                        : formatTableResult(item.result, session.outputMode);
-                    if (rendered.length > 0) output.write(rendered + '\n');
+                const meta = await runMetaCommand(session, line);
+                if (meta.needsPassphrase !== undefined) {
+                    output.write(await fulfillKeyPassphrase(session, meta.needsPassphrase, rl) + '\n');
+                } else if (meta.output !== undefined && meta.output.length > 0) {
+                    output.write(meta.output + '\n');
                 }
+                if (meta.quit === true) return { quit: true };
             } catch (e) {
                 output.write((e instanceof Error ? e.message : String(e)) + '\n');
-            } finally {
-                buffer = '';
             }
+            return { quit: false };
         }
-    } finally {
-        rl.close();
-    }
+
+        buffer += (buffer.length === 0 ? '' : '\n') + line;
+        if (!isComplete(buffer)) return { quit: false };
+
+        try {
+            const run = await runLanguageText(session, buffer);
+            for (const item of run.results) {
+                const rendered = session.outputMode === 'json'
+                    ? formatJson(item.result)
+                    : formatTableResult(item.result, session.outputMode);
+                if (rendered.length > 0) output.write(rendered + '\n');
+            }
+        } catch (e) {
+            output.write((e instanceof Error ? e.message : String(e)) + '\n');
+        } finally {
+            buffer = '';
+        }
+        return { quit: false };
+    };
+
+    await new Promise<void>((resolve) => {
+        const pump = async (): Promise<void> => {
+            if (busy) return;
+            busy = true;
+            try {
+                while (pending.length > 0) {
+                    const line = pending.shift()!;
+                    const { quit } = await handleLine(line);
+                    if (quit) {
+                        rl.close();
+                        return;
+                    }
+                }
+            } finally {
+                busy = false;
+            }
+            // Only prompt once the queue is fully drained, so a burst of pasted
+            // lines never produces intermediate prompts.
+            if (pending.length === 0) drawPrompt();
+        };
+
+        rl.on('line', (line) => {
+            pending.push(line);
+            void pump();
+        });
+
+        rl.on('close', () => resolve());
+
+        drawPrompt();
+    });
+
+    if (input.isTTY) output.write('\x1b[?2004l');
 }
 
 function isComplete(text: string): boolean {
-    return text.trimEnd().endsWith(';');
+    return scanStatement(text).kind === 'complete';
 }

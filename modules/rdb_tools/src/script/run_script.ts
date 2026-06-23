@@ -2,6 +2,8 @@ import { promises as fs } from "node:fs";
 import { stdin as input, stdout as output } from "node:process";
 import { createInterface } from "node:readline/promises";
 
+import { scanStatement } from "@hyper-hyper-space/hhs3_rdb_lang";
+
 import { WorkspaceSession } from "../session/session.js";
 import { runCommand } from "./run_command.js";
 
@@ -32,7 +34,7 @@ export async function runScript(session: WorkspaceSession, text: string, file = 
             }
 
             buffer += (buffer.length === 0 ? '' : '\n') + line;
-            if (!trimmed.endsWith(';')) continue;
+            if (scanStatement(buffer).kind !== 'complete') continue;
 
             const result = await runCommand(session, buffer, file, { rl });
             if (result.output.length > 0) outputs.push(result.output);

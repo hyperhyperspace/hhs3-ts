@@ -2,6 +2,7 @@ import { testing } from "@hyper-hyper-space/hhs3_util";
 
 import { lexerTests } from "./lexer_tests.js";
 import { parserTests } from "./parser_tests.js";
+import { scannerTests } from "./scanner_tests.js";
 import { phase1VerticalTests } from "./phase1_vertical_tests.js";
 import { diagnosticTests } from "./diagnostic_tests.js";
 import { restPhaseTests } from "./rest_phase_tests.js";
@@ -13,6 +14,7 @@ async function main() {
 
     allTests.set(lexerTests.title, lexerTests.tests);
     allTests.set(parserTests.title, parserTests.tests);
+    allTests.set(scannerTests.title, scannerTests.tests);
     allTests.set(phase1VerticalTests.title, phase1VerticalTests.tests);
     allTests.set(diagnosticTests.title, diagnosticTests.tests);
     allTests.set(restPhaseTests.title, restPhaseTests.tests);
