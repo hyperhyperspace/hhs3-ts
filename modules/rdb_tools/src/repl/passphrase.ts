@@ -13,13 +13,13 @@ export async function fulfillKeyPassphrase(
     const displayName = keyDisplayLabel(session, needs.label);
     if (needs.kind === 'create') {
         const passphrase = await promptNewPassphrase(rl, displayName);
-        const identity = await session.keystore.create(needs.label, passphrase);
+        const identity = await session.createKey(needs.label, passphrase);
         return `created ${needs.label} ${identity.keyId}`;
     }
     const passphrase = await promptSecret(rl, `passphrase (${displayName}): `);
-    const identity = await session.keystore.unlock(needs.label, passphrase);
+    const identity = await session.unlockKey(needs.label, passphrase);
     if (needs.kind === 'author') {
-        await session.keystore.select(needs.label);
+        session.selectAuthor(needs.label);
         return `author ${displayName} (${identity.keyId})`;
     }
     return `unlocked ${identity.keyId}`;

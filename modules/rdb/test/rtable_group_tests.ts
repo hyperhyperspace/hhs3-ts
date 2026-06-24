@@ -68,6 +68,7 @@ async function createTestEnv(groupExtras?: {
     const pinned = await (await schema.getScopedDag()).getFrontier();
 
     const groupInit = await RTableGroupImpl.create({
+        name: 'group-test',
         seed: 'group-test',
         schemaRef: schema.getId(),
         schemaVersion: pinned,
@@ -133,7 +134,7 @@ export const rtableGroupTests = {
                         const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
                         const pinned = await (await schema.getScopedDag()).getFrontier();
                         const init = await RTableGroupImpl.create({
-                            seed: 'g', schemaRef: schemaRefOverride ?? schema.getId(), schemaVersion: pinned, ...extras,
+                            name: 'g', seed: 'g', schemaRef: schemaRefOverride ?? schema.getId(), schemaVersion: pinned, ...extras,
                         });
                         await ctx.createObject(init);
                     } catch {

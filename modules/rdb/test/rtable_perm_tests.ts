@@ -66,6 +66,7 @@ async function makeAppGroup(ctx: RContext, seed: string, tables: TableDef[], use
     const pinned = await (await schema.getScopedDag()).getFrontier();
 
     const groupInit = await RTableGroupImpl.create({
+        name: seed,
         seed: seed + '-group',
         schemaRef: schema.getId(),
         schemaVersion: pinned,
@@ -243,6 +244,7 @@ export const rtablePermTests = {
                 const pinned = await (await schema.getScopedDag()).getFrontier();
 
                 const groupInit = await RTableGroupImpl.create({
+                    name: 'perm06-group',
                     seed: 'perm06-group',
                     schemaRef: schema.getId(),
                     schemaVersion: pinned,
@@ -354,7 +356,7 @@ export const rtablePermTests = {
                 const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
                 const pinned = await (await schema.getScopedDag()).getFrontier();
                 const groupInit = await RTableGroupImpl.create({
-                    seed: 'perm09-group', schemaRef: schema.getId(), schemaVersion: pinned,
+                    name: 'perm09-group', seed: 'perm09-group', schemaRef: schema.getId(), schemaVersion: pinned,
                     idProvider: IDENTITIES_TABLE,
                     initialRows: {
                         [IDENTITIES_TABLE]: [{ action: 'insert', rowId: deriveRowId('admin'), uuid: 'admin', values: { keyId: admin.keyId, publicKey: serializePublicKeyToBase64(admin.publicKey) } }],
@@ -473,7 +475,7 @@ export const rtablePermTests = {
 
                 await expectThrow(async () => {
                     const init = await RTableGroupImpl.create({
-                        seed: 'users03-group', schemaRef: schemaA.getId(), schemaVersion: pinned,
+                        name: 'users03-group', seed: 'users03-group', schemaRef: schemaA.getId(), schemaVersion: pinned,
                         bindings: { users: deriveRowId('no-such-users-group') },
                         idProvider: USERS_IDENTITIES_PROVIDER,
                     });
@@ -646,7 +648,7 @@ export const rtablePermTests = {
                 const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
                 const pinned = await (await schema.getScopedDag()).getFrontier();
                 const groupInit = await RTableGroupImpl.create({
-                    seed: 'perm10-group', schemaRef: schema.getId(), schemaVersion: pinned,
+                    name: 'perm10-group', seed: 'perm10-group', schemaRef: schema.getId(), schemaVersion: pinned,
                 });
                 const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
 
@@ -696,7 +698,7 @@ export const rtablePermTests = {
                 const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
                 const pinned = await (await schema.getScopedDag()).getFrontier();
                 const groupInit = await RTableGroupImpl.create({
-                    seed: 'perm11-group', schemaRef: schema.getId(), schemaVersion: pinned,
+                    name: 'perm11-group', seed: 'perm11-group', schemaRef: schema.getId(), schemaVersion: pinned,
                     idProvider: IDENTITIES_TABLE,
                     initialRows: {
                         [IDENTITIES_TABLE]: [{ action: 'insert', rowId: deriveRowId('admin'), uuid: 'admin', values: { keyId: admin.keyId, publicKey: serializePublicKeyToBase64(admin.publicKey) } }],

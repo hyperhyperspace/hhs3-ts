@@ -23,6 +23,7 @@ export type BundleWrite = {
 
 export interface RTableGroup extends RObject, NestingParent {
     // Create-time facts
+    getName(): string;
     seed(): string;
     hashAlgorithm(): string | undefined;
     getSchemaRef(): B64Hash;

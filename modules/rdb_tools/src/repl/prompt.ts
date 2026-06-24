@@ -15,7 +15,7 @@ function groupDisplayName(session: WorkspaceSession): string {
 }
 
 function keyDisplayName(session: WorkspaceSession): string {
-    const identity = session.keystore?.selected();
+    const identity = session.selectedAuthor();
     if (identity === undefined) return '-';
     const label = session.keystore?.list().find((key) => key.keyId === identity.keyId)?.label;
     return label ?? short(identity.keyId);

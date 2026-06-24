@@ -81,6 +81,7 @@ export async function generateSingleGroupHistory(seed: number, ops: number): Pro
     const pinned = await (await schema.getScopedDag()).getFrontier();
 
     const groupInit = await RTableGroupImpl.create({
+        name: `parity-group-${seed}`,
         seed: `parity-group-${seed}`,
         schemaRef: schema.getId(),
         schemaVersion: pinned,
@@ -213,7 +214,7 @@ export async function generateCrossGroupHistory(seed: number, ops: number): Prom
     });
     const schemaB = (await ctx.createObject(schemaBInit)) as RSchemaImpl;
     const pinnedB = await (await schemaB.getScopedDag()).getFrontier();
-    const groupBInit = await RTableGroupImpl.create({ seed: `parity-xgroupB-${seed}`, schemaRef: schemaB.getId(), schemaVersion: pinnedB });
+    const groupBInit = await RTableGroupImpl.create({ name: `parity-xgroupB-${seed}`, seed: `parity-xgroupB-${seed}`, schemaRef: schemaB.getId(), schemaVersion: pinnedB });
     const groupB = (await ctx.createObject(groupBInit)) as RTableGroupImpl;
     const bDag = (await ctx.getDag(groupB.getId()))!;
     const ordersB = await groupB.getTable('orders');
@@ -227,6 +228,7 @@ export async function generateCrossGroupHistory(seed: number, ops: number): Prom
     const schemaA = (await ctx.createObject(schemaAInit)) as RSchemaImpl;
     const pinnedA = await (await schemaA.getScopedDag()).getFrontier();
     const groupAInit = await RTableGroupImpl.create({
+        name: `parity-xgroupA-${seed}`,
         seed: `parity-xgroupA-${seed}`,
         schemaRef: schemaA.getId(),
         schemaVersion: pinnedA,

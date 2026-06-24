@@ -89,6 +89,7 @@ async function makeSchemaGroup(ctx: RContext, seed: string, opts?: {
     const pinned = await (await schema.getScopedDag()).getFrontier();
 
     const groupInit = await RTableGroupImpl.create({
+        name: seed,
         seed: seed + '-group',
         schemaRef: schema.getId(),
         schemaVersion: pinned,

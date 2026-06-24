@@ -43,23 +43,9 @@ export class RootIndex {
         });
     }
 
-    setName(id: B64Hash, name: string): void {
-        const root = this.roots.get(id);
-        if (root === undefined) throw new Error(`Cannot name unknown root '${id}'`);
-        this.upsert({ ...root, name });
-    }
-
     setAlias(name: string, id: B64Hash): void {
         if (!this.roots.has(id)) throw new Error(`Cannot alias unknown root '${id}'`);
         this.aliases.set(name, id);
-    }
-
-    exportNames(): { names: { [id: string]: string }; aliases: { [name: string]: B64Hash } } {
-        const names: { [id: string]: string } = {};
-        for (const root of this.roots.values()) {
-            if (root.name !== undefined) names[root.id] = root.name;
-        }
-        return { names, aliases: Object.fromEntries(this.aliases.entries()) };
     }
 
     list(kind?: RootKind): RootRecord[] {

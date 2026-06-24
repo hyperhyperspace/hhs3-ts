@@ -1,4 +1,6 @@
 import { promises as fs } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 
 import {
     chacha20Poly1305,
@@ -24,9 +26,18 @@ import {
 
 type KeystoreFile = {
     version: 1;
-    selected?: KeyId;
     keys: StoredKeyRecord[];
 };
+
+// Resolve the global keystore path. The keystore is shared across all
+// workspaces and lives in the user's home directory by default. The env
+// overrides exist mainly so tests never touch the real file.
+export function defaultKeystorePath(): string {
+    const explicit = process.env.RDB_KEYSTORE;
+    if (explicit !== undefined && explicit !== '') return explicit;
+    const home = process.env.RDB_HOME ?? join(homedir(), '.rdb');
+    return join(home, 'keys.json');
+}
 
 export type StoredKeyRecord = {
     label: string;
@@ -48,7 +59,6 @@ export type StoredKeyRecord = {
 };
 
 export class KeyStore {
-    private readonly unlocked = new Map<KeyId, OwnIdentity>();
     private data: KeystoreFile = { version: 1, keys: [] };
 
     private constructor(private readonly path: string, private readonly hashSuite: HashSuite) {}
@@ -63,29 +73,20 @@ export class KeyStore {
         return [...this.data.keys];
     }
 
-    selected(): OwnIdentity | undefined {
-        return this.data.selected === undefined ? undefined : this.unlocked.get(this.data.selected);
-    }
-
-    isUnlocked(keyId: KeyId): boolean {
-        return this.unlocked.has(keyId);
-    }
-
-    // Create and unlock a key, adding it to the active (unlocked) set. It does
-    // NOT become the default author: selecting a default is a deliberate act
-    // (see select / clearSelection), so authorship is never implicit.
+    // Create a new key and persist it. The returned identity is unlocked, but
+    // tracking that (and selecting a default author) is the caller's concern:
+    // the keystore is a pure on-disk vault and holds no session state.
     async create(label: string, passphrase: string, signingName: SigningName = SIGNING_ED25519): Promise<OwnIdentity> {
         if (this.data.keys.some((key) => key.label === label)) throw new Error(`Key label '${label}' already exists`);
         const identity = await createIdentity(signingName, this.hashSuite);
         const record = this.encryptRecord(label, identity, passphrase);
         this.data.keys.push(record);
-        this.unlocked.set(identity.keyId, identity);
         await this.save();
         return identity;
     }
 
-    // Unlock a key into the active set. Like create, this does NOT select it as
-    // the default author.
+    // Decrypt a stored key with its passphrase and return the identity. This is
+    // a pure read: it does not mutate the vault or any session state.
     async unlock(labelOrPrefix: string, passphrase: string): Promise<OwnIdentity> {
         const record = this.resolveRecord(labelOrPrefix);
         const key = deriveKey(passphrase, record.kdf);
@@ -93,37 +94,12 @@ export class KeyStore {
         const nonce = base64ToBytes(record.aead.nonce);
         const plaintext = chacha20Poly1305.decrypt(ciphertext, key, nonce, new TextEncoder().encode(record.keyId));
         const secret = JSON.parse(new TextDecoder().decode(plaintext));
-        const identity = decodeIdentitySecret(record.keyId, secret);
-        this.unlocked.set(identity.keyId, identity);
-        await this.save();
-        return identity;
-    }
-
-    // Set the default author. The key must already be in the active set.
-    async select(labelOrPrefix: string): Promise<OwnIdentity> {
-        const record = this.resolveRecord(labelOrPrefix);
-        const identity = this.unlocked.get(record.keyId);
-        if (identity === undefined) throw new Error(`Key '${record.label}' is locked`);
-        this.data.selected = identity.keyId;
-        await this.save();
-        return identity;
-    }
-
-    // Clear the default author (write statements become anonymous unless they
-    // carry an explicit BY clause).
-    async clearSelection(): Promise<void> {
-        this.data.selected = undefined;
-        await this.save();
+        return decodeIdentitySecret(record.keyId, secret);
     }
 
     resolvePublic(labelOrPrefix: string): { keyId: KeyId; publicKey: ReturnType<typeof decodePublicKey> } {
         const record = this.resolveRecord(labelOrPrefix);
         return { keyId: record.keyId, publicKey: decodePublicKey(record.publicKey) };
-    }
-
-    resolveIdentity(labelOrPrefix: string): OwnIdentity | undefined {
-        const record = this.resolveRecord(labelOrPrefix);
-        return this.unlocked.get(record.keyId);
     }
 
     resolveRecord(labelOrPrefix: string): StoredKeyRecord {
@@ -149,7 +125,10 @@ export class KeyStore {
     }
 
     private async save(): Promise<void> {
-        await fs.writeFile(this.path, JSON.stringify(this.data, undefined, 2) + '\n');
+        // The file holds encrypted signing secrets, so keep the directory and
+        // file private to the user.
+        await fs.mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
+        await fs.writeFile(this.path, JSON.stringify(this.data, undefined, 2) + '\n', { mode: 0o600 });
     }
 
     private encryptRecord(label: string, identity: OwnIdentity, passphrase: string): StoredKeyRecord {

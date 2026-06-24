@@ -134,6 +134,7 @@ export const rTableGroupFactory: RObjectFactory = {
 export class RTableGroupImpl implements RTableGroupContract {
 
     static create = async (options: {
+        name: string;
         seed: string;
         schemaRef: B64Hash;
         schemaVersion: Version;
@@ -147,6 +148,7 @@ export class RTableGroupImpl implements RTableGroupContract {
         const createPayload: CreateTableGroupPayload = {
             action: 'create',
             type: RTABLE_GROUP_TYPE_ID,
+            name: options.name,
             seed: options.seed,
             schemaRef: options.schemaRef,
             schemaVersion: json.toSet([...options.schemaVersion]),
@@ -201,6 +203,7 @@ export class RTableGroupImpl implements RTableGroupContract {
 
     // Create-time facts
 
+    getName(): string { return this.createOp.name; }
     seed(): string { return this.createOp.seed; }
     hashAlgorithm(): string | undefined { return this.createOp.hashAlgorithm; }
     getSchemaRef(): B64Hash { return this.createOp.schemaRef; }

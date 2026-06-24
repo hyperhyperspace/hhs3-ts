@@ -49,7 +49,7 @@ async function createItemsGroup() {
     const pinned = await (await schema.getScopedDag()).getFrontier();
 
     const groupInit = await RTableGroupImpl.create({
-        seed: 'query-test', schemaRef: schema.getId(), schemaVersion: pinned,
+        name: 'query-test', seed: 'query-test', schemaRef: schema.getId(), schemaVersion: pinned,
     });
     const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
 

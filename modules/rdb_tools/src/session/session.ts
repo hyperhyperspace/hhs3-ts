@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
+import type { B64Hash, KeyId, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import type { AuthorRef, LangValue } from "@hyper-hyper-space/hhs3_rdb_lang";
 
@@ -24,6 +24,12 @@ export class WorkspaceSession {
     readonly workspace: Workspace;
     readonly variables = new Map<string, LangValue>();
 
+    // Session state: which keys have been unlocked this session and which one is
+    // the current default author. The keystore is a pure on-disk vault and owns
+    // none of this.
+    private readonly unlocked = new Map<KeyId, OwnIdentity>();
+    private currentAuthorKeyId?: KeyId;
+
     keystore?: KeyStore;
     currentDatabase?: B64Hash;
     currentGroup?: B64Hash;
@@ -35,6 +41,43 @@ export class WorkspaceSession {
         this.workspace = options.workspace;
         this.keystore = options.keystore;
         this.outputMode = options.outputMode ?? 'table';
+    }
+
+    // Create a new key in the vault and add it to the unlocked set. Like
+    // unlockKey, this does NOT make it the default author.
+    async createKey(label: string, passphrase: string): Promise<OwnIdentity> {
+        if (this.keystore === undefined) throw new Error('No keystore configured');
+        const identity = await this.keystore.create(label, passphrase);
+        this.unlocked.set(identity.keyId, identity);
+        return identity;
+    }
+
+    // Decrypt a stored key and add it to the unlocked set for this session.
+    async unlockKey(labelOrPrefix: string, passphrase: string): Promise<OwnIdentity> {
+        if (this.keystore === undefined) throw new Error('No keystore configured');
+        const identity = await this.keystore.unlock(labelOrPrefix, passphrase);
+        this.unlocked.set(identity.keyId, identity);
+        return identity;
+    }
+
+    // Set the default author. The key must already be unlocked this session.
+    selectAuthor(labelOrPrefix: string): OwnIdentity {
+        if (this.keystore === undefined) throw new Error('No keystore configured');
+        const record = this.keystore.resolveRecord(labelOrPrefix);
+        const identity = this.unlocked.get(record.keyId);
+        if (identity === undefined) throw new Error(`Key '${record.label}' is locked`);
+        this.currentAuthorKeyId = identity.keyId;
+        return identity;
+    }
+
+    // Clear the default author (writes become anonymous unless they carry an
+    // explicit BY clause).
+    clearAuthor(): void {
+        this.currentAuthorKeyId = undefined;
+    }
+
+    isUnlocked(keyId: KeyId): boolean {
+        return this.unlocked.has(keyId);
     }
 
     setCurrentDatabase(id: B64Hash): void {
@@ -61,14 +104,27 @@ export class WorkspaceSession {
         this.variables.set(name, value);
     }
 
+    // Synchronous accessor for the current default author (used by the prompt,
+    // which renders synchronously).
+    selectedAuthor(): OwnIdentity | undefined {
+        return this.currentAuthorKeyId === undefined ? undefined : this.unlocked.get(this.currentAuthorKeyId);
+    }
+
     async currentAuthor(): Promise<OwnIdentity | undefined> {
-        return this.keystore?.selected();
+        return this.selectedAuthor();
+    }
+
+    // Resolve a key reference to an unlocked identity, or undefined when the key
+    // is known but still locked. Throws on an unknown/ambiguous reference.
+    resolveIdentity(labelOrPrefix: string): OwnIdentity | undefined {
+        if (this.keystore === undefined) throw new Error('No keystore configured');
+        const record = this.keystore.resolveRecord(labelOrPrefix);
+        return this.unlocked.get(record.keyId);
     }
 
     async resolveAuthor(ref: AuthorRef): Promise<OwnIdentity> {
-        if (this.keystore === undefined) throw new Error('No keystore configured');
         const labelOrPrefix = ref.kind === 'variable' ? ref.name : `#${ref.prefix}`;
-        const identity = this.keystore.resolveIdentity(labelOrPrefix);
+        const identity = this.resolveIdentity(labelOrPrefix);
         if (identity === undefined) throw new Error(`Key '${labelOrPrefix}' is not unlocked`);
         return identity;
     }

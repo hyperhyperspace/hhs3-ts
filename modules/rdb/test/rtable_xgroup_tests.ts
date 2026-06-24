@@ -48,6 +48,7 @@ async function makeSchemaGroup(ctx: RContext, seed: string, tables: TableDef[], 
     const pinned = await (await schema.getScopedDag()).getFrontier();
 
     const groupInit = await RTableGroupImpl.create({
+        name: seed,
         seed: seed + '-group',
         schemaRef: schema.getId(),
         schemaVersion: pinned,
@@ -292,13 +293,13 @@ export const rtableXGroupTests = {
 
                 // unbound: bindings omitted
                 await expectThrow(async () => {
-                    const init = await RTableGroupImpl.create({ seed: 'xg07-a-group', schemaRef: schemaA.getId(), schemaVersion: pinned });
+                    const init = await RTableGroupImpl.create({ name: 'xg07-a-group', seed: 'xg07-a-group', schemaRef: schemaA.getId(), schemaVersion: pinned });
                     return ctx.createObject(init);
                 }, 'a create whose schema names an unbound qualified target must be rejected');
 
                 // bound: the same create with the binding succeeds
                 const init = await RTableGroupImpl.create({
-                    seed: 'xg07-a-group', schemaRef: schemaA.getId(), schemaVersion: pinned,
+                    name: 'xg07-a-group', seed: 'xg07-a-group', schemaRef: schemaA.getId(), schemaVersion: pinned,
                     bindings: { users: b.group.getId() },
                 });
                 const group = (await ctx.createObject(init)) as RTableGroupImpl;
@@ -320,7 +321,7 @@ export const rtableXGroupTests = {
 
                 await expectThrow(async () => {
                     const init = await RTableGroupImpl.create({
-                        seed: 'xg08-a-group', schemaRef: schemaA.getId(), schemaVersion: pinned,
+                        name: 'xg08-a-group', seed: 'xg08-a-group', schemaRef: schemaA.getId(), schemaVersion: pinned,
                         bindings: { users: deriveRowId('not-a-real-group') },
                     });
                     return ctx.createObject(init);

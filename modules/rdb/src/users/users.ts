@@ -163,6 +163,7 @@ export async function createUsersGroup(
     const pinned = await (await schema.getScopedDag()).getFrontier();
 
     const groupInit = await RTableGroupImpl.create({
+        name: seed,
         seed: seed + '-group',
         schemaRef: schema.getId(),
         schemaVersion: pinned,

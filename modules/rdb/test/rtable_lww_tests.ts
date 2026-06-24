@@ -54,6 +54,7 @@ async function createTestEnv() {
     const pinned = await (await schema.getScopedDag()).getFrontier();
 
     const groupInit = await RTableGroupImpl.create({
+        name: 'lww-test-group',
         seed: 'lww-test-group',
         schemaRef: schema.getId(),
         schemaVersion: pinned,

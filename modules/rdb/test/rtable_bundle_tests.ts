@@ -74,6 +74,7 @@ async function createTestEnv(opts?: { ordersConcurrentDeletes?: boolean; selfVal
     const pinned = await (await schema.getScopedDag()).getFrontier();
 
     const groupInit = await RTableGroupImpl.create({
+        name: 'bundle-test-group',
         seed: 'bundle-test-group',
         schemaRef: schema.getId(),
         schemaVersion: pinned,

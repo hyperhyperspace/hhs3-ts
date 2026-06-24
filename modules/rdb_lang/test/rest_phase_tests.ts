@@ -49,6 +49,7 @@ async function createEnv() {
     });
     const usersSchema = await ctx.createObject(usersSchemaInit) as RSchemaImpl;
     const usersGroupInit = await RTableGroupImpl.create({
+        name: 'users-group',
         seed: 'users-group',
         schemaRef: usersSchema.getId(),
         schemaVersion: await (await usersSchema.getScopedDag()).getFrontier(),
@@ -237,6 +238,7 @@ export const restPhaseTests = {
                 const renderedGroup = renderCreateTableGroup({
                     action: 'create',
                     type: RTableGroupImpl.typeId,
+                    name: 'shop_prod',
                     seed: 'shop_prod',
                     schemaRef: 'schema',
                     schemaVersion: json.toSet(['schemaVersion']),
@@ -249,6 +251,7 @@ export const restPhaseTests = {
                 const renderedCorrelated = renderCreateTableGroup({
                     action: 'create',
                     type: RTableGroupImpl.typeId,
+                    name: 'shop_prod',
                     seed: 'shop_prod',
                     schemaRef: 'schema',
                     schemaVersion: json.toSet(['schemaVersion']),

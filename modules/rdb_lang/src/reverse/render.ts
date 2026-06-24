@@ -25,7 +25,7 @@ export function renderCreateSchema(payload: CreateRSchemaPayload): string {
 
 export function renderCreateTableGroup(payload: CreateTableGroupPayload): string {
     const parts = [
-        `CREATE TABLEGROUP ${payload.seed} USING SCHEMA #${payload.schemaRef} AT ${renderVersionSet(payload.schemaVersion)}`,
+        `CREATE TABLEGROUP ${payload.name} USING SCHEMA #${payload.schemaRef} AT ${renderVersionSet(payload.schemaVersion)}`,
     ];
     for (const [name, id] of Object.entries(payload.bindings ?? {})) parts.push(`BIND ${name} => #${id}`);
     if (payload.idProvider !== undefined) parts.push(`USING IDENTITIES ${payload.idProvider}`);

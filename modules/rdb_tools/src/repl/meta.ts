@@ -24,10 +24,10 @@ export async function runMetaCommand(session: WorkspaceSession, line: string): P
         case 'groups': return { handled: true, output: formatRoots(session, 'group') };
         case 'dt': return { handled: true, output: await listTables(session, args[0]) };
         case 'd': return { handled: true, output: await describeTable(session, args[0]) };
-        case 'keys': return { handled: true, output: listKeys(session) };
+        case 'keys': return { handled: true, output: await listKeys(session) };
         case 'key': return { handled: true, ...await keyCommand(session, args) };
         case 'author': return { handled: true, ...await authorCommand(session, args) };
-        case 'whoami': return { handled: true, output: session.keystore?.selected()?.keyId ?? '(no identity selected)' };
+        case 'whoami': return { handled: true, output: (await session.currentAuthor())?.keyId ?? '(no identity selected)' };
         case 'use': return { handled: true, output: await useCommand(session, args) };
         case 'view': return { handled: true, output: session.defaultView === undefined ? 'VIEW LATEST' : formatView(session) };
         case 'frontier': return { handled: true, output: await frontier(session, args[0]) };
@@ -73,13 +73,14 @@ async function describeTable(session: WorkspaceSession, tableRef: string | undef
     })));
 }
 
-function listKeys(session: WorkspaceSession): string {
+async function listKeys(session: WorkspaceSession): Promise<string> {
     if (session.keystore === undefined) return '(no keystore)';
+    const selectedKeyId = (await session.currentAuthor())?.keyId;
     return formatRows(session.keystore.list().map((key) => ({
         label: key.label,
         keyId: key.keyId,
-        unlocked: session.keystore?.isUnlocked(key.keyId) === true,
-        selected: session.keystore?.selected()?.keyId === key.keyId,
+        unlocked: session.isUnlocked(key.keyId),
+        selected: selectedKeyId === key.keyId,
     })));
 }
 
@@ -91,13 +92,13 @@ async function keyCommand(session: WorkspaceSession, args: string[]): Promise<Ke
     if (sub === 'create') {
         if (label === undefined) throw new Error('Usage: \\key create <label> [passphrase]');
         if (passphrase === undefined) return { needsPassphrase: { kind: 'create', label } };
-        const identity = await session.keystore.create(label, passphrase);
+        const identity = await session.createKey(label, passphrase);
         return { output: `created ${label} ${identity.keyId}` };
     }
     if (sub === 'unlock') {
         if (label === undefined) throw new Error('Usage: \\key unlock <label|#prefix>');
         if (passphrase === undefined) return { needsPassphrase: { kind: 'unlock', label } };
-        const identity = await session.keystore.unlock(label, passphrase);
+        const identity = await session.unlockKey(label, passphrase);
         return { output: `unlocked ${identity.keyId}` };
     }
     throw new Error('Usage: \\key create|unlock ...');
@@ -110,21 +111,21 @@ async function authorCommand(session: WorkspaceSession, args: string[]): Promise
     if (session.keystore === undefined) throw new Error('No keystore configured');
     const [target, passphrase] = args;
     if (target === undefined) {
-        const identity = session.keystore.selected();
+        const identity = await session.currentAuthor();
         return { output: identity === undefined ? 'nobody' : labelFor(session, identity.keyId) };
     }
     // A key literally labelled "nobody" is selected via its #keyid prefix.
     if (target.toLowerCase() === 'nobody') {
-        await session.keystore.clearSelection();
+        session.clearAuthor();
         return { output: 'author nobody' };
     }
     // resolveIdentity throws on an unknown/ambiguous key, and returns undefined
     // only when the key is known but still locked.
-    if (session.keystore.resolveIdentity(target) === undefined) {
+    if (session.resolveIdentity(target) === undefined) {
         if (passphrase === undefined) return { needsPassphrase: { kind: 'author', label: target } };
-        await session.keystore.unlock(target, passphrase);
+        await session.unlockKey(target, passphrase);
     }
-    const identity = await session.keystore.select(target);
+    const identity = session.selectAuthor(target);
     return { output: `author ${labelFor(session, identity.keyId)}` };
 }
 

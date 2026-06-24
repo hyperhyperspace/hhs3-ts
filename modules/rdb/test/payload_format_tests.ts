@@ -172,6 +172,7 @@ async function testGroupCreate() {
     const create: CreateTableGroupPayload = {
         action: 'create',
         type: RTABLE_GROUP_TYPE_ID,
+        name: 'shop',
         seed: 'seed-1',
         schemaRef: 'schemaObjectId',
         schemaVersion: json.toSet(['hash1', 'hash2']),
@@ -182,6 +183,9 @@ async function testGroupCreate() {
 
     const { schemaRef: _schemaRef, ...noSchemaRef } = create;
     assertFalse(validateTableGroupPayloadFormat(noSchemaRef as json.Literal), 'group create without schemaRef should not validate');
+
+    const { name: _name, ...noName } = create;
+    assertFalse(validateTableGroupPayloadFormat(noName as json.Literal), 'group create without name should not validate');
 
     assertFalse(validateTableGroupPayloadFormat({
         ...create,

@@ -51,6 +51,7 @@ async function compileCreateTableGroup(bound: BoundCreateTableGroup): Promise<Cr
     }
 
     const payload = await RTableGroupImpl.create({
+        name: bound.ast.name,
         seed: bound.seed,
         schemaRef: bound.schema.id,
         schemaVersion: bound.schemaVersion,

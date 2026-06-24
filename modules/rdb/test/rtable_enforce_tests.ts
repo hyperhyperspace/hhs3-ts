@@ -38,6 +38,7 @@ async function createEnv(tables: TableDef[], opts?: {
     const pinned = await (await schema.getScopedDag()).getFrontier();
 
     const groupInit = await RTableGroupImpl.create({
+        name: 'enf-test-group',
         seed: 'enf-test-group',
         schemaRef: schema.getId(),
         schemaVersion: pinned,

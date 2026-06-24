@@ -35,6 +35,7 @@ async function testRDbDrivenSync() {
     const pinned = computePinnedVersion(schemaId);
 
     const groupInit = await RTableGroupImpl.create({
+        name: 'rdb-full-group',
         seed: 'rdb-full-group',
         schemaRef: schemaId,
         schemaVersion: pinned,
@@ -100,6 +101,7 @@ async function testBidirectionalWrites() {
     const pinned = computePinnedVersion(schemaId);
 
     const groupInit = await RTableGroupImpl.create({
+        name: 'rdb-full02-group',
         seed: 'rdb-full02-group',
         schemaRef: schemaId,
         schemaVersion: pinned,
@@ -169,6 +171,7 @@ async function testDynamicMembership() {
     const pinned1 = computePinnedVersion(schema1Id);
 
     const group1Init = await RTableGroupImpl.create({
+        name: 'rdb-full03-group1',
         seed: 'rdb-full03-group1',
         schemaRef: schema1Id,
         schemaVersion: pinned1,
@@ -184,6 +187,7 @@ async function testDynamicMembership() {
     const pinned2 = computePinnedVersion(schema2Id);
 
     const group2Init = await RTableGroupImpl.create({
+        name: 'rdb-full03-group2',
         seed: 'rdb-full03-group2',
         schemaRef: schema2Id,
         schemaVersion: pinned2,
@@ -265,6 +269,7 @@ async function testCrossGroupFkObserve() {
     const pinnedB = computePinnedVersion(schemaBId);
 
     const groupBInit = await RTableGroupImpl.create({
+        name: 'rdb-full04-group-b',
         seed: 'rdb-full04-group-b',
         schemaRef: schemaBId,
         schemaVersion: pinnedB,
@@ -282,6 +287,7 @@ async function testCrossGroupFkObserve() {
     const pinnedA = computePinnedVersion(schemaAId);
 
     const groupAInit = await RTableGroupImpl.create({
+        name: 'rdb-full04-group-a',
         seed: 'rdb-full04-group-a',
         schemaRef: schemaAId,
         schemaVersion: pinnedA,
@@ -356,6 +362,7 @@ async function testSignedOpsMeshSync() {
     const usersPinned = computePinnedVersion(usersSchemaId);
 
     const usersGroupInit = await RTableGroupImpl.create({
+        name: 'rdb-full05-users-group',
         seed: 'rdb-full05-users-group',
         schemaRef: usersSchemaId,
         schemaVersion: usersPinned,
@@ -385,6 +392,7 @@ async function testSignedOpsMeshSync() {
     const appPinned = computePinnedVersion(appSchemaId);
 
     const appGroupInit = await RTableGroupImpl.create({
+        name: 'rdb-full05-app-group',
         seed: 'rdb-full05-app-group',
         schemaRef: appSchemaId,
         schemaVersion: appPinned,
@@ -475,6 +483,7 @@ async function testMultiDagDeployment() {
     const usersPinned = computePinnedVersion(usersSchemaId);
 
     const usersGroupInit = await RTableGroupImpl.create({
+        name: 'rdb-full06-users-group',
         seed: 'rdb-full06-users-group',
         schemaRef: usersSchemaId,
         schemaVersion: usersPinned,
@@ -495,6 +504,7 @@ async function testMultiDagDeployment() {
     const shopPinned = computePinnedVersion(shopSchemaId);
 
     const shopGroupInit = await RTableGroupImpl.create({
+        name: 'rdb-full06-shop-group',
         seed: 'rdb-full06-shop-group',
         schemaRef: shopSchemaId,
         schemaVersion: shopPinned,
@@ -510,6 +520,7 @@ async function testMultiDagDeployment() {
     const invPinned = computePinnedVersion(invSchemaId);
 
     const invGroupInit = await RTableGroupImpl.create({
+        name: 'rdb-full06-inv-group',
         seed: 'rdb-full06-inv-group',
         schemaRef: invSchemaId,
         schemaVersion: invPinned,
