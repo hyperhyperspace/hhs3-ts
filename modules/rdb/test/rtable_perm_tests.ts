@@ -15,6 +15,7 @@ import type { RTableView } from "../src/rtable/interfaces.js";
 import {
     createUsersGroup, registerIdentity, grantCap, revokeCap, findCapGrants,
     usersSchemaTables, IDENTITIES_TABLE, CAPS_TABLE, USERS_IDENTITIES_PROVIDER,
+    capRow, identityRow, USERS_MANAGER_LABEL, USERS_SCHEMA_NAME,
 } from "../src/users/users.js";
 
 const crypto = createBasicCrypto();
@@ -90,6 +91,44 @@ async function authoredInsertEnvelope(
 
 // docs: insert open (default true), update/delete author-is-author (defaults)
 const docsTable: TableDef = { name: 'docs', columns: { body: { type: 'string' } } };
+
+// A Users group with TWO genesis co-admins, each holding a root manager cap in
+// the genesis create entry. A mutual revoke between them is a delete-vs-delete
+// negation cycle that resolves to deny-the-whole-cycle (both revokes voided,
+// both caps survive).
+async function createTwoAdminUsersGroup(
+    ctx: RContext, a: OwnIdentity, b: OwnIdentity,
+): Promise<{ schema: RSchemaImpl; group: RTableGroupImpl }> {
+    const schemaInit = await RSchemaImpl.create({
+        name: USERS_SCHEMA_NAME,
+        creators: [{ keyId: a.keyId, publicKey: a.publicKey }],
+        tables: usersSchemaTables(USERS_MANAGER_LABEL),
+    });
+    const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
+    const pinned = await (await schema.getScopedDag()).getFrontier();
+
+    const groupInit = await RTableGroupImpl.create({
+        name: 'users', seed: 'users-group',
+        schemaRef: schema.getId(), schemaVersion: pinned,
+        idProvider: IDENTITIES_TABLE,
+        initialRows: {
+            [IDENTITIES_TABLE]: [identityRow('admin-a', a), identityRow('admin-b', b)],
+            [CAPS_TABLE]: [
+                capRow('root-cap-a', a.keyId, USERS_MANAGER_LABEL),
+                capRow('root-cap-b', b.keyId, USERS_MANAGER_LABEL),
+            ],
+        },
+    });
+    const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
+    return { schema, group };
+}
+
+// Reload a group as a FRESH RTableGroupImpl over the same DAG: a clean
+// void-recursion guard, so a query that touches caps in a different order
+// genuinely re-derives the cycle verdict (proves eval-order independence).
+async function freshGroup(ctx: RContext, id: B64Hash): Promise<RTableGroupImpl> {
+    return (await rTableGroupFactory.loadObject(id, ctx, { backendLabel: 'default' })) as RTableGroupImpl;
+}
 
 export const rtablePermTests = {
     title: '[PERM] Signed ops + permissions tests',
@@ -737,6 +776,52 @@ export const rtablePermTests = {
                 const merged = await frontier(group);
                 assertFalse(await (await tableView(group, 'docs', merged)).hasRow(dId),
                     'a concurrent barrier revoke of the correlated grant voids the use');
+            }
+        },
+        {
+            name: '[PERM12] mutual revoke of two co-admins: deny-the-whole-cycle (both survive), deterministically (eval-order independent)',
+            invoke: async () => {
+                const ctx = newCtx();
+                const a = await makeIdentity();
+                const b = await makeIdentity();
+                const { group } = await createTwoAdminUsersGroup(ctx, a, b);
+
+                const capA = deriveRowId('root-cap-a');
+                const capB = deriveRowId('root-cap-b');
+
+                // both branch off the genesis frontier -> the two revokes are
+                // mutually concurrent barrier deletes (the negation cycle)
+                const base = await frontier(group);
+                await revokeCap(group, a, b.keyId, USERS_MANAGER_LABEL, base);   // A removes B
+                await revokeCap(group, b, a.keyId, USERS_MANAGER_LABEL, base);   // B removes A
+
+                const merged = await frontier(group);
+
+                // deny-the-whole-cycle: each revoke's authority depends on the
+                // other revoke being voided, so the cycle voids BOTH revokes and
+                // both caps survive (the conservative least fixpoint).
+                const view = await tableView(group, CAPS_TABLE, merged);
+                const aLive = await view.hasRow(capA);
+                const bLive = await view.hasRow(capB);
+                assertTrue(aLive, 'cap A survives the mutual revoke (its revoker is voided)');
+                assertTrue(bLive, 'cap B survives the mutual revoke (its revoker is voided)');
+
+                // eval-order independence: fresh instances that resolve the cycle
+                // starting from either cap reach the same verdict (no cache to
+                // leak a traversal-dependent intermediate across queries)
+                const g1 = await freshGroup(ctx, group.getId());
+                const v1 = await (await g1.getView(merged, merged)).getTableView(CAPS_TABLE);
+                const a1 = await v1.hasRow(capA);   // touch A first
+                const b1 = await v1.hasRow(capB);
+
+                const g2 = await freshGroup(ctx, group.getId());
+                const v2 = await (await g2.getView(merged, merged)).getTableView(CAPS_TABLE);
+                const b2 = await v2.hasRow(capB);   // touch B first
+                const a2 = await v2.hasRow(capA);
+
+                assertEquals(a1, a2, 'cap A verdict is identical regardless of which cap is resolved first');
+                assertEquals(b1, b2, 'cap B verdict is identical regardless of which cap is resolved first');
+                assertEquals(a1, aLive, 'fresh-instance verdict matches the original instance');
             }
         },
     ],

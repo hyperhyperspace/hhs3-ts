@@ -174,16 +174,26 @@ export class RTableGroupImpl implements RTableGroupContract {
     private _causalDag: CausalDag | undefined;
     private tables: Map<string, RTableImpl> = new Map();
 
-    // Entry-void memo (keyed by entryHash|fromKey; positional, so stable) and
-    // the void-recursion cycle guard. Voiding can recurse: a restriction/exists
+    // The void-recursion cycle guard. Voiding can recurse: a restriction/exists
     // (a caps insert gated by exists over caps, whose witness insert is itself
     // gated, ...) AND FK reach (a write whose FK target's own
     // liveness depends on another voided write). Both fold into ONE least-
-    // fixpoint: a cycle DENIES (the entry is treated as VOID). This makes a
-    // self-granting op (its own witness) void — authority must root at a genesis
-    // fiat row, which is never voided — and an FK reference cycle resolve to
-    // DENY (replacing the former assume-live greatest-fixpoint FK guard).
-    private _voidCache: Map<string, boolean> = new Map();
+    // fixpoint: a cycle DENIES (the ENTIRE cycle is treated as VOID). This makes
+    // a self-granting op (its own witness) void — authority must root at a
+    // genesis fiat row, which is never voided — and an FK reference cycle resolve
+    // to DENY (replacing the former assume-live greatest-fixpoint FK guard).
+    //
+    // Deny-the-whole-cycle is the basic, replica-convergent semantics: it is a
+    // pure function of the entry and `from`, so every replica agrees regardless
+    // of which node a top-level query first touches. A delete-vs-delete negation
+    // cycle (mutual revocation) therefore resolves to BOTH deletes voided (both
+    // caps survive) — the conservative least fixpoint, not a single survivor.
+    // NOTE: there is deliberately NO memo cache here. A cache keyed only by
+    // (entry, from) would leak a traversal-dependent intermediate verdict across
+    // independent top-level queries and break replica convergence; the guard
+    // below is transient (added before recursing, removed in finally), so it
+    // only ever detects a cycle within ONE computation. See VOID_SEMANTICS.md
+    // for the logic-program framing and the future stratified/seniority design.
     private _voidVisiting: Set<string> = new Set();
 
     private deltaStrategy: RTableGroupDeltaStrategy = 'bounded';
@@ -468,15 +478,15 @@ export class RTableGroupImpl implements RTableGroupContract {
     // least fixpoint; see the _voidVisiting note above).
     async isEntryVoided(entryHash: B64Hash, from: Version): Promise<boolean> {
         const key = entryHash + '|' + [...from].sort().join(',');
-        const cached = this._voidCache.get(key);
-        if (cached !== undefined) return cached;
-        if (this._voidVisiting.has(key)) return true;   // authorization cycle: DENY (treat as voided)
+
+        // A cycle on the authorization-recursion stack: DENY (least fixpoint —
+        // the whole cycle is treated as voided). The guard is transient, so
+        // this only fires within one top-level computation (see the field note).
+        if (this._voidVisiting.has(key)) return true;
 
         this._voidVisiting.add(key);
         try {
-            const result = await this.computeEntryVoided(entryHash, from);
-            this._voidCache.set(key, result);
-            return result;
+            return await this.computeEntryVoided(entryHash, from);
         } finally {
             this._voidVisiting.delete(key);
         }
