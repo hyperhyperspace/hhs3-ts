@@ -256,6 +256,7 @@ class Parser {
                     end = predicate.span;
                 } else {
                     this.expectKeyword('DEPLOY');
+                    this.expectKeyword('SCHEMA');
                     this.expectKeyword('IF');
                     canDeploy = this.parsePredicate();
                     end = canDeploy.span;

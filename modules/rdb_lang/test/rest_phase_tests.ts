@@ -246,7 +246,7 @@ export const restPhaseTests = {
                     canDeploy: { p: 'true' },
                 } as CreateTableGroupPayload);
                 assertTrue(renderedGroup.includes('USING IDENTITIES users.identities'), 'rendered tablegroup uses USING IDENTITIES syntax');
-                assertTrue(renderedGroup.includes('CAN DEPLOY IF true'), 'rendered tablegroup uses CAN DEPLOY IF syntax');
+                assertTrue(renderedGroup.includes('CAN DEPLOY SCHEMA IF true'), 'rendered tablegroup uses CAN DEPLOY SCHEMA IF syntax');
                 assertTrue(parseStatement(renderedGroup).ok, 'rendered tablegroup parses');
                 const renderedCorrelated = renderCreateTableGroup({
                     action: 'create',

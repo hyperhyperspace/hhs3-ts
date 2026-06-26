@@ -29,7 +29,7 @@ CREATE SCHEMA shop AS (
 CREATE TABLEGROUP shop_prod USING SCHEMA shop AT {#schemaVersion}
   BIND users => users
   USING IDENTITIES users.identities
-  CAN DEPLOY IF EXISTS users.caps WHERE label = 'deployer' AND grantee = $author;
+  CAN DEPLOY SCHEMA IF EXISTS users.caps WHERE label = 'deployer' AND grantee = $author;
 ```
 
 DDL and refs:
@@ -116,7 +116,7 @@ The author is `$name` (an unlocked identity, resolved by the host) or `#keyid` (
 Tablegroup deploy authority uses a positive deploy gate:
 
 ```sql
-CAN DEPLOY IF EXISTS users.caps
+CAN DEPLOY SCHEMA IF EXISTS users.caps
   WHERE label = 'deployer'
   AND grantee = $author
 ```

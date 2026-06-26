@@ -124,6 +124,7 @@ export type CreateTableGroupStatement = {
     schemaVersion?: VersionExpr;
     bindings: { name: string; group: NameOrHashRef; span: TextSpan }[];
     idProvider?: string;
+    // deploy gate: `CAN DEPLOY SCHEMA IF <predicate>`.
     canDeploy?: PredicateExpr;
     // per-binding observation gate: `CAN UPDATE REF <binding> IF <predicate>`.
     canObserve: { binding: string; predicate: PredicateExpr; span: TextSpan }[];

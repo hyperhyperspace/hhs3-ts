@@ -162,11 +162,11 @@ export const parserTests = {
             },
         },
         {
-            name: '[PARSE10] parses CAN DEPLOY IF predicates',
+            name: '[PARSE10] parses CAN DEPLOY SCHEMA IF predicates',
             invoke: async () => {
                 const result = parseStatement(`
                     CREATE TABLEGROUP shop_prod USING SCHEMA shop
-                      CAN DEPLOY IF EXISTS users.caps WHERE label = 'deployer' AND grantee = $author;
+                      CAN DEPLOY SCHEMA IF EXISTS users.caps WHERE label = 'deployer' AND grantee = $author;
                 `);
                 assertTrue(result.ok, 'parse should succeed');
                 if (!result.ok || result.value.kind !== 'create-tablegroup') return;

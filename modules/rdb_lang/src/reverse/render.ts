@@ -29,7 +29,7 @@ export function renderCreateTableGroup(payload: CreateTableGroupPayload): string
     ];
     for (const [name, id] of Object.entries(payload.bindings ?? {})) parts.push(`BIND ${name} => #${id}`);
     if (payload.idProvider !== undefined) parts.push(`USING IDENTITIES ${payload.idProvider}`);
-    if (payload.canDeploy !== undefined) parts.push(`CAN DEPLOY IF ${renderPredicate(payload.canDeploy)}`);
+    if (payload.canDeploy !== undefined) parts.push(`CAN DEPLOY SCHEMA IF ${renderPredicate(payload.canDeploy)}`);
     for (const [binding, pred] of Object.entries(payload.canObserve ?? {})) {
         parts.push(`CAN UPDATE REF ${binding} IF ${renderPredicate(pred)}`);
     }
