@@ -17,6 +17,7 @@ import {
     findConcurrentRefAdvanceBarriers,
     refVersionAtOrAbove,
     refVersionAtOrBelow,
+    resolveRefVersionAtPosition,
     resolveRefVersions,
     projectForeignBound,
     validateRefAdvanceMonotonicity,
@@ -253,6 +254,42 @@ async function testResolveRefVersions() {
     testing.assertTrue(setEq(refFrom, version(fV1)), 'refFrom should resolve at observer frontier without widening');
 }
 
+async function testResolveRefVersionAtPositionIsLive() {
+    const refId = 'foreignObj';
+    const foreignDag = createTestDag();
+    const fRoot = await foreignDag.append({ n: 0 }, {});
+    const fV1 = await foreignDag.append({ n: 1 }, {}, version(fRoot));
+    const fV2 = await foreignDag.append({ n: '2b' }, {}, version(fRoot));   // concurrent to fV1
+
+    const observerRaw = createTestDag();
+    const observer = new RootScopedDag(observerRaw);
+
+    const h0 = await observer.append({ action: 'create' }, {}, undefined);
+    // two concurrent observe ref-advances (both causal at the merge)
+    const hA = await observer.append(
+        createRefAdvancePayload(refId, version(fV1)),
+        createRefAdvanceMeta(refId),
+        version(h0),
+    );
+    const hB = await observer.append(
+        createRefAdvancePayload(refId, version(fV2)),
+        createRefAdvanceMeta(refId),
+        version(h0),
+    );
+
+    const at = version(hA, hB);
+
+    const all = await resolveRefVersionAtPosition(observer, refId, at, at);
+    testing.assertTrue(all.has(fV1) && all.has(fV2), 'without isLive both ref-advances contribute');
+
+    const filtered = await resolveRefVersionAtPosition(observer, refId, at, at, async (h) => h !== hB);
+    testing.assertTrue(filtered.has(fV1), 'a live ref-advance still contributes under isLive');
+    testing.assertFalse(filtered.has(fV2), 'a ref-advance rejected by isLive is skipped');
+
+    const none = await resolveRefVersionAtPosition(observer, refId, at, at, async () => false);
+    testing.assertTrue(none.has(refId) && none.size === 1, 'filtering all ref-advances falls back to version(refId)');
+}
+
 async function testProjectForeignBound() {
     const refId = 'foreignObj';
     const foreignDag = createTestDag();
@@ -393,6 +430,7 @@ export const refsSuite = {
         { name: '[REFS_05] findConcurrentRefAdvanceBarriers DAG query', invoke: testFindConcurrentRefAdvanceBarriers },
         { name: '[REFS_06] refVersionAtOrBelow ordering', invoke: testRefVersionAtOrBelow },
         { name: '[REFS_07] resolveRefVersions for entry', invoke: testResolveRefVersions },
+        { name: '[REFS_07b] resolveRefVersionAtPosition isLive filter', invoke: testResolveRefVersionAtPositionIsLive },
         { name: '[REFS_08] projectForeignBound bound projection', invoke: testProjectForeignBound },
         { name: '[REFS_09] ref-advance monotonicity validation', invoke: testRefAdvanceMonotonicity },
     ],

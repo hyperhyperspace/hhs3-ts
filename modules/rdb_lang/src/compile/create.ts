@@ -1,7 +1,7 @@
 import type { json } from "@hyper-hyper-space/hhs3_json";
 import {
     ColumnDef, CreateRDbPayload, CreateRSchemaPayload, CreateTableGroupPayload, FKs,
-    InsertRowPayload, RDbImpl, RSchemaImpl, RTableGroupImpl, Restriction, TableDef,
+    InsertRowPayload, Predicate, RDbImpl, RSchemaImpl, RTableGroupImpl, Restriction, TableDef,
     deriveRowId,
 } from "@hyper-hyper-space/hhs3_rdb";
 
@@ -50,6 +50,11 @@ async function compileCreateTableGroup(bound: BoundCreateTableGroup): Promise<Cr
         initialRows[row.table].push(payload as unknown as json.Literal);
     }
 
+    const canObserve: { [binding: string]: Predicate } = {};
+    for (const clause of bound.ast.canObserve) {
+        canObserve[clause.binding] = lowerRestrictionPredicate(clause.predicate);
+    }
+
     const payload = await RTableGroupImpl.create({
         name: bound.ast.name,
         seed: bound.seed,
@@ -58,6 +63,7 @@ async function compileCreateTableGroup(bound: BoundCreateTableGroup): Promise<Cr
         ...(Object.keys(bound.bindings).length > 0 ? { bindings: bound.bindings } : {}),
         ...(bound.ast.idProvider !== undefined ? { idProvider: bound.ast.idProvider } : {}),
         ...(bound.ast.canDeploy !== undefined ? { canDeploy: lowerRestrictionPredicate(bound.ast.canDeploy) } : {}),
+        ...(bound.ast.canObserve.length > 0 ? { canObserve } : {}),
         ...(Object.keys(initialRows).length > 0 ? { initialRows } : {}),
     });
 

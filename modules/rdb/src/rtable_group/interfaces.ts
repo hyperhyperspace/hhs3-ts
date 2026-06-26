@@ -30,6 +30,9 @@ export interface RTableGroup extends RObject, NestingParent {
     getPinnedSchemaVersion(): Version;
     getBindings(): { [name: string]: B64Hash };
     getCanDeploy(): Predicate | undefined;
+    // Per-binding gate on foreign-group observations (keyed by binding name),
+    // or undefined when the group declares none.
+    getCanObserve(): { [binding: string]: Predicate } | undefined;
     // The selected identity provider (local table name or 'group.table'), or
     // undefined if the group performs no authentication.
     getIdProvider(): string | undefined;
@@ -48,8 +51,10 @@ export interface RTableGroup extends RObject, NestingParent {
     // exists targets (group.table) up to refVersion. A concurrent observation
     // revises the merged frontier, so a concurrent foreign revoke / deploy
     // voids a concurrent cross-group use there. `group` is a binding name or a
-    // bound group id. No deploy authority is required to advance observation.
-    observe(group: string | B64Hash, refVersion: Version, at?: Version): Promise<B64Hash>;
+    // bound group id. No authority is required to advance an ungated binding;
+    // when the binding declares canObserve, the observation must be authored
+    // (the gate is verified at validation and re-evaluated at-use).
+    observe(group: string | B64Hash, refVersion: Version, author?: OwnIdentity, at?: Version): Promise<B64Hash>;
 
     // Single-entry atomic multi-table write. `writes` is ordered (the bundle
     // order): op i's FK conditions are checked at the sequential cut of `at`

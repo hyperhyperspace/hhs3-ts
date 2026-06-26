@@ -202,6 +202,16 @@ async function testGroupCreate() {
         bindings: { '2bad': 'someGroupId' },
     } as json.Literal), 'binding with invalid name should not validate');
 
+    assertFalse(validateTableGroupPayloadFormat({
+        ...create,
+        bindings: { users: 'sharedGroupId', accounts: 'sharedGroupId' },
+    } as json.Literal), 'non-injective bindings (two names -> one id) should not validate');
+
+    assertTrue(validateTableGroupPayloadFormat({
+        ...create,
+        bindings: { users: 'usersGroupId', accounts: 'accountsGroupId' },
+    } as json.Literal), 'injective bindings (distinct ids) should validate');
+
     const withDeploy: CreateTableGroupPayload = {
         ...create,
         canDeploy: { p: 'exists', table: 'users.caps', where: { label: 'deploy', grantee: '$author' } },

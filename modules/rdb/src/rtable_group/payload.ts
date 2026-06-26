@@ -48,6 +48,20 @@ export const MAX_BUNDLE_OPS = 1024;
 // concrete group object id. v1 bindings are immutable; mutation via barrier
 // ops may come later. A binding whose target object is not present in the
 // replica is an infrastructure error (throw), never an MVT data condition.
+// Bindings must be INJECTIVE (name -> id one-to-one), enforced at create:
+// gates and name resolution are keyed per name, but a ref-advance / observe
+// op is keyed by object id, so the reverse map (id -> name) must be
+// unambiguous to attribute an observe to a single binding name and its gate.
+//
+// `canObserve` is an optional per-binding predicate gating foreign-group
+// observations (ref-advances of a bound group id). It is keyed by binding NAME
+// (resolved to id through the injective bindings map) and evaluated in 'object'
+// context ($author only, no subject row) in the OBSERVED group's frame at the
+// observed foreign version. A binding with no canObserve entry is ungated
+// (observation needs no authority, as before). Enforced both at write-admission
+// (validation, against the imported version) and at-use (view-time, against the
+// G-upward stratified observed version), so a back-dated observation by a former
+// principal is voided. Fixed v1 like bindings / canDeploy.
 //
 // `idProvider` selects this group's identity provider for signature
 // verification: a LOCAL table name (must exist in the pinned schema and be
@@ -68,6 +82,7 @@ export type CreateTableGroupPayload = {
     initialRows?: { [table: string]: json.Literal[] };   // genesis fiat rows (insert op shape)
     bindings?: { [name: string]: B64Hash };        // group name -> group object id (fixed v1)
     canDeploy?: Predicate;                         // gates schema ref-advances ('object' context; fixed v1)
+    canObserve?: { [binding: string]: Predicate }; // per-binding gate on foreign-group observations ('object' context; fixed v1)
     idProvider?: string;                           // local table name or 'group.table' (fixed v1)
     hashAlgorithm?: string;
 };
@@ -88,6 +103,10 @@ export const createTableGroupFormat: json.Format = {
         [json.Type.BoundedString, MAX_HASH_LENGTH],
         MAX_BINDINGS]],
     canDeploy: [json.Type.Option, json.Type.Something],   // checked with validatePredicate('object')
+    canObserve: [json.Type.Option, [json.Type.BoundedMap,
+        [json.Type.BoundedString, MAX_NAME_LENGTH],
+        json.Type.Something,                              // each checked with validatePredicate('object')
+        MAX_BINDINGS]],
     idProvider: [json.Type.Option, [json.Type.BoundedString, MAX_QUALIFIED_NAME_LENGTH]],
     hashAlgorithm: [json.Type.Option, [json.Type.BoundedString, MAX_HASH_ALGORITHM_LENGTH]],
 };

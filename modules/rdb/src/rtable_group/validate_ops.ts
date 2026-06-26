@@ -77,6 +77,12 @@ export type GroupOpHost = {
     getSchemaRef(): B64Hash;
     getPinnedSchemaVersion(): Version;
     getCanDeploy(): Predicate | undefined;
+    // The canObserve gate for an observation of `refId` (a bound group id), or
+    // undefined when the binding is ungated.
+    observeGateFor(refId: B64Hash): Predicate | undefined;
+    // Evaluate a binding's canObserve gate in the OBSERVED group's frame at
+    // (refAt, refFrom) against `author`. True when ungated.
+    evaluateObserveGate(refId: B64Hash, author: KeyId | undefined, refAt: Version, refFrom: Version): Promise<boolean>;
     getBindings(): { [name: string]: B64Hash };
     getIdProvider(): string | undefined;
     getHashSuite(): HashSuite;
@@ -189,6 +195,15 @@ async function validateCreate(create: CreateTableGroupPayload, ctx: RContext): P
     for (const groupName of qualifiedTargetGroups(schemaView)) {
         if (!Object.prototype.hasOwnProperty.call(bindings, groupName)) {
             return validationFailure(`schema target group '${groupName}' is not bound`);
+        }
+    }
+
+    // every canObserve gate must key a DECLARED binding name: the gate is
+    // attributed to an observation through the binding's id, so an entry for a
+    // non-bound name could never be reached (and signals a malformed create).
+    for (const groupName of Object.keys(create.canObserve ?? {})) {
+        if (!Object.prototype.hasOwnProperty.call(bindings, groupName)) {
+            return validationFailure(`canObserve gate names group '${groupName}' which is not bound`);
         }
     }
 
@@ -444,18 +459,51 @@ async function validateRefAdvance(payload: RefAdvancePayload, group: GroupOpHost
     }
 
     // foreign-group observation (cross-group FK / exists). The refId must be a
-    // bound group; advancing observation needs no deploy authority. A missing
-    // bound-group object is an infrastructure error (throw, in
-    // getForeignGroupCausalDag), never a `false`.
+    // bound group; advancing observation needs no deploy authority unless the
+    // binding declares a canObserve gate. A missing bound-group object is an
+    // infrastructure error (throw, in getForeignGroupCausalDag), never a `false`.
     const boundIds = new Set(Object.values(group.getBindings()));
     if (!boundIds.has(payload.refId)) return validationFailure(`ref '${payload.refId}' is neither the schema nor a bound foreign group`);
 
     const foreignCausalDag = await group.getForeignGroupCausalDag(payload.refId);
     const newRefVersion = extractRefVersion(payload);
     const groupDag = await group.getScopedDag();
-    return await validateRefAdvanceMonotonicity(groupDag, foreignCausalDag, payload.refId, newRefVersion, at)
+    if (!await validateRefAdvanceMonotonicity(groupDag, foreignCausalDag, payload.refId, newRefVersion, at)) {
+        return validationFailure(`ref-advance for bound group '${payload.refId}' is not monotonic`);
+    }
+
+    return validateObserveGate(payload, group, at, newRefVersion);
+}
+
+// canObserve gate at write-admission (mirrors validateDeploy's canDeploy block):
+// when the observed binding declares a gate, the observation must be authored,
+// its signature must verify (when a provider is configured), and the gate must
+// hold in the OBSERVED group's frame AT THE IMPORTED VERSION (refAt = refFrom =
+// newRefVersion): "was the author authorized in G at the version they import".
+// At-use voiding (computeEntryVoided) then catches a back-dated observation a
+// later concurrent revoke retroactively unauthorizes.
+async function validateObserveGate(
+    payload: RefAdvancePayload, group: GroupOpHost, at: Version, newRefVersion: Version,
+): Promise<ValidationResult> {
+    if (group.observeGateFor(payload.refId) === undefined) return validationOk();   // ungated binding
+
+    const p = payload as unknown as json.LiteralMap;
+    const author = extractAuthor(p);
+    if (author === undefined) {
+        return validationFailure(`observation of gated group '${payload.refId}' must be authored`);
+    }
+
+    // AUTHENTICATION at the op's own position (the group's OWN provider), like
+    // a deploy: a present-but-unverifiable signature is a hard reject.
+    if (group.getIdProvider() !== undefined) {
+        if (!await verifyPayloadSignature(p, (keyId) => group.resolveAuthorKey(keyId, at))) {
+            return validationFailure(`observation signature from author '${author}' could not be verified`);
+        }
+    }
+
+    return await group.evaluateObserveGate(payload.refId, author, newRefVersion, newRefVersion)
         ? validationOk()
-        : validationFailure(`ref-advance for bound group '${payload.refId}' is not monotonic`);
+        : validationFailure(`canObserve predicate rejected observation of group '${payload.refId}'`);
 }
 
 async function validateDeploy(payload: RefAdvancePayload, group: GroupOpHost, at: Version): Promise<ValidationResult> {

@@ -275,5 +275,45 @@ export const usersPermissionScriptTests = {
                 );
             },
         },
+        {
+            name: '[USERS_SCRIPT06] CAN UPDATE REF gate + BY on UPDATE REF: a manager observes, unauthored is rejected',
+            invoke: async () => {
+                const env = await createEnv();
+                env.vars['me'] = env.admin;
+                await runScriptFile('create_users.sql', env);
+
+                // a docs group whose `users` observation is gated on a manager
+                // cap (evaluated in the users frame: `caps` is local there)
+                await runScriptText(`
+                    CREATE SCHEMA docs_gated_schema CREATORS ($admin) AS (
+                      TABLE docs ( body string )
+                    );
+                    CREATE TABLEGROUP docs_gated
+                      USING SCHEMA docs_gated_schema
+                      BIND users => users
+                      USING IDENTITIES users.identities
+                      CAN UPDATE REF users IF EXISTS caps WHERE label = 'manager' AND grantee = $author;
+                `, env, 'create gated docs group');
+
+                const gated = await group(env, 'docs_gated');
+                const canObserve = gated.getCanObserve();
+                assertTrue(canObserve !== undefined && canObserve['users'] !== undefined,
+                    'CAN UPDATE REF clause compiles into the create payload');
+
+                // an explicitly unauthored observation of a gated binding is rejected
+                await expectScriptFailure('UPDATE REF users TO LATEST ON docs_gated BY NOBODY;', env, false);
+
+                // the admin (a genesis manager) is admitted via `BY $admin`
+                const results = await runScriptText(
+                    'UPDATE REF users TO LATEST ON docs_gated BY $admin;', env, 'authored observe by manager');
+                assertEquals(results[0].kind, 'update-ref', 'a manager-authored observe of a gated binding executes');
+
+                // BY NOBODY on an UNGATED binding stays allowed (explicit unauthored)
+                await runScriptFile('create_docs.sql', env);
+                const ungated = await runScriptText(
+                    'UPDATE REF users TO LATEST ON docs_group BY NOBODY;', env, 'unauthored observe of ungated binding');
+                assertEquals(ungated[0].kind, 'update-ref', 'an ungated binding still observes unauthored');
+            },
+        },
     ],
 };

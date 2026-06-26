@@ -116,11 +116,18 @@ export async function findConcurrentRefAdvanceBarriers(
 // When from === at, only ref-advances in the history of `at` contribute.
 // When from !== at, concurrent ref-advance barriers widen the result,
 // implementing the BFT revision mechanism in the observer DAG.
+//
+// `isLive`, when supplied, is consulted per ref-advance entry (in BOTH folds):
+// an entry for which it returns false is SKIPPED, so a voided ref-advance (e.g.
+// an observation rejected at-use by its authorization gate) contributes no
+// version. Omitting `isLive` is the geometric resolution (every ref-advance
+// counts) and is the default everywhere a gate does not apply.
 export async function resolveRefVersionAtPosition(
     dag: ScopedDag,
     refId: B64Hash,
     at: Version,
     from: Version,
+    isLive?: (entryHash: B64Hash) => Promise<boolean>,
 ): Promise<Version> {
     const causal = await findRefAdvances(dag, refId, at);
     const concurrent = await findConcurrentRefAdvanceBarriers(dag, refId, at, from);
@@ -128,6 +135,7 @@ export async function resolveRefVersionAtPosition(
     const result = version();
 
     for (const hash of causal) {
+        if (isLive !== undefined && !await isLive(hash)) continue;
         const entry = await dag.loadEntry(hash);
         if (entry === undefined) continue;
         if (isRefAdvancePayload(entry.payload)) {
@@ -137,6 +145,7 @@ export async function resolveRefVersionAtPosition(
 
     for (const hash of concurrent) {
         if (causal.has(hash)) continue;
+        if (isLive !== undefined && !await isLive(hash)) continue;
         const entry = await dag.loadEntry(hash);
         if (entry === undefined) continue;
         if (isRefAdvancePayload(entry.payload)) {

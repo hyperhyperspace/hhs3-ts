@@ -242,7 +242,7 @@ export async function generateCrossGroupHistory(seed: number, ops: number): Prom
 
     const observeLatestB = async (at?: Version) => {
         const bFrontier = await bDag.getFrontier();
-        await groupA.observe('B', bFrontier, at);
+        await groupA.observe('B', bFrontier, undefined, at);
     };
 
     // seed a couple of B orders and observe them so A can reference them

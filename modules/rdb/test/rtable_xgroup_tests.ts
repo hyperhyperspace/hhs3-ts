@@ -201,7 +201,7 @@ export const rtableXGroupTests = {
                 // branch 2 (concurrent): delete the identity in B and observe the
                 // post-delete version via a BARRIER observe advance
                 await identities.delete(uId);
-                await a.group.observe('users', await frontier(b.group), base);
+                await a.group.observe('users', await frontier(b.group), undefined, base);
 
                 const merged = await frontier(a.group);
                 assertFalse(await (await tableView(a.group, 'orders', merged)).hasRow(orderId),
@@ -387,7 +387,7 @@ export const rtableXGroupTests = {
                 // branch 2 (concurrent): revoke the witness in B and observe the
                 // revoke via a BARRIER observation advance
                 await caps.delete(capId);
-                await a.group.observe('users', await frontier(b.group), base);
+                await a.group.observe('users', await frontier(b.group), undefined, base);
 
                 const merged = await frontier(a.group);
                 assertFalse(await (await tableView(a.group, 'items', merged)).hasRow(itemId),

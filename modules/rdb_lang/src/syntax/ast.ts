@@ -125,6 +125,8 @@ export type CreateTableGroupStatement = {
     bindings: { name: string; group: NameOrHashRef; span: TextSpan }[];
     idProvider?: string;
     canDeploy?: PredicateExpr;
+    // per-binding observation gate: `CAN UPDATE REF <binding> IF <predicate>`.
+    canObserve: { binding: string; predicate: PredicateExpr; span: TextSpan }[];
     initialRows: InitialRow[];
     span: TextSpan;
 };
@@ -218,6 +220,7 @@ export type UpdateRefStatement = {
     ref: NameOrHashRef;
     version: VersionExpr;
     group: NameOrHashRef;
+    author?: AuthorExpr;
     at?: VersionExpr;
     span: TextSpan;
 };

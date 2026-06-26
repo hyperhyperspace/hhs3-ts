@@ -44,10 +44,19 @@ are barrier-tagged, but only one is negation:
 
 - **schema deploy** (ref-advance of the schema ref) — only *adds* restrictions /
   columns: **monotone**.
-- **foreign-group observe** (ref-advance of a bound group id) — only *widens*
-  the observed foreign version: **monotone**.
+- **foreign-group observe** (ref-advance of a bound group id) — *widens* the
+  observed foreign version: **monotone** as a version-mover, BUT see below.
 - **delete of an authorizing cap** — removes support for a dependent op:
   **non-monotone** (the negation).
+
+An **ungated** observe is monotone (it only widens the observed version). A
+**gated** observe (a binding that declares `canObserve`) is **non-monotone**:
+its own liveness depends on the negation of a concurrent revoke of the
+observation's author in the observed group. That negation is resolved by a
+**local stratification on the observed group's version** (§5.5) rather than by
+the deny-the-whole-cycle collapse — so a gated observe is the one place the
+engine treats an observe edge as negative. The polarity still comes from the
+type (the binding declares the gate), never from the `barrier` tag.
 
 Equating barrier with negative edge would over-stratify: it would drag the
 monotone deploy/observe revisions into the expensive negation-resolution path
@@ -130,6 +139,80 @@ holds. If that ever changes, carry the visiting set as a per-computation value
 (e.g. stored on the `RTableViewImpl` recursion context and threaded through the
 two recursive view-construction sites in `computeEntryVoided` and
 `resolveForeignTableView`) instead of as an instance field.
+
+## 5.5 The gated observe: stratification by the observed version
+
+A `canObserve` gate (declared in rdb_lang as `CAN UPDATE REF <binding> IF ...`)
+authorizes who may advance the observation of a bound foreign group `G`. It is
+enforced in two layers:
+
+- **Layer 1 — the gate (non-monotone).** Decides whether an observe op is a
+  *live ref-advance*. The gate predicate is evaluated in `G`'s frame at the
+  observed version the op resolves to. This is what introduces the negation: a
+  concurrent revoke of the observation's author in `G` can flip the op's
+  liveness.
+- **Layer 2 — reference resolution (monotone).** The effective observed foreign
+  version is the **union** of the live observes' versions; the cross-group view
+  then asks `G` for the target's liveness at that union. This layer is unchanged
+  in semantics; at view-time it merely *skips voided observes*
+  (`resolveRefVersionAtPosition`'s `isLive` filter). A former principal's
+  authority in `G` is neutralized here, monotonically: once any co-observed
+  forward advance carries the revoke, the union carries it, and a later import
+  of an older `G`-branch cannot remove it.
+
+### Why Layer 1's recursion is acyclic (the stratifying coordinate)
+
+The at-use gate widens the observed version **G-upward only**: a concurrent
+observation barrier `z` (publishing `Vz`) widens the cut of observe `y`
+(publishing `Vy`) **iff `Vz` strictly dominates `Vy` in `G`'s DAG** and `z` is
+itself live. The negation we must enforce — a revoke `Rk(author(y))` that voids
+`y` — rides, under **use-before-revoke** (the revoke is causally *after* the
+published `Vy`), a version `Vz ⊋ Vy`. So every negative edge strictly increases
+the `G`-version. A cycle would require `V₁ ⊋ V₂ ⊋ … ⊋ V₁`, impossible in a
+strict partial order. Hence the dependency graph is **locally stratified by the
+`G`-version**: a single sweep, evaluated implicitly latest-`G`-version-first by
+the recursion, has a unique perfect model. No alternating fixpoint, no
+oscillation. The reference pointer being monotone in the observer is exactly the
+coordinate the general delete+barrier case lacks (a mutual revoke there has no
+version pinning the negative edge to a causal direction), which is why a simple
+stratification exists *here* but not in general.
+
+### What this buys
+
+- **Benign concurrent observes** (G-incomparable versions, no revoke): neither
+  is G-above the other, so neither recurses into the other — both live, and the
+  `_voidVisiting` guard never fires. (Equating `barrier` with negative edge
+  would have over-stratified and voided both — see §2.)
+- **Back-dated former-principal observe** (attack 1): the legit revoke-import
+  publishes a strictly-G-greater version, so it widens the back-dated op's cut
+  to include the revoke; the op's own gate then fails — voided.
+- **Back-dated *newer* state to void others** (attack 2): the malicious import
+  is itself widened by the live forward advance above it (which carries the
+  attacker's own revoke), so the malicious observe is voided and excluded from
+  honest ops' anchors; the honest observe stays live.
+
+### The residual core
+
+The stratification only fails to *enforce* a revoke that is `G`-**concurrent**
+to the version it would void (a genuinely concurrent revoke, not a
+use-before-revoke). The gate declines it at Layer 1 — but this is sound, not a
+gap: it is not a "former" principal (he was not yet revoked at publish time),
+and Layer 2's monotone union neutralizes his authority the instant the revoke is
+co-observed. A third-party concurrent cross-revoke (C revokes A, D revokes B,
+cross-carried) is the one irreducible even cycle with `G`-incomparable versions;
+it has no causal stratification and falls back to the existing
+**deny-the-whole-cycle** collapse via `_voidVisiting` (all-survive, convergent),
+exactly as a mutual intra-group revoke does (§4). The guard therefore remains as
+a backstop, but in the entire use-before-revoke regime it is dormant.
+
+### Where it lives
+
+`computeObserveVoided`, `resolveObserveGateRefAt` (the G-upward filtered
+widening), `evaluateObserveGate` (frame rebasing into `G`), and the
+`filterVoided` path of `resolveForeignTableView` in
+[src/rtable_group/group.ts](src/rtable_group/group.ts). The MVT
+`resolveRefVersionAtPosition` `isLive` hook ([modules/mvt/src/refs.ts](../mvt/src/refs.ts))
+is the generic seam for Layer 2.
 
 ## 6. Future direction (not implemented)
 

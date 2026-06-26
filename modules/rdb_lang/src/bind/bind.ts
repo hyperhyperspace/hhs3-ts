@@ -161,6 +161,7 @@ export type BoundUpdateRef = {
     group: ResolvedGroupRef;
     ref: string;
     version: Version;
+    author: OwnIdentity | undefined;
     at: Version;
 };
 
@@ -400,7 +401,8 @@ async function bindUpdateRef(ast: UpdateRefStatement, context: LangBindContext):
     const ref = await resolveBoundGroupRef(ast.ref, group, context);
     const refVersion = await context.resolveVersion(ast.version, { kind: 'group', id: ref.foreign.id, group: ref.foreign.group });
     const at = await context.resolveVersion(ast.at, { kind: 'group', id: group.id, group: group.group });
-    return { kind: 'update-ref', ast, group, ref: ref.observeRef, version: refVersion, at };
+    const author = await resolveEffectiveAuthor(ast.author, context);
+    return { kind: 'update-ref', ast, group, ref: ref.observeRef, version: refVersion, author, at };
 }
 
 async function resolveBoundGroupRef(

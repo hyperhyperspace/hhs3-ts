@@ -96,7 +96,7 @@ Omitted rules use RDb defaults: inserts are allowed, while updates and deletes r
 
 ## Authorship
 
-Authored statements — `INSERT`, `UPDATE`, `DELETE`, `BUNDLE`, `DEPLOY SCHEMA`, and `ALTER SCHEMA` — sign as an author identity. The author is chosen in this order:
+Authored statements — `INSERT`, `UPDATE`, `DELETE`, `BUNDLE`, `DEPLOY SCHEMA`, `UPDATE REF`, and `ALTER SCHEMA` — sign as an author identity. The author is chosen in this order:
 
 1. an explicit trailing `BY` clause, if present;
 2. otherwise the host's default author (`currentAuthor()`), which may itself be unset.
@@ -122,6 +122,18 @@ CAN DEPLOY IF EXISTS users.caps
 ```
 
 The gate is evaluated when deploying a schema version on the tablegroup. It uses object context: `$author` is available, but there is no subject row.
+
+## Ref Update Gates
+
+A bound foreign group can gate who may advance its observed version via `UPDATE REF`:
+
+```sql
+CAN UPDATE REF users IF EXISTS users.caps
+  WHERE label = 'manager'
+  AND grantee = $author
+```
+
+The gate is evaluated against the named binding in object context (`$author`, no subject row). A gated binding requires an authored `UPDATE REF ... BY ...`; ungated bindings still accept `BY NOBODY`.
 
 ## Identity Providers
 

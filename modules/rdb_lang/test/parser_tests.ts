@@ -174,6 +174,20 @@ export const parserTests = {
             },
         },
         {
+            name: '[PARSE10b] parses CAN UPDATE REF gate predicates',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE TABLEGROUP docs_gated USING SCHEMA shop
+                      BIND users => users
+                      CAN UPDATE REF users IF EXISTS users.caps WHERE label = 'manager' AND grantee = $author;
+                `);
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok || result.value.kind !== 'create-tablegroup') return;
+                assertEquals(result.value.canObserve.length, 1, 'one canObserve gate');
+                assertEquals(result.value.canObserve[0].binding, 'users', 'gate binds users');
+            },
+        },
+        {
             name: '[PARSE11] parses single UPDATE REF binding',
             invoke: async () => {
                 const result = parseStatement('UPDATE REF users TO LATEST ON shop_prod;');

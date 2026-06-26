@@ -45,7 +45,7 @@ async function executeRuntime(bound: BoundExecutableStatement): Promise<LangExec
         }
         case 'update-ref': {
             if (bound.group.group === undefined) throw new Error('UPDATE REF target group is not loaded');
-            const entryHash = await bound.group.group.observe(bound.ref, bound.version, bound.at);
+            const entryHash = await bound.group.group.observe(bound.ref, bound.version, bound.author, bound.at);
             return { kind: 'update-ref', entryHash, group: bound.group.id, ref: bound.ref };
         }
         case 'insert': {

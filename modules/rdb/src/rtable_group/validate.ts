@@ -55,13 +55,33 @@ export function validateTableGroupPayloadFormat(payload: json.Literal): Validati
             }
         }
 
-        for (const name of Object.keys(create.bindings ?? {})) {
+        // bindings must be INJECTIVE (name -> id is one-to-one): the reverse
+        // map (group id -> binding name) has to be well-defined so a ref-advance
+        // / observe op (keyed by object id) can be attributed to a single
+        // binding name and its gate. A pure structural property of the payload,
+        // so the rejection is deterministic and replica-convergent.
+        const seenTargets = new Map<string, string>();
+        for (const [name, target] of Object.entries(create.bindings ?? {})) {
             if (!isValidName(name)) return validationFailure(`invalid binding name '${name}'`);
+            const prior = seenTargets.get(target);
+            if (prior !== undefined) {
+                return validationFailure(`bindings must be injective: names '${prior}' and '${name}' both bind group id '${target}'`);
+            }
+            seenTargets.set(target, name);
         }
 
         // canDeploy runs without a subject row: 'object' context ($row.* rejected)
         if (create.canDeploy !== undefined && !validatePredicate(create.canDeploy, 'object')) {
             return validationFailure("canDeploy predicate is invalid");
+        }
+
+        // each canObserve predicate is an 'object'-context gate (no subject row).
+        // Binding-name resolvability (every key is a declared binding) is a
+        // position-independent payload property checked in validate_ops.ts.
+        for (const [binding, pred] of Object.entries(create.canObserve ?? {})) {
+            if (!validatePredicate(pred, 'object')) {
+                return validationFailure(`canObserve predicate for binding '${binding}' is invalid`);
+            }
         }
 
         // idProvider, if present, is a table ref (local name or 'group.table')

@@ -61,8 +61,9 @@ import {
 } from "@hyper-hyper-space/hhs3_mvt";
 import { RootScopedDag, NestedScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
 import {
-    isRefAdvancePayload, extractRefVersion, prepareRefAdvance, createRefAdvanceMeta,
-    createRefAdvancePayload, resolveRefVersionAtPosition,
+    isRefAdvancePayload, extractRefVersion, extractAuthor, prepareRefAdvance, createRefAdvanceMeta,
+    createRefAdvancePayload, resolveRefVersionAtPosition, findConcurrentRefAdvanceBarriers,
+    refVersionAtOrAbove,
 } from "@hyper-hyper-space/hhs3_mvt";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 import { signPayload as signPayloadHelper } from "@hyper-hyper-space/hhs3_mvt";
@@ -80,7 +81,7 @@ import type { RTableGroup as RTableGroupContract, RTableGroupView as RTableGroup
 import { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload, RTABLE_GROUP_TYPE_ID } from "./payload.js";
 import { TableScope, deriveCreateMeta, deriveEnvelopeMeta, deriveBundleMeta } from "./scopes.js";
 import { validateTableGroupPayload } from "./validate_ops.js";
-import { evaluateRowOpRestriction, evaluateRowOpFKReach } from "./predicates.js";
+import { evaluateRowOpRestriction, evaluateRowOpFKReach, evaluatePredicate } from "./predicates.js";
 import { RTableGroupViewImpl } from "./view.js";
 import {
     RTableGroupDelta, RTableGroupDeltaStrategy, RTableGroupDeltaAccumulator,
@@ -141,6 +142,7 @@ export class RTableGroupImpl implements RTableGroupContract {
         initialRows?: { [table: string]: json.Literal[] };
         bindings?: { [name: string]: B64Hash };
         canDeploy?: Predicate;
+        canObserve?: { [binding: string]: Predicate };
         idProvider?: string;
         hashAlgorithm?: string;
     }): Promise<CreateTableGroupPayload> => {
@@ -157,6 +159,7 @@ export class RTableGroupImpl implements RTableGroupContract {
         if (options.initialRows !== undefined) createPayload.initialRows = options.initialRows;
         if (options.bindings !== undefined) createPayload.bindings = options.bindings;
         if (options.canDeploy !== undefined) createPayload.canDeploy = options.canDeploy;
+        if (options.canObserve !== undefined) createPayload.canObserve = options.canObserve;
         if (options.idProvider !== undefined) createPayload.idProvider = options.idProvider;
         if (options.hashAlgorithm !== undefined) createPayload.hashAlgorithm = options.hashAlgorithm;
 
@@ -196,6 +199,11 @@ export class RTableGroupImpl implements RTableGroupContract {
     // for the logic-program framing and the future stratified/seniority design.
     private _voidVisiting: Set<string> = new Set();
 
+    // Memoized inverse of the (injective) bindings map: group id -> binding
+    // name. Injectivity is enforced at create-validation, so the inverse is a
+    // well-defined function; built lazily on first use.
+    private _bindingNameById: Map<B64Hash, string> | undefined;
+
     private deltaStrategy: RTableGroupDeltaStrategy = 'bounded';
 
     constructor(createOpId: B64Hash, createOp: CreateTableGroupPayload, ctx: RContext, backendLabel: string = 'default') {
@@ -228,6 +236,30 @@ export class RTableGroupImpl implements RTableGroupContract {
 
     getCanDeploy(): Predicate | undefined {
         return this.createOp.canDeploy;
+    }
+
+    getCanObserve(): { [binding: string]: Predicate } | undefined {
+        return this.createOp.canObserve;
+    }
+
+    // The binding name a bound group id resolves to, via the injective inverse
+    // of getBindings() (undefined if the id is not a bound group).
+    bindingNameForId(refId: B64Hash): string | undefined {
+        if (this._bindingNameById === undefined) {
+            this._bindingNameById = new Map();
+            for (const [name, id] of Object.entries(this.getBindings())) {
+                this._bindingNameById.set(id, name);
+            }
+        }
+        return this._bindingNameById.get(refId);
+    }
+
+    // The canObserve gate for an observation of `refId` (a bound group id), or
+    // undefined when the binding is ungated (observation needs no authority).
+    observeGateFor(refId: B64Hash): Predicate | undefined {
+        const name = this.bindingNameForId(refId);
+        if (name === undefined) return undefined;
+        return this.getCanObserve()?.[name];
     }
 
     getIdProvider(): string | undefined {
@@ -309,8 +341,16 @@ export class RTableGroupImpl implements RTableGroupContract {
     // own least-fixpoint void guard (each group's _voidVisiting self-
     // terminates), so a mutual A->B->A FK ring resolves to DENY without a
     // shared cross-group guard.
+    //
+    // `filterVoided` (view-time enforcement only): drop observations VOIDED at
+    // this `from` from the observed-version fold (Layer 2 of the observe gate),
+    // so a back-dated observation by a former principal contributes no foreign
+    // state. Validation / view / authentication call sites leave it false (the
+    // geometric resolution); only computeEntryVoided enables it. Note the
+    // observed `from` stays geometric: voided-observe filtering is an `at`-fold
+    // property (which versions participate), not a negative-evidence horizon.
     async resolveForeignTableView(
-        groupName: string, table: string, at: Version, from: Version,
+        groupName: string, table: string, at: Version, from: Version, filterVoided: boolean = false,
     ): Promise<RTableView | undefined> {
         const groupId = this.getBindings()[groupName];
         if (groupId === undefined) return undefined;   // unbound name
@@ -318,13 +358,83 @@ export class RTableGroupImpl implements RTableGroupContract {
         const foreign = await this.loadForeignGroup(groupId, groupName);
 
         const dag = await this.getScopedDag();
-        const foreignAt = await resolveRefVersionAtPosition(dag, groupId, at, from);
+        const isLive = filterVoided ? (h: B64Hash) => this.isObserveLive(groupId, h, from) : undefined;
+        const foreignAt = await resolveRefVersionAtPosition(dag, groupId, at, from, isLive);
         const foreignFrom = await resolveRefVersionAtPosition(dag, groupId, from, from);
 
         const foreignSchema = await foreign.resolveSchemaView(foreignAt, foreignFrom);
         if (!foreignSchema.hasTable(table)) return undefined;   // missing table
 
         return new RTableViewImpl(foreign.makeTable(table), foreignAt, foreignFrom);
+    }
+
+    // Whether the observation entry `entryHash` (a ref-advance of bound group
+    // `groupId`) is LIVE at this `from` horizon: ungated bindings are always
+    // live; a gated binding consults the at-use observe gate (the negation of
+    // isEntryVoided's verdict for the observe). Used as the `isLive` filter for
+    // the Layer 2 observed-version fold.
+    private async isObserveLive(groupId: B64Hash, entryHash: B64Hash, from: Version): Promise<boolean> {
+        if (this.observeGateFor(groupId) === undefined) return true;   // ungated
+        return !await this.isEntryVoided(entryHash, from);
+    }
+
+    // Evaluate a binding's canObserve gate in the OBSERVED group's frame
+    // (frame rebasing): the gate's exists / $author atoms read the foreign
+    // group's tables at the observed foreign version (refAt, refFrom). 'object'
+    // context (no subject row). Returns true when the binding is ungated. Both
+    // the validation path and the at-use path call this with their own anchors.
+    async evaluateObserveGate(
+        refId: B64Hash, author: KeyId | undefined, refAt: Version, refFrom: Version,
+    ): Promise<boolean> {
+        const gate = this.observeGateFor(refId);
+        if (gate === undefined) return true;   // ungated binding
+
+        const foreign = await this.loadForeignGroup(refId, this.bindingNameForId(refId));
+        return evaluatePredicate(gate, {
+            getTableView: (table) => foreign.makeTable(table).getView(refAt, refFrom),
+            getForeignTableView: (groupName, table) =>
+                foreign.resolveForeignTableView(groupName, table, refAt, refFrom),
+            author,
+            context: 'object',
+        });
+    }
+
+    // G-upward filtered widening of the observed version for the at-use observe
+    // gate (Layer 1). Base is the causal (geometric) version published by the
+    // observe at `opPos`; concurrent observation barriers widen it ONLY when
+    // their published version STRICTLY dominates the base in the foreign DAG
+    // AND they are themselves live. Strict G-domination makes the recursion
+    // ascend the foreign version, so it is acyclic and terminating by
+    // construction (no back-edge: an equal/below or concurrent observe is never
+    // a widening candidate), and benign G-incomparable concurrent observes
+    // never recurse into each other. A negative edge (a revoke of this observe's
+    // author) rides a strictly-dominating version under use-before-revoke, so
+    // restricting to G-upward loses no security-relevant widening.
+    async resolveObserveGateRefAt(refId: B64Hash, opPos: Version, from: Version): Promise<Version> {
+        const dag = await this.getScopedDag();
+        const base = await resolveRefVersionAtPosition(dag, refId, opPos, opPos);   // causal base (no widening)
+
+        const foreignDag = await this.getForeignGroupCausalDag(refId);
+        const refAt = version(...base);
+
+        const concurrent = await findConcurrentRefAdvanceBarriers(dag, refId, opPos, from);
+        for (const z of concurrent) {
+            const entry = await dag.loadEntry(z);
+            if (entry === undefined || !isRefAdvancePayload(entry.payload)) continue;
+            const vz = extractRefVersion(entry.payload as RefAdvancePayload);
+
+            // strictly G-above the base: vz >= base AND base !>= vz
+            const above = await refVersionAtOrAbove(foreignDag, vz, base);
+            if (!above) continue;
+            const below = await refVersionAtOrAbove(foreignDag, base, vz);
+            if (below) continue;   // equal / not strict -> not a widening candidate
+
+            if (await this.isEntryVoided(z, from)) continue;   // skip voided concurrent observes
+
+            for (const h of vz) refAt.add(h);
+        }
+
+        return refAt;
     }
 
     private async loadForeignGroup(groupId: B64Hash, groupName?: string): Promise<RTableGroupImpl> {
@@ -414,12 +524,24 @@ export class RTableGroupImpl implements RTableGroupContract {
     // the cross-group use there (symmetric with intra-group concurrent barrier
     // revoke; the foreign-version resolver already passes (at, from), so this
     // is purely the barrier tag). `group` is a binding name or a bound group id.
-    async observe(group: string | B64Hash, refVersion: Version, at?: Version): Promise<B64Hash> {
+    //
+    // When the observed binding declares a canObserve gate, the observation
+    // must be authored: the signature is verified and the gate evaluated at
+    // validation (and re-evaluated at-use), exactly like a gated deploy.
+    async observe(group: string | B64Hash, refVersion: Version, author?: OwnIdentity, at?: Version): Promise<B64Hash> {
         const scopedDag = await this.getScopedDag();
         at = at ?? await scopedDag.getFrontier();
 
         const groupId = this.resolveBoundGroupId(group);
-        const payload = createRefAdvancePayload(groupId, refVersion) as unknown as json.LiteralMap;
+
+        if (this.observeGateFor(groupId) !== undefined && author === undefined) {
+            throw new Error("observe must be authored when the binding declares canObserve");
+        }
+
+        const base = createRefAdvancePayload(groupId, refVersion);
+        const payload = author !== undefined
+            ? await signPayloadHelper(base as unknown as json.LiteralMap, author)
+            : base as unknown as json.LiteralMap;
         const meta = createRefAdvanceMeta(groupId);   // barrier (default)
 
         if (this.selfValidate()) {
@@ -500,7 +622,9 @@ export class RTableGroupImpl implements RTableGroupContract {
         if (entry === undefined) return false;
 
         const payload = entry.payload as json.LiteralMap;
-        if (isRefAdvancePayload(payload)) return false;   // not a row op
+        if (isRefAdvancePayload(payload)) {
+            return this.computeObserveVoided(payload as unknown as RefAdvancePayload, entryHash, from);
+        }
 
         const ops: { table: string; op: RowOpPayload }[] = [];
         if (payload['action'] === 'row') {
@@ -526,8 +650,12 @@ export class RTableGroupImpl implements RTableGroupContract {
         const opPos = version(entryHash);
         const schemaView = await this.resolveSchemaView(opPos, from);
         const getTableView = (table: string) => this.makeTable(table).getView(opPos, from);
+        // view-time enforcement: filter VOIDED observations out of the
+        // observed foreign version (Layer 2 of the observe gate), so a
+        // cross-group FK / exists target made visible only by a back-dated
+        // observation is not live here.
         const getForeignTableView = (group: string, table: string) =>
-            this.resolveForeignTableView(group, table, opPos, from);
+            this.resolveForeignTableView(group, table, opPos, from, true);
 
         // the entry's own sequential-cut overlay: a LOCAL FK target inserted by
         // a sibling op of this same entry (bundle) is live, one it deletes is
@@ -557,6 +685,31 @@ export class RTableGroupImpl implements RTableGroupContract {
             }
         }
         return false;
+    }
+
+    // Whether a ref-advance entry is VOID at this `from` horizon. The schema
+    // deploy is gated at validation only (canDeploy authority is fixed; never
+    // voided at-use). A foreign-group observation of an UNGATED binding is
+    // never voided. A GATED observation is voided when its canObserve gate
+    // fails at-use: evaluated in the observed group's frame at the G-upward
+    // stratified observed version (refAt) with a geometric negative-evidence
+    // horizon (refFrom). The G-upward widening makes the gate recursion acyclic
+    // by construction; the transient _voidVisiting guard remains only as the
+    // residual concurrent-cross-revoke backstop (deny-the-cycle collapse).
+    private async computeObserveVoided(
+        payload: RefAdvancePayload, entryHash: B64Hash, from: Version,
+    ): Promise<boolean> {
+        const refId = payload.refId;
+        if (refId === this.getSchemaRef()) return false;             // schema deploy: validation-only gate
+        if (this.observeGateFor(refId) === undefined) return false;   // ungated observe
+
+        const dag = await this.getScopedDag();
+        const opPos = version(entryHash);
+        const refAt = await this.resolveObserveGateRefAt(refId, opPos, from);
+        const refFrom = await resolveRefVersionAtPosition(dag, refId, from, from);
+        const author = extractAuthor(payload as unknown as json.LiteralMap);
+
+        return !await this.evaluateObserveGate(refId, author, refAt, refFrom);
     }
 
     // RObject interface

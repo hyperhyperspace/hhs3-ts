@@ -222,6 +222,7 @@ class Parser {
         const bindings: CreateTableGroupStatement['bindings'] = [];
         let idProvider: string | undefined;
         let canDeploy: PredicateExpr | undefined;
+        const canObserve: CreateTableGroupStatement['canObserve'] = [];
         const initialRows: InitialRow[] = [];
         let end = schema.span;
 
@@ -245,10 +246,20 @@ class Parser {
                 idProvider = provider.text;
                 end = provider.span;
             } else if (this.matchKeyword('CAN')) {
-                this.expectKeyword('DEPLOY');
-                this.expectKeyword('IF');
-                canDeploy = this.parsePredicate();
-                end = canDeploy.span;
+                const canStart = this.previous().span;
+                if (this.matchKeyword('UPDATE')) {
+                    this.expectKeyword('REF');
+                    const binding = this.expectIdentifierText('binding name');
+                    this.expectKeyword('IF');
+                    const predicate = this.parsePredicate();
+                    canObserve.push({ binding, predicate, span: combineSpans(canStart, predicate.span) });
+                    end = predicate.span;
+                } else {
+                    this.expectKeyword('DEPLOY');
+                    this.expectKeyword('IF');
+                    canDeploy = this.parsePredicate();
+                    end = canDeploy.span;
+                }
             } else if (this.matchKeyword('WITH')) {
                 this.expectKeyword('ROWS');
                 this.expectPunctuation('(');
@@ -265,7 +276,7 @@ class Parser {
             }
         }
 
-        const stmt: CreateTableGroupStatement = { kind: 'create-tablegroup', name, schema, bindings, initialRows, span: combineSpans(start, end) };
+        const stmt: CreateTableGroupStatement = { kind: 'create-tablegroup', name, schema, bindings, canObserve, initialRows, span: combineSpans(start, end) };
         if (schemaVersion !== undefined) stmt.schemaVersion = schemaVersion;
         if (idProvider !== undefined) stmt.idProvider = idProvider;
         if (canDeploy !== undefined) stmt.canDeploy = canDeploy;
@@ -465,11 +476,21 @@ class Parser {
         const group = this.parseNameOrHash();
         let end = group.span;
         let at: VersionExpr | undefined;
-        if (this.matchKeyword('AT')) {
-            at = this.parseVersion();
-            end = at.span;
+        let author: AuthorExpr | undefined;
+        while (!this.isEof() && !this.checkPunctuation(';') && !this.checkPunctuation(')')) {
+            if (this.matchKeyword('AT')) {
+                at = this.parseVersion();
+                end = at.span;
+            } else if (this.matchKeyword('BY')) {
+                author = this.parseAuthor();
+                end = author.span;
+            } else {
+                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected UPDATE REF clause '${this.peek().text}'`, this.peek().span);
+                this.advance();
+            }
         }
         const stmt: UpdateRefStatement = { kind: 'update-ref', ref, version, group, span: combineSpans(start, end) };
+        if (author !== undefined) stmt.author = author;
         if (at !== undefined) stmt.at = at;
         return stmt;
     }

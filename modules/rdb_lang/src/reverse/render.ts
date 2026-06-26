@@ -30,6 +30,9 @@ export function renderCreateTableGroup(payload: CreateTableGroupPayload): string
     for (const [name, id] of Object.entries(payload.bindings ?? {})) parts.push(`BIND ${name} => #${id}`);
     if (payload.idProvider !== undefined) parts.push(`USING IDENTITIES ${payload.idProvider}`);
     if (payload.canDeploy !== undefined) parts.push(`CAN DEPLOY IF ${renderPredicate(payload.canDeploy)}`);
+    for (const [binding, pred] of Object.entries(payload.canObserve ?? {})) {
+        parts.push(`CAN UPDATE REF ${binding} IF ${renderPredicate(pred)}`);
+    }
     if (payload.initialRows !== undefined) {
         const rows: string[] = [];
         for (const [table, tableRows] of Object.entries(payload.initialRows)) {
@@ -68,7 +71,8 @@ export function renderRowOp(payload: RowOpPayload, table?: string, options?: Ren
 }
 
 export function renderRefOp(payload: RefAdvancePayload, options?: RenderOptions): string {
-    return `UPDATE REF #${payload.refId} TO ${renderVersionSet(payload.refVersion)} ON <group>${renderAt(options)};`;
+    const author = (payload as { author?: string }).author;
+    return `UPDATE REF #${payload.refId} TO ${renderVersionSet(payload.refVersion)} ON <group>${renderBy(author)}${renderAt(options)};`;
 }
 
 export function renderBundle(payload: BundlePayload, options?: RenderOptions): string {

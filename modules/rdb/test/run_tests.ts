@@ -9,6 +9,7 @@ import { rtableLwwTests } from "./rtable_lww_tests.js";
 import { rtableBundleTests } from "./rtable_bundle_tests.js";
 import { rtableEnforceTests } from "./rtable_enforce_tests.js";
 import { rtableXGroupTests } from "./rtable_xgroup_tests.js";
+import { rtableObserveGateTests } from "./rtable_observe_gate_tests.js";
 import { rtablePermTests } from "./rtable_perm_tests.js";
 import { rtableQueryTests } from "./rtable_query_tests.js";
 import { rtableDeployTests } from "./rtable_deploy_tests.js";
@@ -33,6 +34,7 @@ async function main() {
     allTests.set(rtableBundleTests.title, rtableBundleTests.tests);
     allTests.set(rtableEnforceTests.title, rtableEnforceTests.tests);
     allTests.set(rtableXGroupTests.title, rtableXGroupTests.tests);
+    allTests.set(rtableObserveGateTests.title, rtableObserveGateTests.tests);
     allTests.set(rtablePermTests.title, rtablePermTests.tests);
     allTests.set(rtableQueryTests.title, rtableQueryTests.tests);
     allTests.set(rtableDeployTests.title, rtableDeployTests.tests);
