@@ -16,6 +16,7 @@ import { runScript } from "../src/script/run_script.js";
 import { resolveRowIdPrefix } from "../src/session/adapter.js";
 import { WorkspaceSession } from "../src/session/session.js";
 import { Workspace } from "../src/workspace/workspace.js";
+import { formatRows, formatRowsVertical } from "../src/format/rows.js";
 
 const tests = [
     {
@@ -121,6 +122,51 @@ const tests = [
                 assertTrue(selected.output.includes('rowId:'), 'vertical rowId field');
                 assertTrue(!selected.output.includes('uuid'), 'vertical output should omit uuid');
                 assertTrue(!selected.output.includes(' | '), 'vertical output should not use table separators');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS05b] formatRows shows fixed columns with blank absent cells',
+        invoke: async () => {
+            const table = formatRows([{ rowId: 'abc', name: 'Admin' }], ['rowId', 'nick', 'name']);
+            assertTrue(table.includes('nick'), 'header includes absent column');
+            const lines = table.split('\n');
+            assertEquals(lines.length, 3, 'header separator and body');
+            const cells = lines[2].split(' | ');
+            assertEquals(cells.length, 3, 'three columns in body');
+            assertEquals(cells[1].trim(), '', 'absent nick cell is blank');
+
+            const vertical = formatRowsVertical([{ rowId: 'abc' }], ['rowId', 'nick']);
+            assertTrue(vertical.includes('nick: '), 'vertical lists absent column with blank value');
+        },
+    },
+    {
+        name: '[RDB_TOOLS05c] SELECT * displays schema columns absent on every row',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, setupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                const alter = await runCommand(session, 'ALTER SCHEMA shop AS (ADD COLUMN products.tag string NULL);');
+                assertEquals(alter.exitCode, 0, alter.output);
+                const deploy = await runCommand(session, 'UPDATE SCHEMA shop TO LATEST ON shop_prod;');
+                assertEquals(deploy.exitCode, 0, deploy.output);
+
+                const selected = await runCommand(session, 'SELECT * FROM shop_prod.products;');
+                assertEquals(selected.exitCode, 0, selected.output);
+                const lines = selected.output.split('\n');
+                assertEquals(lines.length, 3, 'header separator and body');
+                assertTrue(lines[0].includes('tag'), 'SELECT * header includes absent nullable column');
+                const headerCols = lines[0].split(' | ');
+                const dataCols = lines[2].split(' | ');
+                assertEquals(dataCols.length, headerCols.length, 'data row has a cell per header column');
+                const tagIndex = headerCols.indexOf('tag');
+                assertTrue(tagIndex >= 0, 'tag column found in header');
+                assertEquals(dataCols[tagIndex]?.trim(), '', 'tag cell is blank');
+
+                const explicit = await runCommand(session, 'SELECT sku, name FROM shop_prod.products;');
+                assertEquals(explicit.exitCode, 0, explicit.output);
+                assertTrue(!explicit.output.includes('tag |'), 'explicit select does not add extra columns');
             });
         },
     },

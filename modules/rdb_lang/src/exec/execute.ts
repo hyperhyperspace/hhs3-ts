@@ -5,7 +5,7 @@ import { DiagnosticBag, err, ok, Result } from "../diagnostics.js";
 import type { BoundExecutableStatement, BoundStatement } from "../bind/bind.js";
 import { compileCreate } from "../compile/create.js";
 import { executeLog } from "./history.js";
-import type { LangExecutionResult } from "./result.js";
+import type { LangExecutionResult, SelectLangResult } from "./result.js";
 
 export async function execute(bound: BoundStatement): Promise<Result<LangExecutionResult>> {
     const diagnostics = new DiagnosticBag();
@@ -78,12 +78,16 @@ async function executeRuntime(bound: BoundExecutableStatement): Promise<LangExec
         }
         case 'select': {
             const view = await bound.table.table.getView(bound.at, bound.from);
-            return {
+            const result: SelectLangResult = {
                 kind: 'select',
                 table: `${bound.table.groupId}.${bound.table.tableName}`,
                 query: bound.query,
                 rows: await view.query(bound.query),
             };
+            if (bound.ast.projection === '*') {
+                result.columns = await view.getColumns();
+            }
+            return result;
         }
         case 'log':
             return executeLog(bound);

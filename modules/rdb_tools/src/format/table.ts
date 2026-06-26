@@ -14,8 +14,18 @@ export function formatTableResult(result: LangExecutionResult, mode: Exclude<Out
         case 'add-member':
             return `added ${result.member} ${result.memberId} to ${result.database} (${result.entryHash})`;
         case 'select': {
-            const records = result.rows.map(selectRowToRecord);
-            return mode === 'vertical' ? formatRowsVertical(records) : formatRows(records);
+            const schemaColumns = result.columns;
+            const records = result.rows.map((row) => selectRowToRecord(row, schemaColumns));
+            const displayColumns = schemaColumns === undefined
+                ? undefined
+                : [
+                    'rowId',
+                    ...(records.some((row) => row.rowAuthor !== undefined) ? ['rowAuthor'] : []),
+                    ...schemaColumns,
+                ];
+            return mode === 'vertical'
+                ? formatRowsVertical(records, displayColumns)
+                : formatRows(records, displayColumns);
         }
         case 'log':
             return formatLog(result, mode);
@@ -38,10 +48,15 @@ export function formatTableResult(result: LangExecutionResult, mode: Exclude<Out
     }
 }
 
-function selectRowToRecord(row: Row): Record<string, unknown> {
-    return {
-        rowId: row.rowId,
-        ...(row.author !== undefined ? { rowAuthor: row.author } : {}),
-        ...row.values,
-    };
+function selectRowToRecord(row: Row, schemaColumns?: string[]): Record<string, unknown> {
+    const record: Record<string, unknown> = { rowId: row.rowId };
+    if (row.author !== undefined) record.rowAuthor = row.author;
+    if (schemaColumns === undefined) {
+        Object.assign(record, row.values);
+        return record;
+    }
+    for (const column of schemaColumns) {
+        if (row.values[column] !== undefined) record[column] = row.values[column];
+    }
+    return record;
 }

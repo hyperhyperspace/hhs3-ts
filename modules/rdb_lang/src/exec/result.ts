@@ -73,6 +73,7 @@ export type SelectLangResult = {
     table: string;
     query: RowQuery;
     rows: Row[];
+    columns?: string[];   // schema column names; set only for SELECT *
 };
 
 export type LogRow = {

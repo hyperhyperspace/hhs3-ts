@@ -170,6 +170,35 @@ export const restPhaseTests = {
             },
         },
         {
+            name: '[REST02b] SELECT * returns schema columns without materializing absent nullable values',
+            invoke: async () => {
+                const { lang } = await createEnv();
+
+                const insert = await execute(await parseBind("INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');", lang));
+                assertTrue(insert.ok && insert.value.kind === 'insert', 'insert succeeds');
+                if (!insert.ok || insert.value.kind !== 'insert') return;
+
+                const alter = await execute(await parseBind('ALTER SCHEMA shop AS (ADD COLUMN products.tag string NULL);', lang));
+                assertTrue(alter.ok && alter.value.kind === 'alter-schema', 'alter succeeds');
+
+                const deploy = await execute(await parseBind('UPDATE SCHEMA shop TO LATEST ON shop_prod;', lang));
+                assertTrue(deploy.ok && deploy.value.kind === 'update-schema', 'deploy succeeds');
+
+                const select = await execute(await parseBind("SELECT * FROM shop_prod.products WHERE sku = 'A';", lang));
+                assertTrue(select.ok && select.value.kind === 'select', 'select succeeds');
+                if (!select.ok || select.value.kind !== 'select') return;
+                assertTrue(select.value.columns !== undefined && select.value.columns.includes('tag'), 'columns includes absent nullable column');
+                assertTrue(select.value.columns !== undefined && select.value.columns.includes('sku'), 'columns includes sku');
+                assertEquals(select.value.rows[0].values['tag'], undefined, 'absent nullable not in row values');
+
+                const explicit = await execute(await parseBind("SELECT sku, name FROM shop_prod.products WHERE sku = 'A';", lang));
+                assertTrue(explicit.ok && explicit.value.kind === 'select', 'explicit select succeeds');
+                if (explicit.ok && explicit.value.kind === 'select') {
+                    assertEquals(explicit.value.columns, undefined, 'explicit projection omits columns metadata');
+                }
+            },
+        },
+        {
             name: '[REST03] default group resolves unqualified table writes and reads',
             invoke: async () => {
                 const { lang } = await createEnv();
