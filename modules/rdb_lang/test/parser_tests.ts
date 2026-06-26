@@ -162,11 +162,11 @@ export const parserTests = {
             },
         },
         {
-            name: '[PARSE10] parses CAN DEPLOY SCHEMA IF predicates',
+            name: '[PARSE10] parses ALLOW UPDATE SCHEMA IF predicates',
             invoke: async () => {
                 const result = parseStatement(`
                     CREATE TABLEGROUP shop_prod USING SCHEMA shop
-                      CAN DEPLOY SCHEMA IF EXISTS users.caps WHERE label = 'deployer' AND grantee = $author;
+                      ALLOW UPDATE SCHEMA IF EXISTS users.caps WHERE label = 'deployer' AND grantee = $author;
                 `);
                 assertTrue(result.ok, 'parse should succeed');
                 if (!result.ok || result.value.kind !== 'create-tablegroup') return;
@@ -174,17 +174,59 @@ export const parserTests = {
             },
         },
         {
-            name: '[PARSE10b] parses CAN UPDATE REF gate predicates',
+            name: '[PARSE10b] parses ALLOW UPDATE REF gate predicates',
             invoke: async () => {
                 const result = parseStatement(`
                     CREATE TABLEGROUP docs_gated USING SCHEMA shop
                       BIND users => users
-                      CAN UPDATE REF users IF EXISTS users.caps WHERE label = 'manager' AND grantee = $author;
+                      ALLOW UPDATE REF users IF EXISTS users.caps WHERE label = 'manager' AND grantee = $author;
                 `);
                 assertTrue(result.ok, 'parse should succeed');
                 if (!result.ok || result.value.kind !== 'create-tablegroup') return;
                 assertEquals(result.value.canObserve.length, 1, 'one canObserve gate');
                 assertEquals(result.value.canObserve[0].binding, 'users', 'gate binds users');
+            },
+        },
+        {
+            name: '[PARSE10c] rejects deprecated CAN DEPLOY SCHEMA syntax',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE TABLEGROUP shop_prod USING SCHEMA shop
+                      CAN DEPLOY SCHEMA IF true;
+                `);
+                assertTrue(!result.ok, 'CAN DEPLOY SCHEMA should fail');
+                if (!result.ok) {
+                    assertTrue(result.diagnostics.some((d) => d.message.includes('Unexpected CREATE TABLEGROUP clause')),
+                        'diagnostic mentions unexpected clause');
+                }
+            },
+        },
+        {
+            name: '[PARSE10d] rejects row ALLOW rules on CREATE TABLEGROUP',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE TABLEGROUP shop_prod USING SCHEMA shop
+                      ALLOW insert IF true;
+                `);
+                assertTrue(!result.ok, 'ALLOW insert on tablegroup should fail');
+                if (!result.ok) {
+                    assertTrue(result.diagnostics.some((d) => d.message.includes('Expected ALLOW UPDATE SCHEMA or ALLOW UPDATE REF')),
+                        'diagnostic mentions expected tablegroup allow forms');
+                }
+            },
+        },
+        {
+            name: '[PARSE10e] rejects deprecated ALLOW DEPLOY SCHEMA syntax',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE TABLEGROUP shop_prod USING SCHEMA shop
+                      ALLOW DEPLOY SCHEMA IF true;
+                `);
+                assertTrue(!result.ok, 'ALLOW DEPLOY SCHEMA should fail');
+                if (!result.ok) {
+                    assertTrue(result.diagnostics.some((d) => d.message.includes('Expected ALLOW UPDATE SCHEMA or ALLOW UPDATE REF')),
+                        'diagnostic mentions expected tablegroup allow forms');
+                }
             },
         },
         {
@@ -307,9 +349,9 @@ export const parserTests = {
                 assertTrue(anon.ok, 'DELETE BY NOBODY should parse');
                 if (anon.ok && anon.value.kind === 'delete') assertEquals(anon.value.author?.kind, 'nobody', 'delete author is nobody');
 
-                const deploy = parseStatement('DEPLOY SCHEMA s AT LATEST ON g BY $deployer;');
-                assertTrue(deploy.ok, 'DEPLOY BY should parse');
-                if (deploy.ok && deploy.value.kind === 'deploy-schema') assertEquals(deploy.value.author?.kind, 'variable', 'deploy author ref');
+                const deploy = parseStatement('UPDATE SCHEMA s TO LATEST ON g BY $deployer;');
+                assertTrue(deploy.ok, 'UPDATE SCHEMA BY should parse');
+                if (deploy.ok && deploy.value.kind === 'update-schema') assertEquals(deploy.value.author?.kind, 'variable', 'update schema author ref');
 
                 const alter = parseStatement('ALTER SCHEMA s AS (DROP TABLE t) BY $admin;');
                 assertTrue(alter.ok, 'ALTER BY should parse');
@@ -330,6 +372,27 @@ export const parserTests = {
 
                 assertTrue(!parseStatement("BUNDLE ON g (INSERT INTO g.t (v) VALUES ('x') BY $alice;);").ok,
                     'BY on a bundle inner write should fail');
+            },
+        },
+        {
+            name: '[PARSE20] parses UPDATE SCHEMA with trailing causal AT',
+            invoke: async () => {
+                const result = parseStatement('UPDATE SCHEMA shop TO LATEST ON g BY $admin AT {#cut};');
+                assertTrue(result.ok, 'UPDATE SCHEMA with BY and trailing AT should parse');
+                if (!result.ok || result.value.kind !== 'update-schema') return;
+                assertEquals(result.value.author?.kind, 'variable', 'author present');
+                assertEquals(result.value.at?.kind, 'set', 'causal AT present');
+            },
+        },
+        {
+            name: '[PARSE21] rejects deprecated DEPLOY SCHEMA statement syntax',
+            invoke: async () => {
+                const result = parseStatement('DEPLOY SCHEMA shop AT LATEST ON shop_prod;');
+                assertTrue(!result.ok, 'DEPLOY SCHEMA should fail');
+                if (!result.ok) {
+                    assertTrue(result.diagnostics.some((d) => d.message.includes('Unexpected token')),
+                        'diagnostic mentions unexpected token');
+                }
             },
         },
     ],

@@ -8,8 +8,8 @@ import { DiagnosticBag, err, ok, Result } from "../diagnostics.js";
 import type {
     AddMemberStatement, AlterSchemaStatement, AstStatement, AuthorExpr, BundleStatement, BundleWriteStatement,
     CreateDatabaseStatement, CreateSchemaStatement, CreateTableGroupStatement,
-    DeleteStatement, DeploySchemaStatement, InsertStatement, LogStatement,
-    NameOrHashRef, SelectStatement, SetViewStatement, TableRef, UpdateRefStatement, UpdateStatement,
+    DeleteStatement, InsertStatement, LogStatement,
+    NameOrHashRef, SelectStatement, SetViewStatement, TableRef, UpdateRefStatement, UpdateSchemaStatement, UpdateStatement,
 } from "../syntax/ast.js";
 import { compileMigrationRules } from "../compile/ddl.js";
 import { lowerSelectQuery } from "../compile/query.js";
@@ -25,7 +25,7 @@ export type BoundStatement =
     | BoundCreateTableGroup
     | BoundAddMember
     | BoundAlterSchema
-    | BoundDeploySchema
+    | BoundUpdateSchema
     | BoundUpdateRef
     | BoundInsert
     | BoundUpdate
@@ -39,7 +39,7 @@ export type BoundCreateStatement = BoundCreateDatabase | BoundCreateSchema | Bou
 export type BoundExecutableStatement =
     | BoundAddMember
     | BoundAlterSchema
-    | BoundDeploySchema
+    | BoundUpdateSchema
     | BoundUpdateRef
     | BoundInsert
     | BoundUpdate
@@ -146,9 +146,9 @@ export type BoundAlterSchema = {
     at: Version;
 };
 
-export type BoundDeploySchema = {
-    kind: 'deploy-schema';
-    ast: DeploySchemaStatement;
+export type BoundUpdateSchema = {
+    kind: 'update-schema';
+    ast: UpdateSchemaStatement;
     group: ResolvedGroupRef;
     version: Version;
     author?: OwnIdentity;
@@ -195,8 +195,8 @@ export async function bind(statement: AstStatement, context: LangBindContext): P
                 return ok(await bindAddMember(statement, context));
             case 'alter-schema':
                 return ok(await bindAlterSchema(statement, context));
-            case 'deploy-schema':
-                return ok(await bindDeploySchema(statement, context));
+            case 'update-schema':
+                return ok(await bindUpdateSchema(statement, context));
             case 'update-ref':
                 return ok(await bindUpdateRef(statement, context));
             case 'insert':
@@ -383,14 +383,14 @@ async function bindAlterSchema(ast: AlterSchemaStatement, context: LangBindConte
     return { kind: 'alter-schema', ast, schema, rules: compileMigrationRules(ast.rules), author, at };
 }
 
-async function bindDeploySchema(ast: DeploySchemaStatement, context: LangBindContext): Promise<BoundDeploySchema> {
+async function bindUpdateSchema(ast: UpdateSchemaStatement, context: LangBindContext): Promise<BoundUpdateSchema> {
     const group = await context.resolveGroup(ast.group);
-    if (group.group === undefined) throw new Error('DEPLOY SCHEMA target group is not loaded');
+    if (group.group === undefined) throw new Error('UPDATE SCHEMA target group is not loaded');
     const schema = await context.resolveSchema(ast.schema);
     const version = await context.resolveVersion(ast.version, { kind: 'schema', id: schema.id, schema: schema.schema });
     const author = await resolveEffectiveAuthor(ast.author, context);
     const at = await context.resolveVersion(ast.at, { kind: 'group', id: group.id, group: group.group });
-    const bound: BoundDeploySchema = { kind: 'deploy-schema', ast, group, version, at };
+    const bound: BoundUpdateSchema = { kind: 'update-schema', ast, group, version, at };
     if (author !== undefined) bound.author = author;
     return bound;
 }

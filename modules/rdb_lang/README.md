@@ -29,7 +29,7 @@ CREATE SCHEMA shop AS (
 CREATE TABLEGROUP shop_prod USING SCHEMA shop AT {#schemaVersion}
   BIND users => users
   USING IDENTITIES users.identities
-  CAN DEPLOY SCHEMA IF EXISTS users.caps WHERE label = 'deployer' AND grantee = $author;
+  ALLOW UPDATE SCHEMA IF EXISTS users.caps WHERE label = 'deployer' AND grantee = $author;
 ```
 
 DDL and refs:
@@ -44,7 +44,7 @@ ALTER SCHEMA shop AS (
   )
 );
 
-DEPLOY SCHEMA shop AT {#schemaVersion} ON shop_prod;
+UPDATE SCHEMA shop TO {#schemaVersion} ON shop_prod;
 UPDATE REF users TO LATEST ON shop_prod;
 ```
 
@@ -82,7 +82,11 @@ LOG shop_prod LIMIT 20;
 
 ## Allow Rules
 
-Table allow rules are positive gates over row operations:
+Allow rules are positive gates: an operation is permitted only when its predicate is true.
+
+### Table allow rules
+
+Row operations on a table:
 
 ```sql
 ALLOW insert IF EXISTS users.caps
@@ -90,13 +94,29 @@ ALLOW insert IF EXISTS users.caps
   AND grantee = $author
 ```
 
-The operation is allowed only when its predicate is true. Each table or `SET ALLOW RULES` block accepts at most one expression per operation. Use `ALLOW all IF ...` for a shared insert/update/delete rule; do not combine it with operation-specific rules in the same block.
+Each table or `SET ALLOW RULES` block accepts at most one expression per operation. Use `ALLOW all IF ...` for a shared insert/update/delete rule; do not combine it with operation-specific rules in the same block.
 
 Omitted rules use RDb defaults: inserts are allowed, while updates and deletes require `rowAuthor = $author` (the row's insert author must equal the op signer). To explicitly open every operation, write `ALLOW all IF true`.
 
+### Tablegroup allow rules
+
+Deploy authority and ref-update authority use parallel `ALLOW UPDATE …` gates on `CREATE TABLEGROUP`:
+
+```sql
+ALLOW UPDATE SCHEMA IF EXISTS users.caps
+  WHERE label = 'deployer'
+  AND grantee = $author
+
+ALLOW UPDATE REF users IF EXISTS users.caps
+  WHERE label = 'manager'
+  AND grantee = $author
+```
+
+`ALLOW UPDATE SCHEMA IF ...` is evaluated when advancing a schema version on the tablegroup (via `UPDATE SCHEMA`). `ALLOW UPDATE REF <binding> IF ...` gates who may advance the observed version of a bound foreign group via `UPDATE REF`. Both use object context: `$author` is available, but there is no subject row. A gated binding requires an authored `UPDATE REF ... BY ...`; ungated bindings still accept `BY NOBODY`.
+
 ## Authorship
 
-Authored statements — `INSERT`, `UPDATE`, `DELETE`, `BUNDLE`, `DEPLOY SCHEMA`, `UPDATE REF`, and `ALTER SCHEMA` — sign as an author identity. The author is chosen in this order:
+Authored statements — `INSERT`, `UPDATE`, `DELETE`, `BUNDLE`, `UPDATE SCHEMA`, `UPDATE REF`, and `ALTER SCHEMA` — sign as an author identity. The author is chosen in this order:
 
 1. an explicit trailing `BY` clause, if present;
 2. otherwise the host's default author (`currentAuthor()`), which may itself be unset.
@@ -110,30 +130,6 @@ DELETE FROM docs WHERE rowId = #ab BY NOBODY;   -- explicitly unauthored
 The author is `$name` (an unlocked identity, resolved by the host) or `#keyid` (by key-id prefix). The bareword `NOBODY` forces an unauthored op even when a default author is set — useful for anonymous writes. Because `NOBODY` is a keyword, an identity literally named `nobody` is still referenced as `$nobody`.
 
 `BY` sits alongside the optional `AT <version>` clause and is written before it. `$author` and `$me` in value position resolve to the statement's effective author, so `VALUES ($author)` agrees with the identity chosen by `BY`. A `BUNDLE` is a single signed op: put `BY` on the `BUNDLE`, not on its inner writes (a `BY` on an inner write is a parse error). `ALTER SCHEMA` requires an author (explicit or default); the others fall back to an unauthored op when neither is present.
-
-## Deploy Gates
-
-Tablegroup deploy authority uses a positive deploy gate:
-
-```sql
-CAN DEPLOY SCHEMA IF EXISTS users.caps
-  WHERE label = 'deployer'
-  AND grantee = $author
-```
-
-The gate is evaluated when deploying a schema version on the tablegroup. It uses object context: `$author` is available, but there is no subject row.
-
-## Ref Update Gates
-
-A bound foreign group can gate who may advance its observed version via `UPDATE REF`:
-
-```sql
-CAN UPDATE REF users IF EXISTS users.caps
-  WHERE label = 'manager'
-  AND grantee = $author
-```
-
-The gate is evaluated against the named binding in object context (`$author`, no subject row). A gated binding requires an authored `UPDATE REF ... BY ...`; ungated bindings still accept `BY NOBODY`.
 
 ## Identity Providers
 

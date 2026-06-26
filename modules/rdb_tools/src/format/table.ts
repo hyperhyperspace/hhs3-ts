@@ -31,8 +31,8 @@ export function formatTableResult(result: LangExecutionResult, mode: Exclude<Out
             return `bundle ${result.entryHash} (${result.writes} writes)`;
         case 'alter-schema':
             return `altered schema ${result.schema} (${result.rules} rules, ${result.entryHash})`;
-        case 'deploy-schema':
-            return `deployed schema on ${result.group} (${result.entryHash})`;
+        case 'update-schema':
+            return `updated schema on ${result.group} (${result.entryHash})`;
         case 'update-ref':
             return `updated ref ${result.ref} on ${result.group} (${result.entryHash})`;
     }

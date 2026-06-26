@@ -4,10 +4,10 @@ import { combineSpans, DiagnosticBag, err, ok, Result, TextSpan } from "../diagn
 import {
     AddMemberStatement, AllowOp, AllowRuleExpr, AlterSchemaStatement, AstScript, AstStatement, AuthorExpr, BundleStatement, BundleWriteStatement,
     ColumnDecl, ColumnTypeName, CreateDatabaseStatement, CreateSchemaStatement,
-    CreateTableGroupStatement, DeleteStatement, DeploySchemaStatement, HashRef, InitialRow,
+    CreateTableGroupStatement, DeleteStatement, HashRef, InitialRow,
     InsertStatement, LogStatement, MigrationRuleExpr, NameOrHashRef, NameRef, OperandExpr,
     PredicateExpr, SelectStatement, SetViewStatement, TableDecl, TableOption, TableRef, UpdateRefStatement,
-    UpdateStatement, ValueExpr, VersionExpr,
+    UpdateSchemaStatement, UpdateStatement, ValueExpr, VersionExpr,
 } from "./ast.js";
 import { lex } from "./lexer.js";
 import { Token } from "./tokens.js";
@@ -58,10 +58,10 @@ class Parser {
             return undefined;
         }
         if (this.matchKeyword('ALTER')) return this.parseAlterSchema(this.previous().span);
-        if (this.matchKeyword('DEPLOY')) return this.parseDeploySchema(this.previous().span);
         if (this.matchKeyword('UPDATE')) {
             const start = this.previous().span;
             if (this.matchKeyword('REF')) return this.parseUpdateRef(start);
+            if (this.matchKeyword('SCHEMA')) return this.parseUpdateSchema(start);
             return this.parseUpdate(start);
         }
         if (this.matchKeyword('DELETE')) return this.parseDelete(this.previous().span);
@@ -245,21 +245,30 @@ class Parser {
                 const provider = this.expectIdentifierToken('identity provider');
                 idProvider = provider.text;
                 end = provider.span;
-            } else if (this.matchKeyword('CAN')) {
-                const canStart = this.previous().span;
+            } else if (this.matchKeyword('ALLOW')) {
+                const allowStart = this.previous().span;
                 if (this.matchKeyword('UPDATE')) {
-                    this.expectKeyword('REF');
-                    const binding = this.expectIdentifierText('binding name');
-                    this.expectKeyword('IF');
-                    const predicate = this.parsePredicate();
-                    canObserve.push({ binding, predicate, span: combineSpans(canStart, predicate.span) });
-                    end = predicate.span;
+                    if (this.matchKeyword('REF')) {
+                        const binding = this.expectIdentifierText('binding name');
+                        this.expectKeyword('IF');
+                        const predicate = this.parsePredicate();
+                        canObserve.push({ binding, predicate, span: combineSpans(allowStart, predicate.span) });
+                        end = predicate.span;
+                    } else if (this.matchKeyword('SCHEMA')) {
+                        this.expectKeyword('IF');
+                        canDeploy = this.parsePredicate();
+                        end = canDeploy.span;
+                    } else {
+                        this.diagnostics.add('PARSE_EXPECTED_TOKEN',
+                            'Expected ALLOW UPDATE SCHEMA or ALLOW UPDATE REF on CREATE TABLEGROUP',
+                            this.previous().span);
+                        this.advance();
+                    }
                 } else {
-                    this.expectKeyword('DEPLOY');
-                    this.expectKeyword('SCHEMA');
-                    this.expectKeyword('IF');
-                    canDeploy = this.parsePredicate();
-                    end = canDeploy.span;
+                    this.diagnostics.add('PARSE_EXPECTED_TOKEN',
+                        'Expected ALLOW UPDATE SCHEMA or ALLOW UPDATE REF on CREATE TABLEGROUP',
+                        this.previous().span);
+                    this.advance();
                 }
             } else if (this.matchKeyword('WITH')) {
                 this.expectKeyword('ROWS');
@@ -438,10 +447,9 @@ class Parser {
         return { name, columns, options, span: combineSpans(start, end) };
     }
 
-    private parseDeploySchema(start: TextSpan): DeploySchemaStatement {
-        this.expectKeyword('SCHEMA');
+    private parseUpdateSchema(start: TextSpan): UpdateSchemaStatement {
         const schema = this.parseNameOrHash();
-        this.expectKeyword('AT');
+        this.expectKeyword('TO');
         const version = this.parseVersion();
         this.expectKeyword('ON');
         const group = this.parseNameOrHash();
@@ -456,11 +464,11 @@ class Parser {
                 author = this.parseAuthor();
                 end = author.span;
             } else {
-                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected DEPLOY clause '${this.peek().text}'`, this.peek().span);
+                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected UPDATE SCHEMA clause '${this.peek().text}'`, this.peek().span);
                 this.advance();
             }
         }
-        const stmt: DeploySchemaStatement = { kind: 'deploy-schema', schema, version, group, span: combineSpans(start, end) };
+        const stmt: UpdateSchemaStatement = { kind: 'update-schema', schema, version, group, span: combineSpans(start, end) };
         if (author !== undefined) stmt.author = author;
         if (at !== undefined) stmt.at = at;
         return stmt;

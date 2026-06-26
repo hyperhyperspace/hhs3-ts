@@ -1,4 +1,5 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
+import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import {
     AddGroupPayload, AddSchemaPayload, BundlePayload, ColumnDef, CreateRDbPayload, CreateRSchemaPayload,
     CreateTableGroupPayload, DeleteRowPayload, InsertRowPayload, MigrationRule,
@@ -9,6 +10,7 @@ import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 
 export type RenderOptions = {
     at?: json.Set;
+    schemaRef?: B64Hash;
 };
 
 export function renderCreateDatabase(payload: CreateRDbPayload): string {
@@ -29,9 +31,9 @@ export function renderCreateTableGroup(payload: CreateTableGroupPayload): string
     ];
     for (const [name, id] of Object.entries(payload.bindings ?? {})) parts.push(`BIND ${name} => #${id}`);
     if (payload.idProvider !== undefined) parts.push(`USING IDENTITIES ${payload.idProvider}`);
-    if (payload.canDeploy !== undefined) parts.push(`CAN DEPLOY SCHEMA IF ${renderPredicate(payload.canDeploy)}`);
+    if (payload.canDeploy !== undefined) parts.push(`ALLOW UPDATE SCHEMA IF ${renderPredicate(payload.canDeploy)}`);
     for (const [binding, pred] of Object.entries(payload.canObserve ?? {})) {
-        parts.push(`CAN UPDATE REF ${binding} IF ${renderPredicate(pred)}`);
+        parts.push(`ALLOW UPDATE REF ${binding} IF ${renderPredicate(pred)}`);
     }
     if (payload.initialRows !== undefined) {
         const rows: string[] = [];
@@ -72,7 +74,12 @@ export function renderRowOp(payload: RowOpPayload, table?: string, options?: Ren
 
 export function renderRefOp(payload: RefAdvancePayload, options?: RenderOptions): string {
     const author = (payload as { author?: string }).author;
-    return `UPDATE REF #${payload.refId} TO ${renderVersionSet(payload.refVersion)} ON <group>${renderBy(author)}${renderAt(options)};`;
+    const trailing = `${renderBy(author)}${renderAt(options)}`;
+    const version = renderVersionSet(payload.refVersion);
+    if (options?.schemaRef !== undefined && payload.refId === options.schemaRef) {
+        return `UPDATE SCHEMA #${payload.refId} TO ${version} ON <group>${trailing};`;
+    }
+    return `UPDATE REF #${payload.refId} TO ${version} ON <group>${trailing};`;
 }
 
 export function renderBundle(payload: BundlePayload, options?: RenderOptions): string {

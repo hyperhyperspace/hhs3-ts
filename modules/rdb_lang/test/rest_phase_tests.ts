@@ -122,7 +122,7 @@ export const restPhaseTests = {
             },
         },
         {
-            name: '[REST02] ALTER, DEPLOY, UPDATE REF, UPDATE, DELETE and BUNDLE execute',
+            name: '[REST02] ALTER, UPDATE SCHEMA, UPDATE REF, UPDATE, DELETE and BUNDLE execute',
             invoke: async () => {
                 const { lang, group } = await createEnv();
 
@@ -152,8 +152,8 @@ export const restPhaseTests = {
                 const allowAlter = await execute(await parseBind("ALTER SCHEMA shop AS (SET ALLOW RULES products (ALLOW all IF true));", lang));
                 assertTrue(allowAlter.ok && allowAlter.value.kind === 'alter-schema', 'allow rules alter succeeds');
 
-                const deploy = await execute(await parseBind('DEPLOY SCHEMA shop AT LATEST ON shop_prod;', lang));
-                assertTrue(deploy.ok && deploy.value.kind === 'deploy-schema', 'deploy succeeds');
+                const deploy = await execute(await parseBind('UPDATE SCHEMA shop TO LATEST ON shop_prod;', lang));
+                assertTrue(deploy.ok && deploy.value.kind === 'update-schema', 'update schema succeeds');
 
                 const select = await execute(await parseBind("SELECT sku, price FROM shop_prod.products WHERE sku = 'A';", lang));
                 assertTrue(select.ok && select.value.kind === 'select', 'select after deploy succeeds');
@@ -246,7 +246,7 @@ export const restPhaseTests = {
                     canDeploy: { p: 'true' },
                 } as CreateTableGroupPayload);
                 assertTrue(renderedGroup.includes('USING IDENTITIES users.identities'), 'rendered tablegroup uses USING IDENTITIES syntax');
-                assertTrue(renderedGroup.includes('CAN DEPLOY SCHEMA IF true'), 'rendered tablegroup uses CAN DEPLOY SCHEMA IF syntax');
+                assertTrue(renderedGroup.includes('ALLOW UPDATE SCHEMA IF true'), 'rendered tablegroup uses ALLOW UPDATE SCHEMA IF syntax');
                 assertTrue(parseStatement(renderedGroup).ok, 'rendered tablegroup parses');
                 const renderedCorrelated = renderCreateTableGroup({
                     action: 'create',

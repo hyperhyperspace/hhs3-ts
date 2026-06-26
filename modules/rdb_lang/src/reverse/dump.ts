@@ -1,16 +1,20 @@
 import type { RDb, RSchema, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 import type { LoggableObject } from "../bind/context.js";
-import { renderOp } from "./render.js";
+import { renderOp, type RenderOptions } from "./render.js";
 
 export type DumpOptions = {
     includeUnknown?: boolean;
+    render?: RenderOptions;
 };
 
 export async function dumpObject(object: LoggableObject, options: DumpOptions = {}): Promise<string> {
     const statements: string[] = [];
     const dag = await object.getScopedDag();
     for await (const entry of dag.loadAllEntries()) {
-        const rendered = renderOp(entry.payload, { at: entry.header.prevEntryHashes });
+        const rendered = renderOp(entry.payload, {
+            at: entry.header.prevEntryHashes,
+            ...options.render,
+        });
         if (options.includeUnknown === false && rendered.startsWith('-- unknown payload')) continue;
         statements.push(rendered);
     }
@@ -22,7 +26,10 @@ export async function dumpSchema(schema: RSchema & LoggableObject, options?: Dum
 }
 
 export async function dumpGroup(group: RTableGroup & LoggableObject, options?: DumpOptions): Promise<string> {
-    return dumpObject(group, options);
+    return dumpObject(group, {
+        ...options,
+        render: { ...options?.render, schemaRef: group.getSchemaRef() },
+    });
 }
 
 export async function dumpDatabase(db: RDb & LoggableObject, options?: DumpOptions): Promise<string> {

@@ -55,8 +55,8 @@ export type AlterSchemaLangResult = {
     rules: number;
 };
 
-export type DeploySchemaLangResult = {
-    kind: 'deploy-schema';
+export type UpdateSchemaLangResult = {
+    kind: 'update-schema';
     entryHash: B64Hash;
     group: string;
 };
@@ -100,7 +100,7 @@ export type LangExecutionResult =
     | CreatePlanResult
     | AddMemberLangResult
     | AlterSchemaLangResult
-    | DeploySchemaLangResult
+    | UpdateSchemaLangResult
     | UpdateRefLangResult
     | InsertLangResult
     | UpdateLangResult

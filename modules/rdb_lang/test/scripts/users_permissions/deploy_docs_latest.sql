@@ -1,1 +1,1 @@
-DEPLOY SCHEMA docs_schema AT LATEST ON docs_group;
+UPDATE SCHEMA docs_schema TO LATEST ON docs_group;

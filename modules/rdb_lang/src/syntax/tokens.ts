@@ -33,7 +33,6 @@ export const KEYWORDS = new Set([
     'BOOLEAN',
     'BUNDLE',
     'BY',
-    'CAN',
     'COLUMN',
     'CONCURRENT',
     'CREATE',
@@ -42,7 +41,6 @@ export const KEYWORDS = new Set([
     'DEFAULT',
     'DELETE',
     'DELETES',
-    'DEPLOY',
     'DESC',
     'DROP',
     'EXISTS',
@@ -97,6 +95,5 @@ export const PHASE2_KEYWORDS = new Set([
     'ALTER',
     'BUNDLE',
     'DELETE',
-    'DEPLOY',
     'UPDATE',
 ]);

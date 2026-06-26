@@ -14,7 +14,7 @@ export type AstStatement =
     | CreateTableGroupStatement
     | AddMemberStatement
     | AlterSchemaStatement
-    | DeploySchemaStatement
+    | UpdateSchemaStatement
     | UpdateRefStatement
     | InsertStatement
     | UpdateStatement
@@ -124,9 +124,9 @@ export type CreateTableGroupStatement = {
     schemaVersion?: VersionExpr;
     bindings: { name: string; group: NameOrHashRef; span: TextSpan }[];
     idProvider?: string;
-    // deploy gate: `CAN DEPLOY SCHEMA IF <predicate>`.
+    // deploy gate: `ALLOW UPDATE SCHEMA IF <predicate>`.
     canDeploy?: PredicateExpr;
-    // per-binding observation gate: `CAN UPDATE REF <binding> IF <predicate>`.
+    // per-binding observation gate: `ALLOW UPDATE REF <binding> IF <predicate>`.
     canObserve: { binding: string; predicate: PredicateExpr; span: TextSpan }[];
     initialRows: InitialRow[];
     span: TextSpan;
@@ -206,8 +206,8 @@ export type AlterSchemaStatement = {
     span: TextSpan;
 };
 
-export type DeploySchemaStatement = {
-    kind: 'deploy-schema';
+export type UpdateSchemaStatement = {
+    kind: 'update-schema';
     schema: NameOrHashRef;
     version: VersionExpr;
     group: NameOrHashRef;

@@ -142,7 +142,7 @@ two recursive view-construction sites in `computeEntryVoided` and
 
 ## 5.5 The gated observe: stratification by the observed version
 
-A `canObserve` gate (declared in rdb_lang as `CAN UPDATE REF <binding> IF ...`)
+A `canObserve` gate (declared in rdb_lang as `ALLOW UPDATE REF <binding> IF ...`)
 authorizes who may advance the observation of a bound foreign group `G`. It is
 enforced in two layers:
 

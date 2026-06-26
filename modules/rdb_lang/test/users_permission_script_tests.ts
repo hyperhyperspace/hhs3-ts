@@ -276,7 +276,7 @@ export const usersPermissionScriptTests = {
             },
         },
         {
-            name: '[USERS_SCRIPT06] CAN UPDATE REF gate + BY on UPDATE REF: a manager observes, unauthored is rejected',
+            name: '[USERS_SCRIPT06] ALLOW UPDATE REF gate + BY on UPDATE REF: a manager observes, unauthored is rejected',
             invoke: async () => {
                 const env = await createEnv();
                 env.vars['me'] = env.admin;
@@ -292,13 +292,13 @@ export const usersPermissionScriptTests = {
                       USING SCHEMA docs_gated_schema
                       BIND users => users
                       USING IDENTITIES users.identities
-                      CAN UPDATE REF users IF EXISTS caps WHERE label = 'manager' AND grantee = $author;
+                      ALLOW UPDATE REF users IF EXISTS caps WHERE label = 'manager' AND grantee = $author;
                 `, env, 'create gated docs group');
 
                 const gated = await group(env, 'docs_gated');
                 const canObserve = gated.getCanObserve();
                 assertTrue(canObserve !== undefined && canObserve['users'] !== undefined,
-                    'CAN UPDATE REF clause compiles into the create payload');
+                    'ALLOW UPDATE REF clause compiles into the create payload');
 
                 // an explicitly unauthored observation of a gated binding is rejected
                 await expectScriptFailure('UPDATE REF users TO LATEST ON docs_gated BY NOBODY;', env, false);

@@ -38,10 +38,10 @@ async function executeRuntime(bound: BoundExecutableStatement): Promise<LangExec
             const entryHash = await bound.schema.schema.updateSchema(bound.rules, bound.author, undefined, bound.at);
             return { kind: 'alter-schema', entryHash, schema: bound.schema.id, rules: bound.rules.length };
         }
-        case 'deploy-schema': {
-            if (bound.group.group === undefined) throw new Error('DEPLOY SCHEMA target group is not loaded');
+        case 'update-schema': {
+            if (bound.group.group === undefined) throw new Error('UPDATE SCHEMA target group is not loaded');
             const entryHash = await bound.group.group.deploy(bound.version, bound.author, bound.at);
-            return { kind: 'deploy-schema', entryHash, group: bound.group.id };
+            return { kind: 'update-schema', entryHash, group: bound.group.id };
         }
         case 'update-ref': {
             if (bound.group.group === undefined) throw new Error('UPDATE REF target group is not loaded');
