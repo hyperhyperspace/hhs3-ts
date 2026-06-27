@@ -56,6 +56,13 @@ export interface LangBindContext {
     resolveDefaultGroup?(): Promise<NameOrHashRef | undefined>;
     resolveHash(ref: NameOrHashRef, scope: HashScope): Promise<B64Hash>;
     resolveRowId?(ref: HashRef, table: ResolvedTableRef, at: Version, from?: Version): Promise<B64Hash>;
+    resolveFkRowId?(
+        prefix: string,
+        sourceTable: ResolvedTableRef,
+        column: string,
+        at: Version,
+        from?: Version,
+    ): Promise<B64Hash>;
     resolveVersion(expr: VersionExpr | undefined, scope: VersionScope): Promise<Version>;
     resolveDefaultView?(scope: VersionScope): Promise<{ at: Version; from?: Version } | undefined>;
     resolveVariable(name: string): Promise<LangValue>;

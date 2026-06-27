@@ -6,6 +6,7 @@ import { scannerTests } from "./scanner_tests.js";
 import { phase1VerticalTests } from "./phase1_vertical_tests.js";
 import { diagnosticTests } from "./diagnostic_tests.js";
 import { restPhaseTests } from "./rest_phase_tests.js";
+import { fkHashValuesTests } from "./fk_hash_values_tests.js";
 import { usersPermissionScriptTests } from "./users_permission_script_tests.js";
 
 async function main() {
@@ -18,6 +19,7 @@ async function main() {
     allTests.set(phase1VerticalTests.title, phase1VerticalTests.tests);
     allTests.set(diagnosticTests.title, diagnosticTests.tests);
     allTests.set(restPhaseTests.title, restPhaseTests.tests);
+    allTests.set(fkHashValuesTests.title, fkHashValuesTests.tests);
     allTests.set(usersPermissionScriptTests.title, usersPermissionScriptTests.tests);
 
     console.log('Running tests for Hyper Hyper Space v3 rdb_lang module' + (filters.length > 0 ? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');

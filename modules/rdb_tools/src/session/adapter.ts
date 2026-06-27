@@ -1,5 +1,7 @@
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { Version, version } from "@hyper-hyper-space/hhs3_mvt";
+import type { RTableGroup, RTableView } from "@hyper-hyper-space/hhs3_rdb";
+import { splitTableRef } from "@hyper-hyper-space/hhs3_rdb";
 import {
     bind,
     execute,
@@ -39,6 +41,7 @@ export function createBindContext(session: WorkspaceSession): LangBindContext {
             },
         resolveHash: (ref, scope) => session.workspace.roots.resolveHash(ref, scope),
         resolveRowId: (ref, table, at, from) => resolveRowIdPrefix(ref.prefix, table, at, from),
+        resolveFkRowId: (prefix, sourceTable, column, at, from) => resolveFkRowId(prefix, sourceTable, column, at, from),
         resolveVersion: (expr, scope) => resolveVersionExpr(session, expr, scope),
         resolveDefaultView: async () => session.defaultView,
         resolveVariable: (name) => session.resolveVariable(name),
@@ -129,11 +132,56 @@ function hashScopeForVersionScope(scope: VersionScope): HashScope {
 
 export async function resolveRowIdPrefix(prefix: string, table: ResolvedTableRef, at: Version, from?: Version): Promise<B64Hash> {
     const view = await table.table.getView(at, from ?? at);
-    const rowIds = await view.liveRowIds();
+    const tableName = `${table.groupId}.${table.tableName}`;
+    return matchRowIdPrefix(prefix, await view.liveRowIds(), tableName);
+}
+
+export async function resolveFkRowId(
+    prefix: string,
+    sourceTable: ResolvedTableRef,
+    column: string,
+    at: Version,
+    from?: Version,
+): Promise<B64Hash> {
+    const fromVersion = from ?? at;
+    const groupView = await sourceTable.group.getView(at, fromVersion);
+    const schemaView = groupView.getSchemaView();
+    const targetRef = schemaView.getFKs(sourceTable.tableName)[column];
+    if (targetRef === undefined) {
+        throw new Error(`Column '${column}' is not a REFERENCES column`);
+    }
+
+    const [groupName, targetTable] = splitTableRef(targetRef);
+
+    if (groupName === undefined) {
+        const view = await groupView.getTableView(targetTable);
+        const tableName = `${sourceTable.groupId}.${targetTable}`;
+        return matchRowIdPrefix(prefix, await view.liveRowIds(), tableName);
+    }
+
+    const fkGroup = sourceTable.group as CrossGroupFkResolvable;
+    const view = await fkGroup.resolveForeignTableView(groupName, targetTable, at, fromVersion);
+    if (view === undefined) {
+        throw new Error(`Unknown foreign table '${groupName}.${targetTable}' for FK column '${column}'`);
+    }
+    const tableName = `${sourceTable.groupId}.${groupName}.${targetTable}`;
+    return matchRowIdPrefix(prefix, await view.liveRowIds(), tableName);
+}
+
+type CrossGroupFkResolvable = RTableGroup & {
+    resolveForeignTableView(
+        groupName: string,
+        table: string,
+        at: Version,
+        from: Version,
+        filterVoided?: boolean,
+    ): Promise<RTableView | undefined>;
+};
+
+function matchRowIdPrefix(prefix: string, rowIds: B64Hash[], tableName: string): B64Hash {
     const matches = rowIds.filter((rowId) => rowId.startsWith(prefix));
     if (matches.length === 1) return matches[0];
 
-    const tableName = `${table.groupId}.${table.tableName}`;
     if (matches.length === 0) throw new Error(`Unknown rowId prefix '#${prefix}' in ${tableName}`);
     const examples = matches.slice(0, 5).map((rowId) => `#${rowId}`).join(', ');
     throw new Error(`Ambiguous rowId prefix '#${prefix}' in ${tableName}: ${examples}`);

@@ -410,5 +410,15 @@ export const parserTests = {
                 assertEquals(exists.where.keyId, '$row.keyId', 'EXISTS WHERE correlates via $row.keyId');
             },
         },
+        {
+            name: '[PARSE23] parses #prefix hash values in INSERT VALUES',
+            invoke: async () => {
+                const result = parseStatement("INSERT INTO profiles (ownerId, label) VALUES (#abc, 'Admin');");
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok || result.value.kind !== 'insert') return;
+                assertEquals(result.value.values[0].kind, 'hash', 'first value is a hash ref');
+                if (result.value.values[0].kind === 'hash') assertEquals(result.value.values[0].prefix, 'abc', 'hash prefix');
+            },
+        },
     ],
 };

@@ -2,7 +2,8 @@ import { B64Hash, createBasicCrypto, HASH_SHA256, OwnIdentity } from "@hyper-hyp
 import { version } from "@hyper-hyper-space/hhs3_mvt";
 import type { RContext, Version } from "@hyper-hyper-space/hhs3_mvt";
 import type { RObject } from "@hyper-hyper-space/hhs3_mvt";
-import type { RDb, RSchema, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
+import type { RDb, RSchema, RTableGroup, RTableView } from "@hyper-hyper-space/hhs3_rdb";
+import { splitTableRef } from "@hyper-hyper-space/hhs3_rdb";
 
 import type {
     HashScope, LangBindContext, LangValue, ResolvedDatabaseRef, ResolvedGroupRef, ResolvedLogTarget,
@@ -71,6 +72,38 @@ export function createTestBindContext(_ctx: RContext, vars: { [name: string]: La
         async resolveHash(ref: NameOrHashRef, _scope: HashScope): Promise<B64Hash> {
             if (ref.kind === 'name') return ref.text;
             return resolveHashPrefix(ref.prefix, ids());
+        },
+
+        async resolveRowId(ref, table, at, from) {
+            const view = await table.table.getView(at, from ?? at);
+            const tableName = `${table.groupId}.${table.tableName}`;
+            return matchRowIdPrefix(ref.prefix, await view.liveRowIds(), tableName);
+        },
+
+        async resolveFkRowId(prefix, sourceTable, column, at, from) {
+            const fromVersion = from ?? at;
+            const groupView = await sourceTable.group.getView(at, fromVersion);
+            const schemaView = groupView.getSchemaView();
+            const targetRef = schemaView.getFKs(sourceTable.tableName)[column];
+            if (targetRef === undefined) {
+                throw new Error(`Column '${column}' is not a REFERENCES column`);
+            }
+
+            const [groupName, targetTable] = splitTableRef(targetRef);
+
+            if (groupName === undefined) {
+                const view = await groupView.getTableView(targetTable);
+                const tableName = `${sourceTable.groupId}.${targetTable}`;
+                return matchRowIdPrefix(prefix, await view.liveRowIds(), tableName);
+            }
+
+            const fkGroup = sourceTable.group as CrossGroupFkResolvable;
+            const view = await fkGroup.resolveForeignTableView(groupName, targetTable, at, fromVersion);
+            if (view === undefined) {
+                throw new Error(`Unknown foreign table '${groupName}.${targetTable}' for FK column '${column}'`);
+            }
+            const tableName = `${sourceTable.groupId}.${groupName}.${targetTable}`;
+            return matchRowIdPrefix(prefix, await view.liveRowIds(), tableName);
         },
 
         async resolveVersion(expr: VersionExpr | undefined, scope: VersionScope): Promise<Version> {
@@ -143,3 +176,21 @@ function resolveHashPrefix(prefix: string, hashes: B64Hash[]): B64Hash {
     if (matches.length === 0) throw new Error(`Unknown hash prefix '#${prefix}'`);
     throw new Error(`Ambiguous hash prefix '#${prefix}'`);
 }
+
+function matchRowIdPrefix(prefix: string, rowIds: B64Hash[], tableName: string): B64Hash {
+    const matches = rowIds.filter((rowId) => rowId.startsWith(prefix));
+    if (matches.length === 1) return matches[0];
+    if (matches.length === 0) throw new Error(`Unknown rowId prefix '#${prefix}' in ${tableName}`);
+    const examples = matches.slice(0, 5).map((rowId) => `#${rowId}`).join(', ');
+    throw new Error(`Ambiguous rowId prefix '#${prefix}' in ${tableName}: ${examples}`);
+}
+
+type CrossGroupFkResolvable = RTableGroup & {
+    resolveForeignTableView(
+        groupName: string,
+        table: string,
+        at: Version,
+        from: Version,
+        filterVoided?: boolean,
+    ): Promise<RTableView | undefined>;
+};

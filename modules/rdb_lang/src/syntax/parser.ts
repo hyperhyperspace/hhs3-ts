@@ -852,6 +852,10 @@ class Parser {
                 span: tok.span,
             };
         }
+        if (this.checkKind('hash')) {
+            const hashTok = this.advance();
+            return { kind: 'hash', prefix: hashTok.text.substring(1), span: hashTok.span };
+        }
         if (this.checkPunctuation('[') || this.checkPunctuation('{')) {
             return this.parseJsonValue();
         }

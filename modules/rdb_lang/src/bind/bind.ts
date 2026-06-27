@@ -303,11 +303,20 @@ async function bindInsert(ast: InsertStatement, context: LangBindContext): Promi
     const table = await resolveTableRef(ast.table, context);
     const author = await resolveEffectiveAuthor(ast.author, context);
     const valueContext = contextWithAuthor(context, author);
+    const at = await context.resolveVersion(ast.at, { kind: 'group', id: table.groupId, group: table.group });
     const values: { [column: string]: json.Literal } = {};
     for (let i = 0; i < ast.columns.length; i += 1) {
-        values[ast.columns[i]] = asJsonLiteral(await resolveValue(ast.values[i], valueContext));
+        const expr = ast.values[i];
+        const column = ast.columns[i];
+        if (expr.kind === 'hash') {
+            if (context.resolveFkRowId === undefined) {
+                throw new Error('FK #prefix resolution is not available in this host');
+            }
+            values[column] = await context.resolveFkRowId(expr.prefix, table, column, at, at);
+        } else {
+            values[column] = asJsonLiteral(await resolveValue(expr, valueContext));
+        }
     }
-    const at = await context.resolveVersion(ast.at, { kind: 'group', id: table.groupId, group: table.group });
     const bound: BoundInsert = { kind: 'insert', ast, table, values, at, uuid: context.createUuid() };
     if (author !== undefined) bound.author = author;
     return bound;
@@ -352,8 +361,20 @@ async function bindBundle(ast: BundleStatement, context: LangBindContext): Promi
 async function bindBundleWrite(write: BundleWriteStatement, context: LangBindContext, at: Version, author?: KeyId): Promise<BoundBundleWrite> {
     if (write.kind === 'insert') {
         if (write.columns.length !== write.values.length) throw new Error('BUNDLE INSERT column count does not match value count');
+        const table = await context.resolveTable(write.table);
         const values: { [column: string]: json.Literal } = {};
-        for (let i = 0; i < write.columns.length; i += 1) values[write.columns[i]] = asJsonLiteral(await resolveValue(write.values[i], context));
+        for (let i = 0; i < write.columns.length; i += 1) {
+            const expr = write.values[i];
+            const column = write.columns[i];
+            if (expr.kind === 'hash') {
+                if (context.resolveFkRowId === undefined) {
+                    throw new Error('FK #prefix resolution is not available in this host');
+                }
+                values[column] = await context.resolveFkRowId(expr.prefix, table, column, at, at);
+            } else {
+                values[column] = asJsonLiteral(await resolveValue(expr, context));
+            }
+        }
         const uuid = context.createUuid();
         const op: InsertRowPayload = { action: 'insert', rowId: deriveRowId(uuid, author), uuid, values };
         return { table: write.table.table, op };
