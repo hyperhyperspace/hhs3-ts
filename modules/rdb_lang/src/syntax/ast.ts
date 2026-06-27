@@ -254,11 +254,11 @@ export type PredicateExpr =
     | { kind: 'false'; span: TextSpan }
     | { kind: 'comparison'; op: '=' | '!=' | '<' | '<=' | '>' | '>='; left: OperandExpr; right: OperandExpr; span: TextSpan }
     | { kind: 'like'; left: OperandExpr; pattern: ValueExpr; span: TextSpan }
-    | { kind: 'exists'; table: string; where: PredicateExpr; span: TextSpan }
+    | { kind: 'exists'; table: string; alias?: string; where: PredicateExpr; span: TextSpan }
     | { kind: 'not'; arg: PredicateExpr; span: TextSpan }
     | { kind: 'and'; args: PredicateExpr[]; span: TextSpan }
     | { kind: 'or'; args: PredicateExpr[]; span: TextSpan };
 
 export type OperandExpr =
-    | { kind: 'column'; name: string; span: TextSpan }
+    | { kind: 'column'; table?: string; name: string; span: TextSpan }
     | ValueExpr;

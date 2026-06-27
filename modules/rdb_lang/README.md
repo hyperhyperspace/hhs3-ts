@@ -4,6 +4,15 @@
 
 It does not own persistence, SQLite files, workspace root-name metadata, key storage, sync, mesh, a REPL, terminal formatting, or CLI behavior.
 
+## Allow-rule column references
+
+Schema `ALLOW` predicates and group gates (`ALLOW UPDATE SCHEMA IF`, `ALLOW UPDATE REF`) resolve column names by scope:
+
+- Unqualified names are allowed when they refer to exactly one in-scope table.
+- Use `table.column` (or `group.table.column` for cross-group `EXISTS` targets) when a bare name would be ambiguous.
+- `$author` names the operation author. The old `$row.column` surface syntax is removed; correlate to the gated row with `gatedTable.column` instead (lowered to `$row.column` in the IR).
+- Self-referential `EXISTS` (same table as the gated table) requires `EXISTS table AS alias WHERE alias.column = ...`.
+
 ## Public Flow
 
 ```typescript
@@ -164,8 +173,8 @@ CREATE SCHEMA users_schema CREATORS ($admin) AS (
     label string PUB READONLY,
     grantee string PUB READONLY
   ) CONCURRENT DELETES
-    ALLOW insert IF EXISTS caps WHERE label = 'manager' AND grantee = $author
-    ALLOW delete IF grantee = $author OR EXISTS caps WHERE label = 'manager' AND grantee = $author
+    ALLOW insert IF EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
+    ALLOW delete IF grantee = $author OR EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
 );
 
 CREATE TABLEGROUP users

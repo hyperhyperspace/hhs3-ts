@@ -12,6 +12,7 @@ import type {
     NameOrHashRef, SelectStatement, SetViewStatement, TableRef, UpdateRefStatement, UpdateSchemaStatement, UpdateStatement,
 } from "../syntax/ast.js";
 import { compileMigrationRules } from "../compile/ddl.js";
+import { buildAlterColumnsOf } from "../compile/rule_scope.js";
 import { lowerSelectQuery } from "../compile/query.js";
 import type {
     LangBindContext, LangValue, ResolvedDatabaseRef, ResolvedGroupRef, ResolvedLogTarget, ResolvedSchemaRef,
@@ -401,7 +402,9 @@ async function bindAlterSchema(ast: AlterSchemaStatement, context: LangBindConte
     const author = await resolveEffectiveAuthor(ast.author, context);
     if (author === undefined) throw new Error('ALTER SCHEMA requires an author identity');
     const at = await context.resolveVersion(ast.at, { kind: 'schema', id: schema.id, schema: schema.schema });
-    return { kind: 'alter-schema', ast, schema, rules: compileMigrationRules(ast.rules), author, at };
+    const view = await schema.schema.getView(at, at);
+    const columnsOf = buildAlterColumnsOf(view, ast.rules);
+    return { kind: 'alter-schema', ast, schema, rules: compileMigrationRules(ast.rules, columnsOf), author, at };
 }
 
 async function bindUpdateSchema(ast: UpdateSchemaStatement, context: LangBindContext): Promise<BoundUpdateSchema> {

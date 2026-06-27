@@ -252,7 +252,7 @@ export const restPhaseTests = {
                 const renderedSchema = renderCreateSchema(schema.createOp);
                 assertTrue(parseStatement(renderedSchema).ok, 'rendered schema parses');
                 assertTrue(renderedSchema.includes('ALLOW all IF true'), 'rendered schema uses ALLOW IF syntax');
-                assertTrue(renderedSchema.includes('TABLE products (\n    sku string PUB READONLY,\n    name string\n  ) ALLOW all IF true'),
+                assertTrue(renderedSchema.includes('TABLE products (\n    sku string PUB READONLY,\n    name string\n  )\n    ALLOW all IF true'),
                     'rendered schema uses multiline column layout');
                 const renderedMigration = renderSchemaUpdate({
                     action: 'schema-update',
@@ -286,8 +286,8 @@ export const restPhaseTests = {
                     schemaVersion: json.toSet(['schemaVersion']),
                     canDeploy: { p: 'exists', table: 'grants', where: { resource: '$row.resource', grantee: '$author' } },
                 } as CreateTableGroupPayload);
-                assertTrue(renderedCorrelated.includes('resource = $row.resource AND grantee = $author'),
-                    'rendered correlated predicate uses unquoted $-terms');
+                assertTrue(renderedCorrelated.includes('EXISTS grants WHERE grants.resource = resource AND grants.grantee = $author'),
+                    'rendered correlated predicate uses qualified exists columns');
                 assertTrue(renderRowOp({ action: 'update', rowId: 'row', values: { name: 'x' } }, 'shop_prod.products').startsWith('UPDATE'), 'row op renders');
 
                 const insert = await execute(await parseBind("INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');", lang));
@@ -331,8 +331,8 @@ export const restPhaseTests = {
                         label string PUB READONLY,
                         grantee string PUB READONLY
                       ) CONCURRENT DELETES
-                        ALLOW insert IF EXISTS caps WHERE label = 'manager' AND grantee = $author
-                        ALLOW delete IF grantee = $author OR EXISTS caps WHERE label = 'manager' AND grantee = $author
+                        ALLOW insert IF EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
+                        ALLOW delete IF grantee = $author OR EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
                     );
                 `, lang));
                 assertTrue(schemaPlan.ok && schemaPlan.value.kind === 'create-plan', 'users schema create plan succeeds');
@@ -342,10 +342,11 @@ export const restPhaseTests = {
 
                 const renderedSchema = renderCreateSchema(schema.createOp);
                 assertTrue(parseStatement(renderedSchema).ok, 'rendered users schema parses');
-                assertTrue(renderedSchema.includes(`TABLE identities (\n    keyId string PUB READONLY,\n    publicKey string PUB READONLY,\n    name string NULL PUB\n  ) IDENTITY PROVIDER ALLOW insert IF true`),
+                assertTrue(renderedSchema.includes(`TABLE identities (\n    keyId string PUB READONLY,\n    publicKey string PUB READONLY,\n    name string NULL PUB\n  ) IDENTITY PROVIDER\n    ALLOW insert IF true`),
                     'rendered identities table uses multiline columns');
                 assertTrue(renderedSchema.includes(`TABLE caps (\n    label string PUB READONLY,\n    grantee string PUB READONLY\n  ) CONCURRENT DELETES\n    ALLOW insert IF`),
                     'rendered caps table indents ALLOW rules after CONCURRENT DELETES');
+                assertTrue(renderedSchema.includes('EXISTS caps AS c WHERE c.label'), 'self-referential EXISTS uses first-letter alias');
                 assertTrue(renderedSchema.includes('grantee = $author'), 'rendered schema uses unquoted $author');
                 assertTrue(!renderedSchema.includes("grantee = '$author'"), 'rendered schema does not quote $author');
 

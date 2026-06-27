@@ -5,8 +5,14 @@ import {
     deriveRowId,
 } from "@hyper-hyper-space/hhs3_rdb";
 
-import type { ColumnDecl, TableDecl, TableOption } from "../syntax/ast.js";
+import type { ColumnDecl, TableDecl } from "../syntax/ast.js";
 import type { BoundCreateDatabase, BoundCreateSchema, BoundCreateStatement, BoundCreateTableGroup } from "../bind/bind.js";
+import {
+    columnSetFromTableDecl,
+    columnsOfFromTableDecls,
+    columnsOfFromSchemaView,
+    type RuleScope,
+} from "./rule_scope.js";
 import { lowerRestrictionPredicate } from "./query.js";
 
 export type CreatePlan =
@@ -29,10 +35,14 @@ async function compileCreateDatabase(bound: BoundCreateDatabase): Promise<Create
 }
 
 async function compileCreateSchema(bound: BoundCreateSchema): Promise<CreatePlan> {
+    const columnsOf = columnsOfFromTableDecls(bound.ast.tables);
     const payload = await RSchemaImpl.create({
         name: bound.ast.name,
         creators: bound.creators,
-        tables: bound.ast.tables.map(compileTable),
+        tables: bound.ast.tables.map((table) => compileTable(table, {
+            gated: { name: table.name, columns: columnSetFromTableDecl(table) },
+            columnsOf,
+        })),
     });
     return { kind: 'create-schema', name: bound.ast.name, payload };
 }
@@ -50,9 +60,16 @@ async function compileCreateTableGroup(bound: BoundCreateTableGroup): Promise<Cr
         initialRows[row.table].push(payload as unknown as json.Literal);
     }
 
+    let columnsOf = columnsOfFromTableDecls([]);
+    if (bound.schema.schema !== undefined) {
+        const view = await bound.schema.schema.getView(bound.schemaVersion, bound.schemaVersion);
+        columnsOf = columnsOfFromSchemaView(view);
+    }
+    const gateScope: RuleScope = { columnsOf };
+
     const canObserve: { [binding: string]: Predicate } = {};
     for (const clause of bound.ast.canObserve) {
-        canObserve[clause.binding] = lowerRestrictionPredicate(clause.predicate);
+        canObserve[clause.binding] = lowerRestrictionPredicate(clause.predicate, gateScope);
     }
 
     const payload = await RTableGroupImpl.create({
@@ -62,7 +79,7 @@ async function compileCreateTableGroup(bound: BoundCreateTableGroup): Promise<Cr
         schemaVersion: bound.schemaVersion,
         ...(Object.keys(bound.bindings).length > 0 ? { bindings: bound.bindings } : {}),
         ...(bound.ast.idProvider !== undefined ? { idProvider: bound.ast.idProvider } : {}),
-        ...(bound.ast.canDeploy !== undefined ? { canDeploy: lowerRestrictionPredicate(bound.ast.canDeploy) } : {}),
+        ...(bound.ast.canDeploy !== undefined ? { canDeploy: lowerRestrictionPredicate(bound.ast.canDeploy, gateScope) } : {}),
         ...(bound.ast.canObserve.length > 0 ? { canObserve } : {}),
         ...(Object.keys(initialRows).length > 0 ? { initialRows } : {}),
     });
@@ -70,7 +87,7 @@ async function compileCreateTableGroup(bound: BoundCreateTableGroup): Promise<Cr
     return { kind: 'create-tablegroup', name: bound.ast.name, payload };
 }
 
-export function compileTable(table: TableDecl): TableDef {
+export function compileTable(table: TableDecl, scope?: RuleScope): TableDef {
     const columns: { [column: string]: ColumnDef } = {};
     const fks: FKs = {};
     const restrictions: Restriction[] = [];
@@ -82,6 +99,11 @@ export function compileTable(table: TableDecl): TableDef {
         if (column.references !== undefined) fks[column.name] = column.references;
     }
 
+    const ruleScope: RuleScope = scope ?? {
+        gated: { name: table.name, columns: columnSetFromTableDecl(table) },
+        columnsOf: columnsOfFromTableDecls([table]),
+    };
+
     for (const option of table.options) {
         switch (option.kind) {
             case 'concurrent-deletes':
@@ -91,7 +113,7 @@ export function compileTable(table: TableDecl): TableDef {
                 idProvider = { keyIdColumn: option.keyIdColumn, publicKeyColumn: option.publicKeyColumn };
                 break;
             case 'allow-rule':
-                restrictions.push({ on: option.op, rule: lowerRestrictionPredicate(option.predicate) });
+                restrictions.push({ on: option.op, rule: lowerRestrictionPredicate(option.predicate, ruleScope) });
                 break;
         }
     }

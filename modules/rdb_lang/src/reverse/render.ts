@@ -123,17 +123,14 @@ function renderTableDef(table: TableDef): string {
     }
 
     const allows = (table.restrictions ?? [])
-        .map((r) => `ALLOW ${r.on} IF ${renderPredicate(r.rule)}`);
-    const multilineAllows = table.concurrentDeletes !== undefined && allows.length > 0;
+        .map((r) => `ALLOW ${r.on} IF ${renderPredicate(r.rule, { gatedTable: table.name })}`);
 
     let suffix = '';
-    if (structural.length > 0 || allows.length > 0) {
-        if (multilineAllows) {
-            if (structural.length > 0) suffix = ` ${structural.join(' ')}`;
-            suffix += allows.map((allow) => `\n    ${allow}`).join('');
-        } else {
-            suffix = ` ${[...structural, ...allows].join(' ')}`;
-        }
+    if (structural.length > 0) {
+        suffix = ` ${structural.join(' ')}`;
+    }
+    if (allows.length > 0) {
+        suffix += allows.map((allow) => `\n    ${allow}`).join('');
     }
 
     return `TABLE ${table.name} (${cols})${suffix}`;
@@ -164,7 +161,7 @@ function renderMigrationRule(rule: MigrationRule): string {
         case 'set-fks':
             return `SET FKS ${rule.table} (${Object.entries(rule.fks).map(([c, r]) => `${c} REFERENCES ${r}`).join(', ')})`;
         case 'set-restrictions':
-            return `SET ALLOW RULES ${rule.table} (${rule.restrictions.map((r) => `ALLOW ${r.on} IF ${renderPredicate(r.rule)}`).join(', ')})`;
+            return `SET ALLOW RULES ${rule.table} (\n    ${rule.restrictions.map((r) => `ALLOW ${r.on} IF ${renderPredicate(r.rule, { gatedTable: rule.table })}`).join(',\n    ')}\n  )`;
     }
 }
 
@@ -173,7 +170,7 @@ function renderInitialRow(table: string, row: InsertRowPayload): string {
     return `${table} (${values})`;
 }
 
-function renderPredicate(predicate: unknown): string {
+function renderPredicate(predicate: unknown, scope: RenderScope = {}): string {
     if (!isObject(predicate)) return 'true';
     switch (predicate['p']) {
         case 'true':
@@ -181,27 +178,60 @@ function renderPredicate(predicate: unknown): string {
         case 'false':
             return 'false';
         case 'exists': {
+            const existsTable = String(predicate['table']);
+            const isSelfRef = scope.gatedTable !== undefined && existsTable === scope.gatedTable;
+            const alias = isSelfRef ? selfReferentialExistsAlias(existsTable) : undefined;
+            const existsRef = alias !== undefined ? `${existsTable} AS ${alias}` : existsTable;
+            const existsQual = alias ?? existsTable;
             const where = isObject(predicate['where'])
-                ? ` WHERE ${Object.entries(predicate['where']).map(([k, v]) => `${k} = ${renderTermOrLiteral(v)}`).join(' AND ')}`
+                ? ` WHERE ${Object.entries(predicate['where']).map(([k, v]) => `${renderExistsWhereKey(k, existsQual)} = ${renderExistsWhereValue(v, scope.gatedTable)}`).join(' AND ')}`
                 : '';
-            return `EXISTS ${String(predicate['table'])}${where}`;
+            return `EXISTS ${existsRef}${where}`;
         }
         case 'cmp':
-            return `${renderOperand(predicate['left'])} ${renderCmp(String(predicate['cmp']))} ${renderOperand(predicate['right'])}`;
+            return `${renderOperand(predicate['left'], scope.gatedTable, false)} ${renderCmp(String(predicate['cmp']))} ${renderOperand(predicate['right'], scope.gatedTable, false)}`;
         case 'str':
-            return `${renderOperand(predicate['value'])} LIKE ${renderStringPattern(String(predicate['str']), predicate['sub'])}`;
+            return `${renderOperand(predicate['value'], scope.gatedTable, false)} LIKE ${renderStringPattern(String(predicate['str']), predicate['sub'])}`;
         case 'and':
-            return Array.isArray(predicate['args']) ? predicate['args'].map(renderPredicate).join(' AND ') : 'true';
+            return Array.isArray(predicate['args']) ? predicate['args'].map((a) => renderPredicate(a, scope)).join(' AND ') : 'true';
         case 'or':
-            return Array.isArray(predicate['args']) ? predicate['args'].map(renderPredicate).join(' OR ') : 'true';
+            return Array.isArray(predicate['args']) ? predicate['args'].map((a) => renderPredicate(a, scope)).join(' OR ') : 'true';
         default:
             return 'true';
     }
 }
 
-function renderOperand(operand: unknown): string {
+type RenderScope = {
+    gatedTable?: string;
+};
+
+function selfReferentialExistsAlias(tableName: string): string {
+    const letter = tableName[0];
+    return tableName.length === 1 ? `${letter}2` : letter;
+}
+
+function renderExistsWhereKey(key: string, existsQual: string): string {
+    return `${existsQual}.${key}`;
+}
+
+function renderExistsWhereValue(value: unknown, gatedTable?: string): string {
+    if (typeof value === 'string' && value === '$author') return '$author';
+    if (typeof value === 'string') {
+        const col = parseRowFieldTerm(value);
+        if (col !== undefined) {
+            return gatedTable !== undefined ? `${gatedTable}.${col}` : col;
+        }
+    }
+    return renderLiteral(value as json.Literal);
+}
+
+function renderOperand(operand: unknown, gatedTable?: string, bareTopLevel = true): string {
     if (!isObject(operand)) return 'NULL';
-    if ('col' in operand) return String(operand['col']);
+    if ('col' in operand) {
+        const col = String(operand['col']);
+        if (gatedTable !== undefined && !bareTopLevel) return `${gatedTable}.${col}`;
+        return col;
+    }
     if ('lit' in operand) return renderTermOrLiteral(operand['lit']);
     return 'NULL';
 }
@@ -209,7 +239,6 @@ function renderOperand(operand: unknown): string {
 function renderTermOrLiteral(value: unknown): string {
     if (typeof value === 'string' && value.startsWith('$')) {
         if (value === '$author') return '$author';
-        if (parseRowFieldTerm(value) !== undefined) return value;
     }
     return renderLiteral(value as json.Literal);
 }

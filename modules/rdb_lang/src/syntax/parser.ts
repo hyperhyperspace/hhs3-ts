@@ -794,8 +794,12 @@ class Parser {
         if (this.matchKeyword('EXISTS')) {
             const start = this.previous().span;
             const table = this.expectIdentifierToken('EXISTS table');
+            let alias: string | undefined;
+            if (this.matchKeyword('AS')) {
+                alias = this.expectIdentifierToken('EXISTS alias').text;
+            }
             let where: PredicateExpr | undefined;
-            let end = table.span;
+            let end = alias !== undefined ? this.previous().span : table.span;
             if (this.matchKeyword('WHERE')) {
                 where = this.parsePredicate();
                 end = where.span;
@@ -804,7 +808,7 @@ class Parser {
                 this.diagnostics.add('PARSE_EXPECTED_TOKEN', 'EXISTS requires a WHERE clause', table.span);
                 where = { kind: 'false', span: table.span };
             }
-            return { kind: 'exists', table: table.text, where, span: combineSpans(start, end) };
+            return { kind: 'exists', table: table.text, alias, where, span: combineSpans(start, end) };
         }
 
         const left = this.parseOperand();
@@ -825,6 +829,15 @@ class Parser {
     private parseOperand(): OperandExpr {
         if (this.checkKind('identifier')) {
             const tok = this.advance();
+            const dot = tok.text.lastIndexOf('.');
+            if (dot >= 0) {
+                return {
+                    kind: 'column',
+                    table: tok.text.substring(0, dot),
+                    name: tok.text.substring(dot + 1),
+                    span: tok.span,
+                };
+            }
             return { kind: 'column', name: tok.text, span: tok.span };
         }
         return this.parseValue();

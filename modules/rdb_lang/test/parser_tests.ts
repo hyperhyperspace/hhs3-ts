@@ -1,6 +1,7 @@
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 
 import { lowerRestrictionPredicate } from "../src/compile/query.js";
+import { columnSetFromTableDecl, columnsOfFromTableDecls } from "../src/compile/rule_scope.js";
 import { parseStatement } from "../src/syntax/parser.js";
 
 export const parserTests = {
@@ -386,13 +387,13 @@ export const parserTests = {
             },
         },
         {
-            name: '[PARSE22] parses and lowers $row.<column> in allow rule predicates',
+            name: '[PARSE22] parses and lowers table-qualified correlation in allow rule predicates',
             invoke: async () => {
                 const result = parseStatement(`
                     CREATE SCHEMA users AS (
                       TABLE profiles (
                         keyId string PUB READONLY
-                      ) ALLOW insert IF keyId = $author AND EXISTS users.identities WHERE keyId = $row.keyId
+                      ) ALLOW insert IF keyId = $author AND EXISTS users.identities WHERE users.identities.keyId = profiles.keyId
                     );
                 `);
                 assertTrue(result.ok, 'parse should succeed');
@@ -401,17 +402,150 @@ export const parserTests = {
                 assertTrue(allow !== undefined && allow.kind === 'allow-rule', 'allow rule option');
                 if (allow === undefined || allow.kind !== 'allow-rule') return;
 
-                const lowered = lowerRestrictionPredicate(allow.predicate);
+                const table = result.value.tables[0];
+                const columnsOf = columnsOfFromTableDecls(result.value.tables);
+                const scope = {
+                    gated: { name: table.name, columns: columnSetFromTableDecl(table) },
+                    columnsOf,
+                };
+                const lowered = lowerRestrictionPredicate(allow.predicate, scope);
                 assertEquals(lowered.p, 'and', 'top-level predicate is AND');
                 if (lowered.p !== 'and') return;
                 const exists = lowered.args[1];
                 assertEquals(exists.p, 'exists', 'second arm is EXISTS');
                 if (exists.p !== 'exists') return;
-                assertEquals(exists.where.keyId, '$row.keyId', 'EXISTS WHERE correlates via $row.keyId');
+                assertEquals(exists.where.keyId, '$row.keyId', 'EXISTS WHERE correlates via gated table column');
             },
         },
         {
-            name: '[PARSE23] parses #prefix hash values in INSERT VALUES',
+            name: '[PARSE23] rejects removed $row surface syntax',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE SCHEMA s AS (
+                      TABLE t (v string PUB READONLY)
+                        ALLOW insert IF EXISTS u WHERE v = $row.v
+                    );
+                `);
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok || result.value.kind !== 'create-schema') return;
+                const allow = result.value.tables[0].options.find((o) => o.kind === 'allow-rule');
+                if (allow === undefined || allow.kind !== 'allow-rule') return;
+                const table = result.value.tables[0];
+                const scope = {
+                    gated: { name: table.name, columns: columnSetFromTableDecl(table) },
+                    columnsOf: columnsOfFromTableDecls(result.value.tables),
+                };
+                let threw = false;
+                try {
+                    lowerRestrictionPredicate(allow.predicate, scope);
+                } catch {
+                    threw = true;
+                }
+                assertTrue(threw, 'lowering $row should fail');
+            },
+        },
+        {
+            name: '[PARSE24] allows unqualified columns when unambiguous',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE SCHEMA s AS (
+                      TABLE profiles (keyId string PUB READONLY)
+                        ALLOW update IF keyId = $author
+                    );
+                `);
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok || result.value.kind !== 'create-schema') return;
+                const allow = result.value.tables[0].options.find((o) => o.kind === 'allow-rule');
+                if (allow === undefined || allow.kind !== 'allow-rule') return;
+                const table = result.value.tables[0];
+                const scope = {
+                    gated: { name: table.name, columns: columnSetFromTableDecl(table) },
+                    columnsOf: columnsOfFromTableDecls(result.value.tables),
+                };
+                const lowered = lowerRestrictionPredicate(allow.predicate, scope);
+                assertEquals(lowered.p, 'cmp', 'top-level cmp');
+                if (lowered.p !== 'cmp') return;
+                assertTrue('col' in lowered.left && lowered.left.col === 'keyId', 'unqualified keyId resolves to gated table');
+            },
+        },
+        {
+            name: '[PARSE25] requires qualification for ambiguous EXISTS correlation',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE SCHEMA s AS (
+                      TABLE profiles (keyId string PUB READONLY)
+                        ALLOW insert IF EXISTS identities WHERE keyId = keyId,
+                      TABLE identities (keyId string PUB READONLY)
+                    );
+                `);
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok || result.value.kind !== 'create-schema') return;
+                const profiles = result.value.tables.find((t) => t.name === 'profiles');
+                assertTrue(profiles !== undefined, 'profiles table');
+                if (profiles === undefined) return;
+                const allow = profiles.options.find((o) => o.kind === 'allow-rule');
+                if (allow === undefined || allow.kind !== 'allow-rule') return;
+                const scope = {
+                    gated: { name: profiles.name, columns: columnSetFromTableDecl(profiles) },
+                    columnsOf: columnsOfFromTableDecls(result.value.tables),
+                };
+                let threw = false;
+                try {
+                    lowerRestrictionPredicate(allow.predicate, scope);
+                } catch (e) {
+                    threw = e instanceof Error && e.message.includes('ambiguous');
+                }
+                assertTrue(threw, 'ambiguous bare keyId should require qualification');
+            },
+        },
+        {
+            name: '[PARSE26] requires AS alias for self-referential EXISTS',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE SCHEMA s AS (
+                      TABLE caps (label string PUB READONLY, grantee string PUB READONLY)
+                        ALLOW insert IF EXISTS caps WHERE label = 'manager'
+                    );
+                `);
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok || result.value.kind !== 'create-schema') return;
+                const allow = result.value.tables[0].options.find((o) => o.kind === 'allow-rule');
+                if (allow === undefined || allow.kind !== 'allow-rule') return;
+                const table = result.value.tables[0];
+                const scope = {
+                    gated: { name: table.name, columns: columnSetFromTableDecl(table) },
+                    columnsOf: columnsOfFromTableDecls(result.value.tables),
+                };
+                let threw = false;
+                try {
+                    lowerRestrictionPredicate(allow.predicate, scope);
+                } catch (e) {
+                    threw = e instanceof Error && e.message.includes('self-referential');
+                }
+                assertTrue(threw, 'self-referential EXISTS without alias should fail');
+            },
+        },
+        {
+            name: '[PARSE27] rejects top-level column references in group gates',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE TABLEGROUP g USING SCHEMA s
+                      ALLOW UPDATE SCHEMA IF keyId = $author;
+                `);
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok || result.value.kind !== 'create-tablegroup') return;
+                const scope = { columnsOf: () => undefined };
+                let threw = false;
+                try {
+                    lowerRestrictionPredicate(result.value.canDeploy!, scope);
+                } catch (e) {
+                    threw = e instanceof Error && e.message.includes('not allowed');
+                }
+                assertTrue(threw, 'top-level column in canDeploy should fail');
+            },
+        },
+        {
+            name: '[PARSE28] parses #prefix hash values in INSERT VALUES',
             invoke: async () => {
                 const result = parseStatement("INSERT INTO profiles (ownerId, label) VALUES (#abc, 'Admin');");
                 assertTrue(result.ok, 'parse should succeed');
