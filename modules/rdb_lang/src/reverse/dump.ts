@@ -22,7 +22,14 @@ export async function dumpObject(object: LoggableObject, options: DumpOptions = 
 }
 
 export async function dumpSchema(schema: RSchema & LoggableObject, options?: DumpOptions): Promise<string> {
-    return dumpObject(schema, options);
+    return dumpObject(schema, {
+        ...options,
+        render: {
+            ...options?.render,
+            schemaRef: schema.getId(),
+            schemaName: schema.getName(),
+        },
+    });
 }
 
 export async function dumpGroup(group: RTableGroup & LoggableObject, options?: DumpOptions): Promise<string> {

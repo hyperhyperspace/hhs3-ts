@@ -13,7 +13,7 @@ import { bind, BoundStatement } from "../src/bind/bind.js";
 import { execute } from "../src/exec/execute.js";
 import { parseStatement } from "../src/syntax/parser.js";
 import { renderCreateSchema, renderCreateTableGroup, renderRowOp, renderSchemaUpdate } from "../src/reverse/render.js";
-import { dumpDatabase, dumpGroup } from "../src/reverse/dump.js";
+import { dumpDatabase, dumpGroup, dumpSchema } from "../src/reverse/dump.js";
 import { createTestBindContext, TestBindContext } from "./mock_bind_context.js";
 
 const crypto = createBasicCrypto();
@@ -259,6 +259,7 @@ export const restPhaseTests = {
                 assertTrue(renderedSchema.includes('ALLOW all IF true'), 'rendered schema uses ALLOW IF syntax');
                 assertTrue(renderedSchema.includes('TABLE products (\n    sku string PUB READONLY,\n    name string\n  )\n    ALLOW all IF true'),
                     'rendered schema uses multiline column layout');
+                const authorKeyId = schema.createOp.creators[0].keyId;
                 const renderedMigration = renderSchemaUpdate({
                     action: 'schema-update',
                     migration: [{
@@ -266,9 +267,29 @@ export const restPhaseTests = {
                         table: 'products',
                         restrictions: [{ on: 'insert', rule: { p: 'true' } }],
                     }],
-                } as SchemaUpdatePayload);
+                    author: authorKeyId,
+                    signature: 'sig',
+                } as SchemaUpdatePayload, {
+                    schemaRef: schema.getId(),
+                    schemaName: schema.getName(),
+                });
+                assertTrue(renderedMigration.startsWith('-- shop\n'), 'rendered migration includes schema name comment');
+                assertTrue(renderedMigration.includes(`ALTER SCHEMA #${schema.getId()} AS (`), 'rendered migration uses schema hash ref');
+                assertTrue(renderedMigration.includes(` BY #${authorKeyId}`), 'rendered migration includes BY author');
                 assertTrue(renderedMigration.includes('SET ALLOW RULES products'), 'rendered migration uses SET ALLOW RULES syntax');
                 assertTrue(parseStatement(renderedMigration).ok, 'rendered migration parses');
+
+                const alter = await execute(await parseBind('ALTER SCHEMA shop AS (ADD COLUMN products.note string NULL);', lang));
+                assertTrue(alter.ok && alter.value.kind === 'alter-schema', 'alter for schema dump succeeds');
+                const schemaDump = await dumpSchema(schema);
+                assertTrue(!schemaDump.includes('#unknown'), 'schema dump does not use unknown schema ref');
+                assertTrue(schemaDump.includes('-- shop\n'), 'schema dump includes schema name comment');
+                assertTrue(schemaDump.includes(`ALTER SCHEMA #${schema.getId()} AS (`), 'schema dump uses schema hash ref');
+                assertTrue(schemaDump.includes('ADD COLUMN products.note string NULL'), 'schema dump includes alter migration');
+                const schemaDumpLines = schemaDump.split('\n');
+                assertTrue(schemaDumpLines.some((line) =>
+                    line.includes(` BY #${authorKeyId}`) && line.includes(' AT {#')),
+                    'dumped alter includes BY author and causal AT');
                 const renderedGroup = renderCreateTableGroup({
                     action: 'create',
                     type: RTableGroupImpl.typeId,

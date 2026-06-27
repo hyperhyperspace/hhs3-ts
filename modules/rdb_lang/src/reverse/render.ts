@@ -11,6 +11,7 @@ import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 export type RenderOptions = {
     at?: json.Set;
     schemaRef?: B64Hash;
+    schemaName?: string;
 };
 
 export function renderCreateDatabase(payload: CreateRDbPayload): string {
@@ -55,7 +56,9 @@ export function renderAddGroup(payload: AddGroupPayload): string {
 
 export function renderSchemaUpdate(payload: SchemaUpdatePayload, options?: RenderOptions): string {
     const rules = payload.migration.map(renderMigrationRule).join(',\n  ');
-    return `ALTER SCHEMA #unknown AS (\n  ${rules}\n)${renderAt(options)};`;
+    const schemaRef = options?.schemaRef ?? 'unknown';
+    const comment = options?.schemaName === undefined ? '' : `-- ${options.schemaName}\n`;
+    return `${comment}ALTER SCHEMA #${schemaRef} AS (\n  ${rules}\n)${renderBy(payload.author)}${renderAt(options)};`;
 }
 
 export function renderRowOp(payload: RowOpPayload, table?: string, options?: RenderOptions): string {
