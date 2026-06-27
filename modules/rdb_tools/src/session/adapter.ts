@@ -45,6 +45,7 @@ export function createBindContext(session: WorkspaceSession): LangBindContext {
         resolveVersion: (expr, scope) => resolveVersionExpr(session, expr, scope),
         resolveDefaultView: async () => session.defaultView,
         resolveVariable: (name) => session.resolveVariable(name),
+        resolvePublicKey: (labelOrPrefix) => session.resolvePublicKey(labelOrPrefix),
         resolveLogTarget: (ref) => session.workspace.roots.resolveLogTarget(ref),
         currentAuthor: () => session.currentAuthor(),
         resolveAuthor: (ref) => session.resolveAuthor(ref),

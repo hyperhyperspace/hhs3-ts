@@ -53,6 +53,41 @@ export function asCreator(value: LangValue): { keyId: KeyId; publicKey: PublicKe
     throw new Error('Expected identity or creator value');
 }
 
+export async function resolveCreator(
+    expr: ValueExpr,
+    context: LangBindContext,
+): Promise<{ keyId: KeyId; publicKey: PublicKey }> {
+    if (expr.kind === 'variable') {
+        return asCreator(await resolveValue(expr, context));
+    }
+    if (expr.kind === 'hash') {
+        if (context.resolvePublicKey === undefined) {
+            throw new Error('CREATORS #prefix requires a keystore host');
+        }
+        return resolveCreatorKey(context, `#${expr.prefix}`, expr.prefix);
+    }
+    if (expr.kind === 'literal' && typeof expr.value === 'string') {
+        if (context.resolvePublicKey === undefined) {
+            throw new Error('CREATORS key-id literal requires a keystore host');
+        }
+        return resolveCreatorKey(context, `'${expr.value}'`, expr.value);
+    }
+    return asCreator(await resolveValue(expr, context));
+}
+
+async function resolveCreatorKey(
+    context: LangBindContext,
+    displayRef: string,
+    labelOrPrefix: string,
+): Promise<{ keyId: KeyId; publicKey: PublicKey }> {
+    try {
+        return await context.resolvePublicKey!(labelOrPrefix);
+    } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        throw new Error(`${message} (CREATORS ${displayRef})`);
+    }
+}
+
 function publicKeyString(value: LangValue): string {
     if (isIdentity(value) || isKeyRecord(value)) {
         if (value.publicKey === undefined) throw new Error('publicKey() requires an identity or public key record');

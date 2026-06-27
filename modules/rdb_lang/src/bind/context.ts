@@ -66,6 +66,8 @@ export interface LangBindContext {
     resolveVersion(expr: VersionExpr | undefined, scope: VersionScope): Promise<Version>;
     resolveDefaultView?(scope: VersionScope): Promise<{ at: Version; from?: Version } | undefined>;
     resolveVariable(name: string): Promise<LangValue>;
+    // Resolve a keystore label, key-id prefix, or full key id to a creator record.
+    resolvePublicKey?(labelOrPrefix: string): Promise<{ keyId: KeyId; publicKey: PublicKey }>;
     resolveLogTarget(ref: NameOrHashRef): Promise<ResolvedLogTarget>;
     currentAuthor(): Promise<OwnIdentity | undefined>;
     // Resolve an explicit `BY $name` / `BY #prefix` author to an unlocked

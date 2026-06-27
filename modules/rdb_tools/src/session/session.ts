@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import type { B64Hash, KeyId, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
+import type { B64Hash, KeyId, OwnIdentity, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import type { AuthorRef, LangValue } from "@hyper-hyper-space/hhs3_rdb_lang";
 
@@ -148,6 +148,12 @@ export class WorkspaceSession {
         }
 
         throw new Error(`Unknown variable '$${name}'`);
+    }
+
+    async resolvePublicKey(labelOrPrefix: string): Promise<{ keyId: KeyId; publicKey: PublicKey }> {
+        if (this.keystore === undefined) throw new Error('No keystore configured');
+        const record = this.keystore.resolvePublic(labelOrPrefix);
+        return { keyId: record.keyId, publicKey: record.publicKey };
     }
 
     createUuid(): string {

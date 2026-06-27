@@ -250,7 +250,12 @@ export const restPhaseTests = {
             invoke: async () => {
                 const { schema, group, lang } = await createEnv();
                 const renderedSchema = renderCreateSchema(schema.createOp);
-                assertTrue(parseStatement(renderedSchema).ok, 'rendered schema parses');
+                const renderedParsed = parseStatement(renderedSchema);
+                assertTrue(renderedParsed.ok, 'rendered schema parses');
+                if (renderedParsed.ok) {
+                    const renderedBound = await bind(renderedParsed.value, lang);
+                    assertTrue(renderedBound.ok, 'rendered schema binds with keystore creator lookup');
+                }
                 assertTrue(renderedSchema.includes('ALLOW all IF true'), 'rendered schema uses ALLOW IF syntax');
                 assertTrue(renderedSchema.includes('TABLE products (\n    sku string PUB READONLY,\n    name string\n  )\n    ALLOW all IF true'),
                     'rendered schema uses multiline column layout');
@@ -342,6 +347,11 @@ export const restPhaseTests = {
 
                 const renderedSchema = renderCreateSchema(schema.createOp);
                 assertTrue(parseStatement(renderedSchema).ok, 'rendered users schema parses');
+                const renderedParsed = parseStatement(renderedSchema);
+                if (renderedParsed.ok) {
+                    const renderedBound = await bind(renderedParsed.value, lang);
+                    assertTrue(renderedBound.ok, 'rendered users schema binds with keystore creator lookup');
+                }
                 assertTrue(renderedSchema.includes(`TABLE identities (\n    keyId string PUB READONLY,\n    publicKey string PUB READONLY,\n    name string NULL PUB\n  ) IDENTITY PROVIDER\n    ALLOW insert IF true`),
                     'rendered identities table uses multiline columns');
                 assertTrue(renderedSchema.includes(`TABLE caps (\n    label string PUB READONLY,\n    grantee string PUB READONLY\n  ) CONCURRENT DELETES\n    ALLOW insert IF`),

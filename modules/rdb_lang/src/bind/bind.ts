@@ -18,7 +18,7 @@ import type {
     LangBindContext, LangValue, ResolvedDatabaseRef, ResolvedGroupRef, ResolvedLogTarget, ResolvedSchemaRef,
     ResolvedTableRef,
 } from "./context.js";
-import { asIdentity, asJsonLiteral, asKeyId, resolveValue } from "./values.js";
+import { asIdentity, asJsonLiteral, asKeyId, resolveCreator, resolveValue } from "./values.js";
 
 export type BoundStatement =
     | BoundCreateDatabase
@@ -228,9 +228,7 @@ async function bindCreateDatabase(ast: CreateDatabaseStatement, context: LangBin
 async function bindCreateSchema(ast: CreateSchemaStatement, context: LangBindContext): Promise<BoundCreateSchema> {
     const creators: { keyId: KeyId; publicKey: PublicKey }[] = [];
     for (const expr of ast.creators) {
-        const value = await resolveValue(expr, context);
-        if (!isCreatorValue(value)) throw new Error('CREATORS values must resolve to identities or creator records');
-        creators.push({ keyId: value.keyId, publicKey: value.publicKey });
+        creators.push(await resolveCreator(expr, context));
     }
     return { kind: 'create-schema', ast, creators };
 }
@@ -514,8 +512,4 @@ async function bindRowId(
         return (value as { keyId: B64Hash }).keyId;
     }
     throw new Error('rowId must resolve to a hash string');
-}
-
-function isCreatorValue(value: LangValue): value is { keyId: KeyId; publicKey: PublicKey } {
-    return typeof value === 'object' && value !== null && 'keyId' in value && 'publicKey' in value;
 }

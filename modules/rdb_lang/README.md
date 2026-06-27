@@ -162,6 +162,8 @@ CREATE TABLEGROUP app_group USING SCHEMA app_schema
 
 `publicKey($admin)` returns the canonical serialized public key for an identity or public-key record. Plain `$admin` remains the key id string in row values.
 
+`CREATORS` also accepts `#keyIdPrefix` or a full key-id string literal when the key is present in the host keystore (for example when replaying dumped schema SQL).
+
 ```sql
 CREATE SCHEMA users_schema CREATORS ($admin) AS (
   TABLE identities (
@@ -193,6 +195,7 @@ CREATE TABLEGROUP users
 - workspace name resolution for schemas, groups, tables, and log targets,
 - hash-prefix and version resolution,
 - session variables such as `$me`, `$admin`, and `$author`,
+- keystore public-key lookup for `CREATORS (#prefix)` and key-id literals (`resolvePublicKey`),
 - default author identity (`currentAuthor`),
 - explicit `BY` author resolution to an unlocked signing identity (`resolveAuthor`),
 - UUID and seed generation.

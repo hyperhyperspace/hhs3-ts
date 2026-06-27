@@ -1,4 +1,4 @@
-import { B64Hash, createBasicCrypto, HASH_SHA256, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash, createBasicCrypto, HASH_SHA256, KeyId, OwnIdentity, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
 import { version } from "@hyper-hyper-space/hhs3_mvt";
 import type { RContext, Version } from "@hyper-hyper-space/hhs3_mvt";
 import type { RObject } from "@hyper-hyper-space/hhs3_mvt";
@@ -119,6 +119,33 @@ export function createTestBindContext(_ctx: RContext, vars: { [name: string]: La
             return v;
         },
 
+        async resolvePublicKey(labelOrPrefix: string): Promise<{ keyId: KeyId; publicKey: PublicKey }> {
+            const normalized = labelOrPrefix.startsWith('#') ? labelOrPrefix.slice(1) : labelOrPrefix;
+
+            const byName = vars[normalized];
+            if (byName !== undefined) {
+                const record = creatorRecordFrom(byName);
+                if (record !== undefined) return record;
+            }
+
+            const records: { label: string; keyId: KeyId; publicKey: PublicKey }[] = [];
+            const seenKeyIds = new Set<KeyId>();
+            for (const [label, value] of Object.entries(vars)) {
+                const record = creatorRecordFrom(value);
+                if (record === undefined || seenKeyIds.has(record.keyId)) continue;
+                seenKeyIds.add(record.keyId);
+                records.push({ label, ...record });
+            }
+
+            const labelMatches = records.filter((record) => record.label === normalized);
+            if (labelMatches.length === 1) return labelMatches[0];
+
+            const keyMatches = records.filter((record) => record.keyId.startsWith(normalized));
+            if (keyMatches.length === 1) return keyMatches[0];
+            if (keyMatches.length === 0) throw new Error(`Unknown key '${labelOrPrefix}'`);
+            throw new Error(`Ambiguous key prefix '${labelOrPrefix}'`);
+        },
+
         async resolveLogTarget(ref: NameOrHashRef): Promise<ResolvedLogTarget> {
             const name = refText(ref);
             if (name.includes('.')) {
@@ -161,6 +188,15 @@ export function createTestBindContext(_ctx: RContext, vars: { [name: string]: La
     };
 
     return bindContext;
+}
+
+function creatorRecordFrom(value: LangValue): { keyId: KeyId; publicKey: PublicKey } | undefined {
+    if (typeof value !== 'object' || value === null || ('kind' in value && value.kind === 'key-id')) {
+        return undefined;
+    }
+    if (!('keyId' in value) || !('publicKey' in value)) return undefined;
+    if (typeof value.keyId !== 'string' || value.publicKey === undefined) return undefined;
+    return { keyId: value.keyId, publicKey: value.publicKey as PublicKey };
 }
 
 function objectForVersion(scope: VersionScope): ScopedObject | undefined {
