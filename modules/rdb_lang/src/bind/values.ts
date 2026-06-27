@@ -7,7 +7,10 @@ import type { LangBindContext, LangValue } from "./context.js";
 
 export async function resolveValue(expr: ValueExpr, context: LangBindContext): Promise<LangValue> {
     if (expr.kind === 'literal') return expr.value;
-    if (expr.kind === 'variable') return context.resolveVariable(expr.name);
+    if (expr.kind === 'variable') {
+        if (expr.field !== undefined) throw new Error('$row.<column> is only supported in allow rule predicates');
+        return context.resolveVariable(expr.name);
+    }
     if (expr.name === 'publicKey') {
         if (expr.args.length !== 1) throw new Error('publicKey() expects exactly one argument');
         return publicKeyString(await resolveValue(expr.args[0], context));

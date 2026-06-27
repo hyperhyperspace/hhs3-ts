@@ -55,7 +55,7 @@ export type AuthorExpr =
 
 export type ValueExpr =
     | { kind: 'literal'; value: json.Literal | null; span: TextSpan }
-    | { kind: 'variable'; name: string; span: TextSpan }
+    | { kind: 'variable'; name: string; field?: string; span: TextSpan }
     | { kind: 'call'; name: string; args: ValueExpr[]; span: TextSpan };
 
 export type TableRef = {

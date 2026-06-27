@@ -130,7 +130,14 @@ function lowerRestrictionOperand(expr: OperandExpr): Operand {
         if (expr.value === null) throw new Error('NULL is not supported in allow rule operands');
         return { lit: expr.value };
     }
-    if (expr.name === 'author') return { lit: '$author' };
+    if (expr.kind === 'variable') {
+        if (expr.field !== undefined) {
+            if (expr.name !== 'row') throw new Error('Only $row.<column> is supported in allow rule operands');
+            return { col: expr.field };
+        }
+        if (expr.name === 'author') return { lit: '$author' };
+        throw new Error('Only $author is supported in allow rule operands');
+    }
     throw new Error('Only $author is supported in allow rule operands');
 }
 
@@ -140,11 +147,18 @@ function lowerWhereValue(expr: OperandExpr): json.Literal | '$author' | string {
         if (expr.value === null) throw new Error('NULL is not supported in EXISTS WHERE values');
         return expr.value;
     }
-    return lowerIdTerm(expr);
+    if (expr.kind === 'variable') {
+        if (expr.field !== undefined) {
+            if (expr.name !== 'row') throw new Error('Only $row.<column> is supported in EXISTS WHERE values');
+            return `$row.${expr.field}`;
+        }
+        return lowerIdTerm(expr);
+    }
+    throw new Error('EXISTS WHERE value must be a literal or identity term');
 }
 
 function lowerIdTerm(expr: ValueExpr): '$author' {
-    if (expr.kind === 'variable' && expr.name === 'author') return '$author';
+    if (expr.kind === 'variable' && expr.field === undefined && expr.name === 'author') return '$author';
     throw new Error('Expected $author identity term');
 }
 

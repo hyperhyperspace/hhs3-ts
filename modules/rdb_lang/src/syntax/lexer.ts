@@ -95,6 +95,10 @@ export function lex(source: string): Result<Token[]> {
                 continue;
             }
             while (i < source.length && isIdentPart(source[i])) i += 1;
+            if (source[i] === '.' && i + 1 < source.length && isIdentStart(source[i + 1])) {
+                i += 2;
+                while (i < source.length && isIdentPart(source[i])) i += 1;
+            }
             push('variable', source.substring(start, i), start, i);
             continue;
         }

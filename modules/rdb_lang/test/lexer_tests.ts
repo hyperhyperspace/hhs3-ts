@@ -17,5 +17,15 @@ export const lexerTests = {
                 assertEquals(stringToken?.value, "A'1", 'SQL string escaping');
             },
         },
+        {
+            name: '[LEX02] tokenizes dotted variable member access',
+            invoke: async () => {
+                const result = lex('EXISTS users.identities WHERE keyId = $row.keyId');
+                assertTrue(result.ok, 'lexing should succeed');
+                if (!result.ok) return;
+                const variable = result.value.find((t) => t.kind === 'variable');
+                assertEquals(variable?.text, '$row.keyId', 'dotted variable token');
+            },
+        },
     ],
 };

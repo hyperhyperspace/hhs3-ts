@@ -842,7 +842,15 @@ class Parser {
         }
         if (tok.kind === 'variable') {
             this.advance();
-            return { kind: 'variable', name: tok.text.substring(1), span: tok.span };
+            const raw = tok.text.substring(1);
+            const dot = raw.indexOf('.');
+            if (dot === -1) return { kind: 'variable', name: raw, span: tok.span };
+            return {
+                kind: 'variable',
+                name: raw.substring(0, dot),
+                field: raw.substring(dot + 1),
+                span: tok.span,
+            };
         }
         if (this.checkPunctuation('[') || this.checkPunctuation('{')) {
             return this.parseJsonValue();

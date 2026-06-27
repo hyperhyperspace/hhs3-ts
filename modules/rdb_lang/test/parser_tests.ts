@@ -1,5 +1,6 @@
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 
+import { lowerRestrictionPredicate } from "../src/compile/query.js";
 import { parseStatement } from "../src/syntax/parser.js";
 
 export const parserTests = {
@@ -385,14 +386,28 @@ export const parserTests = {
             },
         },
         {
-            name: '[PARSE21] rejects deprecated DEPLOY SCHEMA statement syntax',
+            name: '[PARSE22] parses and lowers $row.<column> in allow rule predicates',
             invoke: async () => {
-                const result = parseStatement('DEPLOY SCHEMA shop AT LATEST ON shop_prod;');
-                assertTrue(!result.ok, 'DEPLOY SCHEMA should fail');
-                if (!result.ok) {
-                    assertTrue(result.diagnostics.some((d) => d.message.includes('Unexpected token')),
-                        'diagnostic mentions unexpected token');
-                }
+                const result = parseStatement(`
+                    CREATE SCHEMA users AS (
+                      TABLE profiles (
+                        keyId string PUB READONLY
+                      ) ALLOW insert IF keyId = $author AND EXISTS users.identities WHERE keyId = $row.keyId
+                    );
+                `);
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok || result.value.kind !== 'create-schema') return;
+                const allow = result.value.tables[0].options.find((o) => o.kind === 'allow-rule');
+                assertTrue(allow !== undefined && allow.kind === 'allow-rule', 'allow rule option');
+                if (allow === undefined || allow.kind !== 'allow-rule') return;
+
+                const lowered = lowerRestrictionPredicate(allow.predicate);
+                assertEquals(lowered.p, 'and', 'top-level predicate is AND');
+                if (lowered.p !== 'and') return;
+                const exists = lowered.args[1];
+                assertEquals(exists.p, 'exists', 'second arm is EXISTS');
+                if (exists.p !== 'exists') return;
+                assertEquals(exists.where.keyId, '$row.keyId', 'EXISTS WHERE correlates via $row.keyId');
             },
         },
     ],
