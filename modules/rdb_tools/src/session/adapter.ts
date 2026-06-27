@@ -15,6 +15,7 @@ import {
     VersionScope,
 } from "@hyper-hyper-space/hhs3_rdb_lang";
 
+import { KeyPassphraseRequiredError } from "./session.js";
 import { WorkspaceSession } from "./session.js";
 
 export type StatementRunResult = {
@@ -91,6 +92,20 @@ export class LanguageError extends Error {
     constructor(readonly diagnostics: LangDiagnostic[]) {
         super(diagnostics.map((d) => `${d.code}: ${d.message}`).join('\n'));
     }
+}
+
+const KEY_PASSPHRASE_REQUIRED = /^Key '([^']+)' is not unlocked$/;
+
+/** Recover a locked-key deferral swallowed by rdb_lang bind error handling. */
+export function keyPassphraseRequiredFromError(e: unknown): KeyPassphraseRequiredError | undefined {
+    if (e instanceof KeyPassphraseRequiredError) return e;
+    if (e instanceof LanguageError) {
+        for (const diagnostic of e.diagnostics) {
+            const match = KEY_PASSPHRASE_REQUIRED.exec(diagnostic.message);
+            if (match !== null) return new KeyPassphraseRequiredError(match[1]);
+        }
+    }
+    return undefined;
 }
 
 async function resolveVersionExpr(session: WorkspaceSession, expr: VersionExpr | undefined, scope: VersionScope): Promise<Version> {

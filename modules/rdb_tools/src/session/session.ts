@@ -20,6 +20,13 @@ export type WorkspaceSessionOptions = {
     outputMode?: OutputMode;
 };
 
+export class KeyPassphraseRequiredError extends Error {
+    constructor(readonly label: string) {
+        super(`Key '${label}' is not unlocked`);
+        this.name = 'KeyPassphraseRequiredError';
+    }
+}
+
 export class WorkspaceSession {
     readonly workspace: Workspace;
     readonly variables = new Map<string, LangValue>();
@@ -125,8 +132,9 @@ export class WorkspaceSession {
     async resolveAuthor(ref: AuthorRef): Promise<OwnIdentity> {
         const labelOrPrefix = ref.kind === 'variable' ? ref.name : `#${ref.prefix}`;
         const identity = this.resolveIdentity(labelOrPrefix);
-        if (identity === undefined) throw new Error(`Key '${labelOrPrefix}' is not unlocked`);
-        return identity;
+        if (identity !== undefined) return identity;
+        const record = this.keystore!.resolveRecord(labelOrPrefix);
+        throw new KeyPassphraseRequiredError(record.label);
     }
 
     async resolveVariable(name: string): Promise<LangValue> {

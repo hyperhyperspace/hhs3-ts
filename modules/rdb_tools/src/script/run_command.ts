@@ -5,8 +5,14 @@ import { formatDiagnostics } from "../format/diagnostics.js";
 import { formatJson } from "../format/json.js";
 import { formatTableResult } from "../format/table.js";
 import { runMetaCommand } from "../repl/meta.js";
-import { fulfillKeyPassphrase } from "../repl/passphrase.js";
-import { LanguageError, runLanguageText } from "../session/adapter.js";
+import {
+    confirmStatementUnlock,
+    fulfillKeyPassphrase,
+    fulfillPassphraseNeed,
+    KeyUnlockDeclinedError,
+    keyDisplayLabel,
+} from "../repl/passphrase.js";
+import { keyPassphraseRequiredFromError, LanguageError, runLanguageText, type ScriptRunResult } from "../session/adapter.js";
 import { WorkspaceSession } from "../session/session.js";
 
 export type CommandRun = {
@@ -18,6 +24,34 @@ export type CommandRunOptions = {
     rl?: Interface;
 };
 
+export async function runLanguageWithUnlock(
+    session: WorkspaceSession,
+    text: string,
+    options?: { rl?: Interface },
+): Promise<ScriptRunResult> {
+    while (true) {
+        try {
+            return await runLanguageText(session, text);
+        } catch (e) {
+            if (e instanceof KeyUnlockDeclinedError) throw e;
+            const required = keyPassphraseRequiredFromError(e);
+            if (required === undefined) throw e;
+            if (!input.isTTY) {
+                throw new Error('passphrase required; use the REPL or pass it inline with -c');
+            }
+            const owned = options?.rl === undefined;
+            const activeRl = options?.rl ?? createInterface({ input, output });
+            try {
+                const displayName = keyDisplayLabel(session, required.label);
+                await confirmStatementUnlock(activeRl, displayName);
+                await fulfillKeyPassphrase(session, { kind: 'unlock', label: required.label }, activeRl);
+            } finally {
+                if (owned) activeRl.close();
+            }
+        }
+    }
+}
+
 export async function runCommand(
     session: WorkspaceSession,
     command: string,
@@ -28,22 +62,13 @@ export async function runCommand(
         const meta = await runMetaCommand(session, command);
         if (meta.handled) {
             if (meta.needsPassphrase !== undefined) {
-                if (!input.isTTY) {
-                    return { exitCode: 1, output: 'passphrase required; use the REPL or pass it inline with -c' };
-                }
-                const owned = options?.rl === undefined;
-                const rl = options?.rl ?? createInterface({ input, output });
-                try {
-                    const text = await fulfillKeyPassphrase(session, meta.needsPassphrase, rl);
-                    return { exitCode: 0, output: text };
-                } finally {
-                    if (owned) rl.close();
-                }
+                const text = await fulfillPassphraseNeed(session, meta.needsPassphrase, options?.rl);
+                return { exitCode: 0, output: text };
             }
             return { exitCode: 0, output: meta.output ?? '' };
         }
 
-        const run = await runLanguageText(session, command);
+        const run = await runLanguageWithUnlock(session, command, { rl: options?.rl });
         const rendered = run.results
             .map((item) => session.outputMode === 'json'
                 ? formatJson(item.result)
@@ -52,6 +77,9 @@ export async function runCommand(
             .join('\n');
         return { exitCode: 0, output: rendered };
     } catch (e) {
+        if (e instanceof KeyUnlockDeclinedError) {
+            return { exitCode: 1, output: 'unlock declined' };
+        }
         if (e instanceof LanguageError) {
             return { exitCode: 2, output: formatDiagnostics(e.diagnostics, file) };
         }

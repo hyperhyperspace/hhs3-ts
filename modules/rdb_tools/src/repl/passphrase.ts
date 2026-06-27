@@ -1,8 +1,15 @@
-import type { Interface } from "node:readline/promises";
-import { stdout as output } from "node:process";
+import { stdin as input, stdout as output } from "node:process";
+import { createInterface, type Interface } from "node:readline/promises";
 
 import { WorkspaceSession } from "../session/session.js";
 import { promptSecret } from "./prompt.js";
+
+export class KeyUnlockDeclinedError extends Error {
+    constructor(readonly label: string) {
+        super('unlock declined');
+        this.name = 'KeyUnlockDeclinedError';
+    }
+}
 
 export async function fulfillKeyPassphrase(
     session: WorkspaceSession,
@@ -25,7 +32,33 @@ export async function fulfillKeyPassphrase(
     return `unlocked ${identity.keyId}`;
 }
 
-function keyDisplayLabel(session: WorkspaceSession, labelOrPrefix: string): string {
+export async function fulfillPassphraseNeed(
+    session: WorkspaceSession,
+    needs: { kind: 'create' | 'unlock' | 'author'; label: string },
+    rl?: Interface,
+): Promise<string> {
+    if (!input.isTTY) {
+        throw new Error('passphrase required; use the REPL or pass it inline with -c');
+    }
+    const owned = rl === undefined;
+    const activeRl = rl ?? createInterface({ input, output });
+    try {
+        return await fulfillKeyPassphrase(session, needs, activeRl);
+    } finally {
+        if (owned) activeRl.close();
+    }
+}
+
+export async function confirmStatementUnlock(rl: Interface, displayName: string): Promise<void> {
+    const answer = (await rl.question(
+        `Key ${displayName} needed to sign statement, unlock? [Y/n] `,
+    )).trim().toLowerCase();
+    if (answer === 'n' || answer === 'no') {
+        throw new KeyUnlockDeclinedError(displayName);
+    }
+}
+
+export function keyDisplayLabel(session: WorkspaceSession, labelOrPrefix: string): string {
     try {
         return session.keystore!.resolveRecord(labelOrPrefix).label;
     } catch {

@@ -6,10 +6,10 @@ import { scanStatement } from "@hyper-hyper-space/hhs3_rdb_lang";
 
 import { formatJson } from "../format/json.js";
 import { formatTableResult } from "../format/table.js";
-import { runLanguageText } from "../session/adapter.js";
+import { runLanguageWithUnlock } from "../script/run_command.js";
 import { WorkspaceSession } from "../session/session.js";
 import { runMetaCommand } from "./meta.js";
-import { fulfillKeyPassphrase } from "./passphrase.js";
+import { fulfillKeyPassphrase, KeyUnlockDeclinedError } from "./passphrase.js";
 import { promptForSession } from "./prompt.js";
 
 export async function startRepl(session: WorkspaceSession): Promise<void> {
@@ -65,7 +65,7 @@ export async function startRepl(session: WorkspaceSession): Promise<void> {
         if (!isComplete(buffer)) return { quit: false };
 
         try {
-            const run = await runLanguageText(session, buffer);
+            const run = await runLanguageWithUnlock(session, buffer, { rl });
             for (const item of run.results) {
                 const rendered = session.outputMode === 'json'
                     ? formatJson(item.result)
@@ -73,7 +73,11 @@ export async function startRepl(session: WorkspaceSession): Promise<void> {
                 if (rendered.length > 0) output.write(rendered + '\n');
             }
         } catch (e) {
-            output.write((e instanceof Error ? e.message : String(e)) + '\n');
+            if (e instanceof KeyUnlockDeclinedError) {
+                // User declined unlock; return to the main prompt without an error line.
+            } else {
+                output.write((e instanceof Error ? e.message : String(e)) + '\n');
+            }
         } finally {
             buffer = '';
         }

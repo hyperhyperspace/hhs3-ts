@@ -401,6 +401,30 @@ const tests = [
             });
         },
     },
+    {
+        name: '[RDB_TOOLS13] locked key on signed statement fails non-interactively',
+        invoke: async () => {
+            await withSession(async (session, dbPath) => {
+                if (session.keystore === undefined) throw new Error('missing keystore');
+                const setup = await runScript(session, setupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+                const alice = session.keystore.list().find((key) => key.label === 'alice');
+                if (alice === undefined) throw new Error('missing alice key');
+
+                const keystore = await KeyStore.open(`${dbPath}.keys.json`, session.workspace.replica.getHashSuite());
+                const reopened = new WorkspaceSession({ workspace: session.workspace, keystore });
+                assertTrue(!reopened.isUnlocked(alice.keyId), 'alice is locked in fresh session');
+
+                const missing = await runCommandNonInteractive(
+                    reopened,
+                    "INSERT INTO shop_prod.products (sku, name) VALUES ('B', 'Gadget') BY $alice;",
+                );
+                assertEquals(missing.exitCode, 1, 'locked BY author fails non-interactively');
+                assertTrue(missing.output.includes('passphrase required'), 'non-interactive signed insert requests passphrase');
+                assertTrue(!reopened.isUnlocked(alice.keyId), 'failed unlock leaves key locked');
+            });
+        },
+    },
 ];
 
 async function runCommandNonInteractive(session: WorkspaceSession, command: string) {
