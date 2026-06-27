@@ -54,6 +54,7 @@ import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 import type { RSchema, RSchemaView } from "../rschema/interfaces.js";
 import type { Predicate } from "../rschema/payload.js";
 import { splitTableRef } from "../rschema/payload.js";
+import { formatPredicate, formatRestrictionFailureReason } from "../rschema/format_predicate.js";
 import { collectExistsAtoms } from "../rschema/validate.js";
 import { isValidTableRef } from "../rschema/validate.js";
 import type { RTable, RTableView } from "../rtable/interfaces.js";
@@ -124,7 +125,7 @@ export async function validateTableGroupPayload(payload: json.Literal, context: 
 
     if (action === 'row') {
         return wrapValidationFailure(
-            `row envelope rejected by group '${group.getId()}'`,
+            'row envelope rejected',
             await validateRowEnvelope(payload as RowEnvelopePayload, group, at),
             group.getId(),
         );
@@ -276,13 +277,14 @@ async function validateRowOpRestrictionAt(
     group: GroupOpHost,
     at: Version,
 ): Promise<ValidationResult> {
+    const rule = schemaView.getRestriction(table, op.action);
     const ok = await evaluateRowOpRestriction(op, table, schemaView,
         (targetTable) => group.makeTable(targetTable).getView(at, at),
         (groupName, targetTable) => group.resolveForeignTableView(groupName, targetTable, at, at),
     );
     return ok
         ? validationOk()
-        : validationFailure(`restriction predicate failed for row '${op.rowId}' in table '${table}'`);
+        : validationFailure(formatRestrictionFailureReason(table, op, rule));
 }
 
 async function validateRowEnvelope(envelope: RowEnvelopePayload, group: GroupOpHost, at: Version): Promise<ValidationResult> {
@@ -503,7 +505,14 @@ async function validateObserveGate(
 
     return await group.evaluateObserveGate(payload.refId, author, newRefVersion, newRefVersion)
         ? validationOk()
-        : validationFailure(`canObserve predicate rejected observation of group '${payload.refId}'`);
+        : validationFailure(`canObserve predicate rejected observation of '${bindingNameFor(group, payload.refId)}': ${formatPredicate(group.observeGateFor(payload.refId)!)}`);
+}
+
+function bindingNameFor(group: GroupOpHost, refId: B64Hash): string {
+    for (const [name, id] of Object.entries(group.getBindings())) {
+        if (id === refId) return name;
+    }
+    return refId;
 }
 
 async function validateDeploy(payload: RefAdvancePayload, group: GroupOpHost, at: Version): Promise<ValidationResult> {
@@ -532,7 +541,7 @@ async function validateDeploy(payload: RefAdvancePayload, group: GroupOpHost, at
             author,
             context: 'object',
         });
-        if (!ok) return validationFailure("canDeploy predicate rejected schema deploy");
+        if (!ok) return validationFailure(`canDeploy predicate rejected schema deploy: ${formatPredicate(canDeploy)}`);
     }
 
     const newRefVersion = extractRefVersion(payload);

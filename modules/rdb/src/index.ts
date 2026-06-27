@@ -7,6 +7,7 @@ export * from "./rschema/delta.js";
 export * from "./rschema/interfaces.js";
 export * from "./rschema/rschema.js";
 export * from "./rschema/expr.js";
+export * from "./rschema/format_predicate.js";
 
 // RTable: a member table (nested RObject on the group's scoped DAG)
 export * from "./rtable/hash.js";

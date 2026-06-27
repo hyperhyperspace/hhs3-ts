@@ -2,7 +2,7 @@ import { assertTrue, assertFalse, assertEquals } from "@hyper-hyper-space/hhs3_u
 import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { version, Version } from "@hyper-hyper-space/hhs3_mvt";
+import { formatValidationFailure, ValidationRejectedError, version, Version } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
@@ -77,14 +77,20 @@ async function expectInsertFailure(table: { insert: (...a: never[]) => Promise<u
     assertTrue(failed, why);
 }
 
-async function expectFailure(fn: () => Promise<unknown>, why: string): Promise<void> {
-    let failed = false;
+async function expectFailure(fn: () => Promise<unknown>, why: string, messageIncludes?: string): Promise<void> {
+    let error: unknown;
     try {
         await fn();
-    } catch {
-        failed = true;
+    } catch (e) {
+        error = e;
     }
-    assertTrue(failed, why);
+    assertTrue(error !== undefined, why);
+    if (messageIncludes !== undefined) {
+        const msg = error instanceof ValidationRejectedError
+            ? formatValidationFailure(error.why)
+            : error instanceof Error ? error.message : String(error);
+        assertTrue(msg.includes(messageIncludes), `expected message to include '${messageIncludes}', got: ${msg}`);
+    }
 }
 
 export const rtableEnforceTests = {
@@ -257,7 +263,8 @@ export const rtableEnforceTests = {
 
                 // no witness yet: restrictions are hard validation at `(at, at)`
                 await expectFailure(() => items.insert('i-void', { name: 'thing' }),
-                    'the exists-gated insert is rejected with no witness');
+                    'the exists-gated insert is rejected with no witness',
+                    "does not satisfy ALLOW insert IF EXISTS caps WHERE caps.label = 'grant'");
 
                 // a witness present at-or-before the use validates a later use
                 // (at-use semantics: the witness must exist at the op position)
@@ -281,7 +288,8 @@ export const rtableEnforceTests = {
                 ], { selfValidate: false });
                 const items = await group.getTable('items');
                 await expectFailure(() => items.insert('i-void', { name: 'thing' }),
-                    'the public insert API should reject invalid ops even when context selfValidate is off');
+                    'the public insert API should reject invalid ops even when context selfValidate is off',
+                    "does not satisfy ALLOW insert IF EXISTS caps WHERE caps.label = 'grant'");
             }
         },
         {
@@ -381,9 +389,11 @@ export const rtableEnforceTests = {
                 // unauthored writes fail the default author-is-author restriction
                 // during validation.
                 await expectFailure(() => docs.update(rowId, { body: 'v2' }),
-                    'an unauthored update of an authored row rejects at validation');
+                    'an unauthored update of an authored row rejects at validation',
+                    'does not satisfy ALLOW update IF docs.rowAuthor = $author');
                 await expectFailure(() => docs.delete(rowId),
-                    'an unauthored delete of an authored row rejects at validation');
+                    'an unauthored delete of an authored row rejects at validation',
+                    'does not satisfy ALLOW delete IF docs.rowAuthor = $author');
                 assertEquals((await (await tableView(group, 'docs')).getRow(rowId))!.values['body'], 'v1',
                     'failed unauthored writes leave the row unchanged');
 
@@ -484,12 +494,20 @@ export const rtableEnforceTests = {
 
                 const stranger = await makeIdentity();
                 let strangerFailed = false;
+                let strangerMessage = '';
                 try {
                     await group.deploy(v2, stranger);
-                } catch {
+                } catch (e) {
                     strangerFailed = true;
+                    if (e instanceof ValidationRejectedError) {
+                        strangerMessage = formatValidationFailure(e.why);
+                    }
                 }
                 assertTrue(strangerFailed, 'a deploy by a non-admin should fail canDeploy');
+                assertTrue(
+                    strangerMessage.includes('canDeploy predicate rejected schema deploy: EXISTS admins WHERE admins.grantee = $author'),
+                    `canDeploy failure should name the predicate, got: ${strangerMessage}`,
+                );
 
                 await group.deploy(v2, admin);
                 assertTrue((await group.getView()).getTableNames().includes('notes'),

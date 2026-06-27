@@ -235,7 +235,7 @@ const tests = [
                 const del = await runCommand(anonymousSession, `DELETE FROM shop_prod.products WHERE rowId = '${rowId}';`);
                 assertEquals(del.exitCode, 2, 'invalid delete should be a language validation error');
                 assertTrue(del.output.includes('VALIDATION_REJECTED'), 'validation diagnostic code');
-                assertTrue(del.output.includes('restriction predicate failed'), 'validation reason');
+                assertTrue(del.output.includes('does not satisfy ALLOW delete IF products.rowAuthor = $author'), 'validation reason');
 
                 const selected = await runCommand(session, "SELECT sku, name FROM shop_prod.products;");
                 assertTrue(selected.output.includes('Widget'), 'rejected delete should not remove the row');

@@ -2,9 +2,9 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import {
     AddGroupPayload, AddSchemaPayload, BundlePayload, ColumnDef, CreateRDbPayload, CreateRSchemaPayload,
-    CreateTableGroupPayload, DeleteRowPayload, InsertRowPayload, MigrationRule,
+    CreateTableGroupPayload, InsertRowPayload, MigrationRule,
     RowEnvelopePayload, RowOpPayload, SchemaUpdatePayload, TableDef, UpdateRowPayload,
-    parseRowFieldTerm,
+    formatPredicate,
 } from "@hyper-hyper-space/hhs3_rdb";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 
@@ -31,9 +31,9 @@ export function renderCreateTableGroup(payload: CreateTableGroupPayload): string
     ];
     for (const [name, id] of Object.entries(payload.bindings ?? {})) parts.push(`BIND ${name} => #${id}`);
     if (payload.idProvider !== undefined) parts.push(`USING IDENTITIES ${payload.idProvider}`);
-    if (payload.canDeploy !== undefined) parts.push(`ALLOW UPDATE SCHEMA IF ${renderPredicate(payload.canDeploy)}`);
+    if (payload.canDeploy !== undefined) parts.push(`ALLOW UPDATE SCHEMA IF ${formatPredicate(payload.canDeploy)}`);
     for (const [binding, pred] of Object.entries(payload.canObserve ?? {})) {
-        parts.push(`ALLOW UPDATE REF ${binding} IF ${renderPredicate(pred)}`);
+        parts.push(`ALLOW UPDATE REF ${binding} IF ${formatPredicate(pred)}`);
     }
     if (payload.initialRows !== undefined) {
         const rows: string[] = [];
@@ -123,7 +123,7 @@ function renderTableDef(table: TableDef): string {
     }
 
     const allows = (table.restrictions ?? [])
-        .map((r) => `ALLOW ${r.on} IF ${renderPredicate(r.rule, { gatedTable: table.name })}`);
+        .map((r) => `ALLOW ${r.on} IF ${formatPredicate(r.rule, { gatedTable: table.name })}`);
 
     let suffix = '';
     if (structural.length > 0) {
@@ -161,97 +161,13 @@ function renderMigrationRule(rule: MigrationRule): string {
         case 'set-fks':
             return `SET FKS ${rule.table} (${Object.entries(rule.fks).map(([c, r]) => `${c} REFERENCES ${r}`).join(', ')})`;
         case 'set-restrictions':
-            return `SET ALLOW RULES ${rule.table} (\n    ${rule.restrictions.map((r) => `ALLOW ${r.on} IF ${renderPredicate(r.rule, { gatedTable: rule.table })}`).join(',\n    ')}\n  )`;
+            return `SET ALLOW RULES ${rule.table} (\n    ${rule.restrictions.map((r) => `ALLOW ${r.on} IF ${formatPredicate(r.rule, { gatedTable: rule.table })}`).join(',\n    ')}\n  )`;
     }
 }
 
 function renderInitialRow(table: string, row: InsertRowPayload): string {
     const values = Object.entries(row.values).map(([k, v]) => `${k}=${renderLiteral(v)}`).join(', ');
     return `${table} (${values})`;
-}
-
-function renderPredicate(predicate: unknown, scope: RenderScope = {}): string {
-    if (!isObject(predicate)) return 'true';
-    switch (predicate['p']) {
-        case 'true':
-            return 'true';
-        case 'false':
-            return 'false';
-        case 'exists': {
-            const existsTable = String(predicate['table']);
-            const isSelfRef = scope.gatedTable !== undefined && existsTable === scope.gatedTable;
-            const alias = isSelfRef ? selfReferentialExistsAlias(existsTable) : undefined;
-            const existsRef = alias !== undefined ? `${existsTable} AS ${alias}` : existsTable;
-            const existsQual = alias ?? existsTable;
-            const where = isObject(predicate['where'])
-                ? ` WHERE ${Object.entries(predicate['where']).map(([k, v]) => `${renderExistsWhereKey(k, existsQual)} = ${renderExistsWhereValue(v, scope.gatedTable)}`).join(' AND ')}`
-                : '';
-            return `EXISTS ${existsRef}${where}`;
-        }
-        case 'cmp':
-            return `${renderOperand(predicate['left'], scope.gatedTable, false)} ${renderCmp(String(predicate['cmp']))} ${renderOperand(predicate['right'], scope.gatedTable, false)}`;
-        case 'str':
-            return `${renderOperand(predicate['value'], scope.gatedTable, false)} LIKE ${renderStringPattern(String(predicate['str']), predicate['sub'])}`;
-        case 'and':
-            return Array.isArray(predicate['args']) ? predicate['args'].map((a) => renderPredicate(a, scope)).join(' AND ') : 'true';
-        case 'or':
-            return Array.isArray(predicate['args']) ? predicate['args'].map((a) => renderPredicate(a, scope)).join(' OR ') : 'true';
-        default:
-            return 'true';
-    }
-}
-
-type RenderScope = {
-    gatedTable?: string;
-};
-
-function selfReferentialExistsAlias(tableName: string): string {
-    const letter = tableName[0];
-    return tableName.length === 1 ? `${letter}2` : letter;
-}
-
-function renderExistsWhereKey(key: string, existsQual: string): string {
-    return `${existsQual}.${key}`;
-}
-
-function renderExistsWhereValue(value: unknown, gatedTable?: string): string {
-    if (typeof value === 'string' && value === '$author') return '$author';
-    if (typeof value === 'string') {
-        const col = parseRowFieldTerm(value);
-        if (col !== undefined) {
-            return gatedTable !== undefined ? `${gatedTable}.${col}` : col;
-        }
-    }
-    return renderLiteral(value as json.Literal);
-}
-
-function renderOperand(operand: unknown, gatedTable?: string, bareTopLevel = true): string {
-    if (!isObject(operand)) return 'NULL';
-    if ('col' in operand) {
-        const col = String(operand['col']);
-        if (gatedTable !== undefined && !bareTopLevel) return `${gatedTable}.${col}`;
-        return col;
-    }
-    if ('lit' in operand) return renderTermOrLiteral(operand['lit']);
-    return 'NULL';
-}
-
-function renderTermOrLiteral(value: unknown): string {
-    if (typeof value === 'string' && value.startsWith('$')) {
-        if (value === '$author') return '$author';
-    }
-    return renderLiteral(value as json.Literal);
-}
-
-function renderCmp(cmp: string): string {
-    return ({ eq: '=', ne: '!=', lt: '<', le: '<=', gt: '>', ge: '>=' } as Record<string, string>)[cmp] ?? '=';
-}
-
-function renderStringPattern(op: string, sub: unknown): string {
-    const lit = isObject(sub) && typeof sub['lit'] === 'string' ? sub['lit'] : '';
-    if (op === 'prefix') return sqlString(`${lit}%`);
-    if (op === 'suffix') return sqlString(`%${lit}`);
-    return sqlString(`%${lit}%`);
 }
 
 function renderLiteral(value: json.Literal): string {

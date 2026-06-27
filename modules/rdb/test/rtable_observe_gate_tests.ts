@@ -2,6 +2,7 @@ import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.
 import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import type { RContext, Version } from "@hyper-hyper-space/hhs3_mvt";
+import { formatValidationFailure, ValidationRejectedError } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
@@ -32,10 +33,16 @@ async function frontier(group: RTableGroupImpl): Promise<Version> {
     return (await group.getScopedDag()).getFrontier();
 }
 
-async function expectThrow(fn: () => Promise<unknown>, why: string): Promise<void> {
-    let threw = false;
-    try { await fn(); } catch { threw = true; }
-    assertTrue(threw, why);
+async function expectThrow(fn: () => Promise<unknown>, why: string, messageIncludes?: string): Promise<void> {
+    let error: unknown;
+    try { await fn(); } catch (e) { error = e; }
+    assertTrue(error !== undefined, why);
+    if (messageIncludes !== undefined) {
+        const msg = error instanceof ValidationRejectedError
+            ? formatValidationFailure(error.why)
+            : error instanceof Error ? error.message : String(error);
+        assertTrue(msg.includes(messageIncludes), `expected message to include '${messageIncludes}', got: ${msg}`);
+    }
 }
 
 // The observe gate evaluated in the OBSERVED (Users) group's frame: the
@@ -125,7 +132,8 @@ export const rtableObserveGateTests = {
                 await expectThrow(() => a.group.observe(USERS_BINDING, v),
                     'a gated observe with no author is rejected');
                 await expectThrow(() => a.group.observe(USERS_BINDING, v, mallory),
-                    'a gated observe by a non-manager is rejected by canObserve');
+                    'a gated observe by a non-manager is rejected by canObserve',
+                    "canObserve predicate rejected observation of 'users': EXISTS caps WHERE caps.label = 'manager' AND caps.grantee = $author");
 
                 const hAdmin = await a.group.observe(USERS_BINDING, v, admin);
                 assertTrue(hAdmin.length > 0, 'a gated observe by a manager is admitted');
