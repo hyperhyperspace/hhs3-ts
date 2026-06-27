@@ -316,6 +316,20 @@ const tests = [
                 if (session.keystore === undefined) throw new Error('missing keystore');
                 const identity = await session.createKey('alice', 'correct');
 
+                let unknownFailed = false;
+                try {
+                    await runMetaCommand(session, '\\key unlock amdin');
+                } catch (e) {
+                    unknownFailed = true;
+                    assertTrue(e instanceof Error && e.message.includes("Unknown key 'amdin'"), 'unknown unlock fails before prompt');
+                }
+                assertTrue(unknownFailed, 'unknown unlock throws');
+
+                const unknownNonInteractive = await runCommandNonInteractive(session, '\\key unlock amdin');
+                assertEquals(unknownNonInteractive.exitCode, 1, 'non-interactive unknown unlock fails');
+                assertTrue(unknownNonInteractive.output.includes('Unknown key'), 'unknown unlock reports unknown key');
+                assertTrue(!unknownNonInteractive.output.includes('passphrase required'), 'unknown unlock does not request passphrase');
+
                 const createPending = await runMetaCommand(session, '\\key create bob');
                 assertEquals(createPending.needsPassphrase?.kind, 'create', 'create without passphrase requests prompt');
                 assertEquals(createPending.needsPassphrase?.label, 'bob', 'create prompt keeps label');

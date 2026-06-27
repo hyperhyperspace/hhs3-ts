@@ -97,7 +97,8 @@ async function keyCommand(session: WorkspaceSession, args: string[]): Promise<Ke
     }
     if (sub === 'unlock') {
         if (label === undefined) throw new Error('Usage: \\key unlock <label|#prefix>');
-        if (passphrase === undefined) return { needsPassphrase: { kind: 'unlock', label } };
+        const record = session.keystore.resolveRecord(label);
+        if (passphrase === undefined) return { needsPassphrase: { kind: 'unlock', label: record.label } };
         const identity = await session.unlockKey(label, passphrase);
         return { output: `unlocked ${identity.keyId}` };
     }
