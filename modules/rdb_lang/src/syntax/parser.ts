@@ -87,7 +87,18 @@ class Parser {
 
     private parseCreateDatabase(start: TextSpan): CreateDatabaseStatement {
         const nameTok = this.expectIdentifierToken('database name');
-        return { kind: 'create-database', name: nameTok.text, span: combineSpans(start, nameTok.span) };
+        let end = nameTok.span;
+        const creators: ValueExpr[] = [];
+        if (this.matchKeyword('CREATORS')) {
+            this.expectPunctuation('(');
+            if (!this.checkPunctuation(')')) {
+                do {
+                    creators.push(this.parseValue());
+                } while (this.matchPunctuation(','));
+            }
+            end = this.expectPunctuation(')').span;
+        }
+        return { kind: 'create-database', name: nameTok.text, creators, span: combineSpans(start, end) };
     }
 
     private parseCreateSchema(start: TextSpan): CreateSchemaStatement {
@@ -313,11 +324,19 @@ class Parser {
         const database = this.parseNameOrHash();
         let end = database.span;
         let note: string | undefined;
+        let at: VersionExpr | undefined;
+        let author: AuthorExpr | undefined;
         while (!this.isEof() && !this.checkPunctuation(';')) {
             if (this.matchKeyword('NOTE')) {
                 const tok = this.expectKind('string', 'NOTE text');
                 note = tok.value as string;
                 end = tok.span;
+            } else if (this.matchKeyword('AT')) {
+                at = this.parseVersion();
+                end = at.span;
+            } else if (this.matchKeyword('BY')) {
+                author = this.parseAuthor();
+                end = author.span;
             } else {
                 this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected ADD clause '${this.peek().text}'`, this.peek().span);
                 this.advance();
@@ -325,6 +344,8 @@ class Parser {
         }
         const stmt: AddMemberStatement = { kind: 'add-member', member, target, database, span: combineSpans(start, end) };
         if (note !== undefined) stmt.note = note;
+        if (at !== undefined) stmt.at = at;
+        if (author !== undefined) stmt.author = author;
         return stmt;
     }
 

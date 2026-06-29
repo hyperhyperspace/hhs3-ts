@@ -283,11 +283,20 @@ async function testGroupRefAdvance() {
 async function testRDbPayloads() {
     assertTrue(validateRDbPayloadFormat({ action: 'create', type: RDB_TYPE_ID, seed: 'seed-1', name: 'mydb' }),
         'well-formed rdb create should validate');
+    assertTrue(validateRDbPayloadFormat({
+        action: 'create', type: RDB_TYPE_ID, seed: 'seed-1', name: 'mydb',
+        creators: [{ keyId: 'alice', publicKey: 'pem...' }],
+    }),
+        'rdb create with creators should validate');
     assertFalse(validateRDbPayloadFormat({ action: 'create', seed: 'seed-1', name: 'mydb' }),
         'rdb create without type should not validate');
 
     assertTrue(validateRDbPayloadFormat({ action: 'add-schema', schemaId: 'schemaObjectId', note: 'the shop schema' }),
         'well-formed add-schema should validate');
+    assertTrue(validateRDbPayloadFormat({
+        action: 'add-schema', schemaId: 'schemaObjectId', author: 'alice', signature: 'sig',
+    }),
+        'add-schema with author/signature should validate');
     assertTrue(validateRDbPayloadFormat({ action: 'add-schema', schemaId: 'schemaObjectId' }),
         'add-schema without note should validate');
     assertTrue(validateRDbPayloadFormat({ action: 'add-schema', schemaId: 'schemaObjectId', note: '2 free-form! text' }),

@@ -109,6 +109,7 @@ export type CreateSchemaStatement = {
 export type CreateDatabaseStatement = {
     kind: 'create-database';
     name: string;
+    creators: ValueExpr[];
     span: TextSpan;
 };
 
@@ -139,6 +140,8 @@ export type AddMemberStatement = {
     target: NameOrHashRef;
     database: NameOrHashRef;
     note?: string;
+    author?: AuthorExpr;
+    at?: VersionExpr;
     span: TextSpan;
 };
 

@@ -15,7 +15,10 @@ export type RenderOptions = {
 };
 
 export function renderCreateDatabase(payload: CreateRDbPayload): string {
-    return `CREATE DATABASE ${payload.name ?? payload.seed};`;
+    const creators = (payload.creators ?? []).length > 0
+        ? ` CREATORS (${payload.creators!.map((c) => sqlString(c.keyId)).join(', ')})`
+        : '';
+    return `CREATE DATABASE ${payload.name ?? payload.seed}${creators};`;
 }
 
 export function renderCreateSchema(payload: CreateRSchemaPayload): string {
@@ -47,11 +50,11 @@ export function renderCreateTableGroup(payload: CreateTableGroupPayload): string
 }
 
 export function renderAddSchema(payload: AddSchemaPayload): string {
-    return `ADD SCHEMA #${payload.schemaId} TO <database>${renderNote(payload.note)};`;
+    return `ADD SCHEMA #${payload.schemaId} TO <database>${renderNote(payload.note)}${renderBy(payload.author)};`;
 }
 
 export function renderAddGroup(payload: AddGroupPayload): string {
-    return `ADD TABLEGROUP #${payload.groupId} TO <database>${renderNote(payload.note)};`;
+    return `ADD TABLEGROUP #${payload.groupId} TO <database>${renderNote(payload.note)}${renderBy(payload.author)};`;
 }
 
 export function renderSchemaUpdate(payload: SchemaUpdatePayload, options?: RenderOptions): string {

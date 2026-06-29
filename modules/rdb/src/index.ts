@@ -37,6 +37,7 @@ export * from "./users/peer_directory.js";
 // RDb: the sync root / orchestrator (advisory; never validity-bearing)
 export * from "./rdb/payload.js";
 export * from "./rdb/validate.js";
+export * from "./rdb/validate_ops.js";
 export * from "./rdb/resolve.js";
 export * from "./rdb/interfaces.js";
 export * from "./rdb/rdb.js";

@@ -29,8 +29,8 @@ async function executeRuntime(bound: BoundExecutableStatement): Promise<LangExec
         case 'add-member': {
             if (bound.database.db === undefined) throw new Error('ADD target database is not loaded');
             const entryHash = bound.member === 'schema'
-                ? await bound.database.db.addSchema(bound.memberId, bound.note, bound.at)
-                : await bound.database.db.addGroup(bound.memberId, bound.note, bound.at);
+                ? await bound.database.db.addSchema(bound.memberId, bound.note, bound.author, bound.at)
+                : await bound.database.db.addGroup(bound.memberId, bound.note, bound.author, bound.at);
             return { kind: 'add-member', member: bound.member, entryHash, database: bound.database.id, memberId: bound.memberId };
         }
         case 'alter-schema': {

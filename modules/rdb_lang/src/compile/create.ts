@@ -30,6 +30,7 @@ async function compileCreateDatabase(bound: BoundCreateDatabase): Promise<Create
     const payload = await RDbImpl.create({
         seed: bound.seed,
         name: bound.ast.name,
+        ...(bound.creators.length > 0 ? { creators: bound.creators } : {}),
     });
     return { kind: 'create-database', name: bound.ast.name, payload };
 }

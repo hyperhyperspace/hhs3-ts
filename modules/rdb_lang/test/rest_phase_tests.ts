@@ -77,7 +77,7 @@ async function createEnv() {
     const group = await ctx.createObject(groupPlan.value.plan.payload) as RTableGroupImpl;
     lang.registerGroup('shop_prod', group);
 
-    return { ctx, lang, schema, group };
+    return { ctx, lang, schema, group, admin };
 }
 
 export const restPhaseTests = {
@@ -119,6 +119,36 @@ export const restPhaseTests = {
                 assertTrue(!dump.includes('-- unknown payload'), 'membership ops render to SQL');
                 assertTrue(dump.includes(`ADD SCHEMA #${schema.getId()} TO <database> NOTE 'shop schema';`), 'ADD SCHEMA round-trips');
                 assertTrue(dump.includes(`ADD TABLEGROUP #${group.getId()} TO <database>;`), 'ADD TABLEGROUP round-trips');
+            },
+        },
+        {
+            name: '[REST01c] gated database requires BY on ADD and dump round-trips CREATORS/BY',
+            invoke: async () => {
+                const { ctx, lang, schema, group, admin } = await createEnv();
+                const dbPlan = await execute(await parseBind('CREATE DATABASE gated CREATORS ($admin);', lang));
+                if (!dbPlan.ok || dbPlan.value.kind !== 'create-plan') throw new Error('database create failed');
+                const db = await ctx.createObject(dbPlan.value.plan.payload) as RDbImpl;
+                lang.registerDatabase('gated', db);
+
+                const unsignedParsed = parseStatement('ADD SCHEMA shop TO gated;');
+                assertTrue(unsignedParsed.ok, 'parse unsigned ADD');
+                if (!unsignedParsed.ok) return;
+                const unsigned = await bind(unsignedParsed.value, lang);
+                assertTrue(!unsigned.ok, 'unsigned ADD must fail bind when database declares creators');
+
+                const addSchema = await execute(await parseBind("ADD SCHEMA shop TO gated BY $admin NOTE 'shop schema';", lang));
+                assertTrue(addSchema.ok && addSchema.value.kind === 'add-member', 'signed ADD SCHEMA succeeds');
+                const addGroup = await execute(await parseBind('ADD TABLEGROUP shop_prod TO gated BY $admin;', lang));
+                assertTrue(addGroup.ok && addGroup.value.kind === 'add-member', 'signed ADD TABLEGROUP succeeds');
+
+                assertTrue((await db.getMemberSchemas()).includes(schema.getId()), 'schema is a member');
+                assertTrue((await db.getMemberGroups()).includes(group.getId()), 'group is a member');
+
+                const dump = await dumpDatabase(db);
+                assertTrue(dump.includes('CREATORS ('), 'dump includes CREATORS');
+                assertTrue(dump.includes(admin.keyId), 'dump includes creator keyId');
+                assertTrue(dump.includes(`ADD SCHEMA #${schema.getId()} TO <database> NOTE 'shop schema' BY #${admin.keyId}`), 'ADD SCHEMA BY round-trips');
+                assertTrue(dump.includes(`ADD TABLEGROUP #${group.getId()} TO <database> BY #${admin.keyId}`), 'ADD TABLEGROUP BY round-trips');
             },
         },
         {

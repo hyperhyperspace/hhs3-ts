@@ -7,15 +7,19 @@
 // ACTIONS (see payload.ts for formats):
 //
 //   create
-//     Genesis of the sync root. Carries: seed, optional name, hash algorithm.
+//     Genesis of the sync root. Carries: seed, optional name, optional
+//     creators (keyId + publicKey; deployment authority when non-empty),
+//     hash algorithm.
 //
 //   add-schema
 //     Records an RSchema as part of the deployment (monotonic, no removal in
-//     v1; optional free-form `note`).
+//     v1; optional free-form `note`). When creators are declared, requires
+//     author + signature from a creator.
 //
 //   add-group
 //     Records a deployed RTableGroup as part of the deployment (monotonic;
-//     optional free-form `note`).
+//     optional free-form `note`). When creators are declared, requires
+//     author + signature from a creator.
 //
 // Invariants:
 //   - RDb state is ADVISORY: nothing's validity ever depends on it; groups are
@@ -39,7 +43,8 @@
 //     (including the RDb's own DAG) and activate it. stopSync tears them down.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { B64Hash, HASH_SHA256 } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash, HASH_SHA256, KeyId, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
+import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, Entry, position } from "@hyper-hyper-space/hhs3_dag";
 
 import {
@@ -47,15 +52,15 @@ import {
     Version, version, ForeignDep, Event, Delta, DeltaAccumulator, View, RObject,
     SyncableObject, formatValidationFailure, validationFailure, ValidationRejectedError, ValidationResult,
 } from "@hyper-hyper-space/hhs3_mvt";
-import { RootScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
+import { RootScopedDag, ScopedDag, CausalDag, signPayload as signPayloadHelper, serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { Mesh, Swarm } from "@hyper-hyper-space/hhs3_mesh";
 import { createSyncSession } from "@hyper-hyper-space/hhs3_sync";
 import type { SyncSession, SyncTarget } from "@hyper-hyper-space/hhs3_sync";
 
 import type { RDb as RDbContract } from "./interfaces.js";
-import { CreateRDbPayload, AddSchemaPayload, AddGroupPayload, RDB_TYPE_ID } from "./payload.js";
-import { validateRDbPayloadFormat } from "./validate.js";
+import { CreateRDbPayload, AddSchemaPayload, AddGroupPayload, RDB_TYPE_ID, SchemaCreator } from "./payload.js";
+import { validateRDbPayload } from "./validate_ops.js";
 import { resolveMembers } from "./resolve.js";
 import { RTableGroupImpl, RTABLE_GROUP_TYPE_ID } from "../rtable_group/group.js";
 
@@ -74,12 +79,12 @@ export const rDbFactory: RObjectFactory = {
         return entry.hash;
     },
 
-    validateCreationPayload: async (payload: Payload, _ctx: RContext) => {
+    validateCreationPayload: async (payload: Payload, ctx: RContext) => {
         if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
             return validationFailure("RDb create payload must be an object");
         }
         if ((payload as json.LiteralMap)['action'] !== 'create') return validationFailure("RDb creation action must be 'create'");
-        return validateRDbPayloadFormat(payload);
+        return validateRDbPayload(payload, { mode: 'create', ctx });
     },
 
     executeCreationPayload: async (payload: Payload, _ctx: RContext, scopedDag: ScopedDag) => {
@@ -106,6 +111,7 @@ export class RDbImpl implements RDbContract, SyncableObject {
     static create = async (options: {
         seed: string;
         name?: string;
+        creators?: { keyId: KeyId; publicKey: PublicKey }[];
         hashAlgorithm?: string;
     }): Promise<CreateRDbPayload> => {
 
@@ -115,6 +121,12 @@ export class RDbImpl implements RDbContract, SyncableObject {
             seed: options.seed,
         };
         if (options.name !== undefined) createPayload.name = options.name;
+        if (options.creators !== undefined && options.creators.length > 0) {
+            createPayload.creators = options.creators.map((c) => ({
+                keyId: c.keyId,
+                publicKey: serializePublicKeyToBase64(c.publicKey),
+            }));
+        }
         if (options.hashAlgorithm !== undefined) createPayload.hashAlgorithm = options.hashAlgorithm;
 
         return createPayload;
@@ -147,6 +159,14 @@ export class RDbImpl implements RDbContract, SyncableObject {
     seed(): string { return this.createOp.seed; }
     hashAlgorithm(): string | undefined { return this.createOp.hashAlgorithm; }
 
+    getCreators(): SchemaCreator[] {
+        return [...(this.createOp.creators ?? [])];
+    }
+
+    isCreator(keyId: KeyId): boolean {
+        return this.getCreators().some((c) => c.keyId === keyId);
+    }
+
     getContext(): RContext { return this.ctx; }
 
     setRuntimeConfig(config: RDbRuntimeConfig): void {
@@ -159,21 +179,35 @@ export class RDbImpl implements RDbContract, SyncableObject {
 
     // --- Membership writers ---
 
-    async addSchema(schemaId: B64Hash, note?: string, at?: Version): Promise<B64Hash> {
-        const payload: AddSchemaPayload = { action: 'add-schema', schemaId };
-        if (note !== undefined) payload.note = note;
-        return this.applyMembership(payload, at);
+    async addSchema(schemaId: B64Hash, note?: string, author?: OwnIdentity, at?: Version): Promise<B64Hash> {
+        const base: Omit<AddSchemaPayload, 'author' | 'signature'> = { action: 'add-schema', schemaId };
+        if (note !== undefined) base.note = note;
+        return this.applyMembership(base, author, at);
     }
 
-    async addGroup(groupId: B64Hash, note?: string, at?: Version): Promise<B64Hash> {
-        const payload: AddGroupPayload = { action: 'add-group', groupId };
-        if (note !== undefined) payload.note = note;
-        return this.applyMembership(payload, at);
+    async addGroup(groupId: B64Hash, note?: string, author?: OwnIdentity, at?: Version): Promise<B64Hash> {
+        const base: Omit<AddGroupPayload, 'author' | 'signature'> = { action: 'add-group', groupId };
+        if (note !== undefined) base.note = note;
+        return this.applyMembership(base, author, at);
     }
 
-    private async applyMembership(payload: Payload, at?: Version): Promise<B64Hash> {
+    private async applyMembership(
+        base: Omit<AddSchemaPayload, 'author' | 'signature'> | Omit<AddGroupPayload, 'author' | 'signature'>,
+        author?: OwnIdentity,
+        at?: Version,
+    ): Promise<B64Hash> {
         const scopedDag = await this.getScopedDag();
         at = at ?? await scopedDag.getFrontier();
+
+        let payload: Payload;
+        if (this.getCreators().length > 0) {
+            if (author === undefined) {
+                throw new Error(`RDb membership op '${(base as json.LiteralMap)['action']}' requires an author when the database declares creators`);
+            }
+            payload = await signPayloadHelper(base as unknown as json.LiteralMap, author);
+        } else {
+            payload = base as Payload;
+        }
 
         if (this.selfValidate()) {
             const result = await this.validatePayload(payload, at);
@@ -215,7 +249,7 @@ export class RDbImpl implements RDbContract, SyncableObject {
         if (action !== 'add-schema' && action !== 'add-group') {
             return validationFailure(`action '${String(action)}' is not an RDb membership op`, { objectHash: this.createOpId });
         }
-        return validateRDbPayloadFormat(payload);
+        return validateRDbPayload(payload, { mode: 'op', rdb: this });
     }
 
     async applyPayload(payload: Payload, at: Version): Promise<B64Hash> {

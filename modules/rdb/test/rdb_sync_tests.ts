@@ -99,8 +99,13 @@ async function makeSchemaGroup(ctx: RContext, seed: string, opts?: {
     return { schema, group };
 }
 
-async function makeRDb(ctx: RContext, seed: string): Promise<RDbImpl> {
-    const init = await RDbImpl.create({ seed });
+async function makeRDb(ctx: RContext, seed: string, creators?: OwnIdentity[]): Promise<RDbImpl> {
+    const init = await RDbImpl.create({
+        seed,
+        ...(creators !== undefined && creators.length > 0
+            ? { creators: creators.map((c) => ({ keyId: c.keyId, publicKey: c.publicKey })) }
+            : {}),
+    });
     return (await ctx.createObject(init)) as RDbImpl;
 }
 
@@ -208,6 +213,49 @@ export const rdbSyncTests = {
                 assertTrue(topics.has(b.group.getId()), 'GroupB synced (bound foreign group)');
                 assertTrue(topics.has(b.schema.getId()), 'SchemaB synced (foreign group schema)');
                 assertTrue(topics.size === 5, `expected 5 sessions (RDb + A/SchemaA + B/SchemaB), got ${topics.size}`);
+            },
+        },
+        {
+            name: '[RDB05] creators gate membership ops: unsigned rejected, creator signed accepted, outsider rejected',
+            invoke: async () => {
+                const ctx = newCtx();
+                const admin = await makeIdentity();
+                const outsider = await makeIdentity();
+                const rdb = await makeRDb(ctx, 'rdb05', [admin]);
+                const { schema, group } = await makeSchemaGroup(ctx, 'rdb05');
+
+                await expectThrow(
+                    () => rdb.addSchema(schema.getId()),
+                    'unsigned add-schema must be rejected when creators are declared',
+                );
+                await expectThrow(
+                    () => rdb.addSchema(schema.getId(), undefined, outsider),
+                    'non-creator add-schema must be rejected',
+                );
+
+                await rdb.addSchema(schema.getId(), undefined, admin);
+                assertTrue((await rdb.getMemberSchemas()).includes(schema.getId()), 'creator-signed add-schema accepted');
+
+                await expectThrow(
+                    () => rdb.addGroup(group.getId()),
+                    'unsigned add-group must be rejected when creators are declared',
+                );
+                await rdb.addGroup(group.getId(), undefined, admin);
+                assertTrue((await rdb.getMemberGroups()).includes(group.getId()), 'creator-signed add-group accepted');
+            },
+        },
+        {
+            name: '[RDB06] no creators keeps unsigned membership ops valid',
+            invoke: async () => {
+                const ctx = newCtx();
+                const rdb = await makeRDb(ctx, 'rdb06');
+                const { schema, group } = await makeSchemaGroup(ctx, 'rdb06');
+
+                await rdb.addSchema(schema.getId());
+                await rdb.addGroup(group.getId());
+
+                assertTrue((await rdb.getMemberSchemas()).includes(schema.getId()), 'unsigned add-schema accepted');
+                assertTrue((await rdb.getMemberGroups()).includes(group.getId()), 'unsigned add-group accepted');
             },
         },
     ],

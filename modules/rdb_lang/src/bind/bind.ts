@@ -54,6 +54,7 @@ export type BoundCreateDatabase = {
     kind: 'create-database';
     ast: CreateDatabaseStatement;
     seed: string;
+    creators: { keyId: KeyId; publicKey: PublicKey }[];
 };
 
 export type BoundCreateSchema = {
@@ -85,6 +86,7 @@ export type BoundAddMember = {
     database: ResolvedDatabaseRef;
     memberId: B64Hash;
     note?: string;
+    author?: OwnIdentity;
     at: Version;
 };
 
@@ -222,7 +224,11 @@ export async function bind(statement: AstStatement, context: LangBindContext): P
 }
 
 async function bindCreateDatabase(ast: CreateDatabaseStatement, context: LangBindContext): Promise<BoundCreateDatabase> {
-    return { kind: 'create-database', ast, seed: context.createSeed('rdb', ast.name) };
+    const creators: { keyId: KeyId; publicKey: PublicKey }[] = [];
+    for (const expr of ast.creators) {
+        creators.push(await resolveCreator(expr, context));
+    }
+    return { kind: 'create-database', ast, seed: context.createSeed('rdb', ast.name), creators };
 }
 
 async function bindCreateSchema(ast: CreateSchemaStatement, context: LangBindContext): Promise<BoundCreateSchema> {
@@ -263,9 +269,17 @@ async function bindAddMember(ast: AddMemberStatement, context: LangBindContext):
     const memberId = ast.member === 'schema'
         ? (await context.resolveSchema(ast.target)).id
         : (await context.resolveGroup(ast.target)).id;
-    const at = await context.resolveVersion(undefined, { kind: 'object', id: database.id, object: database.db });
+    const at = await context.resolveVersion(ast.at, { kind: 'object', id: database.id, object: database.db });
+    if (database.db !== undefined && database.db.getCreators().length > 0 && ast.author === undefined) {
+        throw new Error(`ADD ${ast.member === 'schema' ? 'SCHEMA' : 'TABLEGROUP'} requires BY when the database declares creators`);
+    }
+    const author = await resolveEffectiveAuthor(ast.author, context);
+    if (database.db !== undefined && database.db.getCreators().length > 0 && author === undefined) {
+        throw new Error(`ADD ${ast.member === 'schema' ? 'SCHEMA' : 'TABLEGROUP'} requires an author when the database declares creators`);
+    }
     const bound: BoundAddMember = { kind: 'add-member', ast, member: ast.member, database, memberId, at };
     if (ast.note !== undefined) bound.note = ast.note;
+    if (author !== undefined) bound.author = author;
     return bound;
 }
 

@@ -30,6 +30,18 @@ async function bindCreateSchema(sql: string, context: ReturnType<typeof createTe
     return bound.value;
 }
 
+async function bindCreateDatabase(sql: string, context: ReturnType<typeof createTestBindContext>) {
+    const parsed = parseStatement(sql);
+    assertTrue(parsed.ok, `parse should succeed: ${sql}`);
+    if (!parsed.ok) throw new Error(parsed.diagnostics[0].message);
+    const bound = await bind(parsed.value, context);
+    assertTrue(bound.ok, `bind should succeed: ${sql}`);
+    if (!bound.ok) throw new Error(bound.diagnostics[0].message);
+    assertEquals(bound.value.kind, 'create-database', 'statement kind');
+    if (bound.value.kind !== 'create-database') throw new Error('expected create-database');
+    return bound.value;
+}
+
 export const creatorResolutionTests = {
     title: '[RDB_LANG:CREATORS] Keystore creator resolution',
     tests: [
@@ -114,6 +126,20 @@ export const creatorResolutionTests = {
                         );
                     }
                 }
+            },
+        },
+        {
+            name: '[CREATORS06] CREATE DATABASE CREATORS ($admin) binds with identity variable',
+            invoke: async () => {
+                const ctx = createMockRContext();
+                const admin = await createIdentity(SIGNING_ED25519, hashSuite);
+                const lang = createTestBindContext(ctx, { admin, me: admin });
+                const bound = await bindCreateDatabase('CREATE DATABASE app CREATORS ($admin);', lang);
+                const plan = await compileCreate(bound);
+                assertEquals(plan.kind, 'create-database', 'create plan kind');
+                if (plan.kind !== 'create-database') return;
+                assertEquals(plan.payload.creators![0].keyId, admin.keyId, 'creator keyId');
+                assertEquals(plan.payload.creators![0].publicKey, serializePublicKeyToBase64(admin.publicKey), 'creator publicKey');
             },
         },
     ],
