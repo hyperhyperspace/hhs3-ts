@@ -1,5 +1,5 @@
 /**
- * Statement-boundary scanner — the rdb_lang analog of sqlite3_complete().
+ * Statement-boundary scanner — the C-SQL analog of sqlite3_complete().
  *
  * Determines whether a text buffer constitutes a complete, terminated
  * statement by walking the character stream (handling strings, comments, and

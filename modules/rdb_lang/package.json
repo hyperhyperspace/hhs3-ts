@@ -1,7 +1,7 @@
 {
   "name": "@hyper-hyper-space/hhs3_rdb_lang",
   "version": "0.1.0",
-  "description": "SQL-like language layer for HHSv3 RDb objects",
+  "description": "C-SQL (causal SQL) language layer for HHSv3 RDb objects",
   "type": "module",
   "source": "src/index.ts",
   "main": "dist/index.js",

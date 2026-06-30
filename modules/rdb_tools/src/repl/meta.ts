@@ -1,8 +1,9 @@
-import { dumpDatabase, dumpGroup, dumpSchema, findLangCommandRefs, LANG_COMMAND_SECTIONS, type LangCommandRef } from "@hyper-hyper-space/hhs3_rdb_lang";
+import { dumpDatabase, dumpGroup, dumpSchema, findLangCommandRefs, LANG_COMMAND_SECTIONS, type LangCommandRef, type RenderOptions } from "@hyper-hyper-space/hhs3_rdb_lang";
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { RObject } from "@hyper-hyper-space/hhs3_mvt";
 import type { RSchema, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 
+import { createDumpRenderOptions } from "../dump/alias_context.js";
 import { formatRows } from "../format/table.js";
 import {
     formatAliasListing,
@@ -214,15 +215,16 @@ function setOutput(session: WorkspaceSession, mode: string | undefined): string 
 
 async function dump(session: WorkspaceSession, args: string[]): Promise<string> {
     const [kind, name] = args;
+    const dumpRender = (extra?: RenderOptions): RenderOptions => createDumpRenderOptions(session, extra);
     if (kind === 'schema') {
         const schema = await session.workspace.roots.resolveSchema(ref(name), rootCtx(session));
         if (schema.schema === undefined) throw new Error('Schema is not loaded');
-        return dumpSchema(schema.schema as Parameters<typeof dumpSchema>[0]);
+        return dumpSchema(schema.schema as Parameters<typeof dumpSchema>[0], { render: dumpRender() });
     }
     if (kind === 'group') {
         const group = await session.workspace.roots.resolveGroup(ref(name), rootCtx(session));
         if (group.group === undefined) throw new Error('Group is not loaded');
-        return dumpGroup(group.group as Parameters<typeof dumpGroup>[0]);
+        return dumpGroup(group.group as Parameters<typeof dumpGroup>[0], { render: dumpRender() });
     }
     if (kind === 'database') {
         const dbName = name;
@@ -235,6 +237,7 @@ async function dump(session: WorkspaceSession, args: string[]): Promise<string> 
             mode,
             loadSchema: (id) => loadSchemaObject(session, id),
             loadGroup: (id) => loadGroupObject(session, id),
+            render: dumpRender({ profile: mode }),
         });
     }
     throw new Error('Usage: \\dump schema|group|database <name> [full|schema]');
@@ -280,7 +283,7 @@ function helpCommand(args: string[]): string {
 function formatLangHelp(filter?: string): string {
     const refs = findLangCommandRefs(filter);
     if (refs.length === 0) {
-        return filter === undefined ? '(no language commands)' : `No language commands match '${filter}'`;
+        return filter === undefined ? '(no C-SQL commands)' : `No C-SQL commands match '${filter}'`;
     }
     const showSections = refs.length > 1;
     const lines: string[] = [];
@@ -314,6 +317,6 @@ function helpText(): string {
         '\\use database <name>, \\use group <name>, \\view, \\frontier [group]',
         '\\alias [scope] <name> <#prefix>, \\aliases [scope], \\unalias <scope> <name>, \\output table|json|vertical, \\dump schema|group|database <name> [full|schema]',
         '\\quit',
-        '\\help commands [filter]',
+        '\\help commands [filter]  (C-SQL reference)',
     ].join('\n');
 }

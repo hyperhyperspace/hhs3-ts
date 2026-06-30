@@ -18,11 +18,18 @@ export type DumpDatabaseOptions = DumpOptions & {
     loadGroup: (id: B64Hash) => Promise<RTableGroup & LoggableObject>;
 };
 
+function renderStatement(payload: json.Literal, options?: RenderOptions): string {
+    const sql = renderOp(payload, options);
+    if (options?.aliasMode !== true || options.aliases === undefined) return sql;
+    const defs = options.aliases.drainDefinitions();
+    return defs.length > 0 ? `${defs.join('\n')}\n${sql}` : sql;
+}
+
 export async function dumpObject(object: LoggableObject, options: DumpOptions = {}): Promise<string> {
     const statements: string[] = [];
     const dag = await object.getScopedDag();
     for await (const entry of dag.loadAllEntries()) {
-        const rendered = renderOp(entry.payload, {
+        const rendered = renderStatement(entry.payload, {
             at: entry.header.prevEntryHashes,
             ...options.render,
         });
@@ -33,24 +40,29 @@ export async function dumpObject(object: LoggableObject, options: DumpOptions = 
 }
 
 export async function dumpSchema(schema: RSchema & LoggableObject, options?: DumpOptions): Promise<string> {
+    const name = schema.getName();
     return dumpObject(schema, {
         ...options,
         render: {
             ...options?.render,
             schemaRef: schema.getId(),
-            schemaName: schema.getName(),
+            schemaName: name,
+            versionScope: { objectId: schema.getId(), objectName: name },
         },
     });
 }
 
 export async function dumpGroup(group: RTableGroup & LoggableObject, options?: DumpOptions): Promise<string> {
+    const groupId = group.getId();
+    const groupName = group.getName();
     return dumpObject(group, {
         ...options,
         render: {
             ...options?.render,
             schemaRef: group.getSchemaRef(),
-            groupRef: group.getId(),
-            groupName: group.getName(),
+            groupRef: groupId,
+            groupName,
+            versionScope: { objectId: groupId, objectName: groupName },
         },
     });
 }
@@ -59,7 +71,11 @@ export async function dumpDatabaseCreate(db: RDb & LoggableObject, options: Dump
     const dag = await db.getScopedDag();
     const entry = await dag.loadEntry(db.getId());
     if (entry === undefined) throw new Error('RDb genesis entry not found');
-    return renderOp(entry.payload, options.render);
+    const databaseName = databaseNameFromPayload(entry.payload);
+    return renderStatement(entry.payload, {
+        ...options.render,
+        versionScope: { objectId: db.getId(), objectName: databaseName },
+    });
 }
 
 export async function dumpDatabaseAddSchemas(db: RDb & LoggableObject, options: DumpDatabaseOptions): Promise<string> {
@@ -77,12 +93,16 @@ async function dumpRDbMembershipOps(
 ): Promise<string> {
     const statements: string[] = [];
     const dag = await db.getScopedDag();
+    const genesis = await dag.loadEntry(db.getId());
+    const databaseName = genesis === undefined ? 'database' : databaseNameFromPayload(genesis.payload);
+    const versionScope = { objectId: db.getId(), objectName: databaseName };
     for await (const entry of dag.loadAllEntries()) {
         if (entry.hash === db.getId()) continue;
         const payload = entry.payload as json.LiteralMap;
         if (payload['action'] !== action) continue;
-        statements.push(renderOp(entry.payload, {
+        statements.push(renderStatement(entry.payload, {
             at: entry.header.prevEntryHashes,
+            versionScope,
             ...options.render,
         }));
     }
@@ -93,9 +113,14 @@ export async function dumpGroupCreate(group: RTableGroup & LoggableObject, optio
     const dag = await group.getScopedDag();
     const entry = await dag.loadEntry(group.getId());
     if (entry === undefined) throw new Error('Tablegroup genesis entry not found');
-    return renderOp(entry.payload, {
+    const groupId = group.getId();
+    const groupName = group.getName();
+    return renderStatement(entry.payload, {
         ...options?.render,
         schemaRef: group.getSchemaRef(),
+        groupRef: groupId,
+        groupName,
+        versionScope: { objectId: groupId, objectName: groupName },
         at: entry.header.prevEntryHashes,
     });
 }
@@ -140,9 +165,15 @@ export async function dumpDatabase(db: RDb & LoggableObject, options: DumpDataba
 
     for (const schemaId of schemaIds) {
         const schema = await options.loadSchema(schemaId);
+        const schemaName = schema.getName();
         sections.push(await dumpSchema(schema, {
             ...options,
-            render: { ...renderOpts, schemaRef: schema.getId(), schemaName: schema.getName() },
+            render: {
+                ...renderOpts,
+                schemaRef: schemaId,
+                schemaName,
+                versionScope: { objectId: schemaId, objectName: schemaName },
+            },
         }));
     }
 
@@ -152,10 +183,14 @@ export async function dumpDatabase(db: RDb & LoggableObject, options: DumpDataba
     for (const groupId of groupIds) {
         const group = await options.loadGroup(groupId);
         const schemaName = schemaNames.get(group.getSchemaRef());
+        const groupName = group.getName();
         const groupRender: RenderOptions = {
             ...renderOpts,
             schemaRef: group.getSchemaRef(),
             schemaName,
+            groupRef: groupId,
+            groupName,
+            versionScope: { objectId: groupId, objectName: groupName },
         };
         if (profile === 'full') {
             sections.push(await dumpGroup(group, { ...options, render: groupRender }));

@@ -1,3 +1,4 @@
+/** C-SQL (causal SQL) command reference for \\help commands. */
 import type { AstStatement } from "../syntax/ast.js";
 
 export type LangCommandSection = 'creation' | 'schema' | 'refs' | 'data' | 'query';

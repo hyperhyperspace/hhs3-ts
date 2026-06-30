@@ -14,6 +14,7 @@ import { execute } from "../src/exec/execute.js";
 import { parseStatement } from "../src/syntax/parser.js";
 import { renderCreateSchema, renderCreateTableGroup, renderRowOp, renderSchemaUpdate } from "../src/reverse/render.js";
 import { dumpDatabase, dumpGroup, dumpSchema } from "../src/reverse/dump.js";
+import type { RenderAliasContext, RenderVersionScope } from "../src/reverse/aliases.js";
 import { createTestBindContext, TestBindContext } from "./mock_bind_context.js";
 
 const crypto = createBasicCrypto();
@@ -95,6 +96,78 @@ function dumpLoaders(ctx: MockCtx) {
             return object as RTableGroupImpl;
         },
     };
+}
+
+class TestAliasContext implements RenderAliasContext {
+    private readonly hashToName = new Map<string, string>();
+    private readonly usedNames = new Map<string, Set<string>>();
+    private readonly pending: string[] = [];
+    private readonly versionCounters = new Map<B64Hash, number>();
+    private keyCounter = 0;
+
+    constructor(private readonly keyLabels = new Map<B64Hash, string>()) {}
+
+    key(keyId: B64Hash, hint?: string): string {
+        return this.ensure('key', keyId, hint ?? this.keyLabels.get(keyId) ?? `keyId${++this.keyCounter}`);
+    }
+
+    schema(id: B64Hash, hint?: string): string {
+        return this.ensure('schema', id, hint ?? 'schema');
+    }
+
+    group(id: B64Hash, hint?: string): string {
+        return this.ensure('group', id, hint ?? 'group');
+    }
+
+    db(_id: B64Hash, hint?: string): string {
+        return hint ?? 'db';
+    }
+
+    version(hash: B64Hash, scope: RenderVersionScope): string {
+        const existing = this.hashToName.get(`version:${hash}`);
+        if (existing !== undefined) return existing;
+        const n = (this.versionCounters.get(scope.objectId) ?? 0) + 1;
+        this.versionCounters.set(scope.objectId, n);
+        const name = `${scope.objectName}_ver${n}`;
+        this.register('version', hash, name);
+        return name;
+    }
+
+    drainDefinitions(): string[] {
+        const out = [...this.pending];
+        this.pending.length = 0;
+        return out;
+    }
+
+    private ensure(scope: string, hash: B64Hash, preferred: string): string {
+        const existing = this.hashToName.get(`${scope}:${hash}`);
+        if (existing !== undefined) return existing;
+        const name = this.uniqueName(scope, preferred);
+        this.register(scope, hash, name);
+        return name;
+    }
+
+    private register(scope: string, hash: B64Hash, name: string): void {
+        this.hashToName.set(`${scope}:${hash}`, name);
+        this.pending.push(`\\alias ${scope} ${name} #${hash}`);
+    }
+
+    private uniqueName(scope: string, preferred: string): string {
+        let names = this.usedNames.get(scope);
+        if (names === undefined) {
+            names = new Set();
+            this.usedNames.set(scope, names);
+        }
+        if (!names.has(preferred)) {
+            names.add(preferred);
+            return preferred;
+        }
+        let i = 2;
+        while (names.has(`${preferred}${i}`)) i++;
+        const name = `${preferred}${i}`;
+        names.add(name);
+        return name;
+    }
 }
 
 export const restPhaseTests = {
@@ -296,7 +369,7 @@ export const restPhaseTests = {
             },
         },
         {
-            name: '[REST05] reverse rendering and dump produce SQL-like output',
+            name: '[REST05] reverse rendering and dump produce C-SQL output',
             invoke: async () => {
                 const { schema, group, lang } = await createEnv();
                 const renderedSchema = renderCreateSchema(schema.createOp);
@@ -607,6 +680,48 @@ export const restPhaseTests = {
                 );`, lang);
                 await parseBind(`UPDATE SCHEMA #${schema.getId()} TO LATEST ON #${group.getId()};`, lang);
                 await parseBind(`UPDATE REF #${usersGroup.getId()} TO LATEST ON #${group.getId()};`, lang);
+            },
+        },
+        {
+            name: '[REST11] aliasMode dump uses aliases not raw hashes',
+            invoke: async () => {
+                const { ctx, lang, schema, group, admin, usersGroup } = await createEnv();
+                const dbPlan = await execute(await parseBind("CREATE DATABASE app SEED 'alias-dump-db';", lang));
+                if (!dbPlan.ok || dbPlan.value.kind !== 'create-plan') throw new Error('database create failed');
+                const db = await ctx.createObject(dbPlan.value.plan.payload) as RDbImpl;
+                lang.registerDatabase('app', db);
+
+                await execute(await parseBind('ADD SCHEMA shop TO app BY $admin;', lang));
+                await execute(await parseBind('ADD TABLEGROUP shop_prod TO app BY $admin;', lang));
+                await execute(await parseBind("INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget') BY $admin;", lang));
+                await execute(await parseBind('ALTER SCHEMA shop AS (ADD COLUMN products.note string NULL) BY $admin;', lang));
+
+                const aliases = new TestAliasContext(new Map([[admin.keyId, 'admin']]));
+                const loaders = dumpLoaders(ctx);
+                const dump = await dumpDatabase(db, {
+                    ...loaders,
+                    mode: 'full',
+                    render: {
+                        aliasMode: true,
+                        aliases,
+                        resolveSchemaName: (id) => (id === schema.getId() ? 'shop' : undefined),
+                        resolveGroupName: (id) => {
+                            if (id === group.getId()) return 'shop_prod';
+                            if (id === usersGroup.getId()) return 'users';
+                            return undefined;
+                        },
+                    },
+                });
+
+                assertTrue(dump.includes('\\alias key admin #'), 'dump defines key alias with full hash');
+                assertTrue(dump.includes('\\alias version '), 'dump defines version aliases');
+                assertTrue(dump.includes('BY $admin'), 'dump uses aliased BY author');
+                assertTrue(!dump.includes(`BY #${admin.keyId}`), 'dump omits raw BY key hash');
+                assertTrue(dump.includes(' AT {') && dump.includes('_ver'), 'dump uses version alias names in AT');
+                assertTrue(!/ AT \{#[A-Za-z0-9+/=]+/.test(dump), 'dump AT clauses omit raw version hashes');
+                assertTrue(dump.includes(`BIND users => #${usersGroup.getId()}`), 'BIND RHS still uses hash');
+                assertTrue(dump.includes('ADD SCHEMA shop TO app'), 'ADD SCHEMA uses schema alias name');
+                assertTrue(dump.includes('ADD TABLEGROUP shop_prod TO app'), 'ADD TABLEGROUP uses group alias name');
             },
         },
     ],

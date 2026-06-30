@@ -26,7 +26,7 @@ async function main() {
     allTests.set(usersPermissionScriptTests.title, usersPermissionScriptTests.tests);
     allTests.set(referenceTests.title, referenceTests.tests);
 
-    console.log('Running tests for Hyper Hyper Space v3 rdb_lang module' + (filters.length > 0 ? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');
+    console.log('Running tests for Hyper Hyper Space v3 C-SQL (rdb_lang) module' + (filters.length > 0 ? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');
 
     for (const [title, tests] of allTests.entries()) {
         console.log(title);

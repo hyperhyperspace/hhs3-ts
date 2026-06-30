@@ -120,14 +120,14 @@ const tests = [
                 assertTrue(create.output?.includes('CREATE TABLEGROUP') === true, 'CREATE TABLEGROUP in filtered help');
 
                 const noMatch = await runMetaCommand(session, '\\help commands NOPE');
-                assertEquals(noMatch.output, "No language commands match 'NOPE'", 'no-match message');
+                assertEquals(noMatch.output, "No C-SQL commands match 'NOPE'", 'no-match message');
 
                 const createAlias = await runMetaCommand(session, '\\help command CREATE');
                 assertEquals(createAlias.output, create.output, '\\help command matches \\help commands');
 
                 const meta = await runMetaCommand(session, '\\help');
                 assertTrue(meta.output?.includes('\\quit') === true, 'meta help includes quit');
-                assertTrue(meta.output?.includes('\\help commands [filter]') === true, 'meta help includes commands hint');
+                assertTrue(meta.output?.includes('\\help commands [filter]') === true, 'meta help includes C-SQL commands hint');
             });
         },
     },
@@ -545,6 +545,41 @@ const tests = [
                 }
                 assertTrue(ambiguous, 'ambiguous prefix should fail');
             });
+        },
+    },
+    {
+        name: '[RDB_TOOLS16] \\dump database emits alias definitions and replays',
+        invoke: async () => {
+            const dir = await mkdtemp(join(tmpdir(), 'rdb-tools-dump-alias-'));
+            const dbPath = join(dir, 'dev.db');
+            const keysPath = `${dbPath}.keys.json`;
+            try {
+                const workspace1 = await Workspace.open({ path: dbPath });
+                const keystore1 = await KeyStore.open(keysPath, workspace1.replica.getHashSuite());
+                const session1 = new WorkspaceSession({ workspace: workspace1, keystore: keystore1 });
+                const setup = await runScript(session1, databaseSetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                const full = await runMetaCommand(session1, '\\dump database app;');
+                const dumpText = full.output ?? '';
+                assertTrue(dumpText.includes('\\alias key alice #'), 'dump defines key alias with full hash');
+                assertTrue(dumpText.includes('\\alias version '), 'dump defines version aliases');
+                assertTrue(dumpText.includes('BY $alice'), 'dump uses aliased BY author');
+                assertTrue(dumpText.includes('_ver'), 'dump uses version alias names');
+                assertTrue(dumpText.includes('INSERT INTO products'), 'dump includes row ops');
+                await workspace1.close();
+
+                const workspace2 = await Workspace.open({ path: join(dir, 'replay.db') });
+                const { copyFile } = await import('node:fs/promises');
+                await copyFile(keysPath, `${join(dir, 'replay.db')}.keys.json`);
+                const keystoreReplay = await KeyStore.open(`${join(dir, 'replay.db')}.keys.json`, workspace2.replica.getHashSuite());
+                const session2 = new WorkspaceSession({ workspace: workspace2, keystore: keystoreReplay });
+                const replay = await runScript(session2, `\\key unlock alice correct\n${dumpText}`);
+                assertEquals(replay.exitCode, 0, replay.output);
+                await workspace2.close();
+            } finally {
+                await rm(dir, { recursive: true, force: true });
+            }
         },
     },
 ];

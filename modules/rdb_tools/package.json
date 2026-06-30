@@ -1,7 +1,7 @@
 {
   "name": "@hyper-hyper-space/hhs3_rdb_tools",
   "version": "0.1.0",
-  "description": "REPL and script tooling for HHSv3 RDb",
+  "description": "REPL and script tooling for HHSv3 RDb (C-SQL)",
   "type": "module",
   "source": "src/index.ts",
   "main": "dist/src/index.js",

@@ -8,10 +8,16 @@ import {
 } from "@hyper-hyper-space/hhs3_rdb";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 
+import type { RenderAliasContext, RenderVersionScope } from "./aliases.js";
+
 export type DumpRenderProfile = 'full' | 'schema';
 
 export type RenderOptions = {
     profile?: DumpRenderProfile;
+    aliasMode?: boolean;
+    aliases?: RenderAliasContext;
+    versionScope?: RenderVersionScope;
+    refVersionScope?: RenderVersionScope;
     at?: json.Set;
     schemaRef?: B64Hash;
     schemaName?: string;
@@ -26,26 +32,45 @@ function isFullProfile(options?: RenderOptions): boolean {
     return options?.profile !== 'schema';
 }
 
+function useAliases(options?: RenderOptions): boolean {
+    return options?.aliasMode === true && options.aliases !== undefined;
+}
+
+function schemaVersionScope(options?: RenderOptions): RenderVersionScope | undefined {
+    if (options?.schemaRef === undefined) return undefined;
+    return { objectId: options.schemaRef, objectName: options.schemaName ?? 'schema' };
+}
+
+function renderObjectRef(
+    scope: 'schema' | 'group',
+    id: B64Hash,
+    hint: string | undefined,
+    options?: RenderOptions,
+): string {
+    if (useAliases(options) && isFullProfile(options)) {
+        const aliases = options!.aliases!;
+        return scope === 'schema' ? aliases.schema(id, hint) : aliases.group(id, hint);
+    }
+    if (isFullProfile(options)) return `#${id}`;
+    if (scope === 'schema') return options?.resolveSchemaName?.(id) ?? `#${id}`;
+    return options?.resolveGroupName?.(id) ?? hint ?? `#${id}`;
+}
+
 function renderGroupTarget(options?: RenderOptions): string {
     if (options?.groupRef === undefined) return '<group>';
-    if (isFullProfile(options)) return `#${options.groupRef}`;
-    return options.groupName ?? options.resolveGroupName?.(options.groupRef) ?? `#${options.groupRef}`;
+    return renderObjectRef('group', options.groupRef, options.groupName, options);
 }
 
 export function renderCreateDatabase(payload: CreateRDbPayload, options?: RenderOptions): string {
-    const creators = (payload.creators ?? []).length > 0
-        ? ` CREATORS (${payload.creators!.map((c) => sqlString(c.keyId)).join(', ')})`
-        : '';
+    const creators = renderCreators(payload.creators ?? [], options);
     const seed = isFullProfile(options) && payload.seed !== undefined && payload.seed.length > 0
         ? ` SEED ${sqlString(payload.seed)}`
         : '';
     return `CREATE DATABASE ${payload.name ?? payload.seed}${seed}${creators};`;
 }
 
-export function renderCreateSchema(payload: CreateRSchemaPayload): string {
-    const creators = payload.creators.length > 0
-        ? ` CREATORS (${payload.creators.map((c) => sqlString(c.keyId)).join(', ')})`
-        : '';
+export function renderCreateSchema(payload: CreateRSchemaPayload, options?: RenderOptions): string {
+    const creators = renderCreators(payload.creators, options);
     const tables = payload.tables.map(renderTableDef).join(',\n  ');
     return `CREATE SCHEMA ${payload.name}${creators} AS (\n  ${tables}\n);`;
 }
@@ -57,8 +82,14 @@ export function renderCreateTableGroup(payload: CreateTableGroupPayload, options
     const seed = isFullProfile(options) && payload.seed !== undefined && payload.seed.length > 0
         ? ` SEED ${sqlString(payload.seed)}`
         : '';
+    const schemaRef = renderObjectRef(
+        'schema',
+        payload.schemaRef,
+        options?.schemaName ?? options?.resolveSchemaName?.(payload.schemaRef),
+        options,
+    );
     const parts = [
-        `${schemaComment}CREATE TABLEGROUP ${payload.name}${seed} USING SCHEMA #${payload.schemaRef} AT ${renderVersionSet(payload.schemaVersion)}`,
+        `${schemaComment}CREATE TABLEGROUP ${payload.name}${seed} USING SCHEMA ${schemaRef} AT ${renderVersionSet(payload.schemaVersion, schemaVersionScope(options), options)}`,
     ];
     for (const [name, id] of Object.entries(payload.bindings ?? {})) {
         if (isFullProfile(options)) {
@@ -86,26 +117,37 @@ export function renderCreateTableGroup(payload: CreateTableGroupPayload, options
 }
 
 export function renderAddSchema(payload: AddSchemaPayload, options?: RenderOptions): string {
-    const target = isFullProfile(options)
-        ? `#${payload.schemaId}`
-        : (options?.resolveSchemaName?.(payload.schemaId) ?? `#${payload.schemaId}`);
+    const target = renderObjectRef(
+        'schema',
+        payload.schemaId,
+        options?.resolveSchemaName?.(payload.schemaId),
+        options,
+    );
     const db = options?.databaseName ?? '<database>';
-    return `ADD SCHEMA ${target} TO ${db}${renderNote(payload.note)}${renderBy(payload.author)}${isFullProfile(options) ? renderAt(options) : ''};`;
+    return `ADD SCHEMA ${target} TO ${db}${renderNote(payload.note)}${renderBy(payload.author, options)}${isFullProfile(options) ? renderAt(options) : ''};`;
 }
 
 export function renderAddGroup(payload: AddGroupPayload, options?: RenderOptions): string {
-    const target = isFullProfile(options)
-        ? `#${payload.groupId}`
-        : (options?.resolveGroupName?.(payload.groupId) ?? `#${payload.groupId}`);
+    const target = renderObjectRef(
+        'group',
+        payload.groupId,
+        options?.resolveGroupName?.(payload.groupId),
+        options,
+    );
     const db = options?.databaseName ?? '<database>';
-    return `ADD TABLEGROUP ${target} TO ${db}${renderNote(payload.note)}${renderBy(payload.author)}${isFullProfile(options) ? renderAt(options) : ''};`;
+    return `ADD TABLEGROUP ${target} TO ${db}${renderNote(payload.note)}${renderBy(payload.author, options)}${isFullProfile(options) ? renderAt(options) : ''};`;
 }
 
 export function renderSchemaUpdate(payload: SchemaUpdatePayload, options?: RenderOptions): string {
     const rules = payload.migration.map(renderMigrationRule).join(',\n  ');
     const schemaRef = options?.schemaRef ?? 'unknown';
     const comment = options?.schemaName === undefined ? '' : `-- ${options.schemaName}\n`;
-    return `${comment}ALTER SCHEMA #${schemaRef} AS (\n  ${rules}\n)${renderBy(payload.author)}${renderAt(options)};`;
+    const schemaTarget = schemaRef === 'unknown'
+        ? schemaRef
+        : (useAliases(options) && isFullProfile(options)
+            ? renderObjectRef('schema', schemaRef as B64Hash, options?.schemaName, options)
+            : `#${schemaRef}`);
+    return `${comment}ALTER SCHEMA ${schemaTarget} AS (\n  ${rules}\n)${renderBy(payload.author, options)}${renderAt(options)};`;
 }
 
 export function renderRowOp(payload: RowOpPayload, table?: string, options?: RenderOptions): string {
@@ -115,37 +157,47 @@ export function renderRowOp(payload: RowOpPayload, table?: string, options?: Ren
         const cols = Object.keys(insert.values);
         const vals = cols.map((c) => renderLiteral(insert.values[c]));
         if (isFullProfile(options) && insert.uuid !== undefined) {
-            return `INSERT INTO ${target} (uuid, ${cols.join(', ')}) VALUES (${sqlString(insert.uuid)}, ${vals.join(', ')})${renderBy(insert.author)}${renderAt(options)};`;
+            return `INSERT INTO ${target} (uuid, ${cols.join(', ')}) VALUES (${sqlString(insert.uuid)}, ${vals.join(', ')})${renderBy(insert.author, options)}${renderAt(options)};`;
         }
-        return `INSERT INTO ${target} (${cols.join(', ')}) VALUES (${vals.join(', ')})${renderBy(insert.author)}${renderAt(options)};`;
+        return `INSERT INTO ${target} (${cols.join(', ')}) VALUES (${vals.join(', ')})${renderBy(insert.author, options)}${renderAt(options)};`;
     }
     if (payload.action === 'update') {
         const update = payload as UpdateRowPayload;
         const values = Object.entries(update.values).map(([k, v]) => `${k} = ${renderLiteral(v)}`).join(', ');
-        return `UPDATE ${target} SET ${values} WHERE rowId = #${update.rowId}${renderBy(update.author)}${renderAt(options)};`;
+        return `UPDATE ${target} SET ${values} WHERE rowId = #${update.rowId}${renderBy(update.author, options)}${renderAt(options)};`;
     }
-    return `DELETE FROM ${target} WHERE rowId = #${payload.rowId}${renderBy(payload.author)}${renderAt(options)};`;
+    return `DELETE FROM ${target} WHERE rowId = #${payload.rowId}${renderBy(payload.author, options)}${renderAt(options)};`;
 }
 
 export function renderRefOp(payload: RefAdvancePayload, options?: RenderOptions): string {
     const author = (payload as { author?: string }).author;
-    const trailing = `${renderBy(author)}${renderAt(options)}`;
-    const version = renderVersionSet(payload.refVersion);
+    const trailing = `${renderBy(author, options)}${renderAt(options)}`;
+    const isSchemaDeploy = options?.schemaRef !== undefined && payload.refId === options.schemaRef;
+    const refVersionScope = options?.refVersionScope ?? (isSchemaDeploy
+        ? schemaVersionScope(options)
+        : {
+            objectId: payload.refId,
+            objectName: options?.resolveGroupName?.(payload.refId) ?? 'group',
+        });
+    const version = renderVersionSet(payload.refVersion, refVersionScope, options);
     const group = renderGroupTarget(options);
-    if (options?.schemaRef !== undefined && payload.refId === options.schemaRef) {
-        return `UPDATE SCHEMA #${payload.refId} TO ${version} ON ${group}${trailing};`;
+    const refTarget = isSchemaDeploy
+        ? renderObjectRef('schema', payload.refId, options?.schemaName, options)
+        : renderObjectRef('group', payload.refId, options?.resolveGroupName?.(payload.refId), options);
+    if (isSchemaDeploy) {
+        return `UPDATE SCHEMA ${refTarget} TO ${version} ON ${group}${trailing};`;
     }
-    return `UPDATE REF #${payload.refId} TO ${version} ON ${group}${trailing};`;
+    return `UPDATE REF ${refTarget} TO ${version} ON ${group}${trailing};`;
 }
 
 export function renderBundle(payload: BundlePayload, options?: RenderOptions): string {
     const writes = payload.writes.map((w) => {
         const op = w.op as unknown as RowOpPayload;
         const { author: _author, ...innerOp } = op as RowOpPayload & { author?: string };
-        return renderRowOp(innerOp as RowOpPayload, w.table);
+        return renderRowOp(innerOp as RowOpPayload, w.table, options);
     }).join('\n  ');
     const author = (payload as { author?: string }).author;
-    return `BUNDLE ON ${renderGroupTarget(options)} (\n  ${writes}\n)${renderBy(author)}${renderAt(options)};`;
+    return `BUNDLE ON ${renderGroupTarget(options)} (\n  ${writes}\n)${renderBy(author, options)}${renderAt(options)};`;
 }
 
 export function renderOp(payload: json.Literal, options?: RenderOptions): string {
@@ -154,7 +206,7 @@ export function renderOp(payload: json.Literal, options?: RenderOptions): string
         return renderCreateDatabase(payload as CreateRDbPayload, options);
     }
     if (payload['action'] === 'create' && payload['type'] === 'hhs/rschema_v1') {
-        return renderCreateSchema(payload as CreateRSchemaPayload);
+        return renderCreateSchema(payload as CreateRSchemaPayload, options);
     }
     if (payload['action'] === 'create' && payload['type'] === 'hhs/rtable_group_v1') {
         return renderCreateTableGroup(payload as CreateTableGroupPayload, options);
@@ -253,14 +305,29 @@ function renderNote(note?: string): string {
 }
 
 function renderAt(options?: RenderOptions): string {
-    return options?.at === undefined ? '' : ` AT ${renderVersionSet(options.at)}`;
+    return options?.at === undefined ? '' : ` AT ${renderVersionSet(options.at, options.versionScope, options)}`;
 }
 
-function renderBy(author?: string): string {
-    return author === undefined ? '' : ` BY #${author}`;
+function renderBy(author?: string, options?: RenderOptions): string {
+    if (author === undefined) return '';
+    if (useAliases(options)) return ` BY $${options!.aliases!.key(author as B64Hash)}`;
+    return ` BY #${author}`;
 }
 
-function renderVersionSet(set: json.Set): string {
+function renderCreators(creators: { keyId: string }[], options?: RenderOptions): string {
+    if (creators.length === 0) return '';
+    const names = creators.map((c) => {
+        if (useAliases(options)) return `$${options!.aliases!.key(c.keyId as B64Hash)}`;
+        return sqlString(c.keyId);
+    });
+    return ` CREATORS (${names.join(', ')})`;
+}
+
+function renderVersionSet(set: json.Set, scope: RenderVersionScope | undefined, options?: RenderOptions): string {
+    if (useAliases(options) && scope !== undefined) {
+        const names = [...json.fromSet(set)].map((h) => options!.aliases!.version(h, scope));
+        return `{${names.join(', ')}}`;
+    }
     return `{${[...json.fromSet(set)].map((h) => `#${h}`).join(', ')}}`;
 }
 
