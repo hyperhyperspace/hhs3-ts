@@ -1,4 +1,4 @@
-import { dumpDatabase, dumpGroup, dumpSchema, findLangCommandRefs, LANG_COMMAND_SECTIONS, type LangCommandRef, type RenderOptions } from "@hyper-hyper-space/hhs3_rdb_lang";
+import { dumpDatabase, dumpGroup, dumpSchema, findLangCommandRefs, isLangCommonHelpQuery, LANG_COMMAND_SECTIONS, LANG_COMMON_REF, type LangCommandRef, type RenderOptions } from "@hyper-hyper-space/hhs3_rdb_lang";
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { RObject } from "@hyper-hyper-space/hhs3_mvt";
 import type { RSchema, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
@@ -281,18 +281,29 @@ function helpCommand(args: string[]): string {
 }
 
 function formatLangHelp(filter?: string): string {
+    if (isLangCommonHelpQuery(filter)) {
+        return formatHelpEntry(LANG_COMMON_REF).join('\n');
+    }
+
     const refs = findLangCommandRefs(filter);
     if (refs.length === 0) {
-        return filter === undefined ? '(no C-SQL commands)' : `No C-SQL commands match '${filter}'`;
+        return `No C-SQL commands match '${filter}'`;
     }
-    const showSections = refs.length > 1;
+
     const lines: string[] = [];
+    if (filter === undefined) {
+        lines.push('--- common ---');
+        lines.push(...formatHelpEntry(LANG_COMMON_REF));
+        lines.push('');
+    }
+
+    const showSections = refs.length > 1 || filter === undefined;
     for (const section of LANG_COMMAND_SECTIONS) {
         const sectionRefs = refs.filter((ref) => ref.section === section);
         if (sectionRefs.length === 0) continue;
         if (showSections) lines.push(`--- ${section} ---`);
         for (const ref of sectionRefs) {
-            lines.push(...formatLangCommandEntry(ref));
+            lines.push(...formatHelpEntry(ref));
             lines.push('');
         }
     }
@@ -300,7 +311,7 @@ function formatLangHelp(filter?: string): string {
     return lines.join('\n');
 }
 
-function formatLangCommandEntry(ref: LangCommandRef): string[] {
+function formatHelpEntry(ref: Pick<LangCommandRef, 'command' | 'syntax' | 'description'>): string[] {
     const syntaxLines = ref.syntax.split('\n');
     return [
         ref.command,

@@ -2,6 +2,7 @@ import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test
 
 import type { AstStatement } from "../src/syntax/ast.js";
 import { findLangCommandRefs, LANG_COMMAND_REFS } from "../src/reference/commands.js";
+import { isLangCommonHelpQuery, LANG_COMMON_REF } from "../src/reference/common.js";
 
 const ALL_KINDS: AstStatement['kind'][] = [
     'create-database',
@@ -56,6 +57,24 @@ export const referenceTests = {
                 assertTrue(create.every((ref) => ref.command.startsWith('CREATE')), 'CREATE prefix match');
                 assertEquals(findLangCommandRefs('NOPE').length, 0, 'unknown prefix');
                 assertEquals(findLangCommandRefs().length, 15, 'no filter returns all');
+            },
+        },
+        {
+            name: '[REF05] LANG_COMMON_REF documents shared clauses',
+            invoke: async () => {
+                assertEquals(LANG_COMMON_REF.command, 'COMMON', 'common command label');
+                assertTrue(LANG_COMMON_REF.syntax.includes('BY author'), 'BY clause');
+                assertTrue(LANG_COMMON_REF.syntax.includes('AT version'), 'AT clause');
+                assertTrue(LANG_COMMON_REF.syntax.includes('rowId = #prefix'), 'rowId clause');
+            },
+        },
+        {
+            name: '[REF06] isLangCommonHelpQuery recognizes common filter',
+            invoke: async () => {
+                assertTrue(isLangCommonHelpQuery('common'), 'common lowercase');
+                assertTrue(isLangCommonHelpQuery('COMMON'), 'common uppercase');
+                assertTrue(!isLangCommonHelpQuery('CREATE'), 'command prefix is not common');
+                assertTrue(!isLangCommonHelpQuery(undefined), 'undefined is not common');
             },
         },
     ],

@@ -118,6 +118,19 @@ const tests = [
                 assertTrue(create.output?.includes('CREATE DATABASE') === true, 'CREATE DATABASE in filtered help');
                 assertTrue(create.output?.includes('CREATE SCHEMA') === true, 'CREATE SCHEMA in filtered help');
                 assertTrue(create.output?.includes('CREATE TABLEGROUP') === true, 'CREATE TABLEGROUP in filtered help');
+                assertTrue(create.output?.startsWith('COMMON') !== true, 'filtered help omits COMMON block');
+                assertTrue(create.output?.includes('--- common ---') !== true, 'filtered help omits common section');
+
+                const all = await runMetaCommand(session, '\\help commands');
+                assertTrue(all.output?.startsWith('--- common ---\nCOMMON') === true, 'full help starts with common section');
+                assertTrue(all.output?.includes('--- creation ---') === true, 'full help includes creation section');
+
+                const common = await runMetaCommand(session, '\\help commands common');
+                const commonAlias = await runMetaCommand(session, '\\help command common');
+                assertEquals(commonAlias.output, common.output, '\\help command common matches \\help commands common');
+                assertTrue(common.output?.startsWith('COMMON') === true, 'common-only help starts with COMMON');
+                assertTrue(common.output?.includes('CREATE SCHEMA name') !== true, 'common-only help omits command entries');
+                assertTrue(common.output?.includes('--- common ---') !== true, 'common-only help omits section header');
 
                 const noMatch = await runMetaCommand(session, '\\help commands NOPE');
                 assertEquals(noMatch.output, "No C-SQL commands match 'NOPE'", 'no-match message');
