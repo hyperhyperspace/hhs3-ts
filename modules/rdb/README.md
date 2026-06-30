@@ -1,62 +1,91 @@
-# Rdb — Relational Database Monotone View Types
+# Rdb — A Causal/Relational Database Engine
 
-Models a relational database as a family of composable [Monotone View Types](../mvt). Four first-class types:
+Rdb is a relational database for decentralized applications. Each replica is a complete database; the application reads and writes locally. Replicas synchronize over the open Internet and reconcile deterministically, even when peers are slow, offline, or adversarial. The schema is the authority, enforced by every replica, and it travels with the data. Rdb is built on [Monotone View Types](../mvt) (MVTs).
 
-- **`RSchema`** — the spec for one table group: table definitions, column types (with `pub` annotations, see below), FK declarations (at-use), restrictions (at-use predicates gating row ops), per-table delete reach (`concurrentDeletes`), and migration rules. A standalone RObject in its own DAG; it evolves independently of any group instance, and multiple `RTableGroup` instances may share one `RSchema` (the spec is the reusable module definition). Spec authority belongs to the schema's `creators`: schema-updates must be signed by one of them. Deploy authority is NOT the schema's concern (see `canDeploy` below).
-- **`RTableGroup`** — the unit of atomicity, snapshot, observation and composition. Owns one physical DAG; member tables are scoped projections of it, so a single group position is a consistent snapshot of all member tables. The group observes its `RSchema` via ref-advance; the barrier ref-advance to a new schema version is the deploy moment, gated by the group's own `canDeploy` predicate (instance policy, fixed in the create payload). Qualified FK targets are resolved through `bindings` (group name -> group id) fixed in the group's create payload; the group makes a bound foreign group's rows visible to those targets with `observe(group, refVersion)`, a **barrier** ref-advance of the foreign group's id (no deploy authority required). Genesis `initialRows` (fiat data, like RCap's irrevocable creators) root permission delegation chains. Multi-table atomic writes are single-entry bundle ops.
-- **`RTable`** — a member table: a proper nested RObject living on a scoped projection of its group's DAG (same mechanism as nested `RSet` elements). Rows are anonymous or implicitly owned by the insert op author; callers cannot set a separate owner/recipient field. Row ids are derived as `hash(uuid, authorId)` for authored inserts, or `hash(uuid)` for unauthored/genesis rows, so the id space remains partitioned by author, and rowIds are **write-once identities**: deletes are permanent and a deleted rowId can never be re-inserted ("restoring" means inserting a new row with a fresh uuid; note that a deterministic, well-known uuid is burned for its author once deleted). Per-field last-writer-wins updates (causally-latest write per column, entry-hash tiebreak for concurrent writers); columns marked `readonly` are fixed at insert. The per-table `concurrentDeletes` flag (default true) controls a delete's reach across concurrency: deletes are *always* barrier-tagged at write, and the flag is resolved **at-use, per delete** — at each barrier delete's OWN position (observed from the view `from`) — and is the sole authority on whether that delete's barrier is honored, so when true the delete also hides the row at concurrent view positions and when false it acts only causally. Because the flag is read at the delete's position (not the view horizon), a causally-later flag flip does not revise an already-written delete, while a flip CONCURRENT with the delete still does (from-widened). No unique constraints, no auto-increment.
-- **`RDb`** — the sync root and orchestrator for a deployment: records member schemas/groups (advisory, monotonic) and ensures they and their transitive references are present and syncing in the replica. Nothing's validity ever depends on RDb state; a missing referenced object is an infrastructure error (throw), never an MVT data condition.
+## Co-transactions
 
-## FKs and restrictions
+A row operation — insert, update, or delete — is validated optimistically against the local replica: foreign keys resolve, the author satisfies the table's restrictions, the row fits the schema. Valid operations apply immediately, with no coordination.
 
-Referential integrity and permissions are both schema-derived and enforced by validators and views (never serialized in row op payloads; BFT: a writer cannot evade a rule by omitting it). FKs are checked at write time and rechecked at-use in views. Restrictions are a hard validation gate at the parent frontier `(at, at)`, then rechecked at-use in `computeEntryVoided` for concurrent barrier/revision effects:
+When a peer's updates arrive, each operation is re-checked through MVT's view-revision mechanism. A view is read *at* one version (here, the operation's own application version) *from* a later one (the current frontier): the rules are evaluated at the version where the operation was authored, now seeing everything concurrent that is visible from the frontier. Whatever breaks the schema in that view is discarded — a write whose permission was concurrently revoked, an insert whose foreign-key target was concurrently deleted, a row that violates a concurrently deployed restriction. Every honest replica reaches the same verdict.
 
-- **FKs** (`fks: { [column]: 'table' | 'group.table' }`) — AT-USE dependency, folded into op-voiding: a write op whose own FK column points at a target that is not live at **the op's own position** (observed from the view `from`) is VOID. A voided insert never lives; a voided FK-update contributes no value, so LWW reverts to the prior write. The FK SET is read from the schema at the op's position, so a causally-later add-fk / drop-fk does not revise an old write. Anchored at the op (not the view horizon), so a target deleted **concurrently** with the write voids it at the merge (merge stability), while a causally-**later** delete is inert (use-before-revoke) — the dependent becomes live-but-dangling rather than cascade-hidden. A reference cycle resolves to **DENY**. To bound one-time adoption, `add-fk` carries a **deploy prerequisite**: a deploy whose new FK would strand an existing live row is hard-rejected. See the enforcement note in `src/rschema/payload.ts`.
-- **Restrictions** — predicates gating row ops, tagged `insert` / `update` / `delete` / `all`: an op is valid only if its restriction passes against the parent frontier `(at, at)`, so authorizing/granting rows must causally precede the op. The same predicate is re-evaluated at the op's own position for views; the op survives later deletion of a witness row (use-before-revoke), but is voided by a concurrent barrier delete or concurrent schema/foreign observation that removes the proof. This is the single permissions mechanism. Deploy gating uses the same predicate grammar, but lives in the group's `canDeploy`.
+Authority is the schema, not the message: a writer cannot evade a constraint by omitting it. Reconciliation is coordination-free.
 
-Restriction predicates are positive propositional logic (`true` / `false` / `exists` / `cmp` / `str`, combined with `and` / `or` — no negation): an `exists` atom is an **existence predicate** ("some live row with `label = 'deploy'` and `grantee = $author`"), evaluated through indexed cover queries over DAG entry meta, so its `where` fields must be **`pub` columns** or the implicit `rowAuthor` system field. Searches and predicates match against the **resolved** value at the position — stale meta from superseded writes is candidate noise, filtered by re-checking. `pub` and **`readonly`** are independent modifiers: a pub column stays updatable unless also declared readonly. Permission-witness columns such as capability `label` and `grantee` should be `pub` + `readonly`: a mutable witness would make predicate truth tiebreak-dependent under concurrency and allow stealth permission rewrites; with readonly, revocation has exactly one shape — deleting the row. Predicates name the op signer through the reserved **$-term** `$author`; capability recipients are explicit row columns such as `grantee`.
+## Content addressing
 
-Predicates may also evaluate the **subject row's own fields**, but only via **`readonly`** columns or the implicit readonly `rowAuthor` system field — fixed at insert, so the value is merge-stable (never tiebreak-flippable by a concurrent winning write) and reading it never re-enters the current op's own value resolution. Two forms: `cmp` / `str` atoms take **operand** expressions over `$row.<col>` (a readonly column of the row being written), `rowAuthor`, literals, integer-only arithmetic (`add` / `sub` / `mul`) and `len`, comparing them (`eq` / `ne` / `lt` / `le` / `gt` / `ge`) or string-matching (`prefix` / `suffix` / `contains`); and an `exists` `where` value may be `$row.<col>`, **correlating** the witness search to the subject row (e.g. "a grant whose `resource` equals the row's readonly `resource` and whose `grantee` is `$author`" — resource-scoped attenuation). For `insert` the subject row is the op's values plus schema defaults and implicit row author; for `update` / `delete` it is the row's **post-image** (the live row's resolved values overlaid with the op's writes). An unresolvable operand or term collapses its atom to false (positive logic). Capabilities are ordinary rows (typically in a standardized Users module with a `concurrentDeletes` caps table, so a revocation reaches concurrent uses), not a special type. The same grammar in the 'object' context (no subject row, so no `$row`) gates object-level ops: v1 has one such gate, the group's `canDeploy`.
+Schemas, table groups, tables and databases are identified by the hash of their creation operations. As they mutate, they are versioned by hash-linked causal history, so integrity of operations can be fully verified, and versioning reduces to the frontier-set of hashes.
 
-Intra-group FK and exists checks resolve positionally (cover queries on the shared DAG); cross-group ones resolve through ref-advance observation. The declaration shape is identical; only the mechanism differs.
+## Identities
 
-## Querying
+Operations are signed. An identity is a public key; its id is the key's hash. The signing suite is selectable — Ed25519, ML-DSA, or a hybrid requiring both — so post-quantum identities are opt-in. A group that declares an identity provider verifies signatures at validation and rejects forgeries.
 
-`RTableView.query(q)` is a single-table, read-only `SELECT … WHERE … ORDER BY … LIMIT/OFFSET` over one table at the view's `(at, from)` horizon (no joins). It is a **local read**: it voids nothing and needs no cross-replica agreement, so its `RowFilter` is a deliberately **richer, separate front-end** from the restriction `Predicate` — it adds `not`, allows floats, and filters on **any** column (pub or not) plus the implicit `rowAuthor` system column — while sharing only the pure operand / `cmp` / `str` evaluator (`src/rschema/expr.ts`). The restriction grammar and its BFT validation are untouched; `RowFilter` is never accepted where a `Predicate` is expected. Filtering is two-valued: a missing column value makes its atom false, and `not` negates normally (no SQL three-valued NULL); `orderBy` sorts within a column's type with rows missing the value last and a `rowId` tiebreak for total determinism.
+Permissions are data. A capability is a row; restrictions gate operations on positive existence predicates ("allowed if a live row grants it to the author"). Granting is an insert, revoking a delete, and delegation chains follow from re-evaluating each grant at use. There is no privileged table and no access-control server.
 
-Query results are exactly the **enforced-live, LWW-resolved** rows satisfying the filter — the same liveness and resolution as `getRow` / `findRowIds`, so a deleted, voided, or stale-meta row never leaks through. The engine validates the query against the schema (**user-facing** validation: it *throws* on mistakes — unknown columns, malformed filters, type-incoherent comparisons, bad `limit` / `offset` — distinct from the silent BFT op-validation used for incoming writes), then picks candidates (push one top-level `and` conjunct down: a `cmp eq` on a pub column uses the pub-meta index, a `cmp eq` on `rowAuthor` uses the author meta index, else a full scan), re-checks the **full** filter over the resolved rows, and finally applies `orderBy` / `offset` / `limit` / `select` projection. Pushdown never changes the result set, only the candidate set; the residual re-check guarantees parity with a full scan. See `src/rtable/query.ts`.
+## Table groups
 
-## Schema evolution
+A table group is the unit of atomicity, snapshot, observation, and composition. Its member tables share one causal history, so a single position is a consistent snapshot of every table at once, and a multi-table write is one atomic operation.
 
-`RSchema` is a confluent MVT with no barriers: a schema-update carries only migration rules (`add/drop-table`, `add/drop-column`, `set-concurrent-deletes`, `set-fks`, `set-restrictions` — the slot writes), signed by one of the schema's `creators`. The effective schema at a position is derived by per-slot LWW resolution (causally-maximal write wins, entry-hash tiebreak, tombstones for drops; a winning `add-table` resets the whole table namespace), so it is a pure function of the version — never serialized, cached per position. Deploying is each group's own barrier ref-advance.
+A group pins one schema version. The schema is a separate object; the group observes it at a fixed version, advanced forward only (a deploy). Pinning at the group is the only path from group to schema: every table is interpreted under the same version, and tables cannot drift onto different schema versions through different references.
 
-## v1 scope
+## Foreign references
 
-**Included.** All four types above are implemented end-to-end: schema model and payload formats; `RSchema` as a DAG-backed RObject (per-slot LWW, signed schema-updates, views, delta); `RTableGroup` + `RTable` (insert / update / delete, permanent-delete liveness, per-field LWW, pub meta, bundles, validation plus at-use enforcement for restrictions, at-use enforcement for FKs, cross-group FK / `exists` via barrier `observe`, schema deploy as a monotonicity-validated barrier ref-advance); signed row / bundle / deploy ops with optional identity providers; a standard **Users** module (`src/users/users.ts`) with open self-certifying `identities` + manager-gated `caps` delegation (see [`CAPABILITIES.md`](./CAPABILITIES.md)); a single-table **query** read on `RTableView` (see [Querying](#querying)); group `computeDelta` with `full` and `bounded` strategies (two channels: per-table row changes + schema sub-delta); and `RDb` as the deployment sync root (`add-schema` / `add-group`, transitive closure fetch, per-DAG sync sessions).
+A group depends on another — a cross-group foreign key, a shared capability table — by observing it at a chosen version and advancing that observation forward. The dependency is recorded as data, never implicit. This is MVT's [State-Observation-as-Data](../mvt#composability-soad-architecture) pattern: the observed group is unaware of its observers, the dependency graph stays acyclic, and data is the integration surface between applications.
 
-**Authorship.** When a group selects an identity provider (`idProvider`: a local table or bound `'group.table'`), signatures on row / bundle / deploy ops are verified at validation (hard reject on bad signature; defer when the provider object is not yet synced). Restriction validation and view-time `exists` evaluation trust `op.author` after that check. A group with **no** provider performs no authentication — claimed authors are trusted.
+The same mechanism covers data and schemas. A schema is referenced by hash and reused as a module; a group's pinned schema is an observation, like its foreign-data references. Reusing a schema, sharing a capability system, and composing applications are one operation: a forward-only observation of a content-addressed object.
 
-**Deploy and revision.** Both ref-advance flavors (schema deploy and foreign-group `observe`) are barriers. The effective schema and observed foreign versions are resolved at the full `(at, from)` horizon; a deploy or observation concurrent to a use, visible from the merged frontier, revises the schema / foreign view there (new restrictions void concurrent uses; column defaults activate; `concurrentDeletes` flips take effect). A causally-later deploy or observation does not retroact. When several concurrent barrier ref-advances resolve to different versions, the effective version is their **union** (`resolveRefVersionAtPosition`).
+## Deltas & Projections
 
-**Delta.** The bounded strategy projects a revision bound as the GLB over the group's `RSchema` and every bound foreign group, then walks above it. At-use semantics make that floor exact. Fuzz parity between `full` and `bounded` is in `test/delta_parity/` (smoke on `npm test`; extended on `npm run test:parity`).
+A delta reports how the database differs between two versions, on two channels:
 
-**Sync.** `RDb.startSync` first ensures the transitive closure (members, schemas, bound foreign groups) is present — fetching via `RContext.fetchObject` when needed — then opens one sync session per DAG. `stopSync` tears them down.
+- **Data** — rows whose live values changed.
+- **Schema** — how the schema evolved: added columns and defaults, dropped tables, changed foreign keys, restrictions, flags.
 
-## Users peer discovery
+A delta records liveness transitions, so it also pinpoints operations discarded by reconciliation: an insert that never went live, or a row revoked when a concurrent revoke or deploy came into view, appears as a row going from live to dead.
 
-The Users module supports two mesh integration modes (see `src/users/peer_authorizer.ts`, `endpoints.ts`, `peer_directory.ts`):
+Deltas project the database into ordinary SQL. The delta from the version an application last saw to the latest one projects current state into a plain local relational database, queried with normal SQL. [rdb_adapter](../rdb_adapter) projects deltas into a conventional store to keep it in sync.
 
-**Tracker + caps (mode 1).** Keep your existing `PeerDiscovery` (e.g. a tracker client). Attach `createUsersPeerAuthorizer(usersGroup, capLabel)` to each swarm — caps are checked at connect time (`PeerAuthorizer`). The `endpoints` table is unused.
+## C-SQL
 
-**RDb directory (mode 2).** Omit the tracker. Peers publish listen addresses with `publishEndpoints(group, identity, addresses)` (requires a live cap, default label `'member'`). `UsersPeerDirectory` implements `PeerDiscovery`: `discover()` reads cap holders with endpoint rows from the synced Users view; `announce()` / `leave()` are no-ops. Grant `'member'` via `grantCap`; register with `registerIdentity` first.
+Rdb is driven through **C-SQL** (causal SQL), a SQL-like language with causal extensions: versions and views (`AT` / `FROM`), allow-rules, foreign-group bindings, and identity-aware authorship. It is implemented in [rdb_lang](../rdb_lang); [rdb_tools](../rdb_tools) provides a REPL and CLI.
 
-## v1 limitations
+```sql
+CREATE SCHEMA shop AS (
+  TABLE products (
+    sku string PUB READONLY,
+    name string
+  ) ALLOW insert IF EXISTS users.caps WHERE label = 'writer' AND grantee = $author
+);
 
-- At most one implicit author-owner per row; no unique constraints or auto-increment.
-- `RDb.computeDelta` throws — RDb carries no view delta.
-- Sync fan-out is snapshot-at-`startSync`: new member DAGs require `stopSync` + `startSync` (and the serving peer must refresh) before they are subscribed.
-- Binding cycles (A binds B binds A) are unsupported — foreign-group bound projection recurses infinitely.
-- Subject-row references in restrictions are limited to **`readonly`** columns (merge stability); mutable subject-row fields cannot gate an op. Subject-row attenuation itself is supported (`$row.<col>` correlation; see [`CAPABILITIES.md`](./CAPABILITIES.md)).
-- Users registration is open self-certifying (v1); enroll-gated registration is a plausible future variant.
+CREATE TABLEGROUP shop_prod USING SCHEMA shop AT {#schemaVersion}
+  BIND users => users
+  USING IDENTITIES users.identities
+  ALLOW UPDATE SCHEMA IF EXISTS users.caps WHERE label = 'deployer' AND grantee = $author;
 
-Run tests with `npm test`.
+INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget') BY $alice;
+SELECT sku, name FROM shop_prod.products WHERE name LIKE 'Wid%' ORDER BY sku LIMIT 10;
+```
+
+The two namesake dimensions of an object are read separately. `SELECT` reads the relational dimension — the live rows at a view — and `LOG` reads the causal dimension — the operations that produced it. `SET VIEW` fixes the `AT` / `FROM` horizon both share, so the rows and their history are read at the same point in causal history.
+
+```sql
+SET VIEW AT {#at} FROM {#from};
+SELECT sku, name FROM shop_prod.products WHERE name LIKE 'Wid%' ORDER BY sku;
+LOG shop_prod LIMIT 20;
+```
+
+## Building blocks
+
+Rdb is four content-addressed MVT types. C-SQL and the adapter are the intended interfaces; the types are the vocabulary the rest of the docs use.
+
+- `**RSchema**` — the specification for one table group: tables, columns, foreign keys, restrictions, and migration rules. A standalone object with its own history; it evolves independently and is reusable by many groups. Spec authority belongs to its signed creators.
+- `**RTableGroup**` — the unit of atomicity, snapshot, observation, and composition. Pins a schema version, binds and observes foreign groups, and is where deploys and cross-group references happen.
+- `**RTable**` — a member table on a scoped projection of its group's history. Rows are write-once identities with permanent deletes and per-field last-writer-wins updates.
+- `**RDb**` — the deployment sync root: records member schemas and groups and ensures they and their transitive references are present and syncing in the replica.
+
+Deeper notes: [CAPABILITIES.md](./CAPABILITIES.md) (capabilities from rows and at-use predicates), [VOID_SEMANTICS.md](./VOID_SEMANTICS.md) (discarding rule-breaking operations under concurrency), [mvt](../mvt) (the underlying type system and SOaD), [rdb_lang](../rdb_lang) (the C-SQL reference).
+
+## Tests
+
+```
+npm test
+```
+

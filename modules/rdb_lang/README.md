@@ -1,6 +1,6 @@
-# hhs3_rdb_lang — C-SQL (causal SQL)
+# C-SQL (causal SQL for Rdb)
 
-`hhs3_rdb_lang` implements **C-SQL** (*causal SQL*): a reusable language for RDb. It parses C-SQL command text, binds names and session values through caller-provided resolvers, compiles creation statements into RDb create payloads, executes local DDL/DML/query/history statements against already-resolved RDb objects, and renders known RDb payloads back to C-SQL text.
+Implementation of **C-SQL** (*causal SQL*): a language for RDb. It parses C-SQL command text, binds names and session values through caller-provided resolvers, compiles creation statements into RDb create payloads, executes local DDL/DML/query/history statements against already-resolved RDb objects, and renders known RDb payloads back to C-SQL text.
 
 It does not own persistence, SQLite files, workspace root-name metadata, key storage, sync, mesh, a REPL, terminal formatting, or CLI behavior.
 
@@ -12,6 +12,8 @@ Schema `ALLOW` predicates and group gates (`ALLOW UPDATE SCHEMA IF`, `ALLOW UPDA
 - Use `table.column` (or `group.table.column` for cross-group `EXISTS` targets) when a bare name would be ambiguous.
 - `$author` names the operation author. The old `$row.column` surface syntax is removed; correlate to the gated row with `gatedTable.column` instead (lowered to `$row.column` in the IR).
 - Self-referential `EXISTS` (same table as the gated table) requires `EXISTS table AS alias WHERE alias.column = ...`.
+
+
 
 ## Public Flow
 
@@ -88,6 +90,8 @@ SET VIEW AT {#at} FROM {#from};
 SELECT sku, name FROM shop_prod.products WHERE name LIKE 'Wid%' ORDER BY sku LIMIT 10;
 LOG shop_prod LIMIT 20;
 ```
+
+
 
 ## Allow Rules
 
@@ -188,6 +192,8 @@ CREATE TABLEGROUP users
   );
 ```
 
+
+
 ## Binding Boundary
 
 `LangBindContext` supplies all host-owned behavior:
@@ -242,10 +248,10 @@ Reverse helpers render known payloads and DAG histories:
 
 Modes:
 
-- **`full` (default, clone):** includes `SEED`, `uuid` pseudo-column, and `#hash` refs for replay with stable ids. Group-scoped ops (`UPDATE REF`, `UPDATE SCHEMA`, `BUNDLE`) render `ON #groupId` / `BUNDLE ON #groupId`.
-- **`schema` (bootstrap):** omits `SEED`/`uuid`; uses names for `ADD`/`BIND`; group section is genesis + `WITH ROWS` only (no row/ref ops). Membership ops (`ADD SCHEMA`, `ADD TABLEGROUP`) omit causal `AT` because the database seed is not fixed; replay appends at the db frontier. Schema migrations and group genesis schema-version pins are unchanged.
+- `full` **(default, clone):** includes `SEED`, `uuid` pseudo-column, and `#hash` refs for replay with stable ids. Group-scoped ops (`UPDATE REF`, `UPDATE SCHEMA`, `BUNDLE`) render `ON #groupId` / `BUNDLE ON #groupId`.
+- `schema` **(bootstrap):** omits `SEED`/`uuid`; uses names for `ADD`/`BIND`; group section is genesis + `WITH ROWS` only (no row/ref ops). Membership ops (`ADD SCHEMA`, `ADD TABLEGROUP`) omit causal `AT` because the database seed is not fixed; replay appends at the db frontier. Schema migrations and group genesis schema-version pins are unchanged.
 
-**`aliasMode` (opt-in via `RenderOptions`, enabled by `rdb_tools` `\\dump`):** emits `\alias` preamble lines (always with the full hash as target) immediately before the first statement that needs each alias, then renders readable names instead of raw hashes in `BY` (`BY $name`), `CREATORS ($name, ...)`, `AT`/`TO` version sets (`AT {schema_ver1}`), and object refs in full profile (`ADD SCHEMA shop`, `ON shop_prod`, etc.). Version aliases are allocated lazily on first reference (`{objectName}_ver{N}` per owning DAG). Keys are always aliased for portable replay even when a keystore label exists. `BIND` RHS and `rowId` prefixes are unchanged. With `aliasMode: false` (default), output matches the legacy `#hash` form.
+`aliasMode` **(opt-in via** `RenderOptions`**, enabled by** `rdb_tools` ****`\\dump`**):** emits `\alias` preamble lines (always with the full hash as target) immediately before the first statement that needs each alias, then renders readable names instead of raw hashes in `BY` (`BY $name`), `CREATORS ($name, ...)`, `AT`/`TO` version sets (`AT {schema_ver1}`), and object refs in full profile (`ADD SCHEMA shop`, `ON shop_prod`, etc.). Version aliases are allocated lazily on first reference (`{objectName}_ver{N}` per owning DAG). Keys are always aliased for portable replay even when a keystore label exists. `BIND` RHS and `rowId` prefixes are unchanged. With `aliasMode: false` (default), output matches the legacy `#hash` form.
 
 Unknown payloads render as stable SQL comments instead of being dropped.
 
