@@ -88,6 +88,12 @@ class Parser {
     private parseCreateDatabase(start: TextSpan): CreateDatabaseStatement {
         const nameTok = this.expectIdentifierToken('database name');
         let end = nameTok.span;
+        let seed: string | undefined;
+        if (this.matchKeyword('SEED')) {
+            const seedTok = this.expectKind('string', 'SEED value');
+            seed = seedTok.value as string;
+            end = seedTok.span;
+        }
         const creators: ValueExpr[] = [];
         if (this.matchKeyword('CREATORS')) {
             this.expectPunctuation('(');
@@ -98,7 +104,9 @@ class Parser {
             }
             end = this.expectPunctuation(')').span;
         }
-        return { kind: 'create-database', name: nameTok.text, creators, span: combineSpans(start, end) };
+        const stmt: CreateDatabaseStatement = { kind: 'create-database', name: nameTok.text, creators, span: combineSpans(start, end) };
+        if (seed !== undefined) stmt.seed = seed;
+        return stmt;
     }
 
     private parseCreateSchema(start: TextSpan): CreateSchemaStatement {
@@ -148,6 +156,9 @@ class Parser {
     private parseColumnDecl(): ColumnDecl {
         const start = this.peek().span;
         const name = this.expectIdentifierText('column name');
+        if (name === 'uuid') {
+            this.diagnostics.add('PARSE_RESERVED_NAME', "column name 'uuid' is reserved", combineSpans(start, this.peek().span));
+        }
         const typeToken = this.advance();
         const type = this.columnTypeFromToken(typeToken);
         let nullable = false;
@@ -226,6 +237,11 @@ class Parser {
 
     private parseCreateTableGroup(start: TextSpan): CreateTableGroupStatement {
         const name = this.expectIdentifierText('tablegroup name');
+        let seed: string | undefined;
+        if (this.matchKeyword('SEED')) {
+            const seedTok = this.expectKind('string', 'SEED value');
+            seed = seedTok.value as string;
+        }
         this.expectKeyword('USING');
         this.expectKeyword('SCHEMA');
         const schema = this.parseNameOrHash();
@@ -298,6 +314,7 @@ class Parser {
         }
 
         const stmt: CreateTableGroupStatement = { kind: 'create-tablegroup', name, schema, bindings, canObserve, initialRows, span: combineSpans(start, end) };
+        if (seed !== undefined) stmt.seed = seed;
         if (schemaVersion !== undefined) stmt.schemaVersion = schemaVersion;
         if (idProvider !== undefined) stmt.idProvider = idProvider;
         if (canDeploy !== undefined) stmt.canDeploy = canDeploy;

@@ -108,6 +108,25 @@ const tests = [
         },
     },
     {
+        name: '[RDB_TOOLS04b] \\dump database full and schema modes',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, databaseSetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+                const full = await runMetaCommand(session, '\\dump database app;');
+                assertTrue(full.output?.includes('CREATE DATABASE app') === true, 'full dump header');
+                assertTrue(full.output?.includes('ADD SCHEMA') === true, 'full dump membership');
+                assertTrue(full.output?.includes('INSERT INTO products') === true, 'full dump row ops');
+
+                const schema = await runMetaCommand(session, '\\dump database app schema;');
+                assertTrue(schema.output?.includes('CREATE DATABASE app') === true, 'schema dump header');
+                assertTrue(schema.output?.includes('ADD SCHEMA shop TO app') === true, 'schema dump named ADD SCHEMA');
+                assertTrue(schema.output?.includes('ADD TABLEGROUP shop_prod TO app') === true, 'schema dump named ADD TABLEGROUP');
+                assertTrue(schema.output?.includes('INSERT INTO products') !== true, 'schema dump omits row ops');
+            });
+        },
+    },
+    {
         name: '[RDB_TOOLS05] vertical output formats SELECT rows as stacked fields',
         invoke: async () => {
             await withSession(async (session) => {
@@ -465,6 +484,24 @@ CREATE TABLEGROUP shop_prod USING SCHEMA shop;
 INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');
 SELECT sku, name FROM shop_prod.products;
 LOG shop_prod LIMIT 5;
+`;
+}
+
+function databaseSetupScript(): string {
+    return `
+\\key create alice correct
+\\author alice
+CREATE DATABASE app;
+CREATE SCHEMA shop CREATORS ($me) AS (
+  TABLE products (
+    sku string PUB READONLY,
+    name string
+  )
+);
+CREATE TABLEGROUP shop_prod USING SCHEMA shop;
+ADD SCHEMA shop TO app;
+ADD TABLEGROUP shop_prod TO app;
+INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');
 `;
 }
 

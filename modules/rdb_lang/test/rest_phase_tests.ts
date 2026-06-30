@@ -6,10 +6,10 @@ import { serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 import { createMockRContext } from "../../rdb/test/mock_rcontext.js";
 import {
     CreateTableGroupPayload, RDbImpl, rDbFactory, RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory,
-    SchemaUpdatePayload,
+    SchemaUpdatePayload, deriveRowId,
 } from "@hyper-hyper-space/hhs3_rdb";
 
-import { bind, BoundStatement } from "../src/bind/bind.js";
+import { bind, BoundStatement, PSEUDO_COLUMN_UUID } from "../src/bind/bind.js";
 import { execute } from "../src/exec/execute.js";
 import { parseStatement } from "../src/syntax/parser.js";
 import { renderCreateSchema, renderCreateTableGroup, renderRowOp, renderSchemaUpdate } from "../src/reverse/render.js";
@@ -49,7 +49,7 @@ async function createEnv() {
     });
     const usersSchema = await ctx.createObject(usersSchemaInit) as RSchemaImpl;
     const usersGroupInit = await RTableGroupImpl.create({
-        name: 'users-group',
+        name: 'users',
         seed: 'users-group',
         schemaRef: usersSchema.getId(),
         schemaVersion: await (await usersSchema.getScopedDag()).getFrontier(),
@@ -77,7 +77,24 @@ async function createEnv() {
     const group = await ctx.createObject(groupPlan.value.plan.payload) as RTableGroupImpl;
     lang.registerGroup('shop_prod', group);
 
-    return { ctx, lang, schema, group, admin };
+    return { ctx, lang, schema, group, admin, usersGroup };
+}
+
+type MockCtx = ReturnType<typeof createMockRContext>;
+
+function dumpLoaders(ctx: MockCtx) {
+    return {
+        loadSchema: async (id: B64Hash) => {
+            const object = await ctx.getObject(id);
+            if (object === undefined) throw new Error(`Schema '${id}' not found`);
+            return object as RSchemaImpl;
+        },
+        loadGroup: async (id: B64Hash) => {
+            const object = await ctx.getObject(id);
+            if (object === undefined) throw new Error(`Group '${id}' not found`);
+            return object as RTableGroupImpl;
+        },
+    };
 }
 
 export const restPhaseTests = {
@@ -115,10 +132,13 @@ export const restPhaseTests = {
                 assertTrue(memberSchemas.includes(schema.getId()), 'schema is a member');
                 assertTrue(memberGroups.includes(group.getId()), 'group is a member');
 
-                const dump = await dumpDatabase(db);
-                assertTrue(!dump.includes('-- unknown payload'), 'membership ops render to SQL');
-                assertTrue(dump.includes(`ADD SCHEMA #${schema.getId()} TO <database> NOTE 'shop schema';`), 'ADD SCHEMA round-trips');
-                assertTrue(dump.includes(`ADD TABLEGROUP #${group.getId()} TO <database>;`), 'ADD TABLEGROUP round-trips');
+                const dump = await dumpDatabase(db, dumpLoaders(ctx));
+                assertTrue(dump.includes('CREATE DATABASE app'), 'dump includes CREATE DATABASE');
+                assertTrue(dump.includes('CREATE SCHEMA shop'), 'dump includes CREATE SCHEMA');
+                assertTrue(dump.indexOf('ADD SCHEMA') < dump.indexOf('CREATE TABLEGROUP'), 'ADD SCHEMA before CREATE TABLEGROUP');
+                assertTrue(dump.includes(`ADD SCHEMA #${schema.getId()} TO app`) && dump.includes(`NOTE 'shop schema'`), 'ADD SCHEMA round-trips');
+                assertTrue(dump.includes(`ADD TABLEGROUP #${group.getId()} TO app`), 'ADD TABLEGROUP round-trips');
+                assertTrue(!dump.includes('TO <database>'), 'no database placeholder');
             },
         },
         {
@@ -144,11 +164,11 @@ export const restPhaseTests = {
                 assertTrue((await db.getMemberSchemas()).includes(schema.getId()), 'schema is a member');
                 assertTrue((await db.getMemberGroups()).includes(group.getId()), 'group is a member');
 
-                const dump = await dumpDatabase(db);
+                const dump = await dumpDatabase(db, dumpLoaders(ctx));
                 assertTrue(dump.includes('CREATORS ('), 'dump includes CREATORS');
                 assertTrue(dump.includes(admin.keyId), 'dump includes creator keyId');
-                assertTrue(dump.includes(`ADD SCHEMA #${schema.getId()} TO <database> NOTE 'shop schema' BY #${admin.keyId}`), 'ADD SCHEMA BY round-trips');
-                assertTrue(dump.includes(`ADD TABLEGROUP #${group.getId()} TO <database> BY #${admin.keyId}`), 'ADD TABLEGROUP BY round-trips');
+                assertTrue(dump.includes(`ADD SCHEMA #${schema.getId()} TO gated`) && dump.includes(`NOTE 'shop schema'`) && dump.includes(`BY #${admin.keyId}`), 'ADD SCHEMA BY round-trips');
+                assertTrue(dump.includes(`ADD TABLEGROUP #${group.getId()} TO gated`) && dump.includes(`BY #${admin.keyId}`), 'ADD TABLEGROUP BY round-trips');
             },
         },
         {
@@ -361,7 +381,10 @@ export const restPhaseTests = {
                 const dumpLines = dump.split('\n');
                 const hasLine = (needle: string) => dumpLines.some((line) =>
                     line.includes(needle) && line.includes(' BY #') && line.includes(' AT {#'));
-                assertTrue(hasLine("INSERT INTO products (sku, name) VALUES ('A', 'Widget')"), 'dumped insert includes BY author and causal AT');
+                assertTrue(dumpLines.some((line) =>
+                    line.includes('INSERT INTO products') && line.includes('(uuid,') && line.includes("'A'")
+                    && line.includes(' BY #') && line.includes(' AT {#')),
+                    'dumped insert includes uuid, BY author and causal AT');
                 assertTrue(hasLine(`UPDATE products SET name = 'Widget 2' WHERE rowId = #${insert.value.rowId}`), 'dumped update includes BY author and causal AT');
                 assertTrue(hasLine(`DELETE FROM products WHERE rowId = #${insert.value.rowId}`), 'dumped delete includes BY author and causal AT');
             },
@@ -469,6 +492,121 @@ export const restPhaseTests = {
                 const bound = await bind(parsed.value, lang);
                 assertTrue(!bound.ok, 'publicKey() on bare key id should fail binding');
                 if (!bound.ok) assertTrue(bound.diagnostics[0].message.includes('publicKey() requires'), 'diagnostic mentions publicKey requirement');
+            },
+        },
+        {
+            name: '[REST08] SEED and uuid pseudo-column bind deterministically',
+            invoke: async () => {
+                const { ctx, lang, admin } = await createEnv();
+                const dbPlan = await execute(await parseBind("CREATE DATABASE app SEED 'db-seed-fixed';", lang));
+                if (!dbPlan.ok || dbPlan.value.kind !== 'create-plan') throw new Error('database create failed');
+                const db1 = await ctx.createObject(dbPlan.value.plan.payload) as RDbImpl;
+                const db2 = await ctx.createObject(dbPlan.value.plan.payload) as RDbImpl;
+                assertEquals(db1.getId(), db2.getId(), 'same SEED yields same database id');
+
+                const insert = await execute(await parseBind(
+                    "INSERT INTO shop_prod.products (uuid, sku, name) VALUES ('row-uuid-1', 'A', 'Widget');",
+                    lang,
+                ));
+                assertTrue(insert.ok && insert.value.kind === 'insert', 'insert with uuid succeeds');
+                if (!insert.ok || insert.value.kind !== 'insert') return;
+                assertEquals(insert.value.rowId, deriveRowId('row-uuid-1', admin.keyId), 'uuid pseudo-column fixes rowId');
+            },
+        },
+        {
+            name: '[REST09] dumpDatabase full and schema profiles',
+            invoke: async () => {
+                const { ctx, lang, schema, group, usersGroup } = await createEnv();
+                const dbPlan = await execute(await parseBind("CREATE DATABASE app SEED 'dump-test-db';", lang));
+                if (!dbPlan.ok || dbPlan.value.kind !== 'create-plan') throw new Error('database create failed');
+                const db = await ctx.createObject(dbPlan.value.plan.payload) as RDbImpl;
+                lang.registerDatabase('app', db);
+
+                await execute(await parseBind('ADD SCHEMA shop TO app;', lang));
+                await execute(await parseBind('ADD TABLEGROUP users TO app;', lang));
+                await execute(await parseBind('ADD TABLEGROUP shop_prod TO app;', lang));
+                await execute(await parseBind("INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');", lang));
+                await execute(await parseBind('ALTER SCHEMA shop AS (ADD COLUMN products.note string NULL);', lang));
+
+                const loaders = dumpLoaders(ctx);
+                const fullDump = await dumpDatabase(db, { ...loaders, mode: 'full' });
+                assertTrue(fullDump.includes("SEED 'dump-test-db'"), 'full dump includes database SEED');
+                assertTrue(fullDump.indexOf('ADD SCHEMA') < fullDump.indexOf('CREATE TABLEGROUP'), 'ADD SCHEMA before groups');
+                assertTrue(fullDump.indexOf('CREATE TABLEGROUP users') < fullDump.indexOf('CREATE TABLEGROUP shop_prod'), 'users before shop_prod');
+                assertTrue(fullDump.includes(`ADD TABLEGROUP #${usersGroup.getId()} TO app`), 'full ADD TABLEGROUP by hash');
+                assertTrue(fullDump.includes(`BIND users => #${usersGroup.getId()}`), 'full BIND by hash');
+                assertTrue(fullDump.includes('INSERT INTO products'), 'full dump includes row ops');
+                for (const line of fullDump.split('\n')) {
+                    if (!line.startsWith('ADD SCHEMA ') && !line.startsWith('ADD TABLEGROUP ')) continue;
+                    assertTrue(line.includes(' AT {#'), `full dump membership includes AT: ${line}`);
+                }
+
+                const schemaDump = await dumpDatabase(db, { ...loaders, mode: 'schema' });
+                assertTrue(!schemaDump.includes("SEED 'dump-test-db'"), 'schema dump omits database SEED');
+                assertTrue(schemaDump.includes('ADD SCHEMA shop TO app'), 'schema dump ADD SCHEMA by name');
+                assertTrue(schemaDump.includes('ADD TABLEGROUP shop_prod TO app'), 'schema dump ADD TABLEGROUP by name');
+                assertTrue(schemaDump.includes('BIND users => users'), 'schema dump BIND by name');
+                assertTrue(!schemaDump.includes('INSERT INTO products'), 'schema dump omits row ops');
+                assertTrue(schemaDump.includes('CREATE SCHEMA shop'), 'schema dump includes schema DDL');
+                for (const line of schemaDump.split('\n')) {
+                    if (!line.startsWith('ADD SCHEMA ') && !line.startsWith('ADD TABLEGROUP ')) continue;
+                    assertTrue(!line.includes(' AT {#'), `schema dump membership omits AT: ${line}`);
+                }
+                const alterStmt = schemaDump.split('\n\n').find((s) =>
+                    s.includes('ALTER SCHEMA #') && s.includes('ADD COLUMN products.note string NULL'));
+                assertTrue(alterStmt !== undefined && alterStmt.includes(' AT {#'), 'schema dump alter keeps causal AT');
+            },
+        },
+        {
+            name: '[REST10] full dumpGroup renders group-scoped ops with #groupId',
+            invoke: async () => {
+                const { lang, group, schema, usersGroup } = await createEnv();
+
+                const insert = await execute(await parseBind("INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');", lang));
+                assertTrue(insert.ok && insert.value.kind === 'insert', 'insert succeeds');
+                if (!insert.ok || insert.value.kind !== 'insert') return;
+
+                lang.resolveRowId = async (ref, table, at, from) => {
+                    const ids = await (await table.table.getView(at, from ?? at)).liveRowIds();
+                    const matches = ids.filter((id: B64Hash) => id.startsWith(ref.prefix));
+                    if (matches.length !== 1) throw new Error(`rowId prefix did not resolve uniquely: ${ref.prefix}`);
+                    return matches[0];
+                };
+
+                const bundle = await execute(await parseBind(`BUNDLE ON shop_prod (
+                    UPDATE products SET name = 'Widget 3' WHERE rowId = #${insert.value.rowId.slice(0, 10)};
+                );`, lang));
+                assertTrue(bundle.ok && bundle.value.kind === 'bundle', 'bundle succeeds');
+
+                const deploy = await execute(await parseBind('UPDATE SCHEMA shop TO LATEST ON shop_prod;', lang));
+                assertTrue(deploy.ok && deploy.value.kind === 'update-schema', 'update schema succeeds');
+
+                const updateRef = await execute(await parseBind('UPDATE REF users TO LATEST ON shop_prod;', lang));
+                assertTrue(updateRef.ok && updateRef.value.kind === 'update-ref', 'update ref succeeds');
+
+                const dump = await dumpGroup(group, { render: { profile: 'full' } });
+                const groupTarget = `#${group.getId()}`;
+                assertTrue(!dump.includes('<group>'), 'full dump does not emit <group> placeholder');
+                assertTrue(dump.includes(`BUNDLE ON ${groupTarget}`), 'dumped bundle uses group id');
+                assertTrue(
+                    dump.includes(`UPDATE SCHEMA #${schema.getId()} TO`) && dump.includes(` ON ${groupTarget}`),
+                    'dumped UPDATE SCHEMA uses group id',
+                );
+                assertTrue(dump.includes('UPDATE REF #') && dump.includes(` ON ${groupTarget}`), 'dumped UPDATE REF uses group id');
+
+                for (const statement of dump.split('\n\n')) {
+                    const line = statement.split('\n')[0] ?? '';
+                    if (!line.startsWith('BUNDLE ON ') && !line.startsWith('UPDATE REF ') && !line.startsWith('UPDATE SCHEMA ')) continue;
+                    const parsed = parseStatement(statement);
+                    assertTrue(parsed.ok, `dumped group-scoped statement parses: ${line}`);
+                }
+
+                const rowPrefix = insert.value.rowId.slice(0, 10);
+                await parseBind(`BUNDLE ON #${group.getId()} (
+                    UPDATE products SET name = 'Widget 4' WHERE rowId = #${rowPrefix};
+                );`, lang);
+                await parseBind(`UPDATE SCHEMA #${schema.getId()} TO LATEST ON #${group.getId()};`, lang);
+                await parseBind(`UPDATE REF #${usersGroup.getId()} TO LATEST ON #${group.getId()};`, lang);
             },
         },
     ],

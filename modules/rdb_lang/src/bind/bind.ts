@@ -10,6 +10,7 @@ import type {
     CreateDatabaseStatement, CreateSchemaStatement, CreateTableGroupStatement,
     DeleteStatement, InsertStatement, LogStatement,
     NameOrHashRef, SelectStatement, SetViewStatement, TableRef, UpdateRefStatement, UpdateSchemaStatement, UpdateStatement,
+    ValueExpr,
 } from "../syntax/ast.js";
 import { compileMigrationRules } from "../compile/ddl.js";
 import { buildAlterColumnsOf } from "../compile/rule_scope.js";
@@ -19,6 +20,9 @@ import type {
     ResolvedTableRef,
 } from "./context.js";
 import { asIdentity, asJsonLiteral, asKeyId, resolveCreator, resolveValue } from "./values.js";
+
+/** Reserved INSERT / WITH ROWS pseudo-column; not a schema column. */
+export const PSEUDO_COLUMN_UUID = 'uuid';
 
 export type BoundStatement =
     | BoundCreateDatabase
@@ -228,10 +232,17 @@ async function bindCreateDatabase(ast: CreateDatabaseStatement, context: LangBin
     for (const expr of ast.creators) {
         creators.push(await resolveCreator(expr, context));
     }
-    return { kind: 'create-database', ast, seed: context.createSeed('rdb', ast.name), creators };
+    return { kind: 'create-database', ast, seed: ast.seed ?? context.createSeed('rdb', ast.name), creators };
 }
 
 async function bindCreateSchema(ast: CreateSchemaStatement, context: LangBindContext): Promise<BoundCreateSchema> {
+    for (const table of ast.tables) {
+        for (const column of table.columns) {
+            if (column.name === PSEUDO_COLUMN_UUID) {
+                throw new Error("column name 'uuid' is reserved");
+            }
+        }
+    }
     const creators: { keyId: KeyId; publicKey: PublicKey }[] = [];
     for (const expr of ast.creators) {
         creators.push(await resolveCreator(expr, context));
@@ -248,15 +259,13 @@ async function bindCreateTableGroup(ast: CreateTableGroupStatement, context: Lan
     }
     const initialRows: BoundInitialRow[] = [];
     for (const row of ast.initialRows) {
-        const values: { [column: string]: json.Literal } = {};
-        for (const v of row.values) values[v.column] = asJsonLiteral(await resolveValue(v.value, context));
-        const bound: BoundInitialRow = { table: row.table, uuid: context.createUuid(), values };
-        initialRows.push(bound);
+        const { uuid, values } = await bindInitialRowValues(row.values, context);
+        initialRows.push({ table: row.table, uuid, values });
     }
     return {
         kind: 'create-tablegroup',
         ast,
-        seed: context.createSeed('group', ast.name),
+        seed: ast.seed ?? context.createSeed('group', ast.name),
         schema,
         schemaVersion,
         bindings,
@@ -317,20 +326,8 @@ async function bindInsert(ast: InsertStatement, context: LangBindContext): Promi
     const author = await resolveEffectiveAuthor(ast.author, context);
     const valueContext = contextWithAuthor(context, author);
     const at = await context.resolveVersion(ast.at, { kind: 'group', id: table.groupId, group: table.group });
-    const values: { [column: string]: json.Literal } = {};
-    for (let i = 0; i < ast.columns.length; i += 1) {
-        const expr = ast.values[i];
-        const column = ast.columns[i];
-        if (expr.kind === 'hash') {
-            if (context.resolveFkRowId === undefined) {
-                throw new Error('FK #prefix resolution is not available in this host');
-            }
-            values[column] = await context.resolveFkRowId(expr.prefix, table, column, at, at);
-        } else {
-            values[column] = asJsonLiteral(await resolveValue(expr, valueContext));
-        }
-    }
-    const bound: BoundInsert = { kind: 'insert', ast, table, values, at, uuid: context.createUuid() };
+    const { uuid, values } = await bindInsertColumns(ast.columns, ast.values, context, table, at, valueContext);
+    const bound: BoundInsert = { kind: 'insert', ast, table, values, at, uuid };
     if (author !== undefined) bound.author = author;
     return bound;
 }
@@ -375,20 +372,7 @@ async function bindBundleWrite(write: BundleWriteStatement, context: LangBindCon
     if (write.kind === 'insert') {
         if (write.columns.length !== write.values.length) throw new Error('BUNDLE INSERT column count does not match value count');
         const table = await context.resolveTable(write.table);
-        const values: { [column: string]: json.Literal } = {};
-        for (let i = 0; i < write.columns.length; i += 1) {
-            const expr = write.values[i];
-            const column = write.columns[i];
-            if (expr.kind === 'hash') {
-                if (context.resolveFkRowId === undefined) {
-                    throw new Error('FK #prefix resolution is not available in this host');
-                }
-                values[column] = await context.resolveFkRowId(expr.prefix, table, column, at, at);
-            } else {
-                values[column] = asJsonLiteral(await resolveValue(expr, context));
-            }
-        }
-        const uuid = context.createUuid();
+        const { uuid, values } = await bindInsertColumns(write.columns, write.values, context, table, at, context);
         const op: InsertRowPayload = { action: 'insert', rowId: deriveRowId(uuid, author), uuid, values };
         return { table: write.table.table, op };
     }
@@ -503,6 +487,55 @@ async function bindLog(ast: LogStatement, context: LangBindContext): Promise<Bou
     const bound: BoundLog = { kind: 'log', ast, target };
     if (at !== undefined) bound.at = at;
     return bound;
+}
+
+async function bindInsertColumns(
+    columns: string[],
+    valueExprs: ValueExpr[],
+    context: LangBindContext,
+    table: ResolvedTableRef,
+    at: Version,
+    valueContext: LangBindContext,
+): Promise<{ uuid: string; values: { [column: string]: json.Literal } }> {
+    let uuid: string | undefined;
+    const values: { [column: string]: json.Literal } = {};
+    for (let i = 0; i < columns.length; i += 1) {
+        const column = columns[i];
+        const expr = valueExprs[i];
+        if (column === PSEUDO_COLUMN_UUID) {
+            const lit = asJsonLiteral(await resolveValue(expr, valueContext));
+            if (typeof lit !== 'string') throw new Error('uuid pseudo-column requires a string value');
+            uuid = lit;
+            continue;
+        }
+        if (expr.kind === 'hash') {
+            if (context.resolveFkRowId === undefined) {
+                throw new Error('FK #prefix resolution is not available in this host');
+            }
+            values[column] = await context.resolveFkRowId(expr.prefix, table, column, at, at);
+        } else {
+            values[column] = asJsonLiteral(await resolveValue(expr, valueContext));
+        }
+    }
+    return { uuid: uuid ?? context.createUuid(), values };
+}
+
+async function bindInitialRowValues(
+    pairs: { column: string; value: ValueExpr }[],
+    context: LangBindContext,
+): Promise<{ uuid: string; values: { [column: string]: json.Literal } }> {
+    let uuid: string | undefined;
+    const values: { [column: string]: json.Literal } = {};
+    for (const pair of pairs) {
+        if (pair.column === PSEUDO_COLUMN_UUID) {
+            const lit = asJsonLiteral(await resolveValue(pair.value, context));
+            if (typeof lit !== 'string') throw new Error('uuid pseudo-column requires a string value');
+            uuid = lit;
+            continue;
+        }
+        values[pair.column] = asJsonLiteral(await resolveValue(pair.value, context));
+    }
+    return { uuid: uuid ?? context.createUuid(), values };
 }
 
 async function bindRowId(

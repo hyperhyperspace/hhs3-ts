@@ -109,6 +109,7 @@ export type CreateSchemaStatement = {
 export type CreateDatabaseStatement = {
     kind: 'create-database';
     name: string;
+    seed?: string;
     creators: ValueExpr[];
     span: TextSpan;
 };
@@ -122,6 +123,7 @@ export type InitialRow = {
 export type CreateTableGroupStatement = {
     kind: 'create-tablegroup';
     name: string;
+    seed?: string;
     schema: NameOrHashRef;
     schemaVersion?: VersionExpr;
     bindings: { name: string; group: NameOrHashRef; span: TextSpan }[];

@@ -554,5 +554,39 @@ export const parserTests = {
                 if (result.value.values[0].kind === 'hash') assertEquals(result.value.values[0].prefix, 'abc', 'hash prefix');
             },
         },
+        {
+            name: '[PARSE29] parses SEED on CREATE DATABASE and CREATE TABLEGROUP',
+            invoke: async () => {
+                const db = parseStatement("CREATE DATABASE app SEED 'db-seed';");
+                assertTrue(db.ok && db.value.kind === 'create-database', 'database parse');
+                if (db.ok && db.value.kind === 'create-database') assertEquals(db.value.seed, 'db-seed', 'database seed');
+
+                const group = parseStatement("CREATE TABLEGROUP g SEED 'g-seed' USING SCHEMA shop;");
+                assertTrue(group.ok && group.value.kind === 'create-tablegroup', 'tablegroup parse');
+                if (group.ok && group.value.kind === 'create-tablegroup') assertEquals(group.value.seed, 'g-seed', 'group seed');
+            },
+        },
+        {
+            name: '[PARSE30] parses uuid pseudo-column on INSERT',
+            invoke: async () => {
+                const result = parseStatement("INSERT INTO products (uuid, sku) VALUES ('u1', 'A');");
+                assertTrue(result.ok && result.value.kind === 'insert', 'insert parse');
+                if (!result.ok || result.value.kind !== 'insert') return;
+                assertEquals(result.value.columns[0], 'uuid', 'uuid column');
+            },
+        },
+        {
+            name: '[PARSE31] rejects uuid as schema column name',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE SCHEMA bad AS (
+                      TABLE t (
+                        uuid string
+                      )
+                    );
+                `);
+                assertTrue(!result.ok, 'parse should fail for uuid column');
+            },
+        },
     ],
 };

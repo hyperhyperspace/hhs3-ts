@@ -200,6 +200,16 @@ CREATE TABLEGROUP users
 - explicit `BY` author resolution to an unlocked signing identity (`resolveAuthor`),
 - UUID and seed generation.
 
+Optional deterministic identity on create/write statements:
+
+```sql
+CREATE DATABASE app SEED 'fixed-db-seed';
+CREATE TABLEGROUP shop_prod SEED 'fixed-group-seed' USING SCHEMA shop;
+INSERT INTO products (uuid, sku, name) VALUES ('fixed-row-uuid', 'A', 'Widget');
+```
+
+The `uuid` identifier is a reserved pseudo-column on `INSERT` and in `WITH ROWS` (not a schema column). When omitted, the host generates fresh seeds/uuids.
+
 The language layer validates and applies language semantics, but it does not persist workspace metadata or manage keys.
 
 ## Reverse Rendering
@@ -219,6 +229,20 @@ Reverse helpers render known payloads and DAG histories:
 - `dumpSchema`
 - `dumpGroup`
 - `dumpDatabase`
+- `sortMemberGroupsByBindings`
+
+`dumpDatabase(db, { mode, loadSchema, loadGroup })` emits a five-section script:
+
+1. `CREATE DATABASE`
+2. Member schema DAGs (`getMemberSchemas()`)
+3. `ADD SCHEMA` membership ops
+4. Member tablegroup DAGs (`getMemberGroups()`, BIND topo order among members)
+5. `ADD TABLEGROUP` membership ops
+
+Modes:
+
+- **`full` (default, clone):** includes `SEED`, `uuid` pseudo-column, and `#hash` refs for replay with stable ids. Group-scoped ops (`UPDATE REF`, `UPDATE SCHEMA`, `BUNDLE`) render `ON #groupId` / `BUNDLE ON #groupId`.
+- **`schema` (bootstrap):** omits `SEED`/`uuid`; uses names for `ADD`/`BIND`; group section is genesis + `WITH ROWS` only (no row/ref ops). Membership ops (`ADD SCHEMA`, `ADD TABLEGROUP`) omit causal `AT` because the database seed is not fixed; replay appends at the db frontier. Schema migrations and group genesis schema-version pins are unchanged.
 
 Unknown payloads render as stable SQL comments instead of being dropped.
 

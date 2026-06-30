@@ -8,17 +8,38 @@ import {
 } from "@hyper-hyper-space/hhs3_rdb";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 
+export type DumpRenderProfile = 'full' | 'schema';
+
 export type RenderOptions = {
+    profile?: DumpRenderProfile;
     at?: json.Set;
     schemaRef?: B64Hash;
     schemaName?: string;
+    databaseName?: string;
+    groupRef?: B64Hash;
+    groupName?: string;
+    resolveSchemaName?: (id: B64Hash) => string | undefined;
+    resolveGroupName?: (id: B64Hash) => string | undefined;
 };
 
-export function renderCreateDatabase(payload: CreateRDbPayload): string {
+function isFullProfile(options?: RenderOptions): boolean {
+    return options?.profile !== 'schema';
+}
+
+function renderGroupTarget(options?: RenderOptions): string {
+    if (options?.groupRef === undefined) return '<group>';
+    if (isFullProfile(options)) return `#${options.groupRef}`;
+    return options.groupName ?? options.resolveGroupName?.(options.groupRef) ?? `#${options.groupRef}`;
+}
+
+export function renderCreateDatabase(payload: CreateRDbPayload, options?: RenderOptions): string {
     const creators = (payload.creators ?? []).length > 0
         ? ` CREATORS (${payload.creators!.map((c) => sqlString(c.keyId)).join(', ')})`
         : '';
-    return `CREATE DATABASE ${payload.name ?? payload.seed}${creators};`;
+    const seed = isFullProfile(options) && payload.seed !== undefined && payload.seed.length > 0
+        ? ` SEED ${sqlString(payload.seed)}`
+        : '';
+    return `CREATE DATABASE ${payload.name ?? payload.seed}${seed}${creators};`;
 }
 
 export function renderCreateSchema(payload: CreateRSchemaPayload): string {
@@ -29,11 +50,24 @@ export function renderCreateSchema(payload: CreateRSchemaPayload): string {
     return `CREATE SCHEMA ${payload.name}${creators} AS (\n  ${tables}\n);`;
 }
 
-export function renderCreateTableGroup(payload: CreateTableGroupPayload): string {
+export function renderCreateTableGroup(payload: CreateTableGroupPayload, options?: RenderOptions): string {
+    const schemaComment = options?.schemaName !== undefined && !isFullProfile(options)
+        ? `-- ${options.schemaName}\n`
+        : '';
+    const seed = isFullProfile(options) && payload.seed !== undefined && payload.seed.length > 0
+        ? ` SEED ${sqlString(payload.seed)}`
+        : '';
     const parts = [
-        `CREATE TABLEGROUP ${payload.name} USING SCHEMA #${payload.schemaRef} AT ${renderVersionSet(payload.schemaVersion)}`,
+        `${schemaComment}CREATE TABLEGROUP ${payload.name}${seed} USING SCHEMA #${payload.schemaRef} AT ${renderVersionSet(payload.schemaVersion)}`,
     ];
-    for (const [name, id] of Object.entries(payload.bindings ?? {})) parts.push(`BIND ${name} => #${id}`);
+    for (const [name, id] of Object.entries(payload.bindings ?? {})) {
+        if (isFullProfile(options)) {
+            parts.push(`BIND ${name} => #${id}`);
+        } else {
+            const groupName = options?.resolveGroupName?.(id) ?? name;
+            parts.push(`BIND ${name} => ${groupName}`);
+        }
+    }
     if (payload.idProvider !== undefined) parts.push(`USING IDENTITIES ${payload.idProvider}`);
     if (payload.canDeploy !== undefined) parts.push(`ALLOW UPDATE SCHEMA IF ${formatPredicate(payload.canDeploy)}`);
     for (const [binding, pred] of Object.entries(payload.canObserve ?? {})) {
@@ -42,19 +76,29 @@ export function renderCreateTableGroup(payload: CreateTableGroupPayload): string
     if (payload.initialRows !== undefined) {
         const rows: string[] = [];
         for (const [table, tableRows] of Object.entries(payload.initialRows)) {
-            for (const row of tableRows) rows.push(renderInitialRow(table, row as unknown as InsertRowPayload));
+            for (const row of tableRows) {
+                rows.push(renderInitialRow(table, row as unknown as InsertRowPayload, options));
+            }
         }
         if (rows.length > 0) parts.push(`WITH ROWS (\n  ${rows.join(',\n  ')}\n)`);
     }
     return `${parts.join('\n  ')};`;
 }
 
-export function renderAddSchema(payload: AddSchemaPayload): string {
-    return `ADD SCHEMA #${payload.schemaId} TO <database>${renderNote(payload.note)}${renderBy(payload.author)};`;
+export function renderAddSchema(payload: AddSchemaPayload, options?: RenderOptions): string {
+    const target = isFullProfile(options)
+        ? `#${payload.schemaId}`
+        : (options?.resolveSchemaName?.(payload.schemaId) ?? `#${payload.schemaId}`);
+    const db = options?.databaseName ?? '<database>';
+    return `ADD SCHEMA ${target} TO ${db}${renderNote(payload.note)}${renderBy(payload.author)}${isFullProfile(options) ? renderAt(options) : ''};`;
 }
 
-export function renderAddGroup(payload: AddGroupPayload): string {
-    return `ADD TABLEGROUP #${payload.groupId} TO <database>${renderNote(payload.note)}${renderBy(payload.author)};`;
+export function renderAddGroup(payload: AddGroupPayload, options?: RenderOptions): string {
+    const target = isFullProfile(options)
+        ? `#${payload.groupId}`
+        : (options?.resolveGroupName?.(payload.groupId) ?? `#${payload.groupId}`);
+    const db = options?.databaseName ?? '<database>';
+    return `ADD TABLEGROUP ${target} TO ${db}${renderNote(payload.note)}${renderBy(payload.author)}${isFullProfile(options) ? renderAt(options) : ''};`;
 }
 
 export function renderSchemaUpdate(payload: SchemaUpdatePayload, options?: RenderOptions): string {
@@ -67,13 +111,18 @@ export function renderSchemaUpdate(payload: SchemaUpdatePayload, options?: Rende
 export function renderRowOp(payload: RowOpPayload, table?: string, options?: RenderOptions): string {
     const target = table ?? '<table>';
     if (payload.action === 'insert') {
-        const cols = Object.keys(payload.values);
-        const vals = cols.map((c) => renderLiteral(payload.values[c]));
-        return `INSERT INTO ${target} (${cols.join(', ')}) VALUES (${vals.join(', ')})${renderBy(payload.author)}${renderAt(options)};`;
+        const insert = payload as InsertRowPayload;
+        const cols = Object.keys(insert.values);
+        const vals = cols.map((c) => renderLiteral(insert.values[c]));
+        if (isFullProfile(options) && insert.uuid !== undefined) {
+            return `INSERT INTO ${target} (uuid, ${cols.join(', ')}) VALUES (${sqlString(insert.uuid)}, ${vals.join(', ')})${renderBy(insert.author)}${renderAt(options)};`;
+        }
+        return `INSERT INTO ${target} (${cols.join(', ')}) VALUES (${vals.join(', ')})${renderBy(insert.author)}${renderAt(options)};`;
     }
     if (payload.action === 'update') {
-        const values = Object.entries(payload.values).map(([k, v]) => `${k} = ${renderLiteral(v)}`).join(', ');
-        return `UPDATE ${target} SET ${values} WHERE rowId = #${payload.rowId}${renderBy(payload.author)}${renderAt(options)};`;
+        const update = payload as UpdateRowPayload;
+        const values = Object.entries(update.values).map(([k, v]) => `${k} = ${renderLiteral(v)}`).join(', ');
+        return `UPDATE ${target} SET ${values} WHERE rowId = #${update.rowId}${renderBy(update.author)}${renderAt(options)};`;
     }
     return `DELETE FROM ${target} WHERE rowId = #${payload.rowId}${renderBy(payload.author)}${renderAt(options)};`;
 }
@@ -82,25 +131,36 @@ export function renderRefOp(payload: RefAdvancePayload, options?: RenderOptions)
     const author = (payload as { author?: string }).author;
     const trailing = `${renderBy(author)}${renderAt(options)}`;
     const version = renderVersionSet(payload.refVersion);
+    const group = renderGroupTarget(options);
     if (options?.schemaRef !== undefined && payload.refId === options.schemaRef) {
-        return `UPDATE SCHEMA #${payload.refId} TO ${version} ON <group>${trailing};`;
+        return `UPDATE SCHEMA #${payload.refId} TO ${version} ON ${group}${trailing};`;
     }
-    return `UPDATE REF #${payload.refId} TO ${version} ON <group>${trailing};`;
+    return `UPDATE REF #${payload.refId} TO ${version} ON ${group}${trailing};`;
 }
 
 export function renderBundle(payload: BundlePayload, options?: RenderOptions): string {
-    const writes = payload.writes.map((w) => renderRowOp(w.op as unknown as RowOpPayload, w.table)).join('\n  ');
+    const writes = payload.writes.map((w) => {
+        const op = w.op as unknown as RowOpPayload;
+        const { author: _author, ...innerOp } = op as RowOpPayload & { author?: string };
+        return renderRowOp(innerOp as RowOpPayload, w.table);
+    }).join('\n  ');
     const author = (payload as { author?: string }).author;
-    return `BUNDLE ON <group> (\n  ${writes}\n)${renderBy(author)}${renderAt(options)};`;
+    return `BUNDLE ON ${renderGroupTarget(options)} (\n  ${writes}\n)${renderBy(author)}${renderAt(options)};`;
 }
 
 export function renderOp(payload: json.Literal, options?: RenderOptions): string {
     if (!isObject(payload)) return `-- unknown payload ${json.toStringNormalized(payload)}`;
-    if (payload['action'] === 'create' && payload['type'] === 'hhs/rdb_v1') return renderCreateDatabase(payload as CreateRDbPayload);
-    if (payload['action'] === 'create' && payload['type'] === 'hhs/rschema_v1') return renderCreateSchema(payload as CreateRSchemaPayload);
-    if (payload['action'] === 'create' && payload['type'] === 'hhs/rtable_group_v1') return renderCreateTableGroup(payload as CreateTableGroupPayload);
-    if (payload['action'] === 'add-schema') return renderAddSchema(payload as unknown as AddSchemaPayload);
-    if (payload['action'] === 'add-group') return renderAddGroup(payload as unknown as AddGroupPayload);
+    if (payload['action'] === 'create' && payload['type'] === 'hhs/rdb_v1') {
+        return renderCreateDatabase(payload as CreateRDbPayload, options);
+    }
+    if (payload['action'] === 'create' && payload['type'] === 'hhs/rschema_v1') {
+        return renderCreateSchema(payload as CreateRSchemaPayload);
+    }
+    if (payload['action'] === 'create' && payload['type'] === 'hhs/rtable_group_v1') {
+        return renderCreateTableGroup(payload as CreateTableGroupPayload, options);
+    }
+    if (payload['action'] === 'add-schema') return renderAddSchema(payload as unknown as AddSchemaPayload, options);
+    if (payload['action'] === 'add-group') return renderAddGroup(payload as unknown as AddGroupPayload, options);
     if (payload['action'] === 'schema-update') return renderSchemaUpdate(payload as unknown as SchemaUpdatePayload, options);
     if (payload['action'] === 'row') {
         const row = payload as unknown as RowEnvelopePayload;
@@ -171,9 +231,12 @@ function renderMigrationRule(rule: MigrationRule): string {
     }
 }
 
-function renderInitialRow(table: string, row: InsertRowPayload): string {
-    const values = Object.entries(row.values).map(([k, v]) => `${k}=${renderLiteral(v)}`).join(', ');
-    return `${table} (${values})`;
+function renderInitialRow(table: string, row: InsertRowPayload, options?: RenderOptions): string {
+    const parts = Object.entries(row.values).map(([k, v]) => `${k}=${renderLiteral(v)}`);
+    if (isFullProfile(options) && row.uuid !== undefined) {
+        parts.unshift(`uuid=${sqlString(row.uuid)}`);
+    }
+    return `${table} (${parts.join(', ')})`;
 }
 
 function renderLiteral(value: json.Literal): string {

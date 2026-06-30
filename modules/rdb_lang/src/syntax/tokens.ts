@@ -76,6 +76,7 @@ export const KEYWORDS = new Set([
     'RULES',
     'ROWS',
     'SCHEMA',
+    'SEED',
     'SELECT',
     'SET',
     'STRING',

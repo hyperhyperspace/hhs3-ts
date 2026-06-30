@@ -1,4 +1,7 @@
 import { dumpDatabase, dumpGroup, dumpSchema } from "@hyper-hyper-space/hhs3_rdb_lang";
+import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
+import type { RObject } from "@hyper-hyper-space/hhs3_mvt";
+import type { RSchema, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 
 import { formatRows } from "../format/table.js";
 import { WorkspaceSession } from "../session/session.js";
@@ -182,11 +185,35 @@ async function dump(session: WorkspaceSession, args: string[]): Promise<string> 
         return dumpGroup(group.group as Parameters<typeof dumpGroup>[0]);
     }
     if (kind === 'database') {
-        const db = await session.workspace.roots.resolveDatabase(ref(name));
+        const dbName = name;
+        if (dbName === undefined) throw new Error('Usage: \\dump database <name> [full|schema]');
+        const modeArg = args[2];
+        const mode = modeArg === 'schema' ? 'schema' : 'full';
+        const db = await session.workspace.roots.resolveDatabase(ref(dbName));
         if (db.db === undefined) throw new Error('Database is not loaded');
-        return dumpDatabase(db.db as Parameters<typeof dumpDatabase>[0]);
+        return dumpDatabase(db.db as Parameters<typeof dumpDatabase>[0], {
+            mode,
+            loadSchema: (id) => loadSchemaObject(session, id),
+            loadGroup: (id) => loadGroupObject(session, id),
+        });
     }
-    throw new Error('Usage: \\dump schema|group|database <name>');
+    throw new Error('Usage: \\dump schema|group|database <name> [full|schema]');
+}
+
+async function loadRootObject(session: WorkspaceSession, id: B64Hash): Promise<RObject> {
+    const record = session.workspace.roots.get(id);
+    if (record?.object !== undefined) return record.object;
+    const object = await session.workspace.replica.getObject(id);
+    if (object === undefined) throw new Error(`Object '${id}' is not loaded`);
+    return object;
+}
+
+async function loadSchemaObject(session: WorkspaceSession, id: B64Hash) {
+    return loadRootObject(session, id) as Promise<RSchema & Parameters<typeof dumpSchema>[0]>;
+}
+
+async function loadGroupObject(session: WorkspaceSession, id: B64Hash) {
+    return loadRootObject(session, id) as Promise<RTableGroup & Parameters<typeof dumpGroup>[0]>;
 }
 
 function formatView(session: WorkspaceSession): string {
@@ -207,7 +234,7 @@ function helpText(): string {
         '\\key create <label> [passphrase], \\key unlock <label|#prefix> [passphrase], \\keys, \\whoami',
         '\\author [<label|#prefix> [passphrase]|nobody]  (set/show default author; unlocks if needed; \\author nobody clears it)',
         '\\use database <name>, \\use group <name>, \\view, \\frontier [group]',
-        '\\alias <name> <root|#prefix>, \\output table|json|vertical, \\dump schema|group|database <name>',
+        '\\alias <name> <root|#prefix>, \\output table|json|vertical, \\dump schema|group|database <name> [full|schema]',
         '\\quit',
     ].join('\n');
 }
