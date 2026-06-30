@@ -1,4 +1,4 @@
-# MVT — Monotone-View Types
+# MVT — Monotone View Types
 
 A type system for coordination-free replicable objects. MVTs are a formalism in which observations are monotonic but explicitly version-scoped, allowing historical views to be refined as additional information becomes available. They generalize CRDTs by cleanly separating the write path (validated, version-stamped payloads) from the read path (version-scoped views), enabling coordination-free approximations for applications in any domain.
 
