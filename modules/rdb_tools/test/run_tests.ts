@@ -111,6 +111,27 @@ const tests = [
         },
     },
     {
+        name: '[RDB_TOOLS04c] \\help commands shows language reference',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const create = await runMetaCommand(session, '\\help commands CREATE');
+                assertTrue(create.output?.includes('CREATE DATABASE') === true, 'CREATE DATABASE in filtered help');
+                assertTrue(create.output?.includes('CREATE SCHEMA') === true, 'CREATE SCHEMA in filtered help');
+                assertTrue(create.output?.includes('CREATE TABLEGROUP') === true, 'CREATE TABLEGROUP in filtered help');
+
+                const noMatch = await runMetaCommand(session, '\\help commands NOPE');
+                assertEquals(noMatch.output, "No language commands match 'NOPE'", 'no-match message');
+
+                const createAlias = await runMetaCommand(session, '\\help command CREATE');
+                assertEquals(createAlias.output, create.output, '\\help command matches \\help commands');
+
+                const meta = await runMetaCommand(session, '\\help');
+                assertTrue(meta.output?.includes('\\quit') === true, 'meta help includes quit');
+                assertTrue(meta.output?.includes('\\help commands [filter]') === true, 'meta help includes commands hint');
+            });
+        },
+    },
+    {
         name: '[RDB_TOOLS04b] \\dump database full and schema modes',
         invoke: async () => {
             await withSession(async (session) => {
@@ -480,6 +501,49 @@ const tests = [
                 assertEquals(freshSession.aliases.get('group', 'prod'), undefined, 'aliases session-only');
                 const keys = await runMetaCommand(freshSession, '\\keys');
                 assertTrue(keys.output?.includes('alice') === true, 'keystore label persists');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS15] same-hash alias fan-out across scopes',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, setupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                const group = session.workspace.roots.list('group')[0];
+                const dag = await group.object!.getScopedDag();
+                const opHashes: string[] = [];
+                for await (const entry of dag.loadAllEntries()) opHashes.push(entry.hash);
+                assertEquals(opHashes[0], group.id, 'group id equals genesis op hash');
+
+                const prefix = group.id.slice(0, 12);
+                const fanOut = await runMetaCommand(session, `\\alias genesis #${prefix}`);
+                assertTrue(fanOut.output?.includes('group genesis =>') === true, 'fan-out includes group line');
+                assertTrue(fanOut.output?.includes('version genesis =>') === true, 'fan-out includes version line');
+                assertTrue(fanOut.output?.includes('(shop_prod)') === true, 'version line includes root name');
+                assertEquals(session.aliases.get('group', 'genesis'), group.id, 'group alias stored');
+                assertEquals(session.aliases.get('version', 'genesis'), group.id, 'version alias stored');
+
+                const view = await runCommand(session, 'SET VIEW AT {genesis};');
+                assertEquals(view.exitCode, 0, view.output);
+
+                const explicit = await runMetaCommand(session, `\\alias group only #${prefix}`);
+                assertTrue(explicit.output?.includes('group only =>') === true, 'explicit scope output');
+                assertEquals(session.aliases.get('group', 'only'), group.id, 'explicit group alias stored');
+                assertEquals(session.aliases.get('version', 'only'), undefined, 'explicit scope does not set version');
+
+                let ambiguous = false;
+                try {
+                    await runMetaCommand(session, '\\alias bad #');
+                } catch (e) {
+                    ambiguous = true;
+                    assertTrue(
+                        e instanceof Error && e.message.includes('Ambiguous alias prefix'),
+                        'short prefix still ambiguous across different hashes',
+                    );
+                }
+                assertTrue(ambiguous, 'ambiguous prefix should fail');
             });
         },
     },

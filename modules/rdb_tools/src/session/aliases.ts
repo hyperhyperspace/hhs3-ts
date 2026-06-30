@@ -61,7 +61,7 @@ export async function resolveAliasTarget(
     scope: AliasScope | 'auto',
     prefix: string,
     session: WorkspaceSession,
-): Promise<AliasTarget> {
+): Promise<AliasTarget[]> {
     const normalized = prefix.startsWith('#') ? prefix.slice(1) : prefix;
     const searchScopes = scope === 'auto' ? ALL_SCOPES : [scope];
     const matches: AliasTarget[] = [];
@@ -72,15 +72,29 @@ export async function resolveAliasTarget(
         }
     }
 
-    if (matches.length === 0) throw new Error(`Unknown hash prefix '#${normalized}'`);
-    if (matches.length > 1) {
-        const lines = matches.map((m) => `  ${m.scope.padEnd(7)} => ${m.hash}`).join('\n');
-        throw new Error(
-            `Ambiguous alias prefix '#${normalized}' (${matches.length} matches):\n${lines}\n`
-            + 'Retry with a longer prefix or \\alias <scope> <name> #...',
-        );
+    const deduped = dedupeByScope(matches);
+    if (deduped.length === 0) throw new Error(`Unknown hash prefix '#${normalized}'`);
+    if (deduped.length === 1) return deduped;
+
+    const uniqueHashes = new Set(deduped.map((m) => m.hash));
+    if (uniqueHashes.size === 1) return deduped;
+
+    const lines = deduped.map((m) => `  ${m.scope.padEnd(7)} => ${m.hash}`).join('\n');
+    throw new Error(
+        `Ambiguous alias prefix '#${normalized}' (${deduped.length} matches):\n${lines}\n`
+        + 'Retry with a longer prefix or \\alias <scope> <name> #...',
+    );
+}
+
+function dedupeByScope(matches: AliasTarget[]): AliasTarget[] {
+    const seen = new Set<AliasScope>();
+    const out: AliasTarget[] = [];
+    for (const m of matches) {
+        if (seen.has(m.scope)) continue;
+        seen.add(m.scope);
+        out.push(m);
     }
-    return matches[0];
+    return out;
 }
 
 async function candidatesForScope(scope: AliasScope, session: WorkspaceSession): Promise<B64Hash[]> {
@@ -103,25 +117,44 @@ export async function collectVersionOpHashes(roots: RootIndex): Promise<B64Hash[
     return hashes;
 }
 
-export function aliasLabel(scope: AliasScope, hash: B64Hash, session: WorkspaceSession): string | undefined {
+export async function aliasLabel(
+    scope: AliasScope,
+    hash: B64Hash,
+    session: WorkspaceSession,
+): Promise<string | undefined> {
     if (scope === 'key') {
         return session.keystore?.list().find((k) => k.keyId === hash)?.label;
     }
-    if (scope === 'version') return undefined;
+    if (scope === 'version') return rootNameForVersionHash(hash, session.workspace.roots);
     return session.workspace.roots.get(hash)?.name;
 }
 
-export function formatAliasResult(scope: AliasScope, name: string, hash: B64Hash, session: WorkspaceSession): string {
-    const label = aliasLabel(scope, hash, session);
+export async function rootNameForVersionHash(hash: B64Hash, roots: RootIndex): Promise<string | undefined> {
+    for (const root of roots.list()) {
+        if (root.object === undefined) continue;
+        const dag = await root.object.getScopedDag();
+        if (await dag.loadEntry(hash) !== undefined) return root.name;
+    }
+    return undefined;
+}
+
+export async function formatAliasResult(
+    scope: AliasScope,
+    name: string,
+    hash: B64Hash,
+    session: WorkspaceSession,
+): Promise<string> {
+    const label = await aliasLabel(scope, hash, session);
     const suffix = label === undefined ? '' : ` (${label})`;
     return `${scope} ${name} => ${hash}${suffix}`;
 }
 
-export function formatAliasListing(session: WorkspaceSession, scope?: AliasScope): string {
-    return formatRows(session.aliases.list(scope).map((entry) => ({
+export async function formatAliasListing(session: WorkspaceSession, scope?: AliasScope): Promise<string> {
+    const rows = await Promise.all(session.aliases.list(scope).map(async (entry) => ({
         scope: entry.scope,
         name: entry.name,
         hash: entry.hash,
-        label: aliasLabel(entry.scope, entry.hash, session) ?? '',
+        label: (await aliasLabel(entry.scope, entry.hash, session)) ?? '',
     })));
+    return formatRows(rows);
 }

@@ -1,4 +1,4 @@
-import { dumpDatabase, dumpGroup, dumpSchema } from "@hyper-hyper-space/hhs3_rdb_lang";
+import { dumpDatabase, dumpGroup, dumpSchema, findLangCommandRefs, LANG_COMMAND_SECTIONS, type LangCommandRef } from "@hyper-hyper-space/hhs3_rdb_lang";
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { RObject } from "@hyper-hyper-space/hhs3_mvt";
 import type { RSchema, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
@@ -27,7 +27,7 @@ export async function runMetaCommand(session: WorkspaceSession, line: string): P
     const [command, ...args] = normalized.slice(1).split(/\s+/);
 
     switch (command) {
-        case 'help': return { handled: true, output: helpText() };
+        case 'help': return { handled: true, output: helpCommand(args) };
         case 'q':
         case 'quit': return { handled: true, quit: true };
         case 'dbs': return { handled: true, output: formatRoots(session, 'database') };
@@ -43,7 +43,7 @@ export async function runMetaCommand(session: WorkspaceSession, line: string): P
         case 'view': return { handled: true, output: session.defaultView === undefined ? 'VIEW LATEST' : formatView(session) };
         case 'frontier': return { handled: true, output: await frontier(session, args[0]) };
         case 'alias': return { handled: true, output: await alias(session, args) };
-        case 'aliases': return { handled: true, output: aliases(session, args[0]) };
+        case 'aliases': return { handled: true, output: await aliases(session, args[0]) };
         case 'unalias': return { handled: true, output: unalias(session, args) };
         case 'output': return { handled: true, output: setOutput(session, args[0]) };
         case 'dump': return { handled: true, output: await dump(session, args) };
@@ -183,16 +183,17 @@ async function alias(session: WorkspaceSession, args: string[]): Promise<string>
     if (name === undefined || target === undefined) throw new Error('Usage: \\alias [scope] <name> <#prefix>');
     if (!target.startsWith('#')) throw new Error('Alias target must be a #prefix');
     const resolved = await resolveAliasTarget(scope, target.slice(1), session);
-    session.aliases.set(resolved.scope, name, resolved.hash);
-    return formatAliasResult(resolved.scope, name, resolved.hash, session);
+    for (const r of resolved) session.aliases.set(r.scope, name, r.hash);
+    const lines = await Promise.all(resolved.map((r) => formatAliasResult(r.scope, name, r.hash, session)));
+    return lines.join('\n');
 }
 
-function aliases(session: WorkspaceSession, scopeArg: string | undefined): string {
+async function aliases(session: WorkspaceSession, scopeArg: string | undefined): Promise<string> {
     const scope = scopeArg !== undefined && scopeArg !== '' && isAliasScope(scopeArg) ? scopeArg : undefined;
     if (scopeArg !== undefined && scopeArg !== '' && scope === undefined) {
         throw new Error(`Unknown alias scope '${scopeArg}'`);
     }
-    const rows = formatAliasListing(session, scope);
+    const rows = await formatAliasListing(session, scope);
     return rows === '' ? '(no aliases)' : rows;
 }
 
@@ -267,6 +268,44 @@ function ref(text: string) {
     return { kind: 'name' as const, text, parts: text.split('.'), span: { start: 0, end: text.length, line: 1, column: 1 } };
 }
 
+function helpCommand(args: string[]): string {
+    const topic = args[0];
+    if (topic === 'commands' || topic === 'command') {
+        const filter = args.slice(1).join(' ').trim();
+        return formatLangHelp(filter === '' ? undefined : filter);
+    }
+    return helpText();
+}
+
+function formatLangHelp(filter?: string): string {
+    const refs = findLangCommandRefs(filter);
+    if (refs.length === 0) {
+        return filter === undefined ? '(no language commands)' : `No language commands match '${filter}'`;
+    }
+    const showSections = refs.length > 1;
+    const lines: string[] = [];
+    for (const section of LANG_COMMAND_SECTIONS) {
+        const sectionRefs = refs.filter((ref) => ref.section === section);
+        if (sectionRefs.length === 0) continue;
+        if (showSections) lines.push(`--- ${section} ---`);
+        for (const ref of sectionRefs) {
+            lines.push(...formatLangCommandEntry(ref));
+            lines.push('');
+        }
+    }
+    if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+    return lines.join('\n');
+}
+
+function formatLangCommandEntry(ref: LangCommandRef): string[] {
+    const syntaxLines = ref.syntax.split('\n');
+    return [
+        ref.command,
+        ...syntaxLines.map((line) => `  ${line}`),
+        `  ${ref.description}`,
+    ];
+}
+
 function helpText(): string {
     return [
         '\\dbs, \\schemas, \\groups, \\dt [group], \\d group.table',
@@ -275,5 +314,6 @@ function helpText(): string {
         '\\use database <name>, \\use group <name>, \\view, \\frontier [group]',
         '\\alias [scope] <name> <#prefix>, \\aliases [scope], \\unalias <scope> <name>, \\output table|json|vertical, \\dump schema|group|database <name> [full|schema]',
         '\\quit',
+        '\\help commands [filter]',
     ].join('\n');
 }
