@@ -54,7 +54,7 @@ export interface LangBindContext {
     resolveDatabase(ref: NameOrHashRef): Promise<ResolvedDatabaseRef>;
     resolveTable(ref: TableRef): Promise<ResolvedTableRef>;
     resolveDefaultGroup?(): Promise<NameOrHashRef | undefined>;
-    resolveHash(ref: NameOrHashRef, scope: HashScope): Promise<B64Hash>;
+    resolveHash(ref: HashRef, scope: HashScope): Promise<B64Hash>;
     resolveRowId?(ref: HashRef, table: ResolvedTableRef, at: Version, from?: Version): Promise<B64Hash>;
     resolveFkRowId?(
         prefix: string,

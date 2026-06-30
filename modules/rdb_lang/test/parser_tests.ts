@@ -81,6 +81,22 @@ export const parserTests = {
             },
         },
         {
+            name: '[PARSE04b] parses version set with bare name aliases',
+            invoke: async () => {
+                const result = parseStatement('SET VIEW AT {cut, #abc};');
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok) return;
+                assertEquals(result.value.kind, 'set-view', 'statement kind');
+                if (result.value.kind !== 'set-view') return;
+                assertEquals(result.value.at.kind, 'set', 'AT version set');
+                if (result.value.at.kind !== 'set') return;
+                assertEquals(result.value.at.members.length, 2, 'two version members');
+                assertEquals(result.value.at.members[0].kind, 'name', 'first member is bare name');
+                if (result.value.at.members[0].kind === 'name') assertEquals(result.value.at.members[0].text, 'cut', 'cut alias name');
+                assertEquals(result.value.at.members[1].kind, 'hash', 'second member is hash');
+            },
+        },
+        {
             name: '[PARSE05] parses unqualified table references',
             invoke: async () => {
                 const select = parseStatement('SELECT * FROM products;');

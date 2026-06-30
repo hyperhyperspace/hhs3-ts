@@ -193,8 +193,9 @@ CREATE TABLEGROUP users
 `LangBindContext` supplies all host-owned behavior:
 
 - workspace name resolution for schemas, groups, tables, and log targets,
-- hash-prefix and version resolution,
-- session variables such as `$me`, `$admin`, and `$author`,
+- hash-prefix and version resolution (`#prefix` in `AT {…}`; bare names in `AT {…}` resolve via session version aliases),
+- session scoped aliases (`key`, `schema`, `group`, `db`, `version`) via the REPL `\\alias` command; `$name` for identities only,
+- session variables such as `$me`, `$admin`, and `$author` (identity scope: alias then keystore label),
 - keystore public-key lookup for `CREATORS (#prefix)` and key-id literals (`resolvePublicKey`),
 - default author identity (`currentAuthor`),
 - explicit `BY` author resolution to an unlocked signing identity (`resolveAuthor`),

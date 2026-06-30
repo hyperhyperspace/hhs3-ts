@@ -4,7 +4,15 @@ import type { RObject } from "@hyper-hyper-space/hhs3_mvt";
 import type { RSchema, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 
 import { formatRows } from "../format/table.js";
+import {
+    formatAliasListing,
+    formatAliasResult,
+    isAliasScope,
+    resolveAliasTarget,
+    type AliasScope,
+} from "../session/aliases.js";
 import { WorkspaceSession } from "../session/session.js";
+import type { RootResolveContext } from "../workspace/root_index.js";
 
 export type MetaCommandResult = {
     handled: boolean;
@@ -35,6 +43,8 @@ export async function runMetaCommand(session: WorkspaceSession, line: string): P
         case 'view': return { handled: true, output: session.defaultView === undefined ? 'VIEW LATEST' : formatView(session) };
         case 'frontier': return { handled: true, output: await frontier(session, args[0]) };
         case 'alias': return { handled: true, output: await alias(session, args) };
+        case 'aliases': return { handled: true, output: aliases(session, args[0]) };
+        case 'unalias': return { handled: true, output: unalias(session, args) };
         case 'output': return { handled: true, output: setOutput(session, args[0]) };
         case 'dump': return { handled: true, output: await dump(session, args) };
         default: return { handled: true, output: `Unknown meta-command \\${command}` };
@@ -49,8 +59,12 @@ function formatRoots(session: WorkspaceSession, kind: 'database' | 'schema' | 'g
     })));
 }
 
+function rootCtx(session: WorkspaceSession): RootResolveContext {
+    return { aliases: session.aliases };
+}
+
 async function listTables(session: WorkspaceSession, groupName?: string): Promise<string> {
-    const group = await session.workspace.roots.resolveGroup(ref(groupName ?? session.currentGroup ?? ''));
+    const group = await session.workspace.roots.resolveGroup(ref(groupName ?? session.currentGroup ?? ''), rootCtx(session));
     if (group.group === undefined) throw new Error('Group is not loaded');
     const schema = (await group.group.getView()).getSchemaView();
     return formatRows(schema.getTableNames().map((table) => ({ table })));
@@ -62,7 +76,7 @@ async function describeTable(session: WorkspaceSession, tableRef: string | undef
     const groupName = parts.length > 1 ? parts[0] : session.currentGroup;
     const tableName = parts.length > 1 ? parts.slice(1).join('.') : parts[0];
     if (groupName === undefined) throw new Error('No current group; use \\d group.table');
-    const group = await session.workspace.roots.resolveGroup(ref(groupName));
+    const group = await session.workspace.roots.resolveGroup(ref(groupName), rootCtx(session));
     if (group.group === undefined) throw new Error('Group is not loaded');
     const schema = (await group.group.getView()).getSchemaView();
     const table = schema.getTable(tableName);
@@ -100,7 +114,7 @@ async function keyCommand(session: WorkspaceSession, args: string[]): Promise<Ke
     }
     if (sub === 'unlock') {
         if (label === undefined) throw new Error('Usage: \\key unlock <label|#prefix>');
-        const record = session.keystore.resolveRecord(label);
+        const record = session.keystore.resolveRecord(session.resolveKeyRef(label));
         if (passphrase === undefined) return { needsPassphrase: { kind: 'unlock', label: record.label } };
         const identity = await session.unlockKey(label, passphrase);
         return { output: `unlocked ${identity.keyId}` };
@@ -140,12 +154,12 @@ function labelFor(session: WorkspaceSession, keyId: string): string {
 async function useCommand(session: WorkspaceSession, args: string[]): Promise<string> {
     const [kind, name] = args;
     if (kind === 'database') {
-        const db = await session.workspace.roots.resolveDatabase(ref(name));
+        const db = await session.workspace.roots.resolveDatabase(ref(name), rootCtx(session));
         session.setCurrentDatabase(db.id);
         return `using database ${db.id}`;
     }
     if (kind === 'group') {
-        const group = await session.workspace.roots.resolveGroup(ref(name));
+        const group = await session.workspace.roots.resolveGroup(ref(name), rootCtx(session));
         session.setCurrentGroup(group.id);
         return `using group ${group.id}`;
     }
@@ -153,17 +167,42 @@ async function useCommand(session: WorkspaceSession, args: string[]): Promise<st
 }
 
 async function frontier(session: WorkspaceSession, groupName?: string): Promise<string> {
-    const group = await session.workspace.roots.resolveGroup(ref(groupName ?? session.currentGroup ?? ''));
+    const group = await session.workspace.roots.resolveGroup(ref(groupName ?? session.currentGroup ?? ''), rootCtx(session));
     if (group.group === undefined) throw new Error('Group is not loaded');
     return `{${[...(await (await group.group.getScopedDag()).getFrontier())].map((h) => `#${h}`).join(', ')}}`;
 }
 
 async function alias(session: WorkspaceSession, args: string[]): Promise<string> {
-    const [name, target] = args;
-    if (name === undefined || target === undefined) throw new Error('Usage: \\alias <name> <root|#prefix>');
-    const id = await session.workspace.roots.resolveHash(ref(target), { kind: 'global' });
-    await session.workspace.setAlias(name, id);
-    return `${name} => ${id}`;
+    let scope: AliasScope | 'auto' = 'auto';
+    let rest = args;
+    if (args[0] !== undefined && isAliasScope(args[0])) {
+        scope = args[0];
+        rest = args.slice(1);
+    }
+    const [name, target] = rest;
+    if (name === undefined || target === undefined) throw new Error('Usage: \\alias [scope] <name> <#prefix>');
+    if (!target.startsWith('#')) throw new Error('Alias target must be a #prefix');
+    const resolved = await resolveAliasTarget(scope, target.slice(1), session);
+    session.aliases.set(resolved.scope, name, resolved.hash);
+    return formatAliasResult(resolved.scope, name, resolved.hash, session);
+}
+
+function aliases(session: WorkspaceSession, scopeArg: string | undefined): string {
+    const scope = scopeArg !== undefined && scopeArg !== '' && isAliasScope(scopeArg) ? scopeArg : undefined;
+    if (scopeArg !== undefined && scopeArg !== '' && scope === undefined) {
+        throw new Error(`Unknown alias scope '${scopeArg}'`);
+    }
+    const rows = formatAliasListing(session, scope);
+    return rows === '' ? '(no aliases)' : rows;
+}
+
+function unalias(session: WorkspaceSession, args: string[]): string {
+    const [scopeArg, name] = args;
+    if (scopeArg === undefined || name === undefined || !isAliasScope(scopeArg)) {
+        throw new Error('Usage: \\unalias <scope> <name>');
+    }
+    if (!session.aliases.delete(scopeArg, name)) throw new Error(`No alias '${name}' in scope '${scopeArg}'`);
+    return `removed ${scopeArg} ${name}`;
 }
 
 function setOutput(session: WorkspaceSession, mode: string | undefined): string {
@@ -175,12 +214,12 @@ function setOutput(session: WorkspaceSession, mode: string | undefined): string 
 async function dump(session: WorkspaceSession, args: string[]): Promise<string> {
     const [kind, name] = args;
     if (kind === 'schema') {
-        const schema = await session.workspace.roots.resolveSchema(ref(name));
+        const schema = await session.workspace.roots.resolveSchema(ref(name), rootCtx(session));
         if (schema.schema === undefined) throw new Error('Schema is not loaded');
         return dumpSchema(schema.schema as Parameters<typeof dumpSchema>[0]);
     }
     if (kind === 'group') {
-        const group = await session.workspace.roots.resolveGroup(ref(name));
+        const group = await session.workspace.roots.resolveGroup(ref(name), rootCtx(session));
         if (group.group === undefined) throw new Error('Group is not loaded');
         return dumpGroup(group.group as Parameters<typeof dumpGroup>[0]);
     }
@@ -189,7 +228,7 @@ async function dump(session: WorkspaceSession, args: string[]): Promise<string> 
         if (dbName === undefined) throw new Error('Usage: \\dump database <name> [full|schema]');
         const modeArg = args[2];
         const mode = modeArg === 'schema' ? 'schema' : 'full';
-        const db = await session.workspace.roots.resolveDatabase(ref(dbName));
+        const db = await session.workspace.roots.resolveDatabase(ref(dbName), rootCtx(session));
         if (db.db === undefined) throw new Error('Database is not loaded');
         return dumpDatabase(db.db as Parameters<typeof dumpDatabase>[0], {
             mode,
@@ -234,7 +273,7 @@ function helpText(): string {
         '\\key create <label> [passphrase], \\key unlock <label|#prefix> [passphrase], \\keys, \\whoami',
         '\\author [<label|#prefix> [passphrase]|nobody]  (set/show default author; unlocks if needed; \\author nobody clears it)',
         '\\use database <name>, \\use group <name>, \\view, \\frontier [group]',
-        '\\alias <name> <root|#prefix>, \\output table|json|vertical, \\dump schema|group|database <name> [full|schema]',
+        '\\alias [scope] <name> <#prefix>, \\aliases [scope], \\unalias <scope> <name>, \\output table|json|vertical, \\dump schema|group|database <name> [full|schema]',
         '\\quit',
     ].join('\n');
 }

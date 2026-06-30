@@ -12,11 +12,13 @@ import {
     parseScript,
     ResolvedTableRef,
     VersionExpr,
+    VersionMember,
     VersionScope,
 } from "@hyper-hyper-space/hhs3_rdb_lang";
 
 import { KeyPassphraseRequiredError } from "./session.js";
 import { WorkspaceSession } from "./session.js";
+import type { RootResolveContext } from "../workspace/root_index.js";
 
 export type StatementRunResult = {
     result: LangExecutionResult;
@@ -26,12 +28,17 @@ export type ScriptRunResult = {
     results: StatementRunResult[];
 };
 
+function rootCtx(session: WorkspaceSession): RootResolveContext {
+    return { aliases: session.aliases };
+}
+
 export function createBindContext(session: WorkspaceSession): LangBindContext {
+    const ctx = rootCtx(session);
     return {
-        resolveSchema: (ref) => session.workspace.roots.resolveSchema(ref),
-        resolveGroup: (ref) => session.workspace.roots.resolveGroup(ref),
-        resolveDatabase: (ref) => session.workspace.roots.resolveDatabase(ref),
-        resolveTable: (ref) => session.workspace.roots.resolveTable(ref),
+        resolveSchema: (ref) => session.workspace.roots.resolveSchema(ref, ctx),
+        resolveGroup: (ref) => session.workspace.roots.resolveGroup(ref, ctx),
+        resolveDatabase: (ref) => session.workspace.roots.resolveDatabase(ref, ctx),
+        resolveTable: (ref) => session.workspace.roots.resolveTable(ref, ctx),
         resolveDefaultGroup: async () => session.currentGroup === undefined
             ? undefined
             : {
@@ -47,7 +54,7 @@ export function createBindContext(session: WorkspaceSession): LangBindContext {
         resolveDefaultView: async () => session.defaultView,
         resolveVariable: (name) => session.resolveVariable(name),
         resolvePublicKey: (labelOrPrefix) => session.resolvePublicKey(labelOrPrefix),
-        resolveLogTarget: (ref) => session.workspace.roots.resolveLogTarget(ref),
+        resolveLogTarget: (ref) => session.workspace.roots.resolveLogTarget(ref, ctx),
         currentAuthor: () => session.currentAuthor(),
         resolveAuthor: (ref) => session.resolveAuthor(ref),
         createUuid: () => session.createUuid(),
@@ -123,8 +130,31 @@ async function resolveVersionExpr(session: WorkspaceSession, expr: VersionExpr |
     }
 
     const hashes: B64Hash[] = [];
-    for (const hash of expr.hashes) hashes.push(await session.workspace.roots.resolveHash(hash, hashScope));
+    for (const member of expr.members) {
+        hashes.push(await resolveVersionMember(session, member, hashScope));
+    }
     return version(...hashes);
+}
+
+async function resolveVersionMember(
+    session: WorkspaceSession,
+    member: VersionMember,
+    hashScope: HashScope,
+): Promise<B64Hash> {
+    if (member.kind === 'hash') {
+        return session.workspace.roots.resolveHash(member, hashScope);
+    }
+    const hash = session.aliases.get('version', member.text);
+    if (hash === undefined) throw new Error(`Unknown version alias '${member.text}'`);
+    await assertHashInScopedDag(session, hash, hashScope);
+    return hash;
+}
+
+async function assertHashInScopedDag(session: WorkspaceSession, hash: B64Hash, hashScope: HashScope): Promise<void> {
+    const candidates = await session.workspace.roots.hashCandidates(hashScope);
+    if (!candidates.includes(hash)) {
+        throw new Error(`Version alias hash '${hash}' is not in this object's history`);
+    }
 }
 
 async function frontierForScope(scope: VersionScope): Promise<Version> {

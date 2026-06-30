@@ -7,7 +7,7 @@ import {
     CreateTableGroupStatement, DeleteStatement, HashRef, InitialRow,
     InsertStatement, LogStatement, MigrationRuleExpr, NameOrHashRef, NameRef, OperandExpr,
     PredicateExpr, SelectStatement, SetViewStatement, TableDecl, TableOption, TableRef, UpdateRefStatement,
-    UpdateSchemaStatement, UpdateStatement, ValueExpr, VersionExpr,
+    UpdateSchemaStatement, UpdateStatement, ValueExpr, VersionExpr, VersionMember,
 } from "./ast.js";
 import { lex } from "./lexer.js";
 import { Token } from "./tokens.js";
@@ -978,14 +978,20 @@ class Parser {
             return { kind: 'hash', hash, span: hash.span };
         }
         const start = this.expectPunctuation('{').span;
-        const hashes: HashRef[] = [];
+        const members: VersionMember[] = [];
         if (!this.checkPunctuation('}')) {
             do {
-                hashes.push(this.parseHashRef());
+                members.push(this.parseVersionMember());
             } while (this.matchPunctuation(','));
         }
         const end = this.expectPunctuation('}').span;
-        return { kind: 'set', hashes, span: combineSpans(start, end) };
+        return { kind: 'set', members, span: combineSpans(start, end) };
+    }
+
+    private parseVersionMember(): VersionMember {
+        if (this.checkKind('hash')) return this.parseHashRef();
+        const tok = this.expectIdentifierToken('version member');
+        return this.nameRef(tok.text, tok.span);
     }
 
     private parseRowIdPredicate(): NameOrHashRef | ValueExpr {

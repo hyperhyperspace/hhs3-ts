@@ -54,11 +54,6 @@ export class Workspace {
         await this.replica.destroy();
         this.backend.close();
     }
-
-    // Session-only nickname; not persisted (root names come from payloads on rehydrate).
-    async setAlias(name: string, id: B64Hash): Promise<void> {
-        this.roots.setAlias(name, id);
-    }
 }
 
 function registerTypes(replica: Replica): void {

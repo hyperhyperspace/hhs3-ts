@@ -39,10 +39,12 @@ export type HashRef = {
 
 export type NameOrHashRef = NameRef | HashRef;
 
+export type VersionMember = HashRef | NameRef;
+
 export type VersionExpr =
     | { kind: 'latest'; span: TextSpan }
     | { kind: 'hash'; hash: HashRef; span: TextSpan }
-    | { kind: 'set'; hashes: HashRef[]; span: TextSpan };
+    | { kind: 'set'; members: VersionMember[]; span: TextSpan };
 
 // The author of an authored statement, written with a trailing `BY` clause.
 // `$name` / `#prefix` name an unlocked identity to sign as; `NOBODY` forces an

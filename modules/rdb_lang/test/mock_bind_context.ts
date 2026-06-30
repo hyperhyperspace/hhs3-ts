@@ -9,7 +9,7 @@ import type {
     HashScope, LangBindContext, LangValue, ResolvedDatabaseRef, ResolvedGroupRef, ResolvedLogTarget,
     ResolvedSchemaRef, ResolvedTableRef, VersionScope,
 } from "../src/bind/context.js";
-import type { NameOrHashRef, TableRef, VersionExpr } from "../src/syntax/ast.js";
+import type { HashRef, NameOrHashRef, TableRef, VersionExpr } from "../src/syntax/ast.js";
 
 type ScopedObject = RObject & { getScopedDag(): Promise<{ getFrontier(): Promise<Version> }> };
 
@@ -69,8 +69,7 @@ export function createTestBindContext(_ctx: RContext, vars: { [name: string]: La
             return { groupId: group.getId(), group, tableName: ref.table, table };
         },
 
-        async resolveHash(ref: NameOrHashRef, _scope: HashScope): Promise<B64Hash> {
-            if (ref.kind === 'name') return ref.text;
+        async resolveHash(ref: HashRef, _scope: HashScope): Promise<B64Hash> {
             return resolveHashPrefix(ref.prefix, ids());
         },
 
@@ -107,7 +106,11 @@ export function createTestBindContext(_ctx: RContext, vars: { [name: string]: La
         },
 
         async resolveVersion(expr: VersionExpr | undefined, scope: VersionScope): Promise<Version> {
-            if (expr?.kind === 'set') return version(...expr.hashes.map((h) => resolveHashPrefix(h.prefix, ids())));
+            if (expr?.kind === 'set') {
+                return version(...expr.members.map((m) => m.kind === 'hash'
+                    ? resolveHashPrefix(m.prefix, ids())
+                    : (() => { throw new Error(`Unknown version alias '${m.text}'`); })()));
+            }
             if (expr?.kind === 'hash') return version(resolveHashPrefix(expr.hash.prefix, ids()));
             const obj = objectForVersion(scope);
             return obj === undefined ? version() : await (await obj.getScopedDag()).getFrontier();

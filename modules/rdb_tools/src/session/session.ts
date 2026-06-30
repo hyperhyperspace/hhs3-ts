@@ -5,6 +5,7 @@ import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import type { AuthorRef, LangValue } from "@hyper-hyper-space/hhs3_rdb_lang";
 
 import { KeyStore } from "../keys/keystore.js";
+import { AliasTable } from "./aliases.js";
 import { Workspace } from "../workspace/workspace.js";
 
 export type OutputMode = 'table' | 'json' | 'vertical';
@@ -30,6 +31,7 @@ export class KeyPassphraseRequiredError extends Error {
 export class WorkspaceSession {
     readonly workspace: Workspace;
     readonly variables = new Map<string, LangValue>();
+    readonly aliases = new AliasTable();
 
     // Session state: which keys have been unlocked this session and which one is
     // the current default author. The keystore is a pure on-disk vault and owns
@@ -62,7 +64,7 @@ export class WorkspaceSession {
     // Decrypt a stored key and add it to the unlocked set for this session.
     async unlockKey(labelOrPrefix: string, passphrase: string): Promise<OwnIdentity> {
         if (this.keystore === undefined) throw new Error('No keystore configured');
-        const identity = await this.keystore.unlock(labelOrPrefix, passphrase);
+        const identity = await this.keystore.unlock(this.resolveKeyRef(labelOrPrefix), passphrase);
         this.unlocked.set(identity.keyId, identity);
         return identity;
     }
@@ -70,7 +72,7 @@ export class WorkspaceSession {
     // Set the default author. The key must already be unlocked this session.
     selectAuthor(labelOrPrefix: string): OwnIdentity {
         if (this.keystore === undefined) throw new Error('No keystore configured');
-        const record = this.keystore.resolveRecord(labelOrPrefix);
+        const record = this.keystore.resolveRecord(this.resolveKeyRef(labelOrPrefix));
         const identity = this.unlocked.get(record.keyId);
         if (identity === undefined) throw new Error(`Key '${record.label}' is locked`);
         this.currentAuthorKeyId = identity.keyId;
@@ -125,12 +127,14 @@ export class WorkspaceSession {
     // is known but still locked. Throws on an unknown/ambiguous reference.
     resolveIdentity(labelOrPrefix: string): OwnIdentity | undefined {
         if (this.keystore === undefined) throw new Error('No keystore configured');
-        const record = this.keystore.resolveRecord(labelOrPrefix);
+        const record = this.keystore.resolveRecord(this.resolveKeyRef(labelOrPrefix));
         return this.unlocked.get(record.keyId);
     }
 
     async resolveAuthor(ref: AuthorRef): Promise<OwnIdentity> {
-        const labelOrPrefix = ref.kind === 'variable' ? ref.name : `#${ref.prefix}`;
+        const labelOrPrefix = ref.kind === 'variable'
+            ? this.resolveKeyRef(ref.name)
+            : `#${ref.prefix}`;
         const identity = this.resolveIdentity(labelOrPrefix);
         if (identity !== undefined) return identity;
         const record = this.keystore!.resolveRecord(labelOrPrefix);
@@ -146,6 +150,13 @@ export class WorkspaceSession {
         const explicit = this.variables.get(name);
         if (explicit !== undefined) return explicit;
 
+        const keyAlias = this.aliases.get('key', name);
+        if (keyAlias !== undefined) {
+            if (this.keystore === undefined) throw new Error('No keystore configured');
+            const record = this.keystore.resolvePublic(keyAlias);
+            return { keyId: record.keyId, publicKey: record.publicKey };
+        }
+
         if (this.keystore !== undefined) {
             try {
                 const publicKey = this.keystore.resolvePublic(name);
@@ -160,8 +171,15 @@ export class WorkspaceSession {
 
     async resolvePublicKey(labelOrPrefix: string): Promise<{ keyId: KeyId; publicKey: PublicKey }> {
         if (this.keystore === undefined) throw new Error('No keystore configured');
-        const record = this.keystore.resolvePublic(labelOrPrefix);
+        const record = this.keystore.resolvePublic(this.resolveKeyRef(labelOrPrefix));
         return { keyId: record.keyId, publicKey: record.publicKey };
+    }
+
+    /** Resolve a key reference: key-scoped alias first, then label / #prefix via keystore. */
+    resolveKeyRef(labelOrPrefix: string): string {
+        if (labelOrPrefix.startsWith('#')) return labelOrPrefix;
+        const aliased = this.aliases.get('key', labelOrPrefix);
+        return aliased ?? labelOrPrefix;
     }
 
     createUuid(): string {

@@ -107,7 +107,9 @@ async function expectScriptFailure(nameOrSql: string, env: ScriptEnv, isFile: bo
 }
 
 async function resolveVersionExpr(expr: VersionExpr | undefined, scope: VersionScope): Promise<Version> {
-    if (expr?.kind === 'set') return version(...expr.hashes.map((h) => h.prefix));
+    if (expr?.kind === 'set') {
+        return version(...expr.members.map((m) => m.kind === 'hash' ? m.prefix : m.text));
+    }
     if (expr?.kind === 'hash') return version(expr.hash.prefix);
     return frontierForScope(scope);
 }

@@ -91,8 +91,11 @@ const tests = [
                 const result = await runScript(session, setupScript());
                 assertEquals(result.exitCode, 0, result.output);
                 const group = session.workspace.roots.list('group')[0];
-                const alias = await runMetaCommand(session, `\\alias prod #${group.id.slice(0, 10)}`);
-                assertTrue(alias.output?.includes('prod') === true, 'alias output');
+                const alias = await runMetaCommand(session, `\\alias group prod #${group.id.slice(0, 10)}`);
+                assertTrue(alias.output?.includes('group prod =>') === true, 'alias output format');
+                assertTrue(alias.output?.includes(group.id) === true, 'alias output includes full hash');
+                assertTrue(alias.output?.includes('(shop_prod)') === true, 'alias output includes payload label');
+                assertEquals(session.aliases.get('group', 'prod'), group.id, 'alias stores full group id');
                 const use = await runMetaCommand(session, '\\use group prod');
                 assertTrue(use.output?.includes('using group') === true, 'use output');
                 const useWithSemicolon = await runMetaCommand(session, '\\use group prod;');
@@ -295,7 +298,7 @@ const tests = [
                 assertEquals(promptForSession(session), 'rdb:shop_prod:alice> ', 'prompt uses friendly names');
 
                 const group = session.workspace.roots.list('group')[0];
-                await runMetaCommand(session, `\\alias prod #${group.id.slice(0, 10)}`);
+                await runMetaCommand(session, `\\alias group prod #${group.id.slice(0, 10)}`);
                 await runMetaCommand(session, '\\use group prod');
                 assertEquals(promptForSession(session), 'rdb:shop_prod:alice> ', 'prompt uses canonical group name via alias');
             });
@@ -441,6 +444,42 @@ const tests = [
                 assertEquals(missing.exitCode, 1, 'locked BY author fails non-interactively');
                 assertTrue(missing.output.includes('passphrase required'), 'non-interactive signed insert requests passphrase');
                 assertTrue(!reopened.isUnlocked(alice.keyId), 'failed unlock leaves key locked');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS14] scoped aliases resolve keys and versions',
+        invoke: async () => {
+            await withSession(async (session, dbPath) => {
+                const setup = await runScript(session, setupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                const alice = session.keystore!.list().find((k) => k.label === 'alice')!;
+                await runMetaCommand(session, `\\alias key signer #${alice.keyId.slice(0, 10)}`);
+                assertTrue(session.aliases.get('key', 'signer') === alice.keyId, 'key alias stored');
+
+                const author = await runMetaCommand(session, '\\author signer');
+                assertTrue(author.output?.includes('author alice') === true, 'author via key alias');
+
+                const group = session.workspace.roots.list('group')[0];
+                const dag = await group.object!.getScopedDag();
+                const opHashes: string[] = [];
+                for await (const entry of dag.loadAllEntries()) opHashes.push(entry.hash);
+                assertTrue(opHashes.length > 0, 'group has op hashes');
+                const cutHash = opHashes[opHashes.length - 1];
+                await runMetaCommand(session, `\\alias version cut #${cutHash.slice(0, 10)}`);
+
+                const view = await runCommand(session, 'SET VIEW AT {cut};');
+                assertEquals(view.exitCode, 0, view.output);
+
+                const overwrite = await runMetaCommand(session, `\\alias group prod #${group.id.slice(0, 10)}`);
+                assertTrue(overwrite.output?.includes('group prod =>') === true, 're-alias overwrites');
+                await runMetaCommand(session, '\\unalias group prod');
+
+                const freshSession = new WorkspaceSession({ workspace: session.workspace, keystore: session.keystore });
+                assertEquals(freshSession.aliases.get('group', 'prod'), undefined, 'aliases session-only');
+                const keys = await runMetaCommand(freshSession, '\\keys');
+                assertTrue(keys.output?.includes('alice') === true, 'keystore label persists');
             });
         },
     },
