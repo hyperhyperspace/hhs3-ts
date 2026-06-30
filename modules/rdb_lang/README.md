@@ -1,6 +1,6 @@
-# hhs3_rdb_lang
+# hhs3_rdb_lang — C-SQL (causal SQL)
 
-`hhs3_rdb_lang` is the reusable SQL-like language layer for RDb. It parses command text, binds names and session values through caller-provided resolvers, compiles creation statements into RDb create payloads, executes local DDL/DML/query/history statements against already-resolved RDb objects, and renders known RDb payloads back to SQL-like text.
+`hhs3_rdb_lang` implements **C-SQL** (*causal SQL*): a reusable language for RDb. It parses C-SQL command text, binds names and session values through caller-provided resolvers, compiles creation statements into RDb create payloads, executes local DDL/DML/query/history statements against already-resolved RDb objects, and renders known RDb payloads back to C-SQL text.
 
 It does not own persistence, SQLite files, workspace root-name metadata, key storage, sync, mesh, a REPL, terminal formatting, or CLI behavior.
 
@@ -211,7 +211,7 @@ INSERT INTO products (uuid, sku, name) VALUES ('fixed-row-uuid', 'A', 'Widget');
 
 The `uuid` identifier is a reserved pseudo-column on `INSERT` and in `WITH ROWS` (not a schema column). When omitted, the host generates fresh seeds/uuids.
 
-The language layer validates and applies language semantics, but it does not persist workspace metadata or manage keys.
+The C-SQL layer validates and applies language semantics, but it does not persist workspace metadata or manage keys.
 
 ## Reverse Rendering
 
@@ -245,8 +245,10 @@ Modes:
 - **`full` (default, clone):** includes `SEED`, `uuid` pseudo-column, and `#hash` refs for replay with stable ids. Group-scoped ops (`UPDATE REF`, `UPDATE SCHEMA`, `BUNDLE`) render `ON #groupId` / `BUNDLE ON #groupId`.
 - **`schema` (bootstrap):** omits `SEED`/`uuid`; uses names for `ADD`/`BIND`; group section is genesis + `WITH ROWS` only (no row/ref ops). Membership ops (`ADD SCHEMA`, `ADD TABLEGROUP`) omit causal `AT` because the database seed is not fixed; replay appends at the db frontier. Schema migrations and group genesis schema-version pins are unchanged.
 
+**`aliasMode` (opt-in via `RenderOptions`, enabled by `rdb_tools` `\\dump`):** emits `\alias` preamble lines (always with the full hash as target) immediately before the first statement that needs each alias, then renders readable names instead of raw hashes in `BY` (`BY $name`), `CREATORS ($name, ...)`, `AT`/`TO` version sets (`AT {schema_ver1}`), and object refs in full profile (`ADD SCHEMA shop`, `ON shop_prod`, etc.). Version aliases are allocated lazily on first reference (`{objectName}_ver{N}` per owning DAG). Keys are always aliased for portable replay even when a keystore label exists. `BIND` RHS and `rowId` prefixes are unchanged. With `aliasMode: false` (default), output matches the legacy `#hash` form.
+
 Unknown payloads render as stable SQL comments instead of being dropped.
 
 ## Diagnostics
 
-Language mistakes return `{ ok: false, diagnostics }` where possible. Diagnostics carry a code, message, severity, and source span. Infrastructure errors from underlying RDb/DAG operations are surfaced as execution diagnostics.
+C-SQL mistakes return `{ ok: false, diagnostics }` where possible. Diagnostics carry a code, message, severity, and source span. Infrastructure errors from underlying RDb/DAG operations are surfaced as execution diagnostics.

@@ -14,7 +14,7 @@ This new version has two main goals:
 
 ### Current status
 
-The core sync engine is complete: the **`mvt`** (Monotone View Types), **`replica`**, **`sync`** (synchronizer), and **`mesh`** (networking) layers are all implemented and working together to enable live peer-to-peer state synchronization. A formal [protocol specification](modules/replica/SPECS.md) covers the full architecture — from authenticated mesh channels through DAG exchange to type-level validation. Standard replicable types (starting with RSet) are available in the **`std_types`** module. We're now developing **`rdb_adapter`**, which keeps a local relational database in sync with an HHS replica, enabling integration with existing information systems. Please see the individual module specs and the [roadmap](https://www.hyperhyperspace.org/work-plan-2025.html) for details.
+The core sync engine is complete: the **`dag`** storage layer, **`mvt`** (Monotone View Types), **`replica`**, **`sync`** (synchronizer), and **`mesh`** (networking, plus transports and tracker) layers are all implemented and working together to enable live peer-to-peer state synchronization. A formal [protocol specification](modules/replica/SPECS.md) covers the full architecture — from authenticated mesh channels through DAG exchange to type-level validation. Standard replicable types (**RSet** and **RCap**, with permissioned RSet composition) are available in the **`std_types`** module. The **Causal/Relational database** modules **`rdb`**, **`rdb_lang`**, and **`rdb_tools`** are implemented (causal relational MVT model, SQL-like language, REPL/CLI). **`rdb_adapter`**, which keeps a local relational database in sync with an RDb replica, is in development. Please see the individual module specs and the [roadmap](https://www.hyperhyperspace.org/work-plan-2025.html) for details.
 
 ### Organization
 
@@ -28,7 +28,14 @@ This monorepo is organized as a collection of modules. This is of course WIP.
 - [`modules/dag_sql`](modules/dag_sql) SQL-backed storage for DAG entries and indices, using an abstract SQL connection interface
 - [`modules/dag_sqlite`](modules/dag_sqlite) SQLite bindings for the SQL DAG storage layer
 - [`modules/dag_test`](modules/dag_test) Shared test suites (backend parity, DAG creation helpers) reusable across DAG storage backends
-- [`modules/std_types`](modules/std_types) Standard replicable types (RSet for now) built on the MVT framework
+- [`modules/std_types`](modules/std_types) Standard replicable types (**RSet**, **RCap**, and permissioned RSet) built on the MVT framework
+
+**Causal/Relational database**
+
+- [`modules/rdb`](modules/rdb) Causal/Relational database engine MVTs: RSchema, RTableGroup, RTable, and RDb
+- [`modules/rdb_lang`](modules/rdb_lang) C-SQL: SQL-like language layer to parse, bind, compile, execute, and reverse-render RDb operations
+- [`modules/rdb_tools`](modules/rdb_tools) REPL, CLI (`rdb`), workspace and key management, script runner
+- [`modules/rdb_adapter`](modules/rdb_adapter) Adapter that keeps a local relational database in sync with an RDb replica (in development)
 
 **Synchronization**
 
@@ -66,4 +73,4 @@ To run all the test suites, run
 npm run test
 ```
 
-This automatically excludes the large tests cases from the DAG module, that take a significant amount of time / memory tu run (but it does run the same tests on smaller instances).
+This automatically excludes the large tests cases from the DAG module, that take a significant amount of time / memory to run (but it does run the same tests on smaller instances).
