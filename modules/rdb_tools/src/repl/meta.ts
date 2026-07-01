@@ -3,6 +3,7 @@ import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { RObject } from "@hyper-hyper-space/hhs3_mvt";
 import type { RSchema, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 
+import { runDeltaCommand } from "../delta/delta_command.js";
 import { createDumpRenderOptions } from "../dump/alias_context.js";
 import { formatRows } from "../format/table.js";
 import {
@@ -48,6 +49,7 @@ export async function runMetaCommand(session: WorkspaceSession, line: string): P
         case 'unalias': return { handled: true, output: unalias(session, args) };
         case 'output': return { handled: true, output: setOutput(session, args[0]) };
         case 'dump': return { handled: true, output: await dump(session, args) };
+        case 'delta': return { handled: true, output: await runDeltaCommand(session, args) };
         default: return { handled: true, output: `Unknown meta-command \\${command}` };
     }
 }
@@ -327,6 +329,7 @@ function helpText(): string {
         '\\author [<label|#prefix> [passphrase]|nobody]  (set/show default author; unlocks if needed; \\author nobody clears it)',
         '\\use database <name>, \\use group <name>, \\view, \\frontier [group]',
         '\\alias [scope] <name> <#prefix>, \\aliases [scope], \\unalias <scope> <name>, \\output table|json|vertical, \\dump schema|group|database <name> [full|schema]',
+        '\\delta schema|group <name> <start> <end> [bounded|full]  (schema = spec migrations; group = rows + observed schema)',
         '\\quit',
         '\\help commands [filter]  (C-SQL reference)',
     ].join('\n');

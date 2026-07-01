@@ -595,6 +595,92 @@ const tests = [
             }
         },
     },
+    {
+        name: '[RDB_TOOLS17] \\delta schema reports schema slot changes',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, setupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+                const altered = await runCommand(session, "ALTER SCHEMA shop AS ( ADD COLUMN products.price integer DEFAULT 0 );");
+                assertEquals(altered.exitCode, 0, altered.output);
+
+                const schema = session.workspace.roots.list('schema')[0];
+                const delta = await runMetaCommand(session, `\\delta schema shop #${schema.id.slice(0, 10)} LATEST`);
+                assertTrue(delta.output?.includes('add-column') === true, 'schema delta includes add-column');
+                assertTrue(delta.output?.includes('price') === true, 'schema delta includes new column name');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS18] \\delta group reports row inserts',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, setupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                const group = session.workspace.roots.list('group')[0];
+                const delta = await runMetaCommand(session, `\\delta group shop_prod #${group.id.slice(0, 10)} LATEST`);
+                assertTrue(delta.output?.includes('products') === true, 'group delta names products table');
+                assertTrue(delta.output?.includes('false -> true') === true, 'group delta shows row insert liveness');
+                assertTrue(delta.output?.includes('Widget') === true, 'group delta shows inserted value');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS19] \\delta group with identical bounds is empty',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, setupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                const delta = await runMetaCommand(session, '\\delta group shop_prod LATEST LATEST');
+                assertTrue(delta.output?.includes('(no changes)') === true, 'identical bounds produce no changes');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS20] \\delta group respects json output mode',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, setupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                const group = session.workspace.roots.list('group')[0];
+                await runMetaCommand(session, '\\output json');
+                const delta = await runMetaCommand(session, `\\delta group shop_prod #${group.id.slice(0, 10)} LATEST`);
+                const parsed = JSON.parse(delta.output ?? '{}') as {
+                    kind?: string;
+                    schemaChanges?: { tableChanges: unknown[] };
+                    tables?: unknown[];
+                };
+                assertEquals(parsed.kind, 'group', 'json kind');
+                assertTrue(Array.isArray(parsed.schemaChanges?.tableChanges), 'json schemaChanges.tableChanges');
+                assertTrue(Array.isArray(parsed.tables), 'json tables');
+                assertTrue((parsed.tables?.length ?? 0) > 0, 'json tables non-empty after insert');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS21] \\delta rejects database kind',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, databaseSetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+                const db = session.workspace.roots.list('database')[0];
+                let failed = false;
+                try {
+                    await runMetaCommand(session, `\\delta database app #${db.id.slice(0, 10)} LATEST`);
+                } catch (e) {
+                    failed = true;
+                    assertTrue(
+                        e instanceof Error && e.message.includes('schema|group'),
+                        'database kind rejected with usage error',
+                    );
+                }
+                assertTrue(failed, 'database delta should fail');
+            });
+        },
+    },
 ];
 
 async function runCommandNonInteractive(session: WorkspaceSession, command: string) {

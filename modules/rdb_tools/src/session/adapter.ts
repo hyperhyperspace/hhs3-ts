@@ -5,19 +5,22 @@ import { splitTableRef } from "@hyper-hyper-space/hhs3_rdb";
 import {
     bind,
     execute,
-    HashScope,
     LangBindContext,
     LangDiagnostic,
     LangExecutionResult,
     parseScript,
     ResolvedTableRef,
     VersionExpr,
-    VersionMember,
     VersionScope,
 } from "@hyper-hyper-space/hhs3_rdb_lang";
 
 import { KeyPassphraseRequiredError } from "./session.js";
 import { WorkspaceSession } from "./session.js";
+import {
+    frontierForScope,
+    hashScopeForVersionScope,
+    resolveVersionMember,
+} from "./version.js";
 import type { RootResolveContext } from "../workspace/root_index.js";
 
 export type StatementRunResult = {
@@ -134,46 +137,6 @@ async function resolveVersionExpr(session: WorkspaceSession, expr: VersionExpr |
         hashes.push(await resolveVersionMember(session, member, hashScope));
     }
     return version(...hashes);
-}
-
-async function resolveVersionMember(
-    session: WorkspaceSession,
-    member: VersionMember,
-    hashScope: HashScope,
-): Promise<B64Hash> {
-    if (member.kind === 'hash') {
-        return session.workspace.roots.resolveHash(member, hashScope);
-    }
-    const hash = session.aliases.get('version', member.text);
-    if (hash === undefined) throw new Error(`Unknown version alias '${member.text}'`);
-    await assertHashInScopedDag(session, hash, hashScope);
-    return hash;
-}
-
-async function assertHashInScopedDag(session: WorkspaceSession, hash: B64Hash, hashScope: HashScope): Promise<void> {
-    const candidates = await session.workspace.roots.hashCandidates(hashScope);
-    if (!candidates.includes(hash)) {
-        throw new Error(`Version alias hash '${hash}' is not in this object's history`);
-    }
-}
-
-async function frontierForScope(scope: VersionScope): Promise<Version> {
-    const object = scope.kind === 'schema'
-        ? scope.schema
-        : scope.kind === 'group'
-            ? scope.group
-            : scope.kind === 'table'
-                ? scope.table
-                : scope.object;
-    if (object === undefined) return version();
-    return (await object.getScopedDag()).getFrontier();
-}
-
-function hashScopeForVersionScope(scope: VersionScope): HashScope {
-    if (scope.kind === 'schema') return { kind: 'object', objectId: scope.id };
-    if (scope.kind === 'group') return { kind: 'object', objectId: scope.id };
-    if (scope.kind === 'table') return { kind: 'object', objectId: scope.groupId };
-    return { kind: 'object', objectId: scope.id };
 }
 
 export async function resolveRowIdPrefix(prefix: string, table: ResolvedTableRef, at: Version, from?: Version): Promise<B64Hash> {
