@@ -81,8 +81,11 @@ export const LANG_COMMAND_REFS: readonly LangCommandRef[] = [
         kind: 'alter-schema',
         syntax: [
             'ALTER SCHEMA schemaRef AS (',
-            '  ADD TABLE tableName (...),',
-            '  ADD COLUMN table.column type [modifiers],',
+            '  ADD TABLE tableName (',
+            '    column type [NULL] [DEFAULT value] [PUB] [READONLY] [REFERENCES refTable], ...',
+            '  ) [CONCURRENT DELETES [true|false]] [IDENTITY PROVIDER [(keyIdCol, publicKeyCol)]]',
+            '    [ALLOW op IF predicate], ...],',
+            '  ADD COLUMN table.column type [NULL] [DEFAULT value] [PUB] [READONLY],',
             '  DROP TABLE tableName,',
             '  DROP COLUMN table.column,',
             '  SET CONCURRENT DELETES table true|false,',
