@@ -13,6 +13,7 @@ import { fulfillKeyPassphrase, KeyUnlockDeclinedError } from "./passphrase.js";
 import { promptForSession } from "./prompt.js";
 
 export async function startRepl(session: WorkspaceSession): Promise<void> {
+    session.enableReplDefaults();
     const rl = createInterface({ input, output });
     let buffer = '';
 
@@ -69,7 +70,7 @@ export async function startRepl(session: WorkspaceSession): Promise<void> {
             for (const item of run.results) {
                 const rendered = session.outputMode === 'json'
                     ? formatJson(item.result)
-                    : formatTableResult(item.result, session.outputMode);
+                    : formatTableResult(item.result, session);
                 if (rendered.length > 0) output.write(rendered + '\n');
             }
         } catch (e) {

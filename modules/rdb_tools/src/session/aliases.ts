@@ -1,6 +1,6 @@
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 
-import { formatRows } from "../format/table.js";
+import { formatDisplayString, formatSessionRows } from "../format/display.js";
 import type { RootIndex } from "../workspace/root_index.js";
 import type { WorkspaceSession } from "./session.js";
 
@@ -146,7 +146,8 @@ export async function formatAliasResult(
 ): Promise<string> {
     const label = await aliasLabel(scope, hash, session);
     const suffix = label === undefined ? '' : ` (${label})`;
-    return `${scope} ${name} => ${hash}${suffix}`;
+    const rendered = formatDisplayString(session, hash, { role: 'hash' });
+    return `${scope} ${name} => ${rendered}${suffix}`;
 }
 
 export async function formatAliasListing(session: WorkspaceSession, scope?: AliasScope): Promise<string> {
@@ -156,5 +157,5 @@ export async function formatAliasListing(session: WorkspaceSession, scope?: Alia
         hash: entry.hash,
         label: (await aliasLabel(entry.scope, entry.hash, session)) ?? '',
     })));
-    return formatRows(rows);
+    return formatSessionRows(session, rows, undefined, { structuralColumns: new Set(['hash']) });
 }

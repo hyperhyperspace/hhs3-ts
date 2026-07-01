@@ -5,7 +5,8 @@ import type { RSchema, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 
 import { runDeltaCommand } from "../delta/delta_command.js";
 import { createDumpRenderOptions } from "../dump/alias_context.js";
-import { formatRows } from "../format/table.js";
+import { createDisplayContext, formatDisplayString, formatSessionRows } from "../format/display.js";
+import { formatRows } from "../format/rows.js";
 import {
     formatAliasListing,
     formatAliasResult,
@@ -40,7 +41,11 @@ export async function runMetaCommand(session: WorkspaceSession, line: string): P
         case 'keys': return { handled: true, output: await listKeys(session) };
         case 'key': return { handled: true, ...await keyCommand(session, args) };
         case 'author': return { handled: true, ...await authorCommand(session, args) };
-        case 'whoami': return { handled: true, output: (await session.currentAuthor())?.keyId ?? '(no identity selected)' };
+        case 'whoami': {
+            const identity = await session.currentAuthor();
+            if (identity === undefined) return { handled: true, output: '(no identity selected)' };
+            return { handled: true, output: formatDisplayString(session, identity.keyId, { role: 'hash' }) };
+        }
         case 'use': return { handled: true, output: await useCommand(session, args) };
         case 'view': return { handled: true, output: session.defaultView === undefined ? 'VIEW LATEST' : formatView(session) };
         case 'frontier': return { handled: true, output: await frontier(session, args[0]) };
@@ -48,6 +53,8 @@ export async function runMetaCommand(session: WorkspaceSession, line: string): P
         case 'aliases': return { handled: true, output: await aliases(session, args[0]) };
         case 'unalias': return { handled: true, output: unalias(session, args) };
         case 'output': return { handled: true, output: setOutput(session, args[0]) };
+        case 'hash-width': return { handled: true, output: setHashWidth(session, args[0]) };
+        case 'hash-labels': return { handled: true, output: setHashLabels(session, args[0]) };
         case 'dump': return { handled: true, output: await dump(session, args) };
         case 'delta': return { handled: true, output: await runDeltaCommand(session, args) };
         default: return { handled: true, output: `Unknown meta-command \\${command}` };
@@ -55,11 +62,12 @@ export async function runMetaCommand(session: WorkspaceSession, line: string): P
 }
 
 function formatRoots(session: WorkspaceSession, kind: 'database' | 'schema' | 'group'): string {
-    return formatRows(session.workspace.roots.list(kind).map((root) => ({
+    const rows = session.workspace.roots.list(kind).map((root) => ({
         name: root.name ?? '',
         id: root.id,
         type: root.type,
-    })));
+    }));
+    return formatSessionRows(session, rows, undefined, { structuralColumns: new Set(['id']) });
 }
 
 function rootCtx(session: WorkspaceSession): RootResolveContext {
@@ -96,12 +104,13 @@ async function describeTable(session: WorkspaceSession, tableRef: string | undef
 async function listKeys(session: WorkspaceSession): Promise<string> {
     if (session.keystore === undefined) return '(no keystore)';
     const selectedKeyId = (await session.currentAuthor())?.keyId;
-    return formatRows(session.keystore.list().map((key) => ({
+    const rows = session.keystore.list().map((key) => ({
         label: key.label,
         keyId: key.keyId,
         unlocked: session.isUnlocked(key.keyId),
         selected: selectedKeyId === key.keyId,
-    })));
+    }));
+    return formatSessionRows(session, rows, undefined, { structuralColumns: new Set(['keyId']) });
 }
 
 type KeyCommandResult = Pick<MetaCommandResult, 'output' | 'needsPassphrase'>;
@@ -113,14 +122,14 @@ async function keyCommand(session: WorkspaceSession, args: string[]): Promise<Ke
         if (label === undefined) throw new Error('Usage: \\key create <label> [passphrase]');
         if (passphrase === undefined) return { needsPassphrase: { kind: 'create', label } };
         const identity = await session.createKey(label, passphrase);
-        return { output: `created ${label} ${identity.keyId}` };
+        return { output: `created ${label} ${formatDisplayString(session, identity.keyId, { role: 'hash' })}` };
     }
     if (sub === 'unlock') {
         if (label === undefined) throw new Error('Usage: \\key unlock <label|#prefix>');
         const record = session.keystore.resolveRecord(session.resolveKeyRef(label));
         if (passphrase === undefined) return { needsPassphrase: { kind: 'unlock', label: record.label } };
         const identity = await session.unlockKey(label, passphrase);
-        return { output: `unlocked ${identity.keyId}` };
+        return { output: `unlocked ${formatDisplayString(session, identity.keyId, { role: 'hash' })}` };
     }
     throw new Error('Usage: \\key create|unlock ...');
 }
@@ -151,7 +160,9 @@ async function authorCommand(session: WorkspaceSession, args: string[]): Promise
 }
 
 function labelFor(session: WorkspaceSession, keyId: string): string {
-    return session.keystore?.list().find((key) => key.keyId === keyId)?.label ?? keyId;
+    const label = session.keystore?.list().find((key) => key.keyId === keyId)?.label;
+    if (label !== undefined) return label;
+    return formatDisplayString(session, keyId, { role: 'hash' });
 }
 
 async function useCommand(session: WorkspaceSession, args: string[]): Promise<string> {
@@ -159,12 +170,12 @@ async function useCommand(session: WorkspaceSession, args: string[]): Promise<st
     if (kind === 'database') {
         const db = await session.workspace.roots.resolveDatabase(ref(name), rootCtx(session));
         session.setCurrentDatabase(db.id);
-        return `using database ${db.id}`;
+        return `using database ${formatDisplayString(session, db.id, { role: 'hash' })}`;
     }
     if (kind === 'group') {
         const group = await session.workspace.roots.resolveGroup(ref(name), rootCtx(session));
         session.setCurrentGroup(group.id);
-        return `using group ${group.id}`;
+        return `using group ${formatDisplayString(session, group.id, { role: 'hash' })}`;
     }
     throw new Error('Usage: \\use database <name> | \\use group <name>');
 }
@@ -172,7 +183,9 @@ async function useCommand(session: WorkspaceSession, args: string[]): Promise<st
 async function frontier(session: WorkspaceSession, groupName?: string): Promise<string> {
     const group = await session.workspace.roots.resolveGroup(ref(groupName ?? session.currentGroup ?? ''), rootCtx(session));
     if (group.group === undefined) throw new Error('Group is not loaded');
-    return `{${[...(await (await group.group.getScopedDag()).getFrontier())].map((h) => `#${h}`).join(', ')}}`;
+    const hashes = [...(await (await group.group.getScopedDag()).getFrontier())];
+    const ctx = createDisplayContext(session, hashes);
+    return `{${hashes.map((h) => ctx.formatString(h, { role: 'hash', hashPrefix: true })).join(', ')}}`;
 }
 
 async function alias(session: WorkspaceSession, args: string[]): Promise<string> {
@@ -213,6 +226,28 @@ function setOutput(session: WorkspaceSession, mode: string | undefined): string 
     if (mode !== 'table' && mode !== 'json' && mode !== 'vertical') throw new Error('Usage: \\output table|json|vertical');
     session.setOutputMode(mode);
     return `output ${mode}`;
+}
+
+function setHashWidth(session: WorkspaceSession, width: string | undefined): string {
+    if (width === undefined) throw new Error('Usage: \\hash-width auto|full|<N>');
+    if (width === 'auto') {
+        session.setHashWidth('auto');
+        return 'hash-width auto';
+    }
+    if (width === 'full') {
+        session.setHashWidth('full');
+        return 'hash-width full';
+    }
+    const n = Number(width);
+    if (!Number.isInteger(n) || n <= 0) throw new Error('Usage: \\hash-width auto|full|<N>');
+    session.setHashWidth(n);
+    return `hash-width ${n}`;
+}
+
+function setHashLabels(session: WorkspaceSession, mode: string | undefined): string {
+    if (mode !== 'on' && mode !== 'off') throw new Error('Usage: \\hash-labels on|off');
+    session.setHashLabels(mode === 'on');
+    return `hash-labels ${mode}`;
 }
 
 async function dump(session: WorkspaceSession, args: string[]): Promise<string> {
@@ -263,8 +298,14 @@ async function loadGroupObject(session: WorkspaceSession, id: B64Hash) {
 
 function formatView(session: WorkspaceSession): string {
     if (session.defaultView === undefined) return 'VIEW LATEST';
-    const at = [...session.defaultView.at].map((h) => `#${h}`).join(', ');
-    const from = session.defaultView.from === undefined ? '' : ` FROM {${[...session.defaultView.from].map((h) => `#${h}`).join(', ')}}`;
+    const atHashes = [...session.defaultView.at];
+    const fromHashes = session.defaultView.from === undefined ? [] : [...session.defaultView.from];
+    const truncatable = [...atHashes, ...fromHashes];
+    const ctx = createDisplayContext(session, truncatable);
+    const at = atHashes.map((h) => ctx.formatString(h, { role: 'hash', hashPrefix: true })).join(', ');
+    const from = fromHashes.length === 0
+        ? ''
+        : ` FROM {${fromHashes.map((h) => ctx.formatString(h, { role: 'hash', hashPrefix: true })).join(', ')}}`;
     return `VIEW AT {${at}}${from}`;
 }
 
@@ -328,7 +369,7 @@ function helpText(): string {
         '\\key create <label> [passphrase], \\key unlock <label|#prefix> [passphrase], \\keys, \\whoami',
         '\\author [<label|#prefix> [passphrase]|nobody]  (set/show default author; unlocks if needed; \\author nobody clears it)',
         '\\use database <name>, \\use group <name>, \\view, \\frontier [group]',
-        '\\alias [scope] <name> <#prefix>, \\aliases [scope], \\unalias <scope> <name>, \\output table|json|vertical, \\dump schema|group|database <name> [full|schema]',
+        '\\alias [scope] <name> <#prefix>, \\aliases [scope], \\unalias <scope> <name>, \\output table|json|vertical, \\hash-width auto|full|<N>, \\hash-labels on|off, \\dump schema|group|database <name> [full|schema]',
         '\\delta schema|group <name> <start> <end> [bounded|full]  (schema = spec migrations; group = rows + observed schema)',
         '\\quit',
         '\\help commands [filter]  (C-SQL reference)',

@@ -1,18 +1,29 @@
 import type { Row } from "@hyper-hyper-space/hhs3_rdb";
 import type { LangExecutionResult } from "@hyper-hyper-space/hhs3_rdb_lang";
 
-import type { OutputMode } from "../session/session.js";
+import type { WorkspaceSession } from "../session/session.js";
+import {
+    collectTruncatableFromResult,
+    collectTruncatableStrings,
+    createDisplayContext,
+} from "./display.js";
 import { formatLog } from "./log.js";
 import { formatRows, formatRowsVertical } from "./rows.js";
 
 export { formatRows, formatRowsVertical } from "./rows.js";
 
-export function formatTableResult(result: LangExecutionResult, mode: Exclude<OutputMode, 'json'> = 'table'): string {
+export function formatTableResult(
+    result: LangExecutionResult,
+    session: WorkspaceSession,
+): string {
+    const mode = session.outputMode === 'vertical' ? 'vertical' : 'table';
+    const ctx = createDisplayContext(session, collectTruncatableFromResult(result));
+
     switch (result.kind) {
         case 'create-plan':
             return `create ${result.plan.kind} ${result.plan.name}`;
         case 'add-member':
-            return `added ${result.member} ${result.memberId} to ${result.database} (${result.entryHash})`;
+            return `added ${result.member} ${ctx.formatString(result.memberId, { role: 'hash' })} to ${ctx.formatString(result.database, { role: 'hash' })} (${ctx.formatString(result.entryHash, { role: 'hash' })})`;
         case 'select': {
             const schemaColumns = result.columns;
             const records = result.rows.map((row) => selectRowToRecord(row, schemaColumns));
@@ -23,28 +34,31 @@ export function formatTableResult(result: LangExecutionResult, mode: Exclude<Out
                     ...(records.some((row) => row.rowAuthor !== undefined) ? ['rowAuthor'] : []),
                     ...schemaColumns,
                 ];
+            const truncatable = collectTruncatableStrings(records);
+            const selectCtx = createDisplayContext(session, truncatable);
+            const options = { ctx: selectCtx };
             return mode === 'vertical'
-                ? formatRowsVertical(records, displayColumns)
-                : formatRows(records, displayColumns);
+                ? formatRowsVertical(records, displayColumns, options)
+                : formatRows(records, displayColumns, options);
         }
         case 'log':
-            return formatLog(result, mode);
+            return formatLog(result, session, mode);
         case 'set-view':
             return 'view set';
         case 'insert':
-            return `inserted ${result.rowId} (${result.entryHash})`;
+            return `inserted ${ctx.formatString(result.rowId, { role: 'hash' })} (${ctx.formatString(result.entryHash, { role: 'hash' })})`;
         case 'update':
-            return `updated ${result.rowId} (${result.entryHash})`;
+            return `updated ${ctx.formatString(result.rowId, { role: 'hash' })} (${ctx.formatString(result.entryHash, { role: 'hash' })})`;
         case 'delete':
-            return `deleted ${result.rowId} (${result.entryHash})`;
+            return `deleted ${ctx.formatString(result.rowId, { role: 'hash' })} (${ctx.formatString(result.entryHash, { role: 'hash' })})`;
         case 'bundle':
-            return `bundle ${result.entryHash} (${result.writes} writes)`;
+            return `bundle ${ctx.formatString(result.entryHash, { role: 'hash' })} (${result.writes} writes)`;
         case 'alter-schema':
-            return `altered schema ${result.schema} (${result.rules} rules, ${result.entryHash})`;
+            return `altered schema ${ctx.formatString(result.schema, { role: 'hash' })} (${result.rules} rules, ${ctx.formatString(result.entryHash, { role: 'hash' })})`;
         case 'update-schema':
-            return `updated schema on ${result.group} (${result.entryHash})`;
+            return `updated schema on ${ctx.formatString(result.group, { role: 'hash' })} (${ctx.formatString(result.entryHash, { role: 'hash' })})`;
         case 'update-ref':
-            return `updated ref ${result.ref} on ${result.group} (${result.entryHash})`;
+            return `updated ref ${ctx.formatString(result.ref, { role: 'hash' })} on ${ctx.formatString(result.group, { role: 'hash' })} (${ctx.formatString(result.entryHash, { role: 'hash' })})`;
     }
 }
 

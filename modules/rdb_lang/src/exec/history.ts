@@ -16,12 +16,11 @@ export async function executeLog(bound: BoundLog): Promise<LogLangResult> {
     const limited = bound.ast.limit === undefined
         ? visible.slice(offset)
         : visible.slice(offset, offset + bound.ast.limit);
-    const prefixes = uniquePrefixes(hashesForPrefixes(allEntries));
 
     return {
         kind: 'log',
         target: targetName(bound),
-        rows: limited.map((entry) => toLogRow(entry, prefixes)),
+        rows: limited.map((entry) => toLogRow(entry)),
     };
 }
 
@@ -39,14 +38,14 @@ function filterAt(entries: Entry[], at: Version): Entry[] {
     return entries.filter((entry) => reachable.has(entry.hash));
 }
 
-function toLogRow(entry: Entry, prefixes: Map<B64Hash, string>): LogRow {
+function toLogRow(entry: Entry): LogRow {
     const payload = entry.payload;
     const action = payloadAction(payload);
     const type = payloadType(payload);
     const row: LogRow = {
-        hash: prefixes.get(entry.hash) ?? entry.hash,
+        hash: entry.hash,
         fullHash: entry.hash,
-        prev: (json.fromSet(entry.header.prevEntryHashes) as B64Hash[]).map((h) => prefixes.get(h) ?? h),
+        prev: json.fromSet(entry.header.prevEntryHashes) as B64Hash[],
         summary: summarizePayload(payload),
         payload,
     };
@@ -78,30 +77,6 @@ function summarizePayload(payload: json.Literal): string {
     if (action === 'schema-update') return 'schema-update';
     if (action !== undefined) return action;
     return 'unknown';
-}
-
-function hashesForPrefixes(entries: Entry[]): B64Hash[] {
-    const hashes = new Set<B64Hash>();
-    for (const entry of entries) {
-        hashes.add(entry.hash);
-        for (const prev of json.fromSet(entry.header.prevEntryHashes) as B64Hash[]) hashes.add(prev);
-    }
-    return [...hashes];
-}
-
-function uniquePrefixes(hashes: B64Hash[]): Map<B64Hash, string> {
-    const out = new Map<B64Hash, string>();
-    for (const hash of hashes) {
-        for (let len = 8; len <= hash.length; len += 1) {
-            const prefix = hash.slice(0, len);
-            if (hashes.filter((h) => h.startsWith(prefix)).length === 1) {
-                out.set(hash, prefix);
-                break;
-            }
-        }
-        if (!out.has(hash)) out.set(hash, hash);
-    }
-    return out;
 }
 
 function targetName(bound: BoundLog): string {

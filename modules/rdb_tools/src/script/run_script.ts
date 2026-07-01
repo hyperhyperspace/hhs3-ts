@@ -17,6 +17,7 @@ export async function runScriptFile(session: WorkspaceSession, path: string): Pr
 }
 
 export async function runScript(session: WorkspaceSession, text: string, file = '<script>'): Promise<ScriptRun> {
+    session.enableScriptDefaults();
     const outputs: string[] = [];
     let buffer = '';
     const rl = input.isTTY ? createInterface({ input, output }) : undefined;

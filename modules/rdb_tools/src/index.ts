@@ -24,4 +24,5 @@ export * from "./format/table.js";
 export * from "./format/delta.js";
 export * from "./format/json.js";
 export * from "./format/log.js";
+export * from "./format/display.js";
 export * from "./format/diagnostics.js";

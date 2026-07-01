@@ -72,7 +72,7 @@ export async function runCommand(
         const rendered = run.results
             .map((item) => session.outputMode === 'json'
                 ? formatJson(item.result)
-                : formatTableResult(item.result, session.outputMode))
+                : formatTableResult(item.result, session))
             .filter((text) => text.length > 0)
             .join('\n');
         return { exitCode: 0, output: rendered };

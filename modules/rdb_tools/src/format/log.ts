@@ -1,17 +1,30 @@
-import type { LogLangResult, LogRow } from "@hyper-hyper-space/hhs3_rdb_lang";
+import type { LogLangResult } from "@hyper-hyper-space/hhs3_rdb_lang";
 
-import type { OutputMode } from "../session/session.js";
+import type { OutputMode, WorkspaceSession } from "../session/session.js";
+import { collectTruncatableFromResult, createDisplayContext } from "./display.js";
 import { formatRows, formatRowsVertical } from "./rows.js";
 
-export function formatLog(result: LogLangResult, mode: Exclude<OutputMode, 'json'> = 'table'): string {
-    const records = result.rows.map(logRowToRecord);
-    return mode === 'vertical' ? formatRowsVertical(records) : formatRows(records);
+export function formatLog(
+    result: LogLangResult,
+    session: WorkspaceSession,
+    mode: Exclude<OutputMode, 'json'> = 'table',
+): string {
+    const ctx = createDisplayContext(session, collectTruncatableFromResult(result));
+    const records = result.rows.map((row) => logRowToRecord(row, ctx));
+    return mode === 'vertical'
+        ? formatRowsVertical(records, undefined, { ctx })
+        : formatRows(records, undefined, { ctx });
 }
 
-export function logRowToRecord(row: LogRow): Record<string, unknown> {
+function logRowToRecord(
+    row: LogLangResult['rows'][number],
+    ctx: ReturnType<typeof createDisplayContext>,
+): Record<string, unknown> {
     return {
-        hash: `#${row.hash}`,
-        prev: row.prev.length === 0 ? '-' : row.prev.map((h) => `#${h}`).join(','),
+        hash: ctx.formatString(row.fullHash, { role: 'hash', hashPrefix: true }),
+        prev: row.prev.length === 0
+            ? '-'
+            : row.prev.map((h) => ctx.formatString(h, { role: 'hash', hashPrefix: true })).join(','),
         action: row.action ?? row.type ?? 'entry',
         summary: row.summary,
     };

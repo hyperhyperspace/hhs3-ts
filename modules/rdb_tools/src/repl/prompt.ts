@@ -1,6 +1,7 @@
 import type { Interface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
+import { formatDisplayString } from "../format/display.js";
 import { WorkspaceSession } from "../session/session.js";
 
 export function promptForSession(session: WorkspaceSession, continuation = false): string {
@@ -11,18 +12,15 @@ export function promptForSession(session: WorkspaceSession, continuation = false
 function groupDisplayName(session: WorkspaceSession): string {
     if (session.currentGroup === undefined) return '-';
     const name = session.workspace.roots.get(session.currentGroup)?.name;
-    return name ?? short(session.currentGroup);
+    return name ?? formatDisplayString(session, session.currentGroup, { role: 'hash' });
 }
 
 function keyDisplayName(session: WorkspaceSession): string {
     const identity = session.selectedAuthor();
     if (identity === undefined) return '-';
     const label = session.keystore?.list().find((key) => key.keyId === identity.keyId)?.label;
-    return label ?? short(identity.keyId);
-}
-
-function short(value: string): string {
-    return value.length <= 10 ? value : value.slice(0, 10);
+    if (label !== undefined) return label;
+    return formatDisplayString(session, identity.keyId, { role: 'hash' });
 }
 
 export async function promptSecret(rl: Interface, query: string): Promise<string> {

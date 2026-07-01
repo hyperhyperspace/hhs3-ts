@@ -7,6 +7,11 @@ import {
     schemaChangeRows,
     versionHashes,
 } from "../delta/payload.js";
+import {
+    collectTruncatableFromColumnChanges,
+    createDisplayContext,
+    type HashDisplayContext,
+} from "./display.js";
 import { formatJson } from "./json.js";
 import { formatRows, formatRowsVertical } from "./rows.js";
 import type { WorkspaceSession } from "../session/session.js";
@@ -57,11 +62,18 @@ function buildGroupTablePayload(payload: Extract<DeltaPayload, { kind: 'group' }
 
 function formatDeltaText(session: WorkspaceSession, payload: DeltaPayload): string {
     const { delta } = payload;
+    const versionMembers = [
+        ...versionHashes(delta.start),
+        ...versionHashes(delta.end),
+        ...versionHashes(delta.revisionBound),
+    ];
+    const ctx = createDisplayContext(session, versionMembers);
+
     const lines: string[] = [
         `DELTA ${payload.kind} ${payload.name}`,
-        `  start: #${formatVersion(delta.start)}`,
-        `  end:   #${formatVersion(delta.end)}`,
-        `  bound: #${formatVersion(delta.revisionBound)}`,
+        `  start: #${formatVersion(delta.start, ctx)}`,
+        `  end:   #${formatVersion(delta.end, ctx)}`,
+        `  bound: #${formatVersion(delta.revisionBound, ctx)}`,
     ];
 
     const tableChanges = payload.kind === 'schema'
@@ -100,32 +112,61 @@ function formatGroupRowChanges(
     session: WorkspaceSession,
     payload: Extract<DeltaPayload, { kind: 'group' }>,
 ): string | undefined {
-    const rows: Record<string, unknown>[] = [];
+    const rawRows: Array<{
+        table: string;
+        rowId: B64Hash;
+        live: string;
+        author: string;
+        columnChanges: RTableChanges['rowChanges'][number]['columnChanges'];
+        tableId?: B64Hash;
+    }> = [];
     for (const [tableId, child] of payload.delta.nested) {
         const changes = child.changes as RTableChanges;
         for (const rowChange of changes.rowChanges) {
-            rows.push({
+            rawRows.push({
                 table: payload.tableIdToName.get(tableId) ?? tableId,
-                rowId: `#${rowChange.rowId}`,
+                tableId: payload.tableIdToName.get(tableId) === undefined ? tableId : undefined,
+                rowId: rowChange.rowId,
                 live: `${rowChange.liveBefore} -> ${rowChange.liveAfter}`,
                 author: rowChange.author ?? '',
-                columns: formatColumnChanges(rowChange.columnChanges),
+                columnChanges: rowChange.columnChanges,
             });
         }
     }
-    if (rows.length === 0) return undefined;
-    return renderRows(session, rows, ['table', 'rowId', 'live', 'author', 'columns']);
+    if (rawRows.length === 0) return undefined;
+
+    const truncatable = rawRows.flatMap((row) => [
+        row.rowId,
+        ...(row.author.length > 0 ? [row.author] : []),
+        ...(row.tableId !== undefined ? [row.tableId] : []),
+        ...collectTruncatableFromColumnChanges(row.columnChanges),
+    ]);
+    const ctx = createDisplayContext(session, truncatable);
+    const rows = rawRows.map((row) => ({
+        table: row.tableId === undefined ? row.table : ctx.formatString(row.tableId, { role: 'hash' }),
+        rowId: ctx.formatString(row.rowId, { role: 'hash', hashPrefix: true }),
+        live: row.live,
+        author: row.author.length === 0 ? '' : ctx.formatString(row.author, { role: 'hash' }),
+        columns: formatColumnChanges(row.columnChanges, ctx),
+    }));
+    return renderRows(session, rows, ['table', 'rowId', 'live', 'author', 'columns'], ctx);
 }
 
-function formatVersion(v: Version): string {
-    return [...v].sort().join(',');
+function formatVersion(v: Version, ctx: HashDisplayContext): string {
+    return [...v]
+        .sort()
+        .map((h) => ctx.formatString(h, { role: 'hash' }))
+        .join(',');
 }
 
-function formatColumnChanges(changes: RTableChanges['rowChanges'][number]['columnChanges']): string {
+function formatColumnChanges(
+    changes: RTableChanges['rowChanges'][number]['columnChanges'],
+    ctx: HashDisplayContext,
+): string {
     if (changes.length === 0) return '';
     return changes.map((change) => {
-        const before = change.before === undefined ? '' : JSON.stringify(change.before);
-        const after = change.after === undefined ? '' : JSON.stringify(change.after);
+        const before = change.before === undefined ? '' : ctx.formatValue(change.before, { role: 'cell' });
+        const after = change.after === undefined ? '' : ctx.formatValue(change.after, { role: 'cell' });
         return `${change.column}: ${before} -> ${after}`;
     }).join(', ');
 }
@@ -134,9 +175,12 @@ function renderRows(
     session: WorkspaceSession,
     rows: Record<string, unknown>[],
     columns: string[],
+    ctx?: HashDisplayContext,
 ): string {
+    const structuralColumns = new Set(['rowId', 'author']);
+    const options = ctx === undefined ? undefined : { ctx, structuralColumns };
     if (session.outputMode === 'vertical') {
-        return formatRowsVertical(rows, columns);
+        return formatRowsVertical(rows, columns, options);
     }
-    return formatRows(rows, columns);
+    return formatRows(rows, columns, options);
 }

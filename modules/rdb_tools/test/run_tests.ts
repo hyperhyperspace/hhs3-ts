@@ -17,6 +17,11 @@ import { resolveRowIdPrefix } from "../src/session/adapter.js";
 import { WorkspaceSession } from "../src/session/session.js";
 import { Workspace } from "../src/workspace/workspace.js";
 import { formatRows, formatRowsVertical } from "../src/format/rows.js";
+import {
+    isTruncatable,
+    looksLikeSpeculativeHash,
+    uniquePrefixes,
+} from "../src/format/display.js";
 
 const tests = [
     {
@@ -93,7 +98,7 @@ const tests = [
                 const group = session.workspace.roots.list('group')[0];
                 const alias = await runMetaCommand(session, `\\alias group prod #${group.id.slice(0, 10)}`);
                 assertTrue(alias.output?.includes('group prod =>') === true, 'alias output format');
-                assertTrue(alias.output?.includes(group.id) === true, 'alias output includes full hash');
+                assertTrue(alias.output?.includes(group.id.slice(0, 8)) === true, 'alias output includes hash prefix');
                 assertTrue(alias.output?.includes('(shop_prod)') === true, 'alias output includes payload label');
                 assertEquals(session.aliases.get('group', 'prod'), group.id, 'alias stores full group id');
                 const use = await runMetaCommand(session, '\\use group prod');
@@ -681,6 +686,172 @@ const tests = [
             });
         },
     },
+    {
+        name: '[RDB_TOOLS22] hash display labels and speculative truncation',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, capsSetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                await runMetaCommand(session, '\\hash-labels on');
+                const labeled = await runCommand(session, "SELECT label, grantee FROM user.caps;");
+                assertEquals(labeled.exitCode, 0, labeled.output);
+                assertTrue(labeled.output.includes('$alice'), 'grantee shows keystore label');
+                assertTrue(labeled.output.includes('manager'), 'label column unchanged');
+
+                await runMetaCommand(session, '\\hash-labels off');
+                const unlabeledFull = await runCommand(session, "SELECT label, grantee FROM user.caps;");
+                assertEquals(unlabeledFull.exitCode, 0, unlabeledFull.output);
+                assertTrue(!unlabeledFull.output.includes('$alice'), 'labels off hides $name');
+                const alice = session.keystore!.list().find((key) => key.label === 'alice');
+                assertTrue(alice !== undefined && unlabeledFull.output.includes(alice.keyId), 'script default shows full grantee hash');
+
+                await runMetaCommand(session, '\\hash-width auto');
+                const unlabeled = await runCommand(session, "SELECT label, grantee FROM user.caps;");
+                assertEquals(unlabeled.exitCode, 0, unlabeled.output);
+                assertTrue(alice !== undefined && unlabeled.output.includes(alice.keyId.slice(0, 8)), 'grantee shows truncated hash prefix with auto width');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS23] hash-width modes affect structural hashes',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, setupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                const rowIdFromInsert = (output: string) => output.match(/inserted (\S+)/)?.[1] ?? '';
+
+                await runMetaCommand(session, '\\hash-width 8');
+                const shortInsert = await runCommand(session, "INSERT INTO shop_prod.products (sku, name) VALUES ('B', 'Other');");
+                assertEquals(shortInsert.exitCode, 0, shortInsert.output);
+                assertEquals(rowIdFromInsert(shortInsert.output).length, 8, 'hash-width 8 truncates insert rowId');
+
+                await runMetaCommand(session, '\\hash-width full');
+                const fullInsert = await runCommand(session, "INSERT INTO shop_prod.products (sku, name) VALUES ('C', 'Other2');");
+                assertEquals(fullInsert.exitCode, 0, fullInsert.output);
+                assertTrue(rowIdFromInsert(fullInsert.output).length >= 40, 'hash-width full shows full rowId');
+
+                await runMetaCommand(session, '\\hash-width 12');
+                const fixedInsert = await runCommand(session, "INSERT INTO shop_prod.products (sku, name) VALUES ('D', 'Other3');");
+                assertEquals(fixedInsert.exitCode, 0, fixedInsert.output);
+                assertEquals(rowIdFromInsert(fixedInsert.output).length, 12, 'hash-width 12 truncates rowId');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS24] hash-width auto disambiguates multiple hashes in LOG',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, setupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+                await runMetaCommand(session, '\\hash-width auto');
+                const log = await runCommand(session, "LOG shop_prod LIMIT 5;");
+                assertEquals(log.exitCode, 0, log.output);
+                const hashLines = log.output.split('\n').slice(2).filter((line) => line.includes('|'));
+                assertTrue(hashLines.length >= 2, 'log has multiple rows');
+                const hashes = hashLines.map((line) => line.split('|')[0]?.trim().replace(/^#/, '') ?? '');
+                assertTrue(hashes.every((h) => h.length >= 8), 'auto prefixes are at least 8 chars');
+                assertTrue(new Set(hashes).size === hashes.length, 'auto prefixes are unique in batch');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS25] json output bypasses hash display formatting',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, setupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+                await runMetaCommand(session, '\\hash-width 8');
+                await runMetaCommand(session, '\\hash-labels on');
+                await runMetaCommand(session, '\\output json');
+                const selected = await runCommand(session, "SELECT sku, name FROM shop_prod.products LIMIT 1;");
+                assertEquals(selected.exitCode, 0, selected.output);
+                const parsed = JSON.parse(selected.output) as {
+                    kind: string;
+                    rows: Array<{ rowId: string; values: { sku: string } }>;
+                };
+                assertEquals(parsed.kind, 'select', 'json kind');
+                assertTrue(parsed.rows[0].rowId.length >= 40, 'json rowId stays full length');
+                assertEquals(parsed.rows[0].values.sku, 'A', 'json keeps raw cell values');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS26] REPL and script mode defaults',
+        invoke: async () => {
+            await withSession(async (session) => {
+                assertEquals(session.hashLabels, false, 'base session defaults labels off');
+                assertEquals(session.hashWidth, 'auto', 'base session defaults hash-width auto');
+
+                session.enableScriptDefaults();
+                assertEquals(session.hashWidth, 'full', 'script defaults hash-width full');
+                assertEquals(session.hashLabels, false, 'script defaults labels still off');
+
+                session.enableReplDefaults();
+                assertEquals(session.hashLabels, true, 'repl defaults labels on');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS27] display helpers classify strings for truncation',
+        invoke: async () => {
+            assertTrue(!looksLikeSpeculativeHash('manager'), 'short label is not speculative hash');
+            assertTrue(!looksLikeSpeculativeHash('something'), 'plain word is not speculative hash');
+            assertTrue(
+                looksLikeSpeculativeHash('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789=='),
+                'long base64 ending in = is speculative hash',
+            );
+            assertTrue(isTruncatable('manager', 'cell') === false, 'cell role skips normal text');
+            assertTrue(isTruncatable('abc', 'hash') === true, 'structural role always truncatable');
+
+            const hashes = ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb='];
+            const prefixes = uniquePrefixes(hashes);
+            assertEquals(prefixes.get(hashes[0])?.length, 8, 'uniquePrefixes starts at 8');
+            assertTrue(prefixes.get(hashes[0]) !== prefixes.get(hashes[1]), 'uniquePrefixes disambiguates');
+        },
+    },
+    {
+        name: '[RDB_TOOLS28] hash-width and hash-labels meta commands',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const width = await runMetaCommand(session, '\\hash-width 16');
+                assertEquals(width.output, 'hash-width 16', 'hash-width set');
+                assertEquals(session.hashWidth, 16, 'session hashWidth updated');
+
+                const labels = await runMetaCommand(session, '\\hash-labels on');
+                assertEquals(labels.output, 'hash-labels on', 'hash-labels set');
+                assertEquals(session.hashLabels, true, 'session hashLabels updated');
+
+                const help = await runMetaCommand(session, '\\help');
+                assertTrue(help.output?.includes('\\hash-width') === true, 'help lists hash-width');
+                assertTrue(help.output?.includes('\\hash-labels') === true, 'help lists hash-labels');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS29] \\delta group column values use hash display formatting',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, capsSetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                const alice = session.keystore!.list().find((key) => key.label === 'alice');
+                if (alice === undefined) throw new Error('missing alice key');
+
+                await runMetaCommand(session, '\\hash-labels on');
+                const group = session.workspace.roots.list('group')[0];
+                const delta = await runMetaCommand(session, `\\delta group user #${group.id.slice(0, 10)} LATEST`);
+                assertTrue(delta.output?.includes('grantee:') === true, 'delta shows grantee column change');
+                assertTrue(delta.output?.includes('$alice') === true, 'delta columns show keystore label');
+                assertTrue(delta.output?.includes(alice.keyId) !== true, 'delta columns hide raw grantee keyId');
+
+                await runMetaCommand(session, '\\hash-labels off');
+                const unlabeled = await runMetaCommand(session, `\\delta group user #${group.id.slice(0, 10)} LATEST`);
+                assertTrue(unlabeled.output?.includes(alice.keyId) === true, 'delta columns show full grantee hash when labels off');
+            });
+        },
+    },
 ];
 
 async function runCommandNonInteractive(session: WorkspaceSession, command: string) {
@@ -721,6 +892,21 @@ CREATE TABLEGROUP shop_prod USING SCHEMA shop;
 INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');
 SELECT sku, name FROM shop_prod.products;
 LOG shop_prod LIMIT 5;
+`;
+}
+
+function capsSetupScript(): string {
+    return `
+\\key create alice correct
+\\author alice
+CREATE SCHEMA user CREATORS ($me) AS (
+  TABLE caps (
+    label string PUB,
+    grantee string PUB
+  )
+);
+CREATE TABLEGROUP user USING SCHEMA user;
+INSERT INTO user.caps (label, grantee) VALUES ('manager', $me);
 `;
 }
 

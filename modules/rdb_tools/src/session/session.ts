@@ -10,6 +10,8 @@ import { Workspace } from "../workspace/workspace.js";
 
 export type OutputMode = 'table' | 'json' | 'vertical';
 
+export type HashWidth = 'auto' | 'full' | number;
+
 export type SessionView = {
     at: Version;
     from?: Version;
@@ -19,6 +21,8 @@ export type WorkspaceSessionOptions = {
     workspace: Workspace;
     keystore?: KeyStore;
     outputMode?: OutputMode;
+    hashWidth?: HashWidth;
+    hashLabels?: boolean;
 };
 
 export class KeyPassphraseRequiredError extends Error {
@@ -44,12 +48,16 @@ export class WorkspaceSession {
     currentGroup?: B64Hash;
     defaultView?: SessionView;
     outputMode: OutputMode;
+    hashWidth: HashWidth;
+    hashLabels: boolean;
     stopOnError = true;
 
     constructor(options: WorkspaceSessionOptions) {
         this.workspace = options.workspace;
         this.keystore = options.keystore;
         this.outputMode = options.outputMode ?? 'table';
+        this.hashWidth = options.hashWidth ?? parseHashWidthEnv() ?? 'auto';
+        this.hashLabels = options.hashLabels ?? parseHashLabelsEnv() ?? false;
     }
 
     // Create a new key in the vault and add it to the unlocked set. Like
@@ -107,6 +115,22 @@ export class WorkspaceSession {
 
     setOutputMode(mode: OutputMode): void {
         this.outputMode = mode;
+    }
+
+    setHashWidth(width: HashWidth): void {
+        this.hashWidth = width;
+    }
+
+    setHashLabels(on: boolean): void {
+        this.hashLabels = on;
+    }
+
+    enableReplDefaults(): void {
+        if (parseHashLabelsEnv() === undefined) this.hashLabels = true;
+    }
+
+    enableScriptDefaults(): void {
+        if (parseHashWidthEnv() === undefined) this.hashWidth = 'full';
     }
 
     setVariable(name: string, value: LangValue): void {
@@ -190,4 +214,22 @@ export class WorkspaceSession {
         const hash = this.workspace.replica.getHashSuite();
         return hash.hashToB64(new TextEncoder().encode(`${kind}:${name ?? ''}:${randomUUID()}`));
     }
+}
+
+function parseHashWidthEnv(): HashWidth | undefined {
+    const raw = process.env.RDB_HASH_WIDTH?.trim();
+    if (raw === undefined || raw.length === 0) return undefined;
+    if (raw === 'auto') return 'auto';
+    if (raw === 'full') return 'full';
+    const n = Number(raw);
+    if (Number.isInteger(n) && n > 0) return n;
+    throw new Error(`Invalid RDB_HASH_WIDTH '${raw}' (expected auto, full, or a positive integer)`);
+}
+
+function parseHashLabelsEnv(): boolean | undefined {
+    const raw = process.env.RDB_HASH_LABELS?.trim().toLowerCase();
+    if (raw === undefined || raw.length === 0) return undefined;
+    if (raw === 'on' || raw === 'true' || raw === '1') return true;
+    if (raw === 'off' || raw === 'false' || raw === '0') return false;
+    throw new Error(`Invalid RDB_HASH_LABELS '${raw}' (expected on or off)`);
 }
