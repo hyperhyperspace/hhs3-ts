@@ -90,10 +90,11 @@ export interface RTableView extends View {
     // Delta support (see src/rtable/delta.ts). getColumns: the schema column
     // names at this horizon. deltaRowState: a row's enforced liveness, author,
     // and LWW-resolved WRITTEN values (no default fallback) for `columns`.
-    // Written values resolve schema-independently (a dropped column still
-    // yields its frozen value), so the caller diffs over the UNION of both
-    // horizons' columns, which keeps uniform schema effects (defaults/drops)
-    // out of the per-row diff — those live in the schema sub-delta channel.
+    // Written values are incarnation-scoped at this horizon (a dropped or
+    // re-added column yields no write for the old incarnation), so the caller
+    // diffs over the UNION of both horizons' columns, which keeps uniform
+    // schema effects (defaults/drops) out of the per-row diff — those live in
+    // the schema sub-delta channel.
     getColumns(): Promise<string[]>;
     deltaRowState(rowId: B64Hash, columns: string[]): Promise<DeltaRowState>;
 }

@@ -78,7 +78,7 @@ Rdb is four content-addressed MVT types. C-SQL and the adapter are the intended 
 
 - `**RSchema**` — the specification for one table group: tables, columns, foreign keys, restrictions, and migration rules. A standalone object with its own history; it evolves independently and is reusable by many groups. Spec authority belongs to its signed creators.
 - `**RTableGroup**` — the unit of atomicity, snapshot, observation, and composition. Pins a schema version, binds and observes foreign groups, and is where deploys and cross-group references happen.
-- `**RTable**` — a member table on a scoped projection of its group's history. Rows are write-once identities with permanent deletes and per-field last-writer-wins updates.
+- `**RTable**` — a member table on a scoped projection of its group's history. Rows are write-once identities with permanent deletes; column updates are pinned to the schema birth write active at write time and per-field last-writer-wins within that incarnation.
 - `**RDb**` — the deployment sync root: records member schemas and groups and ensures they and their transitive references are present and syncing in the replica.
 
 Deeper notes: [CAPABILITIES.md](./CAPABILITIES.md) (capabilities from rows and at-use predicates), [VOID_SEMANTICS.md](./VOID_SEMANTICS.md) (discarding rule-breaking operations under concurrency), [mvt](../mvt) (the underlying type system and SOaD), [rdb_lang](../rdb_lang) (the C-SQL reference).

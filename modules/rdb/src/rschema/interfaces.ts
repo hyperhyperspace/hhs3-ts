@@ -6,6 +6,7 @@ import type { RObject, Version, View } from "@hyper-hyper-space/hhs3_mvt";
 import type {
     TableDef, FKs, IdProvider, Predicate, MigrationRule, SchemaCreator,
 } from "./payload.js";
+import type { ColumnIncarnationId } from "./resolve.js";
 
 export interface RSchema extends RObject {
 
@@ -55,4 +56,8 @@ export interface RSchemaView extends View {
     // The identity-provider designation of a table, or undefined if the table
     // is not a provider (or does not exist at this version).
     getIdProvider(table: string): IdProvider | undefined;
+
+    // The live column incarnation id at this version (the birth write of the
+    // winning column slot), or undefined when the column is not live.
+    getColumnIncarnation(table: string, column: string): ColumnIncarnationId | undefined;
 }

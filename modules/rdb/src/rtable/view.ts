@@ -32,9 +32,11 @@
 //      see isEntryVoided in ../rtable_group/group.ts.
 //
 // Values are resolved per-field LWW through cover queries: every insert and
-// update tags its carried columns in entry meta (`cols: ['<rowId>:<column>']`,
-// see ../rtable_group/scopes.ts), so the cover of one column's write meta IS
-// the causal maxima set for that column. Voided entries in the cover are
+// update tags its carried columns in entry meta (`cols: ['<rowId>:<incarnationId>:<column>']`,
+// see ../rtable_group/scopes.ts), keyed by the schema birth write active at
+// write time. At read, the cover is scoped to the live incarnation for that
+// column name at this horizon, so drop/re-add and losing concurrent add-column
+// forks do not resurrect stale writes. Voided entries in the cover are
 // descended through (their writes don't count, but they must not mask valid
 // writes below); candidates surfaced that way are pruned if dominated by
 // another candidate. Concurrent maxima tiebreak by larger entry hash;
@@ -275,15 +277,20 @@ export class RTableViewImpl implements RTableView {
     }
 
     // The LWW-resolved value for one column of a row, or undefined if no
-    // valid write at or below `at` carries it. The cover of the column's
-    // write meta (`cols: ['<rowId>:<column>']`, exact-match so multi-op
-    // entries can't cross-match) is the causal maxima set; voided cover
-    // entries are descended through (and candidates surfaced below them are
-    // pruned if dominated by another candidate). Concurrent maxima tiebreak
-    // by larger entry hash. Does NOT check liveness.
+    // valid write at or below `at` carries it for the column's live
+    // incarnation at this horizon. The cover of the incarnation-scoped write
+    // meta (`cols: ['<rowId>:<incarnationId>:<column>']`) is the causal maxima set;
+    // voided cover entries are descended through (and candidates surfaced
+    // below them are pruned if dominated by another candidate). Concurrent
+    // maxima tiebreak by larger entry hash. Does NOT check liveness.
     private async resolveColumn(rowId: B64Hash, column: string): Promise<json.Literal | undefined> {
+        const schemaView = await this.schemaView();
+        const table = this.target.getTableName();
+        const incarnation = schemaView.getColumnIncarnation(table, column);
+        if (incarnation === undefined) return undefined;
+
         const dag = await this.target.getScopedDag();
-        const filter: EntryMetaFilter = { containsValues: { cols: [colTag(rowId, column)] } };
+        const filter: EntryMetaFilter = { containsValues: { cols: [colTag(rowId, incarnation, column)] } };
 
         // cover among NON-VOIDED entries: descend through voided elements
         const candidates: B64Hash[] = [];
@@ -390,10 +397,11 @@ export class RTableViewImpl implements RTableView {
 
     // Delta support (see ./delta.ts). Enforced liveness + author + the LWW
     // WRITTEN value of each requested column, with NO schema-default fallback:
-    // resolveColumn scans `cols` write-meta and is schema-independent, so a
-    // column dropped between horizons still yields its frozen written value
-    // (hence diffs to "no change") and a column's default never appears as a
-    // per-row write. Callers pass the union of both horizons' columns.
+    // resolveColumn is incarnation-scoped at this horizon, so a column dropped
+    // or re-added between horizons yields no written value for the old
+    // incarnation (hence diffs correctly against defaults / new writes) and a
+    // column's default never appears as a per-row write. Callers pass the
+    // union of both horizons' columns.
     async deltaRowState(rowId: B64Hash, columns: string[]): Promise<DeltaRowState> {
         const insert = await this.liveInsert(rowId);
         if (insert === undefined) return { live: false, author: undefined, written: {} };

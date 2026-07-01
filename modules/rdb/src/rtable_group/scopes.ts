@@ -12,13 +12,11 @@
 //
 //   tables: [touched table names]            - every row-carrying entry
 //   t-<table>-rows: [rowId]                  - row cover queries (liveness)
-//   t-<table>-cols: ['<rowId>:<column>']     - column writes (inserts and
+//   t-<table>-cols: ['<rowId>:<incarnationId>:<column>'] - column writes
 //                                              updates): the per-column LWW
-//                                              cover queries. rowId and column
-//                                              share one value so multi-op
-//                                              entries (create, bundles) can't
-//                                              cross-match a row with a column
-//                                              touched only on another row
+//                                              cover queries, keyed by the
+//                                              schema birth write active at
+//                                              write time (see resolve.ts).
 //   t-<table>-pub-<column>: [normalized]     - pub export (inserts and updates;
 //                                              stale values in old entries are
 //                                              candidate noise, filtered by the
@@ -40,6 +38,7 @@ import { validationFailure, validationOk, ValidationResult, wrapValidationFailur
 import type { DagScope, Version } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchemaView } from "../rschema/interfaces.js";
+import type { ColumnIncarnationId } from "../rschema/resolve.js";
 import type { RowOpPayload, InsertRowPayload } from "../rtable/payload.js";
 import type { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload } from "./payload.js";
 
@@ -59,10 +58,11 @@ export type TableScopeHost = {
     resolveSchemaView(at: Version, from?: Version): Promise<RSchemaView>;
 };
 
-// The combined (rowId, column) meta value for column-write cover queries.
-// B64 hashes never contain ':', so the encoding is unambiguous.
-export function colTag(rowId: B64Hash, column: string): string {
-    return rowId + ':' + column;
+// The combined (rowId, column incarnation, column name) meta value for
+// column-write cover queries. Column name is included because base columns
+// from one add-table rule share the same birth (entryHash, ruleIndex).
+export function colTag(rowId: B64Hash, incarnationId: ColumnIncarnationId, column: string): string {
+    return rowId + ':' + incarnationId + ':' + column;
 }
 
 // Extract one table's row ops from a GROUP-level entry payload (row envelope,
@@ -101,14 +101,23 @@ export function tableOpsFromGroupPayload(payload: json.Literal, table: string): 
 // unable to honor a delete authored while it was off. Tagging unconditionally
 // makes concurrentDeletes resolve fully at the view horizon (like restrictions
 // / FKs); see liveInsert / baseLiveInsert in ../rtable/view.ts.
-export function deriveRowOpInnerMeta(op: RowOpPayload, pubColumns: string[]): MetaProps {
+export function deriveRowOpInnerMeta(op: RowOpPayload, table: string, schemaView: RSchemaView): MetaProps {
     const meta: MetaProps = { rows: json.toSet([op.rowId]) };
 
     if (op.action === 'insert' || op.action === 'update') {
         const columns = Object.keys(op.values);
         if (columns.length > 0) {
-            meta['cols'] = json.toSet(columns.map((column) => colTag(op.rowId, column)));
+            const tags: string[] = [];
+            for (const column of columns) {
+                const incarnation = schemaView.getColumnIncarnation(table, column);
+                if (incarnation === undefined) {
+                    throw new Error(`deriveRowOpInnerMeta: column '${column}' is not live on table '${table}'`);
+                }
+                tags.push(colTag(op.rowId, incarnation, column));
+            }
+            meta['cols'] = json.toSet(tags);
         }
+        const pubColumns = schemaView.getPubColumns(table);
         for (const column of pubColumns) {
             const value = op.values[column];
             if (value !== undefined) {
@@ -147,7 +156,7 @@ export function deriveEnvelopeMeta(envelope: RowEnvelopePayload, schemaView: RSc
     const meta: MetaProps = { tables: json.toSet([envelope.table]) };
     const op = envelope.op as RowOpPayload;
     wrapInnerMeta(meta, envelope.table,
-        deriveRowOpInnerMeta(op, schemaView.getPubColumns(envelope.table)));
+        deriveRowOpInnerMeta(op, envelope.table, schemaView));
     return meta;
 }
 
@@ -163,11 +172,10 @@ function deriveMultiRowMeta(tablesOps: { [table: string]: RowOpPayload[] }, sche
     meta['tables'] = json.toSet(tables);
 
     for (const table of tables) {
-        const pubColumns = schemaView.getPubColumns(table);
         const inner: MetaProps = {};
 
         for (const op of tablesOps[table]) {
-            const opMeta = deriveRowOpInnerMeta(op, pubColumns);
+            const opMeta = deriveRowOpInnerMeta(op, table, schemaView);
             for (const key of Object.keys(opMeta)) {
                 const existing = inner[key];
                 inner[key] = existing === undefined

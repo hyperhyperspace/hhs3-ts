@@ -37,6 +37,14 @@ import {
 } from "./payload.js";
 import { CreateRSchemaPayload, SchemaUpdatePayload, SchemaCreator } from "./payload.js";
 
+// Stable id for one live column incarnation: the schema birth write that
+// introduced the column (add-table base column or add-column rule).
+export type ColumnIncarnationId = `${B64Hash}#${number}`;
+
+export function formatColumnIncarnation(entryHash: B64Hash, ruleIndex: number): ColumnIncarnationId {
+    return `${entryHash}#${ruleIndex}`;
+}
+
 // The resolved, effective schema at a position.
 
 export type SchemaState = {
@@ -44,6 +52,7 @@ export type SchemaState = {
     creators: SchemaCreator[];
     hashAlgorithm?: string;
     tables: Map<string, TableDef>;
+    columnIncarnations: Map<string, Map<string, ColumnIncarnationId>>;
 };
 
 // A single slot write, tagged with its origin for LWW resolution.
@@ -260,6 +269,7 @@ export function resolveSchemaState(entries: Entry[], at: Position): SchemaState 
     // Resolve existence slots first: the winning add-table is the table's
     // current incarnation and masks subordinate writes at-or-below it.
     const tables = new Map<string, TableDef>();
+    const columnIncarnations = new Map<string, Map<string, ColumnIncarnationId>>();
 
     for (const [slot, slotWrites] of writes) {
         if (!slot.startsWith('t:')) continue;
@@ -298,14 +308,17 @@ export function resolveSchemaState(entries: Entry[], at: Position): SchemaState 
         };
 
         const columns: { [column: string]: ColumnDef } = {};
+        const tableIncarnations = new Map<string, ColumnIncarnationId>();
         for (const subSlot of writes.keys()) {
             if (!subSlot.startsWith(`c:${table}:`)) continue;
             const column = subSlot.slice(`c:${table}:`.length);
             const columnWinner = resolveSubordinate(subSlot);
             if (columnWinner !== undefined && columnWinner.value.kind === 'column') {
                 columns[column] = columnWinner.value.def;
+                tableIncarnations.set(column, formatColumnIncarnation(columnWinner.entryHash, columnWinner.ruleIndex));
             }
         }
+        if (Object.keys(columns).length > 0) columnIncarnations.set(table, tableIncarnations);
 
         const def: TableDef = { name: base.def.name, columns };
 
@@ -335,6 +348,7 @@ export function resolveSchemaState(entries: Entry[], at: Position): SchemaState 
         name: create.name,
         creators: create.creators,
         tables,
+        columnIncarnations,
     };
     if (create.hashAlgorithm !== undefined) state.hashAlgorithm = create.hashAlgorithm;
 

@@ -12,8 +12,8 @@
 // sub-delta channel, applied by the consumer to rows not present in the walk.
 //
 // Diffing uses deltaRowState (LWW written values, no default fallback) over the
-// UNION of both horizons' schema columns, so a default/drop produces no per-row
-// change (the underlying writes are unchanged). See ../rtable/view.ts.
+// UNION of both horizons' schema columns; incarnation-scoped resolution keeps
+// drop/re-add from surfacing stale per-row diffs. See ../rtable/view.ts.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, KeyId } from "@hyper-hyper-space/hhs3_crypto";

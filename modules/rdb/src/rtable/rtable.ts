@@ -199,7 +199,7 @@ export class RTableImpl implements RTableContract {
             throw new ValidationRejectedError(formatValidationFailure(result.why), result.why);
         }
 
-        const innerMeta = deriveRowOpInnerMeta(op, schemaView.getPubColumns(this.tableName));
+        const innerMeta = deriveRowOpInnerMeta(op, this.tableName, schemaView);
 
         const scopedDag = await this.getScopedDag();
         return scopedDag.append(op, innerMeta, at);

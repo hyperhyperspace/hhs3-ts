@@ -14,6 +14,7 @@ import { rtableObserveGateTests } from "./rtable_observe_gate_tests.js";
 import { rtablePermTests } from "./rtable_perm_tests.js";
 import { rtableQueryTests } from "./rtable_query_tests.js";
 import { rtableDeployTests } from "./rtable_deploy_tests.js";
+import { columnIncarnationTests } from "./column_incarnation_tests.js";
 import { rdbSyncTests } from "./rdb_sync_tests.js";
 import { rdbFullSyncTests } from "./rdb_full_sync_tests.js";
 import { usersPeerTests } from "./users_peer_tests.js";
@@ -40,6 +41,7 @@ async function main() {
     allTests.set(rtablePermTests.title, rtablePermTests.tests);
     allTests.set(rtableQueryTests.title, rtableQueryTests.tests);
     allTests.set(rtableDeployTests.title, rtableDeployTests.tests);
+    allTests.set(columnIncarnationTests.title, columnIncarnationTests.tests);
     allTests.set(rdbSyncTests.title, rdbSyncTests.tests);
     allTests.set(rdbFullSyncTests.title, rdbFullSyncTests.tests);
     allTests.set(usersPeerTests.title, usersPeerTests.tests);
