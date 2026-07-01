@@ -370,7 +370,7 @@ function helpText(): string {
         '\\author [<label|#prefix> [passphrase]|nobody]  (set/show default author; unlocks if needed; \\author nobody clears it)',
         '\\use database <name>, \\use group <name>, \\view, \\frontier [group]',
         '\\alias [scope] <name> <#prefix>, \\aliases [scope], \\unalias <scope> <name>, \\output table|json|vertical, \\hash-width auto|full|<N>, \\hash-labels on|off, \\dump schema|group|database <name> [full|schema]',
-        '\\delta schema|group <name> <start> <end> [bounded|full]  (schema = spec migrations; group = rows + observed schema)',
+        '\\delta schema|group <name> <start> <end> [bounded|full]  (schema = spec migrations; group = rows + schema + op void flips + reasons)',
         '\\quit',
         '\\help commands [filter]  (C-SQL reference)',
     ].join('\n');

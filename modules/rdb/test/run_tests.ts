@@ -18,6 +18,7 @@ import { columnIncarnationTests } from "./column_incarnation_tests.js";
 import { rdbSyncTests } from "./rdb_sync_tests.js";
 import { rdbFullSyncTests } from "./rdb_full_sync_tests.js";
 import { usersPeerTests } from "./users_peer_tests.js";
+import { opDeltaTests } from "./op_delta_tests.js";
 import { groupDeltaParityTests } from "./delta_parity/group_parity_tests.js";
 import { parseTestFilters } from "./delta_parity/parity.js";
 
@@ -45,6 +46,7 @@ async function main() {
     allTests.set(rdbSyncTests.title, rdbSyncTests.tests);
     allTests.set(rdbFullSyncTests.title, rdbFullSyncTests.tests);
     allTests.set(usersPeerTests.title, usersPeerTests.tests);
+    allTests.set(opDeltaTests.title, opDeltaTests.tests);
     allTests.set(groupDeltaParityTests.title, groupDeltaParityTests.tests);
 
     console.log('Running tests for Hyper Hyper Space v3 rdb module' + (filters.length > 0 ? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');

@@ -657,11 +657,55 @@ const tests = [
                     kind?: string;
                     schemaChanges?: { tableChanges: unknown[] };
                     tables?: unknown[];
+                    opVerdictChanges?: unknown[];
                 };
                 assertEquals(parsed.kind, 'group', 'json kind');
                 assertTrue(Array.isArray(parsed.schemaChanges?.tableChanges), 'json schemaChanges.tableChanges');
                 assertTrue(Array.isArray(parsed.tables), 'json tables');
+                assertTrue(Array.isArray(parsed.opVerdictChanges), 'json opVerdictChanges');
                 assertTrue((parsed.tables?.length ?? 0) > 0, 'json tables non-empty after insert');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS30] \\delta group op changes include void reason',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, voidDeltaSetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                const resolved = await session.workspace.roots.resolveGroup(
+                    { kind: 'name', text: 'void_g', parts: ['void_g'], span: { start: 0, end: 6, line: 1, column: 1 } },
+                    { aliases: session.aliases },
+                );
+                if (resolved.group === undefined) throw new Error('void_g not loaded');
+                const base = await (await resolved.group.getScopedDag()).getFrontier();
+                const baseHash = [...base][0];
+                const capsView = await (await resolved.group.getView(base, base)).getTableView('caps');
+                const capRows = await capsView.findRowIds({ label: 'grant' });
+                assertEquals(capRows.length, 1, 'one cap row at base');
+                const capRowId = capRows[0];
+
+                const revoke = await runCommand(
+                    session,
+                    `DELETE FROM void_g.caps WHERE rowId = '${capRowId}' AT #${baseHash.slice(0, 10)};`,
+                );
+                assertEquals(revoke.exitCode, 0, revoke.output);
+                const insert = await runCommand(
+                    session,
+                    `INSERT INTO void_g.items (name) VALUES ('thing') AT #${baseHash.slice(0, 10)};`,
+                );
+                assertEquals(insert.exitCode, 0, insert.output);
+
+                await runMetaCommand(session, '\\output json');
+                const delta = await runMetaCommand(session, `\\delta group void_g #${baseHash.slice(0, 10)} LATEST`);
+                const parsed = JSON.parse(delta.output ?? '{}') as {
+                    opVerdictChanges?: Array<{ reason?: { kind?: string }; voidHorizon?: string }>;
+                };
+                assertTrue((parsed.opVerdictChanges?.length ?? 0) > 0, 'op flips present');
+                const flip = parsed.opVerdictChanges![0];
+                assertEquals(flip.voidHorizon, 'end', 'reason at end horizon');
+                assertEquals(flip.reason?.kind, 'restriction', 'restriction void reason');
             });
         },
     },
@@ -876,6 +920,23 @@ async function withSession(fn: (session: WorkspaceSession, dbPath: string) => Pr
         await workspace.close();
         await rm(dir, { recursive: true, force: true });
     }
+}
+
+function voidDeltaSetupScript(): string {
+    return `
+\\key create alice correct
+\\author alice
+CREATE SCHEMA voidtest CREATORS ($me) AS (
+  TABLE caps (
+    label string PUB
+  ) CONCURRENT DELETES,
+  TABLE items (
+    name string
+  ) ALLOW insert IF EXISTS caps WHERE label = 'grant'
+);
+CREATE TABLEGROUP void_g USING SCHEMA voidtest;
+INSERT INTO void_g.caps (uuid, label) VALUES ('c-1', 'grant');
+`;
 }
 
 function setupScript(): string {

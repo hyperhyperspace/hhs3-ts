@@ -1,8 +1,8 @@
-// RTableGroup delta: the group leads a two-channel delta between two of its
+// RTableGroup delta: the group leads a three-channel delta between two of its
 // positions, mirroring RSet's full/bounded split but over MORE than one
 // observed object (its RSchema plus every bound foreign group).
 //
-// Two channels:
+// Three channels:
 //   - schema sub-delta (uniform): `schemaChanges` carries column defaults,
 //     table/column drops, FK/restriction/concurrentDeletes flips as RSchema
 //     changes. The consumer applies these to rows NOT present in the row-walk;
@@ -11,6 +11,10 @@
 //   - per-table row-walk (positional): each touched member table's RTableChanges
 //     in the root delta's `nested` map, keyed by the table id. A row appears
 //     only when its liveness flipped or a written value moved (see ../rtable/delta.ts).
+//   - op verdict flips: `opVerdictChanges` lists group DAG entries whose
+//     at-use void verdict changed between the start and end view horizons
+//     (insert/update/delete/bundle ops and gated observes that flip). Row
+//     channel materializes effects; op channel explains reconciliation flips.
 //
 // Strategies (RObject.setDeltaStrategy switch on the group):
 //   - full: bound = empty, walk all history from genesis. The reference
@@ -26,7 +30,7 @@ import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { dag } from "@hyper-hyper-space/hhs3_dag";
 import {
     RObject, Version, version, Delta, DeltaChanges, DeltaAccumulator,
-    walkDelta, computeForkMeet, combineObserverRevisionBounds,
+    computeForkMeet, combineObserverRevisionBounds, walkEntriesBackwardsToBound,
 } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchema } from "../rschema/interfaces.js";
@@ -34,10 +38,16 @@ import type { RSchemaChanges } from "../rschema/delta.js";
 import type { RTable } from "../rtable/interfaces.js";
 import type { RTableChanges } from "../rtable/delta.js";
 
+import { computeOpVerdictFlips, type OpVerdictChange, type OpVoidDetail } from "./op_delta.js";
+
+export type { OpVerdictChange, OpVerdictKind, OpVerdictWrite, OpVerdictHost, OpVoidDetail, OpVoidHorizon } from "./op_delta.js";
+export { formatOpVoidDetail } from "./op_delta.js";
+
 export type RTableGroupDeltaStrategy = 'full' | 'bounded';
 
 export type RTableGroupChanges = {
     schemaChanges: RSchemaChanges;
+    opVerdictChanges: OpVerdictChange[];
 };
 
 export class RTableGroupDelta implements Delta<RTableGroupChanges> {
@@ -58,6 +68,8 @@ export class RTableGroupDelta implements Delta<RTableGroupChanges> {
 
     get schemaChanges(): RSchemaChanges { return this.changes.schemaChanges; }
 
+    get opVerdictChanges(): OpVerdictChange[] { return this.changes.opVerdictChanges; }
+
     // Per-table row changes, keyed by table id (the nested delta subtree).
     get tableChanges(): ReadonlyMap<B64Hash, RTableChanges> {
         const map = new Map<B64Hash, RTableChanges>();
@@ -74,6 +86,10 @@ export type GroupDeltaHost = RObject & {
     // The objects this group OBSERVES — its RSchema plus every bound foreign
     // group — the referenced floors of the bounded revision bound.
     getObservedObjects(): Promise<RObject[]>;
+    isEntryVoided(entryHash: B64Hash, from: Version): Promise<boolean>;
+    explainEntryVoided(entryHash: B64Hash, from: Version): Promise<OpVoidDetail | undefined>;
+    getSchemaRef(): B64Hash;
+    getBindings(): { [name: string]: B64Hash };
 };
 
 export class RTableGroupDeltaAccumulator implements DeltaAccumulator<RTableGroupChanges> {
@@ -128,7 +144,7 @@ export class RTableGroupDeltaAccumulator implements DeltaAccumulator<RTableGroup
 
         return {
             type: this.group.getType(),
-            changes: { schemaChanges },
+            changes: { schemaChanges, opVerdictChanges: [] },
             nested,
         };
     }
@@ -137,7 +153,7 @@ export class RTableGroupDeltaAccumulator implements DeltaAccumulator<RTableGroup
 function emptyChanges(type: string): DeltaChanges<RTableGroupChanges> {
     return {
         type,
-        changes: { schemaChanges: { tableChanges: [] } },
+        changes: { schemaChanges: { tableChanges: [] }, opVerdictChanges: [] },
         nested: new Map(),
     };
 }
@@ -173,7 +189,12 @@ export async function computeRTableGroupDelta(
         throw new Error("Invalid delta strategy: " + strategy);
     }
 
-    const root = await walkDelta(
-        rawDag, start, end, revisionBound, new RTableGroupDeltaAccumulator(group, start, end));
-    return new RTableGroupDelta(start, end, revisionBound, root as DeltaChanges<RTableGroupChanges>);
+    const entries = await walkEntriesBackwardsToBound(rawDag, end, revisionBound);
+    const acc = new RTableGroupDeltaAccumulator(group, start, end);
+    for (const entry of entries) {
+        await acc.ingest(entry);
+    }
+    const root = await acc.finalize() as DeltaChanges<RTableGroupChanges>;
+    root.changes.opVerdictChanges = await computeOpVerdictFlips(group, entries, start, end);
+    return new RTableGroupDelta(start, end, revisionBound, root);
 }

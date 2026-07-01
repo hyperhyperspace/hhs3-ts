@@ -72,6 +72,30 @@ export const formatPredicateTests = {
                 );
             },
         },
+        {
+            name: '[FORMAT03] formatOpVoidDetail renders restriction and observe-gate reasons',
+            invoke: async () => {
+                const { formatOpVoidDetail } = await import("../src/rtable_group/op_void.js");
+                assertEquals(
+                    formatOpVoidDetail({
+                        kind: 'restriction',
+                        table: 'items',
+                        action: 'insert',
+                        rowId: 'abc123=',
+                        rule: { p: 'exists', table: 'caps', where: { label: 'grant' } },
+                    }),
+                    "items insert on row 'abc123=' does not satisfy ALLOW insert IF EXISTS caps WHERE caps.label = 'grant'",
+                );
+                assertEquals(
+                    formatOpVoidDetail({
+                        kind: 'observe-gate',
+                        binding: 'users',
+                        rule: { p: 'exists', table: 'caps', where: { label: 'manager', grantee: '$author' } },
+                    }),
+                    "canObserve predicate rejected observation of 'users': EXISTS caps WHERE caps.label = 'manager' AND caps.grantee = $author",
+                );
+            },
+        },
     ],
 };
 

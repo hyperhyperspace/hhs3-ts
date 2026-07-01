@@ -81,7 +81,8 @@ import type { RTableGroup as RTableGroupContract, RTableGroupView as RTableGroup
 import { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload, RTABLE_GROUP_TYPE_ID } from "./payload.js";
 import { TableScope, deriveCreateMeta, deriveEnvelopeMeta, deriveBundleMeta } from "./scopes.js";
 import { validateTableGroupPayload } from "./validate_ops.js";
-import { evaluateRowOpRestriction, evaluateRowOpFKReach, evaluatePredicate } from "./predicates.js";
+import { evaluatePredicate, explainRowOpRestriction, explainRowOpFKReach } from "./predicates.js";
+import type { OpVoidDetail } from "./op_void.js";
 import { RTableGroupViewImpl } from "./view.js";
 import {
     RTableGroupDelta, RTableGroupDeltaStrategy, RTableGroupDeltaAccumulator,
@@ -608,60 +609,56 @@ export class RTableGroupImpl implements RTableGroupContract {
 
         this._voidVisiting.add(key);
         try {
-            return await this.computeEntryVoided(entryHash, from);
+            return (await this.diagnoseEntryVoided(entryHash, from)) !== undefined;
         } finally {
             this._voidVisiting.delete(key);
         }
     }
 
-    private async computeEntryVoided(entryHash: B64Hash, from: Version): Promise<boolean> {
-        if (entryHash === this.createOpId) return false;   // genesis fiat
+    async explainEntryVoided(entryHash: B64Hash, from: Version): Promise<OpVoidDetail | undefined> {
+        const key = entryHash + '|' + [...from].sort().join(',');
+
+        if (this._voidVisiting.has(key)) return { kind: 'authorization-cycle' };
+
+        this._voidVisiting.add(key);
+        try {
+            return await this.diagnoseEntryVoided(entryHash, from);
+        } finally {
+            this._voidVisiting.delete(key);
+        }
+    }
+
+    private async diagnoseEntryVoided(entryHash: B64Hash, from: Version): Promise<OpVoidDetail | undefined> {
+        if (entryHash === this.createOpId) return undefined;   // genesis fiat
 
         const scopedDag = await this.getScopedDag();
         const entry = await scopedDag.loadEntry(entryHash);
-        if (entry === undefined) return false;
+        if (entry === undefined) return undefined;
 
         const payload = entry.payload as json.LiteralMap;
         if (isRefAdvancePayload(payload)) {
-            return this.computeObserveVoided(payload as unknown as RefAdvancePayload, entryHash, from);
+            return this.diagnoseObserveVoided(payload as unknown as RefAdvancePayload, entryHash, from);
         }
 
         const ops: { table: string; op: RowOpPayload }[] = [];
+        const isBundle = payload['action'] === 'bundle';
         if (payload['action'] === 'row') {
             const envelope = payload as RowEnvelopePayload;
             ops.push({ table: envelope.table, op: envelope.op as RowOpPayload });
-        } else if (payload['action'] === 'bundle') {
+        } else if (isBundle) {
             for (const write of (payload as BundlePayload).writes) {
                 ops.push({ table: write.table, op: write.op as RowOpPayload });
             }
         } else {
-            return false;   // create / unknown
+            return undefined;   // create / unknown
         }
 
-        // at-use: the op's OWN position, observed from `from`. Anchoring at
-        // the entry (not its predecessors) is what makes a barrier revoke
-        // CONCURRENT with the op void it (concurrent to the entry, visible
-        // from `from`), while a causally-later revoke does not (it is in the
-        // op's future, neither at-or-below nor concurrent). BOTH a failed
-        // restriction recheck AND FK reach (a written FK column whose target is
-        // not live at this same position) void the op — FK is at-use
-        // op-voiding, not a continuous view-horizon layer, so a causally-later
-        // target delete or FK declaration change never revises an old write.
         const opPos = version(entryHash);
         const schemaView = await this.resolveSchemaView(opPos, from);
         const getTableView = (table: string) => this.makeTable(table).getView(opPos, from);
-        // view-time enforcement: filter VOIDED observations out of the
-        // observed foreign version (Layer 2 of the observe gate), so a
-        // cross-group FK / exists target made visible only by a back-dated
-        // observation is not live here.
         const getForeignTableView = (group: string, table: string) =>
             this.resolveForeignTableView(group, table, opPos, from, true);
 
-        // the entry's own sequential-cut overlay: a LOCAL FK target inserted by
-        // a sibling op of this same entry (bundle) is live, one it deletes is
-        // dead — resolved here, not via the view, since the entry voids
-        // all-or-nothing and re-checking the view would self-cycle (one op per
-        // rowId per bundle, so insert/delete sets are disjoint).
         const selfInserted = new Map<string, Set<B64Hash>>();
         const selfDeleted = new Map<string, Set<B64Hash>>();
         for (const { table, op } of ops) {
@@ -676,32 +673,47 @@ export class RTableGroupImpl implements RTableGroupContract {
             return undefined;
         };
 
-        for (const { table, op } of ops) {
-            if (!await evaluateRowOpRestriction(op, table, schemaView, getTableView, getForeignTableView)) {
-                return true;
+        for (const [index, { table, op }] of ops.entries()) {
+            const restrictionFailure = await explainRowOpRestriction(
+                op, table, schemaView, getTableView, getForeignTableView,
+            );
+            if (restrictionFailure !== undefined) {
+                const detail: OpVoidDetail = {
+                    kind: 'restriction',
+                    table: restrictionFailure.table,
+                    action: restrictionFailure.action,
+                    rowId: restrictionFailure.rowId,
+                    rule: restrictionFailure.rule,
+                };
+                return isBundle ? { kind: 'bundle', index, detail } : detail;
             }
-            if (!await evaluateRowOpFKReach(op, table, schemaView, getTableView, getForeignTableView, localTargetProvided)) {
-                return true;
+
+            const fkFailure = await explainRowOpFKReach(
+                op, table, schemaView, getTableView, getForeignTableView, localTargetProvided,
+            );
+            if (fkFailure !== undefined) {
+                const detail: OpVoidDetail = {
+                    kind: 'fk',
+                    table: fkFailure.table,
+                    action: fkFailure.action,
+                    rowId: fkFailure.rowId,
+                    column: fkFailure.column,
+                    targetRef: fkFailure.targetRef,
+                    targetRowId: fkFailure.targetRowId,
+                };
+                return isBundle ? { kind: 'bundle', index, detail } : detail;
             }
         }
-        return false;
+        return undefined;
     }
 
-    // Whether a ref-advance entry is VOID at this `from` horizon. The schema
-    // deploy is gated at validation only (canDeploy authority is fixed; never
-    // voided at-use). A foreign-group observation of an UNGATED binding is
-    // never voided. A GATED observation is voided when its canObserve gate
-    // fails at-use: evaluated in the observed group's frame at the G-upward
-    // stratified observed version (refAt) with a geometric negative-evidence
-    // horizon (refFrom). The G-upward widening makes the gate recursion acyclic
-    // by construction; the transient _voidVisiting guard remains only as the
-    // residual concurrent-cross-revoke backstop (deny-the-cycle collapse).
-    private async computeObserveVoided(
+    private async diagnoseObserveVoided(
         payload: RefAdvancePayload, entryHash: B64Hash, from: Version,
-    ): Promise<boolean> {
+    ): Promise<OpVoidDetail | undefined> {
         const refId = payload.refId;
-        if (refId === this.getSchemaRef()) return false;             // schema deploy: validation-only gate
-        if (this.observeGateFor(refId) === undefined) return false;   // ungated observe
+        if (refId === this.getSchemaRef()) return undefined;
+        const gate = this.observeGateFor(refId);
+        if (gate === undefined) return undefined;
 
         const dag = await this.getScopedDag();
         const opPos = version(entryHash);
@@ -709,7 +721,11 @@ export class RTableGroupImpl implements RTableGroupContract {
         const refFrom = await resolveRefVersionAtPosition(dag, refId, from, from);
         const author = extractAuthor(payload as unknown as json.LiteralMap);
 
-        return !await this.evaluateObserveGate(refId, author, refAt, refFrom);
+        const ok = await this.evaluateObserveGate(refId, author, refAt, refFrom);
+        if (ok) return undefined;
+
+        const binding = this.bindingNameForId(refId);
+        return { kind: 'observe-gate', binding: binding ?? refId, rule: gate };
     }
 
     // RObject interface

@@ -34,12 +34,13 @@ The same mechanism covers data and schemas. A schema is referenced by hash and r
 
 ## Deltas & Projections
 
-A delta reports how the database differs between two versions, on two channels:
+A delta reports how the database differs between two versions, on three channels:
 
-- **Data** — rows whose live values changed.
 - **Schema** — how the schema evolved: added columns and defaults, dropped tables, changed foreign keys, restrictions, flags.
+- **Row (data)** — rows whose live values changed (materialized projection diff).
+- **Op** — group DAG entries whose at-use void verdict flipped (reconciliation mind-changed), including gated observes when they void. Each flip carries a structured void reason at the voided horizon (`start` when un-voided, `end` when became voided): restriction failure, dangling FK, observe-gate failure, or authorization cycle.
 
-A delta records liveness transitions, so it also pinpoints operations discarded by reconciliation: an insert that never went live, or a row revoked when a concurrent revoke or deploy came into view, appears as a row going from live to dead.
+A row-channel liveness transition pinpoints operations discarded by reconciliation: an insert that never went live, or a row revoked when a concurrent revoke or deploy came into view, appears as a row going from live to dead. The op channel names the underlying entry-level void flip and explains *why* at the voided horizon; the row channel does not.
 
 Deltas project the database into ordinary SQL. The delta from the version an application last saw to the latest one projects current state into a plain local relational database, queried with normal SQL. [rdb_adapter](../rdb_adapter) projects deltas into a conventional store to keep it in sync.
 

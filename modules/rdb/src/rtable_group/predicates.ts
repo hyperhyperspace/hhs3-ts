@@ -181,6 +181,37 @@ export async function evaluateRowOpRestriction(
     });
 }
 
+export type RowOpRestrictionFailure = {
+    table: string;
+    action: RowOpPayload['action'];
+    rowId: B64Hash;
+    rule: Predicate;
+};
+
+export async function explainRowOpRestriction(
+    op: RowOpPayload,
+    table: string,
+    schemaView: RSchemaView,
+    getTableView: (table: string) => Promise<RTableView>,
+    getForeignTableView: (group: string, table: string) => Promise<RTableView | undefined>,
+): Promise<RowOpRestrictionFailure | undefined> {
+    if (!schemaView.hasTable(table)) {
+        return { table, action: op.action, rowId: op.rowId, rule: { p: 'false' } };
+    }
+    const rule = schemaView.getRestriction(table, op.action);
+    const ok = await evaluateRowOpRestriction(op, table, schemaView, getTableView, getForeignTableView);
+    return ok ? undefined : { table, action: op.action, rowId: op.rowId, rule };
+}
+
+export type RowOpFKFailure = {
+    table: string;
+    action: RowOpPayload['action'];
+    rowId: B64Hash;
+    column: string;
+    targetRef: string;
+    targetRowId: B64Hash;
+};
+
 // At-use FK reach: every FK column the op writes (or inherits as a schema
 // default) must name a target row that is LIVE at the op's OWN position,
 // observed from the evaluating view's `from`. This folds FK enforcement into
@@ -234,4 +265,45 @@ export async function evaluateRowOpFKReach(
     }
 
     return true;
+}
+
+export async function explainRowOpFKReach(
+    op: RowOpPayload,
+    table: string,
+    schemaView: RSchemaView,
+    getTableView: (table: string) => Promise<RTableView>,
+    getForeignTableView: (group: string, table: string) => Promise<RTableView | undefined>,
+    localTargetProvided?: (table: string, rowId: B64Hash) => boolean | undefined,
+): Promise<RowOpFKFailure | undefined> {
+    if (op.action === 'delete') return undefined;
+
+    const fks = schemaView.getFKs(table);
+    const def = schemaView.getTable(table);
+
+    for (const column of Object.keys(fks)) {
+        const value = op.values[column] ?? def?.columns[column]?.default;
+        if (value === undefined) continue;
+        const targetRef = fks[column];
+        if (typeof value !== 'string') {
+            return { table, action: op.action, rowId: op.rowId, column, targetRef, targetRowId: '' as B64Hash };
+        }
+
+        const [group, targetTable] = splitTableRef(targetRef);
+        if (group !== undefined) {
+            const foreign = await getForeignTableView(group, targetTable);
+            if (foreign === undefined || !await foreign.hasRow(value)) {
+                return { table, action: op.action, rowId: op.rowId, column, targetRef, targetRowId: value };
+            }
+        } else {
+            const provided = localTargetProvided?.(targetTable, value);
+            if (provided === false) {
+                return { table, action: op.action, rowId: op.rowId, column, targetRef, targetRowId: value };
+            }
+            if (provided === undefined && !await (await getTableView(targetTable)).hasRow(value)) {
+                return { table, action: op.action, rowId: op.rowId, column, targetRef, targetRowId: value };
+            }
+        }
+    }
+
+    return undefined;
 }

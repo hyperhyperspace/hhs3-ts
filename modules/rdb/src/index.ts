@@ -25,6 +25,8 @@ export * from "./rtable_group/validate.js";
 export * from "./rtable_group/validate_ops.js";
 export * from "./rtable_group/scopes.js";
 export * from "./rtable_group/delta.js";
+export * from "./rtable_group/op_delta.js";
+export * from "./rtable_group/op_void.js";
 export * from "./rtable_group/interfaces.js";
 export * from "./rtable_group/group.js";
 

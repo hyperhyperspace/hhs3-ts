@@ -13,7 +13,7 @@ export function normalizeGroupDelta(delta: RTableGroupDelta) {
     const tables = [...delta.nested.entries()]
         .map(([id, child]) => ({ tableId: id, changes: child.changes as RTableChanges }))
         .sort((a, b) => a.tableId.localeCompare(b.tableId));
-    return { schemaChanges: delta.schemaChanges, tables };
+    return { schemaChanges: delta.schemaChanges, opVerdictChanges: delta.opVerdictChanges, tables };
 }
 
 function versionLabel(v: Version): string {

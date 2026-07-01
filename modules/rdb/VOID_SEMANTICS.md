@@ -127,6 +127,9 @@ seniority special case (senior cap survives). It was removed because the cache
 broke convergence and the special case only covered the isolated 2-cycle. The
 analysis below is the principled version that special case was reaching for.
 
+Group delta's op channel attaches structured void reasons via `explainEntryVoided`
+(a sibling of `isEntryVoided` sharing the same `diagnoseEntryVoided` traversal).
+
 ## 5. Reentrancy note
 
 `_voidVisiting` is an instance field mutated across `await` points. JS is
