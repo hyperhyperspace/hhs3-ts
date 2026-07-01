@@ -51,10 +51,13 @@ C-SQL statements terminate with `;` (multi-line and paste supported). Backslash 
 \key create|unlock ...        \keys \whoami \author   key + identity mgmt
 \alias \aliases \unalias      name #hash prefixes
 \output table|json|vertical   \hash-width \hash-labels   display
+\ref-auto-update on|off       auto UPDATE REF for bound observers (on in REPL, off in scripts)
 \dump schema|group|database <name>
 \delta schema|group <name> <start> <end>
 \quit
 ```
+
+After a mutating write on a table group, `\ref-auto-update on` (the REPL default) finds every loaded group that binds the written group and issues `UPDATE REF` recursively, so cross-group FK targets stay current without manual ref-advances. Each automatic ref-update prints a line like `updated ref on shop_prod to #abc…` (suppressed in `--json` output mode). Override with `RDB_REF_AUTO_UPDATE=on|off`.
 
 ## Test
 

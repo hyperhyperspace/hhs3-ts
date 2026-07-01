@@ -50,6 +50,7 @@ export class WorkspaceSession {
     outputMode: OutputMode;
     hashWidth: HashWidth;
     hashLabels: boolean;
+    refAutoUpdate: boolean;
     stopOnError = true;
 
     constructor(options: WorkspaceSessionOptions) {
@@ -58,6 +59,7 @@ export class WorkspaceSession {
         this.outputMode = options.outputMode ?? 'table';
         this.hashWidth = options.hashWidth ?? parseHashWidthEnv() ?? 'auto';
         this.hashLabels = options.hashLabels ?? parseHashLabelsEnv() ?? false;
+        this.refAutoUpdate = parseRefAutoUpdateEnv() ?? false;
     }
 
     // Create a new key in the vault and add it to the unlocked set. Like
@@ -125,12 +127,18 @@ export class WorkspaceSession {
         this.hashLabels = on;
     }
 
+    setRefAutoUpdate(on: boolean): void {
+        this.refAutoUpdate = on;
+    }
+
     enableReplDefaults(): void {
         if (parseHashLabelsEnv() === undefined) this.hashLabels = true;
+        if (parseRefAutoUpdateEnv() === undefined) this.refAutoUpdate = true;
     }
 
     enableScriptDefaults(): void {
         if (parseHashWidthEnv() === undefined) this.hashWidth = 'full';
+        if (parseRefAutoUpdateEnv() === undefined) this.refAutoUpdate = false;
     }
 
     setVariable(name: string, value: LangValue): void {
@@ -232,4 +240,12 @@ function parseHashLabelsEnv(): boolean | undefined {
     if (raw === 'on' || raw === 'true' || raw === '1') return true;
     if (raw === 'off' || raw === 'false' || raw === '0') return false;
     throw new Error(`Invalid RDB_HASH_LABELS '${raw}' (expected on or off)`);
+}
+
+function parseRefAutoUpdateEnv(): boolean | undefined {
+    const raw = process.env.RDB_REF_AUTO_UPDATE?.trim().toLowerCase();
+    if (raw === undefined || raw.length === 0) return undefined;
+    if (raw === 'on' || raw === 'true' || raw === '1') return true;
+    if (raw === 'off' || raw === 'false' || raw === '0') return false;
+    throw new Error(`Invalid RDB_REF_AUTO_UPDATE '${raw}' (expected on or off)`);
 }

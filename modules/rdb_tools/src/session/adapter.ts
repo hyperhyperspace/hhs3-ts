@@ -16,6 +16,7 @@ import {
 
 import { KeyPassphraseRequiredError } from "./session.js";
 import { WorkspaceSession } from "./session.js";
+import { extractRefUpdateTrigger, propagateRefUpdates } from "./ref_auto_update.js";
 import {
     frontierForScope,
     hashScopeForVersionScope,
@@ -25,6 +26,7 @@ import type { RootResolveContext } from "../workspace/root_index.js";
 
 export type StatementRunResult = {
     result: LangExecutionResult;
+    notices?: string[];
 };
 
 export type ScriptRunResult = {
@@ -92,7 +94,12 @@ export async function runLanguageText(session: WorkspaceSession, text: string): 
             });
         }
 
-        results.push({ result });
+        const trigger = extractRefUpdateTrigger(bound.value);
+        const notices = session.refAutoUpdate && trigger !== undefined
+            ? await propagateRefUpdates(session, trigger.sourceGroupId, trigger.author)
+            : undefined;
+
+        results.push({ result, notices });
     }
 
     return { results };

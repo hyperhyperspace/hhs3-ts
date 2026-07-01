@@ -4,8 +4,7 @@ import { createInterface } from "node:readline/promises";
 
 import { scanStatement } from "@hyper-hyper-space/hhs3_rdb_lang";
 
-import { formatJson } from "../format/json.js";
-import { formatTableResult } from "../format/table.js";
+import { renderStatementOutput } from "../format/table.js";
 import { runLanguageWithUnlock } from "../script/run_command.js";
 import { WorkspaceSession } from "../session/session.js";
 import { runMetaCommand } from "./meta.js";
@@ -68,9 +67,7 @@ export async function startRepl(session: WorkspaceSession): Promise<void> {
         try {
             const run = await runLanguageWithUnlock(session, buffer, { rl });
             for (const item of run.results) {
-                const rendered = session.outputMode === 'json'
-                    ? formatJson(item.result)
-                    : formatTableResult(item.result, session);
+                const rendered = renderStatementOutput(session, item);
                 if (rendered.length > 0) output.write(rendered + '\n');
             }
         } catch (e) {

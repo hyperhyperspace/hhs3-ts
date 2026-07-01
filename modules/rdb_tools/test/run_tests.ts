@@ -827,13 +827,16 @@ const tests = [
             await withSession(async (session) => {
                 assertEquals(session.hashLabels, false, 'base session defaults labels off');
                 assertEquals(session.hashWidth, 'auto', 'base session defaults hash-width auto');
+                assertEquals(session.refAutoUpdate, false, 'base session defaults ref-auto-update off');
 
                 session.enableScriptDefaults();
                 assertEquals(session.hashWidth, 'full', 'script defaults hash-width full');
                 assertEquals(session.hashLabels, false, 'script defaults labels still off');
+                assertEquals(session.refAutoUpdate, false, 'script defaults ref-auto-update off');
 
                 session.enableReplDefaults();
                 assertEquals(session.hashLabels, true, 'repl defaults labels on');
+                assertEquals(session.refAutoUpdate, true, 'repl defaults ref-auto-update on');
             });
         },
     },
@@ -896,6 +899,68 @@ const tests = [
             });
         },
     },
+    {
+        name: '[RDB_TOOLS31] ref-auto-update meta command',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const off = await runMetaCommand(session, '\\ref-auto-update off');
+                assertEquals(off.output, 'ref-auto-update off', 'meta off output');
+                assertEquals(session.refAutoUpdate, false, 'session ref-auto-update off');
+
+                const on = await runMetaCommand(session, '\\ref-auto-update on');
+                assertEquals(on.output, 'ref-auto-update on', 'meta on output');
+                assertEquals(session.refAutoUpdate, true, 'session ref-auto-update on');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS32] ref-auto-update propagates to bound observers',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, crossGroupSetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                session.setRefAutoUpdate(true);
+                const inserted = await runCommand(session, "INSERT INTO users.identities (name) VALUES ('ada');");
+                assertEquals(inserted.exitCode, 0, inserted.output);
+                assertTrue(inserted.output.includes('updated ref on shop_prod to #'), inserted.output);
+
+                session.setOutputMode('json');
+                const selected = await runCommand(session, 'SELECT * FROM users.identities;');
+                assertEquals(selected.exitCode, 0, selected.output);
+                const parsed = JSON.parse(selected.output) as { rows: { rowId: string }[] };
+                const prefix = parsed.rows[0].rowId.slice(0, 8);
+                session.setOutputMode('table');
+                const order = await runCommand(session, `INSERT INTO shop_prod.orders (customer, label) VALUES (#${prefix}, 'o1');`);
+                assertEquals(order.exitCode, 0, order.output);
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS33] ref-auto-update notices suppressed in json output mode',
+        invoke: async () => {
+            await withSession(async (session) => {
+                await runScript(session, crossGroupSetupScript());
+                session.setRefAutoUpdate(true);
+                session.setOutputMode('json');
+                const inserted = await runCommand(session, "INSERT INTO users.identities (name) VALUES ('bob');");
+                assertEquals(inserted.exitCode, 0, inserted.output);
+                assertTrue(!inserted.output.includes('updated ref on'), inserted.output);
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS34] ref-auto-update off by default in scripts',
+        invoke: async () => {
+            await withSession(async (session) => {
+                await runScript(session, crossGroupSetupScript());
+                assertEquals(session.refAutoUpdate, false, 'script mode leaves ref-auto-update off');
+                const inserted = await runCommand(session, "INSERT INTO users.identities (name) VALUES ('carl');");
+                assertEquals(inserted.exitCode, 0, inserted.output);
+                assertTrue(!inserted.output.includes('updated ref on'), inserted.output);
+            });
+        },
+    },
 ];
 
 async function runCommandNonInteractive(session: WorkspaceSession, command: string) {
@@ -953,6 +1018,24 @@ CREATE TABLEGROUP shop_prod USING SCHEMA shop;
 INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');
 SELECT sku, name FROM shop_prod.products;
 LOG shop_prod LIMIT 5;
+`;
+}
+
+function crossGroupSetupScript(): string {
+    return `
+\\key create alice correct
+\\author alice
+CREATE SCHEMA users_schema CREATORS ($me) AS (
+  TABLE identities (name string) ALLOW all IF true
+);
+CREATE TABLEGROUP users USING SCHEMA users_schema;
+CREATE SCHEMA shop CREATORS ($me) AS (
+  TABLE orders (
+    customer string REFERENCES users.identities,
+    label string
+  ) ALLOW all IF true
+);
+CREATE TABLEGROUP shop_prod USING SCHEMA shop BIND users => users;
 `;
 }
 

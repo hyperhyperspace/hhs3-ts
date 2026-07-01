@@ -55,6 +55,7 @@ export async function runMetaCommand(session: WorkspaceSession, line: string): P
         case 'output': return { handled: true, output: setOutput(session, args[0]) };
         case 'hash-width': return { handled: true, output: setHashWidth(session, args[0]) };
         case 'hash-labels': return { handled: true, output: setHashLabels(session, args[0]) };
+        case 'ref-auto-update': return { handled: true, output: setRefAutoUpdate(session, args[0]) };
         case 'dump': return { handled: true, output: await dump(session, args) };
         case 'delta': return { handled: true, output: await runDeltaCommand(session, args) };
         default: return { handled: true, output: `Unknown meta-command \\${command}` };
@@ -250,6 +251,12 @@ function setHashLabels(session: WorkspaceSession, mode: string | undefined): str
     return `hash-labels ${mode}`;
 }
 
+function setRefAutoUpdate(session: WorkspaceSession, mode: string | undefined): string {
+    if (mode !== 'on' && mode !== 'off') throw new Error('Usage: \\ref-auto-update on|off');
+    session.setRefAutoUpdate(mode === 'on');
+    return `ref-auto-update ${mode}`;
+}
+
 async function dump(session: WorkspaceSession, args: string[]): Promise<string> {
     const [kind, name] = args;
     const dumpRender = (extra?: RenderOptions): RenderOptions => createDumpRenderOptions(session, extra);
@@ -369,7 +376,7 @@ function helpText(): string {
         '\\key create <label> [passphrase], \\key unlock <label|#prefix> [passphrase], \\keys, \\whoami',
         '\\author [<label|#prefix> [passphrase]|nobody]  (set/show default author; unlocks if needed; \\author nobody clears it)',
         '\\use database <name>, \\use group <name>, \\view, \\frontier [group]',
-        '\\alias [scope] <name> <#prefix>, \\aliases [scope], \\unalias <scope> <name>, \\output table|json|vertical, \\hash-width auto|full|<N>, \\hash-labels on|off, \\dump schema|group|database <name> [full|schema]',
+        '\\alias [scope] <name> <#prefix>, \\aliases [scope], \\unalias <scope> <name>, \\output table|json|vertical, \\hash-width auto|full|<N>, \\hash-labels on|off, \\ref-auto-update on|off, \\dump schema|group|database <name> [full|schema]',
         '\\delta schema|group <name> <start> <end> [bounded|full]  (schema = spec migrations; group = rows + schema + op void flips + reasons)',
         '\\quit',
         '\\help commands [filter]  (C-SQL reference)',

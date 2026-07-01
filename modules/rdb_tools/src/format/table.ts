@@ -2,15 +2,24 @@ import type { Row } from "@hyper-hyper-space/hhs3_rdb";
 import type { LangExecutionResult } from "@hyper-hyper-space/hhs3_rdb_lang";
 
 import type { WorkspaceSession } from "../session/session.js";
+import type { StatementRunResult } from "../session/adapter.js";
 import {
     collectTruncatableFromResult,
     collectTruncatableStrings,
     createDisplayContext,
 } from "./display.js";
+import { formatJson } from "./json.js";
 import { formatLog } from "./log.js";
 import { formatRows, formatRowsVertical } from "./rows.js";
 
 export { formatRows, formatRowsVertical } from "./rows.js";
+
+export function renderStatementOutput(session: WorkspaceSession, item: StatementRunResult): string {
+    if (session.outputMode === 'json') return formatJson(item.result);
+    const main = formatTableResult(item.result, session);
+    const lines = [main, ...(item.notices ?? [])].filter((line) => line.length > 0);
+    return lines.join('\n');
+}
 
 export function formatTableResult(
     result: LangExecutionResult,

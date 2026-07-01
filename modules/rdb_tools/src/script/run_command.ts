@@ -2,8 +2,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { createInterface, type Interface } from "node:readline/promises";
 
 import { formatDiagnostics } from "../format/diagnostics.js";
-import { formatJson } from "../format/json.js";
-import { formatTableResult } from "../format/table.js";
+import { renderStatementOutput } from "../format/table.js";
 import { runMetaCommand } from "../repl/meta.js";
 import {
     confirmStatementUnlock,
@@ -70,9 +69,7 @@ export async function runCommand(
 
         const run = await runLanguageWithUnlock(session, command, { rl: options?.rl });
         const rendered = run.results
-            .map((item) => session.outputMode === 'json'
-                ? formatJson(item.result)
-                : formatTableResult(item.result, session))
+            .map((item) => renderStatementOutput(session, item))
             .filter((text) => text.length > 0)
             .join('\n');
         return { exitCode: 0, output: rendered };
