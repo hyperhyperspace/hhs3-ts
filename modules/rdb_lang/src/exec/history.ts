@@ -16,7 +16,7 @@ export async function executeLog(bound: BoundLog): Promise<LogLangResult> {
     const limited = bound.ast.limit === undefined
         ? visible.slice(offset)
         : visible.slice(offset, offset + bound.ast.limit);
-    const prefixes = uniquePrefixes(allEntries.map((e) => e.hash));
+    const prefixes = uniquePrefixes(hashesForPrefixes(allEntries));
 
     return {
         kind: 'log',
@@ -78,6 +78,15 @@ function summarizePayload(payload: json.Literal): string {
     if (action === 'schema-update') return 'schema-update';
     if (action !== undefined) return action;
     return 'unknown';
+}
+
+function hashesForPrefixes(entries: Entry[]): B64Hash[] {
+    const hashes = new Set<B64Hash>();
+    for (const entry of entries) {
+        hashes.add(entry.hash);
+        for (const prev of json.fromSet(entry.header.prevEntryHashes) as B64Hash[]) hashes.add(prev);
+    }
+    return [...hashes];
 }
 
 function uniquePrefixes(hashes: B64Hash[]): Map<B64Hash, string> {
