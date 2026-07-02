@@ -50,12 +50,23 @@ export async function fulfillPassphraseNeed(
 }
 
 export async function confirmStatementUnlock(rl: Interface, displayName: string): Promise<void> {
+    if (!await confirmUnlockForSign(rl, displayName)) {
+        throw new KeyUnlockDeclinedError(displayName);
+    }
+}
+
+export async function confirmSignRetry(rl: Interface, authorLabel: string, op: string): Promise<boolean> {
+    const answer = (await rl.question(
+        `${op} needs ${authorLabel}. Sign and retry? [Y/n] `,
+    )).trim().toLowerCase();
+    return answer !== 'n' && answer !== 'no';
+}
+
+export async function confirmUnlockForSign(rl: Interface, displayName: string): Promise<boolean> {
     const answer = (await rl.question(
         `Key ${displayName} needed to sign statement, unlock? [Y/n] `,
     )).trim().toLowerCase();
-    if (answer === 'n' || answer === 'no') {
-        throw new KeyUnlockDeclinedError(displayName);
-    }
+    return answer !== 'n' && answer !== 'no';
 }
 
 export function keyDisplayLabel(session: WorkspaceSession, labelOrPrefix: string): string {

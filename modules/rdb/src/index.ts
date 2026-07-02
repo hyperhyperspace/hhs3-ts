@@ -29,6 +29,7 @@ export * from "./rtable_group/op_delta.js";
 export * from "./rtable_group/op_void.js";
 export * from "./rtable_group/interfaces.js";
 export * from "./rtable_group/group.js";
+export { evaluatePredicate, evaluateRowOpRestriction } from "./rtable_group/predicates.js";
 
 // Users: a standard identities-provider + capabilities RTableGroup
 export * from "./users/users.js";

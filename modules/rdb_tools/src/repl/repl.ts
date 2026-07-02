@@ -4,7 +4,9 @@ import { createInterface } from "node:readline/promises";
 
 import { scanStatement } from "@hyper-hyper-space/hhs3_rdb_lang";
 
+import { formatDiagnostics } from "../format/diagnostics.js";
 import { renderStatementOutput } from "../format/table.js";
+import { LanguageError } from "../session/adapter.js";
 import { runLanguageWithUnlock } from "../script/run_command.js";
 import { WorkspaceSession } from "../session/session.js";
 import { runMetaCommand } from "./meta.js";
@@ -73,6 +75,8 @@ export async function startRepl(session: WorkspaceSession): Promise<void> {
         } catch (e) {
             if (e instanceof KeyUnlockDeclinedError) {
                 // User declined unlock; return to the main prompt without an error line.
+            } else if (e instanceof LanguageError) {
+                output.write(formatDiagnostics(e.diagnostics, undefined, e.hints) + '\n');
             } else {
                 output.write((e instanceof Error ? e.message : String(e)) + '\n');
             }

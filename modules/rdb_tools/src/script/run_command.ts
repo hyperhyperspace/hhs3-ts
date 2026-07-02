@@ -30,7 +30,7 @@ export async function runLanguageWithUnlock(
 ): Promise<ScriptRunResult> {
     while (true) {
         try {
-            return await runLanguageText(session, text);
+            return await runLanguageText(session, text, options);
         } catch (e) {
             if (e instanceof KeyUnlockDeclinedError) throw e;
             const required = keyPassphraseRequiredFromError(e);
@@ -78,7 +78,7 @@ export async function runCommand(
             return { exitCode: 1, output: 'unlock declined' };
         }
         if (e instanceof LanguageError) {
-            return { exitCode: 2, output: formatDiagnostics(e.diagnostics, file) };
+            return { exitCode: 2, output: formatDiagnostics(e.diagnostics, file, e.hints) };
         }
         return { exitCode: 1, output: e instanceof Error ? e.message : String(e) };
     }

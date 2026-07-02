@@ -16,6 +16,8 @@ import {
 
 import { KeyPassphraseRequiredError } from "./session.js";
 import { WorkspaceSession } from "./session.js";
+import { suggestAuthorsForBindFailure, suggestAuthorsForFailure, type ReplAuthContext } from "./authz_suggest.js";
+import { tryAuthSignRetry, tryBindAuthorRetry } from "./sign_retry.js";
 import { extractRefUpdateTrigger, propagateRefUpdates } from "./ref_auto_update.js";
 import {
     frontierForScope,
@@ -32,6 +34,8 @@ export type StatementRunResult = {
 export type ScriptRunResult = {
     results: StatementRunResult[];
 };
+
+export type RunLanguageTextOptions = ReplAuthContext;
 
 function rootCtx(session: WorkspaceSession): RootResolveContext {
     return { aliases: session.aliases };
@@ -67,20 +71,44 @@ export function createBindContext(session: WorkspaceSession): LangBindContext {
     };
 }
 
-export async function runLanguageText(session: WorkspaceSession, text: string): Promise<ScriptRunResult> {
+export async function runLanguageText(
+    session: WorkspaceSession,
+    text: string,
+    options?: RunLanguageTextOptions,
+): Promise<ScriptRunResult> {
     const parsed = parseScript(text);
     if (!parsed.ok) throw new LanguageError(parsed.diagnostics);
 
     const results: StatementRunResult[] = [];
     const context = createBindContext(session);
     for (const statement of parsed.value.statements) {
-        const bound = await bind(statement, context);
-        if (!bound.ok) throw new LanguageError(bound.diagnostics);
+        let bound = await bind(statement, context);
+        if (!bound.ok) {
+            const retried = await tryBindAuthorRetry(session, statement, bound.diagnostics, context, options);
+            if (retried !== undefined) {
+                bound = { ok: true, value: retried };
+            } else {
+                const hint = await suggestAuthorsForBindFailure(session, statement, bound.diagnostics, context);
+                throw new LanguageError(bound.diagnostics, hint === undefined ? [] : [hint]);
+            }
+        }
 
         const executed = await execute(bound.value);
-        if (!executed.ok) throw new LanguageError(executed.diagnostics);
+        let effectiveBound = bound.value;
+        let result: LangExecutionResult;
+        if (!executed.ok) {
+            const retried = await tryAuthSignRetry(session, bound.value, executed.diagnostics, options);
+            if (retried !== undefined) {
+                effectiveBound = retried.bound;
+                result = retried.result;
+            } else {
+                const hint = await suggestAuthorsForFailure(session, bound.value, executed.diagnostics);
+                throw new LanguageError(executed.diagnostics, hint === undefined ? [] : [hint]);
+            }
+        } else {
+            result = executed.value;
+        }
 
-        const result = executed.value;
         if (result.kind === 'create-plan') {
             const object = await session.workspace.createRoot(result.plan);
             if (result.plan.kind === 'create-database') session.setCurrentDatabase(object.getId());
@@ -94,9 +122,9 @@ export async function runLanguageText(session: WorkspaceSession, text: string): 
             });
         }
 
-        const trigger = extractRefUpdateTrigger(bound.value);
+        const trigger = extractRefUpdateTrigger(effectiveBound);
         const notices = session.refAutoUpdate && trigger !== undefined
-            ? await propagateRefUpdates(session, trigger.sourceGroupId, trigger.author)
+            ? await propagateRefUpdates(session, trigger.sourceGroupId, trigger.author, options)
             : undefined;
 
         results.push({ result, notices });
@@ -106,7 +134,7 @@ export async function runLanguageText(session: WorkspaceSession, text: string): 
 }
 
 export class LanguageError extends Error {
-    constructor(readonly diagnostics: LangDiagnostic[]) {
+    constructor(readonly diagnostics: LangDiagnostic[], readonly hints: string[] = []) {
         super(diagnostics.map((d) => `${d.code}: ${d.message}`).join('\n'));
     }
 }

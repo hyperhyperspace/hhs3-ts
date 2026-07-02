@@ -1,5 +1,6 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { stdin as input } from "node:process";
+import type { Interface } from "node:readline/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -13,9 +14,11 @@ import { runMetaCommand } from "../src/repl/meta.js";
 import { promptForSession } from "../src/repl/prompt.js";
 import { runCommand } from "../src/script/run_command.js";
 import { runScript } from "../src/script/run_script.js";
+import { evaluateObserveGateKey, scanKeystore } from "../src/session/authz_suggest.js";
 import { resolveRowIdPrefix } from "../src/session/adapter.js";
 import { WorkspaceSession } from "../src/session/session.js";
 import { Workspace } from "../src/workspace/workspace.js";
+import { RTableGroupImpl } from "@hyper-hyper-space/hhs3_rdb";
 import { formatRows, formatRowsVertical } from "../src/format/rows.js";
 import {
     isTruncatable,
@@ -961,6 +964,258 @@ const tests = [
             });
         },
     },
+    {
+        name: '[RDB_TOOLS35] ref-auto-update resolves gated observe author from keystore',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, gatedCrossGroupSetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                session.setRefAutoUpdate(true);
+                await runMetaCommand(session, '\\author nobody');
+                const inserted = await runCommand(session, "INSERT INTO users.identities (name) VALUES ('ada');");
+                assertEquals(inserted.exitCode, 0, inserted.output);
+                assertTrue(inserted.output.includes('updated ref on doc to #'), inserted.output);
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS36] ref-auto-update reports locked keystore author for gated observe',
+        invoke: async () => {
+            const dir = await mkdtemp(join(tmpdir(), 'rdb-tools-'));
+            const dbPath = join(dir, 'dev.db');
+            try {
+                const workspace1 = await Workspace.open({ path: dbPath });
+                const keystore1 = await KeyStore.open(`${dbPath}.keys.json`, workspace1.replica.getHashSuite());
+                const session1 = new WorkspaceSession({ workspace: workspace1, keystore: keystore1 });
+                const setup = await runScript(session1, gatedBobManagerSetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+                await workspace1.close();
+
+                const workspace2 = await Workspace.open({ path: dbPath });
+                const keystore2 = await KeyStore.open(`${dbPath}.keys.json`, workspace2.replica.getHashSuite());
+                const session2 = new WorkspaceSession({ workspace: workspace2, keystore: keystore2 });
+                try {
+                    await session2.unlockKey('alice', 'correct');
+                    session2.setRefAutoUpdate(true);
+                    await runMetaCommand(session2, '\\author nobody');
+                    const inserted = await runCommandNonInteractive(
+                        session2,
+                        "INSERT INTO users.identities (name) VALUES ('mallory');",
+                    );
+                    assertEquals(inserted.exitCode, 0, inserted.output);
+                    assertTrue(inserted.output.includes('needs $bob (locked)'), inserted.output);
+                } finally {
+                    await workspace2.close();
+                }
+            } finally {
+                await rm(dir, { recursive: true, force: true });
+            }
+        },
+    },
+    {
+        name: '[RDB_TOOLS37] validation failure suggests keystore author',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, setupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                const group = session.workspace.roots.list('group')[0];
+                const table = await (group.object as RTableGroupImpl).getTable('products');
+                const rowId = (await (await table.getView()).liveRowIds())[0];
+
+                const anonymous = new WorkspaceSession({ workspace: session.workspace, keystore: session.keystore });
+                const del = await runCommand(
+                    anonymous,
+                    `DELETE FROM shop_prod.products WHERE rowId = '${rowId}';`,
+                );
+                assertEquals(del.exitCode, 2, del.output);
+                assertTrue(del.output.includes('hint: BY $alice'), del.output);
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS38] scanKeystore finds observe-gate satisfying keys',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, gatedCrossGroupSetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                const docRoot = session.workspace.roots.list('group').find((root) => root.name === 'doc');
+                const usersRoot = session.workspace.roots.list('group').find((root) => root.name === 'users');
+                if (docRoot?.object === undefined || usersRoot === undefined) throw new Error('missing groups');
+
+                const doc = docRoot.object as RTableGroupImpl;
+                const users = usersRoot.object as RTableGroupImpl;
+                const at = await (await users.getScopedDag()).getFrontier();
+                const candidates = await scanKeystore(
+                    session,
+                    (keyId) => evaluateObserveGateKey(doc, usersRoot.id, at, at, keyId),
+                );
+                assertEquals(candidates.length, 1, 'one manager-cap key');
+                assertEquals(candidates[0].label, 'alice', 'alice holds manager cap');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS39] REPL sign-and-retry succeeds without validation error',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, gatedCapsSetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                await runMetaCommand(session, '\\author nobody');
+                const inserted = await runCommandInteractive(
+                    session,
+                    "INSERT INTO user.caps (label, grantee) VALUES ('writer', 'carl');",
+                    ['Y'],
+                );
+                assertEquals(inserted.exitCode, 0, inserted.output);
+                assertTrue(inserted.output.includes('inserted '), inserted.output);
+                assertTrue(!inserted.output.includes('VALIDATION_REJECTED'), inserted.output);
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS40] explicit BY NOBODY skips sign-and-retry',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, gatedCapsSetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                await runMetaCommand(session, '\\author nobody');
+                let prompts = 0;
+                const inserted = await runCommandInteractive(
+                    session,
+                    "INSERT INTO user.caps (label, grantee) VALUES ('writer', 'carl') BY NOBODY;",
+                    [],
+                    () => { prompts++; return 'Y'; },
+                );
+                assertEquals(inserted.exitCode, 2, inserted.output);
+                assertTrue(inserted.output.includes('VALIDATION_REJECTED'), inserted.output);
+                assertTrue(inserted.output.includes('hint: BY $admin'), inserted.output);
+                assertEquals(prompts, 0, 'no sign-and-retry prompt');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS41] explicit BY failing key skips sign-and-retry',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, gatedCapsSetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                await runMetaCommand(session, '\\author nobody');
+                let prompts = 0;
+                const inserted = await runCommandInteractive(
+                    session,
+                    "INSERT INTO user.caps (label, grantee) VALUES ('writer', 'carl') BY $bob;",
+                    [],
+                    () => { prompts++; return 'Y'; },
+                );
+                assertEquals(inserted.exitCode, 2, inserted.output);
+                assertTrue(inserted.output.includes('VALIDATION_REJECTED'), inserted.output);
+                assertTrue(inserted.output.includes('hint: BY $admin'), inserted.output);
+                assertEquals(prompts, 0, 'no sign-and-retry prompt');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS42] declined sign-and-retry shows validation error and hint',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, gatedCapsSetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                await runMetaCommand(session, '\\author nobody');
+                const inserted = await runCommandInteractive(
+                    session,
+                    "INSERT INTO user.caps (label, grantee) VALUES ('writer', 'carl');",
+                    ['n'],
+                );
+                assertEquals(inserted.exitCode, 2, inserted.output);
+                assertTrue(inserted.output.includes('VALIDATION_REJECTED'), inserted.output);
+                assertTrue(inserted.output.includes('hint: BY $admin'), inserted.output);
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS43] bind-author retry succeeds for ALTER SCHEMA',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, setupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                await runMetaCommand(session, '\\author nobody');
+                const altered = await runCommandInteractive(
+                    session,
+                    'ALTER SCHEMA shop AS (ADD COLUMN products.tag string NULL);',
+                    ['Y'],
+                );
+                assertEquals(altered.exitCode, 0, altered.output);
+                assertTrue(!altered.output.includes('BIND_UNKNOWN_NAME'), altered.output);
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS44] explicit BY NOBODY skips bind-author retry',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, setupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                await runMetaCommand(session, '\\author nobody');
+                let prompts = 0;
+                const altered = await runCommandInteractive(
+                    session,
+                    'ALTER SCHEMA shop AS (ADD COLUMN products.tag string NULL) BY NOBODY;',
+                    [],
+                    () => { prompts++; return 'Y'; },
+                );
+                assertEquals(altered.exitCode, 2, altered.output);
+                assertTrue(altered.output.includes('BIND_UNKNOWN_NAME'), altered.output);
+                assertTrue(altered.output.includes('hint: BY $alice'), altered.output);
+                assertEquals(prompts, 0, 'no bind-author retry prompt');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS45] declined bind-author retry shows error and hint',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, setupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                await runMetaCommand(session, '\\author nobody');
+                const altered = await runCommandInteractive(
+                    session,
+                    'ALTER SCHEMA shop AS (ADD COLUMN products.tag string NULL);',
+                    ['n'],
+                );
+                assertEquals(altered.exitCode, 2, altered.output);
+                assertTrue(altered.output.includes('BIND_UNKNOWN_NAME'), altered.output);
+                assertTrue(altered.output.includes('hint: BY $alice'), altered.output);
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS46] bind-author retry succeeds for ADD TABLEGROUP',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, addMemberBindRetrySetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                await runMetaCommand(session, '\\author nobody');
+                const added = await runCommandInteractive(
+                    session,
+                    'ADD TABLEGROUP shop_prod TO app;',
+                    ['Y'],
+                );
+                assertEquals(added.exitCode, 0, added.output);
+                assertTrue(!added.output.includes('BIND_UNKNOWN_NAME'), added.output);
+            });
+        },
+    },
 ];
 
 async function runCommandNonInteractive(session: WorkspaceSession, command: string) {
@@ -968,6 +1223,28 @@ async function runCommandNonInteractive(session: WorkspaceSession, command: stri
     try {
         (input as NodeJS.ReadStream & { isTTY?: boolean }).isTTY = false;
         return await runCommand(session, command);
+    } finally {
+        (input as NodeJS.ReadStream & { isTTY?: boolean }).isTTY = wasTty;
+    }
+}
+
+async function runCommandInteractive(
+    session: WorkspaceSession,
+    command: string,
+    answers: string[],
+    onQuestion?: () => string,
+): Promise<Awaited<ReturnType<typeof runCommand>>> {
+    const wasTty = input.isTTY;
+    let i = 0;
+    const rl = {
+        question: async () => {
+            if (onQuestion !== undefined) return onQuestion();
+            return answers[i++] ?? '';
+        },
+    } as unknown as Interface;
+    try {
+        (input as NodeJS.ReadStream & { isTTY?: boolean }).isTTY = true;
+        return await runCommand(session, command, undefined, { rl });
     } finally {
         (input as NodeJS.ReadStream & { isTTY?: boolean }).isTTY = wasTty;
     }
@@ -1039,6 +1316,70 @@ CREATE TABLEGROUP shop_prod USING SCHEMA shop BIND users => users;
 `;
 }
 
+function gatedCapsSetupScript(): string {
+    return `
+\\key create admin correct
+\\author admin
+CREATE SCHEMA users_schema CREATORS ($me) AS (
+  TABLE identities (name string) ALLOW all IF true,
+  TABLE caps (
+    label string PUB,
+    grantee string PUB
+  ) ALLOW insert IF EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
+);
+CREATE TABLEGROUP user USING SCHEMA users_schema
+  WITH ROWS (
+    caps (uuid='61169c8a-4106-43a1-8d37-39373c07da7a', label='manager', grantee=$me)
+  );
+\\key create bob correct
+`;
+}
+
+function gatedCrossGroupSetupScript(): string {
+    return `
+\\key create alice correct
+\\author alice
+CREATE SCHEMA users_schema CREATORS ($me) AS (
+  TABLE identities (name string) ALLOW all IF true,
+  TABLE caps (label string PUB, grantee string PUB) ALLOW all IF true
+);
+CREATE TABLEGROUP users USING SCHEMA users_schema;
+INSERT INTO users.caps (label, grantee) VALUES ('manager', $me);
+CREATE SCHEMA doc_schema CREATORS ($me) AS (
+  TABLE notes (
+    body string NULL REFERENCES users.identities,
+    label string
+  ) ALLOW all IF true
+);
+CREATE TABLEGROUP doc USING SCHEMA doc_schema
+  BIND users => users
+  ALLOW UPDATE REF users IF EXISTS caps WHERE label = 'manager' AND grantee = $author;
+`;
+}
+
+function gatedBobManagerSetupScript(): string {
+    return `
+\\key create alice correct
+\\author alice
+CREATE SCHEMA users_schema CREATORS ($me) AS (
+  TABLE identities (name string) ALLOW all IF true,
+  TABLE caps (label string PUB, grantee string PUB) ALLOW all IF true
+);
+CREATE TABLEGROUP users USING SCHEMA users_schema;
+\\key create bob correct
+INSERT INTO users.caps (label, grantee) VALUES ('manager', $bob);
+CREATE SCHEMA doc_schema CREATORS ($me) AS (
+  TABLE notes (
+    body string NULL REFERENCES users.identities,
+    label string
+  ) ALLOW all IF true
+);
+CREATE TABLEGROUP doc USING SCHEMA doc_schema
+  BIND users => users
+  ALLOW UPDATE REF users IF EXISTS caps WHERE label = 'manager' AND grantee = $author;
+`;
+}
+
 function capsSetupScript(): string {
     return `
 \\key create alice correct
@@ -1051,6 +1392,22 @@ CREATE SCHEMA user CREATORS ($me) AS (
 );
 CREATE TABLEGROUP user USING SCHEMA user;
 INSERT INTO user.caps (label, grantee) VALUES ('manager', $me);
+`;
+}
+
+function addMemberBindRetrySetupScript(): string {
+    return `
+\\key create alice correct
+\\author alice
+CREATE DATABASE app CREATORS ($me);
+CREATE SCHEMA shop CREATORS ($me) AS (
+  TABLE products (
+    sku string PUB READONLY,
+    name string
+  )
+);
+CREATE TABLEGROUP shop_prod USING SCHEMA shop;
+ADD SCHEMA shop TO app BY $alice;
 `;
 }
 

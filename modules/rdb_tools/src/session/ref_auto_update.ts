@@ -1,11 +1,18 @@
+import { stdin as input } from "node:process";
+
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
-import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import { refVersionAtOrAbove } from "@hyper-hyper-space/hhs3_mvt";
 import type { RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 import { RTableGroupImpl } from "@hyper-hyper-space/hhs3_rdb";
 import type { BoundStatement } from "@hyper-hyper-space/hhs3_rdb_lang";
 
 import { formatDisplayString } from "../format/display.js";
+import { confirmStatementUnlock, fulfillKeyPassphrase } from "../repl/passphrase.js";
+import {
+    labelForKeyId,
+    ReplAuthContext,
+    resolveObserveAuthor,
+} from "./authz_suggest.js";
 import { WorkspaceSession } from "./session.js";
 
 export type RefUpdateTrigger = {
@@ -83,7 +90,7 @@ async function loadForeignGroup(session: WorkspaceSession, foreignGroupId: B64Ha
 async function isAlreadyObserved(
     observer: RTableGroup,
     foreignGroupId: B64Hash,
-    targetVersion: Version,
+    targetVersion: import("@hyper-hyper-space/hhs3_mvt").Version,
     foreignGroup: RTableGroupImpl,
 ): Promise<boolean> {
     const view = await observer.getView();
@@ -96,10 +103,52 @@ function pairKey(observerId: B64Hash, foreignId: B64Hash): string {
     return `${observerId}:${foreignId}`;
 }
 
+async function observeWithResolvedAuthor(
+    session: WorkspaceSession,
+    observer: RTableGroup,
+    observerId: B64Hash,
+    bindingName: string,
+    foreignGroupId: B64Hash,
+    targetVersion: import("@hyper-hyper-space/hhs3_mvt").Version,
+    triggerAuthor: OwnIdentity | undefined,
+    auth?: ReplAuthContext,
+): Promise<B64Hash> {
+    const impl = observer as RTableGroupImpl;
+    const refAt = targetVersion;
+    const refFrom = targetVersion;
+
+    if (impl.observeGateFor(foreignGroupId) === undefined) {
+        return observer.observe(bindingName, targetVersion, triggerAuthor);
+    }
+
+    const preferred = [triggerAuthor, await session.currentAuthor()];
+    const resolution = await resolveObserveAuthor(session, impl, foreignGroupId, refAt, refFrom, preferred);
+
+    if (resolution.identity !== undefined) {
+        return observer.observe(bindingName, targetVersion, resolution.identity);
+    }
+
+    if (resolution.locked !== undefined && input.isTTY && auth?.rl !== undefined) {
+        const label = resolution.locked.label;
+        await confirmStatementUnlock(auth.rl, labelForKeyId(session, resolution.locked.keyId));
+        await fulfillKeyPassphrase(session, { kind: 'unlock', label }, auth.rl);
+        const identity = session.resolveIdentity(label);
+        if (identity === undefined) throw new Error(`Key '${label}' is not unlocked`);
+        return observer.observe(bindingName, targetVersion, identity);
+    }
+
+    if (resolution.locked !== undefined) {
+        throw new Error(`needs ${labelForKeyId(session, resolution.locked.keyId)} (locked)`);
+    }
+
+    throw new Error('no keystore identity satisfies gate');
+}
+
 export async function propagateRefUpdates(
     session: WorkspaceSession,
     sourceGroupId: B64Hash,
     author: OwnIdentity | undefined,
+    auth?: ReplAuthContext,
 ): Promise<string[]> {
     const notices: string[] = [];
     const visitedPairs = new Set<string>();
@@ -120,7 +169,16 @@ export async function propagateRefUpdates(
                     continue;
                 }
 
-                const entryHash = await observer.observe(bindingName, targetVersion, author);
+                const entryHash = await observeWithResolvedAuthor(
+                    session,
+                    observer,
+                    observerId,
+                    bindingName,
+                    foreignGroupId,
+                    targetVersion,
+                    author,
+                    auth,
+                );
                 visitedPairs.add(key);
                 notices.push(formatRefAutoUpdateNotice(session, observerId, entryHash));
                 queue.push(observerId);

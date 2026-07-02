@@ -57,7 +57,7 @@ C-SQL statements terminate with `;` (multi-line and paste supported). Backslash 
 \quit
 ```
 
-After a mutating write on a table group, `\ref-auto-update on` (the REPL default) finds every loaded group that binds the written group and issues `UPDATE REF` recursively, so cross-group FK targets stay current without manual ref-advances. Each automatic ref-update prints a line like `updated ref on shop_prod to #abc…` (suppressed in `--json` output mode). Override with `RDB_REF_AUTO_UPDATE=on|off`.
+After a mutating write on a table group, `\ref-auto-update on` (the REPL default) finds every loaded group that binds the written group and issues `UPDATE REF` recursively, so cross-group FK targets stay current without manual ref-advances. Each automatic ref-update prints a line like `updated ref on shop_prod to #abc…` (suppressed in `--json` output mode). For gated `ALLOW UPDATE REF` bindings, the tool scans the local keystore for an identity that satisfies the gate (read-only predicate check); the REPL may prompt to unlock a matching key. Validation failures on auth-related rules may include a `hint: BY $label` line suggesting a keystore identity that would satisfy the gate. In the interactive REPL, when a statement omits an explicit `BY` clause and a keystore identity would satisfy the auth rule, the tool may prompt to sign and retry instead of showing the validation error first; explicit `BY` (including `NOBODY` or a failing key) shows the error and hint only. The same sign-and-retry flow applies at bind time for `ALTER SCHEMA` and `ADD SCHEMA` / `ADD TABLEGROUP` when an author is required and `BY` is omitted. Override with `RDB_REF_AUTO_UPDATE=on|off`.
 
 ## Test
 
