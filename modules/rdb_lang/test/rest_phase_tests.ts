@@ -105,7 +105,10 @@ class TestAliasContext implements RenderAliasContext {
     private readonly versionCounters = new Map<B64Hash, number>();
     private keyCounter = 0;
 
-    constructor(private readonly keyLabels = new Map<B64Hash, string>()) {}
+    constructor(
+        private readonly keyLabels = new Map<B64Hash, string>(),
+        private readonly keyPublicKeys = new Map<B64Hash, string>(),
+    ) {}
 
     key(keyId: B64Hash, hint?: string): string {
         return this.ensure('key', keyId, hint ?? this.keyLabels.get(keyId) ?? `keyId${++this.keyCounter}`);
@@ -137,6 +140,19 @@ class TestAliasContext implements RenderAliasContext {
         const out = [...this.pending];
         this.pending.length = 0;
         return out;
+    }
+
+    lookupKeyAlias(keyId: B64Hash): string | undefined {
+        return this.hashToName.get(`key:${keyId}`);
+    }
+
+    lookupPublicKeyAlias(serialized: string): string | undefined {
+        for (const [keyId, pubkey] of this.keyPublicKeys) {
+            if (pubkey !== serialized) continue;
+            const alias = this.lookupKeyAlias(keyId);
+            if (alias !== undefined) return alias;
+        }
+        return undefined;
     }
 
     private ensure(scope: string, hash: B64Hash, preferred: string): string {
@@ -524,6 +540,27 @@ export const restPhaseTests = {
                 const identities = payload.initialRows?.['identities'] as Array<{ values: { [key: string]: unknown } }> | undefined;
                 assertEquals(identities?.[0].values['keyId'], admin.keyId, 'plain identity value resolves to keyId');
                 assertEquals(identities?.[0].values['publicKey'], serializePublicKeyToBase64(admin.publicKey), 'publicKey() serializes public key');
+
+                const aliases = new TestAliasContext(
+                    new Map([[admin.keyId, 'admin']]),
+                    new Map([[admin.keyId, serializePublicKeyToBase64(admin.publicKey)]]),
+                );
+                aliases.key(admin.keyId);
+                const aliasedGroup = renderCreateTableGroup(payload, { aliasMode: true, aliases });
+                assertTrue(aliasedGroup.includes('keyId=$admin'), 'aliased WITH ROWS uses $admin for keyId');
+                assertTrue(aliasedGroup.includes('publicKey=publicKey($admin)'), 'aliased WITH ROWS uses publicKey($admin)');
+                assertTrue(aliasedGroup.includes('grantee=$admin'), 'aliased WITH ROWS uses $admin for grantee');
+                const withRows = aliasedGroup.slice(aliasedGroup.indexOf('WITH ROWS'));
+                assertTrue(!withRows.includes(admin.keyId), 'aliased WITH ROWS omits raw keyId literals');
+
+                const unregisteredAliases = new TestAliasContext(
+                    new Map([[admin.keyId, 'admin']]),
+                    new Map([[admin.keyId, serializePublicKeyToBase64(admin.publicKey)]]),
+                );
+                const literalGroup = renderCreateTableGroup(payload, { aliasMode: true, aliases: unregisteredAliases });
+                assertTrue(literalGroup.includes(`keyId='${admin.keyId}'`), 'unregistered alias keeps keyId literal');
+                assertTrue(literalGroup.includes(`publicKey='${serializePublicKeyToBase64(admin.publicKey)}'`),
+                    'unregistered alias keeps publicKey literal');
 
                 const group = await ctx.createObject(payload) as RTableGroupImpl;
                 lang.registerGroup('users', group);

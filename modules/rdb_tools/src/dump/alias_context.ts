@@ -1,11 +1,14 @@
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 import type { RenderAliasContext, RenderVersionScope } from "@hyper-hyper-space/hhs3_rdb_lang";
 
+import { decodePublicKey } from "../keys/identity.js";
 import type { AliasScope } from "../session/aliases.js";
 import type { WorkspaceSession } from "../session/session.js";
 
 type DumpAliasHints = {
     keyLabels?: Map<B64Hash, string>;
+    keyPublicKeys?: Map<B64Hash, string>;
     schemaNames?: Map<B64Hash, string>;
     groupNames?: Map<B64Hash, string>;
     dbNames?: Map<B64Hash, string>;
@@ -58,6 +61,19 @@ export class DumpAliasContext implements RenderAliasContext {
         return out;
     }
 
+    lookupKeyAlias(keyId: B64Hash): string | undefined {
+        return this.hashToName.get(`key:${keyId}`);
+    }
+
+    lookupPublicKeyAlias(serialized: string): string | undefined {
+        for (const [keyId, pubkey] of this.hints.keyPublicKeys ?? []) {
+            if (pubkey !== serialized) continue;
+            const alias = this.lookupKeyAlias(keyId);
+            if (alias !== undefined) return alias;
+        }
+        return undefined;
+    }
+
     private ensure(scope: AliasScope, hash: B64Hash, preferred: string): string {
         const existing = this.hashToName.get(`${scope}:${hash}`);
         if (existing !== undefined) return existing;
@@ -103,8 +119,12 @@ export class DumpAliasContext implements RenderAliasContext {
 
 export function createDumpAliasContext(session: WorkspaceSession): DumpAliasContext {
     const keyLabels = new Map<B64Hash, string>();
+    const keyPublicKeys = new Map<B64Hash, string>();
     if (session.keystore !== undefined) {
-        for (const key of session.keystore.list()) keyLabels.set(key.keyId, key.label);
+        for (const key of session.keystore.list()) {
+            keyLabels.set(key.keyId, key.label);
+            keyPublicKeys.set(key.keyId, serializePublicKeyToBase64(decodePublicKey(key.publicKey)));
+        }
     }
 
     const schemaNames = new Map<B64Hash, string>();
@@ -117,7 +137,7 @@ export function createDumpAliasContext(session: WorkspaceSession): DumpAliasCont
         if (root.kind === 'database') dbNames.set(root.id, root.name);
     }
 
-    return new DumpAliasContext({ keyLabels, schemaNames, groupNames, dbNames });
+    return new DumpAliasContext({ keyLabels, keyPublicKeys, schemaNames, groupNames, dbNames });
 }
 
 export function createDumpRenderOptions(session: WorkspaceSession, extra?: import("@hyper-hyper-space/hhs3_rdb_lang").RenderOptions) {

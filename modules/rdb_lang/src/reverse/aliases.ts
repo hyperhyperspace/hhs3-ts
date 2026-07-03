@@ -17,4 +17,8 @@ export interface RenderAliasContext {
     version(hash: B64Hash, scope: RenderVersionScope): string;
     /** `\alias` lines not yet emitted for the upcoming statement */
     drainDefinitions(): string[];
+    /** Returns alias name if this keyId was already registered via key(); does not allocate */
+    lookupKeyAlias?(keyId: B64Hash): string | undefined;
+    /** Returns alias name if serialized public key matches a registered key with known public key */
+    lookupPublicKeyAlias?(serialized: string): string | undefined;
 }

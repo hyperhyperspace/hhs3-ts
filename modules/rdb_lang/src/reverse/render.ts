@@ -284,11 +284,27 @@ function renderMigrationRule(rule: MigrationRule): string {
 }
 
 function renderInitialRow(table: string, row: InsertRowPayload, options?: RenderOptions): string {
-    const parts = Object.entries(row.values).map(([k, v]) => `${k}=${renderLiteral(v)}`);
+    const parts = Object.entries(row.values).map(([k, v]) => renderRowValue(k, v, options));
     if (isFullProfile(options) && row.uuid !== undefined) {
         parts.unshift(`uuid=${sqlString(row.uuid)}`);
     }
     return `${table} (${parts.join(', ')})`;
+}
+
+function renderRowValue(column: string, value: json.Literal, options?: RenderOptions): string {
+    if (!useAliases(options) || typeof value !== 'string') {
+        return `${column}=${renderLiteral(value)}`;
+    }
+    const aliases = options!.aliases!;
+    if (column === 'publicKey' && aliases.lookupPublicKeyAlias !== undefined) {
+        const name = aliases.lookupPublicKeyAlias(value);
+        if (name !== undefined) return `${column}=publicKey($${name})`;
+    }
+    if (aliases.lookupKeyAlias !== undefined) {
+        const name = aliases.lookupKeyAlias(value as B64Hash);
+        if (name !== undefined) return `${column}=$${name}`;
+    }
+    return `${column}=${renderLiteral(value)}`;
 }
 
 function renderLiteral(value: json.Literal): string {
