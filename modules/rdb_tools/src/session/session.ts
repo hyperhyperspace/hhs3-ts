@@ -51,6 +51,7 @@ export class WorkspaceSession {
     hashWidth: HashWidth;
     hashLabels: boolean;
     refAutoUpdate: boolean;
+    promptForKeys: boolean;
     stopOnError = true;
 
     constructor(options: WorkspaceSessionOptions) {
@@ -60,6 +61,7 @@ export class WorkspaceSession {
         this.hashWidth = options.hashWidth ?? parseHashWidthEnv() ?? 'auto';
         this.hashLabels = options.hashLabels ?? parseHashLabelsEnv() ?? false;
         this.refAutoUpdate = parseRefAutoUpdateEnv() ?? false;
+        this.promptForKeys = parsePromptForKeysEnv() ?? false;
     }
 
     // Create a new key in the vault and add it to the unlocked set. Like
@@ -129,6 +131,10 @@ export class WorkspaceSession {
 
     setRefAutoUpdate(on: boolean): void {
         this.refAutoUpdate = on;
+    }
+
+    setPromptForKeys(on: boolean): void {
+        this.promptForKeys = on;
     }
 
     enableReplDefaults(): void {
@@ -248,4 +254,12 @@ function parseRefAutoUpdateEnv(): boolean | undefined {
     if (raw === 'on' || raw === 'true' || raw === '1') return true;
     if (raw === 'off' || raw === 'false' || raw === '0') return false;
     throw new Error(`Invalid RDB_REF_AUTO_UPDATE '${raw}' (expected on or off)`);
+}
+
+function parsePromptForKeysEnv(): boolean | undefined {
+    const raw = process.env.RDB_PROMPT_KEYS?.trim().toLowerCase();
+    if (raw === undefined || raw.length === 0) return undefined;
+    if (raw === 'on' || raw === 'true' || raw === '1') return true;
+    if (raw === 'off' || raw === 'false' || raw === '0') return false;
+    throw new Error(`Invalid RDB_PROMPT_KEYS '${raw}' (expected on or off)`);
 }

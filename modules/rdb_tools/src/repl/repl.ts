@@ -67,8 +67,12 @@ export async function startRepl(session: WorkspaceSession): Promise<void> {
         if (!isComplete(buffer)) return { quit: false };
 
         try {
-            const run = await runLanguageWithUnlock(session, buffer, { rl });
+            const run = await runLanguageWithUnlock(session, buffer, {
+                rl,
+                onProgress: (line) => output.write(line + '\n'),
+            });
             for (const item of run.results) {
+                if (item.mainStreamed) continue;
                 const rendered = renderStatementOutput(session, item);
                 if (rendered.length > 0) output.write(rendered + '\n');
             }

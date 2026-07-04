@@ -22,6 +22,10 @@ async function parseBind(sql: string, context: ReturnType<typeof createTestBindC
     return bound.value;
 }
 
+function isObject(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 export const phase1VerticalTests = {
     title: '[RDB_LANG:PHASE1] Vertical execution',
     tests: [
@@ -75,7 +79,11 @@ export const phase1VerticalTests = {
                 assertTrue(log.ok && log.value.kind === 'log', 'log executes');
                 if (!log.ok || log.value.kind !== 'log') return;
                 assertTrue(log.value.rows.length >= 2, 'group log includes create and row entries');
-                assertTrue(log.value.rows.some((r) => r.action === 'row'), 'group log summarizes row op');
+                assertTrue(log.value.rows.some((r) => isObject(r.payload) && r.payload['action'] === 'row'), 'group log includes row op');
+                const rowEntry = log.value.rows.find((r) => isObject(r.payload) && r.payload['action'] === 'row');
+                assertEquals(rowEntry?.void, false, 'live row op is OK');
+                const createEntry = log.value.rows.find((r) => isObject(r.payload) && r.payload['action'] === 'create');
+                assertEquals(createEntry?.void, undefined, 'create entry has no verdict');
             },
         },
     ],

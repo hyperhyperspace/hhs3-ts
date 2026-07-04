@@ -17,7 +17,7 @@ import { buildAlterColumnsOf } from "../compile/rule_scope.js";
 import { lowerSelectQuery } from "../compile/query.js";
 import type {
     LangBindContext, LangValue, ResolvedDatabaseRef, ResolvedGroupRef, ResolvedLogTarget, ResolvedSchemaRef,
-    ResolvedTableRef,
+    ResolvedTableRef, VersionScope,
 } from "./context.js";
 import { asIdentity, asJsonLiteral, asKeyId, resolveCreator, resolveValue } from "./values.js";
 
@@ -185,7 +185,9 @@ export type BoundLog = {
     kind: 'log';
     ast: LogStatement;
     target: ResolvedLogTarget;
-    at?: Version;
+    at: Version;
+    from: Version;
+    explain: boolean;
 };
 
 export async function bind(statement: AstStatement, context: LangBindContext): Promise<Result<BoundStatement>> {
@@ -479,14 +481,33 @@ async function resolveTableRef(ref: TableRef, context: LangBindContext): Promise
     return context.resolveTable({ ...ref, group });
 }
 
+function versionScopeForLogTarget(target: ResolvedLogTarget): VersionScope {
+    switch (target.kind) {
+        case 'group':
+            return { kind: 'group', id: target.id, group: target.object };
+        case 'table':
+            return { kind: 'table', groupId: target.groupId, tableName: target.tableName, table: target.object };
+        case 'schema':
+            return { kind: 'schema', id: target.id, schema: target.object };
+        case 'database':
+            return { kind: 'object', id: target.id, object: target.object };
+    }
+}
+
 async function bindLog(ast: LogStatement, context: LangBindContext): Promise<BoundLog> {
+    if (ast.from !== undefined && ast.at === undefined) {
+        throw new Error('LOG FROM version requires AT');
+    }
     const target = await context.resolveLogTarget(ast.target);
-    const at = ast.at !== undefined
-        ? await context.resolveVersion(ast.at, { kind: 'object', id: target.id, object: target.object })
-        : undefined;
-    const bound: BoundLog = { kind: 'log', ast, target };
-    if (at !== undefined) bound.at = at;
-    return bound;
+    const scope = versionScopeForLogTarget(target);
+    const defaultView = ast.at === undefined ? await context.resolveDefaultView?.(scope) : undefined;
+    const at = ast.at === undefined && defaultView !== undefined
+        ? defaultView.at
+        : await context.resolveVersion(ast.at, scope);
+    const from = ast.at === undefined && defaultView?.from !== undefined
+        ? defaultView.from
+        : await context.resolveVersion(ast.from ?? ast.at, scope);
+    return { kind: 'log', ast, target, at, from, explain: ast.explain === true };
 }
 
 async function bindInsertColumns(

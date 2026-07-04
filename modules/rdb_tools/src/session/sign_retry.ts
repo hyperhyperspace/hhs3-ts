@@ -1,4 +1,3 @@
-import { stdin as input } from "node:process";
 import type { Interface } from "node:readline/promises";
 
 import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
@@ -14,6 +13,7 @@ import type {
 import { bind, execute } from "@hyper-hyper-space/hhs3_rdb_lang";
 
 import { confirmSignRetry, fulfillKeyPassphrase } from "../repl/passphrase.js";
+import { canPromptForKeys } from "../repl/prompt_tty.js";
 import {
     boundWithAuthor,
     hasExplicitBy,
@@ -110,7 +110,7 @@ export async function tryAuthSignRetry(
     diagnostics: LangDiagnostic[],
     options?: ReplAuthContext,
 ): Promise<AuthSignRetryResult | undefined> {
-    if (!input.isTTY || options?.rl === undefined) return undefined;
+    if (!canPromptForKeys(session) || options?.rl === undefined) return undefined;
     if (session.keystore === undefined) return undefined;
     if (!isAuthRelatedFailure(diagnostics)) return undefined;
     if (!isAuthRetryBound(bound)) return undefined;
@@ -139,7 +139,7 @@ export async function tryBindAuthorRetry(
     context: LangBindContext,
     options?: ReplAuthContext,
 ): Promise<BoundStatement | undefined> {
-    if (!input.isTTY || options?.rl === undefined) return undefined;
+    if (!canPromptForKeys(session) || options?.rl === undefined) return undefined;
     if (session.keystore === undefined) return undefined;
     if (!isBindAuthorRequiredFailure(diagnostics)) return undefined;
     if (!isBindAuthorRetryStatement(statement)) return undefined;

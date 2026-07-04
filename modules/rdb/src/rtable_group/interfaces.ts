@@ -13,6 +13,7 @@ import type { RSchemaView } from "../rschema/interfaces.js";
 import type { RTable, RTableView } from "../rtable/interfaces.js";
 import type { RowOpPayload } from "../rtable/payload.js";
 import type { RTableGroupDeltaStrategy } from "./delta.js";
+import type { OpVoidDetail } from "./op_void.js";
 
 // One write in a bundle: a row op tagged with its target table. The bundle
 // carries these in order (the bundle order; see RTableGroup.bundle).
@@ -62,6 +63,12 @@ export interface RTableGroup extends RObject, NestingParent {
     bundle(writes: BundleWrite[], author?: OwnIdentity, at?: Version): Promise<B64Hash>;
 
     getView(at?: Version, from?: Version): Promise<RTableGroupView>;
+
+    // Whether an entry is void (drop-on-void) at its own position observed from `from`.
+    isEntryVoided(entryHash: B64Hash, from: Version): Promise<boolean>;
+
+    // Structured void reason at `from`, when the entry is voided there.
+    explainEntryVoided(entryHash: B64Hash, from: Version): Promise<OpVoidDetail | undefined>;
 
     // Delta strategy: 'bounded' (default; projected-meet walk) or 'full'
     // (genesis recompute, the reference implementation). See computeDelta /

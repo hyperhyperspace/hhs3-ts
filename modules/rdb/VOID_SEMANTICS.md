@@ -135,13 +135,15 @@ Group delta's op channel attaches structured void reasons via `explainEntryVoide
 `_voidVisiting` is an instance field mutated across `await` points. JS is
 single-threaded, so this is not a data race, but it *is* an async-reentrancy
 hazard: two interleaved void computations on the same group instance would share
-one set. Today nothing on the read path fans out concurrently (predicate
-evaluation is strictly sequential `for … await`; there is no `Promise.all`), so
-the invariant "void computations are never interleaved per group instance"
-holds. If that ever changes, carry the visiting set as a per-computation value
-(e.g. stored on the `RTableViewImpl` recursion context and threaded through the
-two recursive view-construction sites in `computeEntryVoided` and
-`resolveForeignTableView`) instead of as an instance field.
+one set. Predicate evaluation elsewhere on the read path is strictly sequential
+(`for … await`; no `Promise.all`). `executeLog` in rdb_lang was updated to
+iterate log rows sequentially as well, so the invariant "void computations are
+never interleaved per group instance" is upheld by callers today but not enforced
+by the engine. If concurrent void evaluation is ever desired, carry the visiting
+set as a per-computation value (e.g. stored on the `RTableViewImpl` recursion
+context and threaded through the two recursive view-construction sites in
+`computeEntryVoided` and `resolveForeignTableView`) instead of as an instance
+field.
 
 ## 5.5 The gated observe: stratification by the observed version
 

@@ -2,26 +2,95 @@ import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { Entry } from "@hyper-hyper-space/hhs3_dag";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
-
+import type { CreateRDbPayload } from "@hyper-hyper-space/hhs3_rdb";
+import { formatOpVoidDetail, isVoidCheckable } from "@hyper-hyper-space/hhs3_rdb";
+import type { ResolvedLogTarget } from "../bind/context.js";
 import type { BoundLog } from "../bind/bind.js";
-import type { LogLangResult, LogRow } from "./result.js";
+import type { LogLangResult, LogRenderContext, LogRow } from "./result.js";
 
 export async function executeLog(bound: BoundLog): Promise<LogLangResult> {
     const dag = await bound.target.object.getScopedDag();
     const allEntries: Entry[] = [];
     for await (const entry of dag.loadAllEntries()) allEntries.push(entry);
 
-    const visible = bound.at === undefined ? allEntries : filterAt(allEntries, bound.at);
+    const visible = filterAt(allEntries, bound.at);
     const offset = bound.ast.offset ?? 0;
     const limited = bound.ast.limit === undefined
         ? visible.slice(offset)
         : visible.slice(offset, offset + bound.ast.limit);
 
+    const rows: LogRow[] = [];
+    for (const entry of limited) {
+        const row = toLogRow(entry);
+        if ((bound.target.kind === 'group' || bound.target.kind === 'table')
+            && isVoidCheckable(entry.payload)) {
+            row.void = await bound.target.object.isEntryVoided(entry.hash, bound.from);
+            if (bound.explain && row.void === true) {
+                const detail = await bound.target.object.explainEntryVoided(entry.hash, bound.from);
+                if (detail !== undefined) row.reason = formatOpVoidDetail(detail);
+            }
+        }
+        rows.push(row);
+    }
+
     return {
         kind: 'log',
         target: targetName(bound),
-        rows: limited.map((entry) => toLogRow(entry)),
+        explain: bound.explain,
+        renderContext: await buildLogRenderContext(bound.target),
+        rows,
     };
+}
+
+async function buildLogRenderContext(target: ResolvedLogTarget): Promise<LogRenderContext> {
+    switch (target.kind) {
+        case 'group': {
+            const group = target.object;
+            const groupId = group.getId();
+            const groupName = group.getName();
+            return {
+                schemaRef: group.getSchemaRef(),
+                groupRef: groupId,
+                groupName,
+                versionScope: { objectId: groupId, objectName: groupName },
+            };
+        }
+        case 'schema': {
+            const schema = target.object;
+            const schemaName = schema.getName();
+            return {
+                schemaRef: schema.getId(),
+                schemaName,
+                versionScope: { objectId: schema.getId(), objectName: schemaName },
+            };
+        }
+        case 'database': {
+            const db = target.object;
+            const dbId = db.getId();
+            const genesis = await (await db.getScopedDag()).loadEntry(dbId);
+            const databaseName = genesis === undefined
+                ? 'database'
+                : databaseNameFromPayload(genesis.payload);
+            return {
+                databaseName,
+                versionScope: { objectId: dbId, objectName: databaseName },
+            };
+        }
+        case 'table': {
+            const table = target.object;
+            const groupId = table.getGroupId();
+            return {
+                groupRef: groupId,
+                versionScope: { objectId: groupId, objectName: groupId },
+            };
+        }
+    }
+}
+
+function databaseNameFromPayload(payload: json.Literal): string {
+    if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return 'database';
+    const create = payload as CreateRDbPayload;
+    return create.name ?? create.seed ?? 'database';
 }
 
 function filterAt(entries: Entry[], at: Version): Entry[] {
@@ -39,51 +108,15 @@ function filterAt(entries: Entry[], at: Version): Entry[] {
 }
 
 function toLogRow(entry: Entry): LogRow {
-    const payload = entry.payload;
-    const action = payloadAction(payload);
-    const type = payloadType(payload);
-    const row: LogRow = {
+    return {
         hash: entry.hash,
         fullHash: entry.hash,
         prev: json.fromSet(entry.header.prevEntryHashes) as B64Hash[],
-        summary: summarizePayload(payload),
-        payload,
+        payload: entry.payload,
     };
-    if (action !== undefined) row.action = action;
-    if (type !== undefined) row.type = type;
-    return row;
-}
-
-function payloadAction(payload: json.Literal): string | undefined {
-    return isObject(payload) && typeof payload['action'] === 'string' ? payload['action'] : undefined;
-}
-
-function payloadType(payload: json.Literal): string | undefined {
-    return isObject(payload) && typeof payload['type'] === 'string' ? payload['type'] : undefined;
-}
-
-function summarizePayload(payload: json.Literal): string {
-    if (!isObject(payload)) return typeof payload;
-    const action = payloadAction(payload);
-    if (action === 'create') {
-        const name = typeof payload['name'] === 'string' ? ` ${payload['name']}` : '';
-        return `create${name}`;
-    }
-    if (action === 'row' && typeof payload['table'] === 'string') {
-        const op = isObject(payload['op']) && typeof payload['op']['action'] === 'string' ? payload['op']['action'] : 'row';
-        return `${op} ${payload['table']}`;
-    }
-    if (action === 'bundle') return 'bundle';
-    if (action === 'schema-update') return 'schema-update';
-    if (action !== undefined) return action;
-    return 'unknown';
 }
 
 function targetName(bound: BoundLog): string {
     if (bound.target.kind === 'table') return `${bound.target.groupId}.${bound.target.tableName}`;
     return bound.target.id;
-}
-
-function isObject(value: json.Literal): value is json.LiteralMap {
-    return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

@@ -167,8 +167,8 @@ export const LANG_COMMAND_REFS: readonly LangCommandRef[] = [
         command: 'LOG',
         section: 'query',
         kind: 'log',
-        syntax: 'LOG targetRef [AT version] [LIMIT n] [OFFSET n];',
-        description: 'Shows paginated operation history for a schema, table group, or database. Read-only.',
+        syntax: '[EXPLAIN] LOG targetRef [AT version] [FROM version] [LIMIT n] [OFFSET n];',
+        description: 'Shows paginated operation history for a schema, table group, or database. Group and table logs include status (OK/Cancelled) for void-checkable ops and a truncated reverse-render op preview. EXPLAIN adds a reason column (populated for Cancelled ops only). JSON output carries raw payload rows only. Read-only.',
     },
 ];
 

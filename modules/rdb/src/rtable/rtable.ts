@@ -65,6 +65,7 @@ import { signPayload as signPayloadHelper } from "@hyper-hyper-space/hhs3_mvt";
 import type { RSchemaView } from "../rschema/interfaces.js";
 import { deriveRowOpInnerMeta } from "../rtable_group/scopes.js";
 import type { RowEnvelopePayload } from "../rtable_group/payload.js";
+import type { OpVoidDetail } from "../rtable_group/op_void.js";
 
 import type { RTable as RTableContract, RTableView as RTableViewContract, RowValues } from "./interfaces.js";
 import { InsertRowPayload, UpdateRowPayload, DeleteRowPayload, RowOpPayload } from "./payload.js";
@@ -87,6 +88,7 @@ export type TableGroupHost = {
     validatePayload(payload: Payload, at: Version): Promise<ValidationResult>;
     makeTable(name: string): RTableImpl;
     isEntryVoided(entryHash: B64Hash, from: Version): Promise<boolean>;
+    explainEntryVoided(entryHash: B64Hash, from: Version): Promise<OpVoidDetail | undefined>;
     resolveForeignTableView(
         group: string, table: string, at: Version, from: Version,
     ): Promise<RTableViewContract | undefined>;
@@ -134,6 +136,10 @@ export class RTableImpl implements RTableContract {
     // several tables and voids as a unit); see isEntryVoided in group.ts.
     isEntryVoided(entryHash: B64Hash, from: Version): Promise<boolean> {
         return this.group.isEntryVoided(entryHash, from);
+    }
+
+    explainEntryVoided(entryHash: B64Hash, from: Version) {
+        return this.group.explainEntryVoided(entryHash, from);
     }
 
     // Write-time identity check: base delete-state liveness (no FK reach, no

@@ -1,5 +1,4 @@
-import { stdin as input, stdout as output } from "node:process";
-import { createInterface, type Interface } from "node:readline/promises";
+import type { Interface } from "node:readline/promises";
 
 import { formatDiagnostics } from "../format/diagnostics.js";
 import { renderStatementOutput } from "../format/table.js";
@@ -11,7 +10,14 @@ import {
     KeyUnlockDeclinedError,
     keyDisplayLabel,
 } from "../repl/passphrase.js";
-import { keyPassphraseRequiredFromError, LanguageError, runLanguageText, type ScriptRunResult } from "../session/adapter.js";
+import { canPromptForKeys, closePromptTty, createPromptInterface } from "../repl/prompt_tty.js";
+import {
+    keyPassphraseRequiredFromError,
+    LanguageError,
+    runLanguageText,
+    type RunLanguageTextOptions,
+    type ScriptRunResult,
+} from "../session/adapter.js";
 import { WorkspaceSession } from "../session/session.js";
 
 export type CommandRun = {
@@ -26,7 +32,7 @@ export type CommandRunOptions = {
 export async function runLanguageWithUnlock(
     session: WorkspaceSession,
     text: string,
-    options?: { rl?: Interface },
+    options?: RunLanguageTextOptions,
 ): Promise<ScriptRunResult> {
     while (true) {
         try {
@@ -35,17 +41,23 @@ export async function runLanguageWithUnlock(
             if (e instanceof KeyUnlockDeclinedError) throw e;
             const required = keyPassphraseRequiredFromError(e);
             if (required === undefined) throw e;
-            if (!input.isTTY) {
+            if (!canPromptForKeys(session)) {
                 throw new Error('passphrase required; use the REPL or pass it inline with -c');
             }
             const owned = options?.rl === undefined;
-            const activeRl = options?.rl ?? createInterface({ input, output });
+            const activeRl = options?.rl ?? createPromptInterface(session);
+            if (activeRl === undefined) {
+                throw new Error('passphrase required; use the REPL or pass it inline with -c');
+            }
             try {
                 const displayName = keyDisplayLabel(session, required.label);
                 await confirmStatementUnlock(activeRl, displayName);
                 await fulfillKeyPassphrase(session, { kind: 'unlock', label: required.label }, activeRl);
             } finally {
-                if (owned) activeRl.close();
+                if (owned) {
+                    activeRl.close();
+                    closePromptTty();
+                }
             }
         }
     }

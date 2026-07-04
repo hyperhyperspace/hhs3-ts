@@ -251,8 +251,10 @@ export type LogStatement = {
     kind: 'log';
     target: NameOrHashRef;
     at?: VersionExpr;
+    from?: VersionExpr;
     limit?: number;
     offset?: number;
+    explain?: boolean;
     span: TextSpan;
 };
 

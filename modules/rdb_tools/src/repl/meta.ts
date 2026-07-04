@@ -3,6 +3,7 @@ import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { RObject } from "@hyper-hyper-space/hhs3_mvt";
 import type { RSchema, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 
+import { runDumpOpCommand } from "../dump/op_command.js";
 import { runDeltaCommand } from "../delta/delta_command.js";
 import { createDumpRenderOptions } from "../dump/alias_context.js";
 import { createDisplayContext, formatDisplayString, formatSessionRows } from "../format/display.js";
@@ -260,6 +261,7 @@ function setRefAutoUpdate(session: WorkspaceSession, mode: string | undefined): 
 async function dump(session: WorkspaceSession, args: string[]): Promise<string> {
     const [kind, name] = args;
     const dumpRender = (extra?: RenderOptions): RenderOptions => createDumpRenderOptions(session, extra);
+    if (kind === 'op') return runDumpOpCommand(session, args.slice(1));
     if (kind === 'schema') {
         const schema = await session.workspace.roots.resolveSchema(ref(name), rootCtx(session));
         if (schema.schema === undefined) throw new Error('Schema is not loaded');
@@ -284,7 +286,7 @@ async function dump(session: WorkspaceSession, args: string[]): Promise<string> 
             render: dumpRender({ profile: mode }),
         });
     }
-    throw new Error('Usage: \\dump schema|group|database <name> [full|schema]');
+    throw new Error('Usage: \\dump schema|group|database <name> [full|schema] | \\dump op [group] #hash');
 }
 
 async function loadRootObject(session: WorkspaceSession, id: B64Hash): Promise<RObject> {
@@ -376,7 +378,7 @@ function helpText(): string {
         '\\key create <label> [passphrase], \\key unlock <label|#prefix> [passphrase], \\keys, \\whoami',
         '\\author [<label|#prefix> [passphrase]|nobody]  (set/show default author; unlocks if needed; \\author nobody clears it)',
         '\\use database <name>, \\use group <name>, \\view, \\frontier [group]',
-        '\\alias [scope] <name> <#prefix>, \\aliases [scope], \\unalias <scope> <name>, \\output table|json|vertical, \\hash-width auto|full|<N>, \\hash-labels on|off, \\ref-auto-update on|off, \\dump schema|group|database <name> [full|schema]',
+        '\\alias [scope] <name> <#prefix>, \\aliases [scope], \\unalias <scope> <name>, \\output table|json|vertical, \\hash-width auto|full|<N>, \\hash-labels on|off, \\ref-auto-update on|off, \\dump schema|group|database <name> [full|schema], \\dump op [group] #hash',
         '\\delta schema|group <name> <start> <end> [bounded|full]  (schema = spec migrations; group = rows + schema + op void flips + reasons)',
         '\\quit',
         '\\help commands [filter]  (C-SQL reference)',

@@ -11,6 +11,7 @@ export const scannerTests = {
                 assertEquals(scanStatement('CREATE DATABASE db;').kind, 'complete');
                 assertEquals(scanStatement('SELECT * FROM t.products;').kind, 'complete');
                 assertEquals(scanStatement('LOG shop;').kind, 'complete');
+                assertEquals(scanStatement('EXPLAIN LOG shop;').kind, 'complete');
             },
         },
         {

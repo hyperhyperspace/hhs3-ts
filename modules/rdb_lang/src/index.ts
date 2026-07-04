@@ -18,6 +18,7 @@ export * from "./exec/execute.js";
 
 export * from "./reverse/aliases.js";
 export * from "./reverse/render.js";
+export * from "./reverse/log_line.js";
 export * from "./reverse/planner.js";
 export * from "./reverse/dump.js";
 

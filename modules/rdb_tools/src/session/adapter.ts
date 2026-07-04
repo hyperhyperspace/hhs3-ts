@@ -16,6 +16,7 @@ import {
 
 import { KeyPassphraseRequiredError } from "./session.js";
 import { WorkspaceSession } from "./session.js";
+import { renderStatementMain } from "../format/table.js";
 import { suggestAuthorsForBindFailure, suggestAuthorsForFailure, type ReplAuthContext } from "./authz_suggest.js";
 import { tryAuthSignRetry, tryBindAuthorRetry } from "./sign_retry.js";
 import { extractRefUpdateTrigger, propagateRefUpdates } from "./ref_auto_update.js";
@@ -29,6 +30,7 @@ import type { RootResolveContext } from "../workspace/root_index.js";
 export type StatementRunResult = {
     result: LangExecutionResult;
     notices?: string[];
+    mainStreamed?: boolean;
 };
 
 export type ScriptRunResult = {
@@ -122,12 +124,21 @@ export async function runLanguageText(
             });
         }
 
+        const item: StatementRunResult = { result, notices: undefined };
+        if (options?.onProgress !== undefined && session.outputMode !== 'json') {
+            const main = renderStatementMain(session, item);
+            if (main.length > 0) {
+                options.onProgress(main);
+                item.mainStreamed = true;
+            }
+        }
+
         const trigger = extractRefUpdateTrigger(effectiveBound);
-        const notices = session.refAutoUpdate && trigger !== undefined
+        item.notices = session.refAutoUpdate && trigger !== undefined
             ? await propagateRefUpdates(session, trigger.sourceGroupId, trigger.author, options)
             : undefined;
 
-        results.push({ result, notices });
+        results.push(item);
     }
 
     return { results };

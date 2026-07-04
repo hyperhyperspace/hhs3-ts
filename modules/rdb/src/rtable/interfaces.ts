@@ -10,6 +10,7 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import type { RObject, Version, View } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RowQuery } from "./query.js";
+import type { OpVoidDetail } from "../rtable_group/op_void.js";
 
 export type RowValues = { [column: string]: json.Literal };
 
@@ -49,6 +50,12 @@ export interface RTable extends RObject {
     delete(rowId: B64Hash, author?: OwnIdentity, at?: Version): Promise<B64Hash>;
 
     getView(at?: Version, from?: Version): Promise<RTableView>;
+
+    // Entry voiding is the group's computation; see RTableGroup.isEntryVoided.
+    isEntryVoided(entryHash: B64Hash, from: Version): Promise<boolean>;
+
+    // Structured void reason at `from`, when the entry is voided there.
+    explainEntryVoided(entryHash: B64Hash, from: Version): Promise<OpVoidDetail | undefined>;
 }
 
 export interface RTableView extends View {

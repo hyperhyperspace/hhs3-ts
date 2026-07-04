@@ -1,7 +1,8 @@
+import { stdout as output } from "node:process";
 import type { Interface } from "node:readline/promises";
-import { stdin as input, stdout as output } from "node:process";
 
 import { formatDisplayString } from "../format/display.js";
+import { promptInputStream } from "./prompt_tty.js";
 import { WorkspaceSession } from "../session/session.js";
 
 export function promptForSession(session: WorkspaceSession, continuation = false): string {
@@ -24,25 +25,26 @@ function keyDisplayName(session: WorkspaceSession): string {
 }
 
 export async function promptSecret(rl: Interface, query: string): Promise<string> {
-    if (!input.isTTY) throw new Error('passphrase required; use the REPL or pass it inline with -c');
+    const promptIn = promptInputStream();
 
     return new Promise((resolve, reject) => {
         let password = '';
-        const wasRaw = input.isRaw;
-        const keypressListeners = input.listeners('keypress') as Array<(str: string, key: unknown) => void>;
+        const wasRaw = promptIn.isRaw;
+        const keypressListeners = promptIn.listeners('keypress') as Array<(str: string, key: unknown) => void>;
 
         output.write(query);
         rl.pause();
-        input.removeAllListeners('keypress');
-        input.setRawMode(true);
-        input.resume();
-        input.setEncoding('utf8');
+        promptIn.removeAllListeners('keypress');
+        promptIn.setRawMode(true);
+        promptIn.resume();
+        promptIn.setEncoding('utf8');
 
         const cleanup = () => {
-            input.removeListener('data', onData);
-            if (input.isTTY) input.setRawMode(wasRaw);
-            for (const listener of keypressListeners) input.on('keypress', listener);
-            rl.resume();
+            promptIn.removeListener('data', onData);
+            if (promptIn.isTTY) promptIn.setRawMode(wasRaw);
+            promptIn.pause();
+            for (const listener of keypressListeners) promptIn.on('keypress', listener);
+            rl.pause();
         };
 
         const onData = (char: string) => {
@@ -67,6 +69,6 @@ export async function promptSecret(rl: Interface, query: string): Promise<string
             }
         };
 
-        input.on('data', onData);
+        promptIn.on('data', onData);
     });
 }

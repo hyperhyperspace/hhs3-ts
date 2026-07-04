@@ -27,13 +27,21 @@ npx rdb my.db -c "SELECT * FROM g.t;"
 # run a script file
 npx rdb my.db -f script.sql
 
+# run a script from stdin
+npx rdb my.db < script.sql
+npx rdb my.db -f -
+
+# prompt for locked keys when running scripts (reads passphrases from the terminal)
+npx rdb my.db -k -f script.sql
+npx rdb my.db -k < script.sql
+
 # JSON output instead of tables
 npx rdb my.db --json
 ```
 
 This is a local workspace bin, not published to npm. Plain `npx rdb` outside the monorepo will not work until we release this package.
 
-Scripts are C-SQL statements separated by `;`, `--` line comments, and `\` meta-commands, one per line. `-c`/`-f` exit non-zero on error.
+Scripts are C-SQL statements separated by `;`, `--` line comments, and `\` meta-commands, one per line. `-c`, `-f`, and stdin scripts use script mode (ref-auto-update off, full hash width) and exit non-zero on error. By default, scripts fail when a locked key is needed; pass `-k` (or `--prompt-keys`, or set `RDB_PROMPT_KEYS=on`) to prompt for passphrases on the terminal instead.
 
 Keys live in a keystore at `~/.rdb/keys.json`. Override with `RDB_KEYSTORE` (full path) or `RDB_HOME` (dir).
 
@@ -52,12 +60,15 @@ C-SQL statements terminate with `;` (multi-line and paste supported). Backslash 
 \alias \aliases \unalias      name #hash prefixes
 \output table|json|vertical   \hash-width \hash-labels   display
 \ref-auto-update on|off       auto UPDATE REF for bound observers (on in REPL, off in scripts)
-\dump schema|group|database <name>
+\dump schema|group|database <name> [full|schema]
+\dump op [group] #hash          reverse-render one group op
 \delta schema|group <name> <start> <end>
 \quit
 ```
 
 After a mutating write on a table group, `\ref-auto-update on` (the REPL default) finds every loaded group that binds the written group and issues `UPDATE REF` recursively, so cross-group FK targets stay current without manual ref-advances. Each automatic ref-update prints a line like `updated ref on shop_prod to #abc…` (suppressed in `--json` output mode). For gated `ALLOW UPDATE REF` bindings, the tool scans the local keystore for an identity that satisfies the gate (read-only predicate check); the REPL may prompt to unlock a matching key. Validation failures on auth-related rules may include a `hint: BY $label` line suggesting a keystore identity that would satisfy the gate. In the interactive REPL, when a statement omits an explicit `BY` clause and a keystore identity would satisfy the auth rule, the tool may prompt to sign and retry instead of showing the validation error first; explicit `BY` (including `NOBODY` or a failing key) shows the error and hint only. The same sign-and-retry flow applies at bind time for `ALTER SCHEMA` and `ADD SCHEMA` / `ADD TABLEGROUP` when an author is required and `BY` is omitted. Override with `RDB_REF_AUTO_UPDATE=on|off`.
+
+`EXPLAIN LOG` adds a `reason` column for Cancelled group/table ops (void restriction, FK, observe-gate, etc.).
 
 ## Test
 

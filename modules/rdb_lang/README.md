@@ -88,7 +88,8 @@ Queries and history:
 ```sql
 SET VIEW AT {#at} FROM {#from};
 SELECT sku, name FROM shop_prod.products WHERE name LIKE 'Wid%' ORDER BY sku LIMIT 10;
-LOG shop_prod LIMIT 20;
+LOG shop_prod LIMIT 20;  -- table/vertical: truncated reverse-render op preview; JSON: raw payload only
+EXPLAIN LOG shop_prod LIMIT 20;  -- adds reason column for Cancelled group/table ops
 ```
 
 

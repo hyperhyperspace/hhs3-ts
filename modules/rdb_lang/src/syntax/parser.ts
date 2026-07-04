@@ -74,6 +74,17 @@ class Parser {
         }
         if (this.matchKeyword('INSERT')) return this.parseInsert(this.previous().span);
         if (this.matchKeyword('SELECT')) return this.parseSelect(this.previous().span);
+        if (this.matchKeyword('EXPLAIN')) {
+            const explainStart = this.previous().span;
+            if (!this.matchKeyword('LOG')) {
+                this.expected('LOG');
+                return undefined;
+            }
+            const stmt = this.parseLog(this.previous().span);
+            stmt.explain = true;
+            stmt.span = combineSpans(explainStart, stmt.span);
+            return stmt;
+        }
         if (this.matchKeyword('LOG')) return this.parseLog(this.previous().span);
 
         this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected token '${tok.text}'`, tok.span);
@@ -760,6 +771,7 @@ class Parser {
     private parseLog(start: TextSpan): LogStatement {
         const target = this.parseNameOrHash();
         let at: VersionExpr | undefined;
+        let from: VersionExpr | undefined;
         let limit: number | undefined;
         let offset: number | undefined;
         let end = target.span;
@@ -767,6 +779,9 @@ class Parser {
             if (this.matchKeyword('AT')) {
                 at = this.parseVersion();
                 end = at.span;
+            } else if (this.matchKeyword('FROM')) {
+                from = this.parseVersion();
+                end = from.span;
             } else if (this.matchKeyword('LIMIT')) {
                 limit = this.expectInteger('LIMIT');
                 end = this.previous().span;
@@ -780,6 +795,7 @@ class Parser {
         }
         const stmt: LogStatement = { kind: 'log', target, span: combineSpans(start, end) };
         if (at !== undefined) stmt.at = at;
+        if (from !== undefined) stmt.from = from;
         if (limit !== undefined) stmt.limit = limit;
         if (offset !== undefined) stmt.offset = offset;
         return stmt;

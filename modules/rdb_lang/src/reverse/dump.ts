@@ -109,10 +109,14 @@ async function dumpRDbMembershipOps(
     return statements.join('\n\n');
 }
 
-export async function dumpGroupCreate(group: RTableGroup & LoggableObject, options?: DumpOptions): Promise<string> {
+export async function dumpGroupEntry(
+    group: RTableGroup & LoggableObject,
+    entryHash: B64Hash,
+    options?: DumpOptions,
+): Promise<string | undefined> {
     const dag = await group.getScopedDag();
-    const entry = await dag.loadEntry(group.getId());
-    if (entry === undefined) throw new Error('Tablegroup genesis entry not found');
+    const entry = await dag.loadEntry(entryHash);
+    if (entry === undefined) return undefined;
     const groupId = group.getId();
     const groupName = group.getName();
     return renderStatement(entry.payload, {
@@ -123,6 +127,12 @@ export async function dumpGroupCreate(group: RTableGroup & LoggableObject, optio
         versionScope: { objectId: groupId, objectName: groupName },
         at: entry.header.prevEntryHashes,
     });
+}
+
+export async function dumpGroupCreate(group: RTableGroup & LoggableObject, options?: DumpOptions): Promise<string> {
+    const rendered = await dumpGroupEntry(group, group.getId(), options);
+    if (rendered === undefined) throw new Error('Tablegroup genesis entry not found');
+    return rendered;
 }
 
 function databaseNameFromPayload(payload: json.Literal): string {

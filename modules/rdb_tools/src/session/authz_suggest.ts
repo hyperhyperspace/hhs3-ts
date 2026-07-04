@@ -49,6 +49,7 @@ export type AuthorResolution = {
 
 export type ReplAuthContext = {
     rl?: Interface;
+    onProgress?: (line: string) => void;
 };
 
 const AUTH_FAILURE_PATTERNS = [

@@ -44,6 +44,7 @@ export const KEYWORDS = new Set([
     'DESC',
     'DROP',
     'EXISTS',
+    'EXPLAIN',
     'FALSE',
     'FLOAT',
     'FROM',

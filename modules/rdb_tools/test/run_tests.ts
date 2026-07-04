@@ -14,6 +14,7 @@ import { runMetaCommand } from "../src/repl/meta.js";
 import { promptForSession } from "../src/repl/prompt.js";
 import { runCommand } from "../src/script/run_command.js";
 import { runScript } from "../src/script/run_script.js";
+import { canPromptForKeys } from "../src/repl/prompt_tty.js";
 import { evaluateObserveGateKey, scanKeystore } from "../src/session/authz_suggest.js";
 import { resolveRowIdPrefix } from "../src/session/adapter.js";
 import { WorkspaceSession } from "../src/session/session.js";
@@ -168,6 +169,60 @@ const tests = [
                 assertTrue(schema.output?.includes('ADD SCHEMA shop TO app') === true, 'schema dump named ADD SCHEMA');
                 assertTrue(schema.output?.includes('ADD TABLEGROUP shop_prod TO app') === true, 'schema dump named ADD TABLEGROUP');
                 assertTrue(schema.output?.includes('INSERT INTO products') !== true, 'schema dump omits row ops');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS04d] \\dump op reverse-renders a single group op',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, setupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                const resolved = await session.workspace.roots.resolveGroup(
+                    { kind: 'name', text: 'shop_prod', parts: ['shop_prod'], span: { start: 0, end: 9, line: 1, column: 1 } },
+                    { aliases: session.aliases },
+                );
+                if (resolved.group === undefined) throw new Error('shop_prod not loaded');
+                const group = resolved.group;
+                const frontier = await (await group.getScopedDag()).getFrontier();
+                const insertHash = [...frontier][0];
+                const insertPrefix = insertHash.slice(0, 10);
+                const groupPrefix = group.getId().slice(0, 10);
+
+                const explicit = await runMetaCommand(session, `\\dump op shop_prod #${insertPrefix}`);
+                assertTrue(explicit.output?.includes('INSERT INTO products') === true, 'explicit group insert op');
+
+                await runMetaCommand(session, '\\use group shop_prod');
+                const current = await runMetaCommand(session, `\\dump op #${insertPrefix}`);
+                assertTrue(current.output?.includes('INSERT INTO products') === true, 'current group insert op');
+
+                const genesis = await runMetaCommand(session, `\\dump op shop_prod #${groupPrefix}`);
+                assertTrue(genesis.output?.includes('CREATE TABLEGROUP shop_prod') === true, 'genesis create op');
+
+                let badHashFailed = false;
+                try {
+                    await runMetaCommand(session, '\\dump op shop_prod #zzzzzzzzzz');
+                } catch (e) {
+                    badHashFailed = true;
+                    assertTrue(
+                        e instanceof Error && e.message.includes("Unknown hash prefix"),
+                        'unknown hash prefix error',
+                    );
+                }
+                assertTrue(badHashFailed, 'bad hash should fail');
+
+                let usageFailed = false;
+                try {
+                    await runMetaCommand(session, '\\dump op');
+                } catch (e) {
+                    usageFailed = true;
+                    assertTrue(
+                        e instanceof Error && e.message.includes('Usage: \\dump op'),
+                        'usage error when hash omitted',
+                    );
+                }
+                assertTrue(usageFailed, 'missing hash should fail');
             });
         },
     },
@@ -357,10 +412,19 @@ const tests = [
                 assertEquals(log.exitCode, 0, log.output);
                 assertTrue(log.output.includes('hash'), 'log table includes hash column');
                 assertTrue(log.output.includes('prev'), 'log table includes prev column');
-                assertTrue(log.output.includes('action'), 'log table includes action column');
-                assertTrue(log.output.includes('summary'), 'log table includes summary column');
+                assertTrue(log.output.includes('op'), 'log table includes op column');
+                assertTrue(!log.output.includes('action'), 'log table omits action column');
+                assertTrue(!log.output.includes('summary'), 'log table omits summary column');
+                assertTrue(log.output.includes('INSERT INTO products (uuid, sk...'), 'insert op is truncated to 33 chars');
+                assertTrue(log.output.includes('status'), 'group log includes status column');
+                assertTrue(log.output.includes('OK'), 'group log shows OK for live ops');
+                assertTrue(!log.output.includes('Cancelled'), 'setup log has no voided ops');
                 assertTrue(log.output.includes(' | '), 'log table uses row formatter separators');
                 assertTrue(!log.output.includes('prev='), 'log table should not use legacy inline format');
+
+                const schemaLog = await runCommand(session, "LOG shop LIMIT 5;");
+                assertEquals(schemaLog.exitCode, 0, schemaLog.output);
+                assertTrue(!schemaLog.output.includes('status'), 'schema log omits status column');
 
                 await runMetaCommand(session, '\\output vertical');
                 const vertical = await runCommand(session, "LOG shop_prod LIMIT 1;");
@@ -368,8 +432,56 @@ const tests = [
                 assertTrue(vertical.output.includes('*** row 1 ***'), 'vertical log row header');
                 assertTrue(vertical.output.includes('hash: #'), 'vertical log hash field');
                 assertTrue(vertical.output.includes('prev:'), 'vertical log prev field');
-                assertTrue(vertical.output.includes('summary:'), 'vertical log summary field');
+                assertTrue(vertical.output.includes('op:'), 'vertical log op field');
+                assertTrue(!vertical.output.includes('summary:'), 'vertical log omits summary field');
                 assertTrue(!vertical.output.includes(' | '), 'vertical log should not use table separators');
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS10b] log status shows Cancelled for voided ops',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, voidDeltaSetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                const resolved = await session.workspace.roots.resolveGroup(
+                    { kind: 'name', text: 'void_g', parts: ['void_g'], span: { start: 0, end: 6, line: 1, column: 1 } },
+                    { aliases: session.aliases },
+                );
+                if (resolved.group === undefined) throw new Error('void_g not loaded');
+                const base = await (await resolved.group.getScopedDag()).getFrontier();
+                const baseHash = [...base][0];
+                const capsView = await (await resolved.group.getView(base, base)).getTableView('caps');
+                const capRows = await capsView.findRowIds({ label: 'grant' });
+                assertEquals(capRows.length, 1, 'one cap row at base');
+                const capRowId = capRows[0];
+
+                const revoke = await runCommand(
+                    session,
+                    `DELETE FROM void_g.caps WHERE rowId = '${capRowId}' AT #${baseHash.slice(0, 10)};`,
+                );
+                assertEquals(revoke.exitCode, 0, revoke.output);
+                const insert = await runCommand(
+                    session,
+                    `INSERT INTO void_g.items (name) VALUES ('thing') AT #${baseHash.slice(0, 10)};`,
+                );
+                assertEquals(insert.exitCode, 0, insert.output);
+
+                const log = await runCommand(session, 'LOG void_g LIMIT 20;');
+                assertEquals(log.exitCode, 0, log.output);
+                assertTrue(log.output.includes('status'), 'void log includes status column');
+                assertTrue(log.output.includes('Cancelled'), 'void log shows Cancelled for voided insert');
+                assertTrue(log.output.includes('OK'), 'void log shows OK for live ops');
+                assertTrue(!log.output.includes('reason'), 'plain log omits reason column');
+
+                const explainLog = await runCommand(session, 'EXPLAIN LOG void_g LIMIT 20;');
+                assertEquals(explainLog.exitCode, 0, explainLog.output);
+                assertTrue(explainLog.output.includes('reason'), 'explain log includes reason column');
+                assertTrue(
+                    explainLog.output.includes('items') && explainLog.output.includes('insert'),
+                    'cancelled row has restriction reason text',
+                );
             });
         },
     },
@@ -1216,6 +1328,69 @@ const tests = [
             });
         },
     },
+    {
+        name: '[RDB_TOOLS47] stdin script runs with script defaults',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const result = await runScript(session, setupScript(), '<stdin>');
+                assertEquals(result.exitCode, 0, result.output);
+                assertTrue(result.output.includes('Widget'), result.output);
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS48] stdin script fails non-interactively when passphrase required',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, setupScript(), '<stdin>');
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                const wasTty = input.isTTY;
+                try {
+                    (input as NodeJS.ReadStream & { isTTY?: boolean }).isTTY = false;
+                    const result = await runScript(session, '\\key unlock alice', '<stdin>');
+                    assertEquals(result.exitCode, 1, result.output);
+                    assertTrue(result.output.includes('passphrase required'), result.output);
+                } finally {
+                    (input as NodeJS.ReadStream & { isTTY?: boolean }).isTTY = wasTty;
+                }
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS49] prompt-keys enables sign-and-retry when stdin is not a TTY',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, gatedCapsSetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+                await runMetaCommand(session, '\\author nobody');
+
+                const inserted = await runCommandWithPromptKeys(
+                    session,
+                    "INSERT INTO user.caps (label, grantee) VALUES ('writer', 'carl');",
+                    ['Y'],
+                );
+                assertEquals(inserted.exitCode, 0, inserted.output);
+                assertTrue(!inserted.output.includes('VALIDATION_REJECTED'), inserted.output);
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS50] prompt-keys flag enables prompting when stdin is not a TTY',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const wasTty = input.isTTY;
+                try {
+                    (input as NodeJS.ReadStream & { isTTY?: boolean }).isTTY = false;
+                    assertTrue(!canPromptForKeys(session), 'default is non-interactive');
+                    session.setPromptForKeys(true);
+                    assertTrue(canPromptForKeys(session), 'flag enables prompting');
+                } finally {
+                    (input as NodeJS.ReadStream & { isTTY?: boolean }).isTTY = wasTty;
+                }
+            });
+        },
+    },
 ];
 
 async function runCommandNonInteractive(session: WorkspaceSession, command: string) {
@@ -1223,6 +1398,25 @@ async function runCommandNonInteractive(session: WorkspaceSession, command: stri
     try {
         (input as NodeJS.ReadStream & { isTTY?: boolean }).isTTY = false;
         return await runCommand(session, command);
+    } finally {
+        (input as NodeJS.ReadStream & { isTTY?: boolean }).isTTY = wasTty;
+    }
+}
+
+async function runCommandWithPromptKeys(
+    session: WorkspaceSession,
+    command: string,
+    answers: string[],
+): Promise<Awaited<ReturnType<typeof runCommand>>> {
+    const wasTty = input.isTTY;
+    let i = 0;
+    const rl = {
+        question: async () => answers[i++] ?? '',
+    } as unknown as Interface;
+    try {
+        (input as NodeJS.ReadStream & { isTTY?: boolean }).isTTY = false;
+        session.setPromptForKeys(true);
+        return await runCommand(session, command, undefined, { rl });
     } finally {
         (input as NodeJS.ReadStream & { isTTY?: boolean }).isTTY = wasTty;
     }

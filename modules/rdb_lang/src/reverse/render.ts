@@ -26,6 +26,7 @@ export type RenderOptions = {
     groupName?: string;
     resolveSchemaName?: (id: B64Hash) => string | undefined;
     resolveGroupName?: (id: B64Hash) => string | undefined;
+    comments?: boolean;
 };
 
 function isFullProfile(options?: RenderOptions): boolean {
@@ -34,6 +35,10 @@ function isFullProfile(options?: RenderOptions): boolean {
 
 function useAliases(options?: RenderOptions): boolean {
     return options?.aliasMode === true && options.aliases !== undefined;
+}
+
+function useComments(options?: RenderOptions): boolean {
+    return options?.comments !== false;
 }
 
 function schemaVersionScope(options?: RenderOptions): RenderVersionScope | undefined {
@@ -76,7 +81,7 @@ export function renderCreateSchema(payload: CreateRSchemaPayload, options?: Rend
 }
 
 export function renderCreateTableGroup(payload: CreateTableGroupPayload, options?: RenderOptions): string {
-    const schemaComment = options?.schemaName !== undefined && !isFullProfile(options)
+    const schemaComment = useComments(options) && options?.schemaName !== undefined && !isFullProfile(options)
         ? `-- ${options.schemaName}\n`
         : '';
     const seed = isFullProfile(options) && payload.seed !== undefined && payload.seed.length > 0
@@ -141,7 +146,7 @@ export function renderAddGroup(payload: AddGroupPayload, options?: RenderOptions
 export function renderSchemaUpdate(payload: SchemaUpdatePayload, options?: RenderOptions): string {
     const rules = payload.migration.map(renderMigrationRule).join(',\n  ');
     const schemaRef = options?.schemaRef ?? 'unknown';
-    const comment = options?.schemaName === undefined ? '' : `-- ${options.schemaName}\n`;
+    const comment = useComments(options) && options?.schemaName !== undefined ? `-- ${options.schemaName}\n` : '';
     const schemaTarget = schemaRef === 'unknown'
         ? schemaRef
         : (useAliases(options) && isFullProfile(options)

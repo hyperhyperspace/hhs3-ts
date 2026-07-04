@@ -1,5 +1,3 @@
-import { stdin as input } from "node:process";
-
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { refVersionAtOrAbove } from "@hyper-hyper-space/hhs3_mvt";
 import type { RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
@@ -7,7 +5,8 @@ import { RTableGroupImpl } from "@hyper-hyper-space/hhs3_rdb";
 import type { BoundStatement } from "@hyper-hyper-space/hhs3_rdb_lang";
 
 import { formatDisplayString } from "../format/display.js";
-import { confirmStatementUnlock, fulfillKeyPassphrase } from "../repl/passphrase.js";
+import { confirmRefUpdateUnlock, fulfillKeyPassphrase } from "../repl/passphrase.js";
+import { canPromptForKeys } from "../repl/prompt_tty.js";
 import {
     labelForKeyId,
     ReplAuthContext,
@@ -128,9 +127,10 @@ async function observeWithResolvedAuthor(
         return observer.observe(bindingName, targetVersion, resolution.identity);
     }
 
-    if (resolution.locked !== undefined && input.isTTY && auth?.rl !== undefined) {
+    if (resolution.locked !== undefined && canPromptForKeys(session) && auth?.rl !== undefined) {
         const label = resolution.locked.label;
-        await confirmStatementUnlock(auth.rl, labelForKeyId(session, resolution.locked.keyId));
+        const authorLabel = labelForKeyId(session, resolution.locked.keyId);
+        await confirmRefUpdateUnlock(auth.rl, observerDisplayName(session, observerId), authorLabel);
         await fulfillKeyPassphrase(session, { kind: 'unlock', label }, auth.rl);
         const identity = session.resolveIdentity(label);
         if (identity === undefined) throw new Error(`Key '${label}' is not unlocked`);
@@ -180,12 +180,16 @@ export async function propagateRefUpdates(
                     auth,
                 );
                 visitedPairs.add(key);
-                notices.push(formatRefAutoUpdateNotice(session, observerId, entryHash));
+                const notice = formatRefAutoUpdateNotice(session, observerId, entryHash);
+                notices.push(notice);
+                auth?.onProgress?.(notice);
                 queue.push(observerId);
             } catch (e) {
                 visitedPairs.add(key);
                 const message = e instanceof Error ? e.message : String(e);
-                notices.push(formatRefAutoUpdateFailure(session, observerId, message));
+                const notice = formatRefAutoUpdateFailure(session, observerId, message);
+                notices.push(notice);
+                auth?.onProgress?.(notice);
             }
         }
     }

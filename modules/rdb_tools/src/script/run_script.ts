@@ -1,9 +1,10 @@
 import { promises as fs } from "node:fs";
-import { stdin as input, stdout as output } from "node:process";
-import { createInterface } from "node:readline/promises";
+import { stdin as input } from "node:process";
+import { text } from "node:stream/consumers";
 
 import { scanStatement } from "@hyper-hyper-space/hhs3_rdb_lang";
 
+import { closePromptTty, createPromptInterface } from "../repl/prompt_tty.js";
 import { WorkspaceSession } from "../session/session.js";
 import { runCommand } from "./run_command.js";
 
@@ -16,11 +17,15 @@ export async function runScriptFile(session: WorkspaceSession, path: string): Pr
     return runScript(session, await fs.readFile(path, 'utf8'), path);
 }
 
+export async function runScriptStdin(session: WorkspaceSession): Promise<ScriptRun> {
+    return runScript(session, await text(input), '<stdin>');
+}
+
 export async function runScript(session: WorkspaceSession, text: string, file = '<script>'): Promise<ScriptRun> {
     session.enableScriptDefaults();
     const outputs: string[] = [];
     let buffer = '';
-    const rl = input.isTTY ? createInterface({ input, output }) : undefined;
+    const rl = createPromptInterface(session);
 
     try {
         for (const line of text.split(/\r?\n/)) {
@@ -52,5 +57,6 @@ export async function runScript(session: WorkspaceSession, text: string, file = 
         return { exitCode: 0, output: outputs.join('\n') };
     } finally {
         rl?.close();
+        closePromptTty();
     }
 }

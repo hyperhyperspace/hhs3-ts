@@ -3,6 +3,7 @@ import type { json } from "@hyper-hyper-space/hhs3_json";
 import type { Row, RowQuery } from "@hyper-hyper-space/hhs3_rdb";
 
 import type { CreatePlan } from "../compile/create.js";
+import type { RenderVersionScope } from "../reverse/aliases.js";
 import type { VersionExpr } from "../syntax/ast.js";
 
 export type InsertLangResult = {
@@ -80,15 +81,25 @@ export type LogRow = {
     hash: string;
     fullHash: B64Hash;
     prev: string[];
-    action?: string;
-    type?: string;
-    summary: string;
     payload: json.Literal;
+    void?: boolean;
+    reason?: string;
+};
+
+export type LogRenderContext = {
+    schemaRef?: B64Hash;
+    schemaName?: string;
+    groupRef?: B64Hash;
+    groupName?: string;
+    databaseName?: string;
+    versionScope?: RenderVersionScope;
 };
 
 export type LogLangResult = {
     kind: 'log';
     target: string;
+    explain: boolean;
+    renderContext: LogRenderContext;
     rows: LogRow[];
 };
 

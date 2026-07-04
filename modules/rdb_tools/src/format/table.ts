@@ -14,11 +14,20 @@ import { formatRows, formatRowsVertical } from "./rows.js";
 
 export { formatRows, formatRowsVertical } from "./rows.js";
 
-export function renderStatementOutput(session: WorkspaceSession, item: StatementRunResult): string {
+export function renderStatementMain(session: WorkspaceSession, item: StatementRunResult): string {
     if (session.outputMode === 'json') return formatJson(item.result);
-    const main = formatTableResult(item.result, session);
-    const lines = [main, ...(item.notices ?? [])].filter((line) => line.length > 0);
-    return lines.join('\n');
+    return formatTableResult(item.result, session);
+}
+
+export function renderStatementNotices(session: WorkspaceSession, item: StatementRunResult): string {
+    if (session.outputMode === 'json') return '';
+    return (item.notices ?? []).filter((line) => line.length > 0).join('\n');
+}
+
+export function renderStatementOutput(session: WorkspaceSession, item: StatementRunResult): string {
+    const main = renderStatementMain(session, item);
+    const notices = renderStatementNotices(session, item);
+    return [main, notices].filter((line) => line.length > 0).join('\n');
 }
 
 export function formatTableResult(

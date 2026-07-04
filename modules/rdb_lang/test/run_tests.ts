@@ -4,6 +4,8 @@ import { lexerTests } from "./lexer_tests.js";
 import { parserTests } from "./parser_tests.js";
 import { scannerTests } from "./scanner_tests.js";
 import { phase1VerticalTests } from "./phase1_vertical_tests.js";
+import { logVerdictTests } from "./log_verdict_tests.js";
+import { logLineTests } from "./log_line_tests.js";
 import { diagnosticTests } from "./diagnostic_tests.js";
 import { restPhaseTests } from "./rest_phase_tests.js";
 import { fkHashValuesTests } from "./fk_hash_values_tests.js";
@@ -19,6 +21,8 @@ async function main() {
     allTests.set(parserTests.title, parserTests.tests);
     allTests.set(scannerTests.title, scannerTests.tests);
     allTests.set(phase1VerticalTests.title, phase1VerticalTests.tests);
+    allTests.set(logVerdictTests.title, logVerdictTests.tests);
+    allTests.set(logLineTests.title, logLineTests.tests);
     allTests.set(diagnosticTests.title, diagnosticTests.tests);
     allTests.set(restPhaseTests.title, restPhaseTests.tests);
     allTests.set(fkHashValuesTests.title, fkHashValuesTests.tests);
