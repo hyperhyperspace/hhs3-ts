@@ -134,7 +134,7 @@ export async function runLanguageText(
         }
 
         const trigger = extractRefUpdateTrigger(effectiveBound);
-        item.notices = session.refAutoUpdate && trigger !== undefined
+        item.notices = session.refAutoUpdate !== 'off' && trigger !== undefined
             ? await propagateRefUpdates(session, trigger.sourceGroupId, trigger.author, options)
             : undefined;
 

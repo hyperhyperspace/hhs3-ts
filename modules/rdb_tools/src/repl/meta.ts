@@ -15,7 +15,7 @@ import {
     resolveAliasTarget,
     type AliasScope,
 } from "../session/aliases.js";
-import { WorkspaceSession } from "../session/session.js";
+import { WorkspaceSession, type RefAutoUpdateMode } from "../session/session.js";
 import type { RootResolveContext } from "../workspace/root_index.js";
 
 export type MetaCommandResult = {
@@ -252,10 +252,17 @@ function setHashLabels(session: WorkspaceSession, mode: string | undefined): str
     return `hash-labels ${mode}`;
 }
 
+function normalizeRefAutoUpdateMode(mode: string | undefined): RefAutoUpdateMode {
+    if (mode === undefined) throw new Error('Usage: \\ref-auto-update auto|self|off');
+    if (mode === 'on') return 'auto';
+    if (mode === 'auto' || mode === 'self' || mode === 'off') return mode;
+    throw new Error('Usage: \\ref-auto-update auto|self|off');
+}
+
 function setRefAutoUpdate(session: WorkspaceSession, mode: string | undefined): string {
-    if (mode !== 'on' && mode !== 'off') throw new Error('Usage: \\ref-auto-update on|off');
-    session.setRefAutoUpdate(mode === 'on');
-    return `ref-auto-update ${mode}`;
+    const normalized = normalizeRefAutoUpdateMode(mode);
+    session.setRefAutoUpdate(normalized);
+    return `ref-auto-update ${normalized}`;
 }
 
 async function dump(session: WorkspaceSession, args: string[]): Promise<string> {
@@ -378,7 +385,7 @@ function helpText(): string {
         '\\key create <label> [passphrase], \\key unlock <label|#prefix> [passphrase], \\keys, \\whoami',
         '\\author [<label|#prefix> [passphrase]|nobody]  (set/show default author; unlocks if needed; \\author nobody clears it)',
         '\\use database <name>, \\use group <name>, \\view, \\frontier [group]',
-        '\\alias [scope] <name> <#prefix>, \\aliases [scope], \\unalias <scope> <name>, \\output table|json|vertical, \\hash-width auto|full|<N>, \\hash-labels on|off, \\ref-auto-update on|off, \\dump schema|group|database <name> [full|schema], \\dump op [group] #hash',
+        '\\alias [scope] <name> <#prefix>, \\aliases [scope], \\unalias <scope> <name>, \\output table|json|vertical, \\hash-width auto|full|<N>, \\hash-labels on|off, \\ref-auto-update auto|self|off, \\dump schema|group|database <name> [full|schema], \\dump op [group] #hash',
         '\\delta schema|group <name> <start> <end> [bounded|full]  (schema = spec migrations; group = rows + schema + op void flips + reasons)',
         '\\quit',
         '\\help commands [filter]  (C-SQL reference)',

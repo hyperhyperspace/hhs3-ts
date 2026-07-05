@@ -678,6 +678,21 @@ export class RTableGroupImpl implements RTableGroupContract {
                 op, table, schemaView, getTableView, getForeignTableView,
             );
             if (restrictionFailure !== undefined) {
+                // row-not-live is an explain alias for restriction failure when
+                // enforced liveness is absent; it must not run before restriction
+                // diagnosis (valid deletes whose rules pass without a live target
+                // row would otherwise be voided incorrectly).
+                if ((op.action === 'update' || op.action === 'delete')
+                    && localTargetProvided(table, op.rowId) !== true
+                    && !(await (await getTableView(table)).hasRow(op.rowId))) {
+                    const detail: OpVoidDetail = {
+                        kind: 'row-not-live',
+                        table,
+                        action: op.action,
+                        rowId: op.rowId,
+                    };
+                    return isBundle ? { kind: 'bundle', index, detail } : detail;
+                }
                 const detail: OpVoidDetail = {
                     kind: 'restriction',
                     table: restrictionFailure.table,

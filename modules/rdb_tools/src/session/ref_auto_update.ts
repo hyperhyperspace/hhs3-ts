@@ -8,10 +8,12 @@ import { formatDisplayString } from "../format/display.js";
 import { confirmRefUpdateUnlock, fulfillKeyPassphrase } from "../repl/passphrase.js";
 import { canPromptForKeys } from "../repl/prompt_tty.js";
 import {
+    AuthorCandidate,
     labelForKeyId,
     ReplAuthContext,
     resolveObserveAuthor,
 } from "./authz_suggest.js";
+import type { RefAutoUpdateMode } from "./session.js";
 import { WorkspaceSession } from "./session.js";
 
 export type RefUpdateTrigger = {
@@ -24,6 +26,13 @@ export type ObserverRef = {
     observer: RTableGroup;
     bindingName: string;
 };
+
+export class RefAutoUpdateSkippedError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'RefAutoUpdateSkippedError';
+    }
+}
 
 export function extractRefUpdateTrigger(bound: BoundStatement): RefUpdateTrigger | undefined {
     switch (bound.kind) {
@@ -78,6 +87,17 @@ export function formatRefAutoUpdateFailure(
     return `ref update on ${group} failed: ${message}`;
 }
 
+export function formatRefAutoUpdateSkipped(
+    session: WorkspaceSession,
+    observerGroupId: B64Hash,
+    rejected: AuthorCandidate[],
+): string {
+    const group = observerDisplayName(session, observerGroupId);
+    if (rejected.length === 0) return `ref update on ${group} skipped: no author configured`;
+    const labels = rejected.map((c) => `$${c.label}`).join(', ');
+    return `ref update on ${group} skipped: ${labels} not authorized`;
+}
+
 async function loadForeignGroup(session: WorkspaceSession, foreignGroupId: B64Hash): Promise<RTableGroupImpl> {
     const root = session.workspace.roots.get(foreignGroupId);
     if (root?.object !== undefined) return root.object as RTableGroupImpl;
@@ -110,6 +130,7 @@ async function observeWithResolvedAuthor(
     foreignGroupId: B64Hash,
     targetVersion: import("@hyper-hyper-space/hhs3_mvt").Version,
     triggerAuthor: OwnIdentity | undefined,
+    mode: RefAutoUpdateMode,
     auth?: ReplAuthContext,
 ): Promise<B64Hash> {
     const impl = observer as RTableGroupImpl;
@@ -121,7 +142,15 @@ async function observeWithResolvedAuthor(
     }
 
     const preferred = [triggerAuthor, await session.currentAuthor()];
-    const resolution = await resolveObserveAuthor(session, impl, foreignGroupId, refAt, refFrom, preferred);
+    const resolution = await resolveObserveAuthor(
+        session,
+        impl,
+        foreignGroupId,
+        refAt,
+        refFrom,
+        preferred,
+        { scanKeystore: mode === 'auto' },
+    );
 
     if (resolution.identity !== undefined) {
         return observer.observe(bindingName, targetVersion, resolution.identity);
@@ -141,6 +170,12 @@ async function observeWithResolvedAuthor(
         throw new Error(`needs ${labelForKeyId(session, resolution.locked.keyId)} (locked)`);
     }
 
+    if (mode === 'self') {
+        throw new RefAutoUpdateSkippedError(
+            formatRefAutoUpdateSkipped(session, observerId, resolution.rejected ?? []),
+        );
+    }
+
     throw new Error('no keystore identity satisfies gate');
 }
 
@@ -150,6 +185,9 @@ export async function propagateRefUpdates(
     author: OwnIdentity | undefined,
     auth?: ReplAuthContext,
 ): Promise<string[]> {
+    const mode = session.refAutoUpdate;
+    if (mode === 'off') return [];
+
     const notices: string[] = [];
     const visitedPairs = new Set<string>();
     const queue: B64Hash[] = [sourceGroupId];
@@ -177,6 +215,7 @@ export async function propagateRefUpdates(
                     foreignGroupId,
                     targetVersion,
                     author,
+                    mode,
                     auth,
                 );
                 visitedPairs.add(key);
@@ -186,6 +225,11 @@ export async function propagateRefUpdates(
                 queue.push(observerId);
             } catch (e) {
                 visitedPairs.add(key);
+                if (e instanceof RefAutoUpdateSkippedError) {
+                    notices.push(e.message);
+                    auth?.onProgress?.(e.message);
+                    continue;
+                }
                 const message = e instanceof Error ? e.message : String(e);
                 const notice = formatRefAutoUpdateFailure(session, observerId, message);
                 notices.push(notice);

@@ -427,6 +427,116 @@ export const rtablePermTests = {
             }
         },
         {
+            name: '[PERM09c] semantics preserved: cap delete stays effective after concurrent revoke',
+            invoke: async () => {
+                const ctx = newCtx();
+                const admin = await makeIdentity();
+
+                const tables: TableDef[] = [
+                    ...usersSchemaTables(),
+                    { name: 'wcaps', columns: { label: { type: 'string', pub: true, readonly: true }, grantee: { type: 'string', pub: true, readonly: true } },
+                      concurrentDeletes: true, restrictions: [{ on: 'all', rule: { p: 'true' } }] },
+                    { name: 'docs', columns: { body: { type: 'string' } },
+                      restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'wcaps', where: { label: 'writer', grantee: '$author' } } }] },
+                ];
+                const schemaInit = await RSchemaImpl.create({
+                    name: 'perm09c:schema',
+                    creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
+                    tables,
+                });
+                const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
+                const pinned = await (await schema.getScopedDag()).getFrontier();
+                const groupInit = await RTableGroupImpl.create({
+                    name: 'perm09c-group', seed: 'perm09c-group', schemaRef: schema.getId(), schemaVersion: pinned,
+                    idProvider: IDENTITIES_TABLE,
+                    initialRows: {
+                        [IDENTITIES_TABLE]: [{ action: 'insert', rowId: deriveRowId('admin'), uuid: 'admin', values: { keyId: admin.keyId, publicKey: serializePublicKeyToBase64(admin.publicKey) } }],
+                    },
+                });
+                const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
+
+                const alice = await makeIdentity();
+                await registerIdentity(group, alice);
+
+                const wcaps = await group.getTable('wcaps');
+                const capId = deriveRowId('w-alice');
+                await wcaps.insert('w-alice', { label: 'writer', grantee: alice.keyId });
+
+                const base = await frontier(group);
+                const docs = await group.getTable('docs');
+
+                const dId = deriveRowId('d-1', alice.keyId);
+                await docs.insert('d-1', { body: 'x' }, alice, base);
+                await wcaps.delete(capId, undefined, base);
+
+                const merged = await frontier(group);
+                assertFalse(await (await tableView(group, 'docs', merged)).hasRow(dId),
+                    'insert voided at merge');
+                assertFalse(await (await tableView(group, 'wcaps', merged)).hasRow(capId),
+                    'cap delete still effective at merge (not resurrected by void diagnosis)');
+            }
+        },
+        {
+            name: '[PERM09b] voided insert: update/delete explain row-not-live, not rowAuthor',
+            invoke: async () => {
+                const ctx = newCtx();
+                const admin = await makeIdentity();
+
+                const tables: TableDef[] = [
+                    ...usersSchemaTables(),
+                    { name: 'wcaps', columns: { label: { type: 'string', pub: true, readonly: true }, grantee: { type: 'string', pub: true, readonly: true } },
+                      concurrentDeletes: true, restrictions: [{ on: 'all', rule: { p: 'true' } }] },
+                    { name: 'docs', columns: { body: { type: 'string' } },
+                      restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'wcaps', where: { label: 'writer', grantee: '$author' } } }] },
+                ];
+                const schemaInit = await RSchemaImpl.create({
+                    name: 'perm09b:schema',
+                    creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
+                    tables,
+                });
+                const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
+                const pinned = await (await schema.getScopedDag()).getFrontier();
+                const groupInit = await RTableGroupImpl.create({
+                    name: 'perm09b-group', seed: 'perm09b-group', schemaRef: schema.getId(), schemaVersion: pinned,
+                    idProvider: IDENTITIES_TABLE,
+                    initialRows: {
+                        [IDENTITIES_TABLE]: [{ action: 'insert', rowId: deriveRowId('admin'), uuid: 'admin', values: { keyId: admin.keyId, publicKey: serializePublicKeyToBase64(admin.publicKey) } }],
+                    },
+                });
+                const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
+
+                const alice = await makeIdentity();
+                await registerIdentity(group, alice);
+
+                const wcaps = await group.getTable('wcaps');
+                const capId = deriveRowId('w-alice');
+                await wcaps.insert('w-alice', { label: 'writer', grantee: alice.keyId });
+
+                const base0 = await frontier(group);
+                const docs = await group.getTable('docs');
+                const dId = deriveRowId('d-1', alice.keyId);
+
+                const insertHash = await docs.insert('d-1', { body: 'a' }, alice, base0);
+                const base1 = await frontier(group);
+                const updateHash = await docs.update(dId, { body: 'b' }, alice, base1);
+                await wcaps.delete(capId, undefined, base0);
+
+                const merged = await frontier(group);
+                const { formatOpVoidDetail } = await import("../src/rtable_group/op_void.js");
+
+                assertTrue(await group.isEntryVoided(insertHash, merged), 'insert voided at merge');
+                assertFalse(await (await tableView(group, 'docs', merged)).hasRow(dId),
+                    'row not live at merge');
+
+                assertTrue(await group.isEntryVoided(updateHash, merged), 'update voided at merge');
+                const updateDetail = await group.explainEntryVoided(updateHash, merged);
+                assertTrue(updateDetail !== undefined && updateDetail.kind === 'row-not-live', 'update void reason is row-not-live');
+                const updateReason = formatOpVoidDetail(updateDetail!);
+                assertTrue(updateReason.includes("is not live in table 'docs'"), 'update reason names absent liveness');
+                assertFalse(updateReason.includes('rowAuthor'), 'update reason does not cite rowAuthor');
+            },
+        },
+        {
             name: '[USERS01] cap delegation chain: admin -> manager(alice) -> editor(bob); an unauthorized grant rejects',
             invoke: async () => {
                 const ctx = newCtx();

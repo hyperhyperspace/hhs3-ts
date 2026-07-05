@@ -45,6 +45,11 @@ export type AuthorResolution = {
     identity?: OwnIdentity;
     locked?: AuthorCandidate;
     candidates: AuthorCandidate[];
+    rejected?: AuthorCandidate[];
+};
+
+export type ResolveAuthorOptions = {
+    scanKeystore?: boolean;
 };
 
 export type ReplAuthContext = {
@@ -103,6 +108,15 @@ function toCandidate(session: WorkspaceSession, record: StoredKeyRecord): Author
     };
 }
 
+function candidateFromIdentity(session: WorkspaceSession, identity: OwnIdentity): AuthorCandidate {
+    const record = session.keystore?.list().find((key) => key.keyId === identity.keyId);
+    return {
+        keyId: identity.keyId,
+        label: record?.label ?? identity.keyId,
+        unlocked: session.isUnlocked(identity.keyId),
+    };
+}
+
 export async function scanKeystore(
     session: WorkspaceSession,
     test: (keyId: KeyId) => Promise<boolean>,
@@ -119,15 +133,39 @@ export async function resolveAuthorForGate(
     session: WorkspaceSession,
     test: (keyId: KeyId) => Promise<boolean>,
     preferred: (OwnIdentity | undefined)[],
+    options?: ResolveAuthorOptions,
 ): Promise<AuthorResolution> {
+    const doScanKeystore = options?.scanKeystore !== false;
+    const rejected: AuthorCandidate[] = [];
     const seen = new Set<KeyId>();
+
     for (const identity of preferred) {
         if (identity === undefined || seen.has(identity.keyId)) continue;
         seen.add(identity.keyId);
-        if (!await test(identity.keyId)) continue;
-        if (session.isUnlocked(identity.keyId)) {
-            return { identity, candidates: await scanKeystore(session, test) };
+        const candidate = candidateFromIdentity(session, identity);
+
+        if (!await test(identity.keyId)) {
+            rejected.push(candidate);
+            continue;
         }
+
+        if (session.isUnlocked(identity.keyId)) {
+            return {
+                identity,
+                candidates: doScanKeystore ? await scanKeystore(session, test) : [],
+                rejected: rejected.length > 0 ? rejected : undefined,
+            };
+        }
+
+        return {
+            locked: candidate,
+            candidates: [],
+            rejected: rejected.length > 0 ? rejected : undefined,
+        };
+    }
+
+    if (!doScanKeystore) {
+        return { candidates: [], rejected: rejected.length > 0 ? rejected : undefined };
     }
 
     const candidates = await scanKeystore(session, test);
@@ -210,11 +248,13 @@ export async function resolveObserveAuthor(
     refAt: Version,
     refFrom: Version,
     preferred: (OwnIdentity | undefined)[],
+    options?: ResolveAuthorOptions,
 ): Promise<AuthorResolution> {
     return resolveAuthorForGate(
         session,
         (keyId) => evaluateObserveGateKey(observer, foreignGroupId, refAt, refFrom, keyId),
         preferred,
+        options,
     );
 }
 

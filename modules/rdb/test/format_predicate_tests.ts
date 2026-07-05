@@ -96,6 +96,30 @@ export const formatPredicateTests = {
                 );
             },
         },
+        {
+            name: '[FORMAT04] formatOpVoidDetail renders row-not-live reasons for update and delete',
+            invoke: async () => {
+                const { formatOpVoidDetail } = await import("../src/rtable_group/op_void.js");
+                assertEquals(
+                    formatOpVoidDetail({
+                        kind: 'row-not-live',
+                        table: 'docs',
+                        action: 'update',
+                        rowId: 'abc123=',
+                    }),
+                    "docs update on row 'abc123=': rowId is not live in table 'docs'",
+                );
+                assertEquals(
+                    formatOpVoidDetail({
+                        kind: 'row-not-live',
+                        table: 'docs',
+                        action: 'delete',
+                        rowId: 'abc123=',
+                    }),
+                    "docs delete on row 'abc123=': rowId is not live in table 'docs'",
+                );
+            },
+        },
     ],
 };
 

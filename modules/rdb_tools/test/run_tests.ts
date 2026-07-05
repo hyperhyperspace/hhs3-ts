@@ -942,16 +942,16 @@ const tests = [
             await withSession(async (session) => {
                 assertEquals(session.hashLabels, false, 'base session defaults labels off');
                 assertEquals(session.hashWidth, 'auto', 'base session defaults hash-width auto');
-                assertEquals(session.refAutoUpdate, false, 'base session defaults ref-auto-update off');
+                assertEquals(session.refAutoUpdate, 'off', 'base session defaults ref-auto-update off');
 
                 session.enableScriptDefaults();
                 assertEquals(session.hashWidth, 'full', 'script defaults hash-width full');
                 assertEquals(session.hashLabels, false, 'script defaults labels still off');
-                assertEquals(session.refAutoUpdate, false, 'script defaults ref-auto-update off');
+                assertEquals(session.refAutoUpdate, 'off', 'script defaults ref-auto-update off');
 
                 session.enableReplDefaults();
                 assertEquals(session.hashLabels, true, 'repl defaults labels on');
-                assertEquals(session.refAutoUpdate, true, 'repl defaults ref-auto-update on');
+                assertEquals(session.refAutoUpdate, 'auto', 'repl defaults ref-auto-update auto');
             });
         },
     },
@@ -1020,11 +1020,19 @@ const tests = [
             await withSession(async (session) => {
                 const off = await runMetaCommand(session, '\\ref-auto-update off');
                 assertEquals(off.output, 'ref-auto-update off', 'meta off output');
-                assertEquals(session.refAutoUpdate, false, 'session ref-auto-update off');
+                assertEquals(session.refAutoUpdate, 'off', 'session ref-auto-update off');
+
+                const self = await runMetaCommand(session, '\\ref-auto-update self');
+                assertEquals(self.output, 'ref-auto-update self', 'meta self output');
+                assertEquals(session.refAutoUpdate, 'self', 'session ref-auto-update self');
+
+                const auto = await runMetaCommand(session, '\\ref-auto-update auto');
+                assertEquals(auto.output, 'ref-auto-update auto', 'meta auto output');
+                assertEquals(session.refAutoUpdate, 'auto', 'session ref-auto-update auto');
 
                 const on = await runMetaCommand(session, '\\ref-auto-update on');
-                assertEquals(on.output, 'ref-auto-update on', 'meta on output');
-                assertEquals(session.refAutoUpdate, true, 'session ref-auto-update on');
+                assertEquals(on.output, 'ref-auto-update auto', 'meta on normalizes to auto');
+                assertEquals(session.refAutoUpdate, 'auto', 'session ref-auto-update on alias');
             });
         },
     },
@@ -1035,7 +1043,7 @@ const tests = [
                 const setup = await runScript(session, crossGroupSetupScript());
                 assertEquals(setup.exitCode, 0, setup.output);
 
-                session.setRefAutoUpdate(true);
+                session.setRefAutoUpdate('auto');
                 const inserted = await runCommand(session, "INSERT INTO users.identities (name) VALUES ('ada');");
                 assertEquals(inserted.exitCode, 0, inserted.output);
                 assertTrue(inserted.output.includes('updated ref on shop_prod to #'), inserted.output);
@@ -1056,7 +1064,7 @@ const tests = [
         invoke: async () => {
             await withSession(async (session) => {
                 await runScript(session, crossGroupSetupScript());
-                session.setRefAutoUpdate(true);
+                session.setRefAutoUpdate('auto');
                 session.setOutputMode('json');
                 const inserted = await runCommand(session, "INSERT INTO users.identities (name) VALUES ('bob');");
                 assertEquals(inserted.exitCode, 0, inserted.output);
@@ -1069,7 +1077,7 @@ const tests = [
         invoke: async () => {
             await withSession(async (session) => {
                 await runScript(session, crossGroupSetupScript());
-                assertEquals(session.refAutoUpdate, false, 'script mode leaves ref-auto-update off');
+                assertEquals(session.refAutoUpdate, 'off', 'script mode leaves ref-auto-update off');
                 const inserted = await runCommand(session, "INSERT INTO users.identities (name) VALUES ('carl');");
                 assertEquals(inserted.exitCode, 0, inserted.output);
                 assertTrue(!inserted.output.includes('updated ref on'), inserted.output);
@@ -1083,7 +1091,7 @@ const tests = [
                 const setup = await runScript(session, gatedCrossGroupSetupScript());
                 assertEquals(setup.exitCode, 0, setup.output);
 
-                session.setRefAutoUpdate(true);
+                session.setRefAutoUpdate('auto');
                 await runMetaCommand(session, '\\author nobody');
                 const inserted = await runCommand(session, "INSERT INTO users.identities (name) VALUES ('ada');");
                 assertEquals(inserted.exitCode, 0, inserted.output);
@@ -1109,7 +1117,7 @@ const tests = [
                 const session2 = new WorkspaceSession({ workspace: workspace2, keystore: keystore2 });
                 try {
                     await session2.unlockKey('alice', 'correct');
-                    session2.setRefAutoUpdate(true);
+                    session2.setRefAutoUpdate('auto');
                     await runMetaCommand(session2, '\\author nobody');
                     const inserted = await runCommandNonInteractive(
                         session2,
@@ -1117,6 +1125,74 @@ const tests = [
                     );
                     assertEquals(inserted.exitCode, 0, inserted.output);
                     assertTrue(inserted.output.includes('needs $bob (locked)'), inserted.output);
+                } finally {
+                    await workspace2.close();
+                }
+            } finally {
+                await rm(dir, { recursive: true, force: true });
+            }
+        },
+    },
+    {
+        name: '[RDB_TOOLS36a] ref-auto-update self succeeds with session author',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, gatedCrossGroupSetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                session.setRefAutoUpdate('self');
+                const inserted = await runCommand(session, "INSERT INTO users.identities (name) VALUES ('ada');");
+                assertEquals(inserted.exitCode, 0, inserted.output);
+                assertTrue(inserted.output.includes('updated ref on doc to #'), inserted.output);
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS36b] ref-auto-update self skips when preferred authors fail gate',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const setup = await runScript(session, gatedCrossGroupSetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                await runMetaCommand(session, '\\key create carl correct');
+                await runMetaCommand(session, '\\author carl');
+                session.setRefAutoUpdate('self');
+                const inserted = await runCommand(session, "INSERT INTO users.identities (name) VALUES ('ada');");
+                assertEquals(inserted.exitCode, 0, inserted.output);
+                assertTrue(inserted.output.includes('ref update on doc skipped:'), inserted.output);
+                assertTrue(inserted.output.includes('$carl not authorized'), inserted.output);
+                assertTrue(!inserted.output.includes('updated ref on doc to #'), inserted.output);
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS36d] ref-auto-update self does not scan keystore for unrelated key',
+        invoke: async () => {
+            const dir = await mkdtemp(join(tmpdir(), 'rdb-tools-'));
+            const dbPath = join(dir, 'dev.db');
+            try {
+                const workspace1 = await Workspace.open({ path: dbPath });
+                const keystore1 = await KeyStore.open(`${dbPath}.keys.json`, workspace1.replica.getHashSuite());
+                const session1 = new WorkspaceSession({ workspace: workspace1, keystore: keystore1 });
+                const setup = await runScript(session1, gatedBobManagerSetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+                await workspace1.close();
+
+                const workspace2 = await Workspace.open({ path: dbPath });
+                const keystore2 = await KeyStore.open(`${dbPath}.keys.json`, workspace2.replica.getHashSuite());
+                const session2 = new WorkspaceSession({ workspace: workspace2, keystore: keystore2 });
+                try {
+                    await session2.unlockKey('alice', 'correct');
+                    session2.setRefAutoUpdate('self');
+                    await runMetaCommand(session2, '\\author nobody');
+                    const inserted = await runCommandNonInteractive(
+                        session2,
+                        "INSERT INTO users.identities (name) VALUES ('mallory');",
+                    );
+                    assertEquals(inserted.exitCode, 0, inserted.output);
+                    assertTrue(inserted.output.includes('ref update on doc skipped: no author configured'), inserted.output);
+                    assertTrue(!inserted.output.includes('needs $bob (locked)'), inserted.output);
+                    assertTrue(!inserted.output.includes('updated ref on doc to #'), inserted.output);
                 } finally {
                     await workspace2.close();
                 }
@@ -1435,6 +1511,8 @@ async function runCommandInteractive(
             if (onQuestion !== undefined) return onQuestion();
             return answers[i++] ?? '';
         },
+        pause: () => {},
+        resume: () => {},
     } as unknown as Interface;
     try {
         (input as NodeJS.ReadStream & { isTTY?: boolean }).isTTY = true;

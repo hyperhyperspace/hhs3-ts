@@ -42,6 +42,13 @@ export function formatRestrictionFailureReason(
     return `${table} ${op.action} on row '${op.rowId}' does not satisfy ALLOW ${op.action} IF ${formatPredicate(rule, { gatedTable: table })}`;
 }
 
+export function formatRowNotLiveFailureReason(
+    table: string,
+    op: Pick<RowOpPayload, 'action' | 'rowId'>,
+): string {
+    return `${table} ${op.action} on row '${op.rowId}': rowId is not live in table '${table}'`;
+}
+
 function selfReferentialExistsAlias(tableName: string): string {
     const letter = tableName[0];
     return tableName.length === 1 ? `${letter}2` : letter;

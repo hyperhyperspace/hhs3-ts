@@ -59,14 +59,22 @@ C-SQL statements terminate with `;` (multi-line and paste supported). Backslash 
 \key create|unlock ...        \keys \whoami \author   key + identity mgmt
 \alias \aliases \unalias      name #hash prefixes
 \output table|json|vertical   \hash-width \hash-labels   display
-\ref-auto-update on|off       auto UPDATE REF for bound observers (on in REPL, off in scripts)
+\ref-auto-update auto|self|off   auto UPDATE REF for bound observers (auto in REPL, off in scripts)
 \dump schema|group|database <name> [full|schema]
 \dump op [group] #hash          reverse-render one group op
 \delta schema|group <name> <start> <end>
 \quit
 ```
 
-After a mutating write on a table group, `\ref-auto-update on` (the REPL default) finds every loaded group that binds the written group and issues `UPDATE REF` recursively, so cross-group FK targets stay current without manual ref-advances. Each automatic ref-update prints a line like `updated ref on shop_prod to #abc…` (suppressed in `--json` output mode). For gated `ALLOW UPDATE REF` bindings, the tool scans the local keystore for an identity that satisfies the gate (read-only predicate check); the REPL may prompt to unlock a matching key. Validation failures on auth-related rules may include a `hint: BY $label` line suggesting a keystore identity that would satisfy the gate. In the interactive REPL, when a statement omits an explicit `BY` clause and a keystore identity would satisfy the auth rule, the tool may prompt to sign and retry instead of showing the validation error first; explicit `BY` (including `NOBODY` or a failing key) shows the error and hint only. The same sign-and-retry flow applies at bind time for `ALTER SCHEMA` and `ADD SCHEMA` / `ADD TABLEGROUP` when an author is required and `BY` is omitted. Override with `RDB_REF_AUTO_UPDATE=on|off`.
+After a mutating write on a table group, `\ref-auto-update auto` (the REPL default) finds every loaded group that binds the written group and issues `UPDATE REF` recursively, so cross-group FK targets stay current without manual ref-advances. Each automatic ref-update prints a line like `updated ref on shop_prod to #abc…` (suppressed in `--json` output mode).
+
+Ref-auto-update has three modes:
+
+- **auto** — preferred authors (statement author, then `\author`), then keystore scan for any gate-satisfying identity; the REPL may prompt to unlock a matching key.
+- **self** — preferred authors only (same order); prompt to unlock those identities if gated and locked; skip with a message listing tested identities if none satisfy the gate (no keystore scan).
+- **off** — no automatic ref updates.
+
+For gated `ALLOW UPDATE REF` bindings, validation failures on auth-related rules may include a `hint: BY $label` line suggesting a keystore identity that would satisfy the gate. In the interactive REPL, when a statement omits an explicit `BY` clause and a keystore identity would satisfy the auth rule, the tool may prompt to sign and retry instead of showing the validation error first; explicit `BY` (including `NOBODY` or a failing key) shows the error and hint only. The same sign-and-retry flow applies at bind time for `ALTER SCHEMA` and `ADD SCHEMA` / `ADD TABLEGROUP` when an author is required and `BY` is omitted. Override with `RDB_REF_AUTO_UPDATE=auto|self|off` (`on` is accepted as `auto`).
 
 `EXPLAIN LOG` adds a `reason` column for Cancelled group/table ops (void restriction, FK, observe-gate, etc.).
 
