@@ -81,6 +81,7 @@ async function buildLogRenderContext(target: ResolvedLogTarget): Promise<LogRend
             const groupId = table.getGroupId();
             return {
                 groupRef: groupId,
+                tableName: target.tableName,
                 versionScope: { objectId: groupId, objectName: groupId },
             };
         }

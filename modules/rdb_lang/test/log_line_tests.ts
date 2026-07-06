@@ -3,7 +3,7 @@ import type { json } from "@hyper-hyper-space/hhs3_json";
 import type { SchemaUpdatePayload } from "@hyper-hyper-space/hhs3_rdb";
 
 import { firstNonCommentLine, renderLogOpLine } from "../src/reverse/log_line.js";
-import { renderSchemaUpdate } from "../src/reverse/render.js";
+import { renderOp, renderSchemaUpdate } from "../src/reverse/render.js";
 
 export const logLineTests = {
     title: '[RDB_LANG:LOG_LINE] Reverse render log line',
@@ -70,6 +70,55 @@ export const logLineTests = {
                 const line = renderLogOpLine(payload, prev, {});
                 assertTrue(line.includes(' AT {'), line);
                 assertTrue(line.includes('#prev-hash'), line);
+            },
+        },
+        {
+            name: '[LOGLINE05] renderLogOpLine renders unwrapped table-scope insert',
+            invoke: async () => {
+                const payload = {
+                    action: 'insert',
+                    rowId: 'row-id',
+                    uuid: 'u-1',
+                    values: { label: 'writer', grantee: 'carl' },
+                } as json.Literal;
+                const line = renderLogOpLine(payload, [], { tableName: 'caps' });
+                assertTrue(line.startsWith('INSERT INTO caps'), line);
+            },
+        },
+        {
+            name: '[LOGLINE06] renderOp renders unwrapped table-scope update and delete',
+            invoke: async () => {
+                const update = renderOp({
+                    action: 'update',
+                    rowId: 'row-id',
+                    values: { label: 'admin' },
+                } as json.Literal, { tableName: 'caps' });
+                assertTrue(update.startsWith('UPDATE caps SET'), update);
+
+                const del = renderOp({
+                    action: 'delete',
+                    rowId: 'row-id',
+                } as json.Literal, { tableName: 'caps' });
+                assertTrue(del.startsWith('DELETE FROM caps'), del);
+            },
+        },
+        {
+            name: '[LOGLINE07] rows slice renders multiple ops; log line keeps first only',
+            invoke: async () => {
+                const payload = {
+                    action: 'rows',
+                    ops: [
+                        { action: 'insert', rowId: 'r1', uuid: 'u-1', values: { label: 'a' } },
+                        { action: 'insert', rowId: 'r2', uuid: 'u-2', values: { label: 'b' } },
+                    ],
+                } as json.Literal;
+                const multi = renderOp(payload, { tableName: 'caps' });
+                assertTrue(multi.includes('\n'), 'rows slice should be multiline');
+                assertTrue(multi.startsWith('INSERT INTO caps'), multi);
+
+                const line = renderLogOpLine(payload, [], { tableName: 'caps' });
+                assertTrue(line.startsWith('INSERT INTO caps'), line);
+                assertTrue(!line.includes('\n'), 'log line should keep first statement only');
             },
         },
     ],

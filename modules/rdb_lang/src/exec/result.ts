@@ -91,6 +91,7 @@ export type LogRenderContext = {
     schemaName?: string;
     groupRef?: B64Hash;
     groupName?: string;
+    tableName?: string;
     databaseName?: string;
     versionScope?: RenderVersionScope;
 };

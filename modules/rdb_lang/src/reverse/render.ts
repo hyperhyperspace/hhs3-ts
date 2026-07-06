@@ -24,6 +24,7 @@ export type RenderOptions = {
     databaseName?: string;
     groupRef?: B64Hash;
     groupName?: string;
+    tableName?: string;
     resolveSchemaName?: (id: B64Hash) => string | undefined;
     resolveGroupName?: (id: B64Hash) => string | undefined;
     comments?: boolean;
@@ -205,6 +206,27 @@ export function renderBundle(payload: BundlePayload, options?: RenderOptions): s
     return `BUNDLE ON ${renderGroupTarget(options)} (\n  ${writes}\n)${renderBy(author, options)}${renderAt(options)};`;
 }
 
+function isRowOpAction(action: unknown): action is 'insert' | 'update' | 'delete' {
+    return action === 'insert' || action === 'update' || action === 'delete';
+}
+
+function renderTableScopePayload(
+    payload: json.LiteralMap,
+    tableName: string,
+    options?: RenderOptions,
+): string | undefined {
+    const action = payload['action'];
+    if (isRowOpAction(action)) {
+        return renderRowOp(payload as unknown as RowOpPayload, tableName, options);
+    }
+    if (action === 'rows' && Array.isArray(payload['ops'])) {
+        return (payload['ops'] as RowOpPayload[])
+            .map((op) => renderRowOp(op, tableName, options))
+            .join('\n');
+    }
+    return undefined;
+}
+
 export function renderOp(payload: json.Literal, options?: RenderOptions): string {
     if (!isObject(payload)) return `-- unknown payload ${json.toStringNormalized(payload)}`;
     if (payload['action'] === 'create' && payload['type'] === 'hhs/rdb_v1') {
@@ -225,6 +247,10 @@ export function renderOp(payload: json.Literal, options?: RenderOptions): string
     }
     if (payload['action'] === 'bundle') return renderBundle(payload as unknown as BundlePayload, options);
     if (payload['action'] === 'ref-advance') return renderRefOp(payload as unknown as RefAdvancePayload, options);
+    if (options?.tableName !== undefined) {
+        const rendered = renderTableScopePayload(payload, options.tableName, options);
+        if (rendered !== undefined) return rendered;
+    }
     return `-- unknown payload ${json.toStringNormalized(payload)}`;
 }
 
