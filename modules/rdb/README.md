@@ -90,3 +90,101 @@ Deeper notes: [CAPABILITIES.md](./CAPABILITIES.md) (capabilities from rows and a
 npm test
 ```
 
+## Example: revoking an insert gate
+
+[`examples/editor.sql`](./examples/editor.sql) defines a `user` group containing capabilities and a `doc` group that observes it. Page inserts require a live `writer` capability:
+
+```sql
+TABLE pages (
+  title string,
+  deleted boolean
+) ALLOW insert IF EXISTS user.caps
+    WHERE user.caps.label = 'writer'
+      AND user.caps.grantee = $author
+```
+
+Register `$santi` with the identity provider:
+
+```text
+rdb:-:-> insert into user.identities (keyId, publicKey, name) values ($santi, publicKey($santi), 'Santi');
+inserted osPHT/Qq (niR/TD+S)
+updated ref on doc to #0XQOqMlp
+```
+
+Grant `$santi` the `writer` capability:
+
+```text
+rdb:-:-> insert into user.caps (grantee, label) values ($santi, 'writer') by $admin;
+inserted PNOfPL/+ (atbLbavD)
+updated ref on doc to #FN7PWhKt
+```
+
+The gate now permits `$santi` to insert two pages:
+
+```text
+rdb:-:-> insert into doc.pages (title, deleted) values ('hi', false) by $santi;
+inserted NNXMJ00Z (0XQ3qXkC)
+rdb:-:-> insert into doc.pages (title, deleted) values ('bye', false) by $santi;
+inserted WqSuhMmR (HhtcgvFn)
+```
+
+Both rows are live:
+
+```text
+rdb:-:-> select * from doc.pages;
+rowId    | rowAuthor | title | deleted
+---------+-----------+-------+--------
+NNXMJ00Z | $santi    | hi    | false
+WqSuhMmR | $santi    | bye   | false
+```
+
+Delete the capability:
+
+```text
+rdb:-:-> delete from user.caps where rowId = #PNO;
+Delete needs $admin. Sign and retry? [Y/n] y
+deleted PNOfPL/+ (AkpW2DhH)
+updated ref on doc to #OBXGt1O5
+```
+
+Advancing the reference at the current tip does not rewrite the earlier application views:
+
+```text
+rdb:-:-> select * from doc.pages;
+rowId    | rowAuthor | title | deleted
+---------+-----------+-------+--------
+NNXMJ00Z | $santi    | hi    | false
+WqSuhMmR | $santi    | bye   | false
+```
+
+Place the updated `user` reference at `#0XQ3`, concurrent with the second insert:
+
+```text
+rdb:-:-> update ref user to latest on doc at #0XQ3 by $admin;
+updated ref user on A0bzGQCM (R1tDyESK)
+```
+
+The second insert now sees the revoked capability from its frontier. Its insert gate is false, so reconciliation cancels the operation and removes its row:
+
+```text
+rdb:-:-> select * from doc.pages;
+rowId    | rowAuthor | title | deleted
+---------+-----------+-------+--------
+NNXMJ00Z | $santi    | hi    | false
+```
+
+The log records the cancelled operation. The first insert precedes the concurrent reference update and remains live:
+
+```text
+rdb:-:-> log doc;
+hash      | prev      | op                                | status
+----------+-----------+-----------------------------------+----------
+#A0bzGQCM | -         | CREATE TABLEGROUP doc SEED 'Fc... |
+#0XQOqMlp | #A0bzGQCM | UPDATE REF #p0N+nsa85uTC7o93fh... | OK
+#FN7PWhKt | #0XQOqMlp | UPDATE REF #p0N+nsa85uTC7o93fh... | OK
+#0XQ3qXkC | #FN7PWhKt | INSERT INTO pages (uuid, title... | OK
+#HhtcgvFn | #0XQ3qXkC | INSERT INTO pages (uuid, title... | Cancelled
+#OBXGt1O5 | #HhtcgvFn | UPDATE REF #p0N+nsa85uTC7o93fh... | OK
+#R1tDyESK | #0XQ3qXkC | UPDATE REF #p0N+nsa85uTC7o93fh... | OK
+```
+
