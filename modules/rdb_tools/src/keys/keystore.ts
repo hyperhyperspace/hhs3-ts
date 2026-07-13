@@ -13,6 +13,7 @@ import {
     SigningName,
 } from "@hyper-hyper-space/hhs3_crypto";
 import { scrypt } from "@noble/hashes/scrypt.js";
+import type { KeyRecord, KeyVault } from "@hyper-hyper-space/hhs3_rdb_runtime";
 
 import {
     base64ToBytes,
@@ -39,10 +40,7 @@ export function defaultKeystorePath(): string {
     return join(home, 'keys.json');
 }
 
-export type StoredKeyRecord = {
-    label: string;
-    keyId: KeyId;
-    publicKey: StoredPublicKey;
+export type StoredKeyRecord = KeyRecord & {
     kdf: {
         name: 'scrypt';
         salt: string;
@@ -58,7 +56,7 @@ export type StoredKeyRecord = {
     };
 };
 
-export class KeyStore {
+export class KeyStore implements KeyVault {
     private data: KeystoreFile = { version: 1, keys: [] };
 
     private constructor(private readonly path: string, private readonly hashSuite: HashSuite) {}

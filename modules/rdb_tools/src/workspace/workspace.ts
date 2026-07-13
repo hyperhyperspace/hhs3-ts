@@ -1,13 +1,12 @@
-import { B64Hash, createBasicCrypto, HASH_SHA256 } from "@hyper-hyper-space/hhs3_crypto";
+import { HASH_SHA256, createBasicCrypto } from "@hyper-hyper-space/hhs3_crypto";
 import { Payload, RObject } from "@hyper-hyper-space/hhs3_mvt";
-import { rDbFactory, rSchemaFactory, rTableGroupFactory } from "@hyper-hyper-space/hhs3_rdb";
 import type { CreatePlan } from "@hyper-hyper-space/hhs3_rdb_lang";
-import { Replica } from "@hyper-hyper-space/hhs3_replica";
-import { rSetFactory } from "@hyper-hyper-space/hhs3_std_types";
+import {
+    RdbWorkspace,
+    payloadName,
+} from "@hyper-hyper-space/hhs3_rdb_runtime";
 
 import { SqliteReplicaDagBackend } from "./backend.js";
-import { payloadName, rehydrateRoots } from "./rehydrate.js";
-import { RootIndex } from "./root_index.js";
 
 export type WorkspaceOpenOptions = {
     path: string;
@@ -17,48 +16,36 @@ export type WorkspaceOpenOptions = {
 export class Workspace {
     readonly path: string;
     readonly backendLabel: string;
-    readonly replica: Replica;
+    readonly replica: RdbWorkspace['replica'];
     readonly backend: SqliteReplicaDagBackend;
-    readonly roots: RootIndex;
+    readonly roots: RdbWorkspace['roots'];
 
-    private constructor(path: string, backendLabel: string, replica: Replica, backend: SqliteReplicaDagBackend, roots: RootIndex) {
+    private readonly inner: RdbWorkspace;
+
+    private constructor(path: string, inner: RdbWorkspace, backend: SqliteReplicaDagBackend) {
         this.path = path;
-        this.backendLabel = backendLabel;
-        this.replica = replica;
+        this.inner = inner;
+        this.backendLabel = inner.backendLabel;
+        this.replica = inner.replica;
         this.backend = backend;
-        this.roots = roots;
+        this.roots = inner.roots;
     }
 
     static async open(options: WorkspaceOpenOptions): Promise<Workspace> {
         const crypto = createBasicCrypto();
         const hashSuite = crypto.hash(HASH_SHA256);
-        const backendLabel = options.backendLabel ?? 'default';
         const backend = await SqliteReplicaDagBackend.open({ path: options.path, hashSuite });
-        const replica = new Replica({ crypto, hashSuite, config: { selfValidate: true } });
-        replica.attachBackend(backendLabel, backend);
-        registerTypes(replica);
-
-        const roots = new RootIndex();
-        const workspace = new Workspace(options.path, backendLabel, replica, backend, roots);
-        await rehydrateRoots(replica, backend, roots);
-        return workspace;
+        const inner = await RdbWorkspace.open({ backend, backendLabel: options.backendLabel ?? 'default', hashSuite });
+        return new Workspace(options.path, inner, backend);
     }
 
     async createRoot(plan: CreatePlan): Promise<RObject> {
-        const object = await this.replica.createObject(plan.payload as Payload, this.backendLabel);
-        this.roots.registerObject(object.getId(), object, plan.name ?? payloadName(plan.payload as Payload));
-        return object;
+        return this.inner.createRoot(plan);
     }
 
     async close(): Promise<void> {
-        await this.replica.destroy();
-        this.backend.close();
+        await this.inner.close();
     }
 }
 
-function registerTypes(replica: Replica): void {
-    replica.registerType('hhs/rdb_v1', rDbFactory);
-    replica.registerType('hhs/rschema_v1', rSchemaFactory);
-    replica.registerType('hhs/rtable_group_v1', rTableGroupFactory);
-    replica.registerType('hhs/rset_v1', rSetFactory);
-}
+export { payloadName };
