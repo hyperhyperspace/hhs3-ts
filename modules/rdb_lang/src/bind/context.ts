@@ -46,7 +46,7 @@ export type ResolvedLogTarget =
     | { kind: 'database'; id: B64Hash; object: RDb & LoggableObject }
     | { kind: 'schema'; id: B64Hash; object: RSchema & LoggableObject }
     | { kind: 'group'; id: B64Hash; object: RTableGroup & LoggableObject }
-    | { kind: 'table'; id: B64Hash; object: RTable & LoggableObject; groupId: B64Hash; tableName: string };
+    | { kind: 'table'; id: B64Hash; object: RTable & LoggableObject; groupId: B64Hash; group: RTableGroup & LoggableObject; tableName: string };
 
 export interface LangBindContext {
     resolveSchema(ref: NameOrHashRef): Promise<ResolvedSchemaRef>;

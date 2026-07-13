@@ -500,13 +500,16 @@ async function bindLog(ast: LogStatement, context: LangBindContext): Promise<Bou
     }
     const target = await context.resolveLogTarget(ast.target);
     const scope = versionScopeForLogTarget(target);
+    const fromScope = target.kind === 'table'
+        ? { kind: 'group' as const, id: target.groupId, group: target.group }
+        : scope;
     const defaultView = ast.at === undefined ? await context.resolveDefaultView?.(scope) : undefined;
     const at = ast.at === undefined && defaultView !== undefined
         ? defaultView.at
         : await context.resolveVersion(ast.at, scope);
     const from = ast.at === undefined && defaultView?.from !== undefined
         ? defaultView.from
-        : await context.resolveVersion(ast.from ?? ast.at, scope);
+        : await context.resolveVersion(ast.from ?? ast.at, fromScope);
     return { kind: 'log', ast, target, at, from, explain: ast.explain === true };
 }
 

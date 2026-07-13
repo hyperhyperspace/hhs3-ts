@@ -43,7 +43,7 @@ export const LANG_COMMAND_REFS: readonly LangCommandRef[] = [
             '    [ALLOW op IF predicate], ...',
             ');',
         ].join('\n'),
-        description: 'Defines a schema: tables, columns, allow rules, and an optional identity provider.',
+        description: 'Defines a schema: tables, columns, allow rules, and an optional identity provider. Mark FK columns with REFERENCES refTable (or REFERENCES binding.table for a bound group); insert their values as #rowIdPrefix.',
     },
     {
         command: 'CREATE TABLEGROUP',
@@ -93,7 +93,7 @@ export const LANG_COMMAND_REFS: readonly LangCommandRef[] = [
             '  SET ALLOW RULES table (ALLOW op IF predicate, ...)',
             ') [AT version] [BY author];',
         ].join('\n'),
-        description: 'Migrates a schema with add/drop table or column, FK, allow-rule, and concurrent-delete changes. Requires an author.',
+        description: 'Migrates a schema with add/drop table or column, FK, allow-rule, and concurrent-delete changes. SET FKS table (col REFERENCES refTable, ...) sets a table\'s foreign keys. Requires an author.',
     },
     {
         command: 'UPDATE SCHEMA',
@@ -114,7 +114,7 @@ export const LANG_COMMAND_REFS: readonly LangCommandRef[] = [
         section: 'data',
         kind: 'insert',
         syntax: 'INSERT INTO [group.]table (col, ...) VALUES (value, ...) [BY author] [AT version];',
-        description: 'Inserts a row into a table. Supply uuid for deterministic row identity.',
+        description: 'Inserts a row into a table. Supply uuid for deterministic row identity. For REFERENCES columns, pass the FK value as a #rowIdPrefix of the target row.',
     },
     {
         command: 'UPDATE',

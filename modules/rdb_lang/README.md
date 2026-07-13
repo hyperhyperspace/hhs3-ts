@@ -94,6 +94,39 @@ EXPLAIN LOG shop_prod LIMIT 20;  -- adds reason column for Cancelled group/table
 
 
 
+## Foreign Keys
+
+Mark a column as a foreign key with `REFERENCES <table>`. FK values are `rowId`s of the referenced table:
+
+```sql
+CREATE SCHEMA shop AS (
+  TABLE orders (id string PUB) ALLOW all IF true,
+  TABLE lines (orderRef string REFERENCES orders, qty integer) ALLOW all IF true
+);
+```
+
+Cross-group FKs point at a bound group's table (`REFERENCES <binding>.<table>`); the target group must be bound and observed:
+
+```sql
+TABLE profiles (ownerId string REFERENCES users.identities, label string)
+```
+
+Insert FK values as a `#prefix` hash of the target row's `rowId`; the binder expands it to the full `rowId`:
+
+```sql
+INSERT INTO shop_prod.lines (orderRef, qty) VALUES (#a1b2c3, 1);
+```
+
+`#prefix` only binds on `REFERENCES` columns (using it elsewhere errors), and an unknown prefix is rejected at bind time.
+
+Add or change FKs on an existing schema with `SET FKS`:
+
+```sql
+ALTER SCHEMA shop AS (
+  SET FKS lines (orderRef REFERENCES orders)
+);
+```
+
 ## Allow Rules
 
 Allow rules are positive gates: an operation is permitted only when its predicate is true.

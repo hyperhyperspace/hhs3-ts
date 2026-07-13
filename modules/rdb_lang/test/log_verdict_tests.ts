@@ -152,6 +152,60 @@ export const logVerdictTests = {
             },
         },
         {
+            name: '[LOG03b] table log annotates void verdict on row ops',
+            invoke: async () => {
+                const ctx = createMockRContext({ selfValidate: true });
+                ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
+                ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
+
+                const admin = await createIdentity(SIGNING_ED25519, hashSuite);
+                const lang = createTestBindContext(ctx, { admin, me: admin });
+
+                const schemaBound = await parseBind(`
+                    CREATE SCHEMA shop CREATORS ($admin) AS (
+                      TABLE caps (
+                        label string PUB
+                      ) ALLOW all IF true,
+                      TABLE items (
+                        name string
+                      ) ALLOW insert IF EXISTS caps WHERE label = 'grant'
+                    );
+                `, lang);
+                const schemaPlan = await execute(schemaBound);
+                assertTrue(schemaPlan.ok && schemaPlan.value.kind === 'create-plan', 'schema create');
+                if (!schemaPlan.ok || schemaPlan.value.kind !== 'create-plan') return;
+                const schema = await ctx.createObject(schemaPlan.value.plan.payload) as RSchemaImpl;
+                lang.registerSchema('shop', schema);
+
+                const groupBound = await parseBind('CREATE TABLEGROUP shop_prod USING SCHEMA shop;', lang);
+                const groupPlan = await execute(groupBound);
+                assertTrue(groupPlan.ok && groupPlan.value.kind === 'create-plan', 'group create');
+                if (!groupPlan.ok || groupPlan.value.kind !== 'create-plan') return;
+                const group = await ctx.createObject(groupPlan.value.plan.payload) as RTableGroupImpl;
+                lang.registerGroup('shop_prod', group);
+
+                const caps = await group.getTable('caps');
+                const items = await group.getTable('items');
+                const capId = deriveRowId('c-1');
+                await caps.insert('c-1', { label: 'grant' });
+                const base = await (await group.getScopedDag()).getFrontier();
+                await caps.delete(capId, undefined, base);
+                await items.insert('i-1', { name: 'thing' }, undefined, base);
+
+                const logBound = await parseBind('LOG shop_prod.items LIMIT 20;', lang);
+                const log = await execute(logBound);
+                assertTrue(log.ok && log.value.kind === 'log', 'table log executes');
+                if (!log.ok || log.value.kind !== 'log') return;
+
+                const insertRow = log.value.rows.find((r) => {
+                    if (!isObject(r.payload) || r.payload['action'] !== 'insert') return false;
+                    return isObject(r.payload['values']) && r.payload['values']['name'] === 'thing';
+                });
+                assertTrue(insertRow !== undefined, 'table log includes insert entry');
+                assertEquals(insertRow?.void, true, 'concurrent revoke voids insert in table log');
+            },
+        },
+        {
             name: '[LOG04] parses EXPLAIN LOG',
             invoke: async () => {
                 const result = parseStatement('EXPLAIN LOG shop_prod LIMIT 5;');

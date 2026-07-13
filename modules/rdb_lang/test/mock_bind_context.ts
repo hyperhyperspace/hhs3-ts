@@ -156,7 +156,14 @@ export function createTestBindContext(_ctx: RContext, vars: { [name: string]: La
                 const group = groups.get(parts[0]);
                 if (group === undefined) throw new Error(`Unknown group '${parts[0]}'`);
                 const table = await group.getTable(parts[1]);
-                return { kind: 'table', id: table.getId(), object: table as any, groupId: group.getId(), tableName: parts[1] };
+                return {
+                    kind: 'table',
+                    id: table.getId(),
+                    object: table as any,
+                    groupId: group.getId(),
+                    group,
+                    tableName: parts[1],
+                };
             }
             const schema = schemas.get(name) ?? [...schemas.values()].find((s) => s.getId() === name);
             if (schema !== undefined) return { kind: 'schema', id: schema.getId(), object: schema };

@@ -90,6 +90,7 @@ export class RootIndex {
                 id: table.table.getId(),
                 object: table.table as RTable & { getScopedDag(): ReturnType<RTable['getScopedDag']> },
                 groupId: table.groupId,
+                group: table.group as RTableGroup & { getScopedDag(): ReturnType<RTableGroup['getScopedDag']> },
                 tableName: table.tableName,
             };
         }

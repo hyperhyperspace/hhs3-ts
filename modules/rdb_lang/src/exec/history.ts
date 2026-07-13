@@ -3,7 +3,7 @@ import type { Entry } from "@hyper-hyper-space/hhs3_dag";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import type { CreateRDbPayload } from "@hyper-hyper-space/hhs3_rdb";
-import { formatOpVoidDetail, isVoidCheckable } from "@hyper-hyper-space/hhs3_rdb";
+import { formatOpVoidDetail, isVoidCheckable, isVoidCheckableTableOp } from "@hyper-hyper-space/hhs3_rdb";
 import type { ResolvedLogTarget } from "../bind/context.js";
 import type { BoundLog } from "../bind/bind.js";
 import type { LogLangResult, LogRenderContext, LogRow } from "./result.js";
@@ -22,8 +22,10 @@ export async function executeLog(bound: BoundLog): Promise<LogLangResult> {
     const rows: LogRow[] = [];
     for (const entry of limited) {
         const row = toLogRow(entry);
-        if ((bound.target.kind === 'group' || bound.target.kind === 'table')
-            && isVoidCheckable(entry.payload)) {
+        const checkable = bound.target.kind === 'table'
+            ? isVoidCheckableTableOp(entry.payload)
+            : isVoidCheckable(entry.payload);
+        if ((bound.target.kind === 'group' || bound.target.kind === 'table') && checkable) {
             row.void = await bound.target.object.isEntryVoided(entry.hash, bound.from);
             if (bound.explain && row.void === true) {
                 const detail = await bound.target.object.explainEntryVoided(entry.hash, bound.from);
