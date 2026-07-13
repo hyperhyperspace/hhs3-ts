@@ -111,12 +111,42 @@ inserted osPHT/Qq (niR/TD+S)
 updated ref on doc to #0XQOqMlp
 ```
 
+The identity is now available to the signing rules:
+
+```text
+rdb:-:-> select * from user.identities;
+rowId    | keyId  | publicKey       | name
+---------+--------+-----------------+------
+LzJMa+ww | $admin | AAAAB2VkMjU1MTm | Admin
+osPHT/Qq | $santi | AAAAB2VkMjU1MTn | Santi
+```
+
+Without a `writer` capability, the insert gate rejects `$santi`:
+
+```text
+rdb:-:-> insert into doc.pages (title, deleted) values ('No dice', false) by $santi;
+<input>:1:1: error VALIDATION_REJECTED: row envelope rejected
+(object A0bzGQCM55iFHvguG0VHNRB73xtHcJ8o0Xl98n3lTJc=):
+pages insert on row 'oITlMHy/egymP9j7nhQhCVRNR+u20bvMIvQ9K8T5I/o=' does not satisfy
+ALLOW insert IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author
+```
+
 Grant `$santi` the `writer` capability:
 
 ```text
 rdb:-:-> insert into user.caps (grantee, label) values ($santi, 'writer') by $admin;
 inserted PNOfPL/+ (atbLbavD)
 updated ref on doc to #FN7PWhKt
+```
+
+The capability table now contains the grant:
+
+```text
+rdb:-:-> select * from user.caps;
+rowId    | rowAuthor | label   | grantee
+---------+-----------+---------+--------
+PNOfPL/+ | $admin    | writer  | $santi
+lbz7VOYL |           | manager | $admin
 ```
 
 The gate now permits `$santi` to insert two pages:
@@ -138,6 +168,30 @@ NNXMJ00Z | $santi    | hi    | false
 WqSuhMmR | $santi    | bye   | false
 ```
 
+The logs provide the versions used below. The user history contains the identity and capability inserts:
+
+```text
+rdb:-:-> log user;
+hash      | prev      | op                                | status
+----------+-----------+-----------------------------------+-------
+#p0N+nsa8 | -         | CREATE TABLEGROUP user SEED 'c... |
+#niR/TD+S | #p0N+nsa8 | INSERT INTO identities (uuid, ... | OK
+#atbLbavD | #niR/TD+S | INSERT INTO caps (uuid, grante... | OK
+```
+
+The document history identifies `#0XQ3qXkC` as the version after the first page insert and before the second:
+
+```text
+rdb:-:-> log doc;
+hash      | prev      | op                                | status
+----------+-----------+-----------------------------------+-------
+#A0bzGQCM | -         | CREATE TABLEGROUP doc SEED 'Fc... |
+#0XQOqMlp | #A0bzGQCM | UPDATE REF #p0N+nsa85uTC7o93fh... | OK
+#FN7PWhKt | #0XQOqMlp | UPDATE REF #p0N+nsa85uTC7o93fh... | OK
+#0XQ3qXkC | #FN7PWhKt | INSERT INTO pages (uuid, title... | OK
+#HhtcgvFn | #0XQ3qXkC | INSERT INTO pages (uuid, title... | OK
+```
+
 Delete the capability:
 
 ```text
@@ -145,6 +199,29 @@ rdb:-:-> delete from user.caps where rowId = #PNO;
 Delete needs $admin. Sign and retry? [Y/n] y
 deleted PNOfPL/+ (AkpW2DhH)
 updated ref on doc to #OBXGt1O5
+```
+
+The `writer` row is gone:
+
+```text
+rdb:-:-> select * from user.caps;
+rowId    | rowAuthor | label   | grantee
+---------+-----------+---------+--------
+lbz7VOYL |           | manager | $admin
+```
+
+The document log now ends at `#OBXGt1O5`, whose reference observes the revocation:
+
+```text
+rdb:-:-> log doc;
+hash      | prev      | op                                | status
+----------+-----------+-----------------------------------+-------
+#A0bzGQCM | -         | CREATE TABLEGROUP doc SEED 'Fc... |
+#0XQOqMlp | #A0bzGQCM | UPDATE REF #p0N+nsa85uTC7o93fh... | OK
+#FN7PWhKt | #0XQOqMlp | UPDATE REF #p0N+nsa85uTC7o93fh... | OK
+#0XQ3qXkC | #FN7PWhKt | INSERT INTO pages (uuid, title... | OK
+#HhtcgvFn | #0XQ3qXkC | INSERT INTO pages (uuid, title... | OK
+#OBXGt1O5 | #HhtcgvFn | UPDATE REF #p0N+nsa85uTC7o93fh... | OK
 ```
 
 Advancing the reference at the current tip does not rewrite the earlier application views:
@@ -157,7 +234,7 @@ NNXMJ00Z | $santi    | hi    | false
 WqSuhMmR | $santi    | bye   | false
 ```
 
-Place the updated `user` reference at `#0XQ3`, concurrent with the second insert:
+Use the logged `#0XQ3` prefix to place the latest `user` reference immediately after the first insert, concurrent with the second:
 
 ```text
 rdb:-:-> update ref user to latest on doc at #0XQ3 by $admin;
