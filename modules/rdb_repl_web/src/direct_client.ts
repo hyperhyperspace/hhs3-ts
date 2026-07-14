@@ -79,8 +79,8 @@ function authContext(session: ReplSession, interactions: ReplInteractions): Auth
         onProgress: interactions.onProgress,
         confirmSignRetry: (authorLabel, op) => interactions.requestConfirmation({
             kind: 'confirm',
-            title: `Retry as ${authorLabel}?`,
-            detail: `The operation “${op}” requires a different author.`,
+            title: `Sign and retry as ${authorLabel}?`,
+            detail: `The ${op} operation requires this identity.`,
         }),
         confirmRefUpdateUnlock: async (observerGroup, authorLabel) => {
             const confirmed = await interactions.requestConfirmation({
@@ -103,10 +103,19 @@ function authContext(session: ReplSession, interactions: ReplInteractions): Auth
     };
 }
 
-function requestPassphrase(
+async function requestPassphrase(
     interactions: ReplInteractions,
     need: PassphraseRequest,
 ): Promise<string | undefined> {
+    if (need.kind === 'statement-unlock') {
+        const confirmed = await interactions.requestConfirmation({
+            kind: 'confirm',
+            title: `Sign with ${need.label}?`,
+            detail: `This operation needs ${need.label}. Unlock, sign, and retry?`,
+        });
+        if (!confirmed) throw new KeyUnlockDeclinedError(need.label);
+    }
+
     const action = need.kind === 'create' ? 'Create' : 'Unlock';
     return interactions.requestPassphrase({
         kind: 'passphrase',

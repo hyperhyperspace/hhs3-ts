@@ -15,8 +15,6 @@ export async function mountRepl(client: ReplClient, schemaPresets: SchemaPreset[
     const terminal = document.querySelector<HTMLElement>('.terminal');
     const prompt = element<HTMLLabelElement>('session-prompt');
     const status = element<HTMLSpanElement>('runtime-status');
-    const resetButton = element<HTMLButtonElement>('reset-runtime');
-    const clearButton = element<HTMLButtonElement>('clear-output');
     const schemaMenu = element<HTMLDetailsElement>('schema-menu');
     const schemaButtons = Array.from(schemaMenu.querySelectorAll<HTMLButtonElement>('[data-schema]'));
     const presetsById = new Map(schemaPresets.map((preset) => [preset.id, preset]));
@@ -29,7 +27,6 @@ export async function mountRepl(client: ReplClient, schemaPresets: SchemaPreset[
         busy = next;
         input.disabled = next;
         runButton.disabled = next;
-        resetButton.disabled = next;
         for (const button of schemaButtons) button.disabled = next;
     };
 
@@ -191,36 +188,6 @@ export async function mountRepl(client: ReplClient, schemaPresets: SchemaPreset[
         else historyIndex = Math.min(history.length, historyIndex + 1);
         input.value = historyIndex === history.length ? '' : history[historyIndex] ?? '';
         input.setSelectionRange(input.value.length, input.value.length);
-    });
-
-    clearButton.addEventListener('click', () => {
-        transcript.replaceChildren();
-        input.focus();
-    });
-
-    resetButton.addEventListener('click', async () => {
-        if (busy) return;
-        const confirmed = await showConfirmationDialog(
-            'Reset workspace?',
-            'All databases, keys, aliases, and command output in this tab will be discarded.',
-        );
-        if (!confirmed) return;
-
-        setBusy(true);
-        setStatus('Resetting', 'starting');
-        try {
-            setPrompt(await client.reset());
-            transcript.replaceChildren();
-            history.length = 0;
-            historyIndex = 0;
-            setStatus('Memory workspace', 'ready');
-        } catch (error) {
-            appendEntry('error', errorMessage(error), 'error');
-            setStatus('Runtime error', 'error');
-        } finally {
-            setBusy(false);
-            input.focus();
-        }
     });
 
     try {

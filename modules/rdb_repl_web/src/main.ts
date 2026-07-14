@@ -15,9 +15,14 @@ if (new URLSearchParams(location.search).has('smoke')) {
 
 async function runSmoke(activeClient: DirectReplClient): Promise<void> {
     const output: string[] = [];
+    const confirmations: Array<{ title: string; detail: string }> = [];
+    const confirmationAnswers: boolean[] = [];
     const interactions: ReplInteractions = {
         requestPassphrase: async () => 'browser-smoke',
-        requestConfirmation: async () => true,
+        requestConfirmation: async (prompt) => {
+            confirmations.push(prompt);
+            return confirmationAnswers.shift() ?? true;
+        },
         onProgress: (line) => output.push(line),
     };
 
@@ -49,6 +54,44 @@ SELECT sku, name FROM shop_prod.products;
         const invalid = await activeClient.execute('SELECT FROM;', interactions);
         if (invalid.exitCode !== 2) throw new Error(`expected diagnostic exit code 2, received ${invalid.exitCode}`);
 
+        assertSuccess(await activeClient.execute(`
+CREATE SCHEMA web_auth CREATORS ($me) AS (
+  TABLE caps (
+    label string PUB,
+    grantee string PUB
+  ) ALLOW insert IF EXISTS caps AS c
+      WHERE c.label = 'manager' AND c.grantee = $author
+);
+CREATE TABLEGROUP web_auth_g USING SCHEMA web_auth
+  WITH ROWS (
+    caps (
+      uuid='61169c8a-4106-43a1-8d37-39373c07da7a',
+      label='manager',
+      grantee=$me
+    )
+  );
+`, interactions), 'create gated table');
+        assertSuccess(await activeClient.execute('\\author nobody', interactions), 'clear author');
+
+        confirmationAnswers.push(false);
+        const declinedPromptIndex = confirmations.length;
+        const declined = await activeClient.execute(
+            "INSERT INTO web_auth_g.caps (label, grantee) VALUES ('writer', 'carl');",
+            interactions,
+        );
+        if (declined.exitCode !== 2 || !declined.output.includes('hint: BY $alice')) {
+            throw new Error(`declined sign-and-retry did not return its author hint: ${declined.output}`);
+        }
+        assertSignRetryPrompt(confirmations, declinedPromptIndex, '$alice');
+
+        confirmationAnswers.push(true);
+        const acceptedPromptIndex = confirmations.length;
+        assertSuccess(await activeClient.execute(
+            "INSERT INTO web_auth_g.caps (label, grantee) VALUES ('writer', 'dana');",
+            interactions,
+        ), 'accepted sign-and-retry');
+        assertSignRetryPrompt(confirmations, acceptedPromptIndex, '$alice');
+
         await activeClient.reset();
         const keysAfterReset = await activeClient.execute('\\keys', interactions);
         assertSuccess(keysAfterReset, 'keys after reset');
@@ -74,6 +117,20 @@ SELECT sku, name FROM shop_prod.products;
 function assertSuccess(result: { exitCode: number; output: string }, operation: string): void {
     if (result.exitCode !== 0) {
         throw new Error(`${operation} failed (${result.exitCode}): ${result.output}`);
+    }
+}
+
+function assertSignRetryPrompt(
+    confirmations: Array<{ title: string; detail: string }>,
+    index: number,
+    authorLabel: string,
+): void {
+    if (confirmations.length !== index + 1) {
+        throw new Error(`expected one sign-and-retry prompt, received ${confirmations.length - index}`);
+    }
+    const prompt = confirmations[index]!;
+    if (!prompt.title.includes('Sign and retry') || !prompt.title.includes(authorLabel)) {
+        throw new Error(`unexpected sign-and-retry prompt: ${prompt.title}`);
     }
 }
 
