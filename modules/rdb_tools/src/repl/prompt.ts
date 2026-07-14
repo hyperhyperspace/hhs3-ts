@@ -1,27 +1,12 @@
 import { stdout as output } from "node:process";
 import type { Interface } from "node:readline/promises";
+import { promptForSession as portablePromptForSession } from "@hyper-hyper-space/hhs3_rdb_repl";
 
-import { formatDisplayString } from "../format/display.js";
 import { promptInputStream } from "./prompt_tty.js";
 import { WorkspaceSession } from "../session/session.js";
 
 export function promptForSession(session: WorkspaceSession, continuation = false): string {
-    if (continuation) return '... ';
-    return `rdb:${groupDisplayName(session)}:${keyDisplayName(session)}> `;
-}
-
-function groupDisplayName(session: WorkspaceSession): string {
-    if (session.currentGroup === undefined) return '-';
-    const name = session.workspace.roots.get(session.currentGroup)?.name;
-    return name ?? formatDisplayString(session, session.currentGroup, { role: 'hash' });
-}
-
-function keyDisplayName(session: WorkspaceSession): string {
-    const identity = session.selectedAuthor();
-    if (identity === undefined) return '-';
-    const label = session.keystore?.list().find((key) => key.keyId === identity.keyId)?.label;
-    if (label !== undefined) return label;
-    return formatDisplayString(session, identity.keyId, { role: 'hash' });
+    return portablePromptForSession(session, continuation);
 }
 
 export async function promptSecret(rl: Interface, query: string): Promise<string> {

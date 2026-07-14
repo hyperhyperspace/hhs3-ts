@@ -115,6 +115,7 @@ export {
 export { rootCtx, nameOrHashRef } from "./session/root_context.js";
 
 export type { KeyVault, KeyRecord } from "./keys/key_vault.js";
+export { MemoryKeyVault } from "./keys/memory_key_vault.js";
 export {
     encodePublicKey,
     decodePublicKey,

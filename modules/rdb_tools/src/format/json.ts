@@ -1,3 +1,1 @@
-export function formatJson(value: unknown): string {
-    return JSON.stringify(value, undefined, 2);
-}
+export { formatJson } from "@hyper-hyper-space/hhs3_rdb_repl";

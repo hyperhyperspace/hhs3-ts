@@ -6,6 +6,7 @@ import {
     executeText,
     keyPassphraseRequiredFromError,
     KeyPassphraseRequiredError,
+    MemoryKeyVault,
     MemDagBackend,
     openMemWorkspace,
     RdbRuntime,
@@ -176,6 +177,56 @@ const tests = [
             }
         },
     },
+    {
+        name: '[RDB_RT09] MemoryKeyVault creates and unlocks ephemeral identities',
+        invoke: async () => {
+            const vault = new MemoryKeyVault();
+            const identity = await vault.create('alice', 'correct');
+
+            assertEquals(identity.publicKey.suite, SIGNING_ED25519, 'defaults to Ed25519');
+            assertEquals(vault.list().length, 1, 'key is listed');
+            assertEquals(vault.resolveRecord('alice').keyId, identity.keyId, 'exact label resolves');
+            assertEquals(vault.resolvePublic('alice').keyId, identity.keyId, 'public key resolves');
+
+            const prefix = identity.keyId.slice(0, 8);
+            const unlocked = await vault.unlock(`#${prefix}`, 'correct');
+            assertEquals(unlocked.keyId, identity.keyId, 'key-id prefix unlocks');
+            assertEquals(unlocked.secretKey.length, identity.secretKey.length, 'secret key is retained');
+
+            await expectError(
+                () => vault.unlock('alice', 'incorrect'),
+                'Wrong passphrase',
+                'wrong passphrase rejected',
+            );
+            await expectError(
+                () => vault.create('alice', 'another'),
+                'already exists',
+                'duplicate label rejected',
+            );
+        },
+    },
+    {
+        name: '[RDB_RT10] MemoryKeyVault resolves exact labels before unambiguous prefixes',
+        invoke: async () => {
+            const vault = new MemoryKeyVault();
+            const first = await vault.create('first', 'one');
+            const prefixLabel = first.keyId.slice(0, 8);
+            const second = await vault.create(prefixLabel, 'two');
+
+            assertEquals(vault.resolveRecord(prefixLabel).keyId, second.keyId, 'exact label wins');
+            assertEquals(vault.resolveRecord(`#${first.keyId}`).keyId, first.keyId, 'full key id resolves');
+            await expectError(
+                async () => vault.resolveRecord(''),
+                'Ambiguous key prefix',
+                'ambiguous prefix rejected',
+            );
+            await expectError(
+                async () => vault.resolveRecord('not-a-key'),
+                'Unknown key',
+                'unknown key rejected',
+            );
+        },
+    },
 ];
 
 class FakeKeyVault implements KeyVault {
@@ -206,13 +257,34 @@ class FakeKeyVault implements KeyVault {
 
     resolveRecord(labelOrPrefix: string): KeyRecord {
         const normalized = labelOrPrefix.startsWith('#') ? labelOrPrefix.slice(1) : labelOrPrefix;
-        const match = this.keys.find((k) => k.label === normalized || k.keyId.startsWith(normalized));
-        if (match === undefined) throw new Error(`Unknown key '${labelOrPrefix}'`);
-        return match;
+        const labelMatch = this.keys.find((key) => key.label === normalized);
+        if (labelMatch !== undefined) return labelMatch;
+
+        const keyMatches = this.keys.filter((key) => key.keyId.startsWith(normalized));
+        if (keyMatches.length === 1) return keyMatches[0]!;
+        if (keyMatches.length === 0) throw new Error(`Unknown key '${labelOrPrefix}'`);
+        throw new Error(`Ambiguous key prefix '${labelOrPrefix}'`);
     }
 }
 
 type StoredKeyRecord = KeyRecord;
+
+async function expectError(
+    invoke: () => unknown | Promise<unknown>,
+    message: string,
+    description: string,
+): Promise<void> {
+    let thrown: unknown;
+    try {
+        await invoke();
+    } catch (e) {
+        thrown = e;
+    }
+    assertTrue(
+        thrown instanceof Error && thrown.message.includes(message),
+        description,
+    );
+}
 
 function setupScript(): string {
     return `

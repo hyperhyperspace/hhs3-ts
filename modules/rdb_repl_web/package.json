@@ -1,0 +1,20 @@
+{
+  "name": "@hyper-hyper-space/hhs3_rdb_repl_web",
+  "version": "0.1.0",
+  "description": "Ephemeral browser REPL for HHSv3 RDB",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p tsconfig.json && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@hyper-hyper-space/hhs3_rdb_repl": "^0.1.0",
+    "@hyper-hyper-space/hhs3_rdb_runtime": "^0.1.0"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3",
+    "vite": "^6.4.3"
+  }
+}

@@ -1,5 +1,6 @@
 import { stdout as output } from "node:process";
 import type { Interface } from "node:readline/promises";
+import type { PassphraseRequest } from "@hyper-hyper-space/hhs3_rdb_repl";
 
 import { WorkspaceSession } from "../session/session.js";
 import { canPromptForKeys, closePromptTty, createPromptInterface } from "./prompt_tty.js";
@@ -48,6 +49,31 @@ export async function fulfillPassphraseNeed(
     }
     try {
         return await fulfillKeyPassphrase(session, needs, activeRl);
+    } finally {
+        if (owned) {
+            activeRl.close();
+            closePromptTty();
+        }
+    }
+}
+
+export async function requestPassphrase(
+    session: WorkspaceSession,
+    need: PassphraseRequest,
+    rl?: Interface,
+): Promise<string | undefined> {
+    if (!canPromptForKeys(session) && rl === undefined) return undefined;
+    const owned = rl === undefined;
+    const activeRl = rl ?? createPromptInterface(session);
+    if (activeRl === undefined) return undefined;
+    try {
+        const displayName = keyDisplayLabel(session, need.label);
+        if (need.kind === 'statement-unlock') {
+            await confirmStatementUnlock(activeRl, displayName);
+        }
+        return need.kind === 'create'
+            ? promptNewPassphrase(activeRl, displayName)
+            : promptSecret(activeRl, `passphrase (${displayName}): `);
     } finally {
         if (owned) {
             activeRl.close();

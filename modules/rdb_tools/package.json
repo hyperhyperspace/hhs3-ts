@@ -26,6 +26,7 @@
     "@hyper-hyper-space/hhs3_mvt": "^0.1.0",
     "@hyper-hyper-space/hhs3_rdb": "^0.1.0",
     "@hyper-hyper-space/hhs3_rdb_lang": "^0.1.0",
+    "@hyper-hyper-space/hhs3_rdb_repl": "^0.1.0",
     "@hyper-hyper-space/hhs3_rdb_runtime": "^0.1.0",
     "@hyper-hyper-space/hhs3_replica": "^0.1.0",
     "@hyper-hyper-space/hhs3_std_types": "^0.1.0",

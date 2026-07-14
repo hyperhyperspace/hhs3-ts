@@ -1,15 +1,18 @@
 import {
-    RdbSession,
     type RefAutoUpdateMode,
     type SessionView,
-    type RdbSessionOptions,
 } from "@hyper-hyper-space/hhs3_rdb_runtime";
+import {
+    ReplSession,
+    type HashWidth,
+    type OutputMode,
+    type ReplSessionOptions,
+} from "@hyper-hyper-space/hhs3_rdb_repl";
 
 import type { KeyStore } from "../keys/keystore.js";
 import type { Workspace } from "../workspace/workspace.js";
 
-export type OutputMode = 'table' | 'json' | 'vertical';
-export type HashWidth = 'auto' | 'full' | number;
+export { ReplSession, type OutputMode, type HashWidth };
 
 export { type RefAutoUpdateMode, type SessionView };
 export { KeyPassphraseRequiredError } from "@hyper-hyper-space/hhs3_rdb_runtime";
@@ -24,26 +27,21 @@ export type WorkspaceSessionOptions = {
     promptForKeys?: boolean;
 };
 
-export class WorkspaceSession extends RdbSession {
+export class WorkspaceSession extends ReplSession {
     declare readonly workspace: Workspace;
-    outputMode: OutputMode;
-    hashWidth: HashWidth;
-    hashLabels: boolean;
-    promptForKeys: boolean;
-    stopOnError = true;
 
     constructor(options: WorkspaceSessionOptions) {
-        const sessionOptions: RdbSessionOptions = {
-            workspace: options.workspace as unknown as RdbSessionOptions['workspace'],
+        const sessionOptions: ReplSessionOptions = {
+            workspace: options.workspace as unknown as ReplSessionOptions['workspace'],
             keyVault: options.keystore,
             refAutoUpdate: options.refAutoUpdate ?? parseRefAutoUpdateEnv() ?? 'off',
+            outputMode: options.outputMode,
+            hashWidth: options.hashWidth ?? parseHashWidthEnv(),
+            hashLabels: options.hashLabels ?? parseHashLabelsEnv(),
+            promptForKeys: options.promptForKeys ?? parsePromptForKeysEnv(),
         };
         super(sessionOptions);
         (this as { workspace: Workspace }).workspace = options.workspace;
-        this.outputMode = options.outputMode ?? 'table';
-        this.hashWidth = options.hashWidth ?? parseHashWidthEnv() ?? 'auto';
-        this.hashLabels = options.hashLabels ?? parseHashLabelsEnv() ?? false;
-        this.promptForKeys = options.promptForKeys ?? parsePromptForKeysEnv() ?? false;
     }
 
     get keystore(): KeyStore | undefined {
@@ -62,22 +60,6 @@ export class WorkspaceSession extends RdbSession {
     enableScriptDefaults(): void {
         if (parseHashWidthEnv() === undefined) this.hashWidth = 'full';
         if (parseRefAutoUpdateEnv() === undefined) this.refAutoUpdate = 'off';
-    }
-
-    setOutputMode(mode: OutputMode): void {
-        this.outputMode = mode;
-    }
-
-    setHashWidth(width: HashWidth): void {
-        this.hashWidth = width;
-    }
-
-    setHashLabels(on: boolean): void {
-        this.hashLabels = on;
-    }
-
-    setPromptForKeys(on: boolean): void {
-        this.promptForKeys = on;
     }
 }
 

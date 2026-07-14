@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="An ephemeral, browser-based REPL for Hyper Hyper Space RDB."
+    />
+    <title>RDB Web REPL</title>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">R</span>
+          <div>
+            <h1>RDB Web REPL</h1>
+            <p>Ephemeral in-memory workspace</p>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <span class="status" id="runtime-status">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span>Starting</span>
+          </span>
+          <button class="button button-quiet" id="clear-output" type="button">Clear output</button>
+          <button class="button button-danger" id="reset-runtime" type="button">Reset workspace</button>
+        </div>
+      </header>
+
+      <main class="terminal" aria-label="RDB command transcript">
+        <div class="terminal-intro">
+          <p class="eyebrow">Browser session</p>
+          <h2>Co-transactional database demo.</h2>
+          <p>
+            Enter C-SQL or a backslash command. Start with <code>\help</code>, or create
+            an author with <code>\key create alice</code>.
+          </p>
+        </div>
+        <div
+          class="transcript"
+          id="transcript"
+          role="log"
+          aria-live="polite"
+          aria-relevant="additions"
+        ></div>
+      </main>
+
+      <form class="composer" id="command-form">
+        <label class="prompt" id="session-prompt" for="command-input">rdb:-:-&gt;</label>
+        <textarea
+          id="command-input"
+          name="command"
+          rows="3"
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck="false"
+          placeholder="SELECT * FROM group.table;"
+          aria-describedby="composer-help"
+        ></textarea>
+        <button class="button button-run" id="run-command" type="submit">Run</button>
+        <p class="composer-help" id="composer-help">
+          <kbd>⌘</kbd><span>+</span><kbd>Enter</kbd> to run
+          <span aria-hidden="true">·</span>
+          <kbd>↑</kbd><kbd>↓</kbd> for history
+        </p>
+      </form>
+    </div>
+
+    <dialog class="prompt-dialog" id="prompt-dialog">
+      <form method="dialog" id="prompt-form">
+        <p class="eyebrow" id="prompt-kind">Key vault</p>
+        <h2 id="prompt-title">Enter passphrase</h2>
+        <p id="prompt-detail"></p>
+        <label for="prompt-value">Passphrase</label>
+        <input id="prompt-value" type="password" autocomplete="off" />
+        <div class="dialog-actions">
+          <button class="button button-quiet" value="cancel" type="submit">Cancel</button>
+          <button class="button button-run" value="confirm" type="submit">Continue</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

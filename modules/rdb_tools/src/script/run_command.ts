@@ -1,29 +1,22 @@
 import type { Interface } from "node:readline/promises";
+import {
+    runCommand as runPortableCommand,
+    type CommandRun,
+} from "@hyper-hyper-space/hhs3_rdb_repl";
 
-import { formatDiagnostics } from "../format/diagnostics.js";
-import { renderStatementOutput } from "../format/table.js";
-import { runMetaCommand } from "../repl/meta.js";
 import {
     confirmStatementUnlock,
     fulfillKeyPassphrase,
-    fulfillPassphraseNeed,
     KeyUnlockDeclinedError,
     keyDisplayLabel,
+    requestPassphrase,
 } from "../repl/passphrase.js";
 import { canPromptForKeys, closePromptTty, createPromptInterface } from "../repl/prompt_tty.js";
-import {
-    keyPassphraseRequiredFromError,
-    LanguageError,
-    runLanguageText,
-    type RunLanguageTextOptions,
-    type ScriptRunResult,
-} from "../session/adapter.js";
+import { keyPassphraseRequiredFromError, runLanguageText, type RunLanguageTextOptions, type ScriptRunResult } from "../session/adapter.js";
+import { toAuthInteractionContext } from "../session/auth_bridge.js";
 import { WorkspaceSession } from "../session/session.js";
 
-export type CommandRun = {
-    exitCode: number;
-    output: string;
-};
+export type { CommandRun };
 
 export type CommandRunOptions = {
     rl?: Interface;
@@ -69,29 +62,8 @@ export async function runCommand(
     file?: string,
     options?: CommandRunOptions,
 ): Promise<CommandRun> {
-    try {
-        const meta = await runMetaCommand(session, command);
-        if (meta.handled) {
-            if (meta.needsPassphrase !== undefined) {
-                const text = await fulfillPassphraseNeed(session, meta.needsPassphrase, options?.rl);
-                return { exitCode: 0, output: text };
-            }
-            return { exitCode: 0, output: meta.output ?? '' };
-        }
-
-        const run = await runLanguageWithUnlock(session, command, { rl: options?.rl });
-        const rendered = run.results
-            .map((item) => renderStatementOutput(session, item))
-            .filter((text) => text.length > 0)
-            .join('\n');
-        return { exitCode: 0, output: rendered };
-    } catch (e) {
-        if (e instanceof KeyUnlockDeclinedError) {
-            return { exitCode: 1, output: 'unlock declined' };
-        }
-        if (e instanceof LanguageError) {
-            return { exitCode: 2, output: formatDiagnostics(e.diagnostics, file, e.hints) };
-        }
-        return { exitCode: 1, output: e instanceof Error ? e.message : String(e) };
-    }
+    return runPortableCommand(session, command, file, {
+        auth: toAuthInteractionContext(session, { rl: options?.rl }),
+        requestPassphrase: (need) => requestPassphrase(session, need, options?.rl),
+    });
 }

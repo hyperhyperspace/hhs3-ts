@@ -1,0 +1,26 @@
+{
+  "name": "@hyper-hyper-space/hhs3_rdb_repl",
+  "version": "0.1.0",
+  "description": "Portable presentation and command tooling for HHSv3 RDb",
+  "type": "module",
+  "source": "src/index.ts",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "scripts": {
+    "test": "node --import ../../register.mjs ./test/run_tests.ts",
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist test-build"
+  },
+  "author": "Santiago Bazerque",
+  "license": "MIT",
+  "dependencies": {
+    "@hyper-hyper-space/hhs3_crypto": "^0.1.0",
+    "@hyper-hyper-space/hhs3_mvt": "^0.1.0",
+    "@hyper-hyper-space/hhs3_rdb": "^0.1.0",
+    "@hyper-hyper-space/hhs3_rdb_lang": "^0.1.0",
+    "@hyper-hyper-space/hhs3_rdb_runtime": "^0.1.0"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3"
+  }
+}
