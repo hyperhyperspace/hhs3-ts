@@ -34,7 +34,10 @@ export async function runLanguageText(
     text: string,
     options?: RunLanguageTextOptions,
 ): Promise<ScriptRunResult> {
-    const run = await executeText(session, text, options);
+    const runtimeOptions = options?.onProgress === undefined
+        ? options
+        : { ...options, onProgress: undefined };
+    const run = await executeText(session, text, runtimeOptions);
     return mapRuntimeResults(session, run, options);
 }
 
@@ -48,13 +51,16 @@ function mapRuntimeResults(
             const mapped: StatementRunResult = {
                 result: item.result,
                 notices: item.events?.map((event) => event.message),
-                noticesStreamed: options?.onProgress !== undefined && (item.events?.length ?? 0) > 0,
             };
             if (options?.onProgress !== undefined && session.outputMode !== 'json') {
                 const main = renderStatementMain(session, mapped);
                 if (main.length > 0) {
                     options.onProgress(main);
                     mapped.mainStreamed = true;
+                }
+                for (const notice of mapped.notices ?? []) {
+                    options.onProgress(notice);
+                    mapped.noticesStreamed = true;
                 }
             }
             return mapped;

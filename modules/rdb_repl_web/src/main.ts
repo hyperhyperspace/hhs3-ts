@@ -1,5 +1,6 @@
 import "./styles.css";
 
+import editorSchemaSql from "../../rdb/examples/editor_web.sql?raw";
 import { mountRepl } from "./app.js";
 import { DirectReplClient } from "./direct_client.js";
 import type { ReplInteractions } from "./protocol.js";
@@ -9,7 +10,7 @@ const client = new DirectReplClient();
 if (new URLSearchParams(location.search).has('smoke')) {
     void runSmoke(client);
 } else {
-    void mountRepl(client);
+    void mountRepl(client, [{ id: 'editor', sql: editorSchemaSql }]);
 }
 
 async function runSmoke(activeClient: DirectReplClient): Promise<void> {
@@ -52,6 +53,12 @@ SELECT sku, name FROM shop_prod.products;
         const keysAfterReset = await activeClient.execute('\\keys', interactions);
         assertSuccess(keysAfterReset, 'keys after reset');
         if (keysAfterReset.output.includes('alice')) throw new Error('ephemeral key survived reset');
+
+        if (await activeClient.hasKey('admin')) throw new Error('admin key existed before schema load');
+        assertSuccess(await activeClient.execute('\\key create admin', interactions), 'create admin key');
+        if (!await activeClient.hasKey('admin')) throw new Error('admin key was not created');
+        assertSuccess(await activeClient.execute('\\author admin', interactions), 'select admin author');
+        assertSuccess(await activeClient.execute(editorSchemaSql, interactions), 'load editor schema');
 
         document.body.dataset.smoke = 'passed';
         document.body.replaceChildren(resultNode('Browser smoke passed'));

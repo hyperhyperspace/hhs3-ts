@@ -55,6 +55,7 @@ export type ExecuteResult = {
 export interface ReplClient {
     start(): Promise<string>;
     execute(text: string, interactions: ReplInteractions): Promise<ExecuteResult>;
+    hasKey(label: string): Promise<boolean>;
     reset(): Promise<string>;
     close(): Promise<void>;
 }

@@ -7,14 +7,24 @@
       name="description"
       content="An ephemeral, browser-based REPL for Hyper Hyper Space RDB."
     />
-    <title>RDB Web REPL</title>
+    <link rel="icon" href="https://www.hyperhyperspace.org/favicon.ico" />
+    <title>RDB Web REPL · Hyper Hyper Space</title>
   </head>
   <body>
     <div class="app-shell">
       <header class="topbar">
         <div class="brand">
-          <span class="brand-mark" aria-hidden="true">R</span>
-          <div>
+          <a
+            class="brand-logo"
+            href="https://www.hyperhyperspace.org"
+            aria-label="Hyper Hyper Space home"
+          >
+            <img
+              src="https://www.hyperhyperspace.org/hhs_logo.png"
+              alt="Hyper Hyper Space"
+            />
+          </a>
+          <div class="brand-product">
             <h1>RDB Web REPL</h1>
             <p>Ephemeral in-memory workspace</p>
           </div>
@@ -24,6 +34,34 @@
             <span class="status-dot" aria-hidden="true"></span>
             <span>Starting</span>
           </span>
+          <a
+            class="button github-link"
+            href="https://github.com/hyperhyperspace/hhs3-ts"
+            target="_blank"
+            rel="noreferrer"
+            aria-label="View hhs3-ts on GitHub"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                fill="currentColor"
+                d="M12 .7a11.5 11.5 0 0 0-3.6 22.4c.6.1.8-.2.8-.5v-2c-3.3.7-4-1.4-4-1.4-.5-1.4-1.3-1.8-1.3-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.2 1.2a11 11 0 0 1 5.8 0c2.2-1.5 3.2-1.2 3.2-1.2.6 1.6.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.4-2.8 5.4-5.5 5.7.4.4.8 1.1.8 2.2v3.3c0 .3.2.6.8.5A11.5 11.5 0 0 0 12 .7Z"
+              />
+            </svg>
+            <span>GitHub</span>
+          </a>
+          <details class="menu" id="schema-menu">
+            <summary class="button">
+              Schemas
+              <span class="menu-chevron" aria-hidden="true">⌄</span>
+            </summary>
+            <div class="menu-popover">
+              <p>Load an example schema</p>
+              <button class="menu-item" type="button" data-schema="editor">
+                <span>Editor</span>
+                <small>Pages, blocks, users, and capabilities</small>
+              </button>
+            </div>
+          </details>
           <button class="button button-quiet" id="clear-output" type="button">Clear output</button>
           <button class="button button-danger" id="reset-runtime" type="button">Reset workspace</button>
         </div>

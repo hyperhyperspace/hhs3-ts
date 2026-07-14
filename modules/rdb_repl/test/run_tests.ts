@@ -85,6 +85,34 @@ SELECT sku, name FROM shop_prod.products;
         assert(unstreamedOnly.includes('Widget'), 'unstreamed main output remains visible');
         assert(!unstreamedOnly.includes('already streamed notice'), 'streamed notices are not rendered twice');
 
+        const observerSetup = await runCommand(session, `
+CREATE SCHEMA users_schema CREATORS ($me) AS (
+  TABLE identities (name string) ALLOW all IF true
+);
+CREATE TABLEGROUP users USING SCHEMA users_schema;
+CREATE SCHEMA observer_schema CREATORS ($me) AS (
+  TABLE orders (
+    customer string REFERENCES users.identities,
+    label string
+  ) ALLOW all IF true
+);
+CREATE TABLEGROUP observer USING SCHEMA observer_schema BIND users => users;
+`);
+        assertEqual(observerSetup.exitCode, 0, 'observer setup');
+        session.setRefAutoUpdate('auto');
+        const orderedProgress: string[] = [];
+        const observedInsert = await runCommand(
+            session,
+            "INSERT INTO users.identities (name) VALUES ('Ada');",
+            undefined,
+            { auth: { onProgress: (line) => orderedProgress.push(line) } },
+        );
+        assertEqual(observedInsert.exitCode, 0, 'observed insert');
+        const insertIndex = orderedProgress.findIndex((line) => line.startsWith('inserted '));
+        const refIndex = orderedProgress.findIndex((line) => line.startsWith('updated ref on observer'));
+        assert(insertIndex >= 0, 'insert result was streamed');
+        assert(refIndex > insertIndex, 'ref update was streamed after its triggering insert');
+
         await runCommand(session, '\\output json');
         const selected = await runCommand(session, 'SELECT sku, name FROM shop_prod.products;');
         assert(selected.exitCode === 0 && selected.output.includes('"Widget"'), 'portable JSON rendering');

@@ -39,6 +39,10 @@ export class DirectReplClient implements ReplClient {
         };
     }
 
+    async hasKey(label: string): Promise<boolean> {
+        return this.requireSession().keystore?.list().some((key) => key.label === label) === true;
+    }
+
     async reset(): Promise<string> {
         await this.close();
         await this.open();

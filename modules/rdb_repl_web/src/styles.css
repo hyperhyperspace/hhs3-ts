@@ -52,6 +52,8 @@ button {
 }
 
 .topbar {
+  position: relative;
+  z-index: 2;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -72,21 +74,29 @@ button {
 }
 
 .brand {
-  gap: 0.8rem;
+  gap: 1rem;
 }
 
-.brand-mark {
-  display: grid;
-  width: 2.7rem;
-  height: 2.7rem;
-  place-items: center;
-  border: 1px solid rgba(117, 230, 182, 0.35);
-  border-radius: 0.55rem;
-  color: #07100c;
-  background: var(--accent);
-  font-weight: 800;
-  font-size: 1.15rem;
-  box-shadow: 0 0 1.5rem rgba(117, 230, 182, 0.12);
+.brand-logo {
+  display: flex;
+  align-items: center;
+  width: clamp(8.5rem, 14vw, 11.5rem);
+  padding-right: 1rem;
+  border-right: 1px solid var(--line);
+}
+
+.brand-logo img {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 2.7rem;
+  object-fit: contain;
+}
+
+.brand-logo:focus-visible {
+  border-radius: 0.25rem;
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
 }
 
 h1,
@@ -139,12 +149,18 @@ p {
 }
 
 .button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
   min-height: 2.35rem;
   padding: 0.45rem 0.75rem;
   border: 1px solid var(--line-bright);
   border-radius: 0.42rem;
+  color: inherit;
   background: var(--panel-raised);
   cursor: pointer;
+  text-decoration: none;
   transition: border-color 120ms ease, background 120ms ease, transform 120ms ease;
 }
 
@@ -184,6 +200,87 @@ input:focus-visible {
 .button:disabled {
   opacity: 0.48;
   cursor: wait;
+}
+
+.github-link svg {
+  width: 1rem;
+  height: 1rem;
+}
+
+.menu {
+  position: relative;
+}
+
+.menu summary {
+  list-style: none;
+  user-select: none;
+}
+
+.menu summary::-webkit-details-marker {
+  display: none;
+}
+
+.menu-chevron {
+  color: var(--muted);
+  font-size: 0.9rem;
+  transition: transform 120ms ease;
+}
+
+.menu[open] .menu-chevron {
+  transform: rotate(180deg);
+}
+
+.menu-popover {
+  position: absolute;
+  top: calc(100% + 0.55rem);
+  right: 0;
+  width: min(20rem, calc(100vw - 2rem));
+  padding: 0.55rem;
+  border: 1px solid var(--line-bright);
+  border-radius: 0.6rem;
+  background: var(--panel-raised);
+  box-shadow: 0 1rem 3rem rgba(0, 0, 0, 0.45);
+}
+
+.menu-popover > p {
+  padding: 0.35rem 0.45rem 0.6rem;
+  color: var(--muted);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.menu-item {
+  display: flex;
+  width: 100%;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.7rem;
+  border: 0;
+  border-radius: 0.4rem;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.menu-item:hover {
+  background: rgba(117, 230, 182, 0.08);
+}
+
+.menu-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.menu-item:disabled {
+  opacity: 0.48;
+  cursor: wait;
+}
+
+.menu-item small {
+  color: var(--muted);
+  font-size: 0.7rem;
 }
 
 .terminal {
@@ -395,12 +492,40 @@ kbd {
 @media (max-width: 720px) {
   .topbar {
     align-items: flex-start;
+    flex-wrap: wrap;
   }
 
   .brand p,
   .status,
   .button-quiet {
     display: none;
+  }
+
+  .brand {
+    gap: 0.65rem;
+  }
+
+  .brand-logo {
+    width: 6.5rem;
+    padding-right: 0.65rem;
+  }
+
+  .github-link {
+    padding-inline: 0.65rem;
+  }
+
+  .github-link span {
+    display: none;
+  }
+
+  .topbar-actions {
+    flex-basis: 100%;
+    justify-content: flex-start;
+  }
+
+  .menu-popover {
+    right: auto;
+    left: 0;
   }
 
   .terminal {

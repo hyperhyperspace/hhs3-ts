@@ -1,8 +1,13 @@
-import type { ReplClient, ReplInteractions } from "./protocol.js";
+import type { ExecuteResult, ReplClient, ReplInteractions } from "./protocol.js";
 
 type EntryKind = 'output' | 'error' | 'progress';
 
-export async function mountRepl(client: ReplClient): Promise<void> {
+export type SchemaPreset = {
+    id: string;
+    sql: string;
+};
+
+export async function mountRepl(client: ReplClient, schemaPresets: SchemaPreset[] = []): Promise<void> {
     const form = element<HTMLFormElement>('command-form');
     const input = element<HTMLTextAreaElement>('command-input');
     const runButton = element<HTMLButtonElement>('run-command');
@@ -12,6 +17,9 @@ export async function mountRepl(client: ReplClient): Promise<void> {
     const status = element<HTMLSpanElement>('runtime-status');
     const resetButton = element<HTMLButtonElement>('reset-runtime');
     const clearButton = element<HTMLButtonElement>('clear-output');
+    const schemaMenu = element<HTMLDetailsElement>('schema-menu');
+    const schemaButtons = Array.from(schemaMenu.querySelectorAll<HTMLButtonElement>('[data-schema]'));
+    const presetsById = new Map(schemaPresets.map((preset) => [preset.id, preset]));
     const history: string[] = [];
     let historyIndex = 0;
     let busy = false;
@@ -22,6 +30,7 @@ export async function mountRepl(client: ReplClient): Promise<void> {
         input.disabled = next;
         runButton.disabled = next;
         resetButton.disabled = next;
+        for (const button of schemaButtons) button.disabled = next;
     };
 
     const setStatus = (text: string, kind: 'starting' | 'ready' | 'error'): void => {
@@ -92,25 +101,32 @@ export async function mountRepl(client: ReplClient): Promise<void> {
         onProgress: appendProgress,
     };
 
+    const runVisibleCommand = async (command: string, addToHistory: boolean): Promise<ExecuteResult> => {
+        const activePrompt = prompt.textContent ?? 'rdb>';
+        appendCommand(activePrompt, command);
+        activeProgressOutput = undefined;
+        if (addToHistory) {
+            history.push(command);
+            historyIndex = history.length;
+        }
+
+        const result = await client.execute(command, interactions);
+        if (result.output.length > 0) {
+            appendEntry(result.exitCode === 0 ? 'result' : `error ${result.exitCode}`, result.output, result.exitCode === 0 ? 'output' : 'error');
+        }
+        setPrompt(result.prompt);
+        if (result.quit) appendEntry('session', 'Use “Reset workspace” to start a new session.', 'output');
+        return result;
+    };
+
     const execute = async (): Promise<void> => {
         const command = input.value.trim();
         if (busy || command.length === 0) return;
 
-        const activePrompt = prompt.textContent ?? 'rdb>';
-        appendCommand(activePrompt, command);
-        activeProgressOutput = undefined;
-        history.push(command);
-        historyIndex = history.length;
         input.value = '';
         setBusy(true);
-
         try {
-            const result = await client.execute(command, interactions);
-            if (result.output.length > 0) {
-                appendEntry(result.exitCode === 0 ? 'result' : `error ${result.exitCode}`, result.output, result.exitCode === 0 ? 'output' : 'error');
-            }
-            setPrompt(result.prompt);
-            if (result.quit) appendEntry('session', 'Use “Reset workspace” to start a new session.', 'output');
+            await runVisibleCommand(command, true);
             setStatus('Memory workspace', 'ready');
         } catch (error) {
             appendEntry('error', errorMessage(error), 'error');
@@ -120,6 +136,40 @@ export async function mountRepl(client: ReplClient): Promise<void> {
             input.focus();
         }
     };
+
+    for (const button of schemaButtons) {
+        button.addEventListener('click', async () => {
+            const preset = presetsById.get(button.dataset.schema ?? '');
+            schemaMenu.removeAttribute('open');
+            if (busy || preset === undefined) return;
+
+            setBusy(true);
+            try {
+                if (!await client.hasKey('admin')) {
+                    const created = await runVisibleCommand('\\key create admin', false);
+                    if (created.exitCode !== 0) {
+                        setStatus('Memory workspace', 'ready');
+                        return;
+                    }
+                }
+
+                const selected = await runVisibleCommand('\\author admin', false);
+                if (selected.exitCode !== 0) {
+                    setStatus('Memory workspace', 'ready');
+                    return;
+                }
+
+                await runVisibleCommand(preset.sql.trim(), true);
+                setStatus('Memory workspace', 'ready');
+            } catch (error) {
+                appendEntry('error', errorMessage(error), 'error');
+                setStatus('Runtime error', 'error');
+            } finally {
+                setBusy(false);
+                input.focus();
+            }
+        });
+    }
 
     form.addEventListener('submit', (event) => {
         event.preventDefault();
