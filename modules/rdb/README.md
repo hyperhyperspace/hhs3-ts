@@ -82,6 +82,31 @@ Rdb is four content-addressed MVT types. C-SQL and the adapter are the intended 
 - **RTable** — a member table on a scoped projection of its group's history. Rows are write-once identities with permanent deletes; column updates are pinned to the schema birth write active at write time and per-field last-writer-wins within that incarnation.
 - **RDb** — the deployment sync root: records member schemas and groups and ensures they and their transitive references are present and syncing in the replica.
 
+## Column types
+
+A column has a base type and, optionally, a set of type-scoped `constraints`. Values are carried in the row as `json.Literal`s; the string-carried numeric and byte types use a **canonical string** so they hash stably and round-trip losslessly across target databases (SQLite / Postgres / IndexedDB).
+
+| Type | Carrier | Canonical form | Constraints |
+|------|---------|----------------|-------------|
+| `string` | JS string | — | `maxLength` |
+| `integer` | JS number | `Number.isSafeInteger` | `min`, `max` |
+| `float` | JS number | `Number.isFinite` | *(none)* |
+| `boolean` | JS boolean | — | *(none)* |
+| `json` | any non-null literal | — | *(none)* |
+| `bigint` | string | signed decimal integer, no leading zeros, no `-0` (`/^(0\|-?[1-9][0-9]*)$/`) | `min`, `max` |
+| `decimal` | string | fixed-scale decimal, exactly `scale` fractional digits, single canonical zero, `-0` normalized to `0` | `scale` (**required**), `precision`, `min`, `max` |
+| `bytes` | string | canonical base64 (RFC 4648 standard alphabet, fixed padding) | `maxLength` (decoded byte length) |
+
+`bigint` is an arbitrary-precision signed integer for finance-grade counters and ids; `decimal` is exact fixed-point (never a float); `bytes` is opaque binary. `integer` is now bounded to the JS safe-integer range — use `bigint` beyond it.
+
+### Constraints and the per-type allowlist
+
+`min` / `max` are **canonical strings** (so bigint / decimal bounds are exact) and are inclusive. `constraints` is validated with a strict per-type allowlist: **any constraint key that does not apply to the column's type is a hard reject** (there is no silent, ignored option — this prevents schema fungibility). `decimal` requires `scale >= 0`; if `precision` is present it must be `>= scale`; `min` must be `<= max`; and a column `default` must itself satisfy the type and constraints.
+
+### Reject, never round
+
+Value validation is a synchronous Layer-1 write-time gate (`columnValueValid`): a value that is non-canonical, out of range, or (for `decimal`) carries more fractional digits than the column scale is **hard-rejected at write time — never rounded or coerced**. Comparisons and ordering on `integer` / `float` / `bigint` / `decimal` are numeric (bigint via `BigInt`, decimal via scaled-integer), not lexical; `bytes` supports equality only. `add` / `sub` / `mul` are exact on `integer`, `bigint`, and `decimal` (operands must share a type family).
+
 Deeper notes: [CAPABILITIES.md](./CAPABILITIES.md) (capabilities from rows and at-use predicates), [VOID_SEMANTICS.md](./VOID_SEMANTICS.md) (discarding rule-breaking operations under concurrency), [mvt](../mvt) (the underlying type system and SOaD), [rdb_lang](../rdb_lang) (the C-SQL reference).
 
 ## Tests

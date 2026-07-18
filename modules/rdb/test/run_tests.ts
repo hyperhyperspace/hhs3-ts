@@ -1,6 +1,7 @@
 import { testing } from "@hyper-hyper-space/hhs3_util";
 
 import { schemaModelTests } from "./schema_model_tests.js";
+import { canonicalTests } from "./canonical_tests.js";
 import { formatPredicateTests } from "./format_predicate_tests.js";
 import { payloadFormatTests } from "./payload_format_tests.js";
 import { rowIdTests } from "./row_id_tests.js";
@@ -29,6 +30,7 @@ async function main() {
     const filters = parseTestFilters(process.argv.slice(2));
 
     allTests.set(schemaModelTests.title, schemaModelTests.tests);
+    allTests.set(canonicalTests.title, canonicalTests.tests);
     allTests.set(formatPredicateTests.title, formatPredicateTests.tests);
     allTests.set(payloadFormatTests.title, payloadFormatTests.tests);
     allTests.set(rowIdTests.title, rowIdTests.tests);

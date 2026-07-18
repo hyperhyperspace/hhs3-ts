@@ -19,7 +19,7 @@ import {
 } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchemaView } from "../rschema/interfaces.js";
-import { columnValueMatchesType } from "../rschema/validate.js";
+import { columnValueValidReason } from "../rschema/validate.js";
 import type { InsertRowPayload, UpdateRowPayload, RowOpPayload } from "./payload.js";
 
 // An insert conforms to the schema iff the table exists, every carried column
@@ -32,8 +32,9 @@ export function validateInsertAgainstSchema(insert: InsertRowPayload, view: RSch
     for (const column of Object.keys(insert.values)) {
         const columnDef = def.columns[column];
         if (columnDef === undefined) return validationFailure(`column '${column}' does not exist on table '${table}'`);
-        if (!columnValueMatchesType(insert.values[column], columnDef.type)) {
-            return validationFailure(`column '${column}' does not match declared type '${columnDef.type}'`);
+        const reason = columnValueValidReason(insert.values[column], columnDef);
+        if (reason !== undefined) {
+            return validationFailure(`column '${column}' (${columnDef.type}): ${reason}`);
         }
     }
 
@@ -61,8 +62,9 @@ export function validateUpdateAgainstSchema(update: UpdateRowPayload, view: RSch
         const columnDef = def.columns[column];
         if (columnDef === undefined) return validationFailure(`column '${column}' does not exist on table '${table}'`);
         if (columnDef.readonly ?? false) return validationFailure(`column '${column}' is readonly`);
-        if (!columnValueMatchesType(update.values[column], columnDef.type)) {
-            return validationFailure(`column '${column}' does not match declared type '${columnDef.type}'`);
+        const reason = columnValueValidReason(update.values[column], columnDef);
+        if (reason !== undefined) {
+            return validationFailure(`column '${column}' (${columnDef.type}): ${reason}`);
         }
     }
 

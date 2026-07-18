@@ -604,5 +604,55 @@ export const parserTests = {
                 assertTrue(!result.ok, 'parse should fail for uuid column');
             },
         },
+        {
+            name: '[PARSE32] parses precise column types + parameters + MIN/MAX',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE SCHEMA finance AS (
+                      TABLE ledger (
+                        seq bigint PUB,
+                        memo string(64),
+                        blob bytes(32),
+                        amount decimal(18, 2),
+                        qty integer MIN 0 MAX 100
+                      )
+                    );
+                `);
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok || result.value.kind !== 'create-schema') return;
+                const cols = result.value.tables[0].columns;
+                const byName = (n: string) => cols.find((c) => c.name === n)!;
+
+                assertEquals(byName('seq').type, 'bigint', 'seq is bigint');
+                assertEquals(byName('memo').type, 'string', 'memo is string');
+                assertEquals(byName('memo').constraints?.maxLength, 64, 'string(64) -> maxLength 64');
+                assertEquals(byName('blob').type, 'bytes', 'blob is bytes');
+                assertEquals(byName('blob').constraints?.maxLength, 32, 'bytes(32) -> maxLength 32');
+                assertEquals(byName('amount').type, 'decimal', 'amount is decimal');
+                assertEquals(byName('amount').constraints?.precision, 18, 'decimal precision');
+                assertEquals(byName('amount').constraints?.scale, 2, 'decimal scale');
+                assertTrue(byName('qty').constraints?.min !== undefined, 'MIN bound present');
+                assertTrue(byName('qty').constraints?.max !== undefined, 'MAX bound present');
+            },
+        },
+        {
+            name: '[PARSE33] parses precise types in ALTER SCHEMA ADD COLUMN',
+            invoke: async () => {
+                const result = parseStatement(`
+                    ALTER SCHEMA finance AS (
+                      ADD COLUMN ledger.balance decimal(20, 4) MIN 0
+                    );
+                `);
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok || result.value.kind !== 'alter-schema') return;
+                const rule = result.value.rules[0];
+                assertEquals(rule.kind, 'add-column', 'add-column rule');
+                if (rule.kind !== 'add-column') return;
+                assertEquals(rule.column.type, 'decimal', 'added column is decimal');
+                assertEquals(rule.column.constraints?.precision, 20, 'precision');
+                assertEquals(rule.column.constraints?.scale, 4, 'scale');
+                assertTrue(rule.column.constraints?.min !== undefined, 'MIN bound present');
+            },
+        },
     ],
 };

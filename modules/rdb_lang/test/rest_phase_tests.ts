@@ -761,5 +761,90 @@ export const restPhaseTests = {
                 assertTrue(dump.includes('ADD TABLEGROUP shop_prod TO app'), 'ADD TABLEGROUP uses group alias name');
             },
         },
+        {
+            name: '[REST12] precise column types: render round-trip, canonical value fidelity, bind-time reject',
+            invoke: async () => {
+                const { ctx, lang } = await createEnv();
+
+                const schemaPlan = await execute(await parseBind(`
+                    CREATE SCHEMA finance CREATORS ($admin) AS (
+                      TABLE ledger (
+                        seq bigint PUB READONLY,
+                        memo string(8),
+                        amount decimal(18, 2),
+                        qty integer MIN 0 MAX 100
+                      ) ALLOW all IF true
+                    );
+                `, lang));
+                assertTrue(schemaPlan.ok && schemaPlan.value.kind === 'create-plan', 'precise schema create plan succeeds');
+                if (!schemaPlan.ok || schemaPlan.value.kind !== 'create-plan') return;
+                const schema = await ctx.createObject(schemaPlan.value.plan.payload) as RSchemaImpl;
+                lang.registerSchema('finance', schema);
+
+                // reverse render preserves type parameters and MIN/MAX modifiers, and re-parses
+                const rendered = renderCreateSchema(schema.createOp);
+                assertTrue(rendered.includes('seq bigint'), 'rendered keeps bigint type');
+                assertTrue(rendered.includes('memo string(8)'), 'rendered keeps string(8) length param');
+                assertTrue(rendered.includes('amount decimal(18, 2)'), 'rendered keeps decimal(precision, scale)');
+                assertTrue(rendered.includes('qty integer') && rendered.includes('MIN ') && rendered.includes('MAX '),
+                    'rendered keeps MIN/MAX modifiers');
+                assertTrue(parseStatement(rendered).ok, 'rendered precise schema re-parses');
+
+                const groupPlan = await execute(await parseBind('CREATE TABLEGROUP fin_prod USING SCHEMA finance;', lang));
+                assertTrue(groupPlan.ok && groupPlan.value.kind === 'create-plan', 'finance group create plan succeeds');
+                if (!groupPlan.ok || groupPlan.value.kind !== 'create-plan') return;
+                const group = await ctx.createObject(groupPlan.value.plan.payload) as RTableGroupImpl;
+                lang.registerGroup('fin_prod', group);
+
+                // canonical string carriers survive a full insert -> select round-trip exactly
+                const insert = await execute(await parseBind(
+                    "INSERT INTO fin_prod.ledger (seq, memo, amount, qty) VALUES ('9', 'hi', '9.99', 5);", lang));
+                assertTrue(insert.ok && insert.value.kind === 'insert', 'canonical insert succeeds');
+
+                const select = await execute(await parseBind(
+                    "SELECT seq, amount, qty FROM fin_prod.ledger WHERE seq = '9';", lang));
+                assertTrue(select.ok && select.value.kind === 'select', 'bigint pub-eq select succeeds');
+                if (select.ok && select.value.kind === 'select') {
+                    assertEquals(select.value.rows.length, 1, 'pub-eq lookup finds the row');
+                    assertEquals(select.value.rows[0].values['seq'], '9', 'bigint carrier round-trips exactly');
+                    assertEquals(select.value.rows[0].values['amount'], '9.99', 'decimal carrier round-trips exactly');
+                    assertEquals(select.value.rows[0].values['qty'], 5, 'integer round-trips');
+                }
+
+                // bind-time canonical encoding rejects non-canonical numeric literals (reject, never round)
+                const overScale = parseStatement("INSERT INTO fin_prod.ledger (seq, amount) VALUES ('1', '9.999');");
+                assertTrue(overScale.ok, 'over-scale insert parses');
+                if (overScale.ok) assertTrue(!(await bind(overScale.value, lang)).ok, 'over-scale decimal rejected at bind');
+
+                const badBigint = parseStatement("INSERT INTO fin_prod.ledger (seq, amount) VALUES ('1.5', '1.00');");
+                assertTrue(badBigint.ok, 'non-integer bigint insert parses');
+                if (badBigint.ok) assertTrue(!(await bind(badBigint.value, lang)).ok, 'non-integer bigint rejected at bind');
+
+                // Tier-1 constraint pre-check: maxLength / range now fail at BIND with the
+                // engine's message, instead of only surfacing later at execute.
+                const expectBindReject = async (sql: string, why: string, msgIncludes: string) => {
+                    const parsed = parseStatement(sql);
+                    assertTrue(parsed.ok, `${why}: parses`);
+                    if (!parsed.ok) return;
+                    const bound = await bind(parsed.value, lang);
+                    assertTrue(!bound.ok, `${why}: rejected at bind`);
+                    if (!bound.ok) {
+                        assertTrue(bound.diagnostics.some((d) => d.message.includes(msgIncludes)),
+                            `${why}: diagnostic should include '${msgIncludes}', got: ${bound.diagnostics.map((d) => d.message).join(' | ')}`);
+                    }
+                };
+                await expectBindReject(
+                    "INSERT INTO fin_prod.ledger (seq, memo, amount) VALUES ('1', 'toolongmemo', '1.00');",
+                    'over-length string', "column 'memo' (string): string length 11 exceeds maxLength 8");
+                await expectBindReject(
+                    "INSERT INTO fin_prod.ledger (seq, amount, qty) VALUES ('1', '1.00', 200);",
+                    'out-of-range integer', "column 'qty' (integer): integer 200 is out of range [0, 100]");
+
+                // an UPDATE path is covered by the same shared encoder too
+                await expectBindReject(
+                    "UPDATE fin_prod.ledger SET memo = 'toolongmemo' WHERE rowId = '#deadbeef';",
+                    'over-length string on update', "column 'memo' (string): string length 11 exceeds maxLength 8");
+            },
+        },
     ],
 };

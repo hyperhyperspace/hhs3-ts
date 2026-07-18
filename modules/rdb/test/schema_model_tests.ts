@@ -2,7 +2,7 @@ import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.
 import { json } from "@hyper-hyper-space/hhs3_json";
 
 import {
-    TableDef, tableDefFormat,
+    ColumnDef, TableDef, tableDefFormat,
     Predicate, Restriction,
     MigrationRule, migrationRuleFormat,
 } from "../src/rschema/payload.js";
@@ -11,7 +11,8 @@ import {
     validateTableDef, validateSchemaTables,
     validatePredicate, validateFKs, validateRestrictions,
     validateMigrationRule,
-    columnValueMatchesType,
+    validateColumnDef,
+    columnValueMatchesType, columnValueValid, columnValueValidReason,
     isValidName, isValidSchemaName, isValidTableRef,
     MAX_EXPR_DEPTH,
 } from "../src/rschema/validate.js";
@@ -86,6 +87,121 @@ async function testColumnTypes() {
     assertTrue(columnValueMatchesType(true, 'boolean'), 'boolean value should match boolean column');
     assertTrue(columnValueMatchesType({ a: [1, 2] }, 'json'), 'object value should match json column');
     assertFalse(columnValueMatchesType('x', 'integer'), 'string value should not match integer column');
+
+    // integer is now bounded to the JS safe-integer range
+    assertFalse(columnValueMatchesType(Number.MAX_SAFE_INTEGER + 1, 'integer'),
+        'an unsafe integer should not match integer column');
+
+    // new string-carried types
+    assertTrue(columnValueMatchesType('123', 'bigint'), 'canonical bigint string should match bigint column');
+    assertFalse(columnValueMatchesType('007', 'bigint'), 'non-canonical bigint (leading zeros) should not match');
+    assertFalse(columnValueMatchesType(123, 'bigint'), 'a number should not match a bigint column carrier');
+    assertTrue(columnValueMatchesType('AAAA', 'bytes'), 'canonical base64 should match bytes column');
+    assertFalse(columnValueMatchesType('AAA', 'bytes'), 'non-multiple-of-4 base64 should not match bytes column');
+
+    // columnValueValid is constraint-aware
+    const dec2: ColumnDef = { type: 'decimal', constraints: { scale: 2 } };
+    assertTrue(columnValueValid('10.50', dec2), 'canonical decimal at scale should be valid');
+    assertFalse(columnValueValid('10.5', dec2), 'decimal with wrong scale should be rejected (never rounded)');
+    assertFalse(columnValueValid('10.505', dec2), 'over-scale decimal should be rejected (never rounded)');
+
+    const boundedInt: ColumnDef = { type: 'integer', constraints: { min: '0', max: '1000' } };
+    assertTrue(columnValueValid(500, boundedInt), 'in-range integer should be valid');
+    assertFalse(columnValueValid(-1, boundedInt), 'below-min integer should be rejected');
+    assertFalse(columnValueValid(1001, boundedInt), 'above-max integer should be rejected');
+
+    const boundedBig: ColumnDef = { type: 'bigint', constraints: { min: '0' } };
+    assertTrue(columnValueValid('99999999999999999999999999', boundedBig), 'large canonical bigint should be valid');
+    assertFalse(columnValueValid('-1', boundedBig), 'below-min bigint should be rejected');
+
+    const cappedStr: ColumnDef = { type: 'string', constraints: { maxLength: 3 } };
+    assertTrue(columnValueValid('abc', cappedStr), 'string within maxLength should be valid');
+    assertFalse(columnValueValid('abcd', cappedStr), 'string over maxLength should be rejected');
+}
+
+async function testColumnConstraintValidation() {
+    // decimal requires a scale
+    assertTrue(validateColumnDef({ type: 'decimal', constraints: { scale: 2 } }) === undefined,
+        'decimal with scale should validate');
+    assertTrue(validateColumnDef({ type: 'decimal' }) !== undefined,
+        'decimal without a scale should not validate');
+    assertTrue(validateColumnDef({ type: 'decimal', constraints: { scale: 2, precision: 1 } }) !== undefined,
+        'decimal with precision < scale should not validate');
+    assertTrue(validateColumnDef({ type: 'decimal', constraints: { scale: 2, precision: 4 } }) === undefined,
+        'decimal with precision >= scale should validate');
+
+    // min <= max
+    assertTrue(validateColumnDef({ type: 'integer', constraints: { min: '5', max: '1' } }) !== undefined,
+        'min > max should not validate');
+    assertTrue(validateColumnDef({ type: 'integer', constraints: { min: '1', max: '5' } }) === undefined,
+        'min <= max should validate');
+
+    // non-canonical bound rejected
+    assertTrue(validateColumnDef({ type: 'bigint', constraints: { min: '007' } }) !== undefined,
+        'non-canonical bigint bound should not validate');
+
+    // default must satisfy type + constraints
+    assertTrue(validateColumnDef({ type: 'decimal', constraints: { scale: 2 }, default: '1.00' }) === undefined,
+        'in-form decimal default should validate');
+    assertTrue(validateColumnDef({ type: 'decimal', constraints: { scale: 2 }, default: '1.5' }) !== undefined,
+        'wrong-scale decimal default should not validate');
+
+    // anti-fungibility: inapplicable constraint keys are a hard reject
+    assertTrue(validateColumnDef({ type: 'string', constraints: { min: '0' } }) !== undefined,
+        'min on a string column should be rejected (not applicable)');
+    assertTrue(validateColumnDef({ type: 'integer', constraints: { maxLength: 4 } }) !== undefined,
+        'maxLength on an integer column should be rejected (not applicable)');
+    assertTrue(validateColumnDef({ type: 'float', constraints: { min: '0' } }) !== undefined,
+        'any constraint on a float column should be rejected (float takes none)');
+    assertTrue(validateColumnDef({ type: 'boolean', constraints: { maxLength: 1 } }) !== undefined,
+        'any constraint on a boolean column should be rejected');
+    assertTrue(validateColumnDef({ type: 'string', constraints: { maxLength: 8 } }) === undefined,
+        'maxLength on a string column should validate');
+    assertTrue(validateColumnDef({ type: 'bytes', constraints: { maxLength: 32 } }) === undefined,
+        'maxLength on a bytes column should validate');
+    assertTrue(validateColumnDef({ type: 'bigint', constraints: { min: '0', max: '100' } }) === undefined,
+        'min/max on a bigint column should validate');
+}
+
+async function testColumnValueReasons() {
+    // valid values yield no reason
+    assertTrue(columnValueValidReason('ok', { type: 'string' }) === undefined, 'valid string has no reason');
+    assertTrue(columnValueValidReason('10.50', { type: 'decimal', constraints: { scale: 2 } }) === undefined,
+        'valid decimal has no reason');
+
+    // reasons distinguish carrier mismatch from constraint violations
+    const cappedStr: ColumnDef = { type: 'string', constraints: { maxLength: 3 } };
+    const tooLong = columnValueValidReason('abcd', cappedStr);
+    assertTrue(tooLong !== undefined && tooLong.includes('maxLength 3') && tooLong.includes('length 4'),
+        `string over maxLength names the limit: ${tooLong}`);
+    const notString = columnValueValidReason(5, cappedStr);
+    assertTrue(notString !== undefined && notString.includes('expected a string') && notString.includes('number'),
+        `wrong carrier names the expected/actual type: ${notString}`);
+
+    const boundedInt: ColumnDef = { type: 'integer', constraints: { min: '0', max: '1000' } };
+    const oob = columnValueValidReason(1001, boundedInt);
+    assertTrue(oob !== undefined && oob.includes('out of range') && oob.includes('[0, 1000]'),
+        `out-of-range integer names the bounds: ${oob}`);
+
+    const dec2: ColumnDef = { type: 'decimal', constraints: { scale: 2 } };
+    const badScale = columnValueValidReason('10.5', dec2);
+    assertTrue(badScale !== undefined && badScale.includes('canonical decimal') && badScale.includes('scale=2'),
+        `wrong-scale decimal names the scale: ${badScale}`);
+
+    const bigCol: ColumnDef = { type: 'bigint' };
+    const badBig = columnValueValidReason('007', bigCol);
+    assertTrue(badBig !== undefined && badBig.includes('canonical bigint'),
+        `non-canonical bigint is reported as such: ${badBig}`);
+
+    const bytes8: ColumnDef = { type: 'bytes', constraints: { maxLength: 1 } };
+    const tooManyBytes = columnValueValidReason('AAAA', bytes8);   // 'AAAA' -> 3 bytes
+    assertTrue(tooManyBytes !== undefined && tooManyBytes.includes('byte length') && tooManyBytes.includes('maxLength 1'),
+        `over-length bytes names the byte count: ${tooManyBytes}`);
+
+    // the boolean wrapper stays consistent with the reason function
+    assertTrue(columnValueValid('abc', cappedStr) === (columnValueValidReason('abc', cappedStr) === undefined),
+        'columnValueValid agrees with columnValueValidReason (valid)');
+    assertFalse(columnValueValid('abcd', cappedStr), 'columnValueValid agrees with columnValueValidReason (invalid)');
 }
 
 async function testTableDefFormatAndValidation() {
@@ -407,6 +523,8 @@ export const schemaModelTests = {
     tests: [
         { name: '[MODEL01] Names and table refs', invoke: testNames },
         { name: '[MODEL02] Column types', invoke: testColumnTypes },
+        { name: '[MODEL02b] Column constraint validation', invoke: testColumnConstraintValidation },
+        { name: '[MODEL02c] Column value rejection reasons', invoke: testColumnValueReasons },
         { name: '[MODEL03] Table def format and validation', invoke: testTableDefFormatAndValidation },
         { name: '[MODEL04] Restriction defaults', invoke: testRestrictionDefaults },
         { name: '[MODEL05] FKs', invoke: testFKs },

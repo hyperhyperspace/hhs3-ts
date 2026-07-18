@@ -2,7 +2,7 @@ import type { B64Hash, KeyId, OwnIdentity, PublicKey } from "@hyper-hyper-space/
 import type { json } from "@hyper-hyper-space/hhs3_json";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import { deriveRowId } from "@hyper-hyper-space/hhs3_rdb";
-import type { InsertRowPayload, MigrationRule, RowOpPayload, RowQuery } from "@hyper-hyper-space/hhs3_rdb";
+import type { ColumnDef, InsertRowPayload, MigrationRule, RowOpPayload, RowQuery } from "@hyper-hyper-space/hhs3_rdb";
 
 import { DiagnosticBag, err, ok, Result } from "../diagnostics.js";
 import type {
@@ -19,7 +19,7 @@ import type {
     LangBindContext, LangValue, ResolvedDatabaseRef, ResolvedGroupRef, ResolvedLogTarget, ResolvedSchemaRef,
     ResolvedTableRef, VersionScope,
 } from "./context.js";
-import { asIdentity, asJsonLiteral, asKeyId, resolveCreator, resolveValue } from "./values.js";
+import { asIdentity, asJsonLiteral, asKeyId, canonicalEncodeRowValues, resolveCreator, resolveValue } from "./values.js";
 
 /** Reserved INSERT / WITH ROWS pseudo-column; not a schema column. */
 export const PSEUDO_COLUMN_UUID = 'uuid';
@@ -260,9 +260,13 @@ async function bindCreateTableGroup(ast: CreateTableGroupStatement, context: Lan
         bindings[binding.name] = (await context.resolveGroup(binding.group)).id;
     }
     const initialRows: BoundInitialRow[] = [];
+    const schemaView = schema.schema !== undefined
+        ? await schema.schema.getView(schemaVersion, schemaVersion)
+        : undefined;
     for (const row of ast.initialRows) {
         const { uuid, values } = await bindInitialRowValues(row.values, context);
-        initialRows.push({ table: row.table, uuid, values });
+        const columns = schemaView?.getTable(row.table)?.columns ?? {};
+        initialRows.push({ table: row.table, uuid, values: canonicalEncodeRowValues(values, columns) });
     }
     return {
         kind: 'create-tablegroup',
@@ -338,9 +342,10 @@ async function bindUpdate(ast: UpdateStatement, context: LangBindContext): Promi
     const table = await resolveTableRef(ast.table, context);
     const author = await resolveEffectiveAuthor(ast.author, context);
     const valueContext = contextWithAuthor(context, author);
-    const values: { [column: string]: json.Literal } = {};
-    for (const v of ast.values) values[v.column] = asJsonLiteral(await resolveValue(v.value, valueContext));
+    const rawValues: { [column: string]: json.Literal } = {};
+    for (const v of ast.values) rawValues[v.column] = asJsonLiteral(await resolveValue(v.value, valueContext));
     const at = await context.resolveVersion(ast.at, { kind: 'group', id: table.groupId, group: table.group });
+    const values = canonicalEncodeRowValues(rawValues, await resolveColumnDefs(table, at));
     const rowId = await bindRowId(ast.rowId, context, table, at);
     const bound: BoundUpdate = { kind: 'update', ast, table, values, rowId, at };
     if (author !== undefined) bound.author = author;
@@ -380,8 +385,9 @@ async function bindBundleWrite(write: BundleWriteStatement, context: LangBindCon
     }
     if (write.kind === 'update') {
         const table = await context.resolveTable(write.table);
-        const values: { [column: string]: json.Literal } = {};
-        for (const v of write.values) values[v.column] = asJsonLiteral(await resolveValue(v.value, context));
+        const rawValues: { [column: string]: json.Literal } = {};
+        for (const v of write.values) rawValues[v.column] = asJsonLiteral(await resolveValue(v.value, context));
+        const values = canonicalEncodeRowValues(rawValues, await resolveColumnDefs(table, at));
         return { table: write.table.table, op: { action: 'update', rowId: await bindRowId(write.rowId, context, table, at), values } };
     }
     const table = await context.resolveTable(write.table);
@@ -541,7 +547,8 @@ async function bindInsertColumns(
             values[column] = asJsonLiteral(await resolveValue(expr, valueContext));
         }
     }
-    return { uuid: uuid ?? context.createUuid(), values };
+    const columnDefs = await resolveColumnDefs(table, at);
+    return { uuid: uuid ?? context.createUuid(), values: canonicalEncodeRowValues(values, columnDefs) };
 }
 
 async function bindInitialRowValues(
@@ -560,6 +567,15 @@ async function bindInitialRowValues(
         values[pair.column] = asJsonLiteral(await resolveValue(pair.value, context));
     }
     return { uuid: uuid ?? context.createUuid(), values };
+}
+
+// The declared column defs of a group table at a version, for canonical value
+// encoding. An unresolved schema (or absent table) yields an empty map, in
+// which case values pass through unchanged (the engine still gates on write).
+async function resolveColumnDefs(table: ResolvedTableRef, at: Version): Promise<{ [column: string]: ColumnDef }> {
+    const view = await table.group.getView(at, at);
+    const def = view.getSchemaView().getTable(table.tableName);
+    return def?.columns ?? {};
 }
 
 async function bindRowId(

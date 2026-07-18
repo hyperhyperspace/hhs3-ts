@@ -7,8 +7,16 @@ export const STRUCTURAL_HASH_COLUMNS = new Set(['rowId', 'rowAuthor']);
 export type FormatStringRole = 'hash' | 'cell';
 export type FormatStringOpts = { role?: FormatStringRole; hashPrefix?: boolean };
 
+// Heuristic for a content hash rendered as base64 (so it can be truncated to a
+// unique prefix in display). Content hashes are SHORT and padded; the upper
+// bound keeps longer base64 `bytes` column values (which share the alphabet)
+// from being mistaken for hashes and cosmetically truncated. This is a display
+// heuristic only — the formatter has no per-column type context.
+const MAX_SPECULATIVE_HASH_LENGTH = 64;
+
 export function looksLikeSpeculativeHash(s: string): boolean {
-    return s.length >= 30 && /^[A-Za-z0-9+/]+=*$/.test(s) && s.endsWith('=');
+    return s.length >= 30 && s.length <= MAX_SPECULATIVE_HASH_LENGTH
+        && /^[A-Za-z0-9+/]+=*$/.test(s) && s.endsWith('=');
 }
 
 export function isTruncatable(value: string, role: FormatStringRole): boolean {

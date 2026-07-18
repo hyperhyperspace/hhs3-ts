@@ -43,6 +43,31 @@ CREATE TABLEGROUP shop_prod USING SCHEMA shop AT {#schemaVersion}
   ALLOW UPDATE SCHEMA IF EXISTS users.caps WHERE label = 'deployer' AND grantee = $author;
 ```
 
+Column types and constraints:
+
+```sql
+CREATE SCHEMA shop AS (
+  TABLE ledger (
+    id        string(64) READONLY,        -- string(n): maxLength
+    memo      string NULL,
+    payload   bytes(4096),                 -- bytes(n): decoded byte-length cap
+    amount    decimal(18, 2) MIN '0.00' MAX '1000000.00',
+    seq       bigint MIN '0',              -- arbitrary-precision integer
+    qty       integer MIN 0 MAX 1000
+  )
+);
+
+ALTER SCHEMA shop AS (
+  ADD COLUMN ledger.fee decimal(12, 4) DEFAULT '0.0000'
+);
+```
+
+The base types are `string`, `integer`, `float`, `boolean`, `json`, `bigint`, `decimal`, and `bytes`. Parenthesized parameters and `MIN` / `MAX` modifiers map to the column's `constraints`:
+
+- `string(n)` / `bytes(n)` set `maxLength` (bytes counts decoded bytes).
+- `decimal(p, s)` sets `precision` = `p` and `scale` = `s` (SQL-standard order; both required).
+- `MIN` / `MAX` set inclusive bounds and apply only to `integer` / `bigint` / `decimal`. `bigint` and `decimal` bounds and values are written as quoted strings so they stay exact (a bare number literal would lose precision); the binder canonically encodes them. A `decimal` value with more fractional digits than the column scale, or any out-of-range / non-canonical value, is **rejected, never rounded**. Constraints that do not apply to a type (e.g. `MIN` on a `string`) are rejected.
+
 DDL and refs:
 
 ```sql

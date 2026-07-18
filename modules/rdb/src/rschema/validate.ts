@@ -9,7 +9,7 @@ import { validationFailure, validationOk, ValidationResult } from "@hyper-hyper-
 import {
     createRSchemaFormat, CreateRSchemaPayload,
     schemaUpdateFormat, SchemaUpdatePayload,
-    ColumnDef, ColumnType, FKs, IdProvider, IdTerm, MigrationRule, Operand, Predicate, PredicateContext,
+    ColumnDef, ColumnConstraints, ColumnType, FKs, IdProvider, IdTerm, MigrationRule, Operand, Predicate, PredicateContext,
     Restriction, TableDef,
     MAX_FKS, MAX_NAME_LENGTH, MAX_QUALIFIED_NAME_LENGTH, MAX_RESTRICTIONS,
     ID_TERMS, CMP_OPS, STR_OPS, CmpOp, StrOp,
@@ -17,6 +17,10 @@ import {
 
 import { splitTableRef, parseRowFieldTerm } from "./payload.js";
 import { cmpTypesOk, strTypesOk } from "./expr.js";
+import {
+    isCanonicalBigint, isCanonicalDecimal, isCanonicalBase64, base64ByteLen,
+    normalizeBigint, normalizeDecimal, intInRange, bigintInRange, decInRange, compareNumericStr,
+} from "./canonical.js";
 
 export const MAX_WHERE_FIELDS = 64;
 export const MAX_EXPR_DEPTH = 16;
@@ -54,14 +58,97 @@ function invalidNameReason(name: string, kind: 'table' | 'column'): string {
     return `invalid ${kind} name '${name}'`;
 }
 
+// Coarse type check (carrier only; no constraints). For decimal it can only
+// confirm the carrier is a string, since the canonical form needs the column
+// scale — use columnValueValid for the authoritative, constraint-aware check.
 export function columnValueMatchesType(value: json.Literal, type: ColumnType): boolean {
     switch (type) {
         case 'string': return typeof value === 'string';
-        case 'integer': return typeof value === 'number' && Number.isInteger(value);
+        case 'integer': return typeof value === 'number' && Number.isSafeInteger(value);
         case 'float': return typeof value === 'number' && Number.isFinite(value);
         case 'boolean': return typeof value === 'boolean';
         case 'json': return value !== undefined && value !== null;
+        case 'bigint': return typeof value === 'string' && isCanonicalBigint(value);
+        case 'decimal': return typeof value === 'string';
+        case 'bytes': return typeof value === 'string' && isCanonicalBase64(value);
     }
+}
+
+// Names the carrier (JS runtime shape) of a value, for "expected X, got Y"
+// diagnostics.
+function carrierName(value: json.Literal): string {
+    if (value === undefined) return 'undefined';
+    if (value === null) return 'null';
+    if (Array.isArray(value)) return 'array';
+    return typeof value;   // 'string' | 'number' | 'boolean' | 'object'
+}
+
+// Renders an inclusive [min, max] range for range-violation diagnostics.
+function rangeDesc(c: ColumnConstraints | undefined): string {
+    return `[${c?.min ?? '-inf'}, ${c?.max ?? '+inf'}]`;
+}
+
+// Authoritative value check that returns a human-readable reason when a value
+// is rejected (undefined = valid). This is the Layer-1 write-time gate — it
+// distinguishes carrier mismatch, non-canonical form, length, range, and scale
+// failures so callers can surface a precise diagnostic instead of a generic
+// "does not match declared type". See ../rtable/validate_ops.ts.
+export function columnValueValidReason(value: json.Literal, def: ColumnDef): ValidateReason {
+    const c = def.constraints;
+    switch (def.type) {
+        case 'string':
+            if (typeof value !== 'string') return `expected a string, got ${carrierName(value)}`;
+            if (c?.maxLength !== undefined && value.length > c.maxLength) {
+                return `string length ${value.length} exceeds maxLength ${c.maxLength}`;
+            }
+            return undefined;
+        case 'integer':
+            if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
+                return `expected a safe integer, got ${carrierName(value)}`;
+            }
+            if (!intInRange(value, c)) return `integer ${value} is out of range ${rangeDesc(c)}`;
+            return undefined;
+        case 'float':
+            if (typeof value !== 'number' || !Number.isFinite(value)) {
+                return `expected a finite number, got ${carrierName(value)}`;
+            }
+            return undefined;
+        case 'boolean':
+            if (typeof value !== 'boolean') return `expected a boolean, got ${carrierName(value)}`;
+            return undefined;
+        case 'json':
+            if (value === undefined || value === null) return `expected a JSON value, got ${carrierName(value)}`;
+            return undefined;
+        case 'bigint':
+            if (typeof value !== 'string') return `expected a bigint string, got ${carrierName(value)}`;
+            if (!isCanonicalBigint(value)) {
+                return `'${value}' is not a canonical bigint (expected an integer with no leading zeros, '+', or '-0')`;
+            }
+            if (!bigintInRange(value, c)) return `bigint ${value} is out of range ${rangeDesc(c)}`;
+            return undefined;
+        case 'decimal':
+            if (typeof value !== 'string') return `expected a decimal string, got ${carrierName(value)}`;
+            if (c?.scale === undefined) return `decimal column is missing its scale constraint`;
+            if (!isCanonicalDecimal(value, c.scale, c.precision)) {
+                const p = c.precision !== undefined ? `, precision=${c.precision}` : '';
+                return `'${value}' is not a canonical decimal(scale=${c.scale}${p})`;
+            }
+            if (!decInRange(value, c)) return `decimal ${value} is out of range ${rangeDesc(c)}`;
+            return undefined;
+        case 'bytes':
+            if (typeof value !== 'string') return `expected a base64 bytes string, got ${carrierName(value)}`;
+            if (!isCanonicalBase64(value)) return `value is not canonical base64`;
+            if (c?.maxLength !== undefined && base64ByteLen(value) > c.maxLength) {
+                return `byte length ${base64ByteLen(value)} exceeds maxLength ${c.maxLength}`;
+            }
+            return undefined;
+    }
+}
+
+// Authoritative boolean check: carrier + canonical form + constraints. Thin
+// wrapper over columnValueValidReason for callers that only need a verdict.
+export function columnValueValid(value: json.Literal, def: ColumnDef): boolean {
+    return columnValueValidReason(value, def) === undefined;
 }
 
 function isValidTerm(value: json.Literal, context: PredicateContext): boolean {
@@ -273,9 +360,80 @@ export function checkPredicateColumns(
     return undefined;
 }
 
+// Which constraint keys are applicable per column type. Any OTHER key present
+// (with a defined value) is a hard reject, to prevent silent fungibility.
+const ALLOWED_CONSTRAINTS: { [t in ColumnType]: (keyof ColumnConstraints)[] } = {
+    string: ['maxLength'],
+    bytes: ['maxLength'],
+    integer: ['min', 'max'],
+    bigint: ['min', 'max'],
+    decimal: ['scale', 'precision', 'min', 'max'],
+    float: [],
+    boolean: [],
+    json: [],
+};
+
+// A min/max bound must be a canonical value of the column type.
+function validateBound(def: ColumnDef, bound: string | undefined, which: 'min' | 'max'): ValidateReason {
+    if (bound === undefined) return undefined;
+    switch (def.type) {
+        case 'integer':
+        case 'bigint':
+            if (normalizeBigint(bound) !== bound) return `constraint '${which}' must be a canonical integer string`;
+            return undefined;
+        case 'decimal': {
+            const scale = def.constraints?.scale ?? 0;
+            if (normalizeDecimal(bound, scale) !== bound) {
+                return `constraint '${which}' must be a canonical decimal string at scale ${scale}`;
+            }
+            return undefined;
+        }
+        default:
+            return undefined;
+    }
+}
+
+function compareBound(def: ColumnDef, a: string, b: string): number {
+    return compareNumericStr(a, b, def.type === 'decimal' ? 'decimal' : 'bigint');
+}
+
 export function validateColumnDef(def: ColumnDef): ValidateReason {
-    if (def.default !== undefined && !columnValueMatchesType(def.default, def.type)) {
-        return `default value does not match column type '${def.type}'`;
+    const c = def.constraints;
+    if (c !== undefined) {
+        const allowed = ALLOWED_CONSTRAINTS[def.type];
+        for (const key of Object.keys(c) as (keyof ColumnConstraints)[]) {
+            if (c[key] === undefined) continue;
+            if (!allowed.includes(key)) {
+                return `constraint '${key}' is not applicable to column type '${def.type}'`;
+            }
+        }
+        if (c.maxLength !== undefined && (!Number.isInteger(c.maxLength) || c.maxLength <= 0)) {
+            return `constraint 'maxLength' must be a positive integer`;
+        }
+        if (def.type === 'decimal') {
+            if (c.scale === undefined || !Number.isInteger(c.scale) || c.scale < 0) {
+                return `decimal column requires an integer constraints.scale >= 0`;
+            }
+            if (c.precision !== undefined) {
+                if (!Number.isInteger(c.precision) || c.precision < 1) {
+                    return `constraint 'precision' must be a positive integer`;
+                }
+                if (c.precision < c.scale) {
+                    return `constraint 'precision' must be >= scale`;
+                }
+            }
+        }
+        const boundReason = validateBound(def, c.min, 'min') ?? validateBound(def, c.max, 'max');
+        if (boundReason !== undefined) return boundReason;
+        if (c.min !== undefined && c.max !== undefined && compareBound(def, c.min, c.max) > 0) {
+            return `constraint 'min' must be <= 'max'`;
+        }
+    } else if (def.type === 'decimal') {
+        return `decimal column requires an integer constraints.scale >= 0`;
+    }
+
+    if (def.default !== undefined && !columnValueValid(def.default, def)) {
+        return `default value does not satisfy column type '${def.type}'${c !== undefined ? ' and its constraints' : ''}`;
     }
     return undefined;
 }

@@ -67,7 +67,19 @@ export type TableRef = {
     span: TextSpan;
 };
 
-export type ColumnTypeName = 'string' | 'integer' | 'float' | 'boolean' | 'json';
+export type ColumnTypeName = 'string' | 'integer' | 'float' | 'boolean' | 'json' | 'bigint' | 'decimal' | 'bytes';
+
+// Constraints parsed from the column declaration: parenthesized type params
+// (STRING(n) / BYTES(n) -> maxLength; DECIMAL(p, s) -> precision, scale) and
+// MIN / MAX modifiers (numeric-literal bounds). Bounds are the raw literal text
+// here; bind canonically encodes them per the column type.
+export type ColumnConstraintsExpr = {
+    maxLength?: number;
+    precision?: number;
+    scale?: number;
+    min?: ValueExpr;
+    max?: ValueExpr;
+};
 
 export type ColumnDecl = {
     name: string;
@@ -77,6 +89,7 @@ export type ColumnDecl = {
     pub: boolean;
     readonly: boolean;
     references?: string;
+    constraints?: ColumnConstraintsExpr;
     span: TextSpan;
 };
 

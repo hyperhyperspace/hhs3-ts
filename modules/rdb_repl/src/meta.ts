@@ -1,6 +1,6 @@
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { RObject } from "@hyper-hyper-space/hhs3_mvt";
-import type { RSchema, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
+import type { ColumnConstraints, RSchema, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 import {
     dumpDatabase,
     dumpGroup,
@@ -107,7 +107,18 @@ async function describeTable(session: ReplSession, tableRef?: string): Promise<s
     if (table === undefined) throw new Error(`Unknown table '${tableName}'`);
     return formatRows(Object.entries(table.columns).map(([column, def]) => ({
         column, type: def.type, pub: def.pub === true, readonly: def.readonly === true, nullable: def.nullable === true,
+        constraints: formatConstraints(def.constraints),
     })));
+}
+
+function formatConstraints(c: ColumnConstraints | undefined): string {
+    if (c === undefined) return '';
+    const parts: string[] = [];
+    if (c.precision !== undefined || c.scale !== undefined) parts.push(`(${c.precision ?? ''},${c.scale ?? ''})`);
+    if (c.maxLength !== undefined) parts.push(`len<=${c.maxLength}`);
+    if (c.min !== undefined) parts.push(`min=${c.min}`);
+    if (c.max !== undefined) parts.push(`max=${c.max}`);
+    return parts.join(' ');
 }
 
 async function listKeys(session: ReplSession): Promise<string> {

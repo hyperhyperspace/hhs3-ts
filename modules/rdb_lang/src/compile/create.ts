@@ -1,11 +1,12 @@
 import type { json } from "@hyper-hyper-space/hhs3_json";
 import {
-    ColumnDef, CreateRDbPayload, CreateRSchemaPayload, CreateTableGroupPayload, FKs,
+    ColumnConstraints, ColumnDef, CreateRDbPayload, CreateRSchemaPayload, CreateTableGroupPayload, FKs,
     InsertRowPayload, Predicate, RDbImpl, RSchemaImpl, RTableGroupImpl, Restriction, TableDef,
-    deriveRowId,
+    deriveRowId, normalizeBigint, normalizeDecimal,
 } from "@hyper-hyper-space/hhs3_rdb";
 
-import type { ColumnDecl, TableDecl } from "../syntax/ast.js";
+import type { ColumnDecl, ColumnTypeName, TableDecl, ValueExpr } from "../syntax/ast.js";
+import { canonicalEncodeValue } from "../bind/values.js";
 import type { BoundCreateDatabase, BoundCreateSchema, BoundCreateStatement, BoundCreateTableGroup } from "../bind/bind.js";
 import {
     columnSetFromTableDecl,
@@ -130,12 +131,53 @@ export function compileTable(table: TableDecl, scope?: RuleScope): TableDef {
 export function compileColumn(column: ColumnDecl): ColumnDef {
     const def: ColumnDef = { type: column.type };
     if (column.nullable) def.nullable = true;
+
+    const constraints = compileColumnConstraints(column);
+    if (constraints !== undefined) def.constraints = constraints;
+
     if (column.defaultValue !== undefined) {
         if (column.defaultValue.kind !== 'literal') throw new Error('column DEFAULT must be a literal');
         if (column.defaultValue.value === null) throw new Error('column DEFAULT NULL is not supported by RDb json.Literal payloads');
-        def.default = column.defaultValue.value;
+        def.default = canonicalEncodeValue(column.defaultValue.value, def);
     }
     if (column.pub) def.pub = true;
     if (column.readonly) def.readonly = true;
     return def;
+}
+
+// Map the parsed constraint expression to the payload ColumnConstraints,
+// canonically encoding MIN / MAX bounds against the column type. Per-type
+// applicability (e.g. MIN on a string column) is enforced by validateColumnDef
+// in rdb core; here we only produce the canonical shapes.
+function compileColumnConstraints(column: ColumnDecl): ColumnConstraints | undefined {
+    const c = column.constraints;
+    if (c === undefined) return undefined;
+    const out: ColumnConstraints = {};
+    if (c.maxLength !== undefined) out.maxLength = c.maxLength;
+    if (c.precision !== undefined) out.precision = c.precision;
+    if (c.scale !== undefined) out.scale = c.scale;
+    if (c.min !== undefined) out.min = encodeBound(c.min, column.type, c.scale, 'MIN');
+    if (c.max !== undefined) out.max = encodeBound(c.max, column.type, c.scale, 'MAX');
+    return out;
+}
+
+function encodeBound(expr: ValueExpr, type: ColumnTypeName, scale: number | undefined, which: string): string {
+    if (expr.kind !== 'literal') throw new Error(`column ${which} must be a literal`);
+    const v = expr.value;
+    if (type === 'integer' || type === 'bigint') {
+        if (typeof v !== 'string' && typeof v !== 'number') throw new Error(`${which} must be an integer bound`);
+        const s = normalizeBigint(v);
+        if (s === undefined) throw new Error(`${which} '${String(v)}' is not a valid integer bound`);
+        return s;
+    }
+    if (type === 'decimal') {
+        if (scale === undefined) throw new Error('DECIMAL column requires (precision, scale)');
+        if (typeof v !== 'string' && typeof v !== 'number') throw new Error(`${which} must be a numeric bound`);
+        const s = normalizeDecimal(v, scale);
+        if (s === undefined) throw new Error(`${which} '${String(v)}' is not a valid decimal bound at scale ${scale}`);
+        return s;
+    }
+    // Inapplicable type: keep a string form so validateColumnDef rejects it as
+    // a non-applicable constraint (anti-fungibility) with a clear message.
+    return typeof v === 'string' ? v : String(v);
 }

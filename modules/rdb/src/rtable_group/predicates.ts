@@ -22,9 +22,9 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import type { KeyId, B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 
 import type { RSchemaView } from "../rschema/interfaces.js";
-import type { Predicate, PredicateContext, WhereValue, Operand } from "../rschema/payload.js";
+import type { ColumnType, Predicate, PredicateContext, WhereValue, Operand } from "../rschema/payload.js";
 import { splitTableRef, parseRowFieldTerm } from "../rschema/payload.js";
-import { evalOperand, compareOperands } from "../rschema/expr.js";
+import { evalOperand, compareOperands, resolveCmpType } from "../rschema/expr.js";
 import type { RTableView, RowValues } from "../rtable/interfaces.js";
 import type { RowOpPayload } from "../rtable/payload.js";
 
@@ -44,6 +44,11 @@ export type PredicateEnv = {
     // readonly-only, so a missing entry makes the referencing atom false.
     subjectRow?: RowValues;
     context: PredicateContext;
+    // Column-type lookup for the subject table (rowAuthor -> 'string'), used to
+    // resolve cmp ordering by numeric value for bigint/decimal columns. Absent
+    // for callers that only use eq/ne (comparison then falls back to normalized
+    // string equality, which is correct for canonical carriers).
+    typeOf?: (column: string) => ColumnType | undefined;
 };
 
 function resolveIdTerm(term: '$author', env: PredicateEnv): KeyId | undefined {
@@ -109,7 +114,8 @@ export async function evaluatePredicate(pred: Predicate, env: PredicateEnv): Pro
             const l = evalPredicateOperand(pred.left, env);
             const r = evalPredicateOperand(pred.right, env);
             if (l === undefined || r === undefined) return false;
-            return compareOperands(pred.cmp, l, r);
+            const type = env.typeOf !== undefined ? resolveCmpType(pred.left, pred.right, env.typeOf) : undefined;
+            return compareOperands(pred.cmp, l, r, type);
         }
 
         case 'str': {
@@ -176,8 +182,11 @@ export async function evaluateRowOpRestriction(
         }
     }
 
+    const def = schemaView.getTable(table);
+    const typeOf = (column: string): ColumnType | undefined => column === 'rowAuthor' ? 'string' : def?.columns[column]?.type;
+
     return evaluatePredicate(rule, {
-        getTableView, getForeignTableView, author: op.author, subjectRow, context: 'row',
+        getTableView, getForeignTableView, author: op.author, subjectRow, context: 'row', typeOf,
     });
 }
 

@@ -38,12 +38,12 @@ export const LANG_COMMAND_REFS: readonly LangCommandRef[] = [
         syntax: [
             'CREATE SCHEMA name [CREATORS (value, ...)] AS (',
             '  TABLE tableName (',
-            '    column type [NULL] [DEFAULT value] [PUB] [READONLY] [REFERENCES refTable], ...',
+            '    column type [MIN v] [MAX v] [NULL] [DEFAULT value] [PUB] [READONLY] [REFERENCES refTable], ...',
             '  ) [CONCURRENT DELETES [true|false]] [IDENTITY PROVIDER [(keyIdCol, publicKeyCol)]]',
             '    [ALLOW op IF predicate], ...',
             ');',
         ].join('\n'),
-        description: 'Defines a schema: tables, columns, allow rules, and an optional identity provider. Mark FK columns with REFERENCES refTable (or REFERENCES binding.table for a bound group); insert their values as #rowIdPrefix.',
+        description: "Defines a schema: tables, columns, allow rules, and an optional identity provider. Column type is one of string[(n)], integer, float, boolean, json, bigint, decimal(p, s), bytes[(n)] (n = maxLength; p, s = precision, scale). MIN/MAX give inclusive bounds (integer/bigint/decimal only); write bigint/decimal literals as quoted strings so they stay exact. Values are rejected, never rounded. Mark FK columns with REFERENCES refTable (or REFERENCES binding.table for a bound group); insert their values as #rowIdPrefix.",
     },
     {
         command: 'CREATE TABLEGROUP',
@@ -82,10 +82,10 @@ export const LANG_COMMAND_REFS: readonly LangCommandRef[] = [
         syntax: [
             'ALTER SCHEMA schemaRef AS (',
             '  ADD TABLE tableName (',
-            '    column type [NULL] [DEFAULT value] [PUB] [READONLY] [REFERENCES refTable], ...',
+            '    column type [MIN v] [MAX v] [NULL] [DEFAULT value] [PUB] [READONLY] [REFERENCES refTable], ...',
             '  ) [CONCURRENT DELETES [true|false]] [IDENTITY PROVIDER [(keyIdCol, publicKeyCol)]]',
             '    [ALLOW op IF predicate], ...],',
-            '  ADD COLUMN table.column type [NULL] [DEFAULT value] [PUB] [READONLY],',
+            '  ADD COLUMN table.column type [MIN v] [MAX v] [NULL] [DEFAULT value] [PUB] [READONLY],',
             '  DROP TABLE tableName,',
             '  DROP COLUMN table.column,',
             '  SET CONCURRENT DELETES table true|false,',

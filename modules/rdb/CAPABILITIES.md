@@ -115,8 +115,14 @@ Rdb restrictions can now also reference the **subject row's own readonly
 fields**, which RCap has no equivalent for:
 
 - **`cmp` / `str` atoms** evaluate operand expressions over `$row.<col>`
-  (readonly columns of the row being written), literals, integer arithmetic and
-  `len` — gating an op on its own immutable shape.
+  (readonly columns of the row being written), literals, exact arithmetic
+  (`add` / `sub` / `mul` on `integer` / `bigint` / `decimal`, operands sharing a
+  type family) and `len` — gating an op on its own immutable shape. Ordering
+  comparisons are numeric for `integer` / `float` / `bigint` / `decimal` (bigint
+  via `BigInt`, decimal via scaled-integer — never lexical over the canonical
+  string carrier); `bytes` supports equality only. A write carrying a
+  non-canonical / out-of-range / out-of-scale value is hard-rejected at write
+  time (Layer-1), never rounded.
 - **Correlated `exists`** — an `exists` `where` value may be `$row.<col>`, so
   "grant X only for resource R, where R is a *field of the row being written*"
   IS expressible: e.g. `exists grants where resource=$row.resource and

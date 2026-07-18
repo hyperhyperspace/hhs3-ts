@@ -286,13 +286,32 @@ function renderTableDef(table: TableDef): string {
 }
 
 function renderColumnDef(name: string, def: ColumnDef, fk?: string): string {
-    const parts = [name, def.type];
+    const parts = [name, renderColumnType(def)];
     if (def.nullable) parts.push('NULL');
     if (def.default !== undefined) parts.push(`DEFAULT ${renderLiteral(def.default)}`);
     if (def.pub) parts.push('PUB');
     if (def.readonly) parts.push('READONLY');
     if (fk !== undefined) parts.push(`REFERENCES ${fk}`);
+    const c = def.constraints;
+    if (c?.min !== undefined) parts.push(`MIN ${sqlString(c.min)}`);
+    if (c?.max !== undefined) parts.push(`MAX ${sqlString(c.max)}`);
     return parts.join(' ');
+}
+
+// Render the column type with its parenthesized params: string(n) / bytes(n)
+// carry maxLength; decimal(p, s) carries precision + scale (SQL-standard order).
+function renderColumnType(def: ColumnDef): string {
+    const c = def.constraints;
+    switch (def.type) {
+        case 'string':
+            return c?.maxLength !== undefined ? `string(${c.maxLength})` : 'string';
+        case 'bytes':
+            return c?.maxLength !== undefined ? `bytes(${c.maxLength})` : 'bytes';
+        case 'decimal':
+            return `decimal(${c?.precision ?? c?.scale ?? 0}, ${c?.scale ?? 0})`;
+        default:
+            return def.type;
+    }
 }
 
 function renderMigrationRule(rule: MigrationRule): string {

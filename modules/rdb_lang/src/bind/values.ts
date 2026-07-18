@@ -1,6 +1,8 @@
 import type { KeyId, OwnIdentity, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
 import type { json } from "@hyper-hyper-space/hhs3_json";
 import { serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
+import type { ColumnDef } from "@hyper-hyper-space/hhs3_rdb";
+import { normalizeBigint, normalizeDecimal, normalizeBase64, columnValueValidReason } from "@hyper-hyper-space/hhs3_rdb";
 
 import type { ValueExpr } from "../syntax/ast.js";
 import type { LangBindContext, LangValue } from "./context.js";
@@ -22,6 +24,69 @@ export async function resolveValue(expr: ValueExpr, context: LangBindContext): P
         throw new Error(`Unknown value function '${expr.name}'`);
     }
     throw new Error('Unexpected value expression');
+}
+
+// Canonically encode a bound literal for its declared column type. The
+// string-carried types (bigint / decimal / bytes) accept ergonomic input
+// (a number literal or a loosely-formatted string) and produce the single
+// canonical string the engine stores and hashes. Non-representable input
+// (e.g. a decimal with more fractional digits than the column scale) is
+// REJECTED here, never rounded — mirroring the engine's write-time gate.
+export function canonicalEncodeValue(value: json.Literal, def: ColumnDef): json.Literal {
+    switch (def.type) {
+        case 'bigint': {
+            if (typeof value !== 'string' && typeof value !== 'number') {
+                throw new Error(`bigint column requires an integer value, got ${typeof value}`);
+            }
+            const s = normalizeBigint(value);
+            if (s === undefined) throw new Error(`value '${String(value)}' is not a valid bigint`);
+            return s;
+        }
+        case 'decimal': {
+            const scale = def.constraints?.scale;
+            if (scale === undefined) throw new Error('decimal column is missing a scale constraint');
+            if (typeof value !== 'string' && typeof value !== 'number') {
+                throw new Error(`decimal column requires a numeric value, got ${typeof value}`);
+            }
+            const s = normalizeDecimal(value, scale);
+            if (s === undefined) throw new Error(`value '${String(value)}' is not a valid decimal at scale ${scale}`);
+            return s;
+        }
+        case 'bytes': {
+            if (typeof value !== 'string') throw new Error('bytes column requires a base64 string value');
+            const s = normalizeBase64(value);
+            if (s === undefined) throw new Error(`value '${String(value)}' is not valid base64`);
+            return s;
+        }
+        default:
+            return value;
+    }
+}
+
+// Encode a whole row's values against the table's column defs, and validate the
+// canonical result against the column's constraints so violations (maxLength,
+// min/max range, decimal scale/precision) are reported at bind time with the
+// same message the engine's write-time gate produces — instead of only
+// surfacing later as a VALIDATION_REJECTED at execute. Columns absent from the
+// schema (or system pseudo-columns) pass through unchanged; the engine still
+// gates them. This is a UX pre-check, not a security boundary.
+export function canonicalEncodeRowValues(
+    values: { [column: string]: json.Literal },
+    columns: { [column: string]: ColumnDef },
+): { [column: string]: json.Literal } {
+    const out: { [column: string]: json.Literal } = {};
+    for (const [column, value] of Object.entries(values)) {
+        const def = columns[column];
+        if (def === undefined) {
+            out[column] = value;
+            continue;
+        }
+        const encoded = canonicalEncodeValue(value, def);
+        const reason = columnValueValidReason(encoded, def);
+        if (reason !== undefined) throw new Error(`column '${column}' (${def.type}): ${reason}`);
+        out[column] = encoded;
+    }
+    return out;
 }
 
 export function asJsonLiteral(value: LangValue): json.Literal {

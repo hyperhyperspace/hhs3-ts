@@ -3,7 +3,7 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import { combineSpans, DiagnosticBag, err, ok, Result, TextSpan } from "../diagnostics.js";
 import {
     AddMemberStatement, AllowOp, AllowRuleExpr, AlterSchemaStatement, AstScript, AstStatement, AuthorExpr, BundleStatement, BundleWriteStatement,
-    ColumnDecl, ColumnTypeName, CreateDatabaseStatement, CreateSchemaStatement,
+    ColumnDecl, ColumnConstraintsExpr, ColumnTypeName, CreateDatabaseStatement, CreateSchemaStatement,
     CreateTableGroupStatement, DeleteStatement, HashRef, InitialRow,
     InsertStatement, LogStatement, MigrationRuleExpr, NameOrHashRef, NameRef, OperandExpr,
     PredicateExpr, SelectStatement, SetViewStatement, TableDecl, TableOption, TableRef, UpdateRefStatement,
@@ -170,15 +170,9 @@ class Parser {
         if (name === 'uuid') {
             this.diagnostics.add('PARSE_RESERVED_NAME', "column name 'uuid' is reserved", combineSpans(start, this.peek().span));
         }
-        const typeToken = this.advance();
-        const type = this.columnTypeFromToken(typeToken);
-        let nullable = false;
-        let defaultValue: ValueExpr | undefined;
-        let pub = false;
-        let readonly = false;
-        let references: string | undefined;
-        let end = typeToken.span;
-        const column: ColumnDecl = { name, type, nullable, pub, readonly, span: combineSpans(start, end) };
+        const typeInfo = this.parseColumnType();
+        const column: ColumnDecl = { name, type: typeInfo.type, nullable: false, pub: false, readonly: false, span: combineSpans(start, typeInfo.span) };
+        if (typeInfo.constraints !== undefined) column.constraints = typeInfo.constraints;
 
         this.parseColumnModifiers(column);
 
@@ -204,6 +198,16 @@ class Parser {
                 const ref = this.expectIdentifierToken('referenced table');
                 column.references = ref.text;
                 end = ref.span;
+            } else if (this.matchKeyword('MIN')) {
+                const v = this.parseValue();
+                if (column.constraints === undefined) column.constraints = {};
+                column.constraints.min = v;
+                end = v.span;
+            } else if (this.matchKeyword('MAX')) {
+                const v = this.parseValue();
+                if (column.constraints === undefined) column.constraints = {};
+                column.constraints.max = v;
+                end = v.span;
             } else {
                 break;
             }
@@ -417,9 +421,9 @@ class Parser {
             }
             this.expectKeyword('COLUMN');
             const { table, column } = this.parseQualifiedColumn();
-            const typeTok = this.advance();
-            const type = this.columnTypeFromToken(typeTok);
-            const col: ColumnDecl = { name: column, type, nullable: false, pub: false, readonly: false, span: combineSpans(start, typeTok.span) };
+            const typeInfo = this.parseColumnType();
+            const col: ColumnDecl = { name: column, type: typeInfo.type, nullable: false, pub: false, readonly: false, span: combineSpans(start, typeInfo.span) };
+            if (typeInfo.constraints !== undefined) col.constraints = typeInfo.constraints;
             this.parseColumnModifiers(col);
             return { kind: 'add-column', table, column: col, span: col.span };
         }
@@ -1078,9 +1082,39 @@ class Parser {
 
     private columnTypeFromToken(tok: Token): ColumnTypeName {
         const type = tok.upper.toLowerCase();
-        if (['string', 'integer', 'float', 'boolean', 'json'].includes(type)) return type as ColumnTypeName;
+        if (['string', 'integer', 'float', 'boolean', 'json', 'bigint', 'decimal', 'bytes'].includes(type)) return type as ColumnTypeName;
         this.diagnostics.add('PARSE_EXPECTED_TOKEN', `Expected column type, got '${tok.text}'`, tok.span);
         return 'string';
+    }
+
+    // Parse a column type name plus its optional parenthesized parameters:
+    //   STRING(n) / BYTES(n)  -> constraints.maxLength = n
+    //   DECIMAL(p, s)         -> constraints.precision = p, constraints.scale = s
+    // (SQL-standard order: precision then scale; both required.)
+    private parseColumnType(): { type: ColumnTypeName; constraints?: ColumnConstraintsExpr; span: TextSpan } {
+        const typeTok = this.advance();
+        const type = this.columnTypeFromToken(typeTok);
+        let end = typeTok.span;
+        let constraints: ColumnConstraintsExpr | undefined;
+
+        if (type === 'string' || type === 'bytes') {
+            if (this.matchPunctuation('(')) {
+                const n = this.expectInteger(type === 'string' ? 'string length' : 'bytes length');
+                end = this.expectPunctuation(')').span;
+                constraints = { maxLength: n };
+            }
+        } else if (type === 'decimal') {
+            this.expectPunctuation('(');
+            const precision = this.expectInteger('decimal precision');
+            this.expectPunctuation(',');
+            const scale = this.expectInteger('decimal scale');
+            end = this.expectPunctuation(')').span;
+            constraints = { precision, scale };
+        }
+
+        return constraints !== undefined
+            ? { type, constraints, span: combineSpans(typeTok.span, end) }
+            : { type, span: combineSpans(typeTok.span, end) };
     }
 
     private parseAllowRule(): AllowRuleExpr {

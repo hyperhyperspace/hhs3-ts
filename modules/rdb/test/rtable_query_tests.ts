@@ -34,6 +34,42 @@ function itemsTable(): TableDef {
     };
 }
 
+// A ledger with a pub bigint key, an exact decimal amount, and a bounded
+// integer, for typed comparison / ordering / write-path tests.
+function ledgerTable(): TableDef {
+    return {
+        name: 'ledger',
+        columns: {
+            seq: { type: 'bigint', pub: true },
+            amount: { type: 'decimal', constraints: { scale: 2 } },
+            qty: { type: 'integer', nullable: true, constraints: { min: '0', max: '100' } },
+        },
+        concurrentDeletes: false,
+        restrictions: [{ on: 'all', rule: { p: 'true' } }],
+    };
+}
+
+async function createLedgerGroup() {
+    const ctx = createMockRContext({ selfValidate: true });
+    ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
+    ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
+
+    const admin = await makeIdentity();
+    const schemaInit = await RSchemaImpl.create({
+        name: 'finance',
+        creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
+        tables: [ledgerTable()],
+    });
+    const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
+    const pinned = await (await schema.getScopedDag()).getFrontier();
+
+    const groupInit = await RTableGroupImpl.create({
+        name: 'ledger-test', seed: 'ledger-test', schemaRef: schema.getId(), schemaVersion: pinned,
+    });
+    const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
+    return { ctx, group, admin };
+}
+
 async function createItemsGroup() {
     const ctx = createMockRContext({ selfValidate: true });
     ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
@@ -279,6 +315,83 @@ export const rtableQueryTests = {
                 const i1 = (await view.query({ where: { p: 'cmp', cmp: 'eq', left: { col: 'kind' }, right: { lit: 'fruit' } }, select: ['qty'] }))
                     .find((r) => r.uuid === 'i1')!;
                 assertEquals(i1.values['qty'], 50, 'non-pub LWW value reflected (not the stale 5)');
+            }
+        },
+        {
+            name: '[QRY08] typed comparison + ordering: bigint / decimal are numeric, not lexical',
+            invoke: async () => {
+                const typeOf = (c: string): 'bigint' | 'decimal' | undefined =>
+                    c === 'seq' ? 'bigint' : c === 'amount' ? 'decimal' : undefined;
+
+                // Without type context, string carriers would compare lexically
+                // ('9' > '10'); with type context they compare by value.
+                const nine = row('n', { seq: '9', amount: '9.99' });
+                assertTrue(evalRowFilter({ p: 'cmp', cmp: 'lt', left: { col: 'seq' }, right: { lit: '10' } }, nine, typeOf),
+                    'bigint 9 < 10 with type context');
+                assertFalse(evalRowFilter({ p: 'cmp', cmp: 'lt', left: { col: 'seq' }, right: { lit: '10' } }, nine),
+                    'bigint 9 vs 10 would compare lexically (9 > 10) with no type context');
+                assertTrue(evalRowFilter({ p: 'cmp', cmp: 'lt', left: { col: 'amount' }, right: { lit: '10.00' } }, nine, typeOf),
+                    'decimal 9.99 < 10.00 with type context');
+                assertTrue(evalRowFilter({ p: 'cmp', cmp: 'eq', left: { col: 'amount' }, right: { lit: '9.99' } }, nine, typeOf),
+                    'decimal eq is normalized-string equality');
+
+                // exact typed arithmetic in a predicate
+                assertTrue(evalRowFilter({ p: 'cmp', cmp: 'eq',
+                    left: { fn: 'add', args: [{ col: 'seq' }, { lit: '1' }] }, right: { lit: '10' } }, nine, typeOf),
+                    'bigint add: 9 + 1 == 10');
+
+                // numeric ordering (not lexical) via orderRows with types
+                const rows = [
+                    row('a', { seq: '100', amount: '1.00' }),
+                    row('b', { seq: '9', amount: '10.50' }),
+                    row('c', { seq: '10', amount: '2.05' }),
+                ];
+                const bySeq = orderRows(rows, [{ column: 'seq', dir: 'asc' }], typeOf);
+                assertEquals(bySeq.map((r) => r.uuid).join(','), 'b,c,a', 'bigint order: 9 < 10 < 100 (numeric)');
+                const byAmount = orderRows(rows, [{ column: 'amount', dir: 'asc' }], typeOf);
+                assertEquals(byAmount.map((r) => r.uuid).join(','), 'a,c,b', 'decimal order: 1.00 < 2.05 < 10.50 (numeric)');
+            }
+        },
+        {
+            name: '[QRY09] engine: bigint pub-eq lookup + decimal ordering + write-path reject',
+            invoke: async () => {
+                const { group } = await createLedgerGroup();
+                const ledger = await group.getTable('ledger');
+                await ledger.insert('l1', { seq: '9', amount: '9.99', qty: 5 });
+                await ledger.insert('l2', { seq: '10', amount: '10.00', qty: 10 });
+                await ledger.insert('l3', { seq: '100', amount: '2.50', qty: 0 });
+
+                const view = await ledger.getView();
+
+                // pub-eq index lookup on the bigint column returns the exact row
+                const bySeq = await view.query({ where: { p: 'cmp', cmp: 'eq', left: { col: 'seq' }, right: { lit: '10' } } });
+                assertEquals(uuids(bySeq), 'l2', 'bigint pub-eq lookup matches the canonical-string carrier');
+
+                // numeric decimal ordering through the engine
+                const byAmount = await view.query({ orderBy: [{ column: 'amount', dir: 'asc' }] });
+                assertEquals(byAmount.map((r) => r.uuid).join(','), 'l3,l1,l2', 'decimal orderBy is numeric (2.50 < 9.99 < 10.00)');
+
+                // numeric bigint ordering (not lexical)
+                const bySeqOrder = await view.query({ orderBy: [{ column: 'seq', dir: 'asc' }] });
+                assertEquals(bySeqOrder.map((r) => r.uuid).join(','), 'l1,l2,l3', 'bigint orderBy is numeric (9 < 10 < 100)');
+
+                // write-path Layer-1 rejects: reject, never round
+                const expectInsertFailure = async (uuid: string, values: Row['values'], why: string, msgIncludes?: string) => {
+                    let message: string | undefined;
+                    try { await ledger.insert(uuid, values); } catch (e) { message = e instanceof Error ? e.message : String(e); }
+                    assertTrue(message !== undefined, why);
+                    if (msgIncludes !== undefined) {
+                        assertTrue(message!.includes(msgIncludes), `${why}: message should include '${msgIncludes}', got: ${message}`);
+                    }
+                };
+                await expectInsertFailure('bad1', { seq: '007', amount: '1.00' }, 'non-canonical bigint (leading zeros) rejected',
+                    "column 'seq' (bigint): '007' is not a canonical bigint");
+                await expectInsertFailure('bad2', { seq: '1', amount: '1.5' }, 'wrong-scale decimal rejected (never rounded)',
+                    "column 'amount' (decimal): '1.5' is not a canonical decimal(scale=2)");
+                await expectInsertFailure('bad3', { seq: '1', amount: '1.005' }, 'over-scale decimal rejected (never rounded)');
+                await expectInsertFailure('bad4', { seq: '1', amount: '1.00', qty: 200 }, 'out-of-range integer rejected',
+                    "column 'qty' (integer): integer 200 is out of range [0, 100]");
+                await expectInsertFailure('bad5', { seq: '1', amount: '1.00', qty: -1 }, 'below-min integer rejected');
             }
         },
     ],

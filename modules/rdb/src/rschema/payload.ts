@@ -39,11 +39,47 @@ export const MAX_NOTE_LENGTH = 4096;
 export const MAX_CREATORS = 64;
 export const MAX_HASH_LENGTH = 128;
 
+// Upper bound on the length of a canonical numeric-string constraint bound
+// (constraints.min / constraints.max). Generous enough for very large bigint /
+// decimal bounds while keeping the payload format bounded.
+export const MAX_NUMSTR_LENGTH = 4096;
+
 // Column types
+//
+// The scalar carriers are:
+//   string   -> JS string
+//   integer  -> JS number, Number.isSafeInteger
+//   float    -> JS number, Number.isFinite
+//   boolean  -> JS boolean
+//   json     -> any non-null json.Literal
+//   bigint   -> canonical decimal STRING (arbitrary-precision signed integer)
+//   decimal  -> canonical fixed-scale decimal STRING (exact fixed-point)
+//   bytes    -> canonical base64 STRING (opaque bytes)
+//
+// bigint / decimal / bytes are carried as canonical strings so they hash stably
+// via json.toStringNormalized and round-trip losslessly across target databases
+// (see ./canonical.ts for the canonical forms and range/compare helpers).
 
-export type ColumnType = 'string' | 'integer' | 'float' | 'boolean' | 'json';
+export type ColumnType = 'string' | 'integer' | 'float' | 'boolean' | 'json' | 'bigint' | 'decimal' | 'bytes';
 
-export const COLUMN_TYPES: ColumnType[] = ['string', 'integer', 'float', 'boolean', 'json'];
+export const COLUMN_TYPES: ColumnType[] = ['string', 'integer', 'float', 'boolean', 'json', 'bigint', 'decimal', 'bytes'];
+
+// Optional, type-scoped refinements on a column. Each key is only applicable to
+// a subset of column types; inapplicable keys MUST be absent (enforced in
+// validate.ts validateColumnDef to prevent silent fungibility). min / max are
+// canonical numeric STRINGS so bigint / decimal bounds stay exact.
+//
+//   maxLength  string (chars), bytes (decoded byte length)
+//   min / max  integer, bigint, decimal (inclusive bound, canonical string)
+//   scale      decimal only (REQUIRED): fractional digits
+//   precision  decimal only (optional): total significant digits
+export type ColumnConstraints = {
+    maxLength?: number;
+    min?: string;
+    max?: string;
+    scale?: number;
+    precision?: number;
+};
 
 export type ColumnDef = {
     type: ColumnType;
@@ -53,6 +89,15 @@ export type ColumnDef = {
     readonly?: boolean;        // default false; fixed at insert: updates rejected.
                                // Independent of pub; permission-witness columns
                                // (caps labels) should be pub + readonly.
+    constraints?: ColumnConstraints;   // type-scoped refinements (see above)
+};
+
+export const columnConstraintsFormat: json.Format = {
+    maxLength: [json.Type.Option, json.Type.Int32],
+    min: [json.Type.Option, [json.Type.BoundedString, MAX_NUMSTR_LENGTH]],
+    max: [json.Type.Option, [json.Type.BoundedString, MAX_NUMSTR_LENGTH]],
+    scale: [json.Type.Option, json.Type.Int32],
+    precision: [json.Type.Option, json.Type.Int32],
 };
 
 export const columnDefFormat: json.Format = {
@@ -61,6 +106,7 @@ export const columnDefFormat: json.Format = {
     default: [json.Type.Option, json.Type.Something],
     pub: [json.Type.Option, json.Type.Boolean],
     readonly: [json.Type.Option, json.Type.Boolean],
+    constraints: [json.Type.Option, columnConstraintsFormat],
 };
 
 // Deletes are permanent (a rowId is a write-once identity; no re-insertion).
@@ -143,7 +189,8 @@ export type WhereValue = json.Literal | IdTerm | RowFieldTerm;
 export type PredicateContext = 'row' | 'object';
 
 // Operand of a value expression (cmp / str atoms). `col` resolves to the
-// subject row's readonly column value ($row.<col>); arithmetic is integer-only,
+// subject row's readonly column value ($row.<col>); arithmetic (add/sub/mul)
+// operates on integer, bigint, or decimal operands of the same type family,
 // `len` takes a string and yields an integer.
 export type Operand =
     | { lit: json.Literal }

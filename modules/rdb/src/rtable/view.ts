@@ -54,7 +54,7 @@ import { version, Version, ScopedDag } from "@hyper-hyper-space/hhs3_mvt";
 import { deserializePublicKeyFromBase64 } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchemaView } from "../rschema/interfaces.js";
-import type { Operand } from "../rschema/payload.js";
+import type { ColumnType, Operand } from "../rschema/payload.js";
 import { colTag, type RowsSlicePayload } from "../rtable_group/scopes.js";
 
 import type { RTable, RTableView, Row, RowValues, DeltaRowState } from "./interfaces.js";
@@ -602,15 +602,17 @@ export class RTableViewImpl implements RTableView {
             candidates = await this.liveRowIds();
         }
 
+        const typeOf = (column: string): ColumnType | undefined => column === 'rowAuthor' ? 'string' : columns[column];
+
         const rows: Row[] = [];
         for (const rowId of candidates) {
             const row = await this.getRow(rowId);
             if (row === undefined) continue;   // not live at this horizon
-            if (q.where === undefined || evalRowFilter(q.where, row)) rows.push(row);
+            if (q.where === undefined || evalRowFilter(q.where, row, typeOf)) rows.push(row);
         }
 
         const ordered = q.orderBy !== undefined && q.orderBy.length > 0
-            ? orderRows(rows, q.orderBy)
+            ? orderRows(rows, q.orderBy, typeOf)
             : rows.sort((a, b) => (a.rowId < b.rowId ? -1 : a.rowId > b.rowId ? 1 : 0));
 
         const offset = q.offset ?? 0;

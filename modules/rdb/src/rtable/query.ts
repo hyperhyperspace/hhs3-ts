@@ -17,10 +17,15 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
 import type { ColumnType, CmpOp, Operand, StrOp } from "../rschema/payload.js";
 import { CMP_OPS, STR_OPS, ARITH_FNS } from "../rschema/payload.js";
-import { evalOperand, compareOperands, cmpTypesOk, strTypesOk } from "../rschema/expr.js";
+import { evalOperand, compareOperands, cmpTypesOk, strTypesOk, resolveCmpType } from "../rschema/expr.js";
+import { compareNumericStr } from "../rschema/canonical.js";
 import { MAX_EXPR_DEPTH, MAX_EXPR_ARGS } from "../rschema/validate.js";
 
 import type { Row, RowValues } from "./interfaces.js";
+
+// Column-type lookup (rowAuthor is a system string column). Passed into
+// evaluation so ordering / comparisons on bigint / decimal are numeric.
+export type TypeOf = (column: string) => ColumnType | undefined;
 
 // Two-valued logic: an operand that does not resolve (missing column value)
 // makes its cmp/str atom false; `not` negates normally (no SQL three-valued
@@ -51,7 +56,7 @@ export type ColumnTypes = { [column: string]: ColumnType };
 // Evaluation
 // ---------------------------------------------------------------------------
 
-export function evalRowFilter(filter: RowFilter, row: Row): boolean {
+export function evalRowFilter(filter: RowFilter, row: Row, typeOf?: TypeOf): boolean {
     const lookup = (column: string): json.Literal | undefined => column === 'rowAuthor' ? row.author : row.values[column];
 
     switch (filter.p) {
@@ -61,7 +66,8 @@ export function evalRowFilter(filter: RowFilter, row: Row): boolean {
             const l = evalOperand(filter.left, lookup);
             const r = evalOperand(filter.right, lookup);
             if (l === undefined || r === undefined) return false;
-            return compareOperands(filter.cmp, l, r);
+            const type = typeOf !== undefined ? resolveCmpType(filter.left, filter.right, typeOf) : undefined;
+            return compareOperands(filter.cmp, l, r, type);
         }
         case 'str': {
             const v = evalOperand(filter.value, lookup);
@@ -72,11 +78,11 @@ export function evalRowFilter(filter: RowFilter, row: Row): boolean {
             return v.includes(s);
         }
         case 'not':
-            return !evalRowFilter(filter.arg, row);
+            return !evalRowFilter(filter.arg, row, typeOf);
         case 'and':
-            return filter.args.every((a) => evalRowFilter(a, row));
+            return filter.args.every((a) => evalRowFilter(a, row, typeOf));
         case 'or':
-            return filter.args.some((a) => evalRowFilter(a, row));
+            return filter.args.some((a) => evalRowFilter(a, row, typeOf));
     }
 }
 
@@ -84,9 +90,14 @@ export function evalRowFilter(filter: RowFilter, row: Row): boolean {
 // Post-processing (order / project)
 // ---------------------------------------------------------------------------
 
-// Total order over two present scalar values within their type; mixed or
+// Total order over two present scalar values. When a numeric `type` is known
+// (integer/float/bigint/decimal) values compare by numeric value (so bigint /
+// decimal canonical strings order correctly, not lexically); otherwise mixed or
 // non-scalar values fall back to normalized-string comparison (deterministic).
-function compareValues(a: json.Literal, b: json.Literal): number {
+function compareValues(a: json.Literal, b: json.Literal, type?: ColumnType): number {
+    if (type === 'integer' || type === 'float' || type === 'bigint' || type === 'decimal') {
+        return compareNumericStr(a, b, type);
+    }
     if (typeof a === 'number' && typeof b === 'number') return a < b ? -1 : a > b ? 1 : 0;
     if (typeof a === 'string' && typeof b === 'string') return a < b ? -1 : a > b ? 1 : 0;
     if (typeof a === 'boolean' && typeof b === 'boolean') return (a ? 1 : 0) - (b ? 1 : 0);
@@ -97,7 +108,7 @@ function compareValues(a: json.Literal, b: json.Literal): number {
 
 // orderBy with rows missing a value sorted LAST (asc or desc), and a stable
 // rowId tiebreak for total determinism.
-export function orderRows(rows: Row[], orderBy: OrderBy[]): Row[] {
+export function orderRows(rows: Row[], orderBy: OrderBy[], typeOf?: TypeOf): Row[] {
     return rows.slice().sort((x, y) => {
         for (const { column, dir } of orderBy) {
             const av = column === 'rowAuthor' ? x.author : x.values[column];
@@ -108,7 +119,8 @@ export function orderRows(rows: Row[], orderBy: OrderBy[]): Row[] {
                 if (aMissing && bMissing) continue;
                 return aMissing ? 1 : -1;   // missing last regardless of direction
             }
-            let c = compareValues(av, bv);
+            const type = column === 'rowAuthor' ? 'string' : typeOf?.(column);
+            let c = compareValues(av, bv, type);
             if (dir === 'desc') c = -c;
             if (c !== 0) return c;
         }
