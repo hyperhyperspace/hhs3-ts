@@ -83,11 +83,12 @@ function formatGroupRows(session: ReplSession, payload: Extract<DeltaPayload, { 
         rowId: ctx.formatString(row.rowId, { role: 'hash', hashPrefix: true }),
         live: row.live,
         author: row.author === '' ? '' : ctx.formatString(row.author, { role: 'hash' }),
-        columns: row.columnChanges.map((change) => {
-            const before = change.before === undefined ? '' : ctx.formatValue(change.before);
-            const after = change.after === undefined ? '' : ctx.formatValue(change.after);
+        columns: ((identityCols) => row.columnChanges.map((change) => {
+            const opts = identityCols.has(change.column) ? { identity: true } : {};
+            const before = change.before === undefined ? '' : ctx.formatValue(change.before, opts);
+            const after = change.after === undefined ? '' : ctx.formatValue(change.after, opts);
             return `${change.column}: ${before} -> ${after}`;
-        }).join(', '),
+        }).join(', '))(payload.identityColumnsByTable.get(row.table) ?? new Set<string>()),
     }));
     return renderRows(session, rows, ['table', 'rowId', 'live', 'author', 'columns'], ctx);
 }

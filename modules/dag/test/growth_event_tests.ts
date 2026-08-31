@@ -79,6 +79,32 @@ async function testListenerFiresOncePerTransaction() {
     d.removeListener(listener);
 }
 
+async function testInterleavedTransactionsDeliverPerTx() {
+    // Two appends launched without awaiting the first interleave their
+    // withTransaction calls. Because entries travel in the per-call TxResult
+    // (not shared store state), each commit fires its own single-entry growth
+    // event: no cross-delivery, no loss. This is the no-serialization guarantee.
+    const d = createMemDag();
+    const events: string[][] = [];
+    const listener = (growth: { entries: readonly { hash: string }[] }) => {
+        events.push(growth.entries.map(e => e.hash));
+    };
+    d.addListener(listener as Parameters<typeof d.addListener>[0]);
+
+    const [h1, h2] = await Promise.all([
+        d.append({ a: 1 }, {}),
+        d.append({ b: 2 }, {}),
+    ]);
+
+    assertTrue(events.length === 2, 'each interleaved transaction should fire its own growth event (got ' + events.length + ')');
+    assertTrue(events.every(e => e.length === 1), 'each growth event should carry exactly one entry (no cross-delivery)');
+    const delivered = new Set(events.flat());
+    assertTrue(delivered.has(h1), 'entry from first interleaved tx should be delivered');
+    assertTrue(delivered.has(h2), 'entry from second interleaved tx should be delivered');
+
+    d.removeListener(listener as Parameters<typeof d.addListener>[0]);
+}
+
 async function testFrontierUpToDateWhenListenerFires() {
     const d = createMemDag();
     let frontierInListener: Set<string> | undefined;
@@ -110,5 +136,6 @@ export const growthEventSuite = {
         { name: "[MEM_GROW_03] removeListener stops delivery (small DAGs)",            invoke: testRemoveListenerStopsDelivery },
         { name: "[MEM_GROW_04] Listener fires once per transaction (small DAGs)",      invoke: testListenerFiresOncePerTransaction },
         { name: "[MEM_GROW_05] Frontier up to date when listener fires (small DAGs)",  invoke: testFrontierUpToDateWhenListenerFires },
+        { name: "[MEM_GROW_06] Interleaved transactions deliver per-tx (no serialization)", invoke: testInterleavedTransactionsDeliverPerTx },
     ],
 };

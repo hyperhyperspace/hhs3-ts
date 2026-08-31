@@ -60,9 +60,9 @@ export const MAX_NUMSTR_LENGTH = 4096;
 // via json.toStringNormalized and round-trip losslessly across target databases
 // (see ./canonical.ts for the canonical forms and range/compare helpers).
 
-export type ColumnType = 'string' | 'integer' | 'float' | 'boolean' | 'json' | 'bigint' | 'decimal' | 'bytes';
+export type ColumnType = 'string' | 'integer' | 'float' | 'boolean' | 'json' | 'bigint' | 'decimal' | 'bytes' | 'identity';
 
-export const COLUMN_TYPES: ColumnType[] = ['string', 'integer', 'float', 'boolean', 'json', 'bigint', 'decimal', 'bytes'];
+export const COLUMN_TYPES: ColumnType[] = ['string', 'integer', 'float', 'boolean', 'json', 'bigint', 'decimal', 'bytes', 'identity'];
 
 // Optional, type-scoped refinements on a column. Each key is only applicable to
 // a subset of column types; inapplicable keys MUST be absent (enforced in

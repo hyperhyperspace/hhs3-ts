@@ -27,12 +27,13 @@ export async function startRepl(session: WorkspaceSession): Promise<void> {
     let busy = false;
     const pending: string[] = [];
 
+    const onKeypress = (_s: string, key: { name?: string } | undefined): void => {
+        if (key?.name === 'paste-start') isPasting = true;
+        if (key?.name === 'paste-end') isPasting = false;
+    };
     if (input.isTTY) {
         emitKeypressEvents(input, rl);
-        input.on('keypress', (_s: string, key: { name?: string } | undefined) => {
-            if (key?.name === 'paste-start') isPasting = true;
-            if (key?.name === 'paste-end') isPasting = false;
-        });
+        input.on('keypress', onKeypress);
         // Enable bracketed paste so the terminal brackets the paste and readline
         // coalesces it; combined with isPasting this suppresses continuation
         // prompts mid-paste.
@@ -121,7 +122,12 @@ export async function startRepl(session: WorkspaceSession): Promise<void> {
         drawPrompt();
     });
 
-    if (input.isTTY) output.write('\x1b[?2004l');
+    if (input.isTTY) {
+        output.write('\x1b[?2004l');
+        input.removeListener('keypress', onKeypress);
+        if (input.isRaw) input.setRawMode(false);
+        input.pause();
+    }
 }
 
 function isComplete(text: string): boolean {

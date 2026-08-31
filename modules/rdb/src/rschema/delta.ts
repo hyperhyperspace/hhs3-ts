@@ -14,14 +14,22 @@ import {
     walkDelta, computeForkMeet,
 } from "@hyper-hyper-space/hhs3_mvt";
 
-import { TableDef, ColumnDef } from "./payload.js";
+import { ColumnDef } from "./payload.js";
 import { CreateRSchemaPayload, SchemaUpdatePayload } from "./payload.js";
-import type { RSchema } from "./interfaces.js";
+import type { RSchema, RSchemaView } from "./interfaces.js";
 
 export type ColumnChange = {
     column: string;
     before: ColumnDef | undefined;
     after: ColumnDef | undefined;
+    // True iff `before` and `after` are byte-identical defs but the column's
+    // LIVE INCARNATION differs across the delta — a same-shape drop+re-add (or
+    // a table reincarnation via two identical add-table forks resolving to
+    // different winners). The resolved def is unchanged, but every existing
+    // row's written value for the OLD incarnation is masked, so a consumer must
+    // treat it like a drop+add (clear the column, re-materialize). False for an
+    // ordinary def change (before !== after) and for a pure add / drop.
+    reincarnated: boolean;
 };
 
 export type TableChange = {
@@ -33,6 +41,12 @@ export type TableChange = {
     concurrentDeletesChanged: boolean;
     fksChanged: boolean;
     restrictionsChanged: boolean;
+    // The table's idProvider designation changed. idProvider rides on the
+    // winning add-table base def (no set-idProvider rule exists), so this only
+    // flips on a table reincarnation; surfaced explicitly so a consumer whose
+    // projection depends on the provider (which columns are dropped / renamed)
+    // is never left to infer it from column reincarnations.
+    idProviderChanged: boolean;
 };
 
 export type RSchemaChanges = {
@@ -63,7 +77,12 @@ function sameLiteral(a: json.Literal | undefined, b: json.Literal | undefined): 
     return json.toStringNormalized(a) === json.toStringNormalized(b);
 }
 
-function diffTable(table: string, before: TableDef | undefined, after: TableDef | undefined): TableChange | undefined {
+// Diff one candidate table across the delta. Takes the resolved START and END
+// views (not just the TableDefs) because a same-shape reincarnation is only
+// visible through getColumnIncarnation / getIdProvider — the defs are equal.
+function diffTable(table: string, startView: RSchemaView, endView: RSchemaView): TableChange | undefined {
+    const before = startView.getTable(table);
+    const after = endView.getTable(table);
     if (before === undefined && after === undefined) return undefined;
 
     const change: TableChange = {
@@ -74,13 +93,25 @@ function diffTable(table: string, before: TableDef | undefined, after: TableDef 
         concurrentDeletesChanged: false,
         fksChanged: false,
         restrictionsChanged: false,
+        idProviderChanged: false,
     };
 
     if (before === undefined || after === undefined) return change;
 
     for (const column of new Set([...Object.keys(before.columns), ...Object.keys(after.columns)])) {
         if (!sameLiteral(before.columns[column], after.columns[column])) {
-            change.columnChanges.push({ column, before: before.columns[column], after: after.columns[column] });
+            // Ordinary def change or pure add / drop: the defs already differ.
+            change.columnChanges.push({
+                column, before: before.columns[column], after: after.columns[column], reincarnated: false,
+            });
+        } else if (before.columns[column] !== undefined
+            && startView.getColumnIncarnation(table, column) !== endView.getColumnIncarnation(table, column)) {
+            // Same resolved def, new live incarnation: a same-shape drop+re-add
+            // that leaves old rows' written values masked. Reported so a
+            // consumer can clear + re-materialize the column.
+            change.columnChanges.push({
+                column, before: before.columns[column], after: after.columns[column], reincarnated: true,
+            });
         }
     }
 
@@ -89,9 +120,12 @@ function diffTable(table: string, before: TableDef | undefined, after: TableDef 
     change.restrictionsChanged = !sameLiteral(
         before.restrictions as json.Literal | undefined,
         after.restrictions as json.Literal | undefined);
+    change.idProviderChanged = !sameLiteral(
+        startView.getIdProvider(table) as json.Literal | undefined,
+        endView.getIdProvider(table) as json.Literal | undefined);
 
     if (change.columnChanges.length === 0 && !change.concurrentDeletesChanged
-        && !change.fksChanged && !change.restrictionsChanged) {
+        && !change.fksChanged && !change.restrictionsChanged && !change.idProviderChanged) {
         return undefined;
     }
 
@@ -134,7 +168,7 @@ export class RSchemaDeltaAccumulator implements DeltaAccumulator<RSchemaChanges>
 
         const tableChanges: TableChange[] = [];
         for (const table of this.candidateTables) {
-            const change = diffTable(table, startView.getTable(table), endView.getTable(table));
+            const change = diffTable(table, startView, endView);
             if (change !== undefined) tableChanges.push(change);
         }
 

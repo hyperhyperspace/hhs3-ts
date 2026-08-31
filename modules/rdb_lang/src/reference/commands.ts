@@ -43,7 +43,7 @@ export const LANG_COMMAND_REFS: readonly LangCommandRef[] = [
             '    [ALLOW op IF predicate], ...',
             ');',
         ].join('\n'),
-        description: "Defines a schema: tables, columns, allow rules, and an optional identity provider. Column type is one of string[(n)], integer, float, boolean, json, bigint, decimal(p, s), bytes[(n)] (n = maxLength; p, s = precision, scale). MIN/MAX give inclusive bounds (integer/bigint/decimal only); write bigint/decimal literals as quoted strings so they stay exact. Values are rejected, never rounded. Mark FK columns with REFERENCES refTable (or REFERENCES binding.table for a bound group); insert their values as #rowIdPrefix.",
+        description: "Defines a schema: tables, columns, allow rules, and an optional identity provider. Column type is one of string[(n)], integer, float, boolean, json, bigint, decimal(p, s), bytes[(n)], identity (n = maxLength; p, s = precision, scale; identity stores a key-hash string). MIN/MAX give inclusive bounds (integer/bigint/decimal only); write bigint/decimal literals as quoted strings so they stay exact. Values are rejected, never rounded. Mark FK columns with REFERENCES refTable (or REFERENCES binding.table for a bound group); insert their values as #rowIdPrefix. For identity columns, insert $name or #keyIdPrefix.",
     },
     {
         command: 'CREATE TABLEGROUP',

@@ -72,7 +72,7 @@ export {
     formatRefAutoUpdateFailure,
     formatRefAutoUpdateSkipped,
     RefAutoUpdateSkippedError,
-    type RefUpdateEvent,
+    type RefUpdateOutcome,
     type RefUpdateTrigger,
     type ObserverRef,
 } from "./session/ref_auto_update.js";

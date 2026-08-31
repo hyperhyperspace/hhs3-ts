@@ -529,6 +529,7 @@ async function bindInsertColumns(
 ): Promise<{ uuid: string; values: { [column: string]: json.Literal } }> {
     let uuid: string | undefined;
     const values: { [column: string]: json.Literal } = {};
+    const columnDefs = await resolveColumnDefs(table, at);
     for (let i = 0; i < columns.length; i += 1) {
         const column = columns[i];
         const expr = valueExprs[i];
@@ -539,15 +540,21 @@ async function bindInsertColumns(
             continue;
         }
         if (expr.kind === 'hash') {
-            if (context.resolveFkRowId === undefined) {
-                throw new Error('FK #prefix resolution is not available in this host');
+            if (columnDefs[column]?.type === 'identity') {
+                if (context.resolvePublicKey === undefined) {
+                    throw new Error('identity #prefix resolution is not available in this host');
+                }
+                values[column] = (await context.resolvePublicKey(expr.prefix)).keyId;
+            } else {
+                if (context.resolveFkRowId === undefined) {
+                    throw new Error('FK #prefix resolution is not available in this host');
+                }
+                values[column] = await context.resolveFkRowId(expr.prefix, table, column, at, at);
             }
-            values[column] = await context.resolveFkRowId(expr.prefix, table, column, at, at);
         } else {
             values[column] = asJsonLiteral(await resolveValue(expr, valueContext));
         }
     }
-    const columnDefs = await resolveColumnDefs(table, at);
     return { uuid: uuid ?? context.createUuid(), values: canonicalEncodeRowValues(values, columnDefs) };
 }
 

@@ -89,8 +89,13 @@ export type RObject = {
 
     extractForeignDeps(payload: Payload, at: Version): ForeignDep[] | undefined;
 
-    subscribe(callback: (event: Event) => void): void;
-    unsubscribe(callback: (event: Event) => void): void;
+    // Reactivity. The callback receives the raw DAG frontier (Version) whenever
+    // this object's own sub-DAG advances -- never on sibling changes. Consumers
+    // deduplicate by their own cursor and pull deltas/views as needed. Register
+    // the callback first, then read the current state to establish a cursor:
+    // at-least-once delivery follows any subsequent change.
+    subscribe(callback: (version: Version) => void): void;
+    unsubscribe(callback: (version: Version) => void): void;
 
     getBackendLabel(): string;
     destroy(): Promise<void>;
@@ -156,10 +161,58 @@ export type View = {
     resolveRefVersion(refId: B64Hash): Promise<Version>;
 }
 
-export type Event = {
-    getObjectId(): B64Hash;
-    getType(): string;
-    getVersion(): Version;
+// Shared implementation of RObject.subscribe/unsubscribe. Each RObject holds
+// one of these, constructed with a getter for its ScopedDag. It lazily attaches
+// a single listener to the ScopedDag on the first subscriber and detaches on
+// the last, translating scoped growth into a raw-frontier callback. The
+// ScopedDag chain, in turn, arms its parents lazily -- so an object with no
+// subscribers imposes no observation cost anywhere up to the physical store.
+export class ScopedDagSubscription {
+
+    private callbacks = new Set<(version: Version) => void>();
+    private scopedDag: ScopedDag | undefined = undefined;
+    private listener: ((growth: { frontier: Version }) => void) | undefined = undefined;
+
+    constructor(private readonly scopedDagProvider: () => Promise<ScopedDag>) {}
+
+    subscribe(callback: (version: Version) => void): void {
+        const wasEmpty = this.callbacks.size === 0;
+        this.callbacks.add(callback);
+        if (wasEmpty) {
+            void this.attach();
+        }
+    }
+
+    unsubscribe(callback: (version: Version) => void): void {
+        this.callbacks.delete(callback);
+        if (this.callbacks.size === 0) {
+            this.detach();
+        }
+    }
+
+    private async attach(): Promise<void> {
+        if (this.listener !== undefined) return;
+        const scopedDag = await this.scopedDagProvider();
+        // Guard the async gap: a fast subscribe/unsubscribe may have emptied the
+        // set, or another attach may have won the race.
+        if (this.callbacks.size === 0 || this.listener !== undefined) return;
+
+        const listener = (growth: { frontier: Version }) => {
+            for (const cb of [...this.callbacks]) {
+                try { cb(growth.frontier); } catch (_e) { /* keep firing even if a callback throws */ }
+            }
+        };
+        this.listener = listener;
+        this.scopedDag = scopedDag;
+        scopedDag.addListener(listener);
+    }
+
+    private detach(): void {
+        if (this.scopedDag !== undefined && this.listener !== undefined) {
+            this.scopedDag.removeListener(this.listener);
+        }
+        this.listener = undefined;
+    }
 }
 
 export type RObjectTypeRegistry = {

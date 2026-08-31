@@ -38,10 +38,13 @@ export function formatTableResult(result: LangExecutionResult, session: ReplSess
                 ...(records.some((row) => row.rowAuthor !== undefined) ? ['rowAuthor'] : []),
                 ...result.columns,
             ];
-            const selectCtx = createDisplayContext(session, collectTruncatableStrings(records));
+            const identityColumns = new Set(result.identityColumns ?? []);
+            const selectCtx = createDisplayContext(
+                session, collectTruncatableStrings(records, undefined, identityColumns));
+            const rowOpts = { ctx: selectCtx, identityColumns };
             return mode === 'vertical'
-                ? formatRowsVertical(records, columns, { ctx: selectCtx })
-                : formatRows(records, columns, { ctx: selectCtx });
+                ? formatRowsVertical(records, columns, rowOpts)
+                : formatRows(records, columns, rowOpts);
         }
         case 'log': return formatLog(result, session, mode);
         case 'set-view': return 'view set';

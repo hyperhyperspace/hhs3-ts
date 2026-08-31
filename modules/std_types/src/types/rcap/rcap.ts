@@ -7,7 +7,7 @@ import {
     Payload, RObject, RObjectFactory, RContext, LoadObjectOptions, Version, View, ForeignDep,
     formatValidationFailure, ValidationRejectedError, ValidationResult,
 } from "@hyper-hyper-space/hhs3_mvt";
-import { RootScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
+import { RootScopedDag, ScopedDag, CausalDag, ScopedDagSubscription } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { Mesh, Swarm } from "@hyper-hyper-space/hhs3_mesh";
 import { createSyncSession } from "@hyper-hyper-space/hhs3_sync";
@@ -25,7 +25,6 @@ import {
     CapPayload,
 } from "./payload.js";
 
-import type { RCapEvent } from "./events.js";
 import type { RCap as RCapContract, RCapView as RCapViewContract } from "./interfaces.js";
 import { validateRCapPayload } from "./validate.js";
 import { RCapViewImpl } from "./view.js";
@@ -298,12 +297,21 @@ export class RCapImpl implements RCapContract {
         return undefined;
     }
 
-    subscribe(_callback: (event: RCapEvent) => void): void {
-        throw new Error("Method not implemented.");
+    private _subscription: ScopedDagSubscription | undefined;
+
+    private subscription(): ScopedDagSubscription {
+        if (this._subscription === undefined) {
+            this._subscription = new ScopedDagSubscription(() => this.getScopedDag());
+        }
+        return this._subscription;
     }
 
-    unsubscribe(_callback: (event: RCapEvent) => void): void {
-        throw new Error("Method not implemented.");
+    subscribe(callback: (version: Version) => void): void {
+        this.subscription().subscribe(callback);
+    }
+
+    unsubscribe(callback: (version: Version) => void): void {
+        this.subscription().unsubscribe(callback);
     }
 
     setDeltaStrategy(strategy: RCapDeltaStrategy): void {

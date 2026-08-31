@@ -17,6 +17,7 @@
     "@hyper-hyper-space/hhs3_crypto": "^0.1.0",
     "@hyper-hyper-space/hhs3_dag": "^0.1.0",
     "@hyper-hyper-space/hhs3_dag_sql": "^0.1.0",
+    "@hyper-hyper-space/hhs3_file_watch": "^0.1.0",
     "@types/better-sqlite3": "^7.6.0",
     "better-sqlite3": "^12.11.1"
   },

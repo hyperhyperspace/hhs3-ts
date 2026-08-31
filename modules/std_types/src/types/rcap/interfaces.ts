@@ -3,7 +3,6 @@ import type { OwnIdentity, HashSuite } from "@hyper-hyper-space/hhs3_crypto";
 
 import { Payload, RObject, SyncableObject, Version, View, ForeignDep, ValidationResult } from "@hyper-hyper-space/hhs3_mvt";
 
-import type { RCapEvent } from "./events.js";
 import type { CapDefinition } from "./payload.js";
 
 export interface RCap extends RObject, SyncableObject {
@@ -25,8 +24,8 @@ export interface RCap extends RObject, SyncableObject {
     applyPayload(payload: Payload, at: Version): Promise<B64Hash>;
     getView(at?: Version, from?: Version): Promise<RCapView>;
     extractForeignDeps(payload: Payload, at: Version): ForeignDep[] | undefined;
-    subscribe(callback: (event: RCapEvent) => void): void;
-    unsubscribe(callback: (event: RCapEvent) => void): void;
+    subscribe(callback: (version: Version) => void): void;
+    unsubscribe(callback: (version: Version) => void): void;
 
     setDeltaStrategy(strategy: "full" | "bounded"): void;
     configure(config: { meshLabel?: string }): void;

@@ -18,7 +18,7 @@ import { KeyPassphraseRequiredError } from "./session.js";
 import { RdbSession } from "./session.js";
 import { suggestAuthorsForBindFailure, suggestAuthorsForFailure } from "./authz_suggest.js";
 import { tryAuthSignRetry, tryBindAuthorRetry } from "./sign_retry.js";
-import { extractRefUpdateTrigger, propagateRefUpdates, type RefUpdateEvent } from "./ref_auto_update.js";
+import { extractRefUpdateTrigger, propagateRefUpdates, type RefUpdateOutcome } from "./ref_auto_update.js";
 import {
     frontierForScope,
     hashScopeForVersionScope,
@@ -29,7 +29,7 @@ import type { AuthInteractionContext } from "./prompts.js";
 
 export type StatementRunResult = {
     result: LangExecutionResult;
-    events?: RefUpdateEvent[];
+    refUpdates?: RefUpdateOutcome[];
 };
 
 export type ScriptRunResult = {
@@ -122,7 +122,7 @@ export async function executeText(
         const item: StatementRunResult = { result };
         const trigger = extractRefUpdateTrigger(effectiveBound);
         if (session.refAutoUpdate !== 'off' && trigger !== undefined) {
-            item.events = await propagateRefUpdates(session, trigger.sourceGroupId, trigger.author, options);
+            item.refUpdates = await propagateRefUpdates(session, trigger.sourceGroupId, trigger.author, options);
         }
 
         results.push(item);

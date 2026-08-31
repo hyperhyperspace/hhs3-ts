@@ -93,6 +93,7 @@ async function createItemsGroup() {
 }
 
 const ITEM_COLUMNS: ColumnTypes = { kind: 'string', qty: 'integer', price: 'float', label: 'string' };
+const KEY_COLUMNS: ColumnTypes = { grantee: 'identity', keyId: 'string' };
 
 function row(rowId: string, values: Row['values'], author?: string): Row {
     const r: Row = { rowId, uuid: rowId, values };
@@ -160,6 +161,12 @@ export const rtableQueryTests = {
                 assertTrue(evalRowFilter({ p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: 'key-1' } }, authored), 'author match');
                 assertFalse(evalRowFilter({ p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: 'key-2' } }, authored), 'author mismatch');
                 assertFalse(evalRowFilter({ p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: 'key-1' } }, r), 'missing author does not match');
+
+                const keyed = row('k', { grantee: 'key-1', keyId: 'key-1' });
+                assertTrue(evalRowFilter({ p: 'cmp', cmp: 'eq', left: { col: 'grantee' }, right: { lit: 'key-1' } }, keyed), 'identity = literal');
+                assertTrue(evalRowFilter({ p: 'cmp', cmp: 'eq', left: { col: 'grantee' }, right: { col: 'keyId' } }, keyed), 'identity = string col');
+                assertFalse(evalRowFilter({ p: 'cmp', cmp: 'eq', left: { col: 'grantee' }, right: { col: 'keyId' } },
+                    row('k2', { grantee: 'key-1', keyId: 'key-2' })), 'identity != other string');
             }
         },
         {
@@ -180,6 +187,9 @@ export const rtableQueryTests = {
                 expectThrow(() => validateRowQuery({ orderBy: [{ column: 'qty', dir: 'down' as 'asc' }] }, ITEM_COLUMNS), 'bad orderBy dir');
                 expectThrow(() => validateRowQuery({ where: { p: 'bogus' } as unknown as RowFilter }, ITEM_COLUMNS), 'unknown filter tag');
                 validateRowQuery({ where: { p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: 'key-1' } } }, ITEM_COLUMNS);
+                validateRowQuery({ where: { p: 'cmp', cmp: 'eq', left: { col: 'grantee' }, right: { lit: 'key-1' } } }, KEY_COLUMNS);
+                validateRowQuery({ where: { p: 'cmp', cmp: 'eq', left: { col: 'grantee' }, right: { col: 'keyId' } } }, KEY_COLUMNS);
+                expectThrow(() => validateRowQuery({ where: { p: 'cmp', cmp: 'lt', left: { col: 'grantee' }, right: { lit: 'key-1' } } }, KEY_COLUMNS), 'identity ordering rejected');
             }
         },
         {

@@ -8,6 +8,7 @@ export type SchemaDeltaPayload = {
 export type GroupDeltaPayload = {
     kind: 'group'; name: string; objectId: B64Hash; delta: RTableGroupDelta;
     tableIdToName: Map<B64Hash, string>;
+    identityColumnsByTable: Map<string, Set<string>>;
 };
 export type DeltaPayload = SchemaDeltaPayload | GroupDeltaPayload;
 
@@ -22,17 +23,22 @@ export function schemaChangeRows(changes: TableChange[]): Record<string, unknown
         else if (change.existedBefore && !change.existsAfter) rows.push({ table: change.table, change: 'drop-table', detail: '' });
         else {
             for (const column of change.columnChanges) {
-                const kind = column.before === undefined ? 'add-column'
-                    : column.after === undefined ? 'drop-column' : 'change-column';
-                const detail = column.before === undefined
-                    ? `${column.column}: ${JSON.stringify(column.after)}`
-                    : column.after === undefined ? column.column
-                        : `${column.column}: ${JSON.stringify(column.before)} -> ${JSON.stringify(column.after)}`;
+                // A reincarnation is a same-shape drop+re-add: before and after
+                // are equal defs, so distinguish it explicitly rather than
+                // rendering an identical-looking 'change-column'.
+                const kind = column.reincarnated ? 'reincarnate-column'
+                    : column.before === undefined ? 'add-column'
+                        : column.after === undefined ? 'drop-column' : 'change-column';
+                const detail = column.reincarnated ? `${column.column}: ${JSON.stringify(column.after)}`
+                    : column.before === undefined ? `${column.column}: ${JSON.stringify(column.after)}`
+                        : column.after === undefined ? column.column
+                            : `${column.column}: ${JSON.stringify(column.before)} -> ${JSON.stringify(column.after)}`;
                 rows.push({ table: change.table, change: kind, detail });
             }
             if (change.concurrentDeletesChanged) rows.push({ table: change.table, change: 'concurrent-deletes', detail: 'changed' });
             if (change.fksChanged) rows.push({ table: change.table, change: 'fks', detail: 'changed' });
             if (change.restrictionsChanged) rows.push({ table: change.table, change: 'restrictions', detail: 'changed' });
+            if (change.idProviderChanged) rows.push({ table: change.table, change: 'id-provider', detail: 'changed' });
         }
     }
     return rows;

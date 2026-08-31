@@ -72,7 +72,7 @@ function order<T extends number | string>(cmp: CmpOp, l: T, r: T): boolean {
 
 const NUMERIC_TYPES: ColumnType[] = ['integer', 'float', 'bigint', 'decimal'];
 // String-carried types a bare string literal can stand in for.
-const STRING_CARRIED: ColumnType[] = ['string', 'bigint', 'decimal', 'bytes'];
+const STRING_CARRIED: ColumnType[] = ['string', 'bigint', 'decimal', 'bytes', 'identity'];
 
 // Compare two resolved literals under `cmp`. eq/ne use normalized-string
 // equality (works for any scalar, and for the canonical string carriers of
@@ -132,14 +132,19 @@ export function resolveCmpType(left: Operand, right: Operand, typeOf: (column: s
 }
 
 // Type coherence of a cmp atom's two operands: a common type that supports the
-// operator (eq/ne over any scalar; ordering excludes boolean and bytes).
+// operator (eq/ne over any scalar including identity; identity also equals
+// string, for key-hash columns). Ordering excludes boolean, bytes, and identity.
 export function cmpTypesOk(cmp: CmpOp, left: Operand, right: Operand, typeOf: (column: string) => ColumnType | undefined): boolean {
     const t = resolveCmpType(left, right, typeOf);
-    if (t === undefined) return false;
     if (cmp === 'eq' || cmp === 'ne') {
-        return ['integer', 'float', 'string', 'boolean', 'bigint', 'decimal', 'bytes'].includes(t);
+        if (t !== undefined) {
+            return ['integer', 'float', 'string', 'boolean', 'bigint', 'decimal', 'bytes', 'identity'].includes(t);
+        }
+        const lt = operandType(left, typeOf);
+        const rt = operandType(right, typeOf);
+        return (lt === 'identity' && rt === 'string') || (lt === 'string' && rt === 'identity');
     }
-    return ['integer', 'float', 'string', 'bigint', 'decimal'].includes(t);   // ordering
+    return t !== undefined && ['integer', 'float', 'string', 'bigint', 'decimal'].includes(t);
 }
 
 // Type coherence of a str atom: both operands resolve to strings.

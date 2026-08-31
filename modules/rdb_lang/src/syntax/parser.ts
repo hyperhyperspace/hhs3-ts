@@ -1082,7 +1082,7 @@ class Parser {
 
     private columnTypeFromToken(tok: Token): ColumnTypeName {
         const type = tok.upper.toLowerCase();
-        if (['string', 'integer', 'float', 'boolean', 'json', 'bigint', 'decimal', 'bytes'].includes(type)) return type as ColumnTypeName;
+        if (['string', 'integer', 'float', 'boolean', 'json', 'bigint', 'decimal', 'bytes', 'identity'].includes(type)) return type as ColumnTypeName;
         this.diagnostics.add('PARSE_EXPECTED_TOKEN', `Expected column type, got '${tok.text}'`, tok.span);
         return 'string';
     }

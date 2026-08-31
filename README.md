@@ -15,7 +15,7 @@ This new version has two main goals:
 
 ### Current status
 
-The core sync engine is complete: the `dag` storage layer, `mvt` (Monotone View Types), `replica`, `sync` (synchronizer), and `mesh` (networking, plus transports and tracker) layers are all implemented and working together to enable live peer-to-peer state synchronization. A formal [protocol specification](modules/replica/SPECS.md) covers the full architecture — from authenticated mesh channels through DAG exchange to type-level validation. Standard replicable types (**RSet** and **RCap**, with permissioned RSet composition) are available in the `std_types` module. The **Causal/Relational database** modules `rdb`, `rdb_lang`, `rdb_runtime`, `rdb_repl`, and `rdb_tools` are implemented (causal relational MVT model, C-SQL, browser-safe runtime, portable REPL tooling, and Node CLI). `rdb_repl_web` is an ephemeral browser REPL; try the live [Causal DB demo](https://www.hyperhyperspace.org/db-demo/). Please see the individual module specs and the [roadmap](https://www.hyperhyperspace.org/work-plan-2025.html) for details.
+The core sync engine is complete: the `dag` storage layer, `mvt` (Monotone View Types), `replica`, `sync` (synchronizer), and `mesh` (networking, plus transports and tracker) layers are all implemented and working together to enable live peer-to-peer state synchronization. A formal [protocol specification](modules/replica/SPECS.md) covers the full architecture — from authenticated mesh channels through DAG exchange to type-level validation. Standard replicable types (**RSet** and **RCap**, with permissioned RSet composition) are available in the `std_types` module. The **Causal/Relational database** modules `rdb`, `rdb_lang`, `rdb_runtime`, `rdb_repl`, and `rdb_tools` are implemented (causal relational MVT model, C-SQL, browser-safe runtime, portable REPL tooling, and Node CLI). `rdb_repl_web` is an ephemeral browser REPL; try the live [Causal DB demo](https://www.hyperhyperspace.org/db-demo/). The `rdb_adapter` family (`rdb_adapter`, `rdb_adapter_sqlite`, `rdb_adapter_test`, and `rdb_projection`) projects an RDb into a regular relational database (SQLite or in-memory) and ingests local edits back, with `rdb_projection` supervising replica-wide, reactive bidirectional sync. Please see the individual module specs and the [roadmap](https://www.hyperhyperspace.org/work-plan-2025.html) for details.
 
 ### Organization
 
@@ -39,6 +39,10 @@ This monorepo is organized as a collection of modules. This is of course WIP.
 - [`modules/rdb_repl`](modules/rdb_repl) Portable presentation and command tooling for RDb
 - [`modules/rdb_tools`](modules/rdb_tools) Node REPL, CLI (`rdb`), workspace and key management, script runner
 - [`modules/rdb_repl_web`](modules/rdb_repl_web) Ephemeral browser REPL ([live demo](https://www.hyperhyperspace.org/db-demo/))
+- [`modules/rdb_adapter`](modules/rdb_adapter) Engine-agnostic projection/ingestion core (Rdb ⇄ relational database)
+- [`modules/rdb_adapter_sqlite`](modules/rdb_adapter_sqlite) SQLite `MaterializationTarget` for rdb_adapter
+- [`modules/rdb_adapter_test`](modules/rdb_adapter_test) Backend-agnostic conformance suites + fixtures for rdb_adapter targets
+- [`modules/rdb_projection`](modules/rdb_projection) Reactive supervisor for replica-wide, bidirectional projection of an RDb
 
 **Synchronization**
 

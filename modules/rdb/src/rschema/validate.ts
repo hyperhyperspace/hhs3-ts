@@ -71,6 +71,7 @@ export function columnValueMatchesType(value: json.Literal, type: ColumnType): b
         case 'bigint': return typeof value === 'string' && isCanonicalBigint(value);
         case 'decimal': return typeof value === 'string';
         case 'bytes': return typeof value === 'string' && isCanonicalBase64(value);
+        case 'identity': return typeof value === 'string' && value.length > 0;
     }
 }
 
@@ -141,6 +142,10 @@ export function columnValueValidReason(value: json.Literal, def: ColumnDef): Val
             if (c?.maxLength !== undefined && base64ByteLen(value) > c.maxLength) {
                 return `byte length ${base64ByteLen(value)} exceeds maxLength ${c.maxLength}`;
             }
+            return undefined;
+        case 'identity':
+            if (typeof value !== 'string') return `expected an identity (key hash string), got ${carrierName(value)}`;
+            if (value.length === 0) return `identity key hash must be non-empty`;
             return undefined;
     }
 }
@@ -313,7 +318,8 @@ function columnTypeOf(columns: { [c: string]: ColumnDef }): (column: string) => 
 //   - every $row.<col> reference names an existing READONLY column of `def`;
 //   - cmp/str operand types are coherent over `def`'s columns;
 //   - an exists where-value $row.<col> matches the (local) target field's type
-//     (the target field's pub-ness is enforced separately by the exists check).
+//     (identity also matches string; the target field's pub-ness is enforced
+//     separately by the exists check).
 // Foreign (group.table) exists targets are skipped (checked at binding time).
 export function checkPredicateColumns(
     def: TableDef,
@@ -351,7 +357,9 @@ export function checkPredicateColumns(
             const targetCol = target.columns[field];
             if (subjectCol === undefined) return `$row field '${col}' not found in table '${def.name}'`;
             if (targetCol === undefined) return `exists where field '${field}' not found in table '${table}'`;
-            if (subjectCol.type !== targetCol.type) {
+            if (subjectCol.type !== targetCol.type
+                && !((subjectCol.type === 'identity' && targetCol.type === 'string')
+                  || (subjectCol.type === 'string' && targetCol.type === 'identity'))) {
                 return `$row field '${col}' type '${subjectCol.type}' does not match exists where field '${field}' type '${targetCol.type}'`;
             }
         }
@@ -371,6 +379,7 @@ const ALLOWED_CONSTRAINTS: { [t in ColumnType]: (keyof ColumnConstraints)[] } = 
     float: [],
     boolean: [],
     json: [],
+    identity: [],
 };
 
 // A min/max bound must be a canonical value of the column type.

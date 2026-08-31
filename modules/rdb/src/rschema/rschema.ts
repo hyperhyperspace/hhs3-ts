@@ -38,10 +38,10 @@ import { dag, Entry, position } from "@hyper-hyper-space/hhs3_dag";
 
 import {
     Payload, RObjectFactory, RContext, LoadObjectOptions,
-    Version, ForeignDep, Event, Delta, DeltaAccumulator,
+    Version, ForeignDep, Delta, DeltaAccumulator,
     formatValidationFailure, ValidationRejectedError, ValidationResult,
 } from "@hyper-hyper-space/hhs3_mvt";
-import { RootScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
+import { RootScopedDag, ScopedDag, CausalDag, ScopedDagSubscription } from "@hyper-hyper-space/hhs3_mvt";
 import { signPayload as signPayloadHelper, serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchema as RSchemaContract, RSchemaView as RSchemaViewContract } from "./interfaces.js";
@@ -220,12 +220,21 @@ export class RSchemaImpl implements RSchemaContract {
         return new RSchemaDeltaAccumulator(this, start, end);
     }
 
-    subscribe(_callback: (event: Event) => void): void {
-        throw new Error("Method not implemented.");
+    private _subscription: ScopedDagSubscription | undefined;
+
+    private subscription(): ScopedDagSubscription {
+        if (this._subscription === undefined) {
+            this._subscription = new ScopedDagSubscription(() => this.getScopedDag());
+        }
+        return this._subscription;
     }
 
-    unsubscribe(_callback: (event: Event) => void): void {
-        throw new Error("Method not implemented.");
+    subscribe(callback: (version: Version) => void): void {
+        this.subscription().subscribe(callback);
+    }
+
+    unsubscribe(callback: (version: Version) => void): void {
+        this.subscription().unsubscribe(callback);
     }
 
     async getScopedDag(): Promise<ScopedDag> {

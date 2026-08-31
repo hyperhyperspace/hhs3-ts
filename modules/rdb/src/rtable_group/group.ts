@@ -56,10 +56,10 @@ import { dag, position } from "@hyper-hyper-space/hhs3_dag";
 
 import {
     Payload, RObjectFactory, RContext, LoadObjectOptions, NestingParent,
-    Version, version, ForeignDep, Event, DeltaAccumulator, RObject,
+    Version, version, ForeignDep, DeltaAccumulator, RObject,
     formatValidationFailure, validationFailure, ValidationRejectedError, ValidationResult,
 } from "@hyper-hyper-space/hhs3_mvt";
-import { RootScopedDag, NestedScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
+import { RootScopedDag, NestedScopedDag, ScopedDag, CausalDag, ScopedDagSubscription } from "@hyper-hyper-space/hhs3_mvt";
 import {
     isRefAdvancePayload, extractRefVersion, extractAuthor, prepareRefAdvance, createRefAdvanceMeta,
     createRefAdvancePayload, resolveRefVersionAtPosition, findConcurrentRefAdvanceBarriers,
@@ -858,12 +858,21 @@ export class RTableGroupImpl implements RTableGroupContract {
         return deps;
     }
 
-    subscribe(_callback: (event: Event) => void): void {
-        throw new Error("Method not implemented.");
+    private _subscription: ScopedDagSubscription | undefined;
+
+    private subscription(): ScopedDagSubscription {
+        if (this._subscription === undefined) {
+            this._subscription = new ScopedDagSubscription(() => this.getScopedDag());
+        }
+        return this._subscription;
     }
 
-    unsubscribe(_callback: (event: Event) => void): void {
-        throw new Error("Method not implemented.");
+    subscribe(callback: (version: Version) => void): void {
+        this.subscription().subscribe(callback);
+    }
+
+    unsubscribe(callback: (version: Version) => void): void {
+        this.subscription().unsubscribe(callback);
     }
 
     async getScopedDag(): Promise<ScopedDag> {

@@ -67,7 +67,7 @@ export type TableRef = {
     span: TextSpan;
 };
 
-export type ColumnTypeName = 'string' | 'integer' | 'float' | 'boolean' | 'json' | 'bigint' | 'decimal' | 'bytes';
+export type ColumnTypeName = 'string' | 'integer' | 'float' | 'boolean' | 'json' | 'bigint' | 'decimal' | 'bytes' | 'identity';
 
 // Constraints parsed from the column declaration: parenthesized type params
 // (STRING(n) / BYTES(n) -> maxLength; DECIMAL(p, s) -> precision, scale) and

@@ -32,7 +32,7 @@ import {
     Payload, RObject, RObjectFactory, RContext, NestingParent, Version, ForeignDep, LoadObjectOptions,
     formatValidationFailure, validationOk, ValidationRejectedError, ValidationResult,
 } from "@hyper-hyper-space/hhs3_mvt";
-import { DagScope, NestedScopedDag, RootScopedDag, ScopedDag, CausalDag } from "@hyper-hyper-space/hhs3_mvt";
+import { DagScope, NestedScopedDag, RootScopedDag, ScopedDag, CausalDag, ScopedDagSubscription } from "@hyper-hyper-space/hhs3_mvt";
 import { isRefAdvancePayload, extractRefVersion, prepareRefAdvance, createRefAdvanceMeta } from "@hyper-hyper-space/hhs3_mvt";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 import { set } from "@hyper-hyper-space/hhs3_util";
@@ -48,8 +48,6 @@ import { validateRSetPayload } from "./validate.js";
 import { hashElement } from "./hash.js";
 import { RSetViewImpl } from "./view.js";
 import { RSetDelta, RSetDeltaStrategy, RSetDeltaAccumulator, computeRSetDelta } from "./delta.js";
-
-import { RAddEvent, RDeleteEvent, RSetEvent } from "./events.js";
 
 import { CreateSetPayload, RSET_TYPE_ID } from "./payload.js";
 import { AddElmtPayload } from "./payload.js";
@@ -551,12 +549,21 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
         return obj as RCap;
     }
 
-    subscribe(callback: (event: RAddEvent | RDeleteEvent) => void): void {
-        throw new Error("Method not implemented.");
+    private _subscription: ScopedDagSubscription | undefined;
+
+    private subscription(): ScopedDagSubscription {
+        if (this._subscription === undefined) {
+            this._subscription = new ScopedDagSubscription(() => this.getScopedDag());
+        }
+        return this._subscription;
     }
 
-    unsubscribe(callback: (event: RAddEvent | RDeleteEvent) => void): void {
-        throw new Error("Method not implemented.");
+    subscribe(callback: (version: Version) => void): void {
+        this.subscription().subscribe(callback);
+    }
+
+    unsubscribe(callback: (version: Version) => void): void {
+        this.subscription().unsubscribe(callback);
     }
 
     private deltaStrategy: RSetDeltaStrategy = 'bounded';

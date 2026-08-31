@@ -40,8 +40,17 @@ export async function runDeltaCommand(session: ReplSession, args: string[]): Pro
     ) as RTableGroupDelta;
     const tableIdToName = new Map<B64Hash, string>();
     const view = await group.getView();
+    const schemaView = view.getSchemaView();
+    const identityColumnsByTable = new Map<string, Set<string>>();
     for (const tableName of view.getTableNames()) {
         tableIdToName.set((await group.getTable(tableName)).getId(), tableName);
+        const identityColumns = new Set<string>();
+        for (const [col, colDef] of Object.entries(schemaView.getTable(tableName)?.columns ?? {})) {
+            if (colDef.type === 'identity') identityColumns.add(col);
+        }
+        const provider = schemaView.getIdProvider(tableName);
+        if (provider !== undefined) identityColumns.add(provider.keyIdColumn);
+        if (identityColumns.size > 0) identityColumnsByTable.set(tableName, identityColumns);
     }
     return formatDelta(session, {
         kind,
@@ -49,6 +58,7 @@ export async function runDeltaCommand(session: ReplSession, args: string[]): Pro
         objectId: resolved.id,
         delta,
         tableIdToName,
+        identityColumnsByTable,
     } satisfies GroupDeltaPayload);
 }
 

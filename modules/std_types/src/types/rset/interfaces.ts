@@ -16,7 +16,6 @@ import {
     View,
 } from "@hyper-hyper-space/hhs3_mvt";
 import type { RCap } from "../rcap/interfaces.js";
-import type { RAddEvent, RDeleteEvent } from "./events.js";
 
 export interface RSet<T extends json.Literal = json.Literal> extends RObject, SyncableObject, NestingParent {
     add(element: T, at?: Version): Promise<B64Hash>;
@@ -59,8 +58,8 @@ export interface RSet<T extends json.Literal = json.Literal> extends RObject, Sy
     extractForeignDeps(payload: Payload, at: Version): ForeignDep[] | undefined;
     loadRCap(): Promise<RCap | undefined>;
 
-    subscribe(callback: (event: RAddEvent | RDeleteEvent) => void): void;
-    unsubscribe(callback: (event: RAddEvent | RDeleteEvent) => void): void;
+    subscribe(callback: (version: Version) => void): void;
+    unsubscribe(callback: (version: Version) => void): void;
     setDeltaStrategy(strategy: "full" | "bounded"): void;
     computeDelta(start: Version, end: Version): Promise<Delta>;
 }

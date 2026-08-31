@@ -1,4 +1,3 @@
-\alias key admin #fPCUvyqaz07cmKiuqBIEC9riHu60hPc6FX997CdFt58=
 CREATE DATABASE app CREATORS ($admin);
 
 CREATE SCHEMA hhs:user CREATORS ($admin) AS (
@@ -11,14 +10,14 @@ CREATE SCHEMA hhs:user CREATORS ($admin) AS (
   
   TABLE caps (
     label string PUB READONLY,
-    grantee string PUB READONLY
+    grantee identity PUB READONLY
   ) CONCURRENT DELETES
     ALLOW insert IF EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
     ALLOW delete IF caps.grantee = $author OR EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author,
   
   TABLE profiles (
     ownerId string PUB READONLY REFERENCES identities,
-    keyId string PUB READONLY,
+    keyId identity PUB READONLY,
     displayName string NULL PUB,
     bio string NULL PUB,
     avatarUrl string NULL PUB,
@@ -52,8 +51,8 @@ ADD SCHEMA hhs:doc TO app BY $admin;
 CREATE TABLEGROUP user USING SCHEMA hhs:user AT LATEST
   USING IDENTITIES identities
   WITH ROWS (
-  identities (keyId='fPCUvyqaz07cmKiuqBIEC9riHu60hPc6FX997CdFt58=', publicKey='AAAAB2VkMjU1MTmncum8P+tfAE2p9l2M3Y5VgOowLTnDefocgloRzSEahw==', name='Admin'),
-  caps (label='manager', grantee='fPCUvyqaz07cmKiuqBIEC9riHu60hPc6FX997CdFt58=')
+  identities (keyId=$admin, publicKey=publicKey($admin), name='Admin'),
+  caps (label='manager', grantee=$admin)
 );
 
 -- hhs:doc

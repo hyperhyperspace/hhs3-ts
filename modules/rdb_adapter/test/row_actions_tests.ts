@@ -220,7 +220,10 @@ export const rowActionsTests = {
 
                 // A schema view that no longer lists `tags` (as if it were dropped)
                 // must skip its residual row changes; drop-table already removed them.
-                const droppedView = { getTableNames: () => ['ledger'] } as unknown as RSchemaView;
+                const droppedView = {
+                    getTableNames: () => ['ledger'],
+                    getFKs: () => ({}),
+                } as unknown as RSchemaView;
                 const actions = rowActionsForDelta(delta, droppedView, group.getId(), {});
                 assertEquals(actions.length, 1, 'rows for the dropped table are skipped');
                 assertTrue(actions[0].table === 'ledger', 'only the surviving table is projected');
@@ -265,6 +268,38 @@ export const rowActionsTests = {
                 assertTrue(lastUpsert < firstDelete, 'every upsert is emitted before any delete');
                 assertTrue(actions.some((a) => a.kind === 'delete-row' && a.rowId === l2), 'l2 is deleted');
                 assertTrue(actions.some((a) => a.kind === 'upsert-row' && a.rowId === l1), 'l1 is upserted');
+            },
+        },
+        {
+            name: '[ADPTR09] identity-typed column projects as <col>_key_id carrying the key-hash VALUE',
+            invoke: async () => {
+                const view = {
+                    getFKs: () => ({}),
+                    getTable: () => ({ name: 'caps', columns: {
+                        label: { type: 'string' },
+                        grantee: { type: 'identity' },
+                    } }),
+                } as unknown as RSchemaView;
+
+                const changes: RTableChanges = {
+                    rowChanges: [{
+                        rowId: 'RRRR', liveBefore: false, liveAfter: true,
+                        author: 'k1' as unknown as KeyId,
+                        columnChanges: [
+                            { column: 'label', before: undefined, after: 'manager' },
+                            { column: 'grantee', before: undefined, after: 'KHASH' },
+                        ],
+                    }],
+                };
+
+                const actions = tableRowActions(changes, 'caps', view, {});
+                assertEquals(actions.length, 1, 'one upsert');
+                const a = actions[0];
+                assertTrue(a.kind === 'upsert-row', 'live row becomes upsert-row');
+                if (a.kind !== 'upsert-row') return;
+                assertEquals(a.values['grantee_key_id'], 'KHASH', 'identity value is the key hash under <col>_key_id');
+                assertEquals(a.values['label'], 'manager', 'plain column passes through');
+                assertTrue(!('grantee' in a.values), 'raw identity column name is not emitted');
             },
         },
     ],

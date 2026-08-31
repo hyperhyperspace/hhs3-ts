@@ -116,8 +116,8 @@ type RObject = {
     // inter-DAG dependency discovery (used by the sync layer)
     extractForeignDeps(payload: Payload, at: Version): ForeignDep[] | undefined;
 
-    subscribe(callback: (event: Event) => void): void;
-    unsubscribe(callback: (event: Event) => void): void;
+    subscribe(callback: (version: Version) => void): void;
+    unsubscribe(callback: (version: Version) => void): void;
 
     getBackendLabel(): string;
     destroy(): Promise<void>;
@@ -127,7 +127,7 @@ type RObject = {
 - `Version` is a DAG position — a set of entry hashes representing a point in the causal history.
 - `Payload` is a JSON literal, the unit of replication.
 - `View` is a read-only snapshot of the object's state at a given version, when observed from another version (see below).
-- `Event` signals that the object's state has changed.
+- `subscribe`/`unsubscribe` register reactivity callbacks: the callback receives the raw DAG frontier (`Version`) whenever the object's own sub-DAG advances (never on sibling changes). Register first, then read the current state to establish a cursor; at-least-once delivery follows any later change. See [Reactivity](#reactivity) for the full contract and concurrency guarantees.
 - `ForeignDep` identifies entries in another object's DAG that must be present before a payload can be validated. The sync layer uses `extractForeignDeps` to defer (rather than reject) entries whose cross-DAG dependencies are not yet available.
 - `computeDelta` reports what changed between two versions (type-specific `Delta` implementation).
 - `getScopedDag` returns this object's logical history surface (`ScopedDag`), including `loadAllEntries` for full scans at the correct scope.
@@ -231,6 +231,46 @@ MVTs support composing objects inside other objects' DAGs through a scoping mech
 - **`DagScope`** — the interface a parent object implements to define how a nested object's payloads and metadata are wrapped into the parent DAG and unwrapped on read.
 
 This design lets objects nest arbitrarily without knowing whether they are root-level or embedded inside another object's history.
+
+## Reactivity
+
+`RObject.subscribe` lets consumers react to changes without polling. The mechanism is layered so that observation cost is only incurred where someone is actually watching, and so that it works correctly on any DAG backend without requiring serialized writes.
+
+### The four layers
+
+Notifications flow up from the physical store to the consumer, and each layer only arms the one beneath it while it has at least one listener:
+
+1. **`DagStore` (physical, per backend)** — emits a `DagGrowth` (`{ entries, frontier }`) after each committing transaction. See [`dag/src/store/dag_store.ts`](../dag/src/store/dag_store.ts). Two sources of growth are unified here:
+   - *Local commits* — the appended entries travel back in the transaction's own `TxResult` and are fired directly after commit.
+   - *External / cross-context growth* — writes made by another process or tab. A single per-store **external monitor** (polling, `fs.watch`, `BroadcastChannel`, …) reads the rows appended beyond a baseline cursor and fires them. The monitor is armed lazily on the first `addListener` and stopped on the last `removeListener`.
+2. **`ScopedDag` (logical, per object)** — attaches one listener to the DAG (root) or to its parent `ScopedDag` (nested) while it has subscribers. It **filters** incoming `entries` to its own scope and unwraps nested payloads/metadata, so an object never hears about sibling changes. See [`mvt/src/dag/dag_nesting.ts`](src/dag/dag_nesting.ts).
+3. **`ScopedDagSubscription` (per `RObject`)** — the shared glue held by each type. It attaches one listener to the `ScopedDag` on the first `subscribe` and detaches on the last, translating scoped growth into a raw-frontier callback. See [`mvt/src/mvt.ts`](src/mvt.ts).
+4. **Consumer callback** — receives the raw DAG frontier (`Version`) whenever this object's own sub-DAG advances.
+
+Because each layer arms the layer below it only while it holds a listener, an object with no subscribers imposes **no observation cost** anywhere up to the physical store.
+
+### Consumer contract
+
+```typescript
+obj.subscribe(onChange);           // 1. register first
+const view = await obj.getView();  // 2. then read to establish your cursor
+// 3. onChange(version) fires at-least-once for every later change
+```
+
+- **Register, then read.** Subscribing first and *then* taking a baseline read guarantees you cannot miss a change that lands in the gap.
+- **At-least-once, deduplicate yourself.** A callback may fire more than once for the same change, and the delivered `entries` may be a superset of the strictly-new ones (e.g. a local commit that is also re-observed by the external monitor). Consumers track how far they have ingested (a `Version` cursor) and pull deltas / de-duplicate / debounce as they see fit.
+- **Scoped, never spurious across siblings.** The callback fires only when *this* object's scope advances — never for changes to sibling objects sharing the same physical DAG.
+- **Raw version delivered.** The callback receives the DAG frontier, not a computed delta. React by calling `computeDelta(cursor, version)` (or `getView`) to learn what actually changed.
+
+### Concurrency guarantees
+
+The reactivity layer adds **no serialization requirement** to any backend — backends keep their own transaction isolation; change monitoring never forces a global lock.
+
+- **Per-transaction local delivery.** Appended entries travel in each call's `TxResult`, not in shared store state, so interleaved `withTransaction` calls can neither cross-deliver nor drop each other's entries. Each commit fires from its own result.
+- **Single-flight, epoch-gated external monitor.** The per-store external monitor is guarded by an `externalEpoch` that bumps on every arm/disarm. In-flight cursor initialization and growth handling check the epoch after each `await` and bail out if they no longer own the monitor, so a disarm/re-arm can never let stale work defeat re-baselining or clobber a fresh handler.
+- **No dropped notifications under load.** A notification that arrives while the handler is mid-flight sets a `rescanRequested` flag instead of being dropped; the running pass loops again to pick up the new rows, preserving at-least-once even under bursty external writes.
+
+The in-memory, SQL, and IndexedDB stores all implement this contract; the growth and hardening test suites in [`dag`](../dag/test/growth_event_tests.ts) and [`dag_sql`](../dag_sql/test/sql_dag_tests.ts) exercise interleaved delivery, arm/disarm/re-arm re-baselining, and mid-flight coalescing.
 
 ## Reference helpers (`refs.ts`)
 

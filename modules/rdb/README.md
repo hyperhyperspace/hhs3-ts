@@ -82,6 +82,8 @@ Rdb is four content-addressed MVT types. C-SQL and the adapter are the intended 
 - **RTable** — a member table on a scoped projection of its group's history. Rows are write-once identities with permanent deletes; column updates are pinned to the schema birth write active at write time and per-field last-writer-wins within that incarnation.
 - **RDb** — the deployment sync root: records member schemas and groups and ensures they and their transitive references are present and syncing in the replica.
 
+All four are `RObject`s, so a consumer can observe advances through `subscribe` and pull deltas in response — the mechanism [rdb_projection](../rdb_projection) uses to stay in sync without polling. See [mvt Reactivity](../mvt#reactivity).
+
 ## Column types
 
 A column has a base type and, optionally, a set of type-scoped `constraints`. Values are carried in the row as `json.Literal`s; the string-carried numeric and byte types use a **canonical string** so they hash stably and round-trip losslessly across target databases (SQLite / Postgres / IndexedDB).
@@ -96,8 +98,9 @@ A column has a base type and, optionally, a set of type-scoped `constraints`. Va
 | `bigint` | string | signed decimal integer, no leading zeros, no `-0` (`/^(0\|-?[1-9][0-9]*)$/`) | `min`, `max` |
 | `decimal` | string | fixed-scale decimal, exactly `scale` fractional digits, single canonical zero, `-0` normalized to `0` | `scale` (**required**), `precision`, `min`, `max` |
 | `bytes` | string | canonical base64 (RFC 4648 standard alphabet, fixed padding) | `maxLength` (decoded byte length) |
+| `identity` | string | non-empty key-hash string | *(none)* |
 
-`bigint` is an arbitrary-precision signed integer for finance-grade counters and ids; `decimal` is exact fixed-point (never a float); `bytes` is opaque binary. `integer` is now bounded to the JS safe-integer range — use `bigint` beyond it.
+`bigint` is an arbitrary-precision signed integer for finance-grade counters and ids; `decimal` is exact fixed-point (never a float); `bytes` is opaque binary. `integer` is now bounded to the JS safe-integer range — use `bigint` beyond it. `identity` holds a key hash (the id of a signing key); the group's identity provider is its default association. Equality (`=` / `!=`) is defined against other identity values and against `string` key-hash columns; ordering and LIKE are not. A projection renders it as a numeric id referencing a shared keys table (see [rdb_adapter](../rdb_adapter)).
 
 ### Constraints and the per-type allowlist
 

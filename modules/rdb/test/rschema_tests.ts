@@ -313,5 +313,82 @@ export const rschemaTests = {
                 assertEquals(empty.tableChanges.length, 0, 'identical versions should produce an empty delta');
             }
         },
+        {
+            name: '[RSCHEMA12] Delta reports a same-shape column reincarnation',
+            invoke: async () => {
+                const { schema, admin } = await createTestEnv();
+                const scopedDag = await schema.getScopedDag();
+
+                // A nullable column, so it can be re-added via add-column (rdb
+                // forbids re-adding a non-nullable, default-less column that way;
+                // those reincarnate only through a whole-table re-add).
+                const noteDef = { type: 'string' as const, nullable: true };
+                await schema.updateSchema([{ rule: 'add-column', table: 'orders', column: 'note', def: noteDef }], admin);
+                const start = await scopedDag.getFrontier();
+
+                // Drop then re-add `note` with a BYTE-IDENTICAL def: the resolved
+                // def is unchanged, but the live incarnation moves.
+                await schema.updateSchema([{ rule: 'drop-column', table: 'orders', column: 'note' }], admin);
+                await schema.updateSchema([{ rule: 'add-column', table: 'orders', column: 'note', def: noteDef }], admin);
+
+                const end = await scopedDag.getFrontier();
+                const delta = await schema.computeDelta(start, end);
+
+                const orders = delta.tableChanges.find((c) => c.table === 'orders');
+                assertTrue(orders !== undefined, 'orders must appear in the delta despite an unchanged resolved def');
+                assertEquals(orders!.columnChanges.length, 1, 'exactly one column change');
+                const cc = orders!.columnChanges[0];
+                assertEquals(cc.column, 'note', 'the reincarnated column is note');
+                assertTrue(cc.reincarnated, 'the change is flagged reincarnated');
+                assertEquals(json.toStringNormalized(cc.before as json.Literal),
+                    json.toStringNormalized(cc.after as json.Literal),
+                    'before and after defs are byte-identical for a reincarnation');
+                assertFalse(orders!.idProviderChanged, 'a plain column reincarnation does not touch idProvider');
+            }
+        },
+        {
+            name: '[RSCHEMA13] Delta reports idProviderChanged on a provider table reincarnation',
+            invoke: async () => {
+                // A provider table with two candidate publicKey columns so a
+                // reincarnation can swap the designation.
+                const identities: TableDef = {
+                    name: 'identities',
+                    columns: {
+                        keyId: { type: 'string', pub: true, readonly: true },
+                        publicKey: { type: 'string', pub: true, readonly: true },
+                        altKey: { type: 'string', pub: true, readonly: true },
+                    },
+                    idProvider: { keyIdColumn: 'keyId', publicKeyColumn: 'publicKey' },
+                };
+                const { schema, admin } = await createTestEnv([identities]);
+                const scopedDag = await schema.getScopedDag();
+                const start = await scopedDag.getFrontier();
+
+                // Reincarnate the table with the SAME columns but a different
+                // idProvider designation (publicKeyColumn: publicKey -> altKey).
+                await schema.updateSchema([{ rule: 'drop-table', table: 'identities' }], admin);
+                await schema.updateSchema([{
+                    rule: 'add-table',
+                    def: {
+                        name: 'identities',
+                        columns: {
+                            keyId: { type: 'string', pub: true, readonly: true },
+                            publicKey: { type: 'string', pub: true, readonly: true },
+                            altKey: { type: 'string', pub: true, readonly: true },
+                        },
+                        idProvider: { keyIdColumn: 'keyId', publicKeyColumn: 'altKey' },
+                    },
+                }], admin);
+
+                const end = await scopedDag.getFrontier();
+                const delta = await schema.computeDelta(start, end);
+
+                const table = delta.tableChanges.find((c) => c.table === 'identities');
+                assertTrue(table !== undefined, 'identities must appear in the delta');
+                assertTrue(table!.idProviderChanged, 'the idProvider designation change is reported');
+                assertTrue(table!.existedBefore && table!.existsAfter,
+                    'a same-name reincarnation persists the table across the delta');
+            }
+        },
     ],
 };

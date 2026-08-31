@@ -24,7 +24,7 @@ export type ObserverRef = {
     bindingName: string;
 };
 
-export type RefUpdateEvent = {
+export type RefUpdateOutcome = {
     kind: 'updated' | 'skipped' | 'failed';
     observerGroupId: B64Hash;
     message: string;
@@ -189,11 +189,11 @@ export async function propagateRefUpdates(
     sourceGroupId: B64Hash,
     author: OwnIdentity | undefined,
     auth?: AuthInteractionContext,
-): Promise<RefUpdateEvent[]> {
+): Promise<RefUpdateOutcome[]> {
     const mode = session.refAutoUpdate;
     if (mode === 'off') return [];
 
-    const events: RefUpdateEvent[] = [];
+    const events: RefUpdateOutcome[] = [];
     const visitedPairs = new Set<string>();
     const queue: B64Hash[] = [sourceGroupId];
 
@@ -225,21 +225,21 @@ export async function propagateRefUpdates(
                 );
                 visitedPairs.add(key);
                 const message = formatRefAutoUpdateNotice(session, observerId, entryHash);
-                const event: RefUpdateEvent = { kind: 'updated', observerGroupId: observerId, message, entryHash };
+                const event: RefUpdateOutcome = { kind: 'updated', observerGroupId: observerId, message, entryHash };
                 events.push(event);
                 auth?.onProgress?.(message);
                 queue.push(observerId);
             } catch (e) {
                 visitedPairs.add(key);
                 if (e instanceof RefAutoUpdateSkippedError) {
-                    const event: RefUpdateEvent = { kind: 'skipped', observerGroupId: observerId, message: e.message };
+                    const event: RefUpdateOutcome = { kind: 'skipped', observerGroupId: observerId, message: e.message };
                     events.push(event);
                     auth?.onProgress?.(e.message);
                     continue;
                 }
                 const errMessage = e instanceof Error ? e.message : String(e);
                 const message = formatRefAutoUpdateFailure(session, observerId, errMessage);
-                const event: RefUpdateEvent = { kind: 'failed', observerGroupId: observerId, message };
+                const event: RefUpdateOutcome = { kind: 'failed', observerGroupId: observerId, message };
                 events.push(event);
                 auth?.onProgress?.(message);
             }

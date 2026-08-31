@@ -1,5 +1,5 @@
 import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { checkFilter, Dag, Entry, EntryMetaFilter, EntryPredicate, ForkPosition, joinFilters, MetaProps, position, Position } from "@hyper-hyper-space/hhs3_dag";
+import { checkFilter, Dag, DagGrowth, DagGrowthListener, Entry, EntryMetaFilter, EntryPredicate, ForkPosition, joinFilters, MetaProps, position, Position } from "@hyper-hyper-space/hhs3_dag";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { Literal } from "@hyper-hyper-space/hhs3_json/dist/literal.js";
 
@@ -17,6 +17,15 @@ export type ScopedDag = {
     findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position>;
     findMinimalCover(p: Position): Promise<Position>;
     loadAllEntries(): AsyncIterable<Entry>; // in topo order
+
+    // Reactivity. A listener is invoked with the entries (unwrapped into this
+    // scope) and the raw DAG frontier whenever this scope's sub-DAG grows.
+    // Registration is lazy: a ScopedDag attaches to its parent only while it
+    // has >= 1 listener, and detaches on the last removal. NestedScopedDag
+    // fires only when at least one appended entry belongs to its scope, so
+    // sibling growth never produces a false positive.
+    addListener(listener: DagGrowthListener): void;
+    removeListener(listener: DagGrowthListener): void;
 };
 
 // CausalDag: the broader causal structure, read-only from the object's perspective.
@@ -31,6 +40,9 @@ export type CausalDag = {
 
 export class RootScopedDag implements ScopedDag {
     private dag: Dag;
+
+    private listeners = new Set<DagGrowthListener>();
+    private dagListener: DagGrowthListener | undefined = undefined;
 
     constructor(dag: Dag) {
         this.dag = dag;
@@ -67,6 +79,32 @@ export class RootScopedDag implements ScopedDag {
     loadAllEntries(): AsyncIterable<Entry> {
         return this.dag.loadAllEntries();
     }
+
+    // Root scope is the whole DAG, so growth is forwarded unfiltered. The
+    // physical Dag is observed lazily: we attach on the first listener and
+    // detach on the last, so an unobserved root object costs nothing.
+    addListener(listener: DagGrowthListener): void {
+        const wasEmpty = this.listeners.size === 0;
+        this.listeners.add(listener);
+        if (wasEmpty && this.listeners.size === 1) {
+            this.dagListener = (growth: DagGrowth) => this.fire(growth);
+            this.dag.addListener(this.dagListener);
+        }
+    }
+
+    removeListener(listener: DagGrowthListener): void {
+        this.listeners.delete(listener);
+        if (this.listeners.size === 0 && this.dagListener !== undefined) {
+            this.dag.removeListener(this.dagListener);
+            this.dagListener = undefined;
+        }
+    }
+
+    private fire(growth: DagGrowth): void {
+        for (const cb of [...this.listeners]) {
+            try { cb(growth); } catch (_e) { /* keep firing even if a listener throws */ }
+        }
+    }
 }
 
 
@@ -91,6 +129,9 @@ export class NestedScopedDag implements ScopedDag {
     private dag: ScopedDag;
     private scope: DagScope;
     private empty: boolean;
+
+    private listeners = new Set<DagGrowthListener>();
+    private parentListener: DagGrowthListener | undefined = undefined;
 
     constructor(dag: ScopedDag, scope: DagScope) {
         this.dag = dag;
@@ -190,5 +231,52 @@ export class NestedScopedDag implements ScopedDag {
                 }
             },
         };
+    }
+
+    // Observe the parent scope lazily, filter growth down to this scope, and
+    // fire only when at least one appended entry belongs here. The parent is
+    // observed only while this scope has >= 1 listener, producing a lazy
+    // cascade all the way to the physical store.
+    addListener(listener: DagGrowthListener): void {
+        const wasEmpty = this.listeners.size === 0;
+        this.listeners.add(listener);
+        if (wasEmpty && this.listeners.size === 1) {
+            this.parentListener = (growth: DagGrowth) => this.onParentGrowth(growth);
+            this.dag.addListener(this.parentListener);
+        }
+    }
+
+    removeListener(listener: DagGrowthListener): void {
+        this.listeners.delete(listener);
+        if (this.listeners.size === 0 && this.parentListener !== undefined) {
+            this.dag.removeListener(this.parentListener);
+            this.parentListener = undefined;
+        }
+    }
+
+    private onParentGrowth(growth: DagGrowth): void {
+        const matched: Entry[] = [];
+        for (const entry of growth.entries) {
+            if (!checkFilter(entry.meta, this.scope.baseFilter())) {
+                continue;
+            }
+            const at = position(...json.fromSet(entry.header.prevEntryHashes));
+            const unwrappedPayload = this.scope.unwrapPayload(entry.payload, at);
+            const unwrappedMeta = this.scope.unwrapMeta(entry.meta, unwrappedPayload, at);
+            matched.push({
+                ...entry,
+                payload: unwrappedPayload,
+                meta: unwrappedMeta,
+            });
+        }
+
+        if (matched.length === 0) {
+            return;
+        }
+
+        const scopedGrowth: DagGrowth = { entries: matched, frontier: growth.frontier };
+        for (const cb of [...this.listeners]) {
+            try { cb(scopedGrowth); } catch (_e) { /* keep firing even if a listener throws */ }
+        }
     }
 }

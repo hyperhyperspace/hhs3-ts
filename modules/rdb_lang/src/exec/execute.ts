@@ -87,6 +87,23 @@ async function executeRuntime(bound: BoundExecutableStatement): Promise<LangExec
             if (bound.ast.projection === '*') {
                 result.columns = await view.getColumns();
             }
+            // Identity columns for type-driven REPL display.
+            try {
+                const schemaView = (await bound.table.group.getView(bound.at, bound.from)).getSchemaView();
+                const tableName = bound.table.tableName;
+                const identityColumns: string[] = [];
+                const def = schemaView.getTable(tableName);
+                if (def !== undefined) {
+                    for (const [col, colDef] of Object.entries(def.columns)) {
+                        if (colDef.type === 'identity') identityColumns.push(col);
+                    }
+                }
+                const provider = schemaView.getIdProvider(tableName);
+                if (provider !== undefined) identityColumns.push(provider.keyIdColumn);
+                if (identityColumns.length > 0) result.identityColumns = identityColumns;
+            } catch {
+                // Schema unavailable: formatter falls back without type context.
+            }
             return result;
         }
         case 'log':

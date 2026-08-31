@@ -14,7 +14,7 @@ import {
 } from "@hyper-hyper-space/hhs3_rdb";
 
 import { AdapterConfig, RowAction } from "./types.js";
-import { targetColumnName, targetTableName } from "./names.js";
+import { projectedColumnName, projectedIdentityColumnName, providerColumnRole, targetTableName } from "./names.js";
 
 // ---------------------------------------------------------------------------
 // Pure per-table fold
@@ -28,19 +28,22 @@ import { targetColumnName, targetTableName } from "./names.js";
 // non-live row deletes (deleted OR voided by an at-use verdict flip; the target
 // removes only the app row and keeps the sync row for id stability).
 //
-// Column values pass through verbatim (already rdb-canonical) under their target
-// names. `schemaView` is threaded for the deferred FK reshaping (`<fk>_id`
-// companions); today every column - FK-hash columns included - projects plainly,
-// matching the schema mapper.
+// Column values pass through under their projected names. An FK column's key is
+// FK-reshaped via `schemaView.getFKs`; the VALUE stays the rowId - the target
+// translates a local FK's rowId to the referenced row's serial id at apply time.
+// A provider keyIdColumn projects as `key_id` with the key-hash VALUE; its
+// publicKeyColumn is DROPPED from values but captured into `keyMaterial` so the
+// target can intern (key_hash, public_key) into rdb_keys. An identity-typed
+// column projects as `<col>_key_id` with the key-hash VALUE.
 export function tableRowActions(
     changes: RTableChanges,
     rdbTable: string,
     schemaView: RSchemaView,
     config: AdapterConfig,
 ): RowAction[] {
-    void schemaView;   // reserved for FK companion reshaping (deferred)
-
     const table = targetTableName(config, rdbTable);
+    const fks = schemaView.getFKs(rdbTable);
+    const provider = schemaView.getIdProvider?.(rdbTable);
     const actions: RowAction[] = [];
 
     for (const row of changes.rowChanges) {
@@ -52,13 +55,37 @@ export function tableRowActions(
         }
 
         const values: { [column: string]: json.Literal } = {};
+        const keyMaterial: { [keyHash: string]: string } = {};
+        let keyHash: string | undefined;
+        let publicKey: string | undefined;
+
         for (const change of row.columnChanges) {
             if (change.after === undefined) continue;   // unset value: nothing to write
-            values[targetColumnName(config, rdbTable, change.column)] = change.after;
+            const role = providerColumnRole(provider, change.column);
+            if (role.role === 'publicKey') {
+                if (typeof change.after === 'string') publicKey = change.after;
+                continue;   // not projected
+            }
+            if (role.role === 'keyId') {
+                if (typeof change.after === 'string') keyHash = change.after;
+            }
+            // Identity-typed columns: value is a key hash; no public key on the
+            // business column itself (interning uses hash alone until registered).
+            const colDef = schemaView.getTable?.(rdbTable)?.columns?.[change.column];
+            if (colDef !== undefined && colDef.type === 'identity') {
+                values[projectedIdentityColumnName(config, rdbTable, change.column)] = change.after;
+                continue;
+            }
+            values[projectedColumnName(config, rdbTable, change.column, fks, provider)] = change.after;
+        }
+
+        if (keyHash !== undefined && publicKey !== undefined) {
+            keyMaterial[keyHash] = publicKey;
         }
 
         const action: RowAction = { kind: 'upsert-row', table, rowId: row.rowId, values };
         if (row.author !== undefined) action.author = row.author;
+        if (Object.keys(keyMaterial).length > 0) action.keyMaterial = keyMaterial;
         actions.push(action);
     }
 

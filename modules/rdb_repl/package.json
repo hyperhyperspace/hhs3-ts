@@ -17,7 +17,9 @@
     "@hyper-hyper-space/hhs3_crypto": "^0.1.0",
     "@hyper-hyper-space/hhs3_mvt": "^0.1.0",
     "@hyper-hyper-space/hhs3_rdb": "^0.1.0",
+    "@hyper-hyper-space/hhs3_rdb_adapter": "^0.1.0",
     "@hyper-hyper-space/hhs3_rdb_lang": "^0.1.0",
+    "@hyper-hyper-space/hhs3_rdb_projection": "^0.1.0",
     "@hyper-hyper-space/hhs3_rdb_runtime": "^0.1.0"
   },
   "devDependencies": {

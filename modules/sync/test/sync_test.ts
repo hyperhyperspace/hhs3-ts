@@ -3,7 +3,7 @@ import { B64Hash, sha256, stringToUint8Array } from '@hyper-hyper-space/hhs3_cry
 import { dag, Position, Header, Entry } from '@hyper-hyper-space/hhs3_dag';
 import { json } from '@hyper-hyper-space/hhs3_json';
 import type { TopicChannel } from '@hyper-hyper-space/hhs3_mesh';
-import type { RObject, Version, Payload, View, Event, ForeignDep, Delta, DeltaAccumulator } from '@hyper-hyper-space/hhs3_mvt';
+import type { RObject, Version, Payload, View, ForeignDep, Delta, DeltaAccumulator } from '@hyper-hyper-space/hhs3_mvt';
 import { RootScopedDag, validationOk } from '@hyper-hyper-space/hhs3_mvt';
 
 import { createDagProvider } from '../src/provider.js';
@@ -107,8 +107,8 @@ function createMockRObject(d: dag.Dag, id: B64Hash, opts?: {
         getScopedDag: async () => new RootScopedDag(d),
         getCausalDag: async () => d,
         extractForeignDeps: opts?.extractForeignDeps ?? ((_payload: Payload, _at: Version) => undefined),
-        subscribe: (_cb: (event: Event) => void) => {},
-        unsubscribe: (_cb: (event: Event) => void) => {},
+        subscribe: (_cb: (version: Version) => void) => {},
+        unsubscribe: (_cb: (version: Version) => void) => {},
         destroy: async () => {},
     };
 }

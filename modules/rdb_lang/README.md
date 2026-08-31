@@ -62,11 +62,13 @@ ALTER SCHEMA shop AS (
 );
 ```
 
-The base types are `string`, `integer`, `float`, `boolean`, `json`, `bigint`, `decimal`, and `bytes`. Parenthesized parameters and `MIN` / `MAX` modifiers map to the column's `constraints`:
+The base types are `string`, `integer`, `float`, `boolean`, `json`, `bigint`, `decimal`, `bytes`, and `identity`. Parenthesized parameters and `MIN` / `MAX` modifiers map to the column's `constraints`:
 
 - `string(n)` / `bytes(n)` set `maxLength` (bytes counts decoded bytes).
 - `decimal(p, s)` sets `precision` = `p` and `scale` = `s` (SQL-standard order; both required).
 - `MIN` / `MAX` set inclusive bounds and apply only to `integer` / `bigint` / `decimal`. `bigint` and `decimal` bounds and values are written as quoted strings so they stay exact (a bare number literal would lose precision); the binder canonically encodes them. A `decimal` value with more fractional digits than the column scale, or any out-of-range / non-canonical value, is **rejected, never rounded**. Constraints that do not apply to a type (e.g. `MIN` on a `string`) are rejected.
+
+`identity` stores a key hash and takes no parameters. Insert its value as `$name` (an unlocked identity) or `#keyIdPrefix`, the same forms `BY` accepts. Compare with `=` / `!=` (including against a `string` key-hash column); ordering and LIKE are not defined.
 
 DDL and refs:
 

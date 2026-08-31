@@ -1,0 +1,26 @@
+{
+  "name": "@hyper-hyper-space/hhs3_file_watch",
+  "version": "0.1.0",
+  "description": "Kernel-driven file change watcher (fs.watch with rearm) for HHSv3",
+  "type": "module",
+  "source": "src/index.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    "./dist/*": "./dist/*"
+  },
+  "scripts": {
+    "test": "node --import ../../register.mjs ./test/run_tests.ts",
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "author": "Santiago Bazerque",
+  "license": "MIT",
+  "devDependencies": {
+    "@hyper-hyper-space/hhs3_util": "^0.1.0",
+    "@types/node": "^22.2.0",
+    "ts-node": "^10.9.2",
+    "typescript": "6.0.3"
+  }
+}

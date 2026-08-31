@@ -157,7 +157,7 @@ const tests = [
                 runtime.session.selectAuthor('alice');
                 await runtime.execute(crossGroupSetupScript());
                 const inserted = await runtime.execute("INSERT INTO users.identities (name) VALUES ('ada');");
-                const events = inserted.results[0]?.events ?? [];
+                const events = inserted.results[0]?.refUpdates ?? [];
                 assertTrue(events.some((e) => e.kind === 'updated'), 'ref update event');
             } finally {
                 await runtime.close();

@@ -24,9 +24,10 @@ Each type lives in its own directory under `src/types/<type>/` and is split into
 - **`payload.ts`** — operation payload types and their JSON format / validation schemas.
 - **`validate.ts`** — insertion-time payload validation.
 - **`delta.ts`** — `computeDelta` and delta data types.
-- **`events.ts`** — event types for subscriptions.
 
 `view.ts` and `delta.ts` depend only on `interfaces.ts`, not on the concrete impl class in `<type>.ts`, so there is no import cycle with the main file.
+
+Both types are `RObject`s and expose `subscribe(callback: (version: Version) => void)` for reactivity, delegating to MVT's shared subscription machinery — see [mvt Reactivity](../mvt#reactivity).
 
 `RSet` additionally has **`hash.ts`**, a shared helper for element hashing used by the main file, validation, and the view.
 
@@ -45,7 +46,7 @@ Key features:
 - **Mutable capability set**: `create-cap` and `delete-cap` operations allow adding and removing capability names after creation. `delete-cap` is a barrier that voids grants tied to the deleted capability's origin.
 - **Transitive authorization (admissibility)**: `hasCapability(X, cap)` answers whether an operation appended at the view's position that requires `X` to hold `cap` would be *admissible* when observed from the view's `from` frontier. Each grantor's authority is evaluated **at the version where its grant was made** — so revoking a grantor's authority does **not** retroactively void grants it already made (**use-before-revoke**), while a revoke that is *concurrent* with the use still voids it (**concurrent-void**, a use-anchored barrier). The recursive walk uses a **see-through validity predicate** so unauthorized or authority-voided grants *and* revokes are skipped instead of masking the last valid operation. Cycle detection bounds the recursion. When the view position is a multi-hash frontier it is treated as a single **collapsed use point**: the use-anchored barrier voids only if the revoke is concurrent with *every* element, while a revoke that is merely later on one branch defers to the grant-anchored check (**use-before-revoke**).
 
-Source: [`src/types/rcap/rcap.ts`](./src/types/rcap/rcap.ts), [`interfaces.ts`](./src/types/rcap/interfaces.ts), [`view.ts`](./src/types/rcap/view.ts), [`payload.ts`](./src/types/rcap/payload.ts), [`validate.ts`](./src/types/rcap/validate.ts), [`delta.ts`](./src/types/rcap/delta.ts), [`events.ts`](./src/types/rcap/events.ts)
+Source: [`src/types/rcap/rcap.ts`](./src/types/rcap/rcap.ts), [`interfaces.ts`](./src/types/rcap/interfaces.ts), [`view.ts`](./src/types/rcap/view.ts), [`payload.ts`](./src/types/rcap/payload.ts), [`validate.ts`](./src/types/rcap/validate.ts), [`delta.ts`](./src/types/rcap/delta.ts)
 
 #### Delta computation
 
@@ -73,7 +74,7 @@ Key features:
 - **Version-scoped views**: `RSetView` computes set membership at any `(at, from)` version pair, correctly handling concurrent operations and barriers.
 - **Permissioned mode**: when created with a `capabilityRef` and `capRequirements`, the set becomes RCap-gated — add/delete operations require signed payloads from identities holding the appropriate capabilities. See [Permissioned RSet](#permissioned-rset-references-and-compositional-authorization) and [RCap](#rcap--replicable-capability-system) below.
 
-Source: [`src/types/rset/rset.ts`](./src/types/rset/rset.ts), [`interfaces.ts`](./src/types/rset/interfaces.ts), [`view.ts`](./src/types/rset/view.ts), [`payload.ts`](./src/types/rset/payload.ts), [`validate.ts`](./src/types/rset/validate.ts), [`delta.ts`](./src/types/rset/delta.ts), [`events.ts`](./src/types/rset/events.ts), [`hash.ts`](./src/types/rset/hash.ts)
+Source: [`src/types/rset/rset.ts`](./src/types/rset/rset.ts), [`interfaces.ts`](./src/types/rset/interfaces.ts), [`view.ts`](./src/types/rset/view.ts), [`payload.ts`](./src/types/rset/payload.ts), [`validate.ts`](./src/types/rset/validate.ts), [`delta.ts`](./src/types/rset/delta.ts), [`hash.ts`](./src/types/rset/hash.ts)
 
 ### Permissioned RSet: references and compositional authorization
 
@@ -124,7 +125,7 @@ Source: [`src/authorship.ts`](./src/authorship.ts)
 
 ## Testing
 
-Eight test suites exercise the module:
+Nine test suites exercise the module:
 
 - **Simple set tests** (`test/simple_set_tests.ts`): creation with initial elements, add/delete, redundancy policies, barrier add/delete, concurrent add-delete resolution, and payload validation.
 - **Nested set tests** (`test/nested_set_tests.ts`): nested `RSet`-within-`RSet` scenarios, including creation of inner sets, adding/deleting elements in inner sets, concurrent operations across nesting levels, and fork detection through the causal DAG.
@@ -132,6 +133,7 @@ Eight test suites exercise the module:
 - **RCap tests** (`test/rcap_tests.ts`): all RCap operations (create, grant, revoke, create-cap, delete-cap, add-identity), barrier semantics for revoke and delete-cap, `capOrigin` voiding, creator irrevocability, `managedBy` delegation, and transitive revocation.
 - **Permissioned set tests** (`test/permissioned_set_tests.ts`): RCap-gated `RSet` integration covering authorized/unauthorized add and delete, signed convenience methods, ref-advance authorization, predicate-aware peeling for void entries, compositional `RCap.getView(at, from)` for per-entry authorization (PSET20), transitive revocation through `managedBy` chains, and `extractForeignDeps`.
 - **Delta unit tests** (`test/delta_set_tests.ts`, `test/delta_cap_tests.ts`): hand-written scenarios for `computeDelta` semantics and revision-bound behavior.
+- **Subscribe tests** (`test/subscribe_tests.ts`): `RObject.subscribe` reactivity — nested-object notification, lazy activation (the physical DAG is observed only while a subscriber is registered), and the register-then-read consumer contract.
 - **Delta parity tests** (`test/delta_parity/`): deterministic `computeDelta` parity tests that build pseudo-random RCap/RSet histories from a PRNG seed and assert `bounded` and `full` strategies agree on normalized changes (same check as CAP_DELTA05 / DELTA05). Included in `npm run test` using the **smoke** profile (2 seeds, 20 ops, 40 pairs/seed). A heavier **extended** profile (8 seeds, 80 ops, 200 pairs/seed) runs via `npm run test:parity`. Filter with `DELTA_PARITY` (all), `DELTA_PARITY_RCAP`, `DELTA_PARITY_RSET_PLAIN`, `DELTA_PARITY_RSET_PERM`, or branchy variants `DELTA_PARITY_BRANCHY_*` (branchy suites skip unless `--profile extended`). Override size: `npm run test -- DELTA_PARITY --profile extended`, or `--seeds <seed> --ops <n> --max-pairs <k>`.
 - **Permissioned sync integration tests** (`replica/test/replica_permissioned_sync_tests.ts`): end-to-end tests through the full Replica + mesh stack — see the [replica module](../replica) for details.
 

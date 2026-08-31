@@ -992,6 +992,22 @@ const tests = [
         },
     },
     {
+        name: '[RDB_TOOLS28b] \\keys shows raw keyId even with hash-labels on',
+        invoke: async () => {
+            await withSession(async (session) => {
+                if (session.keystore === undefined) throw new Error('missing keystore');
+                const alice = await session.createKey('alice', 'correct');
+
+                await runMetaCommand(session, '\\hash-labels on');
+                await runMetaCommand(session, '\\hash-width full');
+                const keys = await runMetaCommand(session, '\\keys');
+                assertTrue(keys.output?.includes(alice.keyId) === true, '\\keys shows raw keyId hash');
+                assertTrue(keys.output?.includes('$alice') !== true, '\\keys does not substitute keyId with $label');
+                assertTrue(keys.output?.includes('alice') === true, '\\keys still lists the label column');
+            });
+        },
+    },
+    {
         name: '[RDB_TOOLS29] \\delta group column values use hash display formatting',
         invoke: async () => {
             await withSession(async (session) => {
@@ -1659,7 +1675,7 @@ function capsSetupScript(): string {
 CREATE SCHEMA user CREATORS ($me) AS (
   TABLE caps (
     label string PUB,
-    grantee string PUB
+    grantee identity PUB
   )
 );
 CREATE TABLEGROUP user USING SCHEMA user;

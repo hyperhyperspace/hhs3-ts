@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 import { stderr, stdin, stdout } from "node:process";
+import Database from "better-sqlite3";
+
+import { SqliteTarget } from "@hyper-hyper-space/hhs3_rdb_adapter_sqlite";
 
 import { defaultKeystorePath, KeyStore } from "../src/keys/keystore.js";
 import { startRepl } from "../src/repl/repl.js";
@@ -20,6 +23,21 @@ async function main(): Promise<void> {
     const workspace = await Workspace.open({ path: workspacePath });
     const keystore = await KeyStore.open(defaultKeystorePath(), workspace.replica.getHashSuite());
     const session = new WorkspaceSession({ workspace, keystore });
+
+    // Async projection notices (reactive sync throws, ingest-reject warnings) go
+    // to stderr, out of statement stdout / JSON dumps. Set once here so every
+    // entry point (interactive REPL, -c, -f, piped stdin) reports them.
+    session.onProjectionError = (message) => { stderr.write(message + '\n'); };
+
+    // `\projection ...` backend: a capture-provisioned SQLite file, separate from
+    // the workspace DAG store. A `label` arg is taken as the file path; otherwise
+    // it defaults to a per-database sidecar next to the workspace file.
+    session.projectionTargetFactory = async ({ databaseId, label }) => {
+        const path = label ?? `${workspacePath}.proj-${databaseId.replace(/[^A-Za-z0-9]/g, '_').slice(0, 16)}.sqlite`;
+        // Pass dbPath so the target uses kernel-driven WAL watching (not polling)
+        // to detect local edits waiting in its capture outbox.
+        return new SqliteTarget(new Database(path), { captureChanges: true, dbPath: path });
+    };
 
     try {
         if (args.includes('--json')) session.setOutputMode('json');
@@ -57,6 +75,8 @@ async function main(): Promise<void> {
 
         await startRepl(session);
     } finally {
+        for (const projection of session.projections.values()) await projection.stop();
+        session.projections.clear();
         await workspace.close();
     }
 }

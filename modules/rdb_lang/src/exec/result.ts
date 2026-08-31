@@ -75,6 +75,10 @@ export type SelectLangResult = {
     query: RowQuery;
     rows: Row[];
     columns?: string[];   // schema column names; set only for SELECT *
+    // Columns whose rdb type is `identity`, plus a provider table's keyIdColumn.
+    // Used by the REPL formatter to render key hashes as $labels by type
+    // rather than by value-match heuristics.
+    identityColumns?: string[];
 };
 
 export type LogRow = {

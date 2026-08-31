@@ -10,7 +10,7 @@ import type { LangBindContext, LangValue } from "./context.js";
 export async function resolveValue(expr: ValueExpr, context: LangBindContext): Promise<LangValue> {
     if (expr.kind === 'literal') return expr.value;
     if (expr.kind === 'hash') {
-        throw new Error('#prefix in VALUES is resolved by the binder for REFERENCES columns');
+        throw new Error('#prefix in VALUES is resolved by the binder for REFERENCES or identity columns');
     }
     if (expr.kind === 'variable') {
         if (expr.field !== undefined) throw new Error('$row.<column> is only supported in allow rule predicates');

@@ -10,6 +10,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@hyper-hyper-space/hhs3_rdb_adapter": "^0.1.0",
     "@hyper-hyper-space/hhs3_rdb_repl": "^0.1.0",
     "@hyper-hyper-space/hhs3_rdb_runtime": "^0.1.0"
   },

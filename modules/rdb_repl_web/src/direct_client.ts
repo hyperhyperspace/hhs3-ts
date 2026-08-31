@@ -11,6 +11,7 @@ import {
     runCommand,
     type PassphraseRequest,
 } from "@hyper-hyper-space/hhs3_rdb_repl";
+import { MemoryTarget } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 import type { ExecuteResult, ReplClient, ReplInteractions } from "./protocol.js";
 
@@ -26,6 +27,11 @@ export class DirectReplClient implements ReplClient {
 
     async execute(text: string, interactions: ReplInteractions): Promise<ExecuteResult> {
         const session = this.requireSession();
+        // Async projection notices (reactive sync throws, ingest-reject warnings)
+        // land in the transcript. Rebind per execute: mountRepl reuses one
+        // interactions object whose onProgress appends to the transcript, so
+        // notices arriving after the command returns still show up.
+        session.onProjectionError = interactions.onProgress;
         const result = await runCommand(session, text, undefined, {
             auth: authContext(session, interactions),
             requestPassphrase: (need) => requestPassphrase(interactions, need),
@@ -61,6 +67,9 @@ export class DirectReplClient implements ReplClient {
         const session = new ReplSession({
             workspace,
             keyVault: new MemoryKeyVault(workspace.replica.getHashSuite()),
+            // `\projection ...` backend for the browser: an ephemeral in-memory
+            // target (capture-provisioned so local edits round-trip to rdb).
+            projectionTargetFactory: async () => new MemoryTarget({ captureChanges: true }),
         });
         session.enableReplDefaults();
         this.workspace = workspace;

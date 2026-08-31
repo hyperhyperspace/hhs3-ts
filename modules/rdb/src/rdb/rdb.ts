@@ -49,10 +49,10 @@ import { dag, Entry, position } from "@hyper-hyper-space/hhs3_dag";
 
 import {
     Payload, RObjectFactory, RContext, LoadObjectOptions,
-    Version, version, ForeignDep, Event, Delta, DeltaAccumulator, View, RObject,
+    Version, version, ForeignDep, Delta, DeltaAccumulator, View, RObject,
     SyncableObject, formatValidationFailure, validationFailure, ValidationRejectedError, ValidationResult,
 } from "@hyper-hyper-space/hhs3_mvt";
-import { RootScopedDag, ScopedDag, CausalDag, signPayload as signPayloadHelper, serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
+import { RootScopedDag, ScopedDag, CausalDag, ScopedDagSubscription, signPayload as signPayloadHelper, serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { Mesh, Swarm } from "@hyper-hyper-space/hhs3_mesh";
 import { createSyncSession } from "@hyper-hyper-space/hhs3_sync";
@@ -279,12 +279,21 @@ export class RDbImpl implements RDbContract, SyncableObject {
         throw new Error("RDb is advisory; no delta in v1");
     }
 
-    subscribe(_callback: (event: Event) => void): void {
-        throw new Error("Method not implemented.");
+    private _subscription: ScopedDagSubscription | undefined;
+
+    private subscription(): ScopedDagSubscription {
+        if (this._subscription === undefined) {
+            this._subscription = new ScopedDagSubscription(() => this.getScopedDag());
+        }
+        return this._subscription;
     }
 
-    unsubscribe(_callback: (event: Event) => void): void {
-        throw new Error("Method not implemented.");
+    subscribe(callback: (version: Version) => void): void {
+        this.subscription().subscribe(callback);
+    }
+
+    unsubscribe(callback: (version: Version) => void): void {
+        this.subscription().unsubscribe(callback);
     }
 
     async getScopedDag(): Promise<ScopedDag> {

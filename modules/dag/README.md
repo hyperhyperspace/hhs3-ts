@@ -33,6 +33,10 @@ type Dag = {
 
     loadAllEntries(): AsyncIterable<Entry>; // in topo order
 
+    // Growth events (see below)
+    addListener(listener: DagGrowthListener): void;
+    removeListener(listener: DagGrowthListener): void;
+
     getStore(): DagStore<any>;
     getIndex(): DagIndex<any>;
 };
@@ -115,6 +119,10 @@ const meet = await dag.computeMeet(
 ```
 
 Because the meet of a set equals the meet of its causally-minimal elements, you can fold directly over any generating set (for example the `common` field of a `ForkPosition`, taken as singletons) without first reducing it to an antichain -- dominated elements never lower the result. Disconnected positions meet to the empty set. Each fold step uses the indexed `findForkPosition`, so there is no un-indexed predecessor walk; a native N-ary meet at the index level remains a possible future optimization.
+
+## Growth events
+
+A listener registered with `addListener` is invoked after a committing transaction with a `DagGrowth` (`{ entries, frontier }`): the entries appended and the DAG frontier after the change. Local commits deliver their appended entries directly from the transaction result; growth written by another process or tab is read back by a per-store external monitor that is armed lazily on the first listener and stopped after the last. Delivery is at-least-once and may over-report, so a listener deduplicates against its own `frontier` cursor. The monitor strategies (polling, `fs.watch`, `BroadcastChannel`) live in the storage backends below. For the object-level layering that filters growth to a single nested object's scope, see [mvt Reactivity](../mvt#reactivity).
 
 ## Storage backends
 

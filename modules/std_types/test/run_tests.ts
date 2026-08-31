@@ -1,5 +1,6 @@
 import { simpleSetTests } from "./simple_set_tests.js";
 import { nestedSetTests } from "./nested_set_tests.js";
+import { subscribeTests } from "./subscribe_tests.js";
 import { authorshipTests } from "./authorship_tests.js";
 import { rcapTests } from "./rcap_tests.js";
 import { permissionedSetTests } from "./permissioned_set_tests.js";
@@ -19,6 +20,7 @@ async function main() {
 
     allTests.set(simpleSetTests.title, simpleSetTests.tests);
     allTests.set(nestedSetTests.title, nestedSetTests.tests);
+    allTests.set(subscribeTests.title, subscribeTests.tests);
     allTests.set(authorshipTests.title, authorshipTests.tests);
     allTests.set(rcapTests.title, rcapTests.tests);
     allTests.set(permissionedSetTests.title, permissionedSetTests.tests);

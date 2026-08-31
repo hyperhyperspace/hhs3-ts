@@ -1,9 +1,9 @@
 import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { Entry, Header, Position } from "@hyper-hyper-space/hhs3_dag";
-import { DagGrowthListener, DagStore, TxResult } from "@hyper-hyper-space/hhs3_dag/dist/store/dag_store.js";
+import { DagGrowth, DagGrowthListener, DagStore, TxResult } from "@hyper-hyper-space/hhs3_dag/dist/store/dag_store.js";
 
-import { ENTRIES, FRONTIER } from "./idb_schema.js";
+import { DAGS, ENTRIES, FRONTIER } from "./idb_schema.js";
 import { IdbEnv, IdbReader, IdbTx } from "./idb_env.js";
 
 // IndexedDB-backed DagStore. Abstract in the external-observer dimension: a
@@ -17,6 +17,17 @@ export abstract class IdbDagStore implements DagStore<IdbTx> {
     private listeners = new Set<DagGrowthListener>();
     private externalHandle: unknown = undefined;
 
+    // Cursor (max seq) for reading entries introduced by external writers.
+    private externalCursor: number | undefined = undefined;
+    private externalCursorInit: Promise<void> | undefined = undefined;
+    private externalRunning = false;
+    // Bumped on every arm and disarm so stale in-flight async work (cursor init,
+    // growth handling) can detect it no longer owns the monitor and bail out.
+    private externalEpoch = 0;
+    // Set when a notification arrives while the handler is already running, so
+    // the running pass rescans instead of dropping the notification.
+    private rescanRequested = false;
+
     constructor(env: IdbEnv, dagId: number) {
         this.env = env;
         this.dagId = dagId;
@@ -26,7 +37,7 @@ export abstract class IdbDagStore implements DagStore<IdbTx> {
         const { result, committed } = await this.env.withUnitOfWork<T>(this.dagId, fn);
         if (result.fireListeners) {
             if (committed) this.onCommitted();
-            this.fireListeners();
+            this.fireListeners({ entries: result.entries ?? [], frontier: await this.getFrontier() });
         }
         return result;
     }
@@ -96,21 +107,84 @@ export abstract class IdbDagStore implements DagStore<IdbTx> {
         const wasEmpty = this.listeners.size === 0;
         this.listeners.add(listener);
         if (wasEmpty && this.listeners.size === 1) {
-            this.externalHandle = this.startExternalObserver(() => this.fireListeners());
+            const epoch = ++this.externalEpoch;
+            this.externalCursor = undefined;
+            this.rescanRequested = false;
+            this.externalRunning = false;
+            this.externalCursorInit = this.initExternalCursor(epoch);
+            this.externalHandle = this.startExternalObserver(() => { void this.handleExternalGrowth(epoch); });
         }
     }
 
     removeListener(listener: DagGrowthListener): void {
         this.listeners.delete(listener);
         if (this.listeners.size === 0 && this.externalHandle !== undefined) {
+            // Bump the epoch first so any in-flight init/handler bails out.
+            ++this.externalEpoch;
             this.stopExternalObserver(this.externalHandle);
             this.externalHandle = undefined;
+            this.externalCursor = undefined;
+            this.externalCursorInit = undefined;
+            this.rescanRequested = false;
+            this.externalRunning = false;
         }
     }
 
-    protected fireListeners(): void {
+    protected fireListeners(growth: DagGrowth): void {
         for (const cb of this.listeners) {
-            try { cb(); } catch (_e) { /* keep firing even if a listener throws */ }
+            try { cb(growth); } catch (_e) { /* keep firing even if a listener throws */ }
+        }
+    }
+
+    private async initExternalCursor(epoch: number): Promise<void> {
+        const rec = await this.env.get(DAGS, this.dagId);
+        // Only baseline if we still own the monitor: a disarm/re-arm during the
+        // read would otherwise let this stale value defeat re-baselining.
+        if (epoch === this.externalEpoch && this.externalCursor === undefined) {
+            this.externalCursor = rec !== undefined ? (rec.nextSeq as number) - 1 : -1;
+        }
+    }
+
+    // Called by the external observer when it detects a possible change. Reads
+    // the entries appended (by seq) beyond the cursor and fires listeners.
+    // Single-flight per store instance: a notification arriving mid-pass sets
+    // rescanRequested so the running pass loops again rather than dropping it
+    // (preserving at-least-once).
+    private async handleExternalGrowth(epoch: number): Promise<void> {
+        if (epoch !== this.externalEpoch) return;
+        if (this.externalRunning) { this.rescanRequested = true; return; }
+        this.externalRunning = true;
+        try {
+            do {
+                this.rescanRequested = false;
+                await this.externalCursorInit;
+                if (epoch !== this.externalEpoch) return;
+                const cursor = this.externalCursor ?? -1;
+                const recs = await this.env.getAllByPrefix(ENTRIES, 'by_seq', [this.dagId]);
+                if (epoch !== this.externalEpoch) return;
+                const fresh = recs.filter((r) => (r.seq as number) > cursor);
+                if (fresh.length > 0) {
+                    let maxSeq = cursor;
+                    const entries: Entry[] = [];
+                    for (const rec of fresh) {
+                        maxSeq = Math.max(maxSeq, rec.seq as number);
+                        entries.push({
+                            hash: rec.hash as B64Hash,
+                            payload: rec.payload,
+                            meta: rec.meta,
+                            header: rec.header,
+                        });
+                    }
+                    this.externalCursor = maxSeq;
+                    this.fireListeners({ entries, frontier: await this.getFrontier() });
+                }
+            } while (this.rescanRequested && epoch === this.externalEpoch);
+        } catch (_e) {
+            // ignore transient errors; the next notification will retry
+        } finally {
+            // Only release if we still own the monitor, so a re-arm's handler is
+            // never clobbered by a stale handler completing.
+            if (epoch === this.externalEpoch) this.externalRunning = false;
         }
     }
 

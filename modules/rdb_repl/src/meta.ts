@@ -15,6 +15,7 @@ import {
 import type { RefAutoUpdateMode } from "@hyper-hyper-space/hhs3_rdb_runtime";
 import { formatAliasListing, formatAliasResult, isAliasScope, resolveAliasTarget, type AliasScope } from "./aliases.js";
 import { runDeltaCommand } from "./delta/command.js";
+import { runProjectionCommand } from "./projection/command.js";
 import { createDumpRenderOptions } from "./dump/alias_context.js";
 import { runDumpOpCommand } from "./dump/op_command.js";
 import { createDisplayContext, formatDisplayString, formatSessionRows } from "./format/display.js";
@@ -60,6 +61,7 @@ export async function runMetaCommand(session: ReplSession, line: string): Promis
         case 'ref-auto-update': return { handled: true, output: setRefAutoUpdate(session, args[0]) };
         case 'dump': return { handled: true, output: await dump(session, args) };
         case 'delta': return { handled: true, output: await runDeltaCommand(session, args) };
+        case 'projection': return { handled: true, output: await runProjectionCommand(session, args) };
         default: return { handled: true, output: `Unknown meta-command \\${command}` };
     }
 }
@@ -126,7 +128,7 @@ async function listKeys(session: ReplSession): Promise<string> {
     const selected = (await session.currentAuthor())?.keyId;
     return formatSessionRows(session, session.keyVault.list().map((key) => ({
         label: key.label, keyId: key.keyId, unlocked: session.isUnlocked(key.keyId), selected: selected === key.keyId,
-    })), undefined, { structuralColumns: new Set(['keyId']) });
+    })));
 }
 
 type KeyResult = Pick<MetaCommandResult, 'output' | 'needsPassphrase'>;
@@ -313,6 +315,7 @@ function help(args: string[]): string {
         '\\use database <name>, \\use group <name>, \\view, \\frontier [group]',
         '\\alias [scope] <name> <#prefix>, \\aliases [scope], \\unalias <scope> <name>, \\output table|json|vertical, \\hash-width auto|full|<N>, \\hash-labels on|off, \\ref-auto-update auto|self|off, \\dump schema|group|database <name> [full|schema], \\dump op [group] #hash',
         '\\delta schema|group <name> <start> <end> [bounded|full]',
+        '\\projection start|sync|status|stop|events [<database>] [label], \\projection register-key <keyHash> <publicKey>, \\projection resolve-key <id|keyHash>',
         '\\quit',
         '\\help commands [filter]  (C-SQL reference)',
     ].join('\n');

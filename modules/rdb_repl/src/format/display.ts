@@ -5,13 +5,14 @@ import { formatRows, formatRowsVertical } from "./rows.js";
 
 export const STRUCTURAL_HASH_COLUMNS = new Set(['rowId', 'rowAuthor']);
 export type FormatStringRole = 'hash' | 'cell';
-export type FormatStringOpts = { role?: FormatStringRole; hashPrefix?: boolean };
+export type FormatStringOpts = { role?: FormatStringRole; hashPrefix?: boolean; identity?: boolean };
 
 // Heuristic for a content hash rendered as base64 (so it can be truncated to a
 // unique prefix in display). Content hashes are SHORT and padded; the upper
 // bound keeps longer base64 `bytes` column values (which share the alphabet)
-// from being mistaken for hashes and cosmetically truncated. This is a display
-// heuristic only — the formatter has no per-column type context.
+// from being mistaken for hashes and cosmetically truncated. Used for
+// structural hash columns / explicit hash roles — not for guessing identity
+// columns (those are type-driven via SelectLangResult.identityColumns).
 const MAX_SPECULATIVE_HASH_LENGTH = 64;
 
 export function looksLikeSpeculativeHash(s: string): boolean {
@@ -19,8 +20,8 @@ export function looksLikeSpeculativeHash(s: string): boolean {
         && /^[A-Za-z0-9+/]+=*$/.test(s) && s.endsWith('=');
 }
 
-export function isTruncatable(value: string, role: FormatStringRole): boolean {
-    return role === 'hash' || looksLikeSpeculativeHash(value);
+export function isTruncatable(value: string, role: FormatStringRole, identity?: boolean): boolean {
+    return role === 'hash' || identity === true || looksLikeSpeculativeHash(value);
 }
 
 export function uniquePrefixes(hashes: B64Hash[], minLen = 8): Map<B64Hash, string> {
@@ -68,13 +69,14 @@ export function collectTruncatableFromColumnChanges(
 export function collectTruncatableStrings(
     rows: Record<string, unknown>[],
     structuralColumns: Set<string> = STRUCTURAL_HASH_COLUMNS,
+    identityColumns: Set<string> = new Set(),
 ): string[] {
     const out = new Set<string>();
     for (const row of rows) {
         for (const [column, value] of Object.entries(row)) {
-            if (typeof value === 'string' && (structuralColumns.has(column) || looksLikeSpeculativeHash(value))) {
-                out.add(value);
-            }
+            if (typeof value !== 'string') continue;
+            const isIdentity = structuralColumns.has(column) || identityColumns.has(column);
+            if (isIdentity || looksLikeSpeculativeHash(value)) out.add(value);
         }
     }
     return [...out];
@@ -83,11 +85,15 @@ export function collectTruncatableStrings(
 export function collectTruncatableFromResult(result: LangExecutionResult): string[] {
     switch (result.kind) {
         case 'select':
-            return collectTruncatableStrings(result.rows.map((row) => ({
-                rowId: row.rowId,
-                ...(row.author === undefined ? {} : { rowAuthor: row.author }),
-                ...row.values,
-            })));
+            return collectTruncatableStrings(
+                result.rows.map((row) => ({
+                    rowId: row.rowId,
+                    ...(row.author === undefined ? {} : { rowAuthor: row.author }),
+                    ...row.values,
+                })),
+                STRUCTURAL_HASH_COLUMNS,
+                new Set(result.identityColumns ?? []),
+            );
         case 'log':
             return result.rows.flatMap((row) => [row.fullHash, ...row.prev]);
         case 'add-member':
@@ -126,11 +132,13 @@ export class HashDisplayContext {
 
     formatString(value: string, opts: FormatStringOpts = {}): string {
         const role = opts.role ?? 'cell';
-        if (this.session.hashLabels) {
+        // Key labels only for typed identity / structural hash columns — not
+        // every string cell that happens to match a keystore keyId.
+        if (this.session.hashLabels && (role === 'hash' || opts.identity === true)) {
             const label = this.keyMap.get(value);
             if (label !== undefined) return label;
         }
-        if (!isTruncatable(value, role)) return value;
+        if (!isTruncatable(value, role, opts.identity)) return value;
         let rendered = truncateHash(value, this.session.hashWidth, this.prefixMap);
         if (opts.hashPrefix === true) rendered = `#${rendered}`;
         return rendered;
@@ -153,11 +161,12 @@ export function formatSessionRows(
     session: ReplSession,
     rows: Record<string, unknown>[],
     columns?: string[],
-    options?: { structuralColumns?: Set<string>; vertical?: boolean },
+    options?: { structuralColumns?: Set<string>; identityColumns?: Set<string>; vertical?: boolean },
 ): string {
     const structuralColumns = options?.structuralColumns ?? STRUCTURAL_HASH_COLUMNS;
-    const ctx = createDisplayContext(session, collectTruncatableStrings(rows, structuralColumns));
-    const formatOptions = { ctx, structuralColumns };
+    const identityColumns = options?.identityColumns ?? new Set<string>();
+    const ctx = createDisplayContext(session, collectTruncatableStrings(rows, structuralColumns, identityColumns));
+    const formatOptions = { ctx, structuralColumns, identityColumns };
     return options?.vertical === true || session.outputMode === 'vertical'
         ? formatRowsVertical(rows, columns, formatOptions)
         : formatRows(rows, columns, formatOptions);
@@ -168,6 +177,6 @@ export function formatDisplayString(
     value: string,
     opts: FormatStringOpts = {},
 ): string {
-    const values = isTruncatable(value, opts.role ?? 'cell') ? [value] : [];
+    const values = isTruncatable(value, opts.role ?? 'cell', opts.identity) ? [value] : [];
     return createDisplayContext(session, values).formatString(value, opts);
 }

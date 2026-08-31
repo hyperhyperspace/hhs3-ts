@@ -1,6 +1,6 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { DagGrowthListener, DagStore, TxResult } from "./dag_store.js";
+import { DagGrowth, DagGrowthListener, DagStore, TxResult } from "./dag_store.js";
 import { Entry, Header, Position } from "../dag_defs.js";
 
 
@@ -15,7 +15,9 @@ export class MemDagStorage implements DagStore {
 
     async withTransaction<T extends TxResult>(fn: () => Promise<T>): Promise<T> {
         const result = await fn();
-        if (result.fireListeners) this.fireListeners();
+        if (result.fireListeners) {
+            this.fireListeners({ entries: result.entries ?? [], frontier: await this.getFrontier() });
+        }
         return result;
     }
 
@@ -65,9 +67,9 @@ export class MemDagStorage implements DagStore {
         this.listeners.delete(listener);
     }
 
-    private fireListeners(): void {
+    private fireListeners(growth: DagGrowth): void {
         for (const cb of this.listeners) {
-            try { cb(); } catch (_e) { /* keep firing even if a listener throws */ }
+            try { cb(growth); } catch (_e) { /* keep firing even if a listener throws */ }
         }
     }
 }

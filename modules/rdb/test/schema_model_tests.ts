@@ -435,6 +435,27 @@ async function testSchemaTables() {
     assertTrue(validateSchemaTables([itemsWith({ p: 'cmp', cmp: 'eq', left: { fn: 'add', args: [{ col: 'resource' }, { lit: 1 }] }, right: { lit: 2 } })]) !== undefined,
         'arithmetic over a string column should not validate');
 
+    // identity: eq/ne against $author and against a string key-hash column;
+    // ordering is not defined.
+    const identWith = (rule: Predicate): TableDef => ({
+        name: 'caps',
+        columns: {
+            grantee: { type: 'identity', readonly: true, pub: true },
+            keyId: { type: 'string', readonly: true, pub: true },
+        },
+        restrictions: [{ on: 'delete', rule }],
+    });
+    assertTrue(validateSchemaTables([identWith({ p: 'cmp', cmp: 'eq', left: { col: 'grantee' }, right: { lit: '$author' } })]) === undefined,
+        'identity = $author should validate');
+    assertTrue(validateSchemaTables([identWith({ p: 'cmp', cmp: 'ne', left: { col: 'grantee' }, right: { lit: '$author' } })]) === undefined,
+        'identity != $author should validate');
+    assertTrue(validateSchemaTables([identWith({ p: 'cmp', cmp: 'lt', left: { col: 'grantee' }, right: { lit: '$author' } })]) !== undefined,
+        'identity < $author should not validate');
+    assertTrue(validateSchemaTables([identWith({ p: 'cmp', cmp: 'eq', left: { col: 'grantee' }, right: { col: 'keyId' } })]) === undefined,
+        'identity = string column should validate');
+    assertTrue(validateSchemaTables([identWith({ p: 'cmp', cmp: 'lt', left: { col: 'grantee' }, right: { col: 'keyId' } })]) !== undefined,
+        'identity < string column should not validate');
+
     // Tier 2: $row.<col> correlated to a pub field of the target table; the
     // declaring column must be readonly and types must match.
     const grants: TableDef = {
@@ -457,6 +478,42 @@ async function testSchemaTables() {
         'a $row correlation over a mutable subject column should not validate');
     assertTrue(validateSchemaTables([correlate('qty'), grants]) !== undefined,
         'a $row correlation with mismatched column types should not validate');
+
+    const stringKeyTarget: TableDef = {
+        name: 'identities',
+        columns: { keyId: { type: 'string', pub: true, readonly: true } },
+    };
+    const identitySubject: TableDef = {
+        name: 'profiles',
+        columns: { keyId: { type: 'identity', readonly: true } },
+        restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'identities', where: { keyId: '$row.keyId' } } }],
+    };
+    assertTrue(validateSchemaTables([identitySubject, stringKeyTarget]) === undefined,
+        'exists correlating an identity $row field to a string target field should validate');
+
+    const identityTarget: TableDef = {
+        name: 'holders',
+        columns: { grantee: { type: 'identity', pub: true, readonly: true } },
+    };
+    const stringSubject: TableDef = {
+        name: 'named',
+        columns: { keyId: { type: 'string', readonly: true } },
+        restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'holders', where: { grantee: '$row.keyId' } } }],
+    };
+    assertTrue(validateSchemaTables([stringSubject, identityTarget]) === undefined,
+        'exists correlating a string $row field to an identity target field should validate');
+
+    const intTarget: TableDef = {
+        name: 'counts',
+        columns: { n: { type: 'integer', pub: true, readonly: true } },
+    };
+    const identityToInt: TableDef = {
+        name: 'profiles',
+        columns: { keyId: { type: 'identity', readonly: true } },
+        restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'counts', where: { n: '$row.keyId' } } }],
+    };
+    assertTrue(validateSchemaTables([identityToInt, intTarget]) !== undefined,
+        'exists correlating an identity $row field to an integer target field should not validate');
 }
 
 async function testMigrationRules() {

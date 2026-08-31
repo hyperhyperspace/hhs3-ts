@@ -309,6 +309,8 @@ function renderColumnType(def: ColumnDef): string {
             return c?.maxLength !== undefined ? `bytes(${c.maxLength})` : 'bytes';
         case 'decimal':
             return `decimal(${c?.precision ?? c?.scale ?? 0}, ${c?.scale ?? 0})`;
+        case 'identity':
+            return 'identity';
         default:
             return def.type;
     }

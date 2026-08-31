@@ -50,7 +50,7 @@ function mapRuntimeResults(
         results: run.results.map((item) => {
             const mapped: StatementRunResult = {
                 result: item.result,
-                notices: item.events?.map((event) => event.message),
+                notices: item.refUpdates?.map((event) => event.message),
             };
             if (options?.onProgress !== undefined && session.outputMode !== 'json') {
                 const main = renderStatementMain(session, mapped);
