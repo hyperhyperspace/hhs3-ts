@@ -269,7 +269,8 @@ export const columnIncarnationTests = {
 
                 const afterCreate = await schema.getView();
                 const baseInc = afterCreate.getColumnIncarnation('orders', 'customer')!;
-                assertTrue(baseInc.includes('#'), 'incarnation id should encode the birth write');
+                assertTrue(typeof baseInc === 'string' && baseInc.length > 0,
+                    'incarnation id is a structural hash string');
 
                 await schema.updateSchema([{
                     rule: 'add-column', table: 'orders', column: 'status',
@@ -293,6 +294,146 @@ export const columnIncarnationTests = {
                 const afterReAdd = await schema.getView();
                 const reAddInc = afterReAdd.getColumnIncarnation('orders', 'status')!;
                 assertTrue(reAddInc !== statusInc, 're-add should start a fresh incarnation id');
+            }
+        },
+        {
+            name: '[INC07] concurrent IDENTICAL add-column converges: both forks\' writes survive',
+            invoke: async () => {
+                const { group, schema, admin } = await createEnv([
+                    open('orders', { customer: { type: 'string' } }),
+                ]);
+                const orders = await group.getTable('orders');
+
+                const orderA = deriveRowId('o-a');
+                const orderB = deriveRowId('o-b');
+                await orders.insert('o-a', { customer: 'branch-a' });
+                await orders.insert('o-b', { customer: 'branch-b' });
+                const base = await groupFrontier(group);
+                const schemaBase = await schemaFrontier(schema);
+
+                // BYTE-IDENTICAL def on both forks (same default): the two adds
+                // share a structural incarnation, so neither masks the other.
+                const def = { type: 'string' as const, default: 'same' };
+                const ha = await schema.updateSchema([{
+                    rule: 'add-column', table: 'orders', column: 'status', def,
+                }], admin, 'add status A', schemaBase);
+                const hb = await schema.updateSchema([{
+                    rule: 'add-column', table: 'orders', column: 'status', def,
+                }], admin, 'add status B', schemaBase);
+
+                const deployA = await group.deploy(version(ha), undefined, base);
+                const deployB = await group.deploy(version(hb), undefined, base);
+
+                await orders.update(orderA, { status: 'from-a' }, undefined, version(deployA));
+                await orders.update(orderB, { status: 'from-b' }, undefined, version(deployB));
+
+                const merged = await groupFrontier(group);
+                const view = await viewAt(group, 'orders', merged, merged);
+                assertEquals((await view.getRow(orderA))!.values['status'], 'from-a',
+                    'fork-a write survives the converged incarnation');
+                assertEquals((await view.getRow(orderB))!.values['status'], 'from-b',
+                    'fork-b write ALSO survives (identical structural incarnation, no masking)');
+            }
+        },
+        {
+            name: '[INC08] concurrent IDENTICAL add-table converges; rows from both forks merge',
+            invoke: async () => {
+                const { group, schema, admin } = await createEnv([
+                    open('orders', { customer: { type: 'string' } }),
+                ]);
+                const base = await groupFrontier(group);
+                const schemaBase = await schemaFrontier(schema);
+
+                // two forks add the SAME new table with a byte-identical def
+                const itemsDef: TableDef = open('items', { label: { type: 'string' } });
+                const ha = await schema.updateSchema([{ rule: 'add-table', def: itemsDef }], admin, 'add items A', schemaBase);
+                const hb = await schema.updateSchema([{ rule: 'add-table', def: itemsDef }], admin, 'add items B', schemaBase);
+
+                const deployA = await group.deploy(version(ha), undefined, base);
+                const deployB = await group.deploy(version(hb), undefined, base);
+
+                const items = await group.getTable('items');
+                const itemA = deriveRowId('i-a');
+                const itemB = deriveRowId('i-b');
+                await items.insert('i-a', { label: 'a' }, undefined, version(deployA));
+                await items.insert('i-b', { label: 'b' }, undefined, version(deployB));
+
+                const merged = await groupFrontier(group);
+                const view = await viewAt(group, 'items', merged, merged);
+                assertTrue(await view.hasRow(itemA), 'fork-a row is live under the converged table incarnation');
+                assertTrue(await view.hasRow(itemB), 'fork-b row is live under the converged table incarnation');
+                assertEquals((await view.getRow(itemA))!.values['label'], 'a', 'fork-a value merges');
+                assertEquals((await view.getRow(itemB))!.values['label'], 'b', 'fork-b value merges');
+            }
+        },
+        {
+            name: '[INC09] concurrent DIFFERENT add-table forks: only the winning incarnation\'s rows survive',
+            invoke: async () => {
+                const { group, schema, admin } = await createEnv([
+                    open('orders', { customer: { type: 'string' } }),
+                ]);
+                const base = await groupFrontier(group);
+                const schemaBase = await schemaFrontier(schema);
+
+                // structurally DIFFERENT adds of the same name (different default)
+                const defA: TableDef = open('items', { label: { type: 'string', default: 'a' } });
+                const defB: TableDef = open('items', { label: { type: 'string', default: 'b' } });
+                const ha = await schema.updateSchema([{ rule: 'add-table', def: defA }], admin, 'add items A', schemaBase);
+                const hb = await schema.updateSchema([{ rule: 'add-table', def: defB }], admin, 'add items B', schemaBase);
+
+                const deployA = await group.deploy(version(ha), undefined, base);
+                const deployB = await group.deploy(version(hb), undefined, base);
+
+                const items = await group.getTable('items');
+                const itemA = deriveRowId('i-a');
+                const itemB = deriveRowId('i-b');
+                await items.insert('i-a', { label: 'from-a' }, undefined, version(deployA));
+                await items.insert('i-b', { label: 'from-b' }, undefined, version(deployB));
+
+                // existence LWW picks the max-entry-hash add as the live incarnation
+                const winnerIsA = ha > hb;
+                const winnerRow = winnerIsA ? itemA : itemB;
+                const loserRow = winnerIsA ? itemB : itemA;
+
+                const merged = await groupFrontier(group);
+                const view = await viewAt(group, 'items', merged, merged);
+                assertTrue(await view.hasRow(winnerRow), 'the winning incarnation\'s row is live');
+                assertFalse(await view.hasRow(loserRow),
+                    'the losing incarnation\'s row is not live at the merge (distinct table incarnation)');
+            }
+        },
+        {
+            name: '[INC10] same-shape table drop+re-add resets rows via drop generation',
+            invoke: async () => {
+                const { group, schema, admin } = await createEnv([
+                    open('orders', { customer: { type: 'string' } }),
+                ]);
+                const orders = await group.getTable('orders');
+                const orderId = deriveRowId('o-1');
+                await orders.insert('o-1', { customer: 'ada' });
+
+                const incBefore = (await schema.getView()).getTableIncarnation('orders');
+
+                await schema.updateSchema([{ rule: 'drop-table', table: 'orders' }], admin, 'drop orders');
+                const v2 = await schemaFrontier(schema);
+                await group.deploy(v2);
+
+                // re-add with a BYTE-IDENTICAL def: only the drop generation distinguishes it
+                await schema.updateSchema([{ rule: 'add-table', def: open('orders', { customer: { type: 'string' } }) }], admin, 're-add orders');
+                const v3 = await schemaFrontier(schema);
+                await group.deploy(v3);
+
+                const incAfter = (await schema.getView()).getTableIncarnation('orders');
+                assertTrue(incBefore !== undefined && incAfter !== undefined && incBefore !== incAfter,
+                    'a same-shape drop+re-add yields a fresh table incarnation (drop generation)');
+
+                const newId = deriveRowId('o-2');
+                await orders.insert('o-2', { customer: 'grace' });
+
+                const view = await orders.getView();
+                assertTrue(await view.hasRow(newId), 'the new incarnation serves new rows');
+                assertFalse(await view.hasRow(orderId),
+                    'a prior-incarnation row is not live after a same-shape reset');
             }
         },
     ],

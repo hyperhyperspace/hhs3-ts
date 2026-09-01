@@ -7,7 +7,7 @@ import type { ColumnType } from "@hyper-hyper-space/hhs3_rdb";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import Database from "better-sqlite3";
 
-import { projectGroup, SchemaAction } from "@hyper-hyper-space/hhs3_rdb_adapter";
+import { projectGroup, SchemaAction, RowAction } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import {
     createGroup, sameVersion,
     TargetHarness, ProjectionReader, ReadRow, RowValues,
@@ -44,6 +44,11 @@ function sqliteReader(db: Database.Database): ProjectionReader {
     return {
         hasTable: (table) =>
             db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table) !== undefined,
+
+        listTables: () => {
+            const rows = db.prepare('SELECT "table" AS t FROM rdb_table_meta').all() as { t: string }[];
+            return rows.map((r) => r.t);
+        },
 
         getRowIds: (table) => {
             const m = meta(table);
@@ -371,6 +376,145 @@ export const sqliteSpecificTests = {
                 assertEquals(fkList.length, 0, 'a co-projected cross-group FK declares no DB-level foreign key');
                 assertTrue(tableInfo(db, 'comments').some((c) => c.name === 'origin_id' && c.type === 'INTEGER'),
                     'the cross-group FK still projects as an integer id companion');
+                db.close();
+            },
+        },
+        {
+            name: '[ADPTS-SQL06] ADD COLUMN required no-default on an empty table is direct NOT NULL',
+            invoke: async () => {
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db);
+                const gid = 'g';
+                await target.apply(gid, [{
+                    kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+                    columns: [{ name: 'ref', def: { type: 'string' } }],
+                }], [], new Set(['v1']));
+
+                await target.apply(gid, [{
+                    kind: 'add-column', table: 'acct', column: 'status',
+                    def: { type: 'string' },
+                }], [], new Set(['v2']));
+
+                const status = tableInfo(db, 'acct').find((c) => c.name === 'status');
+                assertTrue(status !== undefined && status.type === 'TEXT' && status.notnull === 1,
+                    'empty-table ADD COLUMN required no-default is NOT NULL');
+                assertTrue(!tableExists(db, 'acct__rebuild'), 'no leftover rebuild table');
+                db.close();
+            },
+        },
+        {
+            name: '[ADPTS-SQL07] ADD COLUMN required no-default on a non-empty table tightens to NOT NULL',
+            invoke: async () => {
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db);
+                const gid = 'g';
+                const insert: RowAction = {
+                    kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { ref: 'a', extra: 'x' },
+                };
+                await target.apply(gid, [{
+                    kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+                    columns: [
+                        { name: 'ref', def: { type: 'string' } },
+                        { name: 'extra', def: { type: 'string' } },
+                    ],
+                }], [insert], new Set(['v1']));
+
+                // Drop+add of a required no-default column (the set-fks flip shape)
+                // with a backfill upsert supplying the new cell.
+                const backfill: RowAction = {
+                    kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { status: 'open' },
+                };
+                await target.apply(gid, [
+                    { kind: 'drop-column', table: 'acct', column: 'extra' },
+                    { kind: 'add-column', table: 'acct', column: 'status', def: { type: 'string' } },
+                ], [backfill], new Set(['v2']));
+
+                const cols = tableInfo(db, 'acct');
+                const status = cols.find((c) => c.name === 'status');
+                assertTrue(status !== undefined && status.type === 'TEXT' && status.notnull === 1,
+                    'tightened column is NOT NULL after backfill');
+                assertTrue(!cols.some((c) => c.name === 'extra'), 'dropped column is gone');
+                const row = db.prepare('SELECT status FROM acct').get() as { status: string };
+                assertEquals(row.status, 'open', 'backfill value survived the tighten rebuild');
+                assertTrue(!tableExists(db, 'acct__rebuild'), 'no leftover rebuild table');
+                db.close();
+            },
+        },
+        {
+            name: '[ADPTS-SQL08] tighten throws when backfill leaves a live row NULL (batch rolls back)',
+            invoke: async () => {
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db);
+                const gid = 'g';
+                const v1: Version = new Set(['v1']);
+                await target.apply(gid, [{
+                    kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+                    columns: [{ name: 'ref', def: { type: 'string' } }],
+                }], [{ kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { ref: 'a' } }], v1);
+
+                const v2: Version = new Set(['v2']);
+                let threw = false;
+                try {
+                    await target.apply(gid, [{
+                        kind: 'add-column', table: 'acct', column: 'status',
+                        def: { type: 'string' },
+                    }], [], v2);
+                } catch {
+                    threw = true;
+                }
+                assertTrue(threw, 'apply throws when a required no-default add is not backfilled');
+                assertTrue(!tableInfo(db, 'acct').some((c) => c.name === 'status'),
+                    'failed ADD COLUMN rolled back');
+                assertTrue(sameVersion(await target.getCheckpoint(gid), v1),
+                    'checkpoint not advanced on tighten failure');
+                db.close();
+            },
+        },
+        {
+            name: '[ADPTS-SQL09] inbound FK on another table survives a tighten rebuild of its target',
+            invoke: async () => {
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db);
+                const gid = 'g';
+                await target.apply(gid, [{
+                    kind: 'create-table', table: 'orders', syncTable: 'orders_sync', primaryKey: 'id',
+                    columns: [{ name: 'customer', def: { type: 'string' } }],
+                }], [{
+                    kind: 'upsert-row', table: 'orders', rowId: 'o1', values: { customer: 'acme' },
+                }], new Set(['v1']));
+
+                await target.apply(gid, [{
+                    kind: 'create-table', table: 'lines', syncTable: 'lines_sync', primaryKey: 'id',
+                    columns: [
+                        { name: 'qty', def: { type: 'integer' } },
+                        { name: 'order_id', def: { type: 'integer' }, fk: { targetTable: 'orders' } },
+                    ],
+                }], [{
+                    kind: 'upsert-row', table: 'lines', rowId: 'l1',
+                    values: { qty: 2, order_id: 'o1' },
+                }], new Set(['v2']));
+
+                const before = db.prepare('SELECT "table" AS t, "from", "to" FROM pragma_foreign_key_list(?)')
+                    .all('lines') as { t: string; from: string; to: string }[];
+                assertTrue(before.some((f) => f.from === 'order_id' && f.t === 'orders' && f.to === 'id'),
+                    'lines.order_id references orders.id before tighten');
+
+                await target.apply(gid, [{
+                    kind: 'add-column', table: 'orders', column: 'note',
+                    def: { type: 'string' },
+                }], [{
+                    kind: 'upsert-row', table: 'orders', rowId: 'o1', values: { note: 'rush' },
+                }], new Set(['v3']));
+
+                const note = tableInfo(db, 'orders').find((c) => c.name === 'note');
+                assertTrue(note !== undefined && note.notnull === 1,
+                    'tightened column on the FK target is NOT NULL');
+                const after = db.prepare('SELECT "table" AS t, "from", "to" FROM pragma_foreign_key_list(?)')
+                    .all('lines') as { t: string; from: string; to: string }[];
+                assertTrue(after.some((f) => f.from === 'order_id' && f.t === 'orders' && f.to === 'id'),
+                    'lines.order_id still references orders.id after the target rebuild');
+                const child = db.prepare('SELECT qty FROM lines').get() as { qty: number };
+                assertEquals(child.qty, 2, 'referencing row survived the target rebuild');
                 db.close();
             },
         },

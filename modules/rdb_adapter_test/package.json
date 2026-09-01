@@ -8,6 +8,8 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "test": "node --import ../../register.mjs ./test/run_tests.ts",
+    "test:projection:fast": "node --import ../../register.mjs ./test/run_tests.ts PROJECTION --profile fast",
+    "test:projection:full": "node --import ../../register.mjs ./test/run_tests.ts PROJECTION --profile full",
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist"
   },
@@ -20,6 +22,7 @@
     "@hyper-hyper-space/hhs3_mvt": "^0.1.0",
     "@hyper-hyper-space/hhs3_rdb": "^0.1.0",
     "@hyper-hyper-space/hhs3_rdb_adapter": "^0.1.0",
+    "@hyper-hyper-space/hhs3_rdb_adapter_test_gen": "^0.1.0",
     "@hyper-hyper-space/hhs3_util": "^0.1.0"
   },
   "devDependencies": {

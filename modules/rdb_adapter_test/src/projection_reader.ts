@@ -27,6 +27,8 @@ export type MaybePromise<T> = T | Promise<T>;
 export interface ProjectionReader {
     // Whether the app table exists (materialized), regardless of row count.
     hasTable(table: string): MaybePromise<boolean>;
+    // Materialized app table names (not sync tables, not rdb_keys).
+    listTables(): MaybePromise<string[]>;
     // The live rowIds of a table (a deleted row is absent even though its sync
     // mapping survives).
     getRowIds(table: string): MaybePromise<string[]>;
@@ -58,6 +60,7 @@ export function memoryHarness(): TargetHarness {
     const target = new MemoryTarget();
     const read: ProjectionReader = {
         hasTable: (table) => target.hasTable(table),
+        listTables: () => target.listTables(),
         getRowIds: (table) => target.getRowIds(table),
         getRow: (table, rowId) => target.getRowByRowId(table, rowId),
         syncId: (table, rowId) => target.syncId(table, rowId),

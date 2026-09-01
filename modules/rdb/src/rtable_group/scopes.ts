@@ -11,7 +11,11 @@
 // meta is unhashed):
 //
 //   tables: [touched table names]            - every row-carrying entry
-//   t-<table>-rows: [rowId]                  - row cover queries (liveness)
+//   t-<table>-rows: ['<tableIncarnationId>:<rowId>'] - row cover queries
+//                                              (liveness), scoped to the table
+//                                              incarnation active at write time
+//                                              so a table drop+re-add resets
+//                                              liveness (see resolve.ts).
 //   t-<table>-cols: ['<rowId>:<incarnationId>:<column>'] - column writes
 //                                              updates): the per-column LWW
 //                                              cover queries, keyed by the
@@ -38,7 +42,7 @@ import { validationFailure, validationOk, ValidationResult, wrapValidationFailur
 import type { DagScope, Version } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchemaView } from "../rschema/interfaces.js";
-import type { ColumnIncarnationId } from "../rschema/resolve.js";
+import type { IncarnationId } from "../rschema/incarnation.js";
 import type { RowOpPayload, InsertRowPayload } from "../rtable/payload.js";
 import type { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload } from "./payload.js";
 
@@ -61,8 +65,17 @@ export type TableScopeHost = {
 // The combined (rowId, column incarnation, column name) meta value for
 // column-write cover queries. Column name is included because base columns
 // from one add-table rule share the same birth (entryHash, ruleIndex).
-export function colTag(rowId: B64Hash, incarnationId: ColumnIncarnationId, column: string): string {
+export function colTag(rowId: B64Hash, incarnationId: IncarnationId, column: string): string {
     return rowId + ':' + incarnationId + ':' + column;
+}
+
+// The (table incarnation, rowId) meta value for row-liveness cover queries. The
+// table incarnation is embedded in the VALUE (not a key prefix) so a delete /
+// insert authored under incarnation I only covers rows of incarnation I: a
+// table drop+re-add (or a losing concurrent-create fork) starts a fresh
+// liveness namespace. See ../rtable/view.ts.
+export function rowTag(incarnationId: IncarnationId, rowId: B64Hash): string {
+    return incarnationId + ':' + rowId;
 }
 
 // Extract one table's row ops from a GROUP-level entry payload (row envelope,
@@ -102,7 +115,11 @@ export function tableOpsFromGroupPayload(payload: json.Literal, table: string): 
 // makes concurrentDeletes resolve fully at the view horizon (like restrictions
 // / FKs); see liveInsert / baseLiveInsert in ../rtable/view.ts.
 export function deriveRowOpInnerMeta(op: RowOpPayload, table: string, schemaView: RSchemaView): MetaProps {
-    const meta: MetaProps = { rows: json.toSet([op.rowId]) };
+    const tableIncarnation = schemaView.getTableIncarnation(table);
+    if (tableIncarnation === undefined) {
+        throw new Error(`deriveRowOpInnerMeta: table '${table}' is not live`);
+    }
+    const meta: MetaProps = { rows: json.toSet([rowTag(tableIncarnation, op.rowId)]) };
 
     if (op.action === 'insert' || op.action === 'update') {
         const columns = Object.keys(op.values);

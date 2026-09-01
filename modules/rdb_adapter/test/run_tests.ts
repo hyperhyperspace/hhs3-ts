@@ -5,7 +5,7 @@ import { rowActionsTests } from "./row_actions_tests.js";
 import { ingestTests } from "./ingest_tests.js";
 import { verdictEventsTests } from "./verdict_events_tests.js";
 import { plannerParityTests } from "./planner_parity/planner_parity_tests.js";
-import { parseTestFilters } from "./planner_parity/profiles.js";
+import { parseTestFilters } from "@hyper-hyper-space/hhs3_rdb_adapter_test_gen";
 
 async function main() {
     const allTests = new Map<string, Array<{ name: string, invoke: () => Promise<void> }>>();

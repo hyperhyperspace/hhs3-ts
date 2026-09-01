@@ -1,4 +1,4 @@
-import { PRNG } from "../../../rdb/test/delta_parity/prng.js";
+import { PRNG } from "./prng.js";
 
 export type FuzzProfileName = "smoke" | "fast" | "full";
 
@@ -16,6 +16,18 @@ export const PARITY_PROFILES: Record<FuzzProfileName, FuzzProfile> = {
     full: {
         seeds: [1, 7, 42, 93, 1771, 9001, 31415],
         ops: 60, maxPairs: 160, ingestBatches: 8, ingestChanges: 48,
+    },
+};
+
+// Projection suite: cost is linear in seeds × ops (one incremental apply per
+// extending checkpoint), so `full` spends its budget on longer histories rather
+// than on maxPairs (the planner-fuzzer knob).
+export const PROJECTION_PROFILES: Record<FuzzProfileName, FuzzProfile> = {
+    smoke: { seeds: [1, 42], ops: 18, maxPairs: 64, ingestBatches: 4, ingestChanges: 24 },
+    fast: { seeds: [1, 42, 9001], ops: 40, maxPairs: 128, ingestBatches: 6, ingestChanges: 32 },
+    full: {
+        seeds: [1, 7, 42, 93, 1771, 9001, 31415],
+        ops: 100, maxPairs: 256, ingestBatches: 8, ingestChanges: 48,
     },
 };
 
@@ -40,7 +52,10 @@ function parseProfileName(value: string): FuzzProfileName {
     throw new Error(`Unknown fuzz profile '${value}' (expected smoke, fast or full)`);
 }
 
-export function resolveFuzzSweepOptions(argv: string[]): ResolvedFuzzSweepOptions {
+export function resolveFuzzSweepOptions(
+    argv: string[],
+    profiles: Record<FuzzProfileName, FuzzProfile> = PARITY_PROFILES,
+): ResolvedFuzzSweepOptions {
     let profileName: FuzzProfileName | undefined;
     let seeds: number[] | undefined;
     let ops: number | undefined;
@@ -55,7 +70,7 @@ export function resolveFuzzSweepOptions(argv: string[]): ResolvedFuzzSweepOption
 
     const name = profileName
         ?? (process.env.PARITY_PROFILE !== undefined ? parseProfileName(process.env.PARITY_PROFILE) : DEFAULT_PARITY_PROFILE);
-    const profile = PARITY_PROFILES[name];
+    const profile = profiles[name];
 
     return {
         profile: name,

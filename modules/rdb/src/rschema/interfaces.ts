@@ -6,7 +6,7 @@ import type { RObject, Version, View } from "@hyper-hyper-space/hhs3_mvt";
 import type {
     TableDef, FKs, IdProvider, Predicate, MigrationRule, SchemaCreator,
 } from "./payload.js";
-import type { ColumnIncarnationId } from "./resolve.js";
+import type { IncarnationId } from "./incarnation.js";
 
 export interface RSchema extends RObject {
 
@@ -57,7 +57,15 @@ export interface RSchemaView extends View {
     // is not a provider (or does not exist at this version).
     getIdProvider(table: string): IdProvider | undefined;
 
-    // The live column incarnation id at this version (the birth write of the
-    // winning column slot), or undefined when the column is not live.
-    getColumnIncarnation(table: string, column: string): ColumnIncarnationId | undefined;
+    // The live table incarnation id at this version (a structural hash of the
+    // winning add-table's base def + drop generation), or undefined when the
+    // table does not exist. Row liveness is scoped to this id, so a table
+    // drop+re-add (or a losing concurrent-create fork) does not resurrect old
+    // rows. See ./incarnation.ts.
+    getTableIncarnation(table: string): IncarnationId | undefined;
+
+    // The live column incarnation id at this version (a structural hash of the
+    // winning column def, seeded by the table incarnation, + drop generation),
+    // or undefined when the column is not live.
+    getColumnIncarnation(table: string, column: string): IncarnationId | undefined;
 }

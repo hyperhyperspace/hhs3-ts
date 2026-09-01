@@ -36,6 +36,13 @@ export type TableChange = {
     table: string;
     existedBefore: boolean;
     existsAfter: boolean;
+    // True iff the table exists on both sides but its LIVE TABLE INCARNATION
+    // differs across the delta — a same-shape table drop+re-add (or a losing
+    // concurrent-create fork resolving to a different winner). The resolved def
+    // may be byte-identical, but every prior-incarnation row is masked, so a
+    // consumer must treat it like drop-table + create-table + backfill. False
+    // for a pure add / drop and for an in-place column/slot change.
+    reincarnated: boolean;
     // slot-level detail, only populated when the table exists on both sides
     columnChanges: ColumnChange[];
     concurrentDeletesChanged: boolean;
@@ -89,6 +96,7 @@ function diffTable(table: string, startView: RSchemaView, endView: RSchemaView):
         table,
         existedBefore: before !== undefined,
         existsAfter: after !== undefined,
+        reincarnated: false,
         columnChanges: [],
         concurrentDeletesChanged: false,
         fksChanged: false,
@@ -97,6 +105,12 @@ function diffTable(table: string, startView: RSchemaView, endView: RSchemaView):
     };
 
     if (before === undefined || after === undefined) return change;
+
+    // Same-shape reincarnation: table present on both sides but the live table
+    // incarnation flipped (drop+re-add, or a losing concurrent-create fork).
+    // Reported so a consumer resets the table (drop + create + backfill).
+    change.reincarnated =
+        startView.getTableIncarnation(table) !== endView.getTableIncarnation(table);
 
     for (const column of new Set([...Object.keys(before.columns), ...Object.keys(after.columns)])) {
         if (!sameLiteral(before.columns[column], after.columns[column])) {
@@ -124,7 +138,7 @@ function diffTable(table: string, startView: RSchemaView, endView: RSchemaView):
         startView.getIdProvider(table) as json.Literal | undefined,
         endView.getIdProvider(table) as json.Literal | undefined);
 
-    if (change.columnChanges.length === 0 && !change.concurrentDeletesChanged
+    if (!change.reincarnated && change.columnChanges.length === 0 && !change.concurrentDeletesChanged
         && !change.fksChanged && !change.restrictionsChanged && !change.idProviderChanged) {
         return undefined;
     }

@@ -69,6 +69,7 @@ export function memoryIngestionHarness(): IngestionHarness {
     const target = new MemoryTarget({ captureChanges: true });
     const read: ProjectionReader = {
         hasTable: (table) => target.hasTable(table),
+        listTables: () => target.listTables(),
         getRowIds: (table) => target.getRowIds(table),
         getRow: (table, rowId) => target.getRowByRowId(table, rowId),
         syncId: (table, rowId) => target.syncId(table, rowId),

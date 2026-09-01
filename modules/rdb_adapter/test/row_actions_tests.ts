@@ -3,7 +3,7 @@ import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from 
 import type { OwnIdentity, KeyId } from "@hyper-hyper-space/hhs3_crypto";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 
-import { createMockRContext } from "../../rdb/test/mock_rcontext.js";
+import { createMockRContext } from "@hyper-hyper-space/hhs3_rdb_adapter_test_gen";
 import {
     RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory,
     TableDef, RSchemaView, RTableChanges,

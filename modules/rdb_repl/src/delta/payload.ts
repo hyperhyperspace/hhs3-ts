@@ -21,6 +21,12 @@ export function schemaChangeRows(changes: TableChange[]): Record<string, unknown
     for (const change of changes) {
         if (!change.existedBefore && change.existsAfter) rows.push({ table: change.table, change: 'add-table', detail: '' });
         else if (change.existedBefore && !change.existsAfter) rows.push({ table: change.table, change: 'drop-table', detail: '' });
+        else if (change.reincarnated) {
+            // Same-shape table reincarnation: a drop+re-add whose resolved def
+            // is unchanged. Render it as one table-level line rather than a
+            // stream of identical-looking reincarnate-column rows.
+            rows.push({ table: change.table, change: 'reincarnate-table', detail: '' });
+        }
         else {
             for (const column of change.columnChanges) {
                 // A reincarnation is a same-shape drop+re-add: before and after

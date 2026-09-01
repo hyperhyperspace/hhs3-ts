@@ -3,12 +3,14 @@ import type { RTableGroupDelta } from "@hyper-hyper-space/hhs3_rdb";
 
 import { initialRowActions, planIncrementalRowActions } from "../../src/project.js";
 import { initialSchemaActions, reprojectedTables, schemaDeltaActions } from "../../src/schema_actions.js";
-import { collectExtendingPairs } from "../../../rdb/test/delta_parity/checkpoints.js";
+import {
+    collectExtendingPairs, generateProjectHistory, resolveFuzzSweepOptions, subsamplePairs,
+    mergeTallies, assertPathologicalCoverage,
+    type ProjectHistory, type ResolvedFuzzSweepOptions, type Tallies,
+} from "@hyper-hyper-space/hhs3_rdb_adapter_test_gen";
 
 import { ActionStore } from "./action_store.js";
 import { fingerprintRdbProjectedRows, rowsOnlyFingerprint, schemaOnlyFingerprint } from "./fingerprint.js";
-import { generateProjectHistory, type ProjectHistory } from "./project_generate.js";
-import { resolveFuzzSweepOptions, subsamplePairs, type ResolvedFuzzSweepOptions } from "./profiles.js";
 
 function mismatch(kind: string, history: ProjectHistory, startIdx: number, endIdx: number, extra: string): Error {
     return new Error(
@@ -68,8 +70,10 @@ async function checkPair(history: ProjectHistory, startIdx: number, endIdx: numb
 }
 
 export async function runProjectPlannerSweep(options: ResolvedFuzzSweepOptions): Promise<void> {
+    const combined: Tallies = {};
     for (const seed of options.seeds) {
         const history = await generateProjectHistory(seed, options.ops);
+        mergeTallies(combined, history.tallies);
         const pairs = subsamplePairs(
             await collectExtendingPairs(history.rawDag, history.checkpoints),
             seed, options.maxPairs,
@@ -83,6 +87,7 @@ export async function runProjectPlannerSweep(options: ResolvedFuzzSweepOptions):
             + `tallies=${JSON.stringify(history.tallies)}\n`,
         );
     }
+    assertPathologicalCoverage(combined, `kind=project-generate profile=${options.profile}`);
 }
 
 export async function runProjectPlannerFromArgv(): Promise<void> {

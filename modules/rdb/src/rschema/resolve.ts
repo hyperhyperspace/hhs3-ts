@@ -15,13 +15,15 @@
 //                                drop-column (tombstone)
 //
 // Incarnation masking: the winning add-table write is a RESET of the whole
-// table namespace. Subordinate writes that are causally at-or-below the
-// winning add-table entry (other than the base writes it carries itself)
-// belong to a previous incarnation and are masked; base writes carried by
-// LOSING concurrent add-table entries are masked as well (a table def never
-// merges fields from two independent creations). Subordinate rule writes
-// (add/drop-column, set-*) that are concurrent with or after the winning
-// add-table participate normally.
+// table namespace, identified by its STRUCTURAL incarnation id (base def +
+// drop generation; see incarnation.ts). Add-table writes sharing that id
+// CONVERGE (structurally-identical concurrent creates merge, with no pick);
+// add-table writes of a DIFFERENT id are losers and their base writes are
+// masked (a table def never merges fields from two structurally-different
+// creations). Subordinate writes causally at-or-below ANY winning-class add
+// belong to a previous incarnation and are masked; subordinate rule writes
+// (add/drop-column, set-*) concurrent with or after the winning add
+// participate normally.
 //
 // Schema DAGs are small: the resolution loads every entry, computes ancestor
 // sets directly, and does no meta indexing. Results are immutable per `at`
@@ -36,14 +38,7 @@ import {
     MigrationRule,
 } from "./payload.js";
 import { CreateRSchemaPayload, SchemaUpdatePayload, SchemaCreator } from "./payload.js";
-
-// Stable id for one live column incarnation: the schema birth write that
-// introduced the column (add-table base column or add-column rule).
-export type ColumnIncarnationId = `${B64Hash}#${number}`;
-
-export function formatColumnIncarnation(entryHash: B64Hash, ruleIndex: number): ColumnIncarnationId {
-    return `${entryHash}#${ruleIndex}`;
-}
+import { IncarnationId, tableIncarnationId, columnIncarnationId } from "./incarnation.js";
 
 // The resolved, effective schema at a position.
 
@@ -52,7 +47,9 @@ export type SchemaState = {
     creators: SchemaCreator[];
     hashAlgorithm?: string;
     tables: Map<string, TableDef>;
-    columnIncarnations: Map<string, Map<string, ColumnIncarnationId>>;
+    // The live table incarnation id per existing table (see incarnation.ts).
+    tableIncarnations: Map<string, IncarnationId>;
+    columnIncarnations: Map<string, Map<string, IncarnationId>>;
 };
 
 // A single slot write, tagged with its origin for LWW resolution.
@@ -266,10 +263,33 @@ export function resolveSchemaState(entries: Entry[], at: Position): SchemaState 
 
     if (create === undefined) throw new Error("resolveSchemaState: create entry not at or below the requested position");
 
-    // Resolve existence slots first: the winning add-table is the table's
-    // current incarnation and masks subordinate writes at-or-below it.
+    // Resolve existence slots first. The winning add-table's STRUCTURAL id (a
+    // hash of its base def + drop generation, see incarnation.ts) is the
+    // table's live incarnation. Add-table writes that share that id CONVERGE
+    // with the winner (no masking, both branches' base writes survive); add
+    // writes with a DIFFERENT id are losers (their base writes are masked). A
+    // subordinate write survives the reset iff it is not causally at-or-below
+    // ANY winning-class add write.
     const tables = new Map<string, TableDef>();
-    const columnIncarnations = new Map<string, Map<string, ColumnIncarnationId>>();
+    const tableIncarnations = new Map<string, IncarnationId>();
+    const columnIncarnations = new Map<string, Map<string, IncarnationId>>();
+
+    // Does write `a` causally precede write `b` (cross-entry ancestry, or an
+    // earlier rule within the same entry)?
+    const precedesWrite = (a: SlotWrite, b: SlotWrite): boolean =>
+        a.entryHash === b.entryHash
+            ? a.ruleIndex < b.ruleIndex
+            : causality.ancestors[b.entryIdx].has(a.entryIdx);
+
+    // The drop generation of a birth write: the number of tombstone writes in
+    // its slot that causally precede it (a convergent count, see incarnation.ts).
+    const dropGeneration = (slotWrites: SlotWrite[], birth: SlotWrite): number => {
+        let n = 0;
+        for (const w of slotWrites) {
+            if (w.value.kind === 'tombstone' && precedesWrite(w, birth)) n++;
+        }
+        return n;
+    };
 
     for (const [slot, slotWrites] of writes) {
         if (!slot.startsWith('t:')) continue;
@@ -278,47 +298,60 @@ export function resolveSchemaState(entries: Entry[], at: Position): SchemaState 
         const winner = resolveSlot(causality, slotWrites);
         if (winner === undefined || winner.value.kind !== 'table') continue;   // tombstone or absent
 
-        const incarnation = winner;
-        const base = incarnation.value as Extract<SlotValue, { kind: 'table' }>;
+        const base = winner.value as Extract<SlotValue, { kind: 'table' }>;
 
-        // a subordinate write survives the reset iff it is NOT causally
-        // at-or-below the incarnation write (base writes from the incarnation
-        // entry itself are included by their rule index)
-        const survives = (w: SlotWrite): boolean => {
-            if (w.entryHash === incarnation.entryHash) return w.ruleIndex >= incarnation.ruleIndex;
-            return !causality.ancestors[incarnation.entryIdx].has(w.entryIdx);
-        };
+        // the winning add's structural id is the live table incarnation
+        const structuralTableId = (w: SlotWrite): IncarnationId =>
+            tableIncarnationId((w.value as Extract<SlotValue, { kind: 'table' }>).def,
+                dropGeneration(slotWrites, w));
+        const tableInc = structuralTableId(winner);
+        tableIncarnations.set(table, tableInc);
+
+        // every add-table write of the SAME structural id converges with the
+        // winner (a shared reset point); adds of a DIFFERENT id are losers.
+        const winningAdds: SlotWrite[] = [];
+        const losingOrigins = new Set<string>();
+        for (const w of slotWrites) {
+            if (w.value.kind !== 'table') continue;
+            if (structuralTableId(w) === tableInc) winningAdds.push(w);
+            else losingOrigins.add(`${w.entryHash}#${w.ruleIndex}`);
+        }
+
+        // a subordinate write is masked iff it is causally at-or-below (or an
+        // earlier rule in the same entry as) ANY winning-class add write; base
+        // writes carried by a winning add (same entry + rule index) survive.
+        const survives = (w: SlotWrite): boolean =>
+            !winningAdds.some((add) =>
+                w.entryHash === add.entryHash
+                    ? w.ruleIndex < add.ruleIndex
+                    : causality.ancestors[add.entryIdx].has(w.entryIdx));
 
         // base writes from LOSING add-table entries must not bleed through:
         // they are 'table'-kind only for the existence slot, but their
         // subordinate base writes share the losing entry hash + rule index.
-        // Identify losing add-table origins to mask them below.
-        const losingOrigins = new Set<string>();
-        for (const w of slotWrites) {
-            if (w.value.kind === 'table' && w.entryHash !== incarnation.entryHash) {
-                losingOrigins.add(`${w.entryHash}#${w.ruleIndex}`);
-            }
-        }
         const fromLosingAddTable = (w: SlotWrite): boolean =>
             losingOrigins.has(`${w.entryHash}#${w.ruleIndex}`);
 
-        const resolveSubordinate = (subSlot: string): SlotWrite | undefined => {
-            const subWrites = (writes.get(subSlot) ?? []).filter((w) => survives(w) && !fromLosingAddTable(w));
-            return resolveSlot(causality, subWrites);
-        };
+        const survivingSubWrites = (subSlot: string): SlotWrite[] =>
+            (writes.get(subSlot) ?? []).filter((w) => survives(w) && !fromLosingAddTable(w));
+
+        const resolveSubordinate = (subSlot: string): SlotWrite | undefined =>
+            resolveSlot(causality, survivingSubWrites(subSlot));
 
         const columns: { [column: string]: ColumnDef } = {};
-        const tableIncarnations = new Map<string, ColumnIncarnationId>();
+        const colIncarnations = new Map<string, IncarnationId>();
         for (const subSlot of writes.keys()) {
             if (!subSlot.startsWith(`c:${table}:`)) continue;
             const column = subSlot.slice(`c:${table}:`.length);
-            const columnWinner = resolveSubordinate(subSlot);
+            const subWrites = survivingSubWrites(subSlot);
+            const columnWinner = resolveSlot(causality, subWrites);
             if (columnWinner !== undefined && columnWinner.value.kind === 'column') {
                 columns[column] = columnWinner.value.def;
-                tableIncarnations.set(column, formatColumnIncarnation(columnWinner.entryHash, columnWinner.ruleIndex));
+                colIncarnations.set(column, columnIncarnationId(
+                    columnWinner.value.def, tableInc, dropGeneration(subWrites, columnWinner)));
             }
         }
-        if (Object.keys(columns).length > 0) columnIncarnations.set(table, tableIncarnations);
+        if (colIncarnations.size > 0) columnIncarnations.set(table, colIncarnations);
 
         const def: TableDef = { name: base.def.name, columns };
 
@@ -348,6 +381,7 @@ export function resolveSchemaState(entries: Entry[], at: Position): SchemaState 
         name: create.name,
         creators: create.creators,
         tables,
+        tableIncarnations,
         columnIncarnations,
     };
     if (create.hashAlgorithm !== undefined) state.hashAlgorithm = create.hashAlgorithm;

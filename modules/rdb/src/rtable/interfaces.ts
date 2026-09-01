@@ -61,13 +61,15 @@ export interface RTable extends RObject {
 export interface RTableView extends View {
     getObject(): RTable;
 
-    // Liveness has two layers: (1) permanent-delete state — an insert in the
-    // row's history, no delete in it (deletes are permanent), no concurrent
-    // delete barrier visible from `from` honored at-use by the concurrentDeletes
-    // flag at the delete's position; (2) op validity — ops from entries whose
-    // restriction predicates fail OR whose written FK columns do not reach a
-    // live target are invisible (drop-on-void, at-use, bundles all-or-nothing).
-    // See src/rtable/view.ts.
+    // Liveness is INCARNATION-SCOPED (a row belongs to the table incarnation it
+    // was written under; a table drop+re-add resets the row namespace) and has
+    // two layers: (1) permanent-delete state — an insert in the row's history,
+    // no delete in it (deletes are permanent), no concurrent delete barrier of
+    // the SAME incarnation visible from `from` honored at-use by the
+    // concurrentDeletes flag at the delete's position; (2) op validity — ops
+    // from entries whose restriction predicates fail OR whose written FK columns
+    // do not reach a live target are invisible (drop-on-void, at-use, bundles
+    // all-or-nothing). See src/rtable/view.ts.
     hasRow(rowId: B64Hash): Promise<boolean>;
     getRow(rowId: B64Hash): Promise<Row | undefined>;
     getAuthor(rowId: B64Hash): Promise<KeyId | undefined>;   // undefined: anonymous or not live

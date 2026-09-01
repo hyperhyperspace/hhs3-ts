@@ -3,7 +3,7 @@ import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from 
 import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 
-import { createMockRContext } from "../../rdb/test/mock_rcontext.js";
+import { createMockRContext } from "@hyper-hyper-space/hhs3_rdb_adapter_test_gen";
 import {
     RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory,
     RSchemaDelta, RSchemaChanges, RSchemaView, TableDef, MigrationRule,
@@ -794,6 +794,50 @@ export const schemaActionsTests = {
                 // row backfill, so it must not flag the table as reprojected.
                 assertEquals(reprojectedTables(changes, endView, startView, {}).size, 0,
                     'a reincarnation does not trigger a row backfill');
+            },
+        },
+        {
+            name: '[ADPT28] table reincarnation emits drop-table + create-table (full reset), incl. a required no-default column',
+            invoke: async () => {
+                const { schema, admin } = await createGroup();
+                // Reincarnate `tags` (drop + re-add) with a NEW required, no-default
+                // column `kind`. A required-no-default column is only sound because
+                // the target table is freshly (re)created and backfilled from rdb
+                // truth: it never ALTERs a populated table with a NOT NULL column.
+                const { changes, endView, startView } = await migrate(schema, admin, [
+                    { rule: 'drop-table', table: 'tags' },
+                    { rule: 'add-table', def: {
+                        name: 'tags',
+                        columns: { code: { type: 'string', pub: true }, kind: { type: 'string' } },
+                        restrictions: [{ on: 'all', rule: { p: 'true' } }],
+                    } },
+                ]);
+
+                const tagsChange = changes.tableChanges.find((c) => c.table === 'tags');
+                assertTrue(tagsChange !== undefined && tagsChange.reincarnated,
+                    'the delta flags tags as reincarnated');
+
+                const actions = schemaDeltaActions(changes, endView, startView, {});
+                const drops = actions.filter((a) => a.kind === 'drop-table' && a.table === 'tags');
+                const creates = actions.filter((a) => a.kind === 'create-table' && a.table === 'tags');
+                assertEquals(drops.length, 1, 'reincarnated table is dropped');
+                assertEquals(creates.length, 1, 'reincarnated table is recreated');
+                // global ordering is drops-before-creates
+                assertTrue(actions.indexOf(drops[0]) < actions.indexOf(creates[0]),
+                    'drop-table precedes create-table');
+
+                // no per-column DDL for a table handled by a full reset
+                const perColumn = actions.filter((a) =>
+                    (a.kind === 'add-column' || a.kind === 'drop-column')
+                    && a.table === 'tags');
+                assertEquals(perColumn.length, 0, 'a reset table emits no per-column actions');
+
+                const create = creates[0];
+                if (create.kind !== 'create-table') return;
+                const kind = create.columns.find((c) => c.name === 'kind');
+                assertTrue(kind !== undefined && kind.def.type === 'string'
+                    && kind.def.default === undefined && (kind.def.nullable ?? false) === false,
+                    'the required no-default column is created as-is on the fresh table');
             },
         },
     ],

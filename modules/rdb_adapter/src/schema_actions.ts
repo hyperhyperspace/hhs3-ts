@@ -239,6 +239,22 @@ export function schemaDeltaActions(
             continue;
         }
 
+        // Same-shape table reincarnation (drop+re-add / losing concurrent-create
+        // fork): the resolved def may be identical, but every prior-incarnation
+        // row is masked. Reset the table fully — drop-table + create-table —
+        // instead of diffing columns; the orchestrator backfills the new
+        // incarnation's live rows (see project.ts planIncrementalRowActions).
+        if (change.reincarnated) {
+            const table = targetTableName(config, rdbTable);
+            dropTables.push({ kind: 'drop-table', table, syncTable: syncTableName(config, table) });
+            const def = endView.getTable(rdbTable);
+            if (def !== undefined) {
+                createTables.push(createTableAction(
+                    config, rdbTable, def, endView.getFKs(rdbTable), endView.getIdProvider?.(rdbTable)));
+            }
+            continue;
+        }
+
         // Table exists on both sides: validate its resulting columns, then diff
         // each column's PROJECTION across the delta. A column's target shape
         // (name / type / fk / keyRef) is fully determined by its def AND its

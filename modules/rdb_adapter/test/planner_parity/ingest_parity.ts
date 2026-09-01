@@ -2,13 +2,13 @@ import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from 
 import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { deriveRowId, RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory, TableDef } from "@hyper-hyper-space/hhs3_rdb";
 
-import { createMockRContext } from "../../../rdb/test/mock_rcontext.js";
+import { createMockRContext } from "@hyper-hyper-space/hhs3_rdb_adapter_test_gen";
 import { changesToEntries, type IngestPlan, type MappingLookup } from "../../src/ingest.js";
 import type { AdapterConfig } from "../../src/types.js";
 
 import { fingerprintRdbRows } from "./fingerprint.js";
 import { generateCapturedBatch } from "./ingest_generate.js";
-import { resolveFuzzSweepOptions, type ResolvedFuzzSweepOptions } from "./profiles.js";
+import { resolveFuzzSweepOptions, type ResolvedFuzzSweepOptions } from "@hyper-hyper-space/hhs3_rdb_adapter_test_gen";
 
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);

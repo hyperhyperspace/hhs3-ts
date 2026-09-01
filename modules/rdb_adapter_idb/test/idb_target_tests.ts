@@ -37,6 +37,7 @@ function waitTx(tx: FacadeTransaction): Promise<void> {
 function idbReader(target: IdbTarget): ProjectionReader {
     return {
         hasTable: (table) => target.hasTable(table),
+        listTables: () => target.appTables(),
         getRowIds: (table) => target.getRowIds(table),
         getRow: async (table, rowId): Promise<ReadRow | undefined> => {
             const row = await target.getRowByRowId(table, rowId);

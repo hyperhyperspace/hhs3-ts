@@ -36,7 +36,7 @@ The same mechanism covers data and schemas. A schema is referenced by hash and r
 
 A delta reports how the database differs between two versions, on three channels:
 
-- **Schema** — how the schema evolved: added columns and defaults, dropped tables, changed foreign keys, restrictions, flags.
+- **Schema** — how the schema evolved: added columns and defaults, dropped tables, changed foreign keys, restrictions, flags, and table/column **reincarnations** (a same-shape drop+re-add whose resolved def is unchanged but whose incarnation reset, so a consumer must clear and re-materialize rather than diff in place).
 - **Row (data)** — rows whose live values changed (materialized projection diff).
 - **Op** — group DAG entries whose at-use void verdict flipped (reconciliation mind-changed), including gated observes when they void. Each flip carries a structured void reason at the voided horizon (`start` when un-voided, `end` when became voided): restriction failure, dangling FK, observe-gate failure, or authorization cycle.
 
@@ -79,10 +79,22 @@ Rdb is four content-addressed MVT types. C-SQL and the adapter are the intended 
 
 - **RSchema** — the specification for one table group: tables, columns, foreign keys, restrictions, and migration rules. A standalone object with its own history; it evolves independently and is reusable by many groups. Spec authority belongs to its signed creators.
 - **RTableGroup** — the unit of atomicity, snapshot, observation, and composition. Pins a schema version, binds and observes foreign groups, and is where deploys and cross-group references happen.
-- **RTable** — a member table on a scoped projection of its group's history. Rows are write-once identities with permanent deletes; column updates are pinned to the schema birth write active at write time and per-field last-writer-wins within that incarnation.
+- **RTable** — a member table on a scoped projection of its group's history. Rows are write-once identities with permanent deletes; both row liveness and per-field column values are pinned to the structural table/column incarnation active at write time (per-field last-writer-wins within that incarnation), so a drop+re-add resets the table or column. See [Schema evolution and incarnations](#schema-evolution-and-incarnations).
 - **RDb** — the deployment sync root: records member schemas and groups and ensures they and their transitive references are present and syncing in the replica.
 
 All four are `RObject`s, so a consumer can observe advances through `subscribe` and pull deltas in response — the mechanism [rdb_projection](../rdb_projection) uses to stay in sync without polling. See [mvt Reactivity](../mvt#reactivity).
+
+## Schema evolution and incarnations
+
+Schema evolution is coordination-free: `add-table` / `drop-table` / `add-column` / `drop-column` / `set-fks` / `set-restrictions` / `set-concurrent-deletes` are per-slot writes resolved by last-writer-wins, so two replicas can migrate concurrently and still converge. To make that convergence *meaningful* — and to make a drop+re-add genuinely reset a table or column — every table and column carries a **structural incarnation id**.
+
+An incarnation id is a content hash of the birth definition plus a **drop generation** (the number of causal-ancestor drop tombstones for that slot). Three consequences follow directly:
+
+- **Structurally-identical concurrent adds converge.** Two branches that independently `add-table t` (or `add-column c`) with a byte-identical definition compute the *same* incarnation id, so neither masks the other and independently-run identical migrations are safe to merge. For a converged `add-table`, both branches' rows *and* column values merge under ordinary LWW; for a converged `add-column`, both branches' values for that column merge.
+- **Structurally-different concurrent adds pick a winner.** Different definitions (say a different default) yield different ids; the per-slot LWW picks one winner and the loser's writes are masked (resolve to the winning default / absent), exactly as a losing concurrent value write would.
+- **Drop + re-add resets.** A re-add is always causally after the drop it follows, so its drop generation is higher and its id differs — even for a byte-identical definition. The old incarnation's rows and column values are masked; the table/column starts empty. Because the generation is a *count* (not a set of drop hashes), two replicas that independently run the same drop+re-add migration still converge.
+
+Row **liveness** is incarnation-scoped, not just column values: a row belongs to the table incarnation it was written under, so a table reset makes prior rows non-live and lets a `rowId` be re-inserted under the new incarnation. A delta reports a same-shape reset as `reincarnated` on the table (or column) change; a projection consumer treats it as drop + create + backfill (see [rdb_adapter](../rdb_adapter)). Object identity is unchanged — a table's id stays `hash(groupId, name)`; the incarnation is a filter *within* that name-keyed scope. See `src/rschema/incarnation.ts`.
 
 ## Column types
 

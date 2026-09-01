@@ -1,4 +1,7 @@
-import { PRNG } from "../../../rdb/test/delta_parity/prng.js";
+// Seeded captured-outbox generator for the ingest planner-parity fuzzer.
+// Emits CapturedBatch lists over posts/comments/ledger occupancy; stays in
+// rdb_adapter because CapturedChange is an adapter type (not rdb).
+import { PRNG } from "@hyper-hyper-space/hhs3_rdb_adapter_test_gen";
 import type { CapturedBatch, CapturedChange, SyncMapping } from "../../src/types.js";
 
 const POSTS = 8;

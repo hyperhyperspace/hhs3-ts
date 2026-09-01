@@ -1,13 +1,13 @@
 import { testing } from "@hyper-hyper-space/hhs3_util";
 
 import {
-    createIngestionSuite, createKeysSuite, createProjectionSuite, memoryAuthorIdTest,
-    memoryHarness, memoryIngestionHarness,
+    createIngestionSuite, createKeysSuite, createProjectionSuite, createProjectionParitySuite,
+    memoryAuthorIdTest, memoryHarness, memoryIngestionHarness, parseTestFilters,
 } from "../src/index.js";
 
 async function main() {
     const allTests = new Map<string, Array<{ name: string, invoke: () => Promise<void> }>>();
-    const filters = process.argv.slice(2);
+    const filters = parseTestFilters(process.argv.slice(2));
 
     // The reference-target self-check: run the shared suites against MemoryTarget.
     const memorySuite = createProjectionSuite('MEMORY', memoryHarness);
@@ -16,6 +16,8 @@ async function main() {
     allTests.set(memoryIngestion.title, memoryIngestion.tests);
     const memoryKeys = createKeysSuite('MEMORY', memoryHarness);
     allTests.set(memoryKeys.title, [memoryAuthorIdTest, ...memoryKeys.tests]);
+    const memoryProjection = createProjectionParitySuite('MEMORY', memoryHarness);
+    allTests.set(memoryProjection.title, memoryProjection.tests);
 
     console.log('Running tests for Hyper Hyper Space v3 rdb_adapter_test module'
         + (filters.length > 0 ? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');

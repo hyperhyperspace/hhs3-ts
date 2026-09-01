@@ -1,11 +1,14 @@
 import { testing } from "@hyper-hyper-space/hhs3_util";
 
-import { createIngestionSuite, createKeysSuite, createProjectionSuite } from "@hyper-hyper-space/hhs3_rdb_adapter_test";
+import {
+    createIngestionSuite, createKeysSuite, createProjectionSuite, createProjectionParitySuite,
+    parseTestFilters,
+} from "@hyper-hyper-space/hhs3_rdb_adapter_test";
 import { sqliteHarness, sqliteIngestionHarness, sqliteSpecificTests } from "./sqlite_target_tests.js";
 
 async function main() {
     const allTests = new Map<string, Array<{ name: string, invoke: () => Promise<void> }>>();
-    const filters = process.argv.slice(2);
+    const filters = parseTestFilters(process.argv.slice(2));
 
     const sharedSuite = createProjectionSuite('SQLITE', sqliteHarness);
     allTests.set(sharedSuite.title, sharedSuite.tests);
@@ -13,6 +16,8 @@ async function main() {
     allTests.set(ingestionSuite.title, ingestionSuite.tests);
     const keysSuite = createKeysSuite('SQLITE', sqliteHarness);
     allTests.set(keysSuite.title, keysSuite.tests);
+    const projectionSuite = createProjectionParitySuite('SQLITE', sqliteHarness);
+    allTests.set(projectionSuite.title, projectionSuite.tests);
     allTests.set(sqliteSpecificTests.title, sqliteSpecificTests.tests);
 
     console.log('Running tests for Hyper Hyper Space v3 rdb_adapter_sqlite module'

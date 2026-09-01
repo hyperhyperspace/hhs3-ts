@@ -64,6 +64,7 @@ import { validateInsertAgainstSchema, validateRowOpAgainstSchema, validateProvid
 import { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload } from "./payload.js";
 import { validateTableGroupPayloadFormat } from "./validate.js";
 import { evaluatePredicate, evaluateRowOpRestriction } from "./predicates.js";
+import { rowTag } from "./scopes.js";
 
 // What op-mode validation needs from the group (implemented by
 // RTableGroupImpl; a structural type to avoid an import cycle).
@@ -306,11 +307,15 @@ async function validateRowEnvelope(envelope: RowEnvelopePayload, group: GroupOpH
     const table = group.makeTable(envelope.table);
 
     if (op.action === 'insert') {
-        // rowIds are write-once: any prior op for this rowId (insert OR
-        // delete) at or below `at` makes the insert invalid — in particular
-        // a deleted rowId can never be re-inserted
+        // rowIds are write-once WITHIN a table incarnation: any prior op for
+        // this rowId (insert OR delete) at or below `at` makes the insert
+        // invalid — in particular a deleted rowId can never be re-inserted. The
+        // cover is incarnation-scoped, so a table drop+re-add starts a fresh
+        // rowId namespace (a prior incarnation's rows do not block re-insert).
+        const incarnation = schemaView.getTableIncarnation(envelope.table);
+        if (incarnation === undefined) return validationFailure(`table '${envelope.table}' is not live`);
         const tableDag = await table.getScopedDag();
-        const cover = await tableDag.findCoverWithFilter(at, { containsValues: { rows: [op.rowId] } });
+        const cover = await tableDag.findCoverWithFilter(at, { containsValues: { rows: [rowTag(incarnation, op.rowId)] } });
         if (cover.size !== 0) return validationFailure(`rowId '${op.rowId}' already exists or was deleted in table '${envelope.table}'`);
     } else {
         // updates and deletes need an undeleted row at the op's own position
@@ -421,8 +426,10 @@ async function validateBundle(bundle: BundlePayload, group: GroupOpHost, at: Ver
 
         const tbl = group.makeTable(table);
         if (op.action === 'insert') {
+            const incarnation = schemaView.getTableIncarnation(table);
+            if (incarnation === undefined) return validationFailure(`table '${table}' is not live`);
             const tableDag = await tbl.getScopedDag();
-            const cover = await tableDag.findCoverWithFilter(at, { containsValues: { rows: [op.rowId] } });
+            const cover = await tableDag.findCoverWithFilter(at, { containsValues: { rows: [rowTag(incarnation, op.rowId)] } });
             if (cover.size !== 0) return validationFailure(`bundle insert rowId '${op.rowId}' already exists or was deleted in table '${table}'`);
         } else {
             if (!await tbl.baseHasRow(op.rowId, at)) return validationFailure(`bundle op rowId '${op.rowId}' is not live in table '${table}'`);

@@ -8,6 +8,8 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "test": "node --import ../../register.mjs ./test/run_tests.ts",
+    "test:projection:fast": "node --import ../../register.mjs ./test/run_tests.ts PROJECTION --profile fast",
+    "test:projection:full": "node --import ../../register.mjs ./test/run_tests.ts PROJECTION --profile full",
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist"
   },

@@ -3,6 +3,7 @@ export * from "./rschema/payload.js";
 export * from "./rschema/validate.js";
 export * from "./rschema/validate_ops.js";
 export * from "./rschema/resolve.js";
+export * from "./rschema/incarnation.js";
 export * from "./rschema/delta.js";
 export * from "./rschema/interfaces.js";
 export * from "./rschema/rschema.js";

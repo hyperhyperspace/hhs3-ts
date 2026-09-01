@@ -180,6 +180,28 @@ async function testProviderClose() {
     testing.assertTrue(serverClosed, 'server transport should close when provider closes');
 }
 
+async function testSchemeDefaultAndWss() {
+    const ws = new WsTransportProvider();
+    testing.assertEquals(ws.scheme, 'ws', 'default scheme should be ws');
+    ws.close();
+
+    const wss = new WsTransportProvider('wss');
+    testing.assertEquals(wss.scheme, 'wss', 'constructor should set wss');
+
+    let threw = false;
+    try {
+        await wss.listen('wss://127.0.0.1:0', () => {});
+    } catch (e) {
+        threw = true;
+        testing.assertTrue(
+            (e as Error).message.includes('TLS termination'),
+            'wss listen() should mention TLS termination',
+        );
+    }
+    testing.assertTrue(threw, 'wss listen() should throw');
+    wss.close();
+}
+
 async function testBinaryIntegrity() {
     const provider = new WsTransportProvider();
 
@@ -219,6 +241,7 @@ const allSuites = [
             { name: '[WS_03] Multiple clients', invoke: testMultipleClients },
             { name: '[WS_04] Provider close', invoke: testProviderClose },
             { name: '[WS_05] Binary integrity', invoke: testBinaryIntegrity },
+            { name: '[WS_06] Scheme default and wss listen guard', invoke: testSchemeDefaultAndWss },
         ],
     },
 ];

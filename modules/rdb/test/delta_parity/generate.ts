@@ -160,6 +160,10 @@ export async function generateSingleGroupHistory(seed: number, ops: number): Pro
                 if (!hasStatus) kinds.push('add-status'); else kinds.push('drop-status');
                 kinds.push('toggle-cd');
                 if (hasFk) kinds.push('drop-fk'); else kinds.push('add-fk');
+                // whole-table drop+re-add of `orders` while it holds live rows
+                // referenced by `lines`: resets the table incarnation (old order
+                // rows go non-live, referencing lines dangle at-use).
+                kinds.push('reincarnate-orders');
                 const kind = kinds[prng.nextInt(0, kinds.length - 1)];
 
                 if (kind === 'add-status') {
@@ -170,8 +174,13 @@ export async function generateSingleGroupHistory(seed: number, ops: number): Pro
                     await schema.updateSchema([{ rule: 'set-concurrent-deletes', table: 'lines', value: !cd }], admin, 'toggle cd');
                 } else if (kind === 'drop-fk') {
                     await schema.updateSchema([{ rule: 'set-fks', table: 'lines', fks: {} }], admin, 'drop fk');
-                } else {
+                } else if (kind === 'add-fk') {
                     await schema.updateSchema([{ rule: 'set-fks', table: 'lines', fks: { order: 'orders' } }], admin, 'add fk');
+                } else {
+                    await schema.updateSchema([
+                        { rule: 'drop-table', table: 'orders' },
+                        { rule: 'add-table', def: open('orders', { customer: { type: 'string' } }) },
+                    ], admin, 'reincarnate orders');
                 }
 
                 const v2 = await schemaFrontier();
@@ -182,7 +191,8 @@ export async function generateSingleGroupHistory(seed: number, ops: number): Pro
                 else if (kind === 'drop-status') hasStatus = false;
                 else if (kind === 'toggle-cd') cd = !cd;
                 else if (kind === 'drop-fk') hasFk = false;
-                else hasFk = true;
+                else if (kind === 'add-fk') hasFk = true;
+                else hasStatus = false;   // reincarnate-orders: fresh base def
             }
         } catch {
             continue;   // invalid attempt (rejected write/deploy): not recorded

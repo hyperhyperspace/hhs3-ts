@@ -6,16 +6,28 @@
 // `from` revises the schema at the merged frontier — newly added restrictions
 // and columns (with defaults) activate, exactly like a concurrent row barrier.
 //
+// Liveness is INCARNATION-SCOPED: every row op is meta-tagged with the TABLE
+// incarnation active at write time (`rows: ['<tableIncarnationId>:<rowId>']`,
+// see ../rtable_group/scopes.ts), and all liveness cover queries filter on the
+// CURRENT table incarnation at this horizon. So a table drop+re-add (or a
+// losing concurrent-create fork) starts a fresh row namespace: prior-incarnation
+// inserts/deletes never match, old rows go non-live, and a rowId may be
+// re-inserted under the new incarnation. If the table does not exist at this
+// horizon the row is not live. This mirrors column-value incarnation scoping
+// (below); together they make a table reset behave like a fresh table.
+//
 // Liveness has two layers:
 //
-//   1. Permanent-delete state (rowIds are write-once identities): some VALID
-//      insert at or below `at`, no valid delete at or below `at`, and no valid
-//      delete barrier concurrent to `at` visible from `from` whose table has
-//      concurrentDeletes enabled. Deletes are ALWAYS barrier-tagged at write;
-//      the concurrentDeletes flag is resolved AT-USE, per concurrent delete,
-//      at THAT delete's own position observed from `from`. A causally-later
-//      flip of the flag never revises an old delete; a flip concurrent to the
-//      delete does. No revival, ever.
+//   1. Permanent-delete state (rowIds are write-once identities WITHIN a table
+//      incarnation): some VALID insert at or below `at`, no valid delete at or
+//      below `at`, and no valid delete barrier concurrent to `at` visible from
+//      `from` whose table has concurrentDeletes enabled. Deletes are ALWAYS
+//      barrier-tagged at write; the concurrentDeletes flag is resolved AT-USE,
+//      per concurrent delete, at THAT delete's own position observed from
+//      `from`. A concurrent delete tagged for a DIFFERENT incarnation cannot
+//      kill or barrier this row. A causally-later flip of the flag never
+//      revises an old delete; a flip concurrent to the delete does. No revival,
+//      ever.
 //   2. Op validity (drop-on-void): an entry is VOID when any row op it carries
 //      fails its restriction predicate OR writes an FK column whose target is
 //      not live, both evaluated AT-USE at the op's own position observed from
@@ -54,8 +66,9 @@ import { version, Version, ScopedDag } from "@hyper-hyper-space/hhs3_mvt";
 import { deserializePublicKeyFromBase64 } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchemaView } from "../rschema/interfaces.js";
+import type { IncarnationId } from "../rschema/incarnation.js";
 import type { ColumnType, Operand } from "../rschema/payload.js";
-import { colTag, type RowsSlicePayload } from "../rtable_group/scopes.js";
+import { colTag, rowTag, type RowsSlicePayload } from "../rtable_group/scopes.js";
 
 import type { RTable, RTableView, Row, RowValues, DeltaRowState } from "./interfaces.js";
 import type { InsertRowPayload, RowOpPayload } from "./payload.js";
@@ -172,7 +185,13 @@ export class RTableViewImpl implements RTableView {
         const dag = await this.target.getScopedDag();
         const table = this.target.getTableName();
 
-        const history = await findAllWithFilter(dag, this.at, { containsValues: { rows: [rowId] } });
+        // liveness is scoped to the CURRENT table incarnation: ops tagged for a
+        // prior incarnation (before a drop+re-add, or a losing concurrent-create
+        // fork) never match, so the table truly resets.
+        const incarnation = (await this.schemaView()).getTableIncarnation(table);
+        if (incarnation === undefined) return undefined;   // table not live here
+
+        const history = await findAllWithFilter(dag, this.at, { containsValues: { rows: [rowTag(incarnation, rowId)] } });
 
         let winner: InsertRowPayload | undefined;
         let winnerHash: B64Hash | undefined;
@@ -195,7 +214,7 @@ export class RTableViewImpl implements RTableView {
         // concurrentDeletes is resolved AT-USE, per delete barrier (base
         // liveness ignores view-time restriction/FK rechecks — deletes count
         // whether voided or not).
-        if (await this.killedByConcurrentDelete(rowId, table, false)) return undefined;
+        if (await this.killedByConcurrentDelete(rowId, table, incarnation, false)) return undefined;
 
         return winner;
     }
@@ -207,11 +226,11 @@ export class RTableViewImpl implements RTableView {
     // the delete does. Deletes are always barrier-tagged. When `checkVoided` is
     // set a voided delete is skipped (the enforced path); base liveness counts
     // deletes regardless of voiding.
-    private async killedByConcurrentDelete(rowId: B64Hash, table: string, checkVoided: boolean): Promise<boolean> {
+    private async killedByConcurrentDelete(rowId: B64Hash, table: string, incarnation: IncarnationId, checkVoided: boolean): Promise<boolean> {
         const dag = await this.target.getScopedDag();
         const concurrentBarriers = await dag.findConcurrentCoverWithFilter(
             this.from, this.at,
-            { containsValues: { barrier: ['t'], rows: [rowId] } });
+            { containsValues: { barrier: ['t'], rows: [rowTag(incarnation, rowId)] } });
 
         for (const hash of concurrentBarriers) {
             if (checkVoided && await this.entryVoided(hash)) continue;
@@ -239,9 +258,13 @@ export class RTableViewImpl implements RTableView {
         const dag = await this.target.getScopedDag();
         const table = this.target.getTableName();
 
+        // liveness is scoped to the CURRENT table incarnation (see baseLiveInsert)
+        const incarnation = (await this.schemaView()).getTableIncarnation(table);
+        if (incarnation === undefined) return undefined;   // table not live here
+
         // full history (not just the cover): a voided entry in the cover
         // must not mask valid ops below it
-        const history = await findAllWithFilter(dag, this.at, { containsValues: { rows: [rowId] } });
+        const history = await findAllWithFilter(dag, this.at, { containsValues: { rows: [rowTag(incarnation, rowId)] } });
 
         let winner: InsertRowPayload | undefined;
         let winnerHash: B64Hash | undefined;
@@ -271,7 +294,7 @@ export class RTableViewImpl implements RTableView {
         // `from`, kills the row even though it is not in the row's history,
         // honored at-use per the concurrentDeletes flag at the delete's
         // position (see killedByConcurrentDelete).
-        if (await this.killedByConcurrentDelete(rowId, table, true)) return undefined;
+        if (await this.killedByConcurrentDelete(rowId, table, incarnation, true)) return undefined;
 
         return winner;
     }

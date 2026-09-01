@@ -23,9 +23,10 @@
 // references and keeps id mappings across deletes, which enforced FKs would
 // reject. Callers must not enable foreign_keys on this connection.
 //
-// Atomicity: apply() runs schema actions THEN row actions THEN the checkpoint
-// commit inside ONE better-sqlite3 transaction; a throw rolls the whole batch
-// back, so the target never claims a checkpoint it does not reflect.
+// Atomicity: apply() runs schema actions THEN row actions THEN any NOT NULL
+// tighten rebuilds THEN the checkpoint commit inside ONE better-sqlite3
+// transaction; a throw rolls the whole batch back, so the target never claims
+// a checkpoint it does not reflect.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
@@ -107,9 +108,10 @@ function defaultFragment(def: ColumnDef): string {
     return ' DEFAULT ' + quoteText(String(value));
 }
 
-// A business-column declaration: `"name" TYPE [NOT NULL] [DEFAULT x]`. rdb
-// guarantees a non-nullable column added later carries a default, satisfying
-// SQLite's ADD COLUMN rule.
+// A business-column declaration: `"name" TYPE [NOT NULL] [DEFAULT x]`. SQLite
+// rejects ALTER TABLE ADD COLUMN ... NOT NULL with no non-NULL default on a
+// non-empty table. addColumn relaxes those adds to nullable and applyTightens
+// restores NOT NULL after the row backfill (same transaction).
 function columnDecl(name: string, def: ColumnDef): string {
     const nn = def.nullable ? '' : ' NOT NULL';
     return `${quoteId(name)} ${sqliteType(def.type)}${nn}${defaultFragment(def)}`;
@@ -196,9 +198,11 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         const run = this.db.transaction(() => {
             // Echo suppression: mark the whole batch as adapter-authored so the
             // capture triggers no-op on our own materialization writes.
+            const tighten: { table: string; column: string }[] = [];
             if (this.capture) this.setApplying(true);
-            for (const action of schemaActions) this.applySchemaAction(action);
+            for (const action of schemaActions) this.applySchemaAction(action, tighten);
             for (const action of rowActions) this.applyRowAction(action);
+            this.applyTightens(tighten);
             this.persistCheckpoint(groupId, checkpoint);
             // Concurrency void/reinstate flips ride the same checkpoint advance.
             if (events !== undefined) for (const e of events) this.logOpEvent(e);
@@ -394,11 +398,13 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     // Schema channel
     // -----------------------------------------------------------------------
 
-    private applySchemaAction(action: SchemaAction): void {
+    private applySchemaAction(
+        action: SchemaAction, tighten: { table: string; column: string }[],
+    ): void {
         switch (action.kind) {
             case 'create-table': return this.createTable(action);
             case 'drop-table': return this.dropTable(action);
-            case 'add-column': return this.addColumn(action);
+            case 'add-column': return this.addColumn(action, tighten);
             case 'drop-column': return this.dropColumn(action);
         }
     }
@@ -473,18 +479,34 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         this.metaCache.delete(action.table);
     }
 
-    private addColumn(action: Extract<SchemaAction, { kind: 'add-column' }>): void {
+    private addColumn(
+        action: Extract<SchemaAction, { kind: 'add-column' }>,
+        tighten: { table: string; column: string }[],
+    ): void {
         // SQLite cannot ADD COLUMN with an inline table-level FK constraint, so a
         // local FK / key-ref added later is tracked in meta (for upsert translation)
         // but its advisory DB FK is not retrofitted - acceptable since FKs are
         // advisory.
-        this.db.exec(`ALTER TABLE ${quoteId(action.table)} ADD COLUMN ${columnDecl(action.column, action.def)}`);
+        //
+        // SQLite also rejects ADD COLUMN ... NOT NULL with no non-NULL default on
+        // a non-empty table. Relax those adds to nullable here; applyTightens
+        // restores NOT NULL after the row backfill, in the same transaction.
+        const relax = action.def.nullable !== true
+            && action.def.default === undefined
+            && this.tableHasRows(action.table);
+        const def = relax ? { ...action.def, nullable: true } : action.def;
+        this.db.exec(`ALTER TABLE ${quoteId(action.table)} ADD COLUMN ${columnDecl(action.column, def)}`);
         const meta = this.loadMeta(action.table);
         meta.columnTypes[action.column] = action.def.type;
         if (action.fk !== undefined) meta.fkColumns[action.column] = { targetTable: action.fk.targetTable };
         if (action.keyRef === true) meta.keyRefColumns.push(action.column);
         this.writeMeta(action.table, meta);
         if (this.capture) this.installTriggers(action.table, meta);   // pick up the new column
+        if (relax) tighten.push({ table: action.table, column: action.column });
+    }
+
+    private tableHasRows(table: string): boolean {
+        return this.db.prepare(`SELECT 1 FROM ${quoteId(table)} LIMIT 1`).get() !== undefined;
     }
 
     private dropColumn(action: Extract<SchemaAction, { kind: 'drop-column' }>): void {
@@ -497,7 +519,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         const fkList = this.db.prepare(`PRAGMA foreign_key_list(${quoteId(action.table)})`)
             .all() as { id: number; seq: number; table: string; from: string; to: string }[];
         if (fkList.some((f) => f.from === action.column)) {
-            this.rebuildTableWithoutColumn(action.table, action.column, fkList);
+            this.rebuildTable(action.table, { dropColumn: action.column });
         } else {
             this.db.exec(`ALTER TABLE ${quoteId(action.table)} DROP COLUMN ${quoteId(action.column)}`);
         }
@@ -509,37 +531,44 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         if (this.capture) this.installTriggers(action.table, meta);   // drop the column's trigger
     }
 
-    // Rebuild `table` without `column` (and without any FK constraint that
-    // referenced it), preserving every surviving column's EXACT definition and
-    // the surviving advisory FK constraints. Used when a plain DROP COLUMN would
-    // be rejected for naming a column in a FOREIGN KEY clause. Column defs are
-    // read live via PRAGMA table_info, so no NOT NULL / DEFAULT detail is lost
-    // (meta records only ColumnType). Runs inside apply()'s transaction; because
-    // foreign_keys is OFF, dropping the old table does not trip inbound
-    // (sync-table) references, and the RENAME - by the unchanged table name -
-    // leaves those references intact.
-    private rebuildTableWithoutColumn(
-        table: string, column: string,
-        fkList: { id: number; from: string; to: string; table: string }[],
+    // Rebuild `table` as CREATE tmp / INSERT...SELECT / DROP / RENAME, optionally
+    // dropping a column and/or forcing named columns to NOT NULL. Used when a
+    // plain DROP COLUMN would be rejected for naming a column in a FOREIGN KEY
+    // clause, and by applyTightens to restore NOT NULL after a relaxed ADD COLUMN.
+    // Column defs are read live via PRAGMA table_info, so no NOT NULL / DEFAULT
+    // detail is lost (meta records only ColumnType). Runs inside apply()'s
+    // transaction; because foreign_keys is OFF, dropping the old table does not
+    // trip inbound (sync-table / other-app-table) references, and the RENAME - by
+    // the unchanged table name - leaves those references intact.
+    //
+    // Trigger reinstall is the caller's job: DROP TABLE removes capture triggers,
+    // and dropColumn still needs to update meta before reinstalling.
+    private rebuildTable(
+        table: string, opts: { dropColumn?: string; forceNotNull?: ReadonlySet<string> } = {},
     ): void {
         const meta = this.loadMeta(table);
         const info = this.db.prepare(`PRAGMA table_info(${quoteId(table)})`)
             .all() as { name: string; type: string; notnull: number; dflt_value: string | null; pk: number }[];
-        const keep = info.filter((c) => c.name !== column);
+        const keep = info.filter((c) => c.name !== opts.dropColumn);
 
         // The id column is `INTEGER PRIMARY KEY` (owned serial); every other
-        // column re-renders its stored type + NOT NULL + DEFAULT verbatim.
-        const decls: string[] = keep.map((c) => c.name === meta.idColumn
-            ? `${quoteId(c.name)} INTEGER PRIMARY KEY`
-            : `${quoteId(c.name)} ${c.type}${c.notnull ? ' NOT NULL' : ''}`
-                + `${c.dflt_value !== null ? ' DEFAULT ' + c.dflt_value : ''}`);
+        // column re-renders its stored type + NOT NULL + DEFAULT verbatim, with
+        // forceNotNull overriding a currently-nullable column after backfill.
+        const decls: string[] = keep.map((c) => {
+            if (c.name === meta.idColumn) return `${quoteId(c.name)} INTEGER PRIMARY KEY`;
+            const nn = c.notnull || opts.forceNotNull?.has(c.name) ? ' NOT NULL' : '';
+            return `${quoteId(c.name)} ${c.type}${nn}`
+                + `${c.dflt_value !== null ? ' DEFAULT ' + c.dflt_value : ''}`;
+        });
 
         // Re-emit every surviving FK constraint (grouped by its id), skipping the
-        // group that referenced the dropped column. Projected FKs are single-column.
+        // group that referenced a dropped column. Projected FKs are single-column.
+        const fkList = this.db.prepare(`PRAGMA foreign_key_list(${quoteId(table)})`)
+            .all() as { id: number; from: string; to: string; table: string }[];
         const byId = new Map<number, { from: string; to: string; table: string }[]>();
         for (const f of fkList) byId.set(f.id, [...(byId.get(f.id) ?? []), f]);
         for (const group of byId.values()) {
-            if (group.some((f) => f.from === column)) continue;
+            if (opts.dropColumn !== undefined && group.some((f) => f.from === opts.dropColumn)) continue;
             const froms = group.map((f) => quoteId(f.from)).join(', ');
             const tos = group.map((f) => quoteId(f.to)).join(', ');
             decls.push(`FOREIGN KEY (${froms}) REFERENCES ${quoteId(group[0].table)} (${tos})`);
@@ -551,6 +580,24 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         this.db.exec(`INSERT INTO ${quoteId(tmp)} (${cols}) SELECT ${cols} FROM ${quoteId(table)}`);
         this.db.exec(`DROP TABLE ${quoteId(table)}`);
         this.db.exec(`ALTER TABLE ${quoteId(tmp)} RENAME TO ${quoteId(table)}`);
+    }
+
+    // Restore NOT NULL on columns that addColumn had to add as nullable (SQLite
+    // ADD COLUMN rule). Grouped per table so one rebuild covers every column
+    // tightened in this apply. The rebuild's NOT NULL is also a backfill-
+    // completeness assertion: a live row still NULL throws and rolls the batch.
+    private applyTightens(specs: { table: string; column: string }[]): void {
+        if (specs.length === 0) return;
+        const grouped = new Map<string, Set<string>>();
+        for (const s of specs) {
+            const cols = grouped.get(s.table);
+            if (cols === undefined) grouped.set(s.table, new Set([s.column]));
+            else cols.add(s.column);
+        }
+        for (const [table, cols] of grouped) {
+            this.rebuildTable(table, { forceNotNull: cols });
+            if (this.capture) this.installTriggers(table, this.loadMeta(table));
+        }
     }
 
     // -----------------------------------------------------------------------

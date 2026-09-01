@@ -161,8 +161,10 @@ target.addChangeListener(() => {
 
 ## Test
 
-Runs the shared conformance, ingestion, and keys suites from [rdb_adapter_test](../rdb_adapter_test). The ingestion harness mutates through `target.database`. A few IDB-only cases cover apply vs the outbox, a transaction abort, reopen, BroadcastChannel across two `IdbTarget`s, and concurrent id allocation. Tests use [`fake-indexeddb`](https://github.com/dumbmatter/fakeIndexedDB).
+Runs the shared conformance, ingestion, and keys suites from [rdb_adapter_test](../rdb_adapter_test). The ingestion harness mutates through `target.database`. A few IDB-only cases cover apply vs the outbox, a transaction abort, reopen, BroadcastChannel across two `IdbTarget`s, and concurrent id allocation. Tests use [`fake-indexeddb`](https://github.com/dumbmatter/fakeIndexedDB). `npm test` includes a smoke projection-vs-rdb sweep (shared [generator](../rdb_adapter_test_gen) vs rdb as oracle, not idb-vs-sqlite); heavier profiles:
 
 ```
 npm test
+npm run test:projection:fast
+npm run test:projection:full
 ```

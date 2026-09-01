@@ -390,5 +390,33 @@ export const rschemaTests = {
                     'a same-name reincarnation persists the table across the delta');
             }
         },
+        {
+            name: '[RSCHEMA14] Delta reports reincarnated on a same-shape table drop+re-add',
+            invoke: async () => {
+                const { schema, admin } = await createTestEnv([ordersTable()]);
+                const scopedDag = await schema.getScopedDag();
+                const start = await scopedDag.getFrontier();
+
+                const startInc = (await schema.getView()).getTableIncarnation('orders');
+
+                // Drop then re-add with a BYTE-IDENTICAL def: the resolved def is
+                // unchanged, but the live TABLE incarnation moves (drop generation).
+                await schema.updateSchema([{ rule: 'drop-table', table: 'orders' }], admin);
+                await schema.updateSchema([{ rule: 'add-table', def: ordersTable() }], admin);
+
+                const end = await scopedDag.getFrontier();
+                const endInc = (await schema.getView()).getTableIncarnation('orders');
+
+                assertTrue(startInc !== undefined && endInc !== undefined && startInc !== endInc,
+                    'the table incarnation id changes across a same-shape drop+re-add');
+
+                const delta = await schema.computeDelta(start, end);
+                const table = delta.tableChanges.find((c) => c.table === 'orders');
+                assertTrue(table !== undefined, 'orders must appear in the delta despite an unchanged resolved def');
+                assertTrue(table!.reincarnated, 'the table change is flagged reincarnated');
+                assertTrue(table!.existedBefore && table!.existsAfter,
+                    'a same-name reincarnation persists the table across the delta');
+            }
+        },
     ],
 };

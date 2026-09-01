@@ -12,6 +12,7 @@
 
 import type { json } from "@hyper-hyper-space/hhs3_json";
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
+import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import type {
     OpVerdictChange, Row, RSchemaView, RTableGroup, RTableGroupDelta, RTableGroupView,
 } from "@hyper-hyper-space/hhs3_rdb";
@@ -106,16 +107,17 @@ export async function initialRowActions(
     return actions;
 }
 
-// Advance `target` to the group's current frontier. Initial (no checkpoint):
-// full schema + live-row backfill. Incremental: the schema + row channels of
-// group.computeDelta(checkpoint, frontier). Both apply atomically in one call.
-export async function projectGroup(
+// Advance `target` to version `to`. Initial (no checkpoint): full schema +
+// live-row backfill at `to`. Incremental: the schema + row channels of
+// group.computeDelta(checkpoint, to). Both apply atomically in one call.
+// Callers must pass a `to` that extends the target's current checkpoint.
+export async function projectGroupTo(
     group: RTableGroup,
     target: MaterializationTarget,
+    to: Version,
     config: AdapterConfig = {},
 ): Promise<void> {
     const groupId = group.getId();
-    const to = await (await group.getScopedDag()).getFrontier();
     const view = await group.getView(to, to);
     const endView = view.getSchemaView();
 
@@ -134,6 +136,16 @@ export async function projectGroup(
     const rowActions = await planIncrementalRowActions(view, delta, startView, endView, groupId, config);
     const events = opVerdictEvents(delta.opVerdictChanges, groupId, config);
     await target.apply(groupId, schemaActions, rowActions, to, events);
+}
+
+// Advance `target` to the group's current frontier.
+export async function projectGroup(
+    group: RTableGroup,
+    target: MaterializationTarget,
+    config: AdapterConfig = {},
+): Promise<void> {
+    const to = await (await group.getScopedDag()).getFrontier();
+    return projectGroupTo(group, target, to, config);
 }
 
 // Incremental row channel matching projectGroup: delta row actions, plus a
@@ -155,7 +167,12 @@ export async function planIncrementalRowActions(
     const deltaRows = rowActionsForDelta(delta, endView, groupId, config);
     const backfillTables = reprojectedTables(delta.schemaChanges, endView, startView, config);
     for (const change of delta.schemaChanges.tableChanges) {
-        if (!change.existedBefore && change.existsAfter) backfillTables.add(change.table);
+        // newly-created tables (rows may sit below the delta's revision bound)
+        // and same-shape reincarnations (schema_actions drops+recreates them,
+        // clearing every row) both need a full live-row re-scan to converge.
+        if ((!change.existedBefore && change.existsAfter) || change.reincarnated) {
+            backfillTables.add(change.table);
+        }
     }
     return backfillTables.size === 0
         ? deltaRows

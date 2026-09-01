@@ -8,7 +8,8 @@ import { Version } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchema, RSchemaView } from "./interfaces.js";
 import type { SchemaCreator } from "./payload.js";
-import { ColumnIncarnationId, SchemaState } from "./resolve.js";
+import { SchemaState } from "./resolve.js";
+import type { IncarnationId } from "./incarnation.js";
 import {
     TableDef, FKs, IdProvider, Predicate,
     DEFAULT_CONCURRENT_DELETES, defaultRestrictionRule,
@@ -114,7 +115,11 @@ export class RSchemaViewImpl implements RSchemaView {
         return this.state.tables.get(table)?.idProvider;
     }
 
-    getColumnIncarnation(table: string, column: string): ColumnIncarnationId | undefined {
+    getTableIncarnation(table: string): IncarnationId | undefined {
+        return this.state.tableIncarnations.get(table);
+    }
+
+    getColumnIncarnation(table: string, column: string): IncarnationId | undefined {
         return this.state.columnIncarnations.get(table)?.get(column);
     }
 }

@@ -8,15 +8,22 @@ import { WsTransport } from './ws_transport.js';
 
 export class WsTransportProvider implements TransportProvider {
 
-    readonly scheme = 'ws';
+    readonly scheme: string;
 
     private server?: WebSocketServer;
     private sockets = new Set<WebSocket>();
+
+    constructor(scheme: string = 'ws') {
+        this.scheme = scheme;
+    }
 
     async listen(
         address: NetworkAddress,
         onConnection: (transport: Transport) => void
     ): Promise<void> {
+        if (this.scheme === 'wss') {
+            throw new Error('wss listen requires TLS termination; run behind a reverse proxy and listen on ws');
+        }
         const url = new URL(address);
         const host = url.hostname;
         const port = parseInt(url.port, 10);

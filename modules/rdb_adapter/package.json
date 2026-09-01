@@ -24,6 +24,7 @@
     "@hyper-hyper-space/hhs3_util": "^0.1.0"
   },
   "devDependencies": {
+    "@hyper-hyper-space/hhs3_rdb_adapter_test_gen": "^0.1.0",
     "@types/node": "^22.2.0",
     "ts-node": "^10.9.2",
     "typescript": "6.0.3"
