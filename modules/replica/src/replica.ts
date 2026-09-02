@@ -39,6 +39,7 @@ export class Replica implements RContext {
     private rootIds: Set<B64Hash> = new Set();
     private backendByDagId: Map<B64Hash, string> = new Map();
     private newRootCallbacks = new Set<(obj: RObject) => void>();
+    private newObjectCallbacks = new Set<(obj: RObject) => void>();
 
     private dagCache: Map<string, Dag> = new Map();
 
@@ -80,6 +81,7 @@ export class Replica implements RContext {
         this.backendByDagId.clear();
         this.dagCache.clear();
         this.newRootCallbacks.clear();
+        this.newObjectCallbacks.clear();
     }
 
     /** @deprecated Use destroy() */
@@ -97,6 +99,14 @@ export class Replica implements RContext {
 
     unsubscribeNewRoot(callback: (obj: RObject) => void): void {
         this.newRootCallbacks.delete(callback);
+    }
+
+    subscribeNewObject(callback: (obj: RObject) => void): void {
+        this.newObjectCallbacks.add(callback);
+    }
+
+    unsubscribeNewObject(callback: (obj: RObject) => void): void {
+        this.newObjectCallbacks.delete(callback);
     }
 
     // --- Object registry ---
@@ -117,9 +127,11 @@ export class Replica implements RContext {
 
     private recordObject(obj: RObject): void {
         const id = obj.getId();
+        const isNew = !this.objects.has(id);
         this.objects.set(id, obj);
         const label = obj.getBackendLabel();
         this.backendByDagId.set(id, label);
+        if (isNew) this.notifyNewObject(obj);
     }
 
     private releaseObject(id: B64Hash): void {
@@ -271,6 +283,12 @@ export class Replica implements RContext {
 
     private notifyNewRoot(obj: RObject): void {
         for (const cb of [...this.newRootCallbacks]) {
+            try { cb(obj); } catch { /* keep firing even if a callback throws */ }
+        }
+    }
+
+    private notifyNewObject(obj: RObject): void {
+        for (const cb of [...this.newObjectCallbacks]) {
             try { cb(obj); } catch { /* keep firing even if a callback throws */ }
         }
     }

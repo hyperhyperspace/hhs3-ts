@@ -3,7 +3,7 @@ import { random } from '@hyper-hyper-space/hhs3_crypto';
 import type { Dag, Header } from '@hyper-hyper-space/hhs3_dag';
 import { json } from '@hyper-hyper-space/hhs3_json';
 import type { TopicChannel } from '@hyper-hyper-space/hhs3_mesh';
-import type { RObject, Version, ForeignDep } from '@hyper-hyper-space/hhs3_mvt';
+import type { RObject, Version, RContext } from '@hyper-hyper-space/hhs3_mvt';
 
 import { stringToUint8Array } from '@hyper-hyper-space/hhs3_crypto';
 import type {
@@ -87,7 +87,7 @@ export function createDagSynchronizer(
     hashSuite: HashSuite,
     getPeers: () => PeerHandle[],
     sendTo: (peer: PeerHandle, msg: SyncMsg) => SendResult,
-    resolveRefDag?: (refId: B64Hash) => Promise<Dag | undefined>,
+    ctx?: RContext,
 ): DagSynchronizer {
 
     // --- accumulative state ---
@@ -127,6 +127,51 @@ export function createDagSynchronizer(
 
     let workInProgress = false;
     let workNeeded = false;
+
+    const refSubs = new Map<B64Hash, { obj: RObject; cb: (version: Version) => void }>();
+    const waitingMissing = new Set<B64Hash>();
+    let newObjectCb: ((obj: RObject) => void) | undefined;
+
+    async function watchRef(obj: RObject): Promise<void> {
+        const id = obj.getId();
+        if (refSubs.has(id)) return;
+        const cb = () => { if (!destroyed) attemptWork(); };
+        obj.subscribe(cb);
+        refSubs.set(id, { obj, cb });
+        // Subscribe-then-read: wait for ScopedDagSubscription.attach (async
+        // getScopedDag + addListener) before the caller checks loadEntry.
+        await obj.getScopedDag();
+        await Promise.resolve();
+    }
+
+    function ensureNewObjectListener() {
+        if (newObjectCb !== undefined || ctx === undefined || ctx.subscribeNewObject === undefined) return;
+        const subscribe = ctx.subscribeNewObject;
+        newObjectCb = (obj: RObject) => {
+            if (destroyed) return;
+            const id = obj.getId();
+            if (!waitingMissing.has(id)) return;
+            waitingMissing.delete(id);
+            void watchRef(obj).then(() => attemptWork());
+            if (waitingMissing.size === 0) detachNewObjectListener();
+        };
+        subscribe(newObjectCb);
+    }
+
+    function detachNewObjectListener() {
+        if (newObjectCb === undefined) return;
+        ctx?.unsubscribeNewObject?.(newObjectCb);
+        newObjectCb = undefined;
+    }
+
+    function dropRefWatches() {
+        for (const { obj, cb } of refSubs.values()) {
+            obj.unsubscribe(cb);
+        }
+        refSubs.clear();
+        waitingMissing.clear();
+        detachNewObjectListener();
+    }
 
     // --- request ID generation ---
 
@@ -887,14 +932,23 @@ export function createDagSynchronizer(
                 const version: Version = new Set(prevHashes);
 
                 const foreignDeps = rObject.extractForeignDeps(payload, version);
-                if (foreignDeps !== undefined && resolveRefDag !== undefined) {
+                if (foreignDeps !== undefined && ctx !== undefined) {
                     let allDepsAvailable = true;
                     for (const dep of foreignDeps) {
-                        const refDag = await resolveRefDag(dep.dagId);
-                        if (refDag === undefined) { allDepsAvailable = false; break; }
+                        const obj = await ctx.getObject(dep.objectId);
+                        if (obj === undefined) {
+                            waitingMissing.add(dep.objectId);
+                            ensureNewObjectListener();
+                            allDepsAvailable = false;
+                            break;
+                        }
+                        waitingMissing.delete(dep.objectId);
+                        await watchRef(obj);
+                        const scoped = await obj.getScopedDag();
                         for (const requiredHash of dep.requiredHashes) {
-                            if (await refDag.loadHeader(requiredHash) === undefined) {
-                                allDepsAvailable = false; break;
+                            if (await scoped.loadEntry(requiredHash) === undefined) {
+                                allDepsAvailable = false;
+                                break;
                             }
                         }
                         if (!allDepsAvailable) break;
@@ -1041,6 +1095,7 @@ export function createDagSynchronizer(
         destroyed = true;
 
         dag.removeListener(onGrowth);
+        dropRefWatches();
 
         for (const state of pendingHeaderRequests.values()) {
             clearTimeout(state.timeout);

@@ -39,7 +39,8 @@
 //     RSchema and bound foreign groups — fetching any object not yet present
 //     with an explicit backend label. Backend labels are fixed at create /
 //     fetch time and only memoized thereafter, so the whole closure must be
-//     present before sessions open (resolveRefDag relies on a memoized label).
+//     present before sessions open (foreign-dep lookup uses getObject, which
+//     needs the closure already in the replica map).
 //   Step 2 (sessions): open one swarm + sync session per DAG not yet in the
 //     session map (including the RDb's own DAG) and activate it.
 // Membership is add-only in v1, so reconcile only opens missing sessions.
@@ -546,8 +547,7 @@ export class RDbImpl implements RDbContract, SyncableObject {
                     dag: rawDag,
                     rObject,
                     hashSuite: this.ctx.getHashSuite(),
-                    resolveRefDag: async (refId) =>
-                        this.ctx.getDag(refId, (await this.ctx.getBackendLabel(refId)) ?? this.backendLabel),
+                    ctx: this.ctx,
                 };
                 session = createSyncSession(target, [swarm]);
                 if (!this.isCurrent(epoch) || this.syncSessions.has(id)) {

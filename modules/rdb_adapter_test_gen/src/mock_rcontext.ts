@@ -76,6 +76,8 @@ export function createMockRContext(config: RObjectConfig = { selfValidate: true 
             return obj;
         },
 
+        registerObject: (obj: RObject) => { recordObject(obj); },
+
         unregisterObject: async (id: B64Hash) => {
             if (rootIds.has(id)) throw new Error(`Cannot unregister root object '${id}'`);
             const obj = objects.get(id);

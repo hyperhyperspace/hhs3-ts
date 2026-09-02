@@ -1,7 +1,7 @@
 import type { B64Hash, HashSuite } from '@hyper-hyper-space/hhs3_crypto';
 import type { Dag } from '@hyper-hyper-space/hhs3_dag';
 import type { Swarm, SwarmPeer } from '@hyper-hyper-space/hhs3_mesh';
-import type { RObject } from '@hyper-hyper-space/hhs3_mvt';
+import type { RObject, RContext } from '@hyper-hyper-space/hhs3_mvt';
 import { extractCreatePayloadType } from '@hyper-hyper-space/hhs3_mvt';
 
 import { decode, encode } from './codec.js';
@@ -31,7 +31,7 @@ export type SyncTarget = {
     dag: Dag;
     rObject: RObject;
     hashSuite: HashSuite;
-    resolveRefDag?: (refId: B64Hash) => Promise<Dag | undefined>;
+    ctx?: RContext;
 };
 
 export interface SyncSession {
@@ -87,7 +87,7 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[]): SyncSess
         target.hashSuite,
         getPeers,
         sendToWithReport,
-        target.resolveRefDag,
+        target.ctx,
     );
 
     synchronizer.onPeerIssue((peerKey, issue) => {

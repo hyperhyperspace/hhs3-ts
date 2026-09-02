@@ -40,14 +40,22 @@ export function createMockRContext(
 
     function recordObject(obj: RObject): void {
         const id = obj.getId();
+        const isNew = !objects.has(id);
         objects.set(id, obj);
         backendById.set(id, obj.getBackendLabel());
+        if (isNew) {
+            for (const cb of [...newObjectCallbacks]) {
+                try { cb(obj); } catch { /* keep firing */ }
+            }
+        }
     }
 
     function releaseObject(id: B64Hash): void {
         objects.delete(id);
         backendById.delete(id);
     }
+
+    const newObjectCallbacks = new Set<(obj: RObject) => void>();
 
     const ctx: RContext = {
         getCrypto: () => crypto,
@@ -90,6 +98,8 @@ export function createMockRContext(
             return obj;
         },
 
+        registerObject: (obj: RObject) => { recordObject(obj); },
+
         unregisterObject: async (id: B64Hash) => {
             if (rootIds.has(id)) {
                 throw new Error(`Cannot unregister root object '${id}'`);
@@ -101,6 +111,9 @@ export function createMockRContext(
         },
 
         fetchObject: opts.fetchObject,
+
+        subscribeNewObject: (cb) => { newObjectCallbacks.add(cb); },
+        unsubscribeNewObject: (cb) => { newObjectCallbacks.delete(cb); },
     };
 
     return ctx;

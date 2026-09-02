@@ -128,7 +128,7 @@ type RObject = {
 - `Payload` is a JSON literal, the unit of replication.
 - `View` is a read-only snapshot of the object's state at a given version, when observed from another version (see below).
 - `subscribe`/`unsubscribe` register reactivity callbacks: the callback receives the raw DAG frontier (`Version`) whenever the object's own sub-DAG advances (never on sibling changes). Register first, then read the current state to establish a cursor; at-least-once delivery follows any later change. See [Reactivity](#reactivity) for the full contract and concurrency guarantees.
-- `ForeignDep` identifies entries in another object's DAG that must be present before a payload can be validated. The sync layer uses `extractForeignDeps` to defer (rather than reject) entries whose cross-DAG dependencies are not yet available.
+- `ForeignDep` identifies another **RObject** (`objectId`) plus entry hashes on that object's scoped history that must be present before a payload can be validated. Lookup is `getObject(objectId)` then `getScopedDag().loadEntry` — never `getDag(objectId)`. The sync layer uses `extractForeignDeps` to defer (rather than reject) entries whose cross-object dependencies are not yet available, and retries when the referenced object grows (`subscribe`) or appears (`subscribeNewObject`).
 - `computeDelta` reports what changed between two versions (type-specific `Delta` implementation).
 - `getScopedDag` returns this object's logical history surface (`ScopedDag`), including `loadAllEntries` for full scans at the correct scope.
 - `getCausalDag` returns read-only access to the broader enclosing DAG (`findForkPosition` for concurrent-branch reasoning). For nested objects this is typically the parent's causal DAG.
@@ -175,11 +175,15 @@ type RContext = {
     getMesh(label: string): any;
 
     createObject(createPayload: Payload, backendLabel?: string): Promise<RObject>;
+    registerObject(obj: RObject): void;
     unregisterObject(id: B64Hash): Promise<void>;
+    fetchObject?(id: B64Hash, opts?: { meshLabel?: string; backendLabel?: string; timeoutMs?: number }): Promise<RObject>;
+    subscribeNewObject?(callback: (obj: RObject) => void): void;
+    unsubscribeNewObject?(callback: (obj: RObject) => void): void;
 }
 ```
 
-`getObject` is the canonical lookup for inter-object references (e.g. permissioned `RSet` resolving its `RCap`). `getBackendLabel` returns the immutable backend label recorded at registration. `unregisterObject` tears down owned (non-root) objects: `destroy()` then registry removal.
+`getObject` is the canonical lookup for inter-object references (e.g. permissioned `RSet` resolving its `RCap`). `registerObject` puts a non-root into that map; use it **only** when another object observes this one directly via ref-advance / `extractForeignDeps`. Nested RSets and RTables stay parent-local unless they become such a target. `subscribeNewObject` fires on first insertion (`createObject` cache miss and `registerObject`). `getBackendLabel` returns the immutable backend label recorded at registration. `unregisterObject` tears down owned (non-root) objects: `destroy()` then registry removal.
 
 ### `LoadObjectOptions`
 

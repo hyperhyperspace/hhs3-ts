@@ -827,7 +827,7 @@ export class RTableGroupImpl implements RTableGroupContract {
         if (isRefAdvancePayload(payload)) {
             const refPayload = payload as unknown as RefAdvancePayload;
             return [{
-                dagId: refPayload.refId,
+                objectId: refPayload.refId,
                 requiredHashes: [...extractRefVersion(refPayload)],
             }];
         }
@@ -837,11 +837,11 @@ export class RTableGroupImpl implements RTableGroupContract {
         if (action === 'create') {
             const create = payload as CreateTableGroupPayload;
             const deps: ForeignDep[] = [{
-                dagId: create.schemaRef,
+                objectId: create.schemaRef,
                 requiredHashes: [...json.fromSet(create.schemaVersion)],
             }];
             for (const target of Object.values(create.bindings ?? {})) {
-                deps.push({ dagId: target, requiredHashes: [] });
+                deps.push({ objectId: target, requiredHashes: [] });
             }
             return deps;
         }
@@ -851,9 +851,9 @@ export class RTableGroupImpl implements RTableGroupContract {
         // targets. The schema is needed at the op's version; bound groups need
         // only be present (their observed versions are pinned by the observe
         // ref-advance ops, which carry their own version deps above).
-        const deps: ForeignDep[] = [{ dagId: this.getSchemaRef(), requiredHashes: [] }];
+        const deps: ForeignDep[] = [{ objectId: this.getSchemaRef(), requiredHashes: [] }];
         for (const target of Object.values(this.getBindings())) {
-            deps.push({ dagId: target, requiredHashes: [] });
+            deps.push({ objectId: target, requiredHashes: [] });
         }
         return deps;
     }

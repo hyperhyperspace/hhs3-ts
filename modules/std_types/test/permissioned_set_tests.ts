@@ -433,7 +433,7 @@ export const permissionedSetTests = {
                 const deps = rset.extractForeignDeps({action: 'add', element: 'x'}, version());
                 assertTrue(deps !== undefined, 'should return foreign deps');
                 assertTrue(deps!.length === 1, 'should have one dep');
-                assertTrue(deps![0].dagId === cap.getId(), 'dep should point to the RCap');
+                assertTrue(deps![0].objectId === cap.getId(), 'dep should point to the RCap');
             }
         },
         {

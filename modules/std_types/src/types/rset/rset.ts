@@ -532,13 +532,13 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
         if (isRefAdvancePayload(payload)) {
             const refPayload = payload as RefAdvancePayload;
             if (refPayload.refId !== ref) return undefined;
-            return [{
-                dagId: ref,
-                requiredHashes: [...extractRefVersion(refPayload)],
-            }];
-        }
+                return [{
+                    objectId: ref,
+                    requiredHashes: [...extractRefVersion(refPayload)],
+                }];
+            }
 
-        return [{ dagId: ref, requiredHashes: [] }];
+            return [{ objectId: ref, requiredHashes: [] }];
     }
 
     async loadRCap(): Promise<RCap | undefined> {
@@ -644,10 +644,7 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
             dag: rawDag,
             rObject: this,
             hashSuite: this.ctx.getHashSuite(),
-            resolveRefDag: async (refId) => {
-                const label = await this.ctx.getBackendLabel(refId);
-                return this.ctx.getDag(refId, label);
-            },
+            ctx: this.ctx,
         };
 
         this._syncSession = createSyncSession(target, [this._swarm]);

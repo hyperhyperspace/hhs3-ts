@@ -78,7 +78,7 @@ Source: [`src/types/rset/rset.ts`](./src/types/rset/rset.ts), [`interfaces.ts`](
 
 ### Permissioned RSet: references and compositional authorization
 
-A permissioned `RSet` does not embed permissions in its own DAG. At creation it stores a **`capabilityRef`**: the id of an `RCap` object whose DAG holds grants, revokes, and identities. The set only records, in its own history, **which version of that `RCap`** it is using when it validates or re-checks operations.
+A permissioned `RSet` does not embed permissions in its own DAG. At creation it stores a **`capabilityRef`**: the id of an **RCap root** (created with `createObject` / `fetchObject`, not a nested handle) whose DAG holds grants, revokes, and identities. The set only records, in its own history, **which version of that `RCap`** it is using when it validates or re-checks operations.
 
 **Ref-advance** is the operation that updates that pointer. Each ref-advance is an entry in the **RSet** DAG with payload `ref-advance`, a `refId` (the `RCap` id), and `refVersion` (a set of hashes: a frontier or version of the `RCap` DAG). Ref-advances are **monotonic**: later ref-advances subsume earlier ones for the same reference, so only the cover of ref-advances in the past of a position matters. See also [Reference helpers](../mvt#reference-helpers-refsts) in the MVT module.
 

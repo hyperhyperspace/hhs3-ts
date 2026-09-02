@@ -3,8 +3,8 @@ import { B64Hash, sha256, stringToUint8Array } from '@hyper-hyper-space/hhs3_cry
 import { dag, Position, Header, Entry } from '@hyper-hyper-space/hhs3_dag';
 import { json } from '@hyper-hyper-space/hhs3_json';
 import type { TopicChannel } from '@hyper-hyper-space/hhs3_mesh';
-import type { RObject, Version, Payload, View, ForeignDep, Delta, DeltaAccumulator } from '@hyper-hyper-space/hhs3_mvt';
-import { RootScopedDag, validationOk } from '@hyper-hyper-space/hhs3_mvt';
+import type { RObject, Version, Payload, View, ForeignDep, Delta, DeltaAccumulator, RContext } from '@hyper-hyper-space/hhs3_mvt';
+import { RootScopedDag, ScopedDagSubscription, validationOk } from '@hyper-hyper-space/hhs3_mvt';
 
 import { createDagProvider } from '../src/provider.js';
 import { createDagSynchronizer } from '../src/synchronizer.js';
@@ -95,6 +95,8 @@ function createChannelPair(topic: string, peerAId: string, peerBId: string): Cha
 function createMockRObject(d: dag.Dag, id: B64Hash, opts?: {
     extractForeignDeps?: (payload: Payload, at: Version) => ForeignDep[] | undefined,
 }): RObject {
+    const scoped = new RootScopedDag(d);
+    const subscription = new ScopedDagSubscription(async () => scoped);
     return {
         getId: () => id,
         getType: () => 'test-object',
@@ -106,12 +108,44 @@ function createMockRObject(d: dag.Dag, id: B64Hash, opts?: {
         getView: async (_at?: Version, _from?: Version): Promise<View> => { throw new Error('not implemented'); },
         computeDelta: async (_start: Version, _end: Version): Promise<Delta> => { throw new Error('not implemented'); },
         createDeltaAccumulator: (_start: Version, _end: Version): DeltaAccumulator => { throw new Error('not implemented'); },
-        getScopedDag: async () => new RootScopedDag(d),
+        getScopedDag: async () => scoped,
         getCausalDag: async () => d,
         extractForeignDeps: opts?.extractForeignDeps ?? ((_payload: Payload, _at: Version) => undefined),
-        subscribe: (_cb: (version: Version) => void) => {},
-        unsubscribe: (_cb: (version: Version) => void) => {},
+        subscribe: (cb: (version: Version) => void) => { subscription.subscribe(cb); },
+        unsubscribe: (cb: (version: Version) => void) => { subscription.unsubscribe(cb); },
         destroy: async () => {},
+    };
+}
+
+function createTestSyncCtx(): RContext {
+    const objects = new Map<B64Hash, RObject>();
+    const newObjectCallbacks = new Set<(obj: RObject) => void>();
+
+    function record(obj: RObject): void {
+        const id = obj.getId();
+        const isNew = !objects.has(id);
+        objects.set(id, obj);
+        if (isNew) {
+            for (const cb of [...newObjectCallbacks]) {
+                try { cb(obj); } catch { /* keep firing */ }
+            }
+        }
+    }
+
+    return {
+        getCrypto: () => { throw new Error('not implemented'); },
+        getHashSuite: () => sha256,
+        getConfig: () => ({}),
+        getRegistry: () => { throw new Error('not implemented'); },
+        getObject: async (id: B64Hash) => objects.get(id),
+        getDag: async (_id: B64Hash) => undefined,
+        getBackendLabel: async () => 'default',
+        getMesh: () => { throw new Error('not implemented'); },
+        createObject: async () => { throw new Error('not implemented'); },
+        registerObject: record,
+        unregisterObject: async (id: B64Hash) => { objects.delete(id); },
+        subscribeNewObject: (cb) => { newObjectCallbacks.add(cb); },
+        unsubscribeNewObject: (cb) => { newObjectCallbacks.delete(cb); },
     };
 }
 
@@ -600,13 +634,13 @@ async function testMultiPeerSync() {
     providerC.destroy();
 }
 
-function wireUpSyncWithRefDag(
+function wireUpSyncWithCtx(
     dagA: dag.Dag,
     dagB: dag.Dag,
     rObjectA: RObject,
     dagId: B64Hash,
     topic: string,
-    resolveRefDag?: (refId: B64Hash) => Promise<dag.Dag | undefined>,
+    ctx?: RContext,
 ) {
     const { local: chALocal, remote: chBLocal } = createChannelPair(topic, 'peerA', 'peerB');
 
@@ -620,7 +654,7 @@ function wireUpSyncWithRefDag(
         sha256,
         () => [peerBHandle],
         (peer, msg) => { try { peer.channel.send(encode(msg)); return 'sent' as const; } catch { return 'error' as const; } },
-        resolveRefDag,
+        ctx,
     );
 
     chBLocal.onMessage((data) => {
@@ -641,7 +675,7 @@ function wireUpSyncWithRefDag(
 async function testForeignDepDeferral() {
     const dagId = 'test-dag-foreign-dep';
     const topic = 'sync-foreign-dep';
-    const refDagId = 'ref-permissions-dag';
+    const refObjectId = 'ref-permissions-obj';
 
     const dagA = createTestDag();
     const dagB = createTestDag();
@@ -656,7 +690,7 @@ async function testForeignDepDeferral() {
 
     const normalEntry = await dagB.append({ op: 'normal' }, {}, new Set([root]));
     const refAdvanceEntry = await dagB.append(
-        { action: 'ref-advance', refId: refDagId, refVersion: { 'v1': '' } },
+        { action: 'ref-advance', refId: refObjectId, refVersion: { 'v1': '' } },
         {},
         new Set([normalEntry]),
     );
@@ -664,18 +698,18 @@ async function testForeignDepDeferral() {
     const rObjectA = createMockRObject(dagA, dagId, {
         extractForeignDeps: (payload: Payload, _at: Version) => {
             if (typeof payload === 'object' && !Array.isArray(payload) && payload['action'] === 'ref-advance') {
-                return [{ dagId: (payload as any).refId, requiredHashes: [requiredRefHash] }];
+                return [{ objectId: (payload as any).refId, requiredHashes: [requiredRefHash] }];
             }
             return undefined;
         },
     });
 
-    const { synchronizerA, providerB, chALocal } = wireUpSyncWithRefDag(
-        dagA, dagB, rObjectA, dagId, topic,
-        async (refId: B64Hash) => {
-            if (refId === refDagId) return refDag;
-            return undefined;
-        },
+    const refObject = createMockRObject(refDag, refObjectId);
+    const ctx = createTestSyncCtx();
+    ctx.registerObject(refObject);
+
+    const { synchronizerA, providerB, chALocal } = wireUpSyncWithCtx(
+        dagA, dagB, rObjectA, dagId, topic, ctx,
     );
 
     const frontierB = await dagB.getFrontier();
@@ -698,10 +732,6 @@ async function testForeignDepDeferral() {
     const actualRefHash = await refDag.append(refPayload, {});
     testing.assertEquals(actualRefHash, requiredRefHash, 'pre-computed and actual ref entry hash should match');
 
-    synchronizerA.handleMessage({
-        type: 'new-frontier', dagId, frontier: [...frontierB],
-    }, chALocal);
-
     await waitUntil(async () => {
         const entry = await dagA.loadEntry(refAdvanceEntry);
         return entry !== undefined;
@@ -709,6 +739,80 @@ async function testForeignDepDeferral() {
 
     const refAdvanceAfter = await dagA.loadEntry(refAdvanceEntry);
     testing.assertTrue(refAdvanceAfter !== undefined, 'ref-advance entry should sync after foreign deps are available');
+
+    synchronizerA.destroy();
+    providerB.destroy();
+}
+
+async function testForeignDepAppearance() {
+    const dagId = 'test-dag-foreign-appear';
+    const topic = 'sync-foreign-appear';
+    const refObjectId = 'ref-late-obj';
+
+    const dagA = createTestDag();
+    const dagB = createTestDag();
+    const refDag = createTestDag();
+
+    const root = await dagB.append({ op: 'root' }, {});
+    await dagA.append({ op: 'root' }, {});
+
+    const refPayload = { op: 'ref-init' };
+    const refEntry = dag.createEntry(refPayload, {}, undefined, sha256);
+    const requiredRefHash = refEntry.hash;
+
+    const normalEntry = await dagB.append({ op: 'normal' }, {}, new Set([root]));
+    const refAdvanceEntry = await dagB.append(
+        { action: 'ref-advance', refId: refObjectId, refVersion: { 'v1': '' } },
+        {},
+        new Set([normalEntry]),
+    );
+
+    const rObjectA = createMockRObject(dagA, dagId, {
+        extractForeignDeps: (payload: Payload, _at: Version) => {
+            if (typeof payload === 'object' && !Array.isArray(payload) && payload['action'] === 'ref-advance') {
+                return [{ objectId: (payload as any).refId, requiredHashes: [requiredRefHash] }];
+            }
+            return undefined;
+        },
+    });
+
+    const refObject = createMockRObject(refDag, refObjectId);
+    const ctx = createTestSyncCtx();
+
+    const { synchronizerA, providerB, chALocal } = wireUpSyncWithCtx(
+        dagA, dagB, rObjectA, dagId, topic, ctx,
+    );
+
+    const frontierB = await dagB.getFrontier();
+    synchronizerA.handleMessage({
+        type: 'new-frontier', dagId, frontier: [...frontierB],
+    }, chALocal);
+
+    await waitUntil(async () => {
+        const entry = await dagA.loadEntry(normalEntry);
+        return entry !== undefined;
+    });
+
+    await wait(300);
+    testing.assertTrue(
+        (await dagA.loadEntry(refAdvanceEntry)) === undefined,
+        'ref-advance should stay deferred while the referenced object is unregistered',
+    );
+
+    ctx.registerObject(refObject);
+
+    const actualRefHash = await refDag.append(refPayload, {});
+    testing.assertEquals(actualRefHash, requiredRefHash, 'pre-computed and actual ref entry hash should match');
+
+    await waitUntil(async () => {
+        const entry = await dagA.loadEntry(refAdvanceEntry);
+        return entry !== undefined;
+    });
+
+    testing.assertTrue(
+        (await dagA.loadEntry(refAdvanceEntry)) !== undefined,
+        'ref-advance should apply after the referenced object is registered and grows',
+    );
 
     synchronizerA.destroy();
     providerB.destroy();
@@ -784,5 +888,6 @@ export const syncSuite = {
         { name: '[SYNC_08] Multi-peer sync', invoke: testMultiPeerSync },
         { name: '[SYNC_09] Foreign dep deferral', invoke: testForeignDepDeferral },
         { name: '[SYNC_10] fetchInit rejects createPayload hash mismatch', invoke: testFetchInitHashMismatch },
+        { name: '[SYNC_11] Foreign dep appearance then growth', invoke: testForeignDepAppearance },
     ],
 };

@@ -366,6 +366,7 @@ export class RCapImpl implements RCapContract {
             dag: rawDag,
             rObject: this,
             hashSuite: this.ctx.getHashSuite(),
+            ctx: this.ctx,
         };
 
         this._syncSession = createSyncSession(target, [this._swarm]);

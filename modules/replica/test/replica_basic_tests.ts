@@ -454,5 +454,48 @@ export const replicaBasicTests = {
                 assertTrue(seen.length === 1 && seen[0] === set.getId(), 'later listeners still run');
             },
         },
+        {
+            name: '[REP17] subscribeNewObject fires on createObject cache miss and registerObject',
+            invoke: async () => {
+                const backend = new MemDagBackend(hashSuite);
+                const replica = new Replica({ crypto, hashSuite, config: { selfValidate: true } });
+                replica.attachBackend('default', backend);
+                replica.registerType(RSet.typeId, rSetFactory);
+                replica.registerType(RCap.typeId, rCapFactory);
+
+                const seen: string[] = [];
+                replica.subscribeNewObject((obj) => { seen.push(obj.getId()); });
+
+                const init = await RSet.create({
+                    seed: 'new-object-listener',
+                    initialElements: [],
+                    hashAlgorithm: 'sha256',
+                });
+                const set = await replica.createObject(init);
+                assertTrue(seen.length === 1 && seen[0] === set.getId(), 'listener fires for createObject cache miss');
+
+                await replica.createObject(init);
+                assertTrue(seen.length === 1, 'idempotent createObject does not fire again');
+
+                const capInit = await RCap.create({
+                    seed: 'owned-cap-new-object',
+                    creators: [],
+                    initialCaps: { admin: { managedBy: ['creator'] } },
+                });
+                const factory = await replica.getRegistry().lookup(RCap.typeId);
+                const id = await factory.computeRootObjectId(capInit, replica, undefined);
+                const { dag, created } = await backend.getOrCreateDag(id, { type: RCap.typeId });
+                if (created) {
+                    await factory.executeCreationPayload(capInit, replica, new RootScopedDag(dag));
+                }
+                const cap = (await factory.loadObject(id, replica, { backendLabel: 'default' })) as RCap;
+                replica.registerObject(cap);
+
+                assertTrue(seen.length === 2 && seen[1] === cap.getId(), 'listener fires for registerObject');
+
+                replica.registerObject(cap);
+                assertTrue(seen.length === 2, 're-registering the same object does not fire again');
+            },
+        },
     ],
 };

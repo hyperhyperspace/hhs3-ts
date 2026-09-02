@@ -30,6 +30,8 @@ A group pins one schema version. The schema is a separate object; the group obse
 
 A group depends on another — a cross-group foreign key, a shared capability table — by observing it at a chosen version and advancing that observation forward. The dependency is recorded as data, never implicit. This is MVT's [State-Observation-as-Data](../mvt#composability-soad-architecture) pattern: the observed group is unaware of its observers, the dependency graph stays acyclic, and data is the integration surface between applications.
 
+Observed targets are **groups and schemas** (roots in the replica map). Member tables are nested handles (`getTable`); FK/exists name a bound group plus table, not a registered `RTable` object.
+
 The same mechanism covers data and schemas. A schema is referenced by hash and reused as a module; a group's pinned schema is an observation, like its foreign-data references. Reusing a schema, sharing a capability system, and composing applications are one operation: a forward-only observation of a content-addressed object.
 
 ## Deltas & Projections

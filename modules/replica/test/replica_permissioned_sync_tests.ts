@@ -265,20 +265,62 @@ async function testForeignDepDeferral() {
     const bobCap = (await bob.replica.createObject(capInit)) as RCap;
     await bobCap.startSync();
 
-    // Wait for RCap to sync
-    await wait(300);
-
-    // Add a new element on Alice to trigger retry of deferred entries on Bob
-    await aliceSet.addSigned('trigger', admin);
-
     await waitUntil(async () => {
         const view = await bobSet.getView();
-        return (await view.has('deferred')) && (await view.has('trigger'));
+        return view.has('deferred');
     });
 
     const bobViewAfter = await bobSet.getView();
-    assertTrue(await bobViewAfter.has('deferred'), 'deferred element should appear after cap DAG available');
-    assertTrue(await bobViewAfter.has('trigger'), 'trigger element should also appear');
+    assertTrue(await bobViewAfter.has('deferred'), 'deferred element should appear after cap object is registered');
+
+    await cleanup([alice, bob], provider);
+}
+
+// ---------- PS03b: hashes land after deferral; no further observer writes ----------
+
+async function testForeignDepHashWait() {
+    const admin = await await createIdentity(SIGNING_ED25519, sha256);
+    const extra = await await createIdentity(SIGNING_ED25519, sha256);
+    const { capInit, setInit, capId } = await createPermissionedPair(admin);
+
+    const capTopic = capId as TopicId;
+    const setTopic = await rSetFactory.computeRootObjectId(setInit, dummyCtx) as TopicId;
+    const topics = [capTopic, setTopic];
+
+    const provider = new MemTransportProvider();
+    const aliceNoise = await await createIdentity(SIGNING_ED25519, sha256);
+    const bobNoise = await await createIdentity(SIGNING_ED25519, sha256);
+    const alicePeer: PeerInfo = { keyId: aliceNoise.keyId, addresses: ['mem://alice-ps03b'] };
+    const bobPeer: PeerInfo = { keyId: bobNoise.keyId, addresses: ['mem://bob-ps03b'] };
+
+    const alice = createPeer('ps03b', 'alice', provider, aliceNoise, bobPeer, topics);
+    const bob = createPeer('ps03b', 'bob', provider, bobNoise, alicePeer, topics);
+
+    const aliceCap = (await alice.replica.createObject(capInit)) as RCap;
+    const aliceSet = (await alice.replica.createObject(setInit)) as RSet;
+    const bobCap = (await bob.replica.createObject(capInit)) as RCap;
+    const bobSet = (await bob.replica.createObject(setInit)) as RSet;
+
+    await aliceCap.addIdentity(
+        extra.keyId, serializePublicKeyToBase64(extra.publicKey),
+        admin,
+    );
+    const capDag = await aliceCap.getScopedDag();
+    const capFrontier = await capDag.getFrontier();
+    await aliceSet.refAdvance(capFrontier, admin);
+    await aliceSet.addSigned('deferred', admin);
+
+    await aliceCap.startSync();
+    await aliceSet.startSync();
+    await bobCap.startSync();
+    await bobSet.startSync();
+
+    await waitUntil(async () => {
+        const view = await bobSet.getView();
+        return view.has('deferred');
+    });
+
+    assertTrue(await (await bobSet.getView()).has('deferred'), 'deferred element should apply once cap hashes arrive');
 
     await cleanup([alice, bob], provider);
 }
@@ -432,6 +474,7 @@ export const replicaPermissionedSyncTests = {
         { name: '[PS01] One-way sync of permissioned RSet + RCap', invoke: testOneWaySyncPermissioned },
         { name: '[PS02] Cross-peer write by grantee', invoke: testCrossPeerWrite },
         { name: '[PS03] Foreign-dep deferral: RSet entries arrive before RCap', invoke: testForeignDepDeferral },
+        { name: '[PS03b] Foreign-dep hash wait without observer-DAG writes', invoke: testForeignDepHashWait },
         { name: '[PS04] Revocation propagates across peers', invoke: testRevocationPropagation },
         { name: '[PS05] Unauthorized payload rejected during sync', invoke: testUnauthorizedPayloadRejected },
     ],

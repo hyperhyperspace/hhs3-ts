@@ -39,8 +39,12 @@ export function validateCreatePayloadType(payload: Payload, expectedTypeId: stri
         : validationFailure(`create payload type is not '${expectedTypeId}'`);
 }
 
+// A cross-object dependency declared by extractForeignDeps. `objectId` is an
+// RObject id (getObject / subscribe / getScopedDag().loadEntry) — never pass it
+// to getDag. For roots, getId() equals the DAG id by replica construction; that
+// coincidence is a storage invariant, not something this type encodes.
 export type ForeignDep = {
-    dagId: B64Hash;
+    objectId: B64Hash;
     requiredHashes: B64Hash[];
 }
 
@@ -135,12 +139,20 @@ export type RContext = {
     getMesh(label: string): any;
 
     createObject(createPayload: Payload, backendLabel?: string): Promise<RObject>;
+    registerObject(obj: RObject): void;
     unregisterObject(id: B64Hash): Promise<void>;
 
     // Bootstrap a not-yet-present object from the mesh (used by sync roots that
     // fan out to members / transitive references). Optional: contexts that do
     // not implement it force callers to handle a missing object as an error.
     fetchObject?(id: B64Hash, opts?: { meshLabel?: string; backendLabel?: string; timeoutMs?: number }): Promise<RObject>;
+
+    // Fired on first insertion into the object map (createObject cache miss and
+    // registerObject). Optional: contexts that omit it cannot wake waiters when
+    // a missing foreign-dep target appears. subscribeNewRoot (Replica-only)
+    // remains a roots-only bus.
+    subscribeNewObject?(callback: (obj: RObject) => void): void;
+    unsubscribeNewObject?(callback: (obj: RObject) => void): void;
 };
 
 export type RObjectFactory = {
