@@ -10,6 +10,8 @@ import {
     type SessionView,
 } from "@hyper-hyper-space/hhs3_rdb_runtime";
 
+import type { SyncMeshFactory, SyncSessionEntry } from "./sync/types.js";
+
 export type OutputMode = 'table' | 'json' | 'vertical';
 export type HashWidth = 'auto' | 'full' | number;
 
@@ -41,6 +43,7 @@ export type ReplSessionOptions = {
     createUuid?: () => string;
     projectionTargetFactory?: ProjectionTargetFactory;
     onProjectionError?: ProjectionErrorHandler;
+    syncMeshFactory?: SyncMeshFactory;
 };
 
 export class ReplSession extends RdbSession {
@@ -55,6 +58,13 @@ export class ReplSession extends RdbSession {
     projectionTargetFactory?: ProjectionTargetFactory;
     onProjectionError?: ProjectionErrorHandler;
     readonly projections = new Map<B64Hash, RdbProjection>();
+
+    // Host-injected mesh factory + the active \\sync sessions, keyed by a
+    // session-global incrementing id that is never reused after stop.
+    syncMeshFactory?: SyncMeshFactory;
+    readonly syncs = new Map<number, SyncSessionEntry>();
+    nextSyncId = 1;
+    nextFetchId = 1;
 
     constructor(options: ReplSessionOptions) {
         const sessionOptions: RdbSessionOptions = {
@@ -71,6 +81,7 @@ export class ReplSession extends RdbSession {
         this.stopOnError = options.stopOnError ?? true;
         this.projectionTargetFactory = options.projectionTargetFactory;
         this.onProjectionError = options.onProjectionError;
+        this.syncMeshFactory = options.syncMeshFactory;
     }
 
     get keystore(): KeyVault | undefined {

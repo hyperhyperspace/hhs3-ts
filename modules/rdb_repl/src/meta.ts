@@ -16,13 +16,16 @@ import type { RefAutoUpdateMode } from "@hyper-hyper-space/hhs3_rdb_runtime";
 import { formatAliasListing, formatAliasResult, isAliasScope, resolveAliasTarget, type AliasScope } from "./aliases.js";
 import { runDeltaCommand } from "./delta/command.js";
 import { runProjectionCommand } from "./projection/command.js";
+import { runSyncCommand } from "./sync/command.js";
 import { createDumpRenderOptions } from "./dump/alias_context.js";
 import { runDumpOpCommand } from "./dump/op_command.js";
 import { createDisplayContext, formatDisplayString, formatSessionRows } from "./format/display.js";
 import { formatRows } from "./format/rows.js";
 import type { ReplSession } from "./session.js";
 
-export type PassphraseNeed = { kind: 'create' | 'unlock' | 'author'; label: string };
+export type PassphraseNeed =
+    | { kind: 'create' | 'unlock' | 'author'; label: string }
+    | { kind: 'sync'; label: string; remainder: string };
 export type MetaCommandResult = {
     handled: boolean;
     output?: string;
@@ -62,6 +65,17 @@ export async function runMetaCommand(session: ReplSession, line: string): Promis
         case 'dump': return { handled: true, output: await dump(session, args) };
         case 'delta': return { handled: true, output: await runDeltaCommand(session, args) };
         case 'projection': return { handled: true, output: await runProjectionCommand(session, args) };
+        case 'sync': {
+            const remainder = line.trim().replace(/;$/, '').trim().replace(/^\\sync\s*/, '');
+            const result = await runSyncCommand(session, remainder);
+            if (result.needsUnlock !== undefined) {
+                return {
+                    handled: true,
+                    needsPassphrase: { kind: 'sync', label: result.needsUnlock.label, remainder },
+                };
+            }
+            return { handled: true, output: result.output };
+        }
         default: return { handled: true, output: `Unknown meta-command \\${command}` };
     }
 }
@@ -79,6 +93,13 @@ export async function fulfillPassphraseNeed(
     if (need.kind === 'author') {
         const identity = session.selectAuthor(need.label);
         return `author ${labelFor(session, identity.keyId)}`;
+    }
+    if (need.kind === 'sync') {
+        const result = await runSyncCommand(session, need.remainder);
+        if (result.needsUnlock !== undefined) {
+            throw new Error(`Key '${need.label}' is locked`);
+        }
+        return result.output ?? '';
     }
     const identity = session.resolveIdentity(need.label);
     if (identity === undefined) throw new Error(`Key '${need.label}' is locked`);
@@ -316,6 +337,9 @@ function help(args: string[]): string {
         '\\alias [scope] <name> <#prefix>, \\aliases [scope], \\unalias <scope> <name>, \\output table|json|vertical, \\hash-width auto|full|<N>, \\hash-labels on|off, \\ref-auto-update auto|self|off, \\dump schema|group|database <name> [full|schema], \\dump op [group] #hash',
         '\\delta schema|group <name> <start> <end> [bounded|full]',
         '\\projection start|sync|status|stop|events [<database>] [label], \\projection register-key <keyHash> <publicKey>, \\projection resolve-key <id|keyHash>',
+        '\\sync fetch #<rdb-id> as <local-id> on <localhost|internet> [--tracker URL] [--tracker-key KEYID] [--listen ADDR]',
+        '\\sync start <db> as <local-id> [allow <sources>] on <localhost|internet> [--tracker URL] [--tracker-key KEYID] [--listen ADDR]',
+        '\\sync status [<db>], \\sync stop <id>, \\sync peers <id>',
         '\\quit',
         '\\help commands [filter]  (C-SQL reference)',
     ].join('\n');

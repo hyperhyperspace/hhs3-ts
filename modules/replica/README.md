@@ -21,7 +21,7 @@ In the current architecture, `Replica` acts as an object container and resource 
 7. Start/stop synchronization directly on objects (`obj.startSync()` / `obj.stopSync()`).
 8. Call `replica.destroy()` on shutdown to tear down roots (`obj.destroy()` then registry cleanup).
 
-`createObject` adds objects to both the `objects` map and `rootIds`. `registerObject` only records in `objects` (and mirrors backend labels). `unregisterObject(id)` is for owned objects: it calls `destroy()` then removes registry entries; it rejects root ids. Root teardown uses `replica.destroy()` instead.
+`createObject` adds objects to both the `objects` map and `rootIds`, then notifies `subscribeNewRoot` listeners (cache miss only; `registerObject` does not). `registerObject` only records in `objects` (and mirrors backend labels). `unregisterObject(id)` is for owned objects: it calls `destroy()` then removes registry entries; it rejects root ids. Root teardown uses `replica.destroy()` instead.
 
 `DagBackend` implementations expose `getOrCreateDag(id, meta) -> { dag, created }`, letting `Replica` execute creation payloads only when a DAG is newly created.
 

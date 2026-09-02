@@ -53,6 +53,10 @@ export class RdbWorkspace {
         registerRdbTypes(replica);
 
         const roots = options.roots ?? new RootIndex();
+        replica.subscribeNewRoot((obj) => {
+            const createOp = (obj as { createOp?: Payload }).createOp;
+            roots.registerObject(obj.getId(), obj, createOp === undefined ? undefined : payloadName(createOp));
+        });
         const workspace = new RdbWorkspace(backendLabel, replica, options.backend, roots);
         if (options.rehydrate !== false) {
             await rehydrateRoots(replica, options.backend, roots);

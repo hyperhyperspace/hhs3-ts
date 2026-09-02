@@ -1,7 +1,7 @@
 import { assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
-import type { RContext } from "@hyper-hyper-space/hhs3_mvt";
+import type { RContext, RObject } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
@@ -32,8 +32,11 @@ type StubSwarm = {
 
 function createStubMesh() {
     const swarms: StubSwarm[] = [];
+    const createOpts: unknown[] = [];
     const mesh = {
-        createSwarm(topic: B64Hash): StubSwarm {
+        createOpts,
+        createSwarm(topic: B64Hash, opts?: unknown): StubSwarm {
+            createOpts.push(opts);
             const swarm: StubSwarm = {
                 topic,
                 activated: false,
@@ -66,8 +69,11 @@ function open(name: string, columns: TableDef['columns']): TableDef {
     return { name, columns, restrictions: [{ on: 'all', rule: { p: 'true' } }] };
 }
 
-function newCtx(opts?: { mesh?: any }): RContext {
-    const ctx = createMockRContext({ selfValidate: true }, { mesh: opts?.mesh });
+function newCtx(opts?: {
+    mesh?: any;
+    fetchObject?: RContext['fetchObject'];
+}): RContext {
+    const ctx = createMockRContext({ selfValidate: true }, { mesh: opts?.mesh, fetchObject: opts?.fetchObject });
     ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
     ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
     ctx.getRegistry().register(RDbImpl.typeId, rDbFactory);
@@ -113,6 +119,25 @@ async function expectThrow(fn: () => Promise<unknown>, why: string): Promise<voi
     let threw = false;
     try { await fn(); } catch { threw = true; }
     assertTrue(threw, why);
+}
+
+function liveSwarms(mesh: ReturnType<typeof createStubMesh>): StubSwarm[] {
+    return mesh.swarms.filter((s) => s.activated && !s.destroyed);
+}
+
+async function waitUntil(pred: () => boolean | Promise<boolean>, why: string, timeoutMs = 2000): Promise<void> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+        if (await pred()) return;
+        await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error(`waitUntil timed out: ${why}`);
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => { resolve = r; });
+    return { promise, resolve };
 }
 
 export const rdbSyncTests = {
@@ -188,6 +213,7 @@ export const rdbSyncTests = {
 
                 await expectThrow(() => rdb.startSync(), 'startSync must throw for an unfetchable absent member');
                 assertTrue(ctx.fetchObject === undefined, 'mock context exposes no fetchObject');
+                assertTrue(liveSwarms(mesh).length === 0, 'failed startSync leaves no live swarms');
             },
         },
         {
@@ -256,6 +282,249 @@ export const rdbSyncTests = {
 
                 assertTrue((await rdb.getMemberSchemas()).includes(schema.getId()), 'unsigned add-schema accepted');
                 assertTrue((await rdb.getMemberGroups()).includes(group.getId()), 'unsigned add-group accepted');
+            },
+        },
+        {
+            name: '[RDB07] startSync passes runtime authorizer into createSwarm',
+            invoke: async () => {
+                const mesh = createStubMesh();
+                const ctx = newCtx({ mesh });
+                const rdb = await makeRDb(ctx, 'rdb07');
+                const { schema, group } = await makeSchemaGroup(ctx, 'rdb07');
+                await rdb.addSchema(schema.getId());
+                await rdb.addGroup(group.getId());
+
+                const authorizer = { authorize: async () => true };
+                rdb.setRuntimeConfig({ authorizer });
+                await rdb.startSync();
+
+                assertTrue(mesh.createOpts.length === 3, 'one createSwarm per DAG');
+                assertTrue(
+                    mesh.createOpts.every((opts) => (opts as { authorizer?: unknown }).authorizer === authorizer),
+                    'authorizer forwarded to every swarm',
+                );
+            },
+        },
+        {
+            name: '[RDB08] startSync fetches an absent member via ctx.fetchObject',
+            invoke: async () => {
+                const mesh = createStubMesh();
+                const creator = await makeIdentity();
+                const schemaInit = await RSchemaImpl.create({
+                    name: 'rdb08:schema',
+                    creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
+                    tables: [open('t', { name: { type: 'string' } })],
+                });
+
+                const fetched: B64Hash[] = [];
+                let ctx!: RContext;
+                ctx = newCtx({
+                    mesh,
+                    fetchObject: async (id) => {
+                        fetched.push(id);
+                        return ctx.createObject(schemaInit);
+                    },
+                });
+
+                const schemaId = await rSchemaFactory.computeRootObjectId(schemaInit, ctx);
+                const rdb = await makeRDb(ctx, 'rdb08');
+                await rdb.addSchema(schemaId);
+
+                assertTrue((await ctx.getObject(schemaId)) === undefined, 'schema is absent before startSync');
+
+                await rdb.startSync();
+
+                assertTrue(fetched.length === 1 && fetched[0] === schemaId, 'fetchObject called once for the absent schema');
+                assertTrue((await ctx.getObject(schemaId)) !== undefined, 'schema present after fetch');
+
+                const topics = new Set(mesh.swarms.map((s) => s.topic));
+                assertTrue(topics.has(rdb.getId()), 'RDb DAG synced');
+                assertTrue(topics.has(schemaId), 'fetched schema DAG synced');
+                assertTrue(topics.size === 2, `expected 2 sessions (RDb + schema), got ${topics.size}`);
+            },
+        },
+        {
+            name: '[RDB09] addGroup after startSync opens a new swarm without stop/start',
+            invoke: async () => {
+                const mesh = createStubMesh();
+                const ctx = newCtx({ mesh });
+                const rdb = await makeRDb(ctx, 'rdb09');
+                const first = await makeSchemaGroup(ctx, 'rdb09-a');
+                const second = await makeSchemaGroup(ctx, 'rdb09-b');
+
+                await rdb.addSchema(first.schema.getId());
+                await rdb.addGroup(first.group.getId());
+                await rdb.startSync();
+                assertTrue(mesh.swarms.length === 3, 'initial closure is RDb + schema + group');
+
+                await rdb.addSchema(second.schema.getId());
+                await rdb.addGroup(second.group.getId());
+
+                await waitUntil(
+                    () => mesh.swarms.some((s) => s.topic === second.group.getId() && s.activated && !s.destroyed),
+                    'second group swarm should open after addGroup',
+                );
+                const topics = new Set(liveSwarms(mesh).map((s) => s.topic));
+                assertTrue(topics.has(second.schema.getId()), 'second schema DAG synced');
+                assertTrue(topics.has(second.group.getId()), 'second group DAG synced');
+                assertTrue(topics.size === 5, `expected 5 live sessions, got ${topics.size}`);
+
+                await rdb.stopSync();
+            },
+        },
+        {
+            name: '[RDB10] concurrent startSync shares one fan-out',
+            invoke: async () => {
+                const mesh = createStubMesh();
+                const ctx = newCtx({ mesh });
+                const rdb = await makeRDb(ctx, 'rdb10');
+                const { schema, group } = await makeSchemaGroup(ctx, 'rdb10');
+                await rdb.addSchema(schema.getId());
+                await rdb.addGroup(group.getId());
+
+                await Promise.all([rdb.startSync(), rdb.startSync()]);
+
+                const topics = new Set(liveSwarms(mesh).map((s) => s.topic));
+                assertTrue(topics.size === 3, `expected 3 live sessions, got ${topics.size}`);
+                assertTrue(mesh.swarms.length === 3, 'concurrent startSync must not double-create swarms');
+
+                await rdb.stopSync();
+            },
+        },
+        {
+            name: '[RDB11] stopSync during fetchObject does not resurrect sessions',
+            invoke: async () => {
+                const mesh = createStubMesh();
+                const creator = await makeIdentity();
+                const schemaInit = await RSchemaImpl.create({
+                    name: 'rdb11:schema',
+                    creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
+                    tables: [open('t', { name: { type: 'string' } })],
+                });
+
+                let releaseFetch!: (obj: RObject) => void;
+                const fetchStarted = deferred<void>();
+                const fetchGate = new Promise<RObject>((resolve) => {
+                    releaseFetch = resolve;
+                });
+
+                let ctx!: RContext;
+                ctx = newCtx({
+                    mesh,
+                    fetchObject: async (_id) => {
+                        fetchStarted.resolve();
+                        return fetchGate;
+                    },
+                });
+
+                const schemaId = await rSchemaFactory.computeRootObjectId(schemaInit, ctx);
+                const rdb = await makeRDb(ctx, 'rdb11');
+                await rdb.addSchema(schemaId);
+
+                const started = rdb.startSync();
+                await fetchStarted.promise;
+                await rdb.stopSync();
+                releaseFetch(await ctx.createObject(schemaInit));
+
+                await expectThrow(() => started, 'startSync must abort when stopSync wins');
+                assertTrue(liveSwarms(mesh).length === 0, 'no live swarms after stop during fetch');
+
+                await rdb.startSync();
+                const topics = new Set(liveSwarms(mesh).map((s) => s.topic));
+                assertTrue(topics.has(rdb.getId()) && topics.has(schemaId), 'a later startSync opens sessions');
+                await rdb.stopSync();
+            },
+        },
+        {
+            name: '[RDB12] stopSync during startSync aborts start; a following startSync works',
+            invoke: async () => {
+                const mesh = createStubMesh();
+                const ctx = newCtx({ mesh });
+                const rdb = await makeRDb(ctx, 'rdb12');
+                const { schema, group } = await makeSchemaGroup(ctx, 'rdb12');
+                await rdb.addSchema(schema.getId());
+                await rdb.addGroup(group.getId());
+
+                const started = rdb.startSync();
+                await rdb.stopSync();
+                await expectThrow(() => started, 'in-flight startSync must reject when stopSync wins');
+                assertTrue(liveSwarms(mesh).length === 0, 'stopSync leaves no live swarms');
+
+                await rdb.startSync();
+                const topics = new Set(liveSwarms(mesh).map((s) => s.topic));
+                assertTrue(topics.size === 3, 'startSync after abort opens the full closure');
+                await rdb.stopSync();
+            },
+        },
+        {
+            name: '[RDB13] addSchema during in-flight start is included in the start promise',
+            invoke: async () => {
+                const mesh = createStubMesh();
+                const creator = await makeIdentity();
+                const schemaAInit = await RSchemaImpl.create({
+                    name: 'rdb13_schema_a',
+                    creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
+                    tables: [open('t', { name: { type: 'string' } })],
+                });
+
+                let releaseFetch!: (obj: RObject) => void;
+                const fetchStarted = deferred<void>();
+                const fetchGate = new Promise<RObject>((resolve) => {
+                    releaseFetch = resolve;
+                });
+
+                let ctx!: RContext;
+                ctx = newCtx({
+                    mesh,
+                    fetchObject: async (_id) => {
+                        fetchStarted.resolve();
+                        return fetchGate;
+                    },
+                });
+
+                const schemaAId = await rSchemaFactory.computeRootObjectId(schemaAInit, ctx);
+                const rdb = await makeRDb(ctx, 'rdb13');
+                const extra = await makeSchemaGroup(ctx, 'rdb13-extra');
+                await rdb.addSchema(schemaAId);
+
+                const started = rdb.startSync();
+                await fetchStarted.promise;
+                await rdb.addSchema(extra.schema.getId());
+                releaseFetch(await ctx.createObject(schemaAInit));
+                await started;
+
+                const topics = new Set(liveSwarms(mesh).map((s) => s.topic));
+                assertTrue(topics.has(schemaAId), 'fetched schema is synced');
+                assertTrue(topics.has(extra.schema.getId()), 'schema added during start is synced');
+                await rdb.stopSync();
+            },
+        },
+        {
+            name: '[RDB14] failed startSync then retry actually opens sessions',
+            invoke: async () => {
+                const mesh = createStubMesh();
+                const creator = await makeIdentity();
+                const schemaInit = await RSchemaImpl.create({
+                    name: 'rdb14:schema',
+                    creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
+                    tables: [open('t', { name: { type: 'string' } })],
+                });
+
+                const ctx = newCtx({ mesh });
+                const schemaId = await rSchemaFactory.computeRootObjectId(schemaInit, ctx);
+                const rdb = await makeRDb(ctx, 'rdb14');
+                await rdb.addSchema(schemaId);
+
+                await expectThrow(() => rdb.startSync(), 'first startSync fails while the schema is absent');
+                assertTrue(liveSwarms(mesh).length === 0, 'failed start leaves no live swarms');
+
+                await ctx.createObject(schemaInit);
+                await rdb.startSync();
+
+                const topics = new Set(liveSwarms(mesh).map((s) => s.topic));
+                assertTrue(topics.has(rdb.getId()) && topics.has(schemaId), 'retry startSync opens sessions');
+                assertTrue(topics.size === 2, `expected 2 live sessions, got ${topics.size}`);
+                await rdb.stopSync();
             },
         },
     ],

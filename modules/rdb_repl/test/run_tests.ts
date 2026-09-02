@@ -16,13 +16,32 @@ import {
     type SyncMapping,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import {
+    KEM_X25519_HKDF,
+    SIGNING_ED25519,
+} from "@hyper-hyper-space/hhs3_crypto";
+import {
+    Mesh,
+    MemTransportProvider,
+    StaticDiscovery,
+    createAuthenticator,
+    type NetworkAddress,
+    type PeerDiscovery,
+    type PeerInfo,
+    type TopicId,
+    type Transport,
+    type TransportProvider,
+} from "@hyper-hyper-space/hhs3_mesh";
+import {
     ReplSession,
     formatRows,
     promptForSession,
     renderStatementOutput,
     runCommand,
     runLanguageText,
+    stopAllSyncs,
+    type SyncMeshFactory,
 } from "../src/index.js";
+import { runSyncAuthorizerTests, runSyncParseTests } from "./sync_parse_tests.js";
 
 function assert(condition: unknown, message: string): asserts condition {
     if (!condition) throw new Error(message);
@@ -182,6 +201,7 @@ ADD TABLEGROUP blog_g TO blog_db;
     } finally {
         for (const projection of session.projections.values()) await projection.stop();
         session.projections.clear();
+        await stopAllSyncs(session);
         await workspace.close();
     }
 }
@@ -325,11 +345,241 @@ ADD TABLEGROUP shop_prod TO shopdb;
 
         const quit = await runCommand(session, '\\quit');
         assert(quit.quit === true, 'portable quit outcome');
+
+        await runSyncCommandTests(session);
     } finally {
+        await stopAllSyncs(session);
         await workspace.close();
     }
 
     await runProjectionNoticeTests();
+    await runSyncFetchNonDefaultBackendTest();
+    await runSyncParseTests();
+    await runSyncAuthorizerTests();
+}
+
+function memSyncFactory(): SyncMeshFactory {
+    return async (req) => {
+        const provider = new MemTransportProvider();
+        const addr = `mem://sync-${req.identity.keyId.slice(0, 12)}`;
+        const discovery = new StaticDiscovery([], []);
+        const mesh = new Mesh({
+            transports: [provider],
+            discovery,
+            authenticator: createAuthenticator({
+                localKey: req.identity,
+                signingName: SIGNING_ED25519,
+                kemPrefs: [KEM_X25519_HKDF],
+            }),
+            localKeyId: req.identity.keyId,
+            listenAddresses: [addr],
+        });
+        return {
+            mesh,
+            discovery,
+            listenAddresses: [addr],
+            announcedAddresses: [addr],
+            discoveryNotes: ['mem'],
+            closeables: [],
+        };
+    };
+}
+
+async function runSyncCommandTests(session: ReplSession): Promise<void> {
+    const missingFactory = await runCommand(session, '\\sync start shopdb as alice on localhost');
+    assert(missingFactory.exitCode === 1 && missingFactory.output.includes('No sync mesh factory'), 'sync start without factory');
+
+    session.syncMeshFactory = memSyncFactory();
+
+    const started = await runCommand(session, '\\sync start shopdb as alice on localhost');
+    assert(started.exitCode === 0 && started.output.includes('started sync 1'), `sync start (${started.output})`);
+    assert(started.output.includes('as alice'), 'sync start names the local id');
+
+    const dup = await runCommand(session, '\\sync start shopdb as alice on localhost');
+    assert(dup.exitCode === 1 && dup.output.includes('already syncing'), 'second start on the same db is refused');
+
+    const st = await runCommand(session, '\\sync status');
+    assert(st.exitCode === 0 && st.output.includes('shopdb') && st.output.includes('everyone'), 'sync status lists everyone');
+
+    const filtered = await runCommand(session, '\\sync status shopdb');
+    assert(filtered.exitCode === 0 && filtered.output.includes('shopdb'), 'sync status can filter by db');
+
+    const listed = await runCommand(session, '\\sync peers 1');
+    assert(listed.exitCode === 0 && listed.output.includes('no peers'), 'sync peers with none connected');
+
+    const stopped = await runCommand(session, '\\sync stop 1');
+    assert(stopped.exitCode === 0 && stopped.output.includes('stopped sync 1'), 'sync stop');
+    const after = await runCommand(session, '\\sync status');
+    assertEqual(after.output, '(no active syncs)', 'sync removed after stop');
+
+    const reused = await runCommand(session, '\\sync start shopdb as alice on localhost');
+    assert(reused.exitCode === 0 && reused.output.includes('started sync 2'), 'ids are never reused after stop');
+    await runCommand(session, '\\sync stop 2');
+
+    const shop = session.workspace.roots.list('database').find((root) => root.name === 'shopdb');
+    assert(shop !== undefined, 'shopdb is a local root for fetch tests');
+    const fetched = await runCommand(session, `\\sync fetch #${shop.id} as alice on localhost`);
+    assert(fetched.exitCode === 0, `already-local fetch (${fetched.output})`);
+    assert(fetched.output.includes('fetched'), 'fetch output mentions fetched');
+    assert(fetched.output.includes('already local') || fetched.output.includes('genesis only'), 'fetch notes genesis / already local');
+    assert(fetched.output.includes('\\sync start'), 'fetch points at start to share');
+
+    const afterFetch = await runCommand(session, '\\sync status');
+    assertEqual(afterFetch.output, '(no active syncs)', 'fetch does not create a sync session');
+
+    const named = await runCommand(session, '\\sync fetch shopdb as alice on localhost');
+    assert(named.exitCode === 1 && named.output.includes('full #hash'), 'fetch rejects a database name');
+}
+
+// Shared mem mesh so two REPL sessions can actually find each other. Mesh.close()
+// shuts its TransportProviders, so each mesh gets a wrapper that does not close
+// the shared inner provider.
+class SharedPeerRegistry {
+    private readonly topics = new Map<TopicId, Map<string, PeerInfo>>();
+
+    announce(topic: TopicId, self: PeerInfo): void {
+        let peers = this.topics.get(topic);
+        if (peers === undefined) {
+            peers = new Map();
+            this.topics.set(topic, peers);
+        }
+        peers.set(self.keyId, self);
+    }
+
+    leave(topic: TopicId, keyId: string): void {
+        this.topics.get(topic)?.delete(keyId);
+    }
+
+    list(topic: TopicId): PeerInfo[] {
+        return [...(this.topics.get(topic)?.values() ?? [])];
+    }
+}
+
+class NonClosingProvider implements TransportProvider {
+    readonly scheme: string;
+    constructor(private readonly inner: TransportProvider) {
+        this.scheme = inner.scheme;
+    }
+    listen(address: NetworkAddress, onConnection: (transport: Transport) => void): Promise<void> {
+        return this.inner.listen(address, onConnection);
+    }
+    connect(remote: NetworkAddress, local?: NetworkAddress): Promise<Transport> {
+        return this.inner.connect(remote, local);
+    }
+    close(): void {}
+}
+
+function registryDiscovery(registry: SharedPeerRegistry, selfKeyId: string): PeerDiscovery {
+    return {
+        async *discover(topic: TopicId, schemes?: string[]): AsyncIterable<PeerInfo> {
+            for (const peer of registry.list(topic)) {
+                if (peer.keyId === selfKeyId) continue;
+                const addresses = schemes === undefined || schemes.length === 0
+                    ? peer.addresses
+                    : peer.addresses.filter((addr) => schemes.some((s) => addr.startsWith(`${s}://`)));
+                if (addresses.length === 0) continue;
+                yield { keyId: peer.keyId, addresses };
+            }
+        },
+        announce(topic, self) {
+            registry.announce(topic, self);
+            return Promise.resolve();
+        },
+        leave(topic, self) {
+            registry.leave(topic, self);
+            return Promise.resolve();
+        },
+    };
+}
+
+function sharedMemSyncFactory(provider: MemTransportProvider, registry: SharedPeerRegistry): SyncMeshFactory {
+    return async (req) => {
+        const addr = `mem://sync-${req.identity.keyId.slice(0, 12)}`;
+        const discovery = registryDiscovery(registry, req.identity.keyId);
+        const mesh = new Mesh({
+            transports: [new NonClosingProvider(provider)],
+            discovery,
+            authenticator: createAuthenticator({
+                localKey: req.identity,
+                signingName: SIGNING_ED25519,
+                kemPrefs: [KEM_X25519_HKDF],
+            }),
+            localKeyId: req.identity.keyId,
+            listenAddresses: [addr],
+        });
+        return {
+            mesh,
+            discovery,
+            listenAddresses: [addr],
+            announcedAddresses: [addr],
+            discoveryNotes: ['mem-shared'],
+            closeables: [],
+        };
+    };
+}
+
+async function runSyncFetchNonDefaultBackendTest(): Promise<void> {
+    const provider = new MemTransportProvider();
+    const registry = new SharedPeerRegistry();
+    const factory = sharedMemSyncFactory(provider, registry);
+
+    const aliceWs = await openMemWorkspace();
+    const alice = new ReplSession({
+        workspace: aliceWs,
+        keyVault: new MemoryKeyVault(aliceWs.replica.getHashSuite()),
+        syncMeshFactory: factory,
+    });
+    alice.enableReplDefaults();
+
+    const bobWs = await openMemWorkspace({ backendLabel: 'rdb-web' });
+    const bob = new ReplSession({
+        workspace: bobWs,
+        keyVault: new MemoryKeyVault(bobWs.replica.getHashSuite()),
+        syncMeshFactory: factory,
+    });
+    bob.enableReplDefaults();
+
+    const passphrase = async () => 'correct horse';
+    try {
+        const createdAlice = await runCommand(alice, '\\key create alice', undefined, { requestPassphrase: passphrase });
+        assertEqual(createdAlice.exitCode, 0, 'alice key');
+        await runCommand(alice, '\\author alice');
+
+        const setup = await runCommand(alice, `
+CREATE SCHEMA shop CREATORS ($me) AS (
+  TABLE products (sku string PUB READONLY, name string)
+);
+CREATE TABLEGROUP shop_prod USING SCHEMA shop;
+CREATE DATABASE shopdb;
+ADD TABLEGROUP shop_prod TO shopdb;
+`);
+        assertEqual(setup.exitCode, 0, `alice shopdb (${setup.output})`);
+
+        const started = await runCommand(alice, '\\sync start shopdb as alice on localhost');
+        assert(started.exitCode === 0, `alice sync start (${started.output})`);
+
+        const shop = alice.workspace.roots.list('database').find((root) => root.name === 'shopdb');
+        assert(shop !== undefined, 'shopdb is a local root on alice');
+
+        const createdBob = await runCommand(bob, '\\key create bob', undefined, { requestPassphrase: passphrase });
+        assertEqual(createdBob.exitCode, 0, 'bob key');
+
+        const fetched = await runCommand(bob, `\\sync fetch #${shop.id} as bob on localhost`);
+        assert(fetched.exitCode === 0, `remote fetch (${fetched.output})`);
+        assert(!fetched.output.includes('No backend attached'), `must not fail on backend label (${fetched.output})`);
+        assert(fetched.output.includes('fetched'), 'fetch output mentions fetched');
+        assert(fetched.output.includes('genesis only'), 'fetch notes genesis only');
+
+        const obj = await bob.workspace.replica.getObject(shop.id);
+        assert(obj !== undefined, 'fetched object is present on bob');
+        assertEqual(obj.getBackendLabel(), 'rdb-web', 'stored on the web-like backend');
+    } finally {
+        await stopAllSyncs(alice);
+        await stopAllSyncs(bob);
+        await aliceWs.close();
+        await bobWs.close();
+        provider.close();
+    }
 }
 
 void main();

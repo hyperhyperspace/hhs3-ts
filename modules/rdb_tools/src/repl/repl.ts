@@ -9,8 +9,8 @@ import { renderStatementOutput } from "../format/table.js";
 import { LanguageError } from "../session/adapter.js";
 import { runLanguageWithUnlock } from "../script/run_command.js";
 import { WorkspaceSession } from "../session/session.js";
-import { runMetaCommand } from "./meta.js";
-import { fulfillKeyPassphrase, KeyUnlockDeclinedError } from "./passphrase.js";
+import { runMetaCommand, fulfillPassphraseNeed } from "./meta.js";
+import { requestPassphrase, KeyUnlockDeclinedError } from "./passphrase.js";
 import { promptForSession } from "./prompt.js";
 
 export async function startRepl(session: WorkspaceSession): Promise<void> {
@@ -53,7 +53,13 @@ export async function startRepl(session: WorkspaceSession): Promise<void> {
             try {
                 const meta = await runMetaCommand(session, line);
                 if (meta.needsPassphrase !== undefined) {
-                    output.write(await fulfillKeyPassphrase(session, meta.needsPassphrase, rl) + '\n');
+                    const passphrase = await requestPassphrase(session, meta.needsPassphrase, rl);
+                    if (passphrase === undefined) {
+                        output.write('passphrase required\n');
+                    } else {
+                        const text = await fulfillPassphraseNeed(session, meta.needsPassphrase, passphrase);
+                        if (text.length > 0) output.write(text + '\n');
+                    }
                 } else if (meta.output !== undefined && meta.output.length > 0) {
                     output.write(meta.output + '\n');
                 }

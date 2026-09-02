@@ -378,5 +378,81 @@ export const replicaBasicTests = {
                 assertTrue(payload.type === RSet.typeId, 'genesis payload should carry MVT type');
             },
         },
+        {
+            name: '[REP14] subscribeNewRoot fires on createObject cache miss only',
+            invoke: async () => {
+                const replica = createTestReplica();
+                const seen: string[] = [];
+                const cb = (obj: { getId(): string }) => { seen.push(obj.getId()); };
+                replica.subscribeNewRoot(cb);
+
+                const init = await RSet.create({
+                    seed: 'new-root-listener',
+                    initialElements: [],
+                    hashAlgorithm: 'sha256',
+                });
+                const set = await replica.createObject(init);
+                assertTrue(seen.length === 1 && seen[0] === set.getId(), 'listener fires once for a new root');
+
+                await replica.createObject(init);
+                assertTrue(seen.length === 1, 'idempotent createObject does not fire again');
+
+                replica.unsubscribeNewRoot(cb);
+                const init2 = await RSet.create({
+                    seed: 'new-root-listener-2',
+                    initialElements: [],
+                    hashAlgorithm: 'sha256',
+                });
+                await replica.createObject(init2);
+                assertTrue(seen.length === 1, 'unsubscribeNewRoot stops further calls');
+            },
+        },
+        {
+            name: '[REP15] subscribeNewRoot does not fire for registerObject',
+            invoke: async () => {
+                const backend = new MemDagBackend(hashSuite);
+                const replica = new Replica({ crypto, hashSuite, config: { selfValidate: true } });
+                replica.attachBackend('default', backend);
+                replica.registerType(RCap.typeId, rCapFactory);
+
+                let fired = 0;
+                replica.subscribeNewRoot(() => { fired += 1; });
+
+                const capInit = await RCap.create({
+                    seed: 'owned-cap-listener',
+                    creators: [],
+                    initialCaps: { admin: { managedBy: ['creator'] } },
+                });
+                const factory = await replica.getRegistry().lookup(RCap.typeId);
+                const id = await factory.computeRootObjectId(capInit, replica, undefined);
+                const { dag, created } = await backend.getOrCreateDag(id, { type: RCap.typeId });
+                if (created) {
+                    await factory.executeCreationPayload(capInit, replica, new RootScopedDag(dag));
+                }
+                const cap = (await factory.loadObject(id, replica, { backendLabel: 'default' })) as RCap;
+                replica.registerObject(cap);
+
+                assertTrue(fired === 0, 'registerObject of a non-root must not notify subscribeNewRoot');
+                assertFalse(replica.getRootIds().has(id), 'registered object should not be a root');
+            },
+        },
+        {
+            name: '[REP16] throwing subscribeNewRoot listener does not fail createObject',
+            invoke: async () => {
+                const replica = createTestReplica();
+                const seen: string[] = [];
+                replica.subscribeNewRoot(() => { throw new Error('listener boom'); });
+                replica.subscribeNewRoot((obj) => { seen.push(obj.getId()); });
+
+                const init = await RSet.create({
+                    seed: 'throwing-listener',
+                    initialElements: [],
+                    hashAlgorithm: 'sha256',
+                });
+                const set = await replica.createObject(init);
+                assertTrue(set !== undefined, 'createObject succeeds when a listener throws');
+                assertTrue(seen.length === 1 && seen[0] === set.getId(), 'later listeners still run');
+            },
+        },
     ],
 };

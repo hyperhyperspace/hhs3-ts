@@ -1,5 +1,5 @@
 import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519, type OwnIdentity, type SigningName } from "@hyper-hyper-space/hhs3_crypto";
-import type { RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
+import { RSchemaImpl, type RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 import { testing } from "@hyper-hyper-space/hhs3_util";
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import {
@@ -46,6 +46,28 @@ const tests = [
                 assertEquals(session.workspace.roots.list('group').length, 1, 'group indexed');
             } finally {
                 await runtime.close();
+            }
+        },
+    },
+    {
+        name: '[RDB_RT03b] createObject without createRoot is indexed via subscribeNewRoot',
+        invoke: async () => {
+            const workspace = await openMemWorkspace();
+            try {
+                const hashSuite = workspace.replica.getHashSuite();
+                const creator = await createIdentity(SIGNING_ED25519, hashSuite);
+                const init = await RSchemaImpl.create({
+                    name: 'fetched_schema',
+                    creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
+                    tables: [{ name: 't', columns: { x: { type: 'string' } } }],
+                });
+                const obj = await workspace.replica.createObject(init);
+                const schemas = workspace.roots.list('schema');
+                assertEquals(schemas.length, 1, 'schema indexed without createRoot');
+                assertEquals(schemas[0]?.name, 'fetched_schema', 'schema name from create payload');
+                assertEquals(schemas[0]?.id, obj.getId(), 'indexed id matches created object');
+            } finally {
+                await workspace.close();
             }
         },
     },

@@ -9,7 +9,9 @@ import { RootScopedDag, validationOk } from '@hyper-hyper-space/hhs3_mvt';
 import { createDagProvider } from '../src/provider.js';
 import { createDagSynchronizer } from '../src/synchronizer.js';
 import { encode, decode } from '../src/codec.js';
-import type { SyncMsg, NewFrontierMsg } from '../src/protocol.js';
+import { fetchInit } from '../src/fetch_init.js';
+import type { SyncMsg, NewFrontierMsg, InitResponse } from '../src/protocol.js';
+import type { Swarm, SwarmPeer } from '@hyper-hyper-space/hhs3_mesh';
 
 // --- Helpers ---
 
@@ -712,6 +714,62 @@ async function testForeignDepDeferral() {
     providerB.destroy();
 }
 
+function stubSwarm(peers: SwarmPeer[]): Swarm {
+    return {
+        topic: 'fetch-init',
+        mode: 'active',
+        activate() {},
+        deactivate() {},
+        sleep() {},
+        destroy() {},
+        peers: () => peers,
+        onPeerJoin() {},
+        onPeerLeave() {},
+        blockPeer() {},
+        wouldAccept() { return Promise.resolve(true); },
+        adopt() { return false; },
+    };
+}
+
+async function testFetchInitHashMismatch() {
+    const expectedPayload = { action: 'create', type: 'hhs/test', seed: 'expected' };
+    const wrongPayload = { action: 'create', type: 'hhs/test', seed: 'wrong' };
+    const objectId = dag.createEntry(expectedPayload, {}, dag.position(), sha256).hash;
+
+    const { local, remote } = createChannelPair('fetch-init', 'peerA', 'peerB');
+    const swarmPeer: SwarmPeer = { keyId: 'peerB', endpoint: 'mem://peerB', channel: local };
+    const swarm = stubSwarm([swarmPeer]);
+
+    remote.onMessage((data) => {
+        const msg = decode(data);
+        if (msg.type !== 'init-request' || msg.objectId !== objectId) return;
+        const resp: InitResponse = {
+            type: 'init-response',
+            objectId,
+            createPayload: wrongPayload,
+        };
+        remote.send(encode(resp));
+    });
+
+    let threw = false;
+    try {
+        await fetchInit(objectId, [swarm], sha256, 2000);
+    } catch (e: any) {
+        threw = true;
+        testing.assertTrue(
+            typeof e.message === 'string' && e.message.includes('Creation payload hash mismatch'),
+            `error should mention hash mismatch, got: ${e.message}`,
+        );
+        testing.assertTrue(
+            e.message.includes(objectId),
+            'error should include the expected object id',
+        );
+    }
+    testing.assertTrue(threw, 'fetchInit should reject a createPayload that does not hash to objectId');
+
+    local.close();
+}
+
 export const syncSuite = {
     title: '[SYNC] DAG sync protocol',
     tests: [
@@ -725,5 +783,6 @@ export const syncSuite = {
         { name: '[SYNC_07] Frontier during sync', invoke: testFrontierDuringSync },
         { name: '[SYNC_08] Multi-peer sync', invoke: testMultiPeerSync },
         { name: '[SYNC_09] Foreign dep deferral', invoke: testForeignDepDeferral },
+        { name: '[SYNC_10] fetchInit rejects createPayload hash mismatch', invoke: testFetchInitHashMismatch },
     ],
 };

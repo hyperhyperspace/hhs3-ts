@@ -33,14 +33,18 @@
 //     fetch (ctx.fetchObject); if that is unavailable or fails, it is an
 //     infrastructure error (throw), never an MVT data condition.
 //
-// startSync is two-step:
+// startSync subscribes to this RDb's DAG (register, then read) and reconciles
+// the sync fan-out. Reconcile is two-step and repeatable:
 //   Step 1 (closure): BFS the transitive closure — members, each group's own
 //     RSchema and bound foreign groups — fetching any object not yet present
 //     with an explicit backend label. Backend labels are fixed at create /
 //     fetch time and only memoized thereafter, so the whole closure must be
 //     present before sessions open (resolveRefDag relies on a memoized label).
-//   Step 2 (sessions): open one swarm + sync session per DAG in the closure
-//     (including the RDb's own DAG) and activate it. stopSync tears them down.
+//   Step 2 (sessions): open one swarm + sync session per DAG not yet in the
+//     session map (including the RDb's own DAG) and activate it.
+// Membership is add-only in v1, so reconcile only opens missing sessions.
+// stopSync unsubscribes, invalidates in-flight work via an epoch, and tears
+// sessions down. An in-flight start that loses to stopSync throws.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, HASH_SHA256, KeyId, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
@@ -54,7 +58,7 @@ import {
 } from "@hyper-hyper-space/hhs3_mvt";
 import { RootScopedDag, ScopedDag, CausalDag, ScopedDagSubscription, signPayload as signPayloadHelper, serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 
-import type { Mesh, Swarm } from "@hyper-hyper-space/hhs3_mesh";
+import type { Mesh, PeerAuthorizer, Swarm } from "@hyper-hyper-space/hhs3_mesh";
 import { createSyncSession } from "@hyper-hyper-space/hhs3_sync";
 import type { SyncSession, SyncTarget } from "@hyper-hyper-space/hhs3_sync";
 
@@ -70,7 +74,15 @@ export type RDbRuntimeConfig = {
     meshLabel?: string;
     backendLabel?: string;
     fetchTimeoutMs?: number;
+    authorizer?: PeerAuthorizer;
 };
+
+class SyncAbortedError extends Error {
+    constructor() {
+        super('RDb startSync aborted');
+        this.name = 'SyncAbortedError';
+    }
+}
 
 export const rDbFactory: RObjectFactory = {
 
@@ -144,6 +156,13 @@ export class RDbImpl implements RDbContract, SyncableObject {
 
     private runtimeConfig: RDbRuntimeConfig = {};
     private syncSessions: Map<B64Hash, { swarm: Swarm; session: SyncSession }> = new Map();
+
+    private syncIntent: 'stopped' | 'running' = 'stopped';
+    private syncEpoch = 0;
+    private startGate: Promise<void> | undefined;
+    private reconcileInFlight = false;
+    private rescanRequested = false;
+    private reconcileIdleWaiters: Array<() => void> = [];
 
     constructor(createOpId: B64Hash, createOp: CreateRDbPayload, ctx: RContext, backendLabel: string = 'default') {
         this.createOpId = createOpId;
@@ -314,51 +333,138 @@ export class RDbImpl implements RDbContract, SyncableObject {
         return this._causalDag;
     }
 
-    // --- SyncableObject: two-step fan-out ---
+    // --- SyncableObject: subscribe + epoch-gated reconcile ---
 
     async startSync(): Promise<void> {
-        if (this.syncSessions.size > 0) return;   // idempotent
+        if (this.startGate !== undefined && this.syncIntent === 'running') return this.startGate;
+        if (this.syncIntent === 'running') return;
 
-        // Step 1: build the transitive closure, fetching anything missing.
-        const closure = await this.ensureClosurePresent();
+        const gate = this.runStart();
+        this.startGate = gate;
+        try {
+            await gate;
+        } finally {
+            if (this.startGate === gate) this.startGate = undefined;
+        }
+    }
 
-        // Step 2: open one sync session per DAG in the closure.
-        const mesh = this.ctx.getMesh(this.runtimeConfig.meshLabel ?? 'default') as Mesh;
+    private async runStart(): Promise<void> {
+        this.syncIntent = 'running';
+        const epoch = ++this.syncEpoch;
+        try {
+            await this.getScopedDag();
+            if (!this.isCurrent(epoch)) throw new SyncAbortedError();
+            this.subscribe(this.onMembershipChange);
+            await this.requestReconcile(true);
+            if (!this.isCurrent(epoch)) throw new SyncAbortedError();
+        } catch (err) {
+            if (this.syncEpoch === epoch) {
+                this.unsubscribe(this.onMembershipChange);
+                this.syncIntent = 'stopped';
+                this.syncEpoch++;
+                this.destroyAllSessions();
+            }
+            throw err;
+        }
+    }
 
-        for (const id of closure) {
-            if (this.syncSessions.has(id)) continue;
+    async stopSync(): Promise<void> {
+        this.syncIntent = 'stopped';
+        this.syncEpoch++;
+        this.unsubscribe(this.onMembershipChange);
+        this.destroyAllSessions();
+    }
 
-            const rObject = id === this.createOpId ? this : await this.ctx.getObject(id);
-            if (rObject === undefined) throw new Error(`Object '${id}' vanished from the replica during startSync`);
+    async destroy(): Promise<void> {
+        await this.stopSync();
+        this._scopedDag = undefined;
+        this._causalDag = undefined;
+    }
 
-            const label = id === this.createOpId
-                ? this.backendLabel
-                : (await this.ctx.getBackendLabel(id)) ?? this.backendLabel;
+    private readonly onMembershipChange = (_version: Version): void => {
+        if (this.syncIntent !== 'running') return;
+        void this.requestReconcile(false);
+    };
 
-            const rawDag = await this.ctx.getDag(id, label);
-            if (rawDag === undefined) throw new Error(`DAG '${id}' not found during startSync`);
+    private isCurrent(epoch: number): boolean {
+        return this.syncIntent === 'running' && this.syncEpoch === epoch;
+    }
 
-            const swarm = mesh.createSwarm(id);
-            const target: SyncTarget = {
-                dagId: id,
-                dag: rawDag,
-                rObject,
-                hashSuite: this.ctx.getHashSuite(),
-                resolveRefDag: async (refId) =>
-                    this.ctx.getDag(refId, (await this.ctx.getBackendLabel(refId)) ?? this.backendLabel),
-            };
+    private destroyAllSessions(): void {
+        const sessions = [...this.syncSessions.values()];
+        this.syncSessions.clear();
+        for (const { swarm, session } of sessions) {
+            session.destroy();
+            swarm.destroy();
+        }
+    }
 
-            const session = createSyncSession(target, [swarm]);
-            swarm.activate();
-            this.syncSessions.set(id, { swarm, session });
+    private waitUntilReconcileIdle(): Promise<void> {
+        if (!this.reconcileInFlight) return Promise.resolve();
+        return new Promise((resolve) => { this.reconcileIdleWaiters.push(resolve); });
+    }
+
+    private async requestReconcile(throwOnError: boolean): Promise<void> {
+        while (this.reconcileInFlight) {
+            if (!throwOnError) {
+                this.rescanRequested = true;
+                return;
+            }
+            await this.waitUntilReconcileIdle();
+            if (this.syncIntent !== 'running') throw new SyncAbortedError();
+        }
+
+        this.reconcileInFlight = true;
+        const epoch = this.syncEpoch;
+        try {
+            let delayMs = 100;
+            for (;;) {
+                this.rescanRequested = false;
+                if (!this.isCurrent(epoch)) {
+                    if (throwOnError) throw new SyncAbortedError();
+                    return;
+                }
+                try {
+                    const closure = await this.ensureClosurePresent(epoch);
+                    if (!this.isCurrent(epoch)) {
+                        if (throwOnError) throw new SyncAbortedError();
+                        return;
+                    }
+                    await this.openMissingSessions(closure, epoch);
+                } catch (err) {
+                    if (err instanceof SyncAbortedError) {
+                        if (throwOnError) throw err;
+                        return;
+                    }
+                    if (!this.isCurrent(epoch)) {
+                        if (throwOnError) throw new SyncAbortedError();
+                        return;
+                    }
+                    if (throwOnError) throw err;
+                    this.rescanRequested = true;
+                    await this.sleep(delayMs);
+                    delayMs = Math.min(delayMs * 2, 2000);
+                    continue;
+                }
+                if (!this.isCurrent(epoch)) {
+                    if (throwOnError) throw new SyncAbortedError();
+                    return;
+                }
+                if (!this.rescanRequested) return;
+            }
+        } finally {
+            this.reconcileInFlight = false;
+            const waiters = this.reconcileIdleWaiters.splice(0);
+            for (const w of waiters) w();
         }
     }
 
     // BFS the closure of member ids + each group's schema + bound foreign
     // groups, fetching any object not yet present in the replica. Returns the
     // set of DAG ids to sync (including the RDb's own DAG).
-    private async ensureClosurePresent(): Promise<B64Hash[]> {
+    private async ensureClosurePresent(epoch: number): Promise<B64Hash[]> {
         const members = await this.resolveAt();
+        if (!this.isCurrent(epoch)) throw new SyncAbortedError();
 
         const visited = new Set<B64Hash>();
         const order: B64Hash[] = [];
@@ -373,6 +479,7 @@ export class RDbImpl implements RDbContract, SyncableObject {
             if (id === this.createOpId) continue;   // RDb itself already present
 
             const obj = await this.ensurePresent(id);
+            if (!this.isCurrent(epoch)) throw new SyncAbortedError();
 
             // groups pull in their own schema and bound foreign groups
             if (obj.getType() === RTABLE_GROUP_TYPE_ID) {
@@ -402,22 +509,65 @@ export class RDbImpl implements RDbContract, SyncableObject {
                 timeoutMs: this.runtimeConfig.fetchTimeoutMs,
             });
         } catch (err) {
+            if (err instanceof SyncAbortedError) throw err;
             throw new Error(`Failed to fetch object '${id}' for RDb sync: ${(err as Error).message}`);
         }
     }
 
-    async stopSync(): Promise<void> {
-        for (const { swarm, session } of this.syncSessions.values()) {
-            session.destroy();
-            swarm.destroy();
+    private async openMissingSessions(closure: B64Hash[], epoch: number): Promise<void> {
+        const mesh = this.ctx.getMesh(this.runtimeConfig.meshLabel ?? 'default') as Mesh;
+
+        for (const id of closure) {
+            if (!this.isCurrent(epoch)) return;
+            if (this.syncSessions.has(id)) continue;
+
+            const rObject = id === this.createOpId ? this : await this.ctx.getObject(id);
+            if (!this.isCurrent(epoch)) return;
+            if (rObject === undefined) throw new Error(`Object '${id}' vanished from the replica during startSync`);
+
+            const label = id === this.createOpId
+                ? this.backendLabel
+                : (await this.ctx.getBackendLabel(id)) ?? this.backendLabel;
+            if (!this.isCurrent(epoch)) return;
+
+            const rawDag = await this.ctx.getDag(id, label);
+            if (!this.isCurrent(epoch)) return;
+            if (rawDag === undefined) throw new Error(`DAG '${id}' not found during startSync`);
+
+            if (this.syncSessions.has(id)) continue;
+
+            const swarm = mesh.createSwarm(id, {
+                authorizer: this.runtimeConfig.authorizer,
+            });
+            let session: SyncSession | undefined;
+            try {
+                const target: SyncTarget = {
+                    dagId: id,
+                    dag: rawDag,
+                    rObject,
+                    hashSuite: this.ctx.getHashSuite(),
+                    resolveRefDag: async (refId) =>
+                        this.ctx.getDag(refId, (await this.ctx.getBackendLabel(refId)) ?? this.backendLabel),
+                };
+                session = createSyncSession(target, [swarm]);
+                if (!this.isCurrent(epoch) || this.syncSessions.has(id)) {
+                    session.destroy();
+                    swarm.destroy();
+                    if (!this.isCurrent(epoch)) return;
+                    continue;
+                }
+                this.syncSessions.set(id, { swarm, session });
+                swarm.activate();
+            } catch (err) {
+                session?.destroy();
+                swarm.destroy();
+                throw err;
+            }
         }
-        this.syncSessions.clear();
     }
 
-    async destroy(): Promise<void> {
-        await this.stopSync();
-        this._scopedDag = undefined;
-        this._causalDag = undefined;
+    private sleep(ms: number): Promise<void> {
+        return new Promise((resolve) => { setTimeout(resolve, ms); });
     }
 }
 

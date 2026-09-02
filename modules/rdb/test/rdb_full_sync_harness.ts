@@ -1,14 +1,17 @@
 // Shared harness for real two-replica RDb integration tests (Replica + Mesh +
-// MemDagBackend). StaticDiscovery requires every sync topic to be precomputed.
+// MemDagBackend). StaticDiscovery is topic-scoped; callers may give Alice and
+// Bob different topic lists. Bob can opt into PoolReuseDiscovery so member
+// DAGs can be negotiated on an existing rdbId connection.
 
 import {
     createBasicCrypto, HASH_SHA256, SIGNING_ED25519, KEM_X25519_HKDF,
     sha256, createIdentity,
 } from "@hyper-hyper-space/hhs3_crypto";
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
-import type { NetworkAddress, PeerInfo, TopicId, Mesh } from "@hyper-hyper-space/hhs3_mesh";
+import type { NetworkAddress, PeerInfo, TopicId, Mesh, PeerDiscovery } from "@hyper-hyper-space/hhs3_mesh";
 import {
     Mesh as MeshClass, StaticDiscovery, MemTransportProvider, createAuthenticator,
+    DiscoveryStack, PoolReuseDiscovery,
 } from "@hyper-hyper-space/hhs3_mesh";
 import type { RContext, Version } from "@hyper-hyper-space/hhs3_mvt";
 import { version } from "@hyper-hyper-space/hhs3_mvt";
@@ -51,6 +54,20 @@ export type PeerSetup = {
     peerInfo: PeerInfo;
 };
 
+function createDiscoverySlot(initial: PeerDiscovery): { discovery: PeerDiscovery; replace(next: PeerDiscovery): void } {
+    let current = initial;
+    return {
+        discovery: {
+            discover(topic, schemes, target) {
+                return current.discover(topic, schemes, target);
+            },
+            announce(topic, self) { return current.announce(topic, self); },
+            leave(topic, keyId) { return current.leave(topic, keyId); },
+        },
+        replace(next) { current = next; },
+    };
+}
+
 export function createPeer(
     testId: string,
     peerName: string,
@@ -58,13 +75,15 @@ export function createPeer(
     noiseId: OwnIdentity,
     remotePeer: PeerInfo,
     topics: TopicId[],
-    config?: { selfValidate?: boolean },
+    config?: { selfValidate?: boolean; poolReuse?: boolean },
 ): PeerSetup {
     const addr: NetworkAddress = `mem://${peerName}-${testId}`;
+    const staticDiscovery = new StaticDiscovery([remotePeer], topics);
+    const slot = config?.poolReuse === true ? createDiscoverySlot(staticDiscovery) : undefined;
 
     const mesh = new MeshClass({
         transports: [provider],
-        discovery: new StaticDiscovery([remotePeer], topics),
+        discovery: slot?.discovery ?? staticDiscovery,
         authenticator: createAuthenticator({
             localKey: noiseId,
             signingName: SIGNING_ED25519,
@@ -73,6 +92,13 @@ export function createPeer(
         localKeyId: noiseId.keyId,
         listenAddresses: [addr],
     });
+
+    if (slot !== undefined) {
+        slot.replace(new DiscoveryStack([
+            { source: new PoolReuseDiscovery(mesh.pool), priority: 0 },
+            { source: staticDiscovery, priority: 10 },
+        ]));
+    }
 
     const replica = new Replica({ crypto, hashSuite, config: { selfValidate: config?.selfValidate ?? true } });
     replica.attachBackend('default', new MemDagBackend(hashSuite));
@@ -128,8 +154,9 @@ export async function frontier(group: RTableGroupImpl): Promise<Version> {
 export async function hasRowOn(
     replica: Replica, groupId: B64Hash, table: string, rowId: B64Hash,
 ): Promise<boolean> {
-    const group = await getGroup(replica, groupId);
-    const view = await (await group.getTable(table)).getView();
+    const obj = await replica.getObject(groupId);
+    if (obj === undefined) return false;
+    const view = await (await (obj as RTableGroupImpl).getTable(table)).getView();
     return view.hasRow(rowId);
 }
 
@@ -144,7 +171,11 @@ export function openTable(name: string, columns: TableDef['columns'], extra?: Pa
 }
 
 /** Wire two peers with precomputed topics (Alice/Bob naming). */
-export async function createAliceBobPeers(testId: string, topics: TopicId[]): Promise<{
+export async function createAliceBobPeers(testId: string, topics: TopicId[], opts?: {
+    aliceTopics?: TopicId[];
+    bobTopics?: TopicId[];
+    bobPoolReuse?: boolean;
+}): Promise<{
     provider: MemTransportProvider;
     alice: PeerSetup;
     bob: PeerSetup;
@@ -158,8 +189,10 @@ export async function createAliceBobPeers(testId: string, topics: TopicId[]): Pr
     const alicePeer: PeerInfo = { keyId: aliceNoise.keyId, addresses: [aliceAddr] };
     const bobPeer: PeerInfo = { keyId: bobNoise.keyId, addresses: [bobAddr] };
 
-    const alice = createPeer(testId, 'alice', provider, aliceNoise, bobPeer, topics);
-    const bob = createPeer(testId, 'bob', provider, bobNoise, alicePeer, topics);
+    const alice = createPeer(testId, 'alice', provider, aliceNoise, bobPeer, opts?.aliceTopics ?? topics);
+    const bob = createPeer(testId, 'bob', provider, bobNoise, alicePeer, opts?.bobTopics ?? topics, {
+        poolReuse: opts?.bobPoolReuse,
+    });
 
     // createPeer derives addr from testId+name; align with our explicit addresses
     alice.addr = aliceAddr;

@@ -15,6 +15,7 @@
   "license": "MIT",
   "dependencies": {
     "@hyper-hyper-space/hhs3_crypto": "^0.1.0",
+    "@hyper-hyper-space/hhs3_mesh": "^0.1.0",
     "@hyper-hyper-space/hhs3_mvt": "^0.1.0",
     "@hyper-hyper-space/hhs3_rdb": "^0.1.0",
     "@hyper-hyper-space/hhs3_rdb_adapter": "^0.1.0",

@@ -3,12 +3,14 @@ import { stderr, stdin, stdout } from "node:process";
 import Database from "better-sqlite3";
 
 import { SqliteTarget } from "@hyper-hyper-space/hhs3_rdb_adapter_sqlite";
+import { stopAllSyncs } from "@hyper-hyper-space/hhs3_rdb_repl";
 
 import { defaultKeystorePath, KeyStore } from "../src/keys/keystore.js";
 import { startRepl } from "../src/repl/repl.js";
 import { runCommand } from "../src/script/run_command.js";
 import { runScriptFile, runScriptStdin } from "../src/script/run_script.js";
 import { WorkspaceSession } from "../src/session/session.js";
+import { createNodeSyncMeshFactory } from "../src/sync/node_mesh.js";
 import { Workspace } from "../src/workspace/workspace.js";
 
 async function main(): Promise<void> {
@@ -38,6 +40,8 @@ async function main(): Promise<void> {
         // to detect local edits waiting in its capture outbox.
         return new SqliteTarget(new Database(path), { captureChanges: true, dbPath: path });
     };
+
+    session.syncMeshFactory = createNodeSyncMeshFactory();
 
     try {
         if (args.includes('--json')) session.setOutputMode('json');
@@ -77,6 +81,7 @@ async function main(): Promise<void> {
     } finally {
         for (const projection of session.projections.values()) await projection.stop();
         session.projections.clear();
+        await stopAllSyncs(session);
         await workspace.close();
     }
 }

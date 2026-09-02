@@ -1,7 +1,7 @@
 // Real two-replica integration tests for the RDb sync root (Replica + Mesh +
 // MemDagBackend). See rdb_full_sync_harness.ts for shared wiring.
 
-import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.js";
+import { assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
@@ -18,7 +18,7 @@ import {
     dummyCtx, hashSuite, wait, waitUntil,
     computePinnedVersion, closureTopicIds,
     createAliceBobPeers, cleanup,
-    getRDb, frontier, waitForRowOn, hasRowOn, openTable,
+    getRDb, frontier, waitForRowOn, openTable,
 } from "./rdb_full_sync_harness.js";
 
 // --- [RDB-FULL] One-way smoke (refactored to harness) ---
@@ -157,7 +157,7 @@ async function testBidirectionalWrites() {
     await cleanup([alice, bob], provider);
 }
 
-// --- [RDB-FULL03] Dynamic membership via RDb DAG sync (v1 stop/start) ---
+// --- [RDB-FULL03] Dynamic membership via RDb DAG sync ---
 
 async function testDynamicMembership() {
     const creator = await createIdentity(SIGNING_ED25519, hashSuite);
@@ -221,13 +221,6 @@ async function testDynamicMembership() {
 
     const row1Id = deriveRowId('g1-row');
     await (await group1A.getTable('t')).insert('g1-row', { name: 'group1' });
-
-    const bobHasGroup1 = (await bob.replica.getObject(group1Id)) !== undefined;
-    const bobSeesRow1 = bobHasGroup1 && await hasRowOn(bob.replica, group1Id, 't', row1Id);
-    assertFalse(bobSeesRow1, 'v1: bob cannot see group1 row before fan-out refresh');
-
-    await rdbB.stopSync();
-    await rdbB.startSync();
     await waitForRowOn(bob.replica, group1Id, 't', row1Id);
 
     await alice.replica.createObject(schema2Init);
@@ -235,21 +228,8 @@ async function testDynamicMembership() {
     await rdbA.addSchema(schema2Id);
     await rdbA.addGroup(group2Id);
 
-    await waitUntil(async () => {
-        const groups = await getRDb(bob.replica, rdbId).then(r => r.getMemberGroups());
-        return groups.includes(group2Id);
-    });
-
-    // v1: both peers refresh fan-out so new member DAGs are served and fetched
-    await rdbA.stopSync();
-    await rdbA.startSync();
-    await wait(300);
-
     const row2Id = deriveRowId('g2-row');
     await (await group2A.getTable('t')).insert('g2-row', { name: 'group2' });
-
-    await rdbB.stopSync();
-    await rdbB.startSync();
     await waitForRowOn(bob.replica, group2Id, 't', row2Id);
 
     await cleanup([alice, bob], provider);
@@ -434,18 +414,16 @@ async function testSignedOpsMeshSync() {
         return groups.includes(usersGroupId) && groups.includes(appGroupId);
     });
 
-    await rdbB.stopSync();
-    await rdbB.startSync();
-    await wait(300);
-
     await waitUntil(async () => {
-        const usersOnBob = await bob.replica.getObject(usersGroupId) as RTableGroupImpl;
+        const usersOnBob = await bob.replica.getObject(usersGroupId) as RTableGroupImpl | undefined;
+        if (usersOnBob === undefined) return false;
         const capsView = await (await usersOnBob.getView()).getTableView(CAPS_TABLE);
         return (await capsView.findRowIds({ label: 'editor', grantee: bobSigning.keyId })).length > 0;
     });
 
     await waitUntil(async () => {
-        const appOnBob = await bob.replica.getObject(appGroupId) as RTableGroupImpl;
+        const appOnBob = await bob.replica.getObject(appGroupId) as RTableGroupImpl | undefined;
+        if (appOnBob === undefined) return false;
         const observed = await (await appOnBob.getView()).resolveRefVersion(usersGroupId);
         return observed.size > 1 || !observed.has(usersGroupId);
     });
@@ -571,9 +549,12 @@ async function testMultiDagDeployment() {
         return groups.includes(usersGroupId) && groups.includes(shopGroupId) && groups.includes(invGroupId);
     });
 
-    await rdbB.stopSync();
-    await rdbB.startSync();
-    await wait(300);
+    await waitUntil(async () => {
+        for (const id of [usersSchemaId, usersGroupId, shopSchemaId, shopGroupId, invSchemaId, invGroupId]) {
+            if ((await bob.replica.getObject(id)) === undefined) return false;
+        }
+        return true;
+    });
 
     for (const id of [usersSchemaId, usersGroupId, shopSchemaId, shopGroupId, invSchemaId, invGroupId]) {
         assertTrue((await bob.replica.getObject(id)) !== undefined, `bob fetched member ${id}`);
@@ -585,14 +566,243 @@ async function testMultiDagDeployment() {
     await cleanup([alice, bob], provider);
 }
 
+// --- [RDB-FULL07] Hash-only RDb join: fetchObject(rdbId), no local create payload ---
+
+async function testHashOnlyRdbJoin() {
+    const creator = await createIdentity(SIGNING_ED25519, hashSuite);
+
+    const schemaInit = await RSchemaImpl.create({
+        name: 'rdb:full07:schema',
+        creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
+        tables: [openTable('t', { name: { type: 'string' } })],
+    });
+    const schemaId = await rSchemaFactory.computeRootObjectId(schemaInit, dummyCtx);
+    const pinned = computePinnedVersion(schemaId);
+
+    const groupInit = await RTableGroupImpl.create({
+        name: 'rdb-full07-group',
+        seed: 'rdb-full07-group',
+        schemaRef: schemaId,
+        schemaVersion: pinned,
+    });
+    const groupId = await rTableGroupFactory.computeRootObjectId(groupInit, dummyCtx);
+
+    const rdbInit = await RDbImpl.create({ seed: 'rdb-full07-db' });
+    const rdbId = await rDbFactory.computeRootObjectId(rdbInit, dummyCtx);
+
+    const topics = closureTopicIds(rdbId, [schemaId], [groupId]);
+    const { provider, alice, bob } = await createAliceBobPeers('full07', topics);
+
+    await alice.replica.createObject(schemaInit);
+    const groupA = (await alice.replica.createObject(groupInit)) as RTableGroupImpl;
+    const rdbA = (await alice.replica.createObject(rdbInit)) as RDbImpl;
+
+    await (await groupA.getTable('t')).insert('row-1', { name: 'alice' });
+    await rdbA.addSchema(schemaId);
+    await rdbA.addGroup(groupId);
+    rdbA.setRuntimeConfig({ fetchTimeoutMs: 8000 });
+    await rdbA.startSync();
+
+    assertTrue((await bob.replica.getObject(rdbId)) === undefined, 'B has no RDb before fetchObject');
+
+    const rdbB = (await bob.replica.fetchObject(rdbId)) as RDbImpl;
+    assertTrue(rdbB.getId() === rdbId, 'fetched RDb has the expected id');
+    assertTrue((await bob.replica.getObject(schemaId)) === undefined, 'B has no schema after RDb fetch');
+    assertTrue((await bob.replica.getObject(groupId)) === undefined, 'B has no group after RDb fetch');
+
+    rdbB.setRuntimeConfig({ fetchTimeoutMs: 8000 });
+    await rdbB.startSync();
+
+    await waitUntil(async () => (await bob.replica.getObject(schemaId)) !== undefined);
+    await waitUntil(async () => (await bob.replica.getObject(groupId)) !== undefined);
+
+    assertTrue((await bob.replica.getObject(schemaId)) !== undefined, 'B fetched schema via RDb fan-out');
+    assertTrue((await bob.replica.getObject(groupId)) !== undefined, 'B fetched group via RDb fan-out');
+
+    const rowId = deriveRowId('row-1');
+    await waitForRowOn(bob.replica, groupId, 't', rowId);
+
+    const finalView = await (await (await bob.replica.getObject(groupId) as RTableGroupImpl).getTable('t')).getView();
+    assertTrue(await finalView.hasRow(rowId), 'B converged the row inserted on A');
+    const row = await finalView.getRow(rowId);
+    assertTrue(row !== undefined && row.values['name'] === 'alice', 'row values converged');
+
+    await cleanup([alice, bob], provider);
+}
+
+// --- [RDB-FULL08] fetchObject(schemaId) then fetchObject(groupId), no RDb on Bob ---
+
+async function testFetchSchemaThenGroup() {
+    const creator = await createIdentity(SIGNING_ED25519, hashSuite);
+
+    const schemaInit = await RSchemaImpl.create({
+        name: 'rdb:full08:schema',
+        creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
+        tables: [openTable('t', { name: { type: 'string' } })],
+    });
+    const schemaId = await rSchemaFactory.computeRootObjectId(schemaInit, dummyCtx);
+    const pinned = computePinnedVersion(schemaId);
+
+    const groupInit = await RTableGroupImpl.create({
+        name: 'rdb-full08-group',
+        seed: 'rdb-full08-group',
+        schemaRef: schemaId,
+        schemaVersion: pinned,
+    });
+    const groupId = await rTableGroupFactory.computeRootObjectId(groupInit, dummyCtx);
+
+    const rdbInit = await RDbImpl.create({ seed: 'rdb-full08-db' });
+    const rdbId = await rDbFactory.computeRootObjectId(rdbInit, dummyCtx);
+
+    const topics = closureTopicIds(rdbId, [schemaId], [groupId]);
+    const { provider, alice, bob } = await createAliceBobPeers('full08', topics);
+
+    await alice.replica.createObject(schemaInit);
+    await alice.replica.createObject(groupInit);
+    const rdbA = (await alice.replica.createObject(rdbInit)) as RDbImpl;
+    await rdbA.addSchema(schemaId);
+    await rdbA.addGroup(groupId);
+    rdbA.setRuntimeConfig({ fetchTimeoutMs: 8000 });
+    await rdbA.startSync();
+
+    assertTrue((await bob.replica.getObject(rdbId)) === undefined, 'B has no RDb');
+
+    const schemaB = (await bob.replica.fetchObject(schemaId)) as RSchemaImpl;
+    assertTrue(schemaB.getId() === schemaId, 'fetched schema has the expected id');
+    assertTrue((await bob.replica.getObject(groupId)) === undefined, 'group still absent after schema fetch');
+
+    const groupB = (await bob.replica.fetchObject(groupId)) as RTableGroupImpl;
+    assertTrue(groupB.getId() === groupId, 'fetched group has the expected id');
+    assertTrue(groupB.getSchemaRef() === schemaId, 'fetched group pins the schema');
+
+    await cleanup([alice, bob], provider);
+}
+
+// --- [RDB-FULL09] fetchObject(groupId) without schema present is rejected ---
+
+async function testFetchGroupWithoutSchema() {
+    const creator = await createIdentity(SIGNING_ED25519, hashSuite);
+
+    const schemaInit = await RSchemaImpl.create({
+        name: 'rdb:full09:schema',
+        creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
+        tables: [openTable('t', { name: { type: 'string' } })],
+    });
+    const schemaId = await rSchemaFactory.computeRootObjectId(schemaInit, dummyCtx);
+    const pinned = computePinnedVersion(schemaId);
+
+    const groupInit = await RTableGroupImpl.create({
+        name: 'rdb-full09-group',
+        seed: 'rdb-full09-group',
+        schemaRef: schemaId,
+        schemaVersion: pinned,
+    });
+    const groupId = await rTableGroupFactory.computeRootObjectId(groupInit, dummyCtx);
+
+    const rdbInit = await RDbImpl.create({ seed: 'rdb-full09-db' });
+    const rdbId = await rDbFactory.computeRootObjectId(rdbInit, dummyCtx);
+
+    const topics = closureTopicIds(rdbId, [schemaId], [groupId]);
+    const { provider, alice, bob } = await createAliceBobPeers('full09', topics);
+
+    await alice.replica.createObject(schemaInit);
+    await alice.replica.createObject(groupInit);
+    const rdbA = (await alice.replica.createObject(rdbInit)) as RDbImpl;
+    await rdbA.addSchema(schemaId);
+    await rdbA.addGroup(groupId);
+    rdbA.setRuntimeConfig({ fetchTimeoutMs: 8000 });
+    await rdbA.startSync();
+
+    let threw = false;
+    try {
+        await bob.replica.fetchObject(groupId);
+    } catch (e: any) {
+        threw = true;
+        assertTrue(
+            typeof e.message === 'string' && e.message.includes(schemaId),
+            `error should mention the missing schema id, got: ${e.message}`,
+        );
+    }
+    assertTrue(threw, 'fetchObject(groupId) must throw when the schema is not local');
+    assertTrue((await bob.replica.getObject(groupId)) === undefined, 'group was not materialized');
+    assertTrue((await bob.replica.getObject(schemaId)) === undefined, 'schema was not fetched as a side effect');
+
+    await cleanup([alice, bob], provider);
+}
+
+// --- [RDB-FULL10] Hash-only join when Bob's discovery only knows rdbId ---
+
+async function testHashOnlyJoinDiscoveryNotPreseeded() {
+    const creator = await createIdentity(SIGNING_ED25519, hashSuite);
+
+    const schemaInit = await RSchemaImpl.create({
+        name: 'rdb:full10:schema',
+        creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
+        tables: [openTable('t', { name: { type: 'string' } })],
+    });
+    const schemaId = await rSchemaFactory.computeRootObjectId(schemaInit, dummyCtx);
+    const pinned = computePinnedVersion(schemaId);
+
+    const groupInit = await RTableGroupImpl.create({
+        name: 'rdb-full10-group',
+        seed: 'rdb-full10-group',
+        schemaRef: schemaId,
+        schemaVersion: pinned,
+    });
+    const groupId = await rTableGroupFactory.computeRootObjectId(groupInit, dummyCtx);
+
+    const rdbInit = await RDbImpl.create({ seed: 'rdb-full10-db' });
+    const rdbId = await rDbFactory.computeRootObjectId(rdbInit, dummyCtx);
+
+    const topics = closureTopicIds(rdbId, [schemaId], [groupId]);
+    const { provider, alice, bob } = await createAliceBobPeers('full10', topics, {
+        aliceTopics: topics,
+        bobTopics: [rdbId],
+        bobPoolReuse: true,
+    });
+
+    await alice.replica.createObject(schemaInit);
+    const groupA = (await alice.replica.createObject(groupInit)) as RTableGroupImpl;
+    const rdbA = (await alice.replica.createObject(rdbInit)) as RDbImpl;
+
+    await (await groupA.getTable('t')).insert('row-1', { name: 'alice' });
+    await rdbA.addSchema(schemaId);
+    await rdbA.addGroup(groupId);
+    rdbA.setRuntimeConfig({ fetchTimeoutMs: 8000 });
+    await rdbA.startSync();
+
+    const rdbB = (await bob.replica.fetchObject(rdbId)) as RDbImpl;
+    assertTrue(rdbB.getId() === rdbId, 'fetched RDb has the expected id');
+    assertTrue((await bob.replica.getObject(schemaId)) === undefined, 'B has no schema after RDb fetch');
+    assertTrue((await bob.replica.getObject(groupId)) === undefined, 'B has no group after RDb fetch');
+
+    rdbB.setRuntimeConfig({ fetchTimeoutMs: 8000 });
+    await rdbB.startSync();
+
+    await waitUntil(async () => (await bob.replica.getObject(schemaId)) !== undefined);
+    await waitUntil(async () => (await bob.replica.getObject(groupId)) !== undefined);
+
+    assertTrue((await bob.replica.getObject(schemaId)) !== undefined, 'B fetched schema via pool-reuse fan-out');
+    assertTrue((await bob.replica.getObject(groupId)) !== undefined, 'B fetched group via pool-reuse fan-out');
+
+    const rowId = deriveRowId('row-1');
+    await waitForRowOn(bob.replica, groupId, 't', rowId);
+
+    await cleanup([alice, bob], provider);
+}
+
 export const rdbFullSyncTests = {
     title: '[RDB-FULL] RDb-driven cross-replica sync',
     tests: [
         { name: '[RDB-FULL] RDb.startSync fetches members and converges a row', invoke: testRDbDrivenSync },
         { name: '[RDB-FULL02] bidirectional row inserts converge on both replicas', invoke: testBidirectionalWrites },
-        { name: '[RDB-FULL03] dynamic membership syncs on RDb DAG; v1 needs stop/start fan-out', invoke: testDynamicMembership },
+        { name: '[RDB-FULL03] dynamic membership fans out without stop/start', invoke: testDynamicMembership },
         { name: '[RDB-FULL04] cross-group FK + observe convergence across replicas', invoke: testCrossGroupFkObserve },
         { name: '[RDB-FULL05] Users caps + signed cross-peer insert under RDb orchestration', invoke: testSignedOpsMeshSync },
         { name: '[RDB-FULL06] multi-DAG deployment closure fetch + row convergence', invoke: testMultiDagDeployment },
+        { name: '[RDB-FULL07] hash-only fetchObject(rdbId) then fan-out members and row', invoke: testHashOnlyRdbJoin },
+        { name: '[RDB-FULL08] fetchObject(schemaId) then fetchObject(groupId) without an RDb', invoke: testFetchSchemaThenGroup },
+        { name: '[RDB-FULL09] fetchObject(groupId) without schema present is rejected', invoke: testFetchGroupWithoutSchema },
+        { name: '[RDB-FULL10] hash-only join with Bob discovery limited to rdbId', invoke: testHashOnlyJoinDiscoveryNotPreseeded },
     ],
 };

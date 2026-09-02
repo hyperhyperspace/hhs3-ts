@@ -28,6 +28,8 @@ export * from "./format/log.js";
 export * from "./format/display.js";
 export * from "./format/diagnostics.js";
 
+export * from "./sync/node_mesh.js";
+
 export {
     RdbRuntime,
     RdbWorkspace,

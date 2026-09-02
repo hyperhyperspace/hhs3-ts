@@ -5,15 +5,17 @@ import {
     type AuthInteractionContext,
     type RdbWorkspace,
 } from "@hyper-hyper-space/hhs3_rdb_runtime";
+import { MemoryTarget } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import {
     ReplSession,
     promptForSession,
     runCommand,
+    stopAllSyncs,
     type PassphraseRequest,
 } from "@hyper-hyper-space/hhs3_rdb_repl";
-import { MemoryTarget } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 import type { ExecuteResult, ReplClient, ReplInteractions } from "./protocol.js";
+import { createBrowserSyncMeshFactory } from "./sync_mesh.js";
 
 export class DirectReplClient implements ReplClient {
     private workspace?: RdbWorkspace;
@@ -56,9 +58,15 @@ export class DirectReplClient implements ReplClient {
     }
 
     async close(): Promise<void> {
+        const session = this.session;
         const workspace = this.workspace;
         this.workspace = undefined;
         this.session = undefined;
+        if (session !== undefined) {
+            for (const projection of session.projections.values()) await projection.stop();
+            session.projections.clear();
+            await stopAllSyncs(session);
+        }
         if (workspace !== undefined) await workspace.close();
     }
 
@@ -70,6 +78,7 @@ export class DirectReplClient implements ReplClient {
             // `\projection ...` backend for the browser: an ephemeral in-memory
             // target (capture-provisioned so local edits round-trip to rdb).
             projectionTargetFactory: async () => new MemoryTarget({ captureChanges: true }),
+            syncMeshFactory: createBrowserSyncMeshFactory(),
         });
         session.enableReplDefaults();
         this.workspace = workspace;

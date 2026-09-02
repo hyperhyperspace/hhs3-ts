@@ -4,7 +4,9 @@ import type { Interface } from "node:readline/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
+import { createBasicCrypto, createIdentity, HASH_SHA256, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import { version } from "@hyper-hyper-space/hhs3_mvt";
+import { stopAllSyncs } from "@hyper-hyper-space/hhs3_rdb_repl";
 import type { ResolvedTableRef } from "@hyper-hyper-space/hhs3_rdb_lang";
 import { testing } from "@hyper-hyper-space/hhs3_util";
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
@@ -19,6 +21,7 @@ import { evaluateObserveGateKey, scanKeystore } from "../src/session/authz_sugge
 import { resolveRowIdPrefix } from "../src/session/adapter.js";
 import { WorkspaceSession } from "../src/session/session.js";
 import { Workspace } from "../src/workspace/workspace.js";
+import { createNodeSyncMeshFactory } from "../src/sync/node_mesh.js";
 import { RTableGroupImpl } from "@hyper-hyper-space/hhs3_rdb";
 import { formatRows, formatRowsVertical } from "../src/format/rows.js";
 import {
@@ -1483,6 +1486,64 @@ const tests = [
             });
         },
     },
+    {
+        name: '[RDB_TOOLS51] sync mesh factory falls back to folder discovery when the tracker is down',
+        invoke: async () => {
+            const dir = await mkdtemp(join(tmpdir(), 'rdb-sync-mesh-'));
+            let builtA: Awaited<ReturnType<ReturnType<typeof createNodeSyncMeshFactory>>> | undefined;
+            let builtB: Awaited<ReturnType<ReturnType<typeof createNodeSyncMeshFactory>>> | undefined;
+            try {
+                const hashSuite = createBasicCrypto().hash(HASH_SHA256);
+                const alice = await createIdentity(SIGNING_ED25519, hashSuite);
+                const bob = await createIdentity(SIGNING_ED25519, hashSuite);
+                const factory = createNodeSyncMeshFactory({
+                    folderRoot: dir,
+                    env: { RDB_SYNC_TRACKER: 'ws://127.0.0.1:1' },
+                });
+                builtA = await factory({ scope: 'localhost', identity: alice });
+                builtB = await factory({ scope: 'localhost', identity: bob });
+                assertTrue(
+                    builtA.discoveryNotes.some((n) => n.includes('unreachable')),
+                    `tracker noted unreachable (${builtA.discoveryNotes.join('; ')})`,
+                );
+                assertTrue(
+                    builtA.discoveryNotes.some((n) => n.startsWith('folder ')),
+                    'folder backup is present',
+                );
+                assertTrue(
+                    builtA.announcedAddresses.every((a) => a.startsWith('ws://127.0.0.1:') && !a.endsWith(':0')),
+                    `announced a concrete loopback port (${builtA.announcedAddresses.join(', ')})`,
+                );
+                assertTrue(
+                    !builtA.listenAddresses.some((a) => a.includes('0.0.0.0')),
+                    'localhost does not bind 0.0.0.0',
+                );
+
+                const topic = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=';
+                await builtA.discovery.announce(topic, {
+                    keyId: alice.keyId,
+                    addresses: builtA.announcedAddresses,
+                });
+                await builtB.discovery.announce(topic, {
+                    keyId: bob.keyId,
+                    addresses: builtB.announcedAddresses,
+                });
+
+                const found: string[] = [];
+                for await (const peer of builtA.discovery.discover(topic)) {
+                    found.push(peer.keyId);
+                }
+                assertTrue(found.includes(bob.keyId), `folder discovery sees the other peer (got ${found.join(', ')})`);
+            } finally {
+                builtA?.mesh.close();
+                builtB?.mesh.close();
+                for (const c of [...(builtA?.closeables ?? []), ...(builtB?.closeables ?? [])]) {
+                    await c.close();
+                }
+                await rm(dir, { recursive: true, force: true });
+            }
+        },
+    },
 ];
 
 async function runCommandNonInteractive(session: WorkspaceSession, command: string) {
@@ -1547,6 +1608,7 @@ async function withSession(fn: (session: WorkspaceSession, dbPath: string) => Pr
     try {
         await fn(session, dbPath);
     } finally {
+        await stopAllSyncs(session);
         await workspace.close();
         await rm(dir, { recursive: true, force: true });
     }

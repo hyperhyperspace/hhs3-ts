@@ -298,6 +298,53 @@ async function testFetchTimeout() {
     provider.close();
 }
 
+// ---------- FO05: a hash prefix is not an object id ----------
+
+async function testFetchPrefixIsNotId() {
+    const rsetInit = await RSet.create({ seed: 'fo05-prefix', initialElements: [], hashAlgorithm: 'sha256' });
+    const setId = await rSetFactory.computeRootObjectId(rsetInit, dummyCtx) as TopicId;
+    const prefix = setId.slice(0, 12) as TopicId;
+
+    const provider = new MemTransportProvider();
+    const aliceNoise = await await createIdentity(SIGNING_ED25519, sha256);
+    const bobNoise = await await createIdentity(SIGNING_ED25519, sha256);
+    const alicePeer: PeerInfo = { keyId: aliceNoise.keyId, addresses: ['mem://alice-fo05'] };
+    const bobPeer: PeerInfo = { keyId: bobNoise.keyId, addresses: ['mem://bob-fo05'] };
+
+    // Alice serves the full object id; Bob's mesh also knows that topic so a
+    // prefix fetch failing is because the swarm topic is the prefix, not
+    // because discovery cannot find Alice at all.
+    const aliceMesh = createMesh(provider, aliceNoise, 'mem://alice-fo05', bobPeer, [setId]);
+    const aliceReplica = new Replica({ crypto, hashSuite, config: { selfValidate: true } });
+    aliceReplica.attachBackend('default', new MemDagBackend(hashSuite));
+    aliceReplica.attachMesh('default', aliceMesh);
+    aliceReplica.registerType(RSet.typeId, rSetFactory);
+
+    const aliceSet = (await aliceReplica.createObject(rsetInit)) as RSet;
+    await aliceSet.startSync();
+
+    const bobMesh = createMesh(provider, bobNoise, 'mem://bob-fo05', alicePeer, [setId, prefix]);
+    const bobReplica = new Replica({ crypto, hashSuite, config: { selfValidate: true } });
+    bobReplica.attachBackend('default', new MemDagBackend(hashSuite));
+    bobReplica.attachMesh('default', bobMesh);
+    bobReplica.registerType(RSet.typeId, rSetFactory);
+
+    let threw = false;
+    try {
+        await bobReplica.fetchObject(prefix, { timeoutMs: 500 });
+    } catch (e: any) {
+        threw = true;
+        assertTrue(e.message.includes('timed out'), `error should mention timeout, got: ${e.message}`);
+    }
+    assertTrue(threw, 'fetchObject of a hash prefix should time out (topics are exact ids)');
+
+    await aliceReplica.close();
+    await bobReplica.close();
+    aliceMesh.close();
+    bobMesh.close();
+    provider.close();
+}
+
 export const replicaFetchTests = {
     title: '[REP-FETCH] Object fetching via creation payload bootstrap',
     tests: [
@@ -306,5 +353,6 @@ export const replicaFetchTests = {
         { name: '[FO02] fetchObject is idempotent', invoke: testFetchIdempotent },
         { name: '[FO03] fetchObject with unknown type rejects', invoke: testFetchUnknownType },
         { name: '[FO04] fetchObject times out with no peers', invoke: testFetchTimeout },
+        { name: '[FO05] fetchObject of a hash prefix times out', invoke: testFetchPrefixIsNotId },
     ],
 };
