@@ -3,7 +3,7 @@ import { random } from '@hyper-hyper-space/hhs3_crypto';
 import type { Dag, Header } from '@hyper-hyper-space/hhs3_dag';
 import { json } from '@hyper-hyper-space/hhs3_json';
 import type { TopicChannel } from '@hyper-hyper-space/hhs3_mesh';
-import { formatValidationFailure, type RObject, type Version, type RContext } from '@hyper-hyper-space/hhs3_mvt';
+import { formatValidationFailure, ValidationRejectedError, type RObject, type Version, type RContext } from '@hyper-hyper-space/hhs3_mvt';
 
 import { stringToUint8Array } from '@hyper-hyper-space/hhs3_crypto';
 import type {
@@ -442,8 +442,13 @@ export function createDagSynchronizer(
             workNeeded = false;
             try {
                 await attemptWorkOnce();
-            } catch (_e) {
-                // prevent a single error from killing the work loop
+            } catch (e) {
+                // Last resort: the per-hash validation loop already defers on missing
+                // data, so a throw here is header dispatch / payload dispatch failing.
+                // Prevent a single error from killing the work loop.
+                if (TRACE_SYNC) {
+                    trace('sync.work-error', { dag: dagId, error: (e as Error)?.message });
+                }
             }
         }
 
@@ -1243,70 +1248,108 @@ export function createDagSynchronizer(
 
                 const version: Version = new Set(prevHashes);
 
-                const foreignDeps = rObject.extractForeignDeps(payload, version);
-                if (foreignDeps !== undefined && ctx !== undefined) {
-                    let allDepsAvailable = true;
-                    let missingObject: B64Hash | undefined;
-                    let missingHash: B64Hash | undefined;
-                    for (const dep of foreignDeps) {
-                        const obj = await ctx.getObject(dep.objectId);
-                        if (obj === undefined) {
-                            waitingMissing.add(dep.objectId);
-                            ensureNewObjectListener();
-                            allDepsAvailable = false;
-                            missingObject = dep.objectId;
-                            break;
-                        }
-                        waitingMissing.delete(dep.objectId);
-                        await watchRef(obj);
-                        const scoped = await obj.getScopedDag();
-                        for (const requiredHash of dep.requiredHashes) {
-                            if (await scoped.loadEntry(requiredHash) === undefined) {
+                // extractForeignDeps, the dep gate, validatePayload and applyPayload
+                // may throw when the replica has not yet received cross-object state
+                // the op reads (a missing bound group, an unresolved schema version,
+                // an index entry not found). Under the pin-or-inherit invariant such
+                // gaps are transient: treat any non-validation throw as a defer (keep
+                // the header, retry on the next wake) rather than a reject, and never
+                // let one hash abort the rest of the pass. Only a genuine type-level
+                // ValidationRejectedError is a reject.
+                try {
+                    const foreignDeps = rObject.extractForeignDeps(payload, version);
+                    if (foreignDeps !== undefined && ctx !== undefined) {
+                        let allDepsAvailable = true;
+                        let missingObject: B64Hash | undefined;
+                        let missingHash: B64Hash | undefined;
+                        for (const dep of foreignDeps) {
+                            const obj = await ctx.getObject(dep.objectId);
+                            if (obj === undefined) {
+                                waitingMissing.add(dep.objectId);
+                                ensureNewObjectListener();
                                 allDepsAvailable = false;
-                                missingHash = requiredHash;
+                                missingObject = dep.objectId;
                                 break;
                             }
+                            waitingMissing.delete(dep.objectId);
+                            await watchRef(obj);
+                            const scoped = await obj.getScopedDag();
+                            for (const requiredHash of dep.requiredHashes) {
+                                if (await scoped.loadEntry(requiredHash) === undefined) {
+                                    allDepsAvailable = false;
+                                    missingHash = requiredHash;
+                                    break;
+                                }
+                            }
+                            if (!allDepsAvailable) break;
                         }
-                        if (!allDepsAvailable) break;
+                        if (!allDepsAvailable) {
+                            if (TRACE_SYNC) {
+                                trace('sync.defer', { dag: dagId, hash, missingObject, missingHash });
+                            }
+                            continue;
+                        }
                     }
-                    if (!allDepsAvailable) {
+
+                    const result = await rObject.validatePayload(payload, version);
+                    if (!result.valid) {
+                        const source = payloadSourcePeer.get(hash);
+                        reportIssue(source, {
+                            kind: 'validation-failed',
+                            severity: 'moderate',
+                            opHash: hash,
+                            message: formatValidationFailure(result.why),
+                        });
                         if (TRACE_SYNC) {
-                            trace('sync.defer', { dag: dagId, hash, missingObject, missingHash });
+                            trace('sync.apply', {
+                                dag: dagId,
+                                hash,
+                                result: 'reject',
+                                why: 'invalid',
+                                reason: formatValidationFailure(result.why),
+                            });
                         }
+                        rejectEntry(hash);
                         continue;
                     }
-                }
 
-                const result = await rObject.validatePayload(payload, version);
-                if (!result.valid) {
-                    const source = payloadSourcePeer.get(hash);
-                    reportIssue(source, {
-                        kind: 'validation-failed',
-                        severity: 'moderate',
-                        opHash: hash,
-                        message: formatValidationFailure(result.why),
-                    });
-                    if (TRACE_SYNC) {
-                        trace('sync.apply', {
-                            dag: dagId,
-                            hash,
-                            result: 'reject',
-                            why: 'invalid',
-                            reason: formatValidationFailure(result.why),
+                    const resultHash = await rObject.applyPayload(payload, version);
+                    if (resultHash !== hash) {
+                        const source = payloadSourcePeer.get(hash);
+                        reportIssue(source, { kind: 'hash-mismatch', severity: 'high', opHash: hash });
+                        if (TRACE_SYNC) {
+                            trace('sync.apply', { dag: dagId, hash, result: 'reject', why: 'hash' });
+                        }
+                        rejectEntry(hash);
+                        continue;
+                    }
+                } catch (e) {
+                    if (e instanceof ValidationRejectedError) {
+                        const source = payloadSourcePeer.get(hash);
+                        reportIssue(source, {
+                            kind: 'validation-failed',
+                            severity: 'moderate',
+                            opHash: hash,
+                            message: formatValidationFailure(e.why),
                         });
+                        if (TRACE_SYNC) {
+                            trace('sync.apply', {
+                                dag: dagId,
+                                hash,
+                                result: 'reject',
+                                why: 'invalid',
+                                reason: formatValidationFailure(e.why),
+                            });
+                        }
+                        rejectEntry(hash);
+                        continue;
                     }
-                    rejectEntry(hash);
-                    continue;
-                }
-
-                const resultHash = await rObject.applyPayload(payload, version);
-                if (resultHash !== hash) {
-                    const source = payloadSourcePeer.get(hash);
-                    reportIssue(source, { kind: 'hash-mismatch', severity: 'high', opHash: hash });
+                    // Missing cross-object data or other infrastructure error: defer,
+                    // keep the header, do not reject. A subscribe / subscribeNewObject
+                    // / own-DAG growth wake reruns attemptWork.
                     if (TRACE_SYNC) {
-                        trace('sync.apply', { dag: dagId, hash, result: 'reject', why: 'hash' });
+                        trace('sync.defer', { dag: dagId, hash, error: (e as Error)?.message });
                     }
-                    rejectEntry(hash);
                     continue;
                 }
 

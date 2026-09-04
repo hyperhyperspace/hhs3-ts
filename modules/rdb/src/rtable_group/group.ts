@@ -131,6 +131,24 @@ export const rTableGroupFactory: RObjectFactory = {
         const createOp = (await scopedDag.loadEntry(id))!.payload as CreateTableGroupPayload;
         return new RTableGroupImpl(id, createOp, ctx, backendLabel);
     },
+
+    // Genesis deps of a group create: the pinned RSchema at its pinned version
+    // (which may be post-genesis, so the schema DAG must have advanced that far),
+    // and every binding target object (bindings are name -> id only, no version,
+    // so object presence suffices). This lives on the factory because it must be
+    // evaluated before the group object exists; the op-level extractForeignDeps
+    // never sees a 'create' (validatePayload rejects create on an existing group).
+    extractCreationForeignDeps: async (payload: Payload, _ctx: RContext) => {
+        const create = payload as CreateTableGroupPayload;
+        const deps: ForeignDep[] = [{
+            objectId: create.schemaRef,
+            requiredHashes: [...json.fromSet(create.schemaVersion)],
+        }];
+        for (const target of Object.values(create.bindings ?? {})) {
+            deps.push({ objectId: target, requiredHashes: [] });
+        }
+        return deps;
+    },
 };
 
 export class RTableGroupImpl implements RTableGroupContract {
@@ -832,25 +850,21 @@ export class RTableGroupImpl implements RTableGroupContract {
             }];
         }
 
-        const action = (payload as json.LiteralMap)['action'];
+        // 'create' is never seen here: validatePayload rejects a create on an
+        // existing group, so sync never routes one through the op-level gate. A
+        // group's genesis deps (schema at pinned version, binding targets) are
+        // declared by rTableGroupFactory.extractCreationForeignDeps instead.
 
-        if (action === 'create') {
-            const create = payload as CreateTableGroupPayload;
-            const deps: ForeignDep[] = [{
-                objectId: create.schemaRef,
-                requiredHashes: [...json.fromSet(create.schemaVersion)],
-            }];
-            for (const target of Object.values(create.bindings ?? {})) {
-                deps.push({ objectId: target, requiredHashes: [] });
-            }
-            return deps;
-        }
-
-        // row / bundle ops validate against the schema at their position, and
-        // may reference bound foreign groups through cross-group FK / exists
-        // targets. The schema is needed at the op's version; bound groups need
-        // only be present (their observed versions are pinned by the observe
-        // ref-advance ops, which carry their own version deps above).
+        // Pin-or-inherit invariant: a row / bundle op reads the schema at its own
+        // position and may reach bound foreign groups through cross-group FK /
+        // exists targets, but every cross-object hash it reads is already pinned
+        // either by this op's own prevs (same-DAG, always gated) or by a causally
+        // prior gated op -- the create pins the schema genesis, each deploy pins
+        // its new schema version, each observe pins the foreign version it reads.
+        // So gating on object PRESENCE (schema, bound groups) is sufficient here;
+        // re-listing the resolved hashes per op would be redundant work. Any new
+        // op type that reads cross-object state MUST preserve this: pin the hashes
+        // it reads, or be causally after an op that did.
         const deps: ForeignDep[] = [{ objectId: this.getSchemaRef(), requiredHashes: [] }];
         for (const target of Object.values(this.getBindings())) {
             deps.push({ objectId: target, requiredHashes: [] });

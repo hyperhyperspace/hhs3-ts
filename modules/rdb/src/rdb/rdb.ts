@@ -56,6 +56,7 @@ import {
     Payload, RObjectFactory, RContext, LoadObjectOptions,
     Version, version, ForeignDep, Delta, DeltaAccumulator, View, RObject,
     SyncableObject, formatValidationFailure, validationFailure, ValidationRejectedError, ValidationResult,
+    extractCreatePayloadType,
 } from "@hyper-hyper-space/hhs3_mvt";
 import { RootScopedDag, ScopedDag, CausalDag, ScopedDagSubscription, signPayload as signPayloadHelper, serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 
@@ -165,6 +166,22 @@ export class RDbImpl implements RDbContract, SyncableObject {
     private reconcileInFlight = false;
     private rescanRequested = false;
     private reconcileIdleWaiters: Array<() => void> = [];
+
+    // A create payload fetched (hash-verified) but not yet materialized because
+    // its genesis deps (e.g. a pinned, possibly post-genesis schema version, or a
+    // bound foreign group) are not yet locally satisfiable. Retried on each
+    // reconcile pass; materialized once every dep object is present and every
+    // pinned requiredHash is on that dep's DAG.
+    private pendingCreates: Map<B64Hash, { payload: Payload; deps: ForeignDep[] }> = new Map();
+
+    // Creates that were genuinely invalid once their deps were satisfied. Dropped
+    // and reported once; never retried within a run.
+    private invalidCreates: Set<B64Hash> = new Set();
+
+    // Objects whose own DAG growth may unblock a pending create (a schema
+    // advancing to a pinned version). Subscribed when their session opens,
+    // unsubscribed on teardown.
+    private watchedObjects: Map<B64Hash, RObject> = new Map();
 
     constructor(createOpId: B64Hash, createOp: CreateRDbPayload, ctx: RContext, backendLabel: string = 'default') {
         this.createOpId = createOpId;
@@ -357,11 +374,17 @@ export class RDbImpl implements RDbContract, SyncableObject {
             await this.getScopedDag();
             if (!this.isCurrent(epoch)) throw new SyncAbortedError();
             this.subscribe(this.onMembershipChange);
+            this.attachNewObjectListener();
+            // The first pass sets up the reachable part and registers pending
+            // creates; it does NOT block on a schema advancing to a pinned
+            // version (that resolves later via dep-growth / new-object wakes),
+            // so \sync start does not hang on remote progress.
             await this.requestReconcile(true);
             if (!this.isCurrent(epoch)) throw new SyncAbortedError();
         } catch (err) {
             if (this.syncEpoch === epoch) {
                 this.unsubscribe(this.onMembershipChange);
+                this.detachNewObjectListener();
                 this.syncIntent = 'stopped';
                 this.syncEpoch++;
                 this.destroyAllSessions();
@@ -374,8 +397,35 @@ export class RDbImpl implements RDbContract, SyncableObject {
         this.syncIntent = 'stopped';
         this.syncEpoch++;
         this.unsubscribe(this.onMembershipChange);
+        this.detachNewObjectListener();
         this.destroyAllSessions();
     }
+
+    private attachNewObjectListener(): void {
+        if (this.ctx.subscribeNewObject !== undefined) {
+            this.ctx.subscribeNewObject(this.onNewObject);
+        }
+    }
+
+    private detachNewObjectListener(): void {
+        if (this.ctx.unsubscribeNewObject !== undefined) {
+            this.ctx.unsubscribeNewObject(this.onNewObject);
+        }
+    }
+
+    // A newly-materialized object may be a dep of a pending create, or a member
+    // whose session must open: rescan.
+    private readonly onNewObject = (_obj: RObject): void => {
+        if (this.syncIntent !== 'running') return;
+        void this.requestReconcile(false);
+    };
+
+    // A watched object's DAG grew (e.g. a schema reached a pinned version):
+    // a pending create may now be materializable.
+    private readonly onDepChange = (_version: Version): void => {
+        if (this.syncIntent !== 'running') return;
+        void this.requestReconcile(false);
+    };
 
     async destroy(): Promise<void> {
         await this.stopSync();
@@ -393,6 +443,13 @@ export class RDbImpl implements RDbContract, SyncableObject {
     }
 
     private destroyAllSessions(): void {
+        for (const obj of this.watchedObjects.values()) {
+            try { obj.unsubscribe(this.onDepChange); } catch { /* best effort */ }
+        }
+        this.watchedObjects.clear();
+        this.pendingCreates.clear();
+        this.invalidCreates.clear();
+
         const sessions = [...this.syncSessions.values()];
         this.syncSessions.clear();
         for (const { swarm, session } of sessions) {
@@ -427,12 +484,7 @@ export class RDbImpl implements RDbContract, SyncableObject {
                     return;
                 }
                 try {
-                    const closure = await this.ensureClosurePresent(epoch);
-                    if (!this.isCurrent(epoch)) {
-                        if (throwOnError) throw new SyncAbortedError();
-                        return;
-                    }
-                    await this.openMissingSessions(closure, epoch);
+                    await this.runReconcilePass(epoch);
                 } catch (err) {
                     if (err instanceof SyncAbortedError) {
                         if (throwOnError) throw err;
@@ -461,49 +513,126 @@ export class RDbImpl implements RDbContract, SyncableObject {
         }
     }
 
-    // BFS the closure of member ids + each group's schema + bound foreign
-    // groups, fetching any object not yet present in the replica. Returns the
-    // set of DAG ids to sync (including the RDb's own DAG).
-    private async ensureClosurePresent(epoch: number): Promise<B64Hash[]> {
+    // One incremental reconcile pass. BFS the closure (members + each present
+    // group's schema and bound foreign groups). For every id:
+    //   - present  -> open its session immediately (so a schema syncs while the
+    //                 group that pins it is still pending) and fan out;
+    //   - absent   -> fetch its create payload (once), register it as pending,
+    //                 enqueue its genesis deps so they fetch / session / advance,
+    //                 and materialize it as soon as those deps are satisfiable.
+    // Materialized objects are fanned out from too. Objects that stay pending are
+    // retried on the next pass, woken by dep-growth (onDepChange) or a new object
+    // appearing (onNewObject). The genesis dep graph is acyclic by hash
+    // construction, so this terminates once the mesh delivers.
+    private async runReconcilePass(epoch: number): Promise<void> {
         const members = await this.resolveAt();
         if (!this.isCurrent(epoch)) throw new SyncAbortedError();
 
+        const mesh = this.ctx.getMesh(this.runtimeConfig.meshLabel ?? 'default') as Mesh;
+
         const visited = new Set<B64Hash>();
-        const order: B64Hash[] = [];
         const queue: B64Hash[] = [this.createOpId, ...members.schemaIds, ...members.groupIds];
 
         while (queue.length > 0) {
             const id = queue.shift()!;
             if (visited.has(id)) continue;
             visited.add(id);
-            order.push(id);
-
-            if (id === this.createOpId) continue;   // RDb itself already present
-
-            const obj = await this.ensurePresent(id);
             if (!this.isCurrent(epoch)) throw new SyncAbortedError();
 
-            // groups pull in their own schema and bound foreign groups
+            if (id === this.createOpId) {
+                await this.ensureSession(id, mesh, epoch);
+                continue;
+            }
+
+            if (this.invalidCreates.has(id)) continue;
+
+            let obj = await this.ctx.getObject(id);
+            if (!this.isCurrent(epoch)) throw new SyncAbortedError();
+
+            if (obj === undefined) {
+                // Prefer the deps-aware path (fetch the create payload, hold it
+                // pending until its genesis deps are satisfiable). Contexts that
+                // only expose fetchObject fall back to direct materialization.
+                obj = this.ctx.fetchCreatePayload !== undefined
+                    ? await this.tryMaterialize(id, epoch)
+                    : await this.fetchAndMaterializeDirect(id);
+                if (!this.isCurrent(epoch)) throw new SyncAbortedError();
+            }
+
+            if (obj === undefined) {
+                // Still pending: keep its deps in the frontier so they get
+                // fetched, sessioned and advanced toward the pinned version.
+                const pending = this.pendingCreates.get(id);
+                if (pending !== undefined) {
+                    for (const dep of pending.deps) queue.push(dep.objectId);
+                }
+                continue;
+            }
+
+            await this.ensureSession(id, mesh, epoch);
+
             if (obj.getType() === RTABLE_GROUP_TYPE_ID) {
                 const group = obj as RTableGroupImpl;
                 queue.push(group.getSchemaRef());
                 for (const boundId of Object.values(group.getBindings())) queue.push(boundId);
             }
         }
-
-        return order;
     }
 
-    // Return the object for `id`, fetching it from the mesh if it is not yet
-    // present. A missing object with no fetch capability is an infra error.
-    private async ensurePresent(id: B64Hash): Promise<RObject> {
-        const existing = await this.ctx.getObject(id);
-        if (existing !== undefined) return existing;
+    // Fetch (once) and try to materialize a not-yet-present object. Returns the
+    // object if it was (or already is) materialized, otherwise undefined (still
+    // pending or dropped as invalid). Throws SyncAbortedError on epoch change and
+    // rethrows a fetch failure so the reconcile loop can back off / retry.
+    private async tryMaterialize(id: B64Hash, epoch: number): Promise<RObject | undefined> {
+        let pending = this.pendingCreates.get(id);
+        if (pending === undefined) {
+            const payload = await this.fetchCreatePayloadFor(id);
+            if (!this.isCurrent(epoch)) throw new SyncAbortedError();
+            const deps = await this.creationDepsFor(payload);
+            if (!this.isCurrent(epoch)) throw new SyncAbortedError();
+            pending = { payload, deps };
+            this.pendingCreates.set(id, pending);
+        }
 
+        // Deps satisfiable? Every dep object present AND every pinned requiredHash
+        // resolvable on that dep's own DAG.
+        for (const dep of pending.deps) {
+            const depObj = await this.ctx.getObject(dep.objectId);
+            if (!this.isCurrent(epoch)) throw new SyncAbortedError();
+            if (depObj === undefined) return undefined;
+            const scoped = await depObj.getScopedDag();
+            for (const requiredHash of dep.requiredHashes) {
+                if (await scoped.loadEntry(requiredHash) === undefined) return undefined;
+            }
+        }
+
+        try {
+            const backendLabel = this.runtimeConfig.backendLabel ?? this.backendLabel;
+            const obj = await this.ctx.createObject(pending.payload, backendLabel);
+            this.pendingCreates.delete(id);
+            return obj;
+        } catch (err) {
+            if (err instanceof SyncAbortedError) throw err;
+            if (err instanceof ValidationRejectedError) {
+                // Genuinely invalid once deps were satisfied: drop, report once,
+                // never retry within this run.
+                this.pendingCreates.delete(id);
+                this.invalidCreates.add(id);
+                this.reportInvalidCreate(id, err);
+                return undefined;
+            }
+            // Transient infra error (e.g. a dep raced away): keep pending, retry.
+            return undefined;
+        }
+    }
+
+    // Legacy path for contexts that expose fetchObject but not fetchCreatePayload
+    // (they cannot inspect a create's deps without materializing it). Fetches and
+    // materializes in one step, as reconcile did before deps-aware materialization.
+    private async fetchAndMaterializeDirect(id: B64Hash): Promise<RObject> {
         if (this.ctx.fetchObject === undefined) {
             throw new Error(`Object '${id}' is not present in the replica and the context cannot fetch it`);
         }
-
         try {
             return await this.ctx.fetchObject(id, {
                 meshLabel: this.runtimeConfig.meshLabel ?? 'default',
@@ -516,54 +645,90 @@ export class RDbImpl implements RDbContract, SyncableObject {
         }
     }
 
-    private async openMissingSessions(closure: B64Hash[], epoch: number): Promise<void> {
-        const mesh = this.ctx.getMesh(this.runtimeConfig.meshLabel ?? 'default') as Mesh;
+    private async creationDepsFor(payload: Payload): Promise<ForeignDep[]> {
+        const typeId = extractCreatePayloadType(payload);
+        if (typeId === undefined) return [];
+        const factory = await this.ctx.getRegistry().lookup(typeId);
+        if (factory.extractCreationForeignDeps === undefined) return [];
+        return (await factory.extractCreationForeignDeps(payload, this.ctx)) ?? [];
+    }
 
-        for (const id of closure) {
-            if (!this.isCurrent(epoch)) return;
-            if (this.syncSessions.has(id)) continue;
-
-            const rObject = id === this.createOpId ? this : await this.ctx.getObject(id);
-            if (!this.isCurrent(epoch)) return;
-            if (rObject === undefined) throw new Error(`Object '${id}' vanished from the replica during startSync`);
-
-            const label = id === this.createOpId
-                ? this.backendLabel
-                : (await this.ctx.getBackendLabel(id)) ?? this.backendLabel;
-            if (!this.isCurrent(epoch)) return;
-
-            const rawDag = await this.ctx.getDag(id, label);
-            if (!this.isCurrent(epoch)) return;
-            if (rawDag === undefined) throw new Error(`DAG '${id}' not found during startSync`);
-
-            if (this.syncSessions.has(id)) continue;
-
-            const swarm = mesh.createSwarm(id, {
-                authorizer: this.runtimeConfig.authorizer,
+    private async fetchCreatePayloadFor(id: B64Hash): Promise<Payload> {
+        if (this.ctx.fetchCreatePayload === undefined) {
+            throw new Error(`Object '${id}' is not present in the replica and the context cannot fetch create payloads`);
+        }
+        try {
+            return await this.ctx.fetchCreatePayload(id, {
+                meshLabel: this.runtimeConfig.meshLabel ?? 'default',
+                timeoutMs: this.runtimeConfig.fetchTimeoutMs,
             });
-            let session: SyncSession | undefined;
-            try {
-                const target: SyncTarget = {
-                    dagId: id,
-                    dag: rawDag,
-                    rObject,
-                    hashSuite: this.ctx.getHashSuite(),
-                    ctx: this.ctx,
-                };
-                session = createSyncSession(target, [swarm], { report: this.runtimeConfig.report });
-                if (!this.isCurrent(epoch) || this.syncSessions.has(id)) {
-                    session.destroy();
-                    swarm.destroy();
-                    if (!this.isCurrent(epoch)) return;
-                    continue;
-                }
-                this.syncSessions.set(id, { swarm, session });
-                swarm.activate();
-            } catch (err) {
-                session?.destroy();
+        } catch (err) {
+            if (err instanceof SyncAbortedError) throw err;
+            throw new Error(`Failed to fetch create payload for '${id}' for RDb sync: ${(err as Error).message}`);
+        }
+    }
+
+    private reportInvalidCreate(id: B64Hash, err: ValidationRejectedError): void {
+        this.runtimeConfig.report?.({
+            source: 'rdb',
+            kind: 'validation-failed',
+            severity: 'moderate',
+            opHash: id,
+            dagId: this.createOpId,
+            message: `RDb member create '${id}' is invalid: ${formatValidationFailure(err.why)}`,
+        });
+    }
+
+    // Open a sync session for a present object (idempotent). Also watches the
+    // object's growth so a pending create that depends on it advancing retries.
+    private async ensureSession(id: B64Hash, mesh: Mesh, epoch: number): Promise<void> {
+        if (this.syncSessions.has(id)) return;
+        if (!this.isCurrent(epoch)) return;
+
+        const rObject = id === this.createOpId ? this : await this.ctx.getObject(id);
+        if (!this.isCurrent(epoch)) return;
+        if (rObject === undefined) return;   // not materialized yet; a later pass opens it
+
+        const label = id === this.createOpId
+            ? this.backendLabel
+            : (await this.ctx.getBackendLabel(id)) ?? this.backendLabel;
+        if (!this.isCurrent(epoch)) return;
+
+        const rawDag = await this.ctx.getDag(id, label);
+        if (!this.isCurrent(epoch)) return;
+        if (rawDag === undefined) throw new Error(`DAG '${id}' not found during startSync`);
+
+        if (this.syncSessions.has(id)) return;
+
+        const swarm = mesh.createSwarm(id, {
+            authorizer: this.runtimeConfig.authorizer,
+        });
+        let session: SyncSession | undefined;
+        try {
+            const target: SyncTarget = {
+                dagId: id,
+                dag: rawDag,
+                rObject,
+                hashSuite: this.ctx.getHashSuite(),
+                ctx: this.ctx,
+            };
+            session = createSyncSession(target, [swarm], { report: this.runtimeConfig.report });
+            if (!this.isCurrent(epoch) || this.syncSessions.has(id)) {
+                session.destroy();
                 swarm.destroy();
-                throw err;
+                return;
             }
+            this.syncSessions.set(id, { swarm, session });
+            swarm.activate();
+
+            if (id !== this.createOpId && !this.watchedObjects.has(id)) {
+                rObject.subscribe(this.onDepChange);
+                this.watchedObjects.set(id, rObject);
+            }
+        } catch (err) {
+            session?.destroy();
+            swarm.destroy();
+            throw err;
         }
     }
 

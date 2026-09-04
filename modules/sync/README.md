@@ -45,6 +45,12 @@ A `SyncSession` is created with a `SyncTarget` (DAG + replicated object + hash s
 
 4. **Validation & apply** — received entries are validated (hash verification, predecessor availability, type-level checks) before being applied to the local DAG. If the `RObject` reports foreign dependencies via `extractForeignDeps` (entries that must exist on another object), and `SyncTarget.ctx` is provided, the synchronizer defers the entry — skipping it rather than rejecting it. Retry is driven by the referenced object's `subscribe` (history grew) and `ctx.subscribeNewObject` (the target appeared in the replica map). A foreign-dep target must be `getObject`-visible: roots via `createObject`/`fetchObject`; a non-root only if it is a **direct ref-advance target** (`registerObject`). Nested children are not registered just because they exist.
 
+   Two things follow from missing cross-object data being a *defer*, not a reject:
+
+   - **Throws from validate/apply defer, they do not reject.** Only a type-level `valid: false` (or a `ValidationRejectedError`) rejects an entry. Any other throw out of `extractForeignDeps`, the dep gate, `validatePayload` or `applyPayload` — a bound object not yet present, a schema version not yet resolvable, an index entry "not found" — is treated as a defer: the header is kept and retried on the next wake, and one throwing hash never aborts the rest of the validation pass. (Trade-off: a payload that throws for a non-transient reason is retried on every pass rather than dropped; the `sync.defer` trace with the error surfaces it. Retries are bounded by the header window.)
+
+   - **Pin-or-inherit invariant.** `extractForeignDeps` only needs to list `requiredHashes` for cross-object versions that are *not* already implied by the op's own history. Every cross-object hash validation reads at a position is either pinned by the op there (a ref-advance / observe carries the version it reads) or by a causally-prior gated op (a create pins the schema genesis; same-DAG prevs are always gated, so a local hash implies its whole history is local). Ordinary row/bundle ops therefore only gate on foreign object *presence*. **Any new op type that reads cross-object state at validation must preserve this: pin the hashes it reads, or be causally after an op that did.** Genesis pins (a create's own foreign versions, e.g. an RTableGroup's pinned schema version) are the base case and are declared separately by `RObjectFactory.extractCreationForeignDeps`, gated at object materialization rather than per op.
+
 ## Usage
 
 ```typescript

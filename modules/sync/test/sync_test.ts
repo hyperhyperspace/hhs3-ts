@@ -1251,6 +1251,63 @@ async function testRejectedCapEviction() {
     d.sync.destroy();
 }
 
+async function testValidateThrowDefersNotRejects() {
+    const dagId = 'drv-throw-defer';
+    const dagS = createTestDag();
+    const root = await dagS.append({ op: 'root' }, {});
+    const x = await dagS.append({ op: 'X' }, {}, new Set([root]));
+    const y = await dagS.append({ op: 'Y' }, {}, new Set([root]));
+
+    const dagA = createTestDag();
+    await dagA.append({ op: 'root' }, {});
+
+    // X's validation throws a plain Error (as a missing-replica-data path would)
+    // until the flag clears; Y always validates OK.
+    let failX = true;
+    const rObjectA = createMockRObject(dagA, dagId, {
+        validatePayload: async (payload) => {
+            if ((payload as { op?: string }).op === 'X' && failX) {
+                throw new Error('transient infrastructure error: dependency not ready');
+            }
+            return validationOk();
+        },
+    });
+    const d = manualDriver(dagId, dagA, rObjectA);
+
+    await d.sync.handleMessage({ type: 'new-frontier', dagId, frontier: [x, y] } as NewFrontierMsg, d.chB);
+    await wait(30);
+    const hreq = lastRequest(d.sent, 'header-request');
+    testing.assertTrue(hreq !== undefined, 'A requests headers');
+
+    await serveAuto(d, hreq!.requestId, dagS, [x, y]);
+    await wait(50);
+
+    // X threw -> deferred; the independent sibling Y still applied in the same
+    // pass, so one throwing hash does not abort the rest of the pass.
+    testing.assertTrue((await dagA.loadEntry(y)) !== undefined, 'a sibling that validates OK applies despite X throwing');
+    testing.assertTrue((await dagA.loadEntry(x)) === undefined, 'the throwing entry X is not applied');
+
+    // A throw is a defer, not a reject: no validation-failed report for X.
+    testing.assertTrue(
+        !d.reports.some((r) => r.kind === 'validation-failed' && r.opHash === x),
+        'an infrastructure throw is deferred, not reported as a validation failure',
+    );
+    testing.assertEquals(
+        d.sync.getDiagnostics().pendingPayloadRequests, 0,
+        'X payload was received (and deferred), so the payload stream drains without a 30s stall',
+    );
+
+    // Stop throwing and wake the loop. X applies -- proving it was kept in
+    // readyToApply (deferred), not rejected/remembered (a reject would evict it
+    // and it would never re-admit without a fresh fetch).
+    failX = false;
+    await d.sync.handleMessage({ type: 'new-frontier', dagId, frontier: [x, y] } as NewFrontierMsg, d.chB);
+    await wait(50);
+    testing.assertTrue((await dagA.loadEntry(x)) !== undefined, 'once the throw clears, the deferred entry applies on the next wake');
+
+    d.sync.destroy();
+}
+
 export const syncSuite = {
     title: '[SYNC] DAG sync protocol',
     tests: [
@@ -1272,5 +1329,6 @@ export const syncSuite = {
         { name: '[SYNC_15] Type reject remembers, reports, discards dependents, no stall', invoke: testTypeRejectRemembersReportsAndDiscards },
         { name: '[SYNC_16] Payload hash mismatch is not poisoned', invoke: testPayloadHashMismatchNotPoisoned },
         { name: '[SYNC_17] rejectedEntries eviction re-admits oldest, keeps newest', invoke: testRejectedCapEviction },
+        { name: '[SYNC_18] validate/apply throw defers (not rejects) and does not abort the pass', invoke: testValidateThrowDefersNotRejects },
     ],
 };

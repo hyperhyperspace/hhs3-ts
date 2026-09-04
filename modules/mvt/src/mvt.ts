@@ -147,6 +147,12 @@ export type RContext = {
     // not implement it force callers to handle a missing object as an error.
     fetchObject?(id: B64Hash, opts?: { meshLabel?: string; backendLabel?: string; timeoutMs?: number }): Promise<RObject>;
 
+    // Fetch (hash-verify) a not-yet-present object's create payload WITHOUT
+    // materializing it. Lets a caller inspect the create's genesis deps
+    // (factory.extractCreationForeignDeps) and defer createObject until those
+    // deps are locally satisfiable. Optional, paired with fetchObject.
+    fetchCreatePayload?(id: B64Hash, opts?: { meshLabel?: string; timeoutMs?: number }): Promise<Payload>;
+
     // Fired on first insertion into the object map (createObject cache miss and
     // registerObject). Optional: contexts that omit it cannot wake waiters when
     // a missing foreign-dep target appears. subscribeNewRoot (Replica-only)
@@ -162,6 +168,14 @@ export type RObjectFactory = {
     executeCreationPayload: (createPayload: Payload, ctx: RContext, scopedDag: ScopedDag) => Promise<B64Hash>;
     
     loadObject: (id: B64Hash, ctx: RContext, opts?: LoadObjectOptions) => Promise<RObject>;
+
+    // Cross-object dependencies that must be present (and, for any listed
+    // requiredHashes, locally resolvable on the dep's own DAG) BEFORE this create
+    // payload can be validated / materialized. Unlike RObject.extractForeignDeps
+    // (which gates ops on an existing object), this gates the object's own genesis
+    // so a create pinning a non-genesis foreign version is not validated until
+    // that version has arrived. Omitted / undefined means "no genesis deps".
+    extractCreationForeignDeps?: (createPayload: Payload, ctx: RContext) => Promise<ForeignDep[] | undefined>;
 }
 
 export type View = {

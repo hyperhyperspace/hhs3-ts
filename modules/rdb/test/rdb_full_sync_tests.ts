@@ -2,24 +2,36 @@
 // MemDagBackend). See rdb_full_sync_harness.ts for shared wiring.
 
 import { assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
-import { createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
+import { createIdentity, SIGNING_ED25519, HASH_SHA256 } from "@hyper-hyper-space/hhs3_crypto";
+import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { dag, position } from "@hyper-hyper-space/hhs3_dag";
+import type { IssueReport } from "@hyper-hyper-space/hhs3_util";
+import type { RObject, RObjectFactory, RContext, Payload, Version } from "@hyper-hyper-space/hhs3_mvt";
+import { validationOk, validationFailure, RootScopedDag, ScopedDagSubscription } from "@hyper-hyper-space/hhs3_mvt";
+import { Replica, MemDagBackend } from "@hyper-hyper-space/hhs3_replica";
 
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
 import { RTableGroupImpl, rTableGroupFactory } from "../src/rtable_group/group.js";
 import { RDbImpl, rDbFactory } from "../src/rdb/rdb.js";
 import { deriveRowId } from "../src/rtable/hash.js";
-import type { TableDef } from "../src/rschema/payload.js";
+import type { TableDef, MigrationRule } from "../src/rschema/payload.js";
 import {
     registerIdentity, grantCap, USERS_IDENTITIES_PROVIDER,
     usersSchemaTables, IDENTITIES_TABLE, CAPS_TABLE, identityRow, capRow,
 } from "../src/users/users.js";
 
 import {
-    dummyCtx, hashSuite, wait, waitUntil,
+    dummyCtx, crypto, hashSuite, wait, waitUntil,
     computePinnedVersion, closureTopicIds,
-    createAliceBobPeers, cleanup,
+    createAliceBobPeers, cleanup, registerRdbTypes,
     getRDb, frontier, waitForRowOn, openTable,
 } from "./rdb_full_sync_harness.js";
+
+function sameVersion(a: Version, b: Version): boolean {
+    if (a.size !== b.size) return false;
+    for (const h of a) if (!b.has(h)) return false;
+    return true;
+}
 
 // --- [RDB-FULL] One-way smoke (refactored to harness) ---
 
@@ -791,6 +803,294 @@ async function testHashOnlyJoinDiscoveryNotPreseeded() {
     await cleanup([alice, bob], provider);
 }
 
+// --- [RDB-FULL11] Group create pinning a POST-genesis schema version ---
+
+async function testPostGenesisSchemaPinMaterializes() {
+    const creator = await createIdentity(SIGNING_ED25519, hashSuite);
+
+    const schemaInit = await RSchemaImpl.create({
+        name: 'rdb:full11:schema',
+        creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
+        tables: [openTable('t', { name: { type: 'string' } })],
+    });
+    const schemaId = await rSchemaFactory.computeRootObjectId(schemaInit, dummyCtx);
+
+    // The group pins the schema at a POST-genesis version (after a migration).
+    // Ed25519 signing + hashing are deterministic, so a throwaway replica yields
+    // the exact version hashes the real Alice will produce -- letting us compute
+    // the group id (and thus the discovery topic) before wiring the peers.
+    const migration: MigrationRule[] = [
+        { rule: 'add-column', table: 't', column: 'tag', def: { type: 'string', nullable: true } },
+    ];
+    const setup = new Replica({ crypto, hashSuite, config: { selfValidate: true } });
+    setup.attachBackend('default', new MemDagBackend(hashSuite));
+    registerRdbTypes(setup);
+    const schemaSetup = (await setup.createObject(schemaInit)) as RSchemaImpl;
+    await schemaSetup.updateSchema(migration, creator, 'v2');
+    const pinnedV2 = await (await schemaSetup.getScopedDag()).getFrontier();
+    await setup.close();
+
+    assertTrue(!(pinnedV2.size === 1 && pinnedV2.has(schemaId)), 'pinned version is post-genesis, not the schema create hash');
+
+    const groupInit = await RTableGroupImpl.create({
+        name: 'rdb-full11-group',
+        seed: 'rdb-full11-group',
+        schemaRef: schemaId,
+        schemaVersion: pinnedV2,
+    });
+    const groupId = await rTableGroupFactory.computeRootObjectId(groupInit, dummyCtx);
+
+    const rdbInit = await RDbImpl.create({ seed: 'rdb-full11-db' });
+    const rdbId = await rDbFactory.computeRootObjectId(rdbInit, dummyCtx);
+
+    const topics = closureTopicIds(rdbId, [schemaId], [groupId]);
+    const { provider, alice, bob } = await createAliceBobPeers('full11', topics);
+
+    const schemaA = (await alice.replica.createObject(schemaInit)) as RSchemaImpl;
+    await schemaA.updateSchema(migration, creator, 'v2');
+    assertTrue(
+        sameVersion(await (await schemaA.getScopedDag()).getFrontier(), pinnedV2),
+        'Alice reproduced the pinned post-genesis schema version deterministically',
+    );
+    const groupA = (await alice.replica.createObject(groupInit)) as RTableGroupImpl;
+    const rdbA = (await alice.replica.createObject(rdbInit)) as RDbImpl;
+    assertTrue(groupA.getId() === groupId, 'group id is deterministic');
+
+    await (await groupA.getTable('t')).insert('row-1', { name: 'alice' });
+    await rdbA.addSchema(schemaId);
+    await rdbA.addGroup(groupId);
+    rdbA.setRuntimeConfig({ fetchTimeoutMs: 8000 });
+    await rdbA.startSync();
+
+    const rdbB = (await bob.replica.createObject(rdbInit)) as RDbImpl;
+    await rdbB.addSchema(schemaId);
+    await rdbB.addGroup(groupId);
+    rdbB.setRuntimeConfig({ fetchTimeoutMs: 8000 });
+
+    // Materializing the group before its pinned schema version has synced would
+    // throw (schema not resolvable at pinnedV2). The reconcile must open the
+    // schema session first and hold the group pending until the pin is local.
+    await rdbB.startSync();
+
+    await waitUntil(async () => (await bob.replica.getObject(schemaId)) !== undefined);
+    await waitUntil(async () => (await bob.replica.getObject(groupId)) !== undefined);
+    assertTrue(
+        (await bob.replica.getObject(groupId)) !== undefined,
+        'B materialized the group whose create pins a post-genesis schema version',
+    );
+
+    const rowId = deriveRowId('row-1');
+    await waitForRowOn(bob.replica, groupId, 't', rowId);
+
+    await cleanup([alice, bob], provider);
+}
+
+// --- [RDB-FULL12] Binding target that is NOT an RDb member is fetched as a
+// genesis dep before the binding group materializes ---
+
+async function testLateBoundNonMemberGroupMaterializes() {
+    const creator = await createIdentity(SIGNING_ED25519, hashSuite);
+
+    const schemaBInit = await RSchemaImpl.create({
+        name: 'rdb:full12:schema_b',
+        creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
+        tables: [openTable('identities', { name: { type: 'string' } })],
+    });
+    const schemaBId = await rSchemaFactory.computeRootObjectId(schemaBInit, dummyCtx);
+    const pinnedB = computePinnedVersion(schemaBId);
+
+    const groupBInit = await RTableGroupImpl.create({
+        name: 'rdb-full12-group-b',
+        seed: 'rdb-full12-group-b',
+        schemaRef: schemaBId,
+        schemaVersion: pinnedB,
+    });
+    const groupBId = await rTableGroupFactory.computeRootObjectId(groupBInit, dummyCtx);
+
+    const schemaAInit = await RSchemaImpl.create({
+        name: 'rdb:full12:schema_a',
+        creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
+        tables: [
+            openTable('items', { sku: { type: 'string' } }),
+            openTable('orders', { customer: { type: 'string' } }, { fks: { customer: 'users.identities' } }),
+        ],
+    });
+    const schemaAId = await rSchemaFactory.computeRootObjectId(schemaAInit, dummyCtx);
+    const pinnedA = computePinnedVersion(schemaAId);
+
+    const groupAInit = await RTableGroupImpl.create({
+        name: 'rdb-full12-group-a',
+        seed: 'rdb-full12-group-a',
+        schemaRef: schemaAId,
+        schemaVersion: pinnedA,
+        bindings: { users: groupBId },
+    });
+    const groupAId = await rTableGroupFactory.computeRootObjectId(groupAInit, dummyCtx);
+
+    const rdbInit = await RDbImpl.create({ seed: 'rdb-full12-db' });
+    const rdbId = await rDbFactory.computeRootObjectId(rdbInit, dummyCtx);
+
+    // Bob must reach the non-member closure DAGs (group B, schema B) as well.
+    const topics = closureTopicIds(rdbId, [schemaAId], [groupAId], [groupBId, schemaBId]);
+    const { provider, alice, bob } = await createAliceBobPeers('full12', topics);
+
+    await alice.replica.createObject(schemaBInit);
+    await alice.replica.createObject(groupBInit);
+    await alice.replica.createObject(schemaAInit);
+    const groupAAlice = (await alice.replica.createObject(groupAInit)) as RTableGroupImpl;
+    const rdbA = (await alice.replica.createObject(rdbInit)) as RDbImpl;
+
+    // Only schema A and group A are RDb members. Group B (the binding target) is
+    // reachable ONLY as group A's genesis dep, never through membership.
+    await rdbA.addSchema(schemaAId);
+    await rdbA.addGroup(groupAId);
+
+    await (await groupAAlice.getTable('items')).insert('item-1', { sku: 'SKU-1' });
+
+    rdbA.setRuntimeConfig({ fetchTimeoutMs: 8000 });
+    await rdbA.startSync();
+
+    const rdbB = (await bob.replica.createObject(rdbInit)) as RDbImpl;
+    await rdbB.addSchema(schemaAId);
+    await rdbB.addGroup(groupAId);
+    rdbB.setRuntimeConfig({ fetchTimeoutMs: 8000 });
+    await rdbB.startSync();
+
+    await waitUntil(async () => (await bob.replica.getObject(groupBId)) !== undefined);
+    await waitUntil(async () => (await bob.replica.getObject(groupAId)) !== undefined);
+    assertTrue((await bob.replica.getObject(schemaBId)) !== undefined, 'B fetched the non-member bound schema as a genesis dep');
+    assertTrue((await bob.replica.getObject(groupBId)) !== undefined, 'B fetched the non-member bound group as a genesis dep');
+    assertTrue((await bob.replica.getObject(groupAId)) !== undefined, 'B materialized the binding group A once its bound target was present');
+
+    const itemId = deriveRowId('item-1');
+    await waitForRowOn(bob.replica, groupAId, 'items', itemId);
+
+    await cleanup([alice, bob], provider);
+}
+
+// --- [RDB-FULL13] An invalid member create is reported once and not retried,
+// and does not stop the rest of the closure from converging ---
+
+const POISON_TYPE_ID = 'test/poison-create';
+
+// Alice hosts this type leniently (so it can serve the create genesis); Bob
+// rejects it, standing in for a peer that serves a malformed create.
+function makePoisonFactory(strict: boolean): RObjectFactory {
+    return {
+        computeRootObjectId: async (payload: Payload, ctx: RContext) =>
+            dag.createEntry(payload, {}, position(), ctx.getCrypto().hash(HASH_SHA256)).hash,
+        validateCreationPayload: async () =>
+            strict ? validationFailure('poison create is invalid') : validationOk(),
+        executeCreationPayload: async (payload: Payload, _ctx: RContext, scopedDag) =>
+            scopedDag.append(payload, {}, position()),
+        loadObject: async (id: B64Hash, ctx: RContext, opts) =>
+            makePoisonObject(id, ctx, opts?.backendLabel ?? 'default'),
+    };
+}
+
+function makePoisonObject(id: B64Hash, ctx: RContext, backendLabel: string): RObject {
+    let scoped: RootScopedDag | undefined;
+    let sub: ScopedDagSubscription | undefined;
+    const getScoped = async () => {
+        if (scoped === undefined) {
+            const raw = await ctx.getDag(id, backendLabel);
+            if (raw === undefined) throw new Error(`DAG '${id}' not found`);
+            scoped = new RootScopedDag(raw);
+        }
+        return scoped;
+    };
+    const subscription = () => (sub ??= new ScopedDagSubscription(getScoped));
+    return {
+        getId: () => id,
+        getType: () => POISON_TYPE_ID,
+        getBackendLabel: () => backendLabel,
+        validatePayload: async () => validationOk(),
+        applyPayload: async (payload: Payload, at: Version) => (await getScoped()).append(payload, {}, at),
+        getView: async () => { throw new Error('not implemented'); },
+        computeDelta: async () => { throw new Error('not implemented'); },
+        createDeltaAccumulator: () => { throw new Error('not implemented'); },
+        getScopedDag: getScoped,
+        getCausalDag: async () => {
+            const raw = await ctx.getDag(id, backendLabel);
+            if (raw === undefined) throw new Error(`DAG '${id}' not found`);
+            return raw;
+        },
+        extractForeignDeps: () => undefined,
+        subscribe: (cb: (version: Version) => void) => subscription().subscribe(cb),
+        unsubscribe: (cb: (version: Version) => void) => subscription().unsubscribe(cb),
+        destroy: async () => {},
+    };
+}
+
+async function testInvalidMemberCreateReportedOnceNotRetried() {
+    const creator = await createIdentity(SIGNING_ED25519, hashSuite);
+
+    const schemaInit = await RSchemaImpl.create({
+        name: 'rdb:full13:schema',
+        creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
+        tables: [openTable('t', { name: { type: 'string' } })],
+    });
+    const schemaId = await rSchemaFactory.computeRootObjectId(schemaInit, dummyCtx);
+    const pinned = computePinnedVersion(schemaId);
+
+    const groupInit = await RTableGroupImpl.create({
+        name: 'rdb-full13-group',
+        seed: 'rdb-full13-group',
+        schemaRef: schemaId,
+        schemaVersion: pinned,
+    });
+    const groupId = await rTableGroupFactory.computeRootObjectId(groupInit, dummyCtx);
+
+    const poisonPayload = { action: 'create', type: POISON_TYPE_ID, seed: 'rdb-full13-poison' } as unknown as Payload;
+    const poisonId = await makePoisonFactory(false).computeRootObjectId(poisonPayload, dummyCtx);
+
+    const rdbInit = await RDbImpl.create({ seed: 'rdb-full13-db' });
+    const rdbId = await rDbFactory.computeRootObjectId(rdbInit, dummyCtx);
+
+    const topics = closureTopicIds(rdbId, [schemaId], [groupId], [poisonId]);
+    const { provider, alice, bob } = await createAliceBobPeers('full13', topics);
+
+    // Alice accepts the poison type; Bob rejects it (a malformed create on the wire).
+    alice.replica.registerType(POISON_TYPE_ID, makePoisonFactory(false));
+    bob.replica.registerType(POISON_TYPE_ID, makePoisonFactory(true));
+
+    const schemaA = (await alice.replica.createObject(schemaInit)) as RSchemaImpl;
+    assertTrue(schemaA.getId() === schemaId, 'schema id deterministic');
+    const groupA = (await alice.replica.createObject(groupInit)) as RTableGroupImpl;
+    await alice.replica.createObject(poisonPayload);
+    const rdbA = (await alice.replica.createObject(rdbInit)) as RDbImpl;
+
+    await (await groupA.getTable('t')).insert('row-1', { name: 'alice' });
+    await rdbA.addSchema(schemaId);
+    await rdbA.addGroup(groupId);
+    await rdbA.addGroup(poisonId);   // advisory membership does not check type
+    rdbA.setRuntimeConfig({ fetchTimeoutMs: 8000 });
+    await rdbA.startSync();
+
+    const reports: IssueReport[] = [];
+    const rdbB = (await bob.replica.createObject(rdbInit)) as RDbImpl;
+    await rdbB.addSchema(schemaId);
+    await rdbB.addGroup(groupId);
+    await rdbB.addGroup(poisonId);
+    rdbB.setRuntimeConfig({ fetchTimeoutMs: 8000, report: (r) => reports.push(r) });
+    await rdbB.startSync();
+
+    // The healthy members converge despite the poison member.
+    await waitUntil(async () => (await bob.replica.getObject(groupId)) !== undefined);
+    const rowId = deriveRowId('row-1');
+    await waitForRowOn(bob.replica, groupId, 't', rowId);
+
+    // Several reconcile passes run while schema/group materialize (each new object
+    // wakes onNewObject). Give them time, then assert the poison create was
+    // reported exactly once and never materialized -- i.e. remembered, not retried.
+    await wait(300);
+    assertTrue((await bob.replica.getObject(poisonId)) === undefined, 'the invalid create is not materialized on B');
+    const poisonReports = reports.filter((r) => r.opHash === poisonId && r.kind === 'validation-failed');
+    assertTrue(poisonReports.length === 1, `invalid create reported exactly once (got ${poisonReports.length})`);
+
+    await cleanup([alice, bob], provider);
+}
+
 export const rdbFullSyncTests = {
     title: '[RDB-FULL] RDb-driven cross-replica sync',
     tests: [
@@ -804,5 +1104,8 @@ export const rdbFullSyncTests = {
         { name: '[RDB-FULL08] fetchObject(schemaId) then fetchObject(groupId) without an RDb', invoke: testFetchSchemaThenGroup },
         { name: '[RDB-FULL09] fetchObject(groupId) without schema present is rejected', invoke: testFetchGroupWithoutSchema },
         { name: '[RDB-FULL10] hash-only join with Bob discovery limited to rdbId', invoke: testHashOnlyJoinDiscoveryNotPreseeded },
+        { name: '[RDB-FULL11] group create pinning a post-genesis schema version materializes', invoke: testPostGenesisSchemaPinMaterializes },
+        { name: '[RDB-FULL12] non-member binding target is fetched as a genesis dep', invoke: testLateBoundNonMemberGroupMaterializes },
+        { name: '[RDB-FULL13] invalid member create is reported once and not retried', invoke: testInvalidMemberCreateReportedOnceNotRetried },
     ],
 };

@@ -194,19 +194,28 @@ export class Replica implements RContext {
         id: B64Hash,
         opts?: { meshLabel?: string; backendLabel?: string; timeoutMs?: number },
     ): Promise<RObject> {
-        const meshLabel = opts?.meshLabel ?? 'default';
         const backendLabel = opts?.backendLabel ?? 'default';
 
         const existing = this.objects.get(id);
         if (existing !== undefined) return existing;
 
+        const createPayload = await this.fetchCreatePayload(id, opts);
+        return await this.createObject(createPayload, backendLabel);
+    }
+
+    // Fetch and hash-verify an object's create payload without materializing it,
+    // so a caller can inspect its genesis deps before deciding to createObject.
+    async fetchCreatePayload(
+        id: B64Hash,
+        opts?: { meshLabel?: string; timeoutMs?: number },
+    ): Promise<Payload> {
+        const meshLabel = opts?.meshLabel ?? 'default';
         const mesh = this.getMesh(meshLabel) as Mesh;
         const swarm = mesh.createSwarm(id as TopicId);
 
         try {
             swarm.activate();
-            const createPayload = await fetchInit(id, [swarm], this.hashSuite, opts?.timeoutMs);
-            return await this.createObject(createPayload, backendLabel);
+            return await fetchInit(id, [swarm], this.hashSuite, opts?.timeoutMs);
         } finally {
             swarm.destroy();
         }

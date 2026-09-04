@@ -178,6 +178,7 @@ type RContext = {
     registerObject(obj: RObject): void;
     unregisterObject(id: B64Hash): Promise<void>;
     fetchObject?(id: B64Hash, opts?: { meshLabel?: string; backendLabel?: string; timeoutMs?: number }): Promise<RObject>;
+    fetchCreatePayload?(id: B64Hash, opts?: { meshLabel?: string; timeoutMs?: number }): Promise<Payload>;
     subscribeNewObject?(callback: (obj: RObject) => void): void;
     unsubscribeNewObject?(callback: (obj: RObject) => void): void;
 }
@@ -199,10 +200,13 @@ type RObjectFactory = {
     validateCreationPayload: (createPayload: Payload, ctx: RContext, parent?: NestingParent) => Promise<ValidationResult>;
     executeCreationPayload: (createPayload: Payload, ctx: RContext, scopedDag: ScopedDag) => Promise<B64Hash>;
     loadObject: (id: B64Hash, ctx: RContext, opts?: LoadObjectOptions) => Promise<RObject>;
+    extractCreationForeignDeps?: (createPayload: Payload, ctx: RContext) => Promise<ForeignDep[] | undefined>;
 }
 ```
 
 Genesis create payloads (the DAG entry written by `executeCreationPayload`) MUST include `action: 'create'` and a `type` field equal to the object's MVT type id (the same string as `getType()` and the registry key). `createObject` accepts this payload directly and derives the type via `extractCreatePayloadType`. This makes persisted roots self-describing for cold reopen. Helpers: `validateCreatePayloadType`, `extractCreatePayloadType`, `createPayloadTypeFormat`.
+
+`extractCreationForeignDeps` is the genesis counterpart of `RObject.extractForeignDeps`: it declares the cross-object dependencies (objects that must be present, and pinned versions that must be locally resolvable on those objects' DAGs) required *before this create can be validated / materialized*. It gates the object's own bootstrap, whereas `extractForeignDeps` gates ops on an already-materialized object. An orchestrator (e.g. `RDb`) uses it — together with the optional `RContext.fetchCreatePayload` (fetch and hash-verify a create payload **without** materializing it) — to hold a create pending until, say, its pinned (possibly post-genesis) schema version has synced, instead of throwing when the version is not yet local. Omitting it means "no genesis deps".
 
 ### `NestingParent`
 
