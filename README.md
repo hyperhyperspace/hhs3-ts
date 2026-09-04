@@ -1,5 +1,3 @@
-Hyper Hyper Space
-
 # Hyper Hyper Space Sync Engine 3.0 (TypeScript)
 
 This is the monorepo for the TypeScript version of [Hyper Hyper Space](https://www.hyperhyperspace.org), version 3.0 [(roadmap)](https://www.hyperhyperspace.org/work-plan-2025.html).

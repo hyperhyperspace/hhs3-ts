@@ -6,4 +6,4 @@ export { createSyncSession } from './session.js';
 export { fetchInit } from './fetch_init.js';
 export type { DagProvider } from './provider.js';
 export type { DagSynchronizer } from './synchronizer.js';
-export type { SyncSession, SyncTarget, SendResult, PeerIssue, SyncSessionDiagnostics } from './session.js';
+export type { SyncSession, SyncTarget, SendResult, SyncSessionOptions, SyncSessionDiagnostics } from './session.js';

@@ -1,5 +1,5 @@
 import type { KeyId, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
-import type { Mesh, PeerDiscovery } from "@hyper-hyper-space/hhs3_mesh";
+import type { IssueReporter, Mesh, PeerDiscovery } from "@hyper-hyper-space/hhs3_mesh";
 import type { RDb } from "@hyper-hyper-space/hhs3_rdb";
 
 import type { AllowSource, SyncScope } from "./parse.js";
@@ -10,6 +10,7 @@ export type SyncMeshBuildRequest = {
     trackerAddress?: string;
     trackerKeyId?: string;
     listenAddress?: string;
+    report?: IssueReporter;
 };
 
 export type SyncCloseable = { close(): void | Promise<void> };

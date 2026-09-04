@@ -3,6 +3,7 @@ import type { Dag } from '@hyper-hyper-space/hhs3_dag';
 import type { Swarm, SwarmPeer } from '@hyper-hyper-space/hhs3_mesh';
 import type { RObject, RContext } from '@hyper-hyper-space/hhs3_mvt';
 import { extractCreatePayloadType } from '@hyper-hyper-space/hhs3_mvt';
+import type { IssueReport, IssueReporter } from '@hyper-hyper-space/hhs3_util';
 
 import { decode, encode } from './codec.js';
 import { createDagProvider } from './provider.js';
@@ -13,13 +14,6 @@ import type { SyncMsg, InitResponse } from './protocol.js';
 import { TRACE_SYNC, trace } from './trace.js';
 
 export type SendResult = 'sent' | 'closed' | 'error';
-
-export type PeerIssue =
-    | 'send-closed'
-    | 'send-error'
-    | 'timeout'
-    | 'validation-failed'
-    | 'decode-failed';
 
 export interface SyncSessionDiagnostics {
     activePeerCount: number;
@@ -35,10 +29,19 @@ export type SyncTarget = {
     ctx?: RContext;
 };
 
+export type SyncSessionOptions = {
+    report?: IssueReporter;
+};
+
 export interface SyncSession {
     destroy(): void;
-    onPeerIssue(cb: (peerKey: string, issue: PeerIssue) => void): void;
     getDiagnostics(): SyncSessionDiagnostics;
+}
+
+function splitPeerKey(pk: string): { keyId?: string; endpoint?: string } {
+    const at = pk.indexOf('@');
+    if (at === -1) return { keyId: pk };
+    return { keyId: pk.slice(0, at), endpoint: pk.slice(at + 1) };
 }
 
 type PeerHandle = {
@@ -50,14 +53,20 @@ const REQUEST_TYPES = new Set([
     'header-request', 'payload-request', 'cancel-request',
 ]);
 
-export function createSyncSession(target: SyncTarget, swarms: Swarm[]): SyncSession {
+export function createSyncSession(target: SyncTarget, swarms: Swarm[], opts?: SyncSessionOptions): SyncSession {
 
     const activePeers = new Map<string, PeerHandle>();
-    const issueCallbacks: Array<(peerKey: string, issue: PeerIssue) => void> = [];
+    const emitReport = opts?.report;
 
-    function reportIssue(peerKey: string, issue: PeerIssue) {
-        if (TRACE_SYNC) trace('sync.issue', { peer: peerKey, issue });
-        for (const cb of issueCallbacks) cb(peerKey, issue);
+    function reportIssue(peerKey: string, partial: Omit<IssueReport, 'source' | 'dagId' | 'keyId' | 'endpoint'>) {
+        if (TRACE_SYNC) trace('sync.issue', { peer: peerKey, issue: partial.kind });
+        if (emitReport === undefined) return;
+        emitReport({
+            source: 'session',
+            dagId: target.dagId,
+            ...splitPeerKey(peerKey),
+            ...partial,
+        });
     }
 
     function getPeers(): PeerHandle[] {
@@ -76,8 +85,8 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[]): SyncSess
 
     function sendToWithReport(peer: PeerHandle, msg: SyncMsg): SendResult {
         const result = sendTo(peer, msg);
-        if (result === 'closed') reportIssue(peer.key, 'send-closed');
-        if (result === 'error')  reportIssue(peer.key, 'send-error');
+        if (result === 'closed') reportIssue(peer.key, { kind: 'send-closed', severity: 'low' });
+        if (result === 'error')  reportIssue(peer.key, { kind: 'send-error', severity: 'low' });
         return result;
     }
 
@@ -90,11 +99,8 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[]): SyncSess
         getPeers,
         sendToWithReport,
         target.ctx,
+        { report: emitReport },
     );
-
-    synchronizer.onPeerIssue((peerKey, issue) => {
-        reportIssue(peerKey, issue);
-    });
 
     function cleanupPeer(key: string) {
         if (!activePeers.has(key)) return;
@@ -114,7 +120,12 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[]): SyncSess
 
         const payloadType = extractCreatePayloadType(rootEntry.payload);
         if (payloadType !== target.rObject.getType()) {
-            reportIssue(key, 'validation-failed');
+            reportIssue(key, {
+                kind: 'validation-failed',
+                severity: 'moderate',
+                opHash: target.dagId,
+                message: 'init payload type mismatch',
+            });
             return;
         }
         const resp: InitResponse = {
@@ -148,7 +159,7 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[]): SyncSess
             try {
                 msg = decode(data);
             } catch {
-                reportIssue(key, 'decode-failed');
+                reportIssue(key, { kind: 'decode-failed', severity: 'high' });
                 return;
             }
 
@@ -194,7 +205,6 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[]): SyncSess
 
     return {
         destroy,
-        onPeerIssue: (cb) => { issueCallbacks.push(cb); },
         getDiagnostics: () => ({
             activePeerCount: activePeers.size,
             ...synchronizer.getDiagnostics(),

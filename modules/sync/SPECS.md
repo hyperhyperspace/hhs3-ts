@@ -247,7 +247,41 @@ into the local DAG. The pipeline is:
    hash. If this hash does not match the claimed `hash`, discard.
 6. **Dependent discard.** If an entry is discarded at any step, all
    entries that transitively depend on it (via `prevEntryHashes`) MUST
-   also be discarded.
+   also be discarded from the receive pipeline.
+
+**Channel-bound provenance.** Every header and payload is verified on
+the topic channel it arrived on, and misbehavior is attributed to that
+channel's `(keyId, endpoint)`. The `requestId` alone is NOT provenance:
+a frame carrying a `requestId` that belongs to a request the receiver
+sent to a *different* peer MUST be dropped without mutating that
+request (the delivering channel is reported for protocol abuse). When an
+entry is type-rejected, the peer blamed is the one whose channel
+delivered the hash-verified payload that was applied — not a request
+target, and not a peer that merely gossiped the same hash.
+
+**Header/payload pairing.** A hash moves through: unknown, header-only,
+header+verified-payload (ready to apply), applied, or rejected. A payload
+that arrives before its header (so its payload hash cannot yet be
+checked) MAY be buffered as *unpaired*, scoped to the delivering
+request; it is promoted (and its payload hash verified) when the header
+arrives, and dropped when that request completes, fails, or times out. A
+receiver MUST NOT retain a payload with no in-pipeline header outside
+this short unpaired buffer. Every in-order payload frame for a live
+request counts toward completion, including duplicate, already-applied,
+rejected, and unpaired frames, so a stream always terminates without
+waiting out the request timeout.
+
+**Type reject vs hash mismatch.** A payload-hash or header-hash mismatch
+is misbehavior of the delivering channel: the entry is dropped and never
+retained, and the hash is NOT remembered (there were never trustworthy
+bytes). A type-level reject (step 4 fails, or step 5's applied hash
+differs) happens only *after* both hashes verified; the receiver
+remembers the offending entry hash in a bounded, insertion-ordered
+per-synchronizer set (evicting the oldest hash when full) so it is not
+re-queued. Only the offending hash is remembered; transitively dependent
+entries are dropped from the pipeline but NOT added to that set. A header
+whose `prevEntryHashes` includes a remembered rejected hash is not
+admitted. Evicted hashes may be fetched again later; that is the bound.
 
 ## 6. Sequencing Constraints
 
@@ -264,10 +298,22 @@ into the local DAG. The pipeline is:
 ## 7. Timeouts and Errors
 
 - Implementations SHOULD use a 30-second timeout for each in-flight
-  request, reset on each received message for that `requestId`.
+  request, reset on each received message for that `requestId`. Because
+  every in-order frame counts toward completion (Section 5), a stream
+  that has some of its entries rejected still completes normally rather
+  than lingering until this timeout.
 - If `headerCount` or `payloadCount` is exceeded, the receiver SHOULD
   fail the request and MAY treat the peer as misbehaving.
 - Hash mismatches (header or payload) SHOULD be treated as peer
-  misbehavior.
-- A peer that repeatedly triggers validation failures or timeouts MAY
-  be disconnected.
+  misbehavior of the delivering channel.
+- A single type-level validation failure MUST NOT by itself be treated
+  as grounds for disconnecting a peer: a benign transient false reject
+  must not cause a receiver to ban the only replica holding a branch. A
+  peer that *repeatedly* triggers validation failures or timeouts MAY be
+  disconnected.
+- Failures MAY be surfaced through a structured issue report carrying an
+  optional severity (`high` = terminate the peer, `moderate` = consider
+  termination if it recurs, `low` = informational). Hash mismatches and
+  framing/protocol violations are high severity; type rejects, timeouts,
+  and `requestId` collisions are moderate; local send failures and
+  unauthorized/connect failures are low.

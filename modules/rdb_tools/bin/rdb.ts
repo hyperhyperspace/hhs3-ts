@@ -41,6 +41,14 @@ async function main(): Promise<void> {
 
     session.syncMeshFactory = createNodeSyncMeshFactory();
 
+    // Naive first-cut issue sink: structured reports from the mesh/swarm/sync
+    // layers go to stderr, out of statement stdout / JSON dumps.
+    session.report = (report) => {
+        const source = report.source ?? 'issue';
+        const detail = report.message ?? report.kind ?? 'unknown issue';
+        stderr.write(`[${source} issue] ${detail}\n`);
+    };
+
     try {
         if (args.includes('--json')) session.setOutputMode('json');
         if (args.includes('-k') || args.includes('--prompt-keys')) session.setPromptForKeys(true);

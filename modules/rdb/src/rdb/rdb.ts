@@ -59,7 +59,7 @@ import {
 } from "@hyper-hyper-space/hhs3_mvt";
 import { RootScopedDag, ScopedDag, CausalDag, ScopedDagSubscription, signPayload as signPayloadHelper, serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 
-import type { Mesh, PeerAuthorizer, Swarm } from "@hyper-hyper-space/hhs3_mesh";
+import type { IssueReporter, Mesh, PeerAuthorizer, Swarm } from "@hyper-hyper-space/hhs3_mesh";
 import { createSyncSession } from "@hyper-hyper-space/hhs3_sync";
 import type { SyncSession, SyncTarget } from "@hyper-hyper-space/hhs3_sync";
 
@@ -76,6 +76,7 @@ export type RDbRuntimeConfig = {
     backendLabel?: string;
     fetchTimeoutMs?: number;
     authorizer?: PeerAuthorizer;
+    report?: IssueReporter;
 };
 
 class SyncAbortedError extends Error {
@@ -549,7 +550,7 @@ export class RDbImpl implements RDbContract, SyncableObject {
                     hashSuite: this.ctx.getHashSuite(),
                     ctx: this.ctx,
                 };
-                session = createSyncSession(target, [swarm]);
+                session = createSyncSession(target, [swarm], { report: this.runtimeConfig.report });
                 if (!this.isCurrent(epoch) || this.syncSessions.has(id)) {
                     session.destroy();
                     swarm.destroy();

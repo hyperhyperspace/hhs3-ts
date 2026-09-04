@@ -1,6 +1,6 @@
 # rdb_tools
 
-REPL, CLI, and script runner for [Rdb](../rdb). Drives an Rdb replica with [C-SQL](../rdb_lang) over a local SQLite-backed workspace, plus workspace/key management.
+REPL, CLI, and script runner for [Rdb](../rdb). Drives an Rdb replica with [C-SQL](../rdb_lang) over a local SQLite-backed workspace, [bi-directional projections](../rdb_projection) to vanilla SQLite instances, and workspace/key management.
 
 ## Build
 
@@ -61,7 +61,7 @@ C-SQL statements terminate with `;` (multi-line and paste supported). Backslash 
 \output table|json|vertical   \hash-width \hash-labels   display
 \ref-auto-update auto|self|off   auto UPDATE REF for bound observers (auto in REPL, off in scripts)
 \dump schema|group|database <name> [full|schema]
-\dump op [group] #hash          reverse-render one group op
+\dump op [group] #hash        reverse-render one group op
 \delta schema|group <name> <start> <end>
 \project start <db> as <id> to <path>
 \project status [<db>]  \project stop|update|events <id>

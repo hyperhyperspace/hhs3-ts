@@ -5,6 +5,7 @@
 // so the same identity on multiple devices gets separate connections.
 
 import type { KeyId } from '@hyper-hyper-space/hhs3_crypto';
+import type { IssueReporter } from '@hyper-hyper-space/hhs3_util';
 import type { TopicId, PeerInfo } from './discovery.js';
 import type { PeerDiscovery } from './discovery.js';
 import type { PeerAuthenticator } from './authenticator.js';
@@ -63,6 +64,7 @@ export interface SwarmDeps {
     authenticator: PeerAuthenticator;
     transports:    TransportProvider[];
     localPeer?:    PeerInfo;
+    report?:       IssueReporter;
 }
 
 const DEFAULT_TARGET_PEERS = 6;
@@ -71,7 +73,7 @@ const REFILL_DEBOUNCE_MS = 150;
 
 export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
 
-    const { pool, discovery, authenticator, transports, localPeer } = deps;
+    const { pool, discovery, authenticator, transports, localPeer, report } = deps;
 
     const topic       = config.topic;
     const targetPeers = config.targetPeers ?? DEFAULT_TARGET_PEERS;
@@ -96,6 +98,13 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
 
     const schemes = transports.map(t => t.scheme);
 
+    function reportSwarmIssue(partial: {
+        kind: string; severity: 'low' | 'moderate' | 'high';
+        keyId?: string; endpoint?: string; message?: string; stack?: string;
+    }) {
+        report?.({ source: 'swarm', ...partial });
+    }
+
     // A candidate is "self" when it carries our own keyId at an address we
     // listen on / announce. Same keyId at a different address is a valid peer
     // (multi-device), so we key on (keyId, addr), not keyId alone.
@@ -113,12 +122,19 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
             authorizer.authorize(conn.peerId).then((ok) => {
                 if (ok && !destroyed && mode !== 'dormant') {
                     adoptPeer(conn.peerId, conn.endpoint, 'pool');
-                } else if (!ok && TRACE_SWARM) {
-                    trace('swarm.peer skip', {
-                        topic,
-                        peer: connectionKey(conn.peerId, conn.endpoint),
-                        why: 'authorizer',
+                } else if (!ok) {
+                    reportSwarmIssue({
+                        kind: 'unauthorized', severity: 'low',
+                        keyId: conn.peerId, endpoint: conn.endpoint,
+                        message: 'authorizer rejected pool peer',
                     });
+                    if (TRACE_SWARM) {
+                        trace('swarm.peer skip', {
+                            topic,
+                            peer: connectionKey(conn.peerId, conn.endpoint),
+                            why: 'authorizer',
+                        });
+                    }
                 }
             }).catch(() => {});
             return;
@@ -235,6 +251,11 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
                 if (authorizer !== undefined) {
                     const ok = await authorizer.authorize(peerInfo.keyId);
                     if (!ok) {
+                        reportSwarmIssue({
+                            kind: 'unauthorized', severity: 'low',
+                            keyId: peerInfo.keyId,
+                            message: 'authorizer rejected discovered peer',
+                        });
                         if (TRACE_SWARM) {
                             trace('swarm.peer skip', { topic, peer: peerInfo.keyId, why: 'authorizer' });
                         }
@@ -361,6 +382,12 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
                 adoptPeer(peerInfo.keyId, addr, 'dial');
                 return true;
             } catch (err) {
+                reportSwarmIssue({
+                    kind: 'connect-failed', severity: 'low',
+                    keyId: peerInfo.keyId, endpoint: addr,
+                    message: err instanceof Error ? err.message : String(err),
+                    stack: err instanceof Error ? err.stack : undefined,
+                });
                 if (!connected && TRACE_MESH) {
                     trace('mesh.connect fail', {
                         to: addr,

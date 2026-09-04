@@ -17,6 +17,7 @@ import {
     createAuthenticator,
     probeTracker,
     type DiscoveryLayer,
+    type IssueReporter,
     type MeshScope,
     type NetworkAddress,
     type PeerDiscovery,
@@ -42,6 +43,7 @@ export type BrowserMeshRequest = {
     trackerAddress?: string;
     trackerKeyId?: string;
     listenAddress?: string;
+    report?: IssueReporter;
 };
 
 export type BrowserMeshOptions = {
@@ -134,6 +136,7 @@ export async function createBrowserMesh(
         authenticator,
         localKeyId: req.identity.keyId,
         listenAddresses,
+        report: req.report,
     });
 
     return {

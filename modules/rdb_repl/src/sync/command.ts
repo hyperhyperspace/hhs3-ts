@@ -90,6 +90,7 @@ async function start(session: ReplSession, cmd: SyncStartCommand): Promise<SyncC
         trackerAddress: cmd.tracker,
         trackerKeyId: cmd.trackerKey,
         listenAddress: cmd.listen,
+        report: session.report,
     });
 
     const syncId = session.nextSyncId;
@@ -112,7 +113,7 @@ async function start(session: ReplSession, cmd: SyncStartCommand): Promise<SyncC
     };
 
     session.workspace.replica.attachMesh(meshLabel, built.mesh);
-    db.setRuntimeConfig({ meshLabel, authorizer });
+    db.setRuntimeConfig({ meshLabel, authorizer, report: session.report });
 
     try {
         await db.startSync();
@@ -162,6 +163,7 @@ async function fetch(session: ReplSession, cmd: SyncFetchCommand): Promise<SyncC
             trackerAddress: cmd.tracker,
             trackerKeyId: cmd.trackerKey,
             listenAddress: cmd.listen,
+            report: session.report,
         });
         replica.attachMesh(meshLabel, built.mesh);
         const obj = await replica.fetchObject(cmd.rdbId, {

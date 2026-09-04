@@ -16,13 +16,26 @@ import type {
     NewFrontierMsg,
     SyncMsg,
 } from './protocol.js';
-import type { SendResult, PeerIssue } from './session.js';
+import type { SendResult } from './session.js';
+import type { IssueReport, IssueReporter } from '@hyper-hyper-space/hhs3_util';
 import { TRACE_SYNC, trace } from './trace.js';
 
 const MAX_HEADERS_PER_REQUEST = 1024;
 const MAX_PAYLOAD_REQUESTS_PER_PEER = 2;
 const PAYLOAD_CHUNK_SIZE = 64;
 const REQUEST_TIMEOUT_MS = 30_000;
+
+// Upper bound on the per-synchronizer set of type-rejected entry hashes. When
+// full, the oldest hash is evicted (it may be re-fetched later; that is the
+// bound). Exported so tests can reason about eviction.
+export const REJECTED_ENTRIES_CAP = 4096;
+
+// Split a sync peer key (`${keyId}@${endpoint}`) into its parts for reporting.
+function splitPeerKey(pk: string): { keyId?: string; endpoint?: string } {
+    const at = pk.indexOf('@');
+    if (at === -1) return { keyId: pk };
+    return { keyId: pk.slice(0, at), endpoint: pk.slice(at + 1) };
+}
 
 type PeerHandle = {
     key: string;
@@ -62,7 +75,6 @@ export interface DagSynchronizer {
     removePeer(peerKey: string): void;
     broadcastFrontier(): Promise<void>;
     destroy(): void;
-    onPeerIssue(cb: (peerKey: string, issue: PeerIssue) => void): void;
     getDiagnostics(): { pendingHeaderRequests: number; pendingPayloadRequests: number };
 }
 
@@ -74,7 +86,11 @@ export function createDagSynchronizer(
     getPeers: () => PeerHandle[],
     sendTo: (peer: PeerHandle, msg: SyncMsg) => SendResult,
     ctx?: RContext,
+    opts?: { report?: IssueReporter; rejectedCap?: number },
 ): DagSynchronizer {
+
+    const emitReport = opts?.report;
+    const rejectedCap = opts?.rejectedCap ?? REJECTED_ENTRIES_CAP;
 
     // --- accumulative state ---
 
@@ -102,7 +118,23 @@ export function createDagSynchronizer(
     const requestedPayloads  = new Set<B64Hash>();
     const receivedPayloads   = new Map<B64Hash, json.Literal>();
     const appliedEntries     = new Set<B64Hash>();
-    const hashSourcePeer     = new Map<B64Hash, string>();
+
+    // Provenance: the channel-verified peer that delivered the (hash-verified)
+    // payload now sitting in receivedPayloads/readyToApply. Only ever written
+    // after a payload-hash match on the delivering channel, so a type reject
+    // blames the peer that actually sent the bytes, not a request target or a
+    // peer who merely gossiped the same hash.
+    const payloadSourcePeer  = new Map<B64Hash, string>();
+
+    // Payloads that arrived before their header (unverified: we cannot check
+    // the payload hash without header.payloadHash). Scoped to the delivering
+    // request; promoted by tryPromote when the header lands, dropped when the
+    // request ends.
+    const unpairedPayloads   = new Map<B64Hash, { payload: json.Literal; source: string; requestId: string }>();
+
+    // Bounded, insertion-ordered set of type-rejected entry hashes (see
+    // addRejected / REJECTED_ENTRIES_CAP).
+    const rejectedEntries    = new Map<B64Hash, true>();
 
     const pendingHeaderRequests  = new Map<string, HeaderRequestState>();
     const pendingPayloadRequests = new Map<string, PayloadRequestState>();
@@ -110,10 +142,87 @@ export function createDagSynchronizer(
     const lastSentFrontier = new Map<string, { frontier: Set<B64Hash>, timestamp: number }>();
     const PUSHBACK_INTERVAL_MS = 15_000;
 
-    const issueCallbacks: Array<(peerKey: string, issue: PeerIssue) => void> = [];
+    // Structured issue reporting. Fills the sync-layer defaults; callers pass
+    // the peer key (`${keyId}@${endpoint}`) plus any known specifics.
+    function reportIssue(peerKey: string | undefined, partial: Omit<IssueReport, 'source' | 'dagId' | 'keyId' | 'endpoint'>) {
+        if (emitReport === undefined) return;
+        emitReport({
+            source: 'sync',
+            dagId,
+            ...(peerKey !== undefined ? splitPeerKey(peerKey) : {}),
+            ...partial,
+        });
+    }
 
-    function reportIssue(peerKey: string, issue: PeerIssue) {
-        for (const cb of issueCallbacks) cb(peerKey, issue);
+    function addRejected(hash: B64Hash) {
+        if (rejectedEntries.has(hash)) return;
+        if (rejectedEntries.size >= rejectedCap) {
+            const oldest = rejectedEntries.keys().next().value;
+            if (oldest !== undefined) rejectedEntries.delete(oldest);
+        }
+        rejectedEntries.set(hash, true);
+    }
+
+    // Move a buffered unpaired payload into readyToApply once its header is
+    // known. No-op for rejected hashes. A payload-hash mismatch here blames the
+    // channel that delivered the payload.
+    function tryPromote(hash: B64Hash) {
+        const buffered = unpairedPayloads.get(hash);
+        if (buffered === undefined) return;
+        if (rejectedEntries.has(hash)) {
+            unpairedPayloads.delete(hash);
+            return;
+        }
+        const header = discoveredHeaders.get(hash);
+        if (header === undefined) return;
+        unpairedPayloads.delete(hash);
+        const computedPayloadHash = hashSuite.hashToB64(
+            stringToUint8Array(json.toStringNormalized(buffered.payload))
+        );
+        if (computedPayloadHash === header.payloadHash) {
+            discoveredHeaders.delete(hash);
+            readyToApply.set(hash, header);
+            receivedPayloads.set(hash, buffered.payload);
+            requestedPayloads.delete(hash);
+            payloadSourcePeer.set(hash, buffered.source);
+        } else {
+            reportIssue(buffered.source, { kind: 'hash-mismatch', severity: 'high', opHash: hash });
+            requestedPayloads.delete(hash);
+        }
+    }
+
+    // Drop unpaired payloads buffered for a payload request that is ending.
+    function dropUnpairedForRequest(state: PayloadRequestState) {
+        for (const [hash, buffered] of unpairedPayloads) {
+            if (buffered.requestId === state.requestId) {
+                unpairedPayloads.delete(hash);
+            }
+        }
+    }
+
+    // After a discard/reject, a pending payload request whose hashes no longer
+    // map to any live header is dead: drop it locally so we do not wait out the
+    // 30s timeout. (Payload requests only ever target already-installed
+    // headers, so "no live header" means every hash was applied or discarded.)
+    function pruneEmptyPayloadRequests() {
+        for (const [rid, state] of pendingPayloadRequests) {
+            let anyLive = false;
+            for (const h of state.requestedHashes) {
+                if (discoveredHeaders.has(h) || readyToApply.has(h)) {
+                    anyLive = true;
+                    break;
+                }
+            }
+            if (anyLive) continue;
+            clearTimeout(state.timeout);
+            pendingPayloadRequests.delete(rid);
+            dropUnpairedForRequest(state);
+            for (const h of state.requestedHashes) {
+                if (!receivedPayloads.has(h) && !appliedEntries.has(h)) {
+                    requestedPayloads.delete(h);
+                }
+            }
+        }
     }
 
     let autoPayloadRequestId: string | undefined;
@@ -417,12 +526,14 @@ export function createDagSynchronizer(
         for (const [_hash, header] of knownHeaders) {
             for (const prev of json.fromSet(header.prevEntryHashes)) {
                 if (!discoveredHeaders.has(prev) && !readyToApply.has(prev)
-                    && !appliedEntries.has(prev) && !requestedPayloads.has(prev)) {
+                    && !appliedEntries.has(prev) && !requestedPayloads.has(prev)
+                    && !rejectedEntries.has(prev)) {
                     const local = await dag.loadEntry(prev);
                     if (local === undefined
                         && !discoveredHeaders.has(prev) && !readyToApply.has(prev)
                         && !requestedPayloads.has(prev)
-                        && !appliedEntries.has(prev)) {
+                        && !appliedEntries.has(prev)
+                        && !rejectedEntries.has(prev)) {
                         unresolvedPrevs.add(prev);
                     }
                 }
@@ -434,7 +545,8 @@ export function createDagSynchronizer(
         for (const [_peerKey, frontier] of peerFrontiers) {
             for (const h of frontier) {
                 if (!localFrontier.has(h) && !discoveredHeaders.has(h)
-                    && !readyToApply.has(h) && !appliedEntries.has(h)) {
+                    && !readyToApply.has(h) && !appliedEntries.has(h)
+                    && !rejectedEntries.has(h)) {
                     const local = await dag.loadEntry(h);
                     if (local === undefined) {
                         unknownFrontierHashes.add(h);
@@ -559,12 +671,25 @@ export function createDagSynchronizer(
 
     // --- header response handling ---
 
-    function handleHeaderResponseMeta(msg: HeaderResponseMeta) {
+    // A response frame arrived on channel `pk` but the request `requestId`
+    // belongs to a different peer: protocol abuse on `pk`. Blame `pk`, drop the
+    // frame, and never mutate the other peer's request.
+    function isCollision(state: { peer: PeerHandle }, pk: string, kind: string, requestId: string): boolean {
+        if (state.peer.key === pk) return false;
+        reportIssue(pk, { kind: 'protocol', severity: 'moderate', message: `requestId collision on ${kind}` });
+        if (TRACE_SYNC) {
+            trace('sync.drop', { dag: dagId, kind, requestId, why: 'requestId-collision', peer: pk });
+        }
+        return true;
+    }
+
+    function handleHeaderResponseMeta(msg: HeaderResponseMeta, pk: string) {
         const state = pendingHeaderRequests.get(msg.requestId);
         if (state === undefined) {
             traceDrop('header-meta', msg.requestId);
             return;
         }
+        if (isCollision(state, pk, 'header-response-meta', msg.requestId)) return;
 
         if (msg.headerCount > MAX_HEADERS_PER_REQUEST) {
             failHeaderRequest(msg.requestId, 'headerCount exceeds maxHeaders');
@@ -598,12 +723,13 @@ export function createDagSynchronizer(
         return;
     }
 
-    async function handleHeaderBatch(msg: HeaderBatch) {
+    async function handleHeaderBatch(msg: HeaderBatch, pk: string) {
         const state = pendingHeaderRequests.get(msg.requestId);
         if (state === undefined) {
             traceDrop('header-batch', msg.requestId);
             return;
         }
+        if (isCollision(state, pk, 'header-batch', msg.requestId)) return;
 
         if (msg.sequence !== state.nextSequence) {
             failHeaderRequest(msg.requestId, `expected sequence ${state.nextSequence}, got ${msg.sequence}`);
@@ -628,6 +754,30 @@ export function createDagSynchronizer(
 
             state.receivedHashes.add(item.hash);
 
+            // Already applied or type-rejected: never re-queue.
+            if (appliedEntries.has(item.hash)) {
+                addToPeerDiscoveredFrontier(state.peer.key, item.hash);
+                forgetHeaderMiss(item.hash);
+                continue;
+            }
+            if (rejectedEntries.has(item.hash)) {
+                unpairedPayloads.delete(item.hash);
+                forgetHeaderMiss(item.hash);
+                continue;
+            }
+
+            // A one-hop dependent of a rejected entry: do not admit it, and do
+            // not add it to the rejected set (only the offending hash is stored).
+            let prevRejected = false;
+            for (const prev of json.fromSet(item.header.prevEntryHashes)) {
+                if (rejectedEntries.has(prev)) { prevRejected = true; break; }
+            }
+            if (prevRejected) {
+                unpairedPayloads.delete(item.hash);
+                forgetHeaderMiss(item.hash);
+                continue;
+            }
+
             // If we already have this entry locally (e.g. common ancestor
             // returned in a divergent-frontier response), do not queue it for
             // payload fetch/validation again.
@@ -643,6 +793,8 @@ export function createDagSynchronizer(
                 && !appliedEntries.has(item.hash)) {
                 discoveredHeaders.set(item.hash, item.header);
                 forgetHeaderMiss(item.hash);
+                // Pair with a payload that arrived ahead of this header.
+                tryPromote(item.hash);
             }
         }
 
@@ -724,7 +876,7 @@ export function createDagSynchronizer(
 
         clearTimeout(state.timeout);
         pendingHeaderRequests.delete(requestId);
-        reportIssue(state.peer.key, 'timeout');
+        reportIssue(state.peer.key, { kind: 'timeout', severity: 'moderate', message: 'header request timed out' });
 
         if (autoPayloadRequestId === requestId) {
             autoPayloadRequestId = undefined;
@@ -743,11 +895,11 @@ export function createDagSynchronizer(
             trace('sync.fail', {
                 dag: dagId,
                 peer: state.peer.key,
-                issue: 'validation-failed',
+                issue: 'protocol',
                 reason,
             });
         }
-        reportIssue(state.peer.key, 'validation-failed');
+        reportIssue(state.peer.key, { kind: 'protocol', severity: 'high', message: reason });
 
         if (autoPayloadRequestId === requestId) {
             autoPayloadRequestId = undefined;
@@ -895,12 +1047,13 @@ export function createDagSynchronizer(
 
     // --- payload response handling ---
 
-    function handlePayloadResponseMeta(msg: PayloadResponseMeta) {
+    function handlePayloadResponseMeta(msg: PayloadResponseMeta, pk: string) {
         const state = pendingPayloadRequests.get(msg.requestId);
         if (state === undefined) {
             traceDrop('payload-meta', msg.requestId);
             return;
         }
+        if (isCollision(state, pk, 'payload-response-meta', msg.requestId)) return;
 
         if (msg.payloadCount !== state.requestedHashes.size) {
             failPayloadRequest(msg.requestId, 'payloadCount mismatch');
@@ -911,12 +1064,32 @@ export function createDagSynchronizer(
         resetPayloadTimeout(state);
     }
 
-    async function handlePayloadMsg(msg: PayloadMsg) {
+    // Complete a payload request once every announced frame has been counted,
+    // regardless of whether each frame was stored, skipped, or rejected.
+    function finalizePayloadRequestIfDone(state: PayloadRequestState) {
+        if (state.expectedPayloadCount === undefined
+            || state.receivedPayloadCount < state.expectedPayloadCount) {
+            return;
+        }
+        clearTimeout(state.timeout);
+        pendingPayloadRequests.delete(state.requestId);
+        dropUnpairedForRequest(state);
+        if (TRACE_SYNC) {
+            trace('sync.payload done', {
+                dag: dagId,
+                peer: state.peer.key,
+                n: state.receivedPayloadCount,
+            });
+        }
+    }
+
+    async function handlePayloadMsg(msg: PayloadMsg, pk: string) {
         const state = pendingPayloadRequests.get(msg.requestId);
         if (state === undefined) {
             traceDrop('payload-msg', msg.requestId, { seq: msg.sequence });
             return;
         }
+        if (isCollision(state, pk, 'payload-msg', msg.requestId)) return;
 
         if (msg.sequence !== state.nextSequence) {
             failPayloadRequest(msg.requestId, `expected sequence ${state.nextSequence}, got ${msg.sequence}`);
@@ -929,67 +1102,57 @@ export function createDagSynchronizer(
             return;
         }
 
-        if (receivedPayloads.has(msg.hash) || appliedEntries.has(msg.hash)) {
-            // Already have this payload (e.g. from a concurrent auto-payload stream).
-            // Skip gracefully rather than failing the whole request.
-            if (state.expectedPayloadCount !== undefined &&
-                state.receivedPayloadCount >= state.expectedPayloadCount) {
-                clearTimeout(state.timeout);
-                pendingPayloadRequests.delete(msg.requestId);
-                if (TRACE_SYNC) {
-                    trace('sync.payload done', {
-                        dag: dagId,
-                        peer: state.peer.key,
-                        n: state.receivedPayloadCount,
-                    });
-                }
-            }
-            return;
-        }
+        // Every in-order frame for a live request counts, including duplicate,
+        // already-applied, rejected, and no-header frames. This is what lets a
+        // stream complete after some of its entries were type-rejected instead
+        // of hanging until the 30s timeout.
+        state.receivedPayloadCount++;
+        resetPayloadTimeout(state);
 
         if (state.expectedPayloadCount !== undefined &&
-            state.receivedPayloadCount + 1 > state.expectedPayloadCount) {
+            state.receivedPayloadCount > state.expectedPayloadCount) {
             failPayloadRequest(msg.requestId, 'received more payloads than announced');
             return;
         }
 
-        state.receivedPayloadCount++;
-        hashSourcePeer.set(msg.hash, state.peer.key);
-        resetPayloadTimeout(state);
+        // Nothing to store: already have it, or it was type-rejected. Frame is
+        // already counted above.
+        if (receivedPayloads.has(msg.hash) || appliedEntries.has(msg.hash)
+            || rejectedEntries.has(msg.hash)) {
+            requestedPayloads.delete(msg.hash);
+            unpairedPayloads.delete(msg.hash);
+            finalizePayloadRequestIfDone(state);
+            await attemptWork();
+            return;
+        }
 
-        // Verify payload hash against header
         const header = discoveredHeaders.get(msg.hash) ?? readyToApply.get(msg.hash);
         if (header !== undefined) {
             const computedPayloadHash = hashSuite.hashToB64(
                 stringToUint8Array(json.toStringNormalized(msg.payload))
             );
             if (computedPayloadHash === header.payloadHash) {
-                // Hash verified: move from discoveredHeaders to readyToApply
+                // Hash verified: move from discoveredHeaders to readyToApply and
+                // record the delivering channel as the provenance for this hash.
                 discoveredHeaders.delete(msg.hash);
                 readyToApply.set(msg.hash, header);
                 receivedPayloads.set(msg.hash, msg.payload);
                 requestedPayloads.delete(msg.hash);
+                payloadSourcePeer.set(msg.hash, pk);
             } else {
-                reportIssue(state.peer.key, 'validation-failed');
+                // Hash mismatch is misbehavior of this channel. Do not store, do
+                // not poison rejectedEntries (we never had trustworthy bytes).
+                reportIssue(pk, { kind: 'hash-mismatch', severity: 'high', opHash: msg.hash });
                 requestedPayloads.delete(msg.hash);
             }
         } else {
-            receivedPayloads.set(msg.hash, msg.payload);
-            requestedPayloads.delete(msg.hash);
+            // Payload ahead of its header: buffer as unpaired (unverified),
+            // scoped to this request. tryPromote verifies it when the header
+            // lands; dropUnpairedForRequest drops it if the request ends first.
+            unpairedPayloads.set(msg.hash, { payload: msg.payload, source: pk, requestId: msg.requestId });
         }
 
-        if (state.expectedPayloadCount !== undefined &&
-            state.receivedPayloadCount >= state.expectedPayloadCount) {
-            clearTimeout(state.timeout);
-            pendingPayloadRequests.delete(msg.requestId);
-            if (TRACE_SYNC) {
-                trace('sync.payload done', {
-                    dag: dagId,
-                    peer: state.peer.key,
-                    n: state.receivedPayloadCount,
-                });
-            }
-        }
+        finalizePayloadRequestIfDone(state);
 
         await attemptWork();
     }
@@ -1000,8 +1163,9 @@ export function createDagSynchronizer(
 
         clearTimeout(state.timeout);
         pendingPayloadRequests.delete(requestId);
-        reportIssue(state.peer.key, 'timeout');
+        reportIssue(state.peer.key, { kind: 'timeout', severity: 'moderate', message: 'payload request timed out' });
 
+        dropUnpairedForRequest(state);
         for (const h of state.requestedHashes) {
             if (!receivedPayloads.has(h) && !appliedEntries.has(h)) {
                 requestedPayloads.delete(h);
@@ -1021,12 +1185,13 @@ export function createDagSynchronizer(
             trace('sync.fail', {
                 dag: dagId,
                 peer: state.peer.key,
-                issue: 'validation-failed',
+                issue: 'protocol',
                 reason,
             });
         }
-        reportIssue(state.peer.key, 'validation-failed');
+        reportIssue(state.peer.key, { kind: 'protocol', severity: 'high', message: reason });
 
+        dropUnpairedForRequest(state);
         for (const h of state.requestedHashes) {
             if (!receivedPayloads.has(h) && !appliedEntries.has(h)) {
                 requestedPayloads.delete(h);
@@ -1114,8 +1279,13 @@ export function createDagSynchronizer(
 
                 const result = await rObject.validatePayload(payload, version);
                 if (!result.valid) {
-                    const source = hashSourcePeer.get(hash);
-                    if (source !== undefined) reportIssue(source, 'validation-failed');
+                    const source = payloadSourcePeer.get(hash);
+                    reportIssue(source, {
+                        kind: 'validation-failed',
+                        severity: 'moderate',
+                        opHash: hash,
+                        message: formatValidationFailure(result.why),
+                    });
                     if (TRACE_SYNC) {
                         trace('sync.apply', {
                             dag: dagId,
@@ -1125,28 +1295,25 @@ export function createDagSynchronizer(
                             reason: formatValidationFailure(result.why),
                         });
                     }
-                    receivedPayloads.delete(hash);
-                    readyToApply.delete(hash);
-                    discardDependents(hash);
+                    rejectEntry(hash);
                     continue;
                 }
 
                 const resultHash = await rObject.applyPayload(payload, version);
                 if (resultHash !== hash) {
-                    const source = hashSourcePeer.get(hash);
-                    if (source !== undefined) reportIssue(source, 'validation-failed');
+                    const source = payloadSourcePeer.get(hash);
+                    reportIssue(source, { kind: 'hash-mismatch', severity: 'high', opHash: hash });
                     if (TRACE_SYNC) {
                         trace('sync.apply', { dag: dagId, hash, result: 'reject', why: 'hash' });
                     }
-                    receivedPayloads.delete(hash);
-                    readyToApply.delete(hash);
-                    discardDependents(hash);
+                    rejectEntry(hash);
                     continue;
                 }
 
                 appliedEntries.add(hash);
                 receivedPayloads.delete(hash);
                 readyToApply.delete(hash);
+                payloadSourcePeer.delete(hash);
                 if (TRACE_SYNC) {
                     trace('sync.apply', { dag: dagId, hash, result: 'ok' });
                 }
@@ -1156,6 +1323,22 @@ export function createDagSynchronizer(
         }
 
         return anyProgress;
+    }
+
+    // Type-level reject of a hash-verified, payload-verified entry: remember the
+    // offending hash in the bounded set, drop it and its live dependents from
+    // the receive pipeline, and free any now-dead payload requests. Only the
+    // offending hash is remembered; dependents are dropped, not stored.
+    function rejectEntry(hash: B64Hash) {
+        addRejected(hash);
+        receivedPayloads.delete(hash);
+        readyToApply.delete(hash);
+        discoveredHeaders.delete(hash);
+        requestedPayloads.delete(hash);
+        payloadSourcePeer.delete(hash);
+        unpairedPayloads.delete(hash);
+        discardDependents(hash);
+        pruneEmptyPayloadRequests();
     }
 
     function discardDependents(badHash: B64Hash) {
@@ -1177,6 +1360,8 @@ export function createDagSynchronizer(
                     discoveredHeaders.delete(hash);
                     readyToApply.delete(hash);
                     requestedPayloads.delete(hash);
+                    payloadSourcePeer.delete(hash);
+                    unpairedPayloads.delete(hash);
                     break;
                 }
             }
@@ -1211,13 +1396,13 @@ export function createDagSynchronizer(
                 if (msg.dagId === dagId) return handleNewFrontier(msg, pk);
                 return;
             case 'header-response-meta':
-                return handleHeaderResponseMeta(msg);
+                return handleHeaderResponseMeta(msg, pk);
             case 'header-batch':
-                return handleHeaderBatch(msg);
+                return handleHeaderBatch(msg, pk);
             case 'payload-response-meta':
-                return handlePayloadResponseMeta(msg);
+                return handlePayloadResponseMeta(msg, pk);
             case 'payload-msg':
-                return handlePayloadMsg(msg);
+                return handlePayloadMsg(msg, pk);
             default:
                 return;
         }
@@ -1253,6 +1438,7 @@ export function createDagSynchronizer(
             if (state.peer.key === peerKey) {
                 clearTimeout(state.timeout);
                 pendingPayloadRequests.delete(rid);
+                dropUnpairedForRequest(state);
                 for (const h of state.requestedHashes) {
                     if (!receivedPayloads.has(h) && !appliedEntries.has(h)) {
                         requestedPayloads.delete(h);
@@ -1281,10 +1467,6 @@ export function createDagSynchronizer(
         pendingPayloadRequests.clear();
     }
 
-    function onPeerIssue(cb: (peerKey: string, issue: PeerIssue) => void) {
-        issueCallbacks.push(cb);
-    }
-
     function getDiagnostics() {
         return {
             pendingHeaderRequests: pendingHeaderRequests.size,
@@ -1292,5 +1474,5 @@ export function createDagSynchronizer(
         };
     }
 
-    return { handleMessage, addPeer, removePeer, broadcastFrontier, destroy, onPeerIssue, getDiagnostics };
+    return { handleMessage, addPeer, removePeer, broadcastFrontier, destroy, getDiagnostics };
 }

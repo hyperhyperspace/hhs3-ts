@@ -86,6 +86,13 @@ export class DirectReplClient implements ReplClient {
                 return new MemoryTarget({ captureChanges: true });
             },
             syncMeshFactory: createBrowserMesh,
+            // Naive first-cut issue sink for the browser demo: structured
+            // reports from the mesh/swarm/sync layers go to the dev console.
+            report: (report) => {
+                const source = report.source ?? 'issue';
+                const detail = report.message ?? report.kind ?? 'unknown issue';
+                console.log(`[${source} issue] ${detail}`);
+            },
         });
         session.enableReplDefaults();
         this.workspace = workspace;

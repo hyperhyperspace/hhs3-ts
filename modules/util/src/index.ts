@@ -7,3 +7,5 @@ export * as testing from "./test.js";
 export * as set from "./set.js";
 export * as iterators from "./iterators.js";
 export { trace } from "./trace.js";
+export { severityRank } from "./report.js";
+export type { IssueReport, IssueReporter, IssueSeverity } from "./report.js";

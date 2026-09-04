@@ -7,6 +7,8 @@ import {
     type SessionView,
 } from "@hyper-hyper-space/hhs3_rdb_runtime";
 
+import type { IssueReporter } from "@hyper-hyper-space/hhs3_mesh";
+
 import type { ProjectionTargetFactory, ProjectSessionEntry } from "./projection/types.js";
 import type { SyncMeshFactory, SyncSessionEntry } from "./sync/types.js";
 
@@ -35,6 +37,7 @@ export type ReplSessionOptions = {
     projectionTargetFactory?: ProjectionTargetFactory;
     onProjectionError?: ProjectionErrorHandler;
     syncMeshFactory?: SyncMeshFactory;
+    report?: IssueReporter;
 };
 
 export class ReplSession extends RdbSession {
@@ -58,6 +61,10 @@ export class ReplSession extends RdbSession {
     nextSyncId = 1;
     nextFetchId = 1;
 
+    // Host-injected structured issue sink, threaded into the sync mesh and the
+    // RDb sync sessions. Absent => issues are dropped.
+    report?: IssueReporter;
+
     constructor(options: ReplSessionOptions) {
         const sessionOptions: RdbSessionOptions = {
             workspace: options.workspace,
@@ -74,6 +81,7 @@ export class ReplSession extends RdbSession {
         this.projectionTargetFactory = options.projectionTargetFactory;
         this.onProjectionError = options.onProjectionError;
         this.syncMeshFactory = options.syncMeshFactory;
+        this.report = options.report;
     }
 
     get keystore(): KeyVault | undefined {

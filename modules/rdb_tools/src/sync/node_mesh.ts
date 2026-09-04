@@ -20,6 +20,7 @@ export function createNodeSyncMeshFactory(opts: NodeSyncMeshFactoryOptions = {})
                 trackerAddress: req.trackerAddress ?? empty(env.RDB_SYNC_TRACKER),
                 trackerKeyId: req.trackerKeyId ?? empty(env.RDB_SYNC_TRACKER_KEY),
                 listenAddress: req.listenAddress ?? empty(env.RDB_SYNC_LISTEN),
+                report: req.report,
             },
             { folderRoot: opts.folderRoot },
         );

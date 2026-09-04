@@ -18,6 +18,7 @@ import {
     createAuthenticator,
     probeTracker,
     type DiscoveryLayer,
+    type IssueReporter,
     type MeshScope,
     type NetworkAddress,
     type PeerDiscovery,
@@ -36,6 +37,7 @@ export type NodeMeshRequest = {
     trackerAddress?: string;
     trackerKeyId?: string;
     listenAddress?: string;
+    report?: IssueReporter;
 };
 
 export type NodeMeshOptions = {
@@ -116,6 +118,7 @@ export async function createNodeMesh(
         authenticator,
         localKeyId: req.identity.keyId,
         listenAddresses,
+        report: req.report,
     });
 
     return {

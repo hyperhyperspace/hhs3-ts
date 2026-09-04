@@ -56,11 +56,15 @@ const session = createSyncSession(
         ctx,  // optional: RContext for foreign-dep lookup and wakeup
     },
     [swarm],
+    {
+        // optional: structured issue sink (IssueReport). Every field is
+        // optional; severity hints how the mesh/swarm should react
+        // (high = terminate, moderate = consider if frequent, low = ignore).
+        report: (issue) => {
+            console.warn(`[${issue.severity ?? 'low'}] ${issue.kind} ${issue.keyId ?? ''}`, issue);
+        },
+    },
 );
-
-session.onPeerIssue((peerKey, issue) => {
-    console.warn(`peer ${peerKey}: ${issue}`);
-});
 
 // Later:
 session.destroy();

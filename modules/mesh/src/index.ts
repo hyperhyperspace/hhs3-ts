@@ -20,3 +20,5 @@ export { MemTransport, MemTransportProvider, createMemTransportPair } from './me
 export type { MeshScope } from './scope.js';
 export { QuietDiscovery } from './quiet_discovery.js';
 export { probeTracker, TRACKER_PROBE_TIMEOUT_MS } from './tracker_probe.js';
+export { severityRank } from '@hyper-hyper-space/hhs3_util';
+export type { IssueReport, IssueReporter, IssueSeverity } from '@hyper-hyper-space/hhs3_util';

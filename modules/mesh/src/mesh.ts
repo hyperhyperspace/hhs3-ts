@@ -8,6 +8,7 @@
 // authorization to per-swarm PeerAuthorizers.
 
 import type { KeyId } from '@hyper-hyper-space/hhs3_crypto';
+import type { IssueReporter } from '@hyper-hyper-space/hhs3_util';
 import type { PeerDiscovery, PeerInfo } from './discovery.js';
 import type { TopicId } from './discovery.js';
 import type { PeerAuthenticator } from './authenticator.js';
@@ -31,6 +32,7 @@ export interface MeshConfig {
     localKeyId?:            KeyId;
     listenAddresses?:       NetworkAddress[];
     negotiationTimeoutMs?:  number;
+    report?:                IssueReporter;
 }
 
 export class Mesh {
@@ -42,10 +44,12 @@ export class Mesh {
     private closed = false;
     private localPeer: PeerInfo | undefined;
     private negotiationTimeoutMs: number;
+    private report: IssueReporter | undefined;
 
     constructor(config: MeshConfig) {
         this.config = config;
         this.negotiationTimeoutMs = config.negotiationTimeoutMs ?? DEFAULT_NEGOTIATION_TIMEOUT_MS;
+        this.report = config.report;
         this.pool = new ConnectionPool();
 
         if (config.localKeyId !== undefined) {
@@ -110,6 +114,7 @@ export class Mesh {
                 authenticator: negotiatingAuth,
                 transports:    this.config.transports,
                 localPeer:     this.localPeer,
+                report:        this.report,
             },
         );
 
@@ -137,6 +142,13 @@ export class Mesh {
         }
     }
 
+    private reportMeshIssue(partial: {
+        kind: string; severity: 'low' | 'moderate' | 'high';
+        keyId?: string; endpoint?: string; message?: string; stack?: string;
+    }): void {
+        this.report?.({ source: 'mesh', ...partial });
+    }
+
     // --- topic interest evaluation (shared by inbound + pool-reuse responders) ---
 
     private async evaluateTopicInterest(topic: TopicId, peerId: KeyId): Promise<Swarm | undefined> {
@@ -158,10 +170,24 @@ export class Mesh {
             );
             if (provider === undefined) continue;
             provider.listen(addr, (transport) => {
-                this.handleIncoming(transport, addr).catch(() => {});
+                this.handleIncoming(transport, addr).catch((err) => {
+                    this.reportMeshIssue({
+                        kind: 'handshake-failed', severity: 'low',
+                        endpoint: addr,
+                        message: err instanceof Error ? err.message : String(err),
+                        stack: err instanceof Error ? err.stack : undefined,
+                    });
+                });
             }).then(() => {
                 if (TRACE_MESH) trace('mesh.listen', { addr });
-            }).catch(() => {});
+            }).catch((err) => {
+                this.reportMeshIssue({
+                    kind: 'listen-failed', severity: 'low',
+                    endpoint: addr,
+                    message: err instanceof Error ? err.message : String(err),
+                    stack: err instanceof Error ? err.stack : undefined,
+                });
+            });
         }
     }
 
@@ -185,6 +211,11 @@ export class Mesh {
 
         const swarm = await this.evaluateTopicInterest(ctrl.topic, channel.remoteKeyId);
         if (swarm === undefined) {
+            this.reportMeshIssue({
+                kind: 'topic-rejected', severity: 'low',
+                keyId: channel.remoteKeyId,
+                message: `no swarm accepted topic ${ctrl.topic}`,
+            });
             if (TRACE_MESH) {
                 trace('mesh.topic reject', { topic: ctrl.topic, peer: channel.remoteKeyId, via: 'inbound' });
             }

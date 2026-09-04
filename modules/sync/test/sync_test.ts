@@ -1,17 +1,21 @@
 import { testing } from '@hyper-hyper-space/hhs3_util';
+import type { IssueReport } from '@hyper-hyper-space/hhs3_util';
 import { B64Hash, sha256, stringToUint8Array } from '@hyper-hyper-space/hhs3_crypto';
 import { dag, Position, Header, Entry } from '@hyper-hyper-space/hhs3_dag';
 import { json } from '@hyper-hyper-space/hhs3_json';
 import type { TopicChannel } from '@hyper-hyper-space/hhs3_mesh';
 import type { RObject, Version, Payload, View, ForeignDep, Delta, DeltaAccumulator, RContext } from '@hyper-hyper-space/hhs3_mvt';
-import { RootScopedDag, ScopedDagSubscription, validationOk } from '@hyper-hyper-space/hhs3_mvt';
+import { RootScopedDag, ScopedDagSubscription, validationOk, validationFailure } from '@hyper-hyper-space/hhs3_mvt';
 
 import { createDagProvider } from '../src/provider.js';
-import { createDagSynchronizer } from '../src/synchronizer.js';
+import { createDagSynchronizer, REJECTED_ENTRIES_CAP } from '../src/synchronizer.js';
 import { createSyncSession } from '../src/session.js';
 import { encode, decode } from '../src/codec.js';
 import { fetchInit } from '../src/fetch_init.js';
-import type { SyncMsg, NewFrontierMsg, InitResponse, HeaderRequest } from '../src/protocol.js';
+import type {
+    SyncMsg, NewFrontierMsg, InitResponse, HeaderRequest,
+    HeaderResponseMeta, HeaderBatch, PayloadRequest, PayloadResponseMeta, PayloadMsg,
+} from '../src/protocol.js';
 import type { Swarm, SwarmPeer } from '@hyper-hyper-space/hhs3_mesh';
 
 // --- Helpers ---
@@ -110,6 +114,7 @@ function createChannelPair(topic: string, peerAId: string, peerBId: string): Cha
 
 function createMockRObject(d: dag.Dag, id: B64Hash, opts?: {
     extractForeignDeps?: (payload: Payload, at: Version) => ForeignDep[] | undefined,
+    validatePayload?: (payload: Payload, at: Version) => Promise<ReturnType<typeof validationOk>>,
 }): RObject {
     const scoped = new RootScopedDag(d);
     const subscription = new ScopedDagSubscription(async () => scoped);
@@ -117,7 +122,7 @@ function createMockRObject(d: dag.Dag, id: B64Hash, opts?: {
         getId: () => id,
         getType: () => 'test-object',
         getBackendLabel: () => 'default',
-        validatePayload: async (_payload: Payload, _at: Version) => validationOk(),
+        validatePayload: opts?.validatePayload ?? (async (_payload: Payload, _at: Version) => validationOk()),
         applyPayload: async (payload: Payload, at: Version) => {
             return await d.append(payload, {}, at);
         },
@@ -962,12 +967,12 @@ async function testAutoPayloadCountMismatch() {
         }
     });
 
-    const issues: string[] = [];
+    const reports: IssueReport[] = [];
     const session = createSyncSession(
         { dagId, dag: dagA, rObject: rObjectA, hashSuite: sha256 },
         [swarm],
+        { report: (r) => reports.push(r) },
     );
-    session.onPeerIssue((_peer, issue) => { issues.push(issue); });
 
     chBLocal.send(encode({
         type: 'new-frontier',
@@ -999,11 +1004,251 @@ async function testAutoPayloadCountMismatch() {
         payloadCount: 99,
     }));
 
-    await waitUntil(async () => issues.includes('validation-failed'), 20, 2000);
-    testing.assertTrue(issues.includes('validation-failed'), 'wrong payloadCount must fail the request');
+    await waitUntil(async () => reports.some((r) => r.kind === 'protocol'), 20, 2000);
+    const protoReport = reports.find((r) => r.kind === 'protocol');
+    testing.assertTrue(protoReport !== undefined, 'wrong payloadCount must fail the request as a protocol issue');
+    testing.assertEquals(protoReport!.keyId, 'peerB', 'protocol issue blames the delivering peer');
+    testing.assertEquals(protoReport!.endpoint, 'mem://peerB', 'protocol issue carries the peer endpoint');
+    testing.assertEquals(protoReport!.severity, 'high', 'protocol violation is high severity');
 
     session.destroy();
     chALocal.close();
+}
+
+// A manually-driven synchronizer A with a single peer B. Outgoing requests are
+// captured in `sent`; structured reports in `reports`. Responses are fed by
+// calling sync.handleMessage(msg, channel) directly, so tests control ordering,
+// provenance (which channel delivers), and payload bytes precisely.
+function manualDriver(dagId: B64Hash, dagA: dag.Dag, rObjectA: RObject, opts?: { rejectedCap?: number }) {
+    const topic = 'drv';
+    const chB = new MockChannel(topic, 'peerB', 'mem://peerB');
+    const peerB = { key: 'peerB@mem://peerB', channel: chB };
+    const sent: SyncMsg[] = [];
+    const reports: IssueReport[] = [];
+    const sync = createDagSynchronizer(
+        dagId,
+        dagA,
+        rObjectA,
+        sha256,
+        () => [peerB],
+        (_peer, msg) => { sent.push(msg); return 'sent' as const; },
+        undefined,
+        { report: (r) => reports.push(r), rejectedCap: opts?.rejectedCap },
+    );
+    sync.addPeer(peerB);
+    return { sync, chB, sent, reports, topic };
+}
+
+function lastRequest<T extends 'header-request' | 'payload-request'>(
+    sent: SyncMsg[], type: T,
+): Extract<SyncMsg, { type: T }> | undefined {
+    for (let i = sent.length - 1; i >= 0; i--) {
+        if (sent[i].type === type) return sent[i] as Extract<SyncMsg, { type: T }>;
+    }
+    return undefined;
+}
+
+// Feed an auto-payload response (meta + header batch + payload meta + payload
+// frames) for `requestId`, sourcing headers/payloads from `dagS`. Payloads are
+// sent in the given `hashes` order (pass causal order so predecessors apply
+// first). `payloadOverride` lets a test send tampered bytes for a hash.
+async function serveAuto(
+    driver: ReturnType<typeof manualDriver>,
+    requestId: string,
+    dagS: dag.Dag,
+    hashes: B64Hash[],
+    payloadOverride?: Map<B64Hash, json.Literal>,
+): Promise<void> {
+    const headers: Array<{ hash: B64Hash; header: Header }> = [];
+    for (const h of hashes) {
+        const header = await dagS.loadHeader(h);
+        headers.push({ hash: h, header: header! });
+    }
+    await driver.sync.handleMessage({
+        type: 'header-response-meta', requestId,
+        headerCount: hashes.length, complete: true, payloadCount: hashes.length,
+    } as HeaderResponseMeta, driver.chB);
+    await driver.sync.handleMessage({
+        type: 'header-batch', requestId, sequence: 0, headers,
+    } as HeaderBatch, driver.chB);
+    await driver.sync.handleMessage({
+        type: 'payload-response-meta', requestId, payloadCount: hashes.length,
+    } as PayloadResponseMeta, driver.chB);
+    let seq = 0;
+    for (const h of hashes) {
+        const payload = payloadOverride?.get(h) ?? (await dagS.loadEntry(h))!.payload;
+        await driver.sync.handleMessage({
+            type: 'payload-msg', requestId, sequence: seq++, hash: h, payload,
+        } as PayloadMsg, driver.chB);
+    }
+}
+
+async function testRequestIdCollision() {
+    const dagId = 'drv-collision';
+    const dagS = createTestDag();
+    const root = await dagS.append({ op: 'root' }, {});
+    const x = await dagS.append({ op: 'X' }, {}, new Set([root]));
+
+    const dagA = createTestDag();
+    await dagA.append({ op: 'root' }, {});
+
+    const d = manualDriver(dagId, dagA, createMockRObject(dagA, dagId));
+
+    await d.sync.handleMessage({ type: 'new-frontier', dagId, frontier: [x] } as NewFrontierMsg, d.chB);
+    await wait(30);
+
+    const hreq = lastRequest(d.sent, 'header-request');
+    testing.assertTrue(hreq !== undefined, 'A should request headers for the unknown frontier hash');
+    testing.assertEquals(d.sync.getDiagnostics().pendingHeaderRequests, 1, 'one header request in flight');
+
+    // A frame carrying A's requestId but delivered on a different peer's channel.
+    const chC = new MockChannel(d.topic, 'peerC', 'mem://peerC');
+    await d.sync.handleMessage({
+        type: 'header-response-meta', requestId: hreq!.requestId,
+        headerCount: 1, complete: true, payloadCount: 0,
+    } as HeaderResponseMeta, chC);
+
+    testing.assertEquals(
+        d.sync.getDiagnostics().pendingHeaderRequests, 1,
+        'a colliding requestId on another channel must not mutate the real request',
+    );
+    const collision = d.reports.find((r) => r.kind === 'protocol' && r.keyId === 'peerC');
+    testing.assertTrue(collision !== undefined, 'the delivering channel (peerC) is blamed, not peerB');
+    testing.assertEquals(collision!.endpoint, 'mem://peerC', 'collision report carries peerC endpoint');
+    testing.assertEquals(collision!.severity, 'moderate', 'requestId collision is moderate severity');
+
+    d.sync.destroy();
+}
+
+async function testTypeRejectRemembersReportsAndDiscards() {
+    const dagId = 'drv-reject';
+    const dagS = createTestDag();
+    const root = await dagS.append({ op: 'root' }, {});
+    const a = await dagS.append({ op: 'A' }, {}, new Set([root]));
+    const b = await dagS.append({ op: 'B' }, {}, new Set([a]));
+    const c = await dagS.append({ op: 'C' }, {}, new Set([b]));
+
+    const dagA = createTestDag();
+    await dagA.append({ op: 'root' }, {});
+
+    const rObjectA = createMockRObject(dagA, dagId, {
+        validatePayload: async (payload) =>
+            (payload as { op?: string }).op === 'B' ? validationFailure('bad B') : validationOk(),
+    });
+    const d = manualDriver(dagId, dagA, rObjectA);
+
+    await d.sync.handleMessage({ type: 'new-frontier', dagId, frontier: [c] } as NewFrontierMsg, d.chB);
+    await wait(30);
+    const hreq = lastRequest(d.sent, 'header-request');
+    testing.assertTrue(hreq !== undefined, 'A requests headers');
+
+    await serveAuto(d, hreq!.requestId, dagS, [a, b, c]);
+    await wait(50);
+
+    testing.assertTrue((await dagA.loadEntry(a)) !== undefined, 'entry before the reject applies');
+    testing.assertTrue((await dagA.loadEntry(b)) === undefined, 'type-rejected entry B is not applied');
+    testing.assertTrue((await dagA.loadEntry(c)) === undefined, 'dependent C is discarded, not applied');
+    testing.assertEquals(
+        d.sync.getDiagnostics().pendingPayloadRequests, 0,
+        'the payload stream completes and drains without the 30s timeout',
+    );
+
+    const rej = d.reports.find((r) => r.kind === 'validation-failed' && r.opHash === b);
+    testing.assertTrue(rej !== undefined, 'type reject is reported with the offending op hash');
+    testing.assertEquals(rej!.keyId, 'peerB', 'reject blames the channel that delivered the verified payload');
+    testing.assertEquals(rej!.endpoint, 'mem://peerB', 'reject carries the peer endpoint');
+    testing.assertEquals(rej!.severity, 'moderate', 'type reject is moderate severity');
+    testing.assertTrue(typeof rej!.message === 'string' && rej!.message!.length > 0, 'reject carries a message');
+
+    d.sync.destroy();
+}
+
+async function testPayloadHashMismatchNotPoisoned() {
+    const dagId = 'drv-mismatch';
+    const dagS = createTestDag();
+    const root = await dagS.append({ op: 'root' }, {});
+    const x = await dagS.append({ op: 'X' }, {}, new Set([root]));
+
+    const dagA = createTestDag();
+    await dagA.append({ op: 'root' }, {});
+
+    const d = manualDriver(dagId, dagA, createMockRObject(dagA, dagId));
+
+    await d.sync.handleMessage({ type: 'new-frontier', dagId, frontier: [x] } as NewFrontierMsg, d.chB);
+    await wait(30);
+    const hreq = lastRequest(d.sent, 'header-request');
+
+    // Deliver a payload whose bytes do not hash to header.payloadHash.
+    await serveAuto(d, hreq!.requestId, dagS, [x], new Map([[x, { op: 'TAMPERED' }]]));
+    await wait(30);
+
+    const mm = d.reports.find((r) => r.kind === 'hash-mismatch' && r.opHash === x);
+    testing.assertTrue(mm !== undefined, 'payload hash mismatch is reported');
+    testing.assertEquals(mm!.severity, 'high', 'hash mismatch is high severity');
+    testing.assertTrue((await dagA.loadEntry(x)) === undefined, 'the tampered payload is not applied');
+
+    // Not poisoned: A re-fetches the payload; correct bytes then apply.
+    await wait(30);
+    const preq = lastRequest(d.sent, 'payload-request');
+    testing.assertTrue(preq !== undefined && preq!.hashes.includes(x), 'A re-requests the payload (hash was not remembered)');
+    await d.sync.handleMessage({ type: 'payload-response-meta', requestId: preq!.requestId, payloadCount: 1 } as PayloadResponseMeta, d.chB);
+    await d.sync.handleMessage({
+        type: 'payload-msg', requestId: preq!.requestId, sequence: 0, hash: x,
+        payload: (await dagS.loadEntry(x))!.payload,
+    } as PayloadMsg, d.chB);
+    await wait(30);
+    testing.assertTrue((await dagA.loadEntry(x)) !== undefined, 'a correct payload applies; the mismatch did not poison the hash');
+
+    d.sync.destroy();
+}
+
+async function testRejectedCapEviction() {
+    const dagId = 'drv-cap';
+    const dagS = createTestDag();
+    const root = await dagS.append({ op: 'root' }, {});
+    const px = await dagS.append({ op: 'PX' }, {}, new Set([root]));
+    const py = await dagS.append({ op: 'PY' }, {}, new Set([root]));
+
+    const dagA = createTestDag();
+    await dagA.append({ op: 'root' }, {});
+
+    const rObjectA = createMockRObject(dagA, dagId, {
+        validatePayload: async (payload) => {
+            const op = (payload as { op?: string }).op;
+            return op === 'PX' || op === 'PY' ? validationFailure(`bad ${op}`) : validationOk();
+        },
+    });
+    // Cap of 1: rejecting a second hash evicts the first.
+    const d = manualDriver(dagId, dagA, rObjectA, { rejectedCap: 1 });
+
+    await d.sync.handleMessage({ type: 'new-frontier', dagId, frontier: [px, py] } as NewFrontierMsg, d.chB);
+    await wait(30);
+    const hreq1 = lastRequest(d.sent, 'header-request');
+    await serveAuto(d, hreq1!.requestId, dagS, [px, py]);
+    await wait(40);
+
+    const countReject = (h: B64Hash) => d.reports.filter((r) => r.kind === 'validation-failed' && r.opHash === h).length;
+    testing.assertEquals(countReject(px), 1, 'PX rejected once in phase 1');
+    testing.assertEquals(countReject(py), 1, 'PY rejected once in phase 1 (evicts PX from the cap-1 set)');
+
+    // Re-advertise: PX was evicted so it is fetched and processed again; PY is
+    // still remembered so it is not even requested, and its header is skipped.
+    await d.sync.handleMessage({ type: 'new-frontier', dagId, frontier: [px, py] } as NewFrontierMsg, d.chB);
+    await wait(30);
+    const hreq2 = lastRequest(d.sent, 'header-request');
+    testing.assertTrue(hreq2 !== undefined && hreq2!.requestId !== hreq1!.requestId, 'a fresh header request is issued');
+    testing.assertTrue(hreq2!.start.includes(px), 'the evicted hash PX is requested again');
+    testing.assertTrue(!hreq2!.start.includes(py), 'the still-remembered hash PY is not requested');
+
+    await serveAuto(d, hreq2!.requestId, dagS, [px, py]);
+    await wait(40);
+    testing.assertEquals(countReject(px), 2, 'evicted PX is admitted again and re-rejected');
+    testing.assertEquals(countReject(py), 1, 'remembered PY is skipped on re-admission (no second reject)');
+    testing.assertEquals(d.sync.getDiagnostics().pendingPayloadRequests, 0, 'no leftover payload wait');
+
+    testing.assertTrue(REJECTED_ENTRIES_CAP === 4096, 'production cap stays at 4096');
+
+    d.sync.destroy();
 }
 
 export const syncSuite = {
@@ -1023,5 +1268,9 @@ export const syncSuite = {
         { name: '[SYNC_11] Foreign dep appearance then growth', invoke: testForeignDepAppearance },
         { name: '[SYNC_12] Auto-payload FIFO survives yielding loadHeader', invoke: testAutoPayloadFifo },
         { name: '[SYNC_13] Auto-payload payloadCount mismatch fails', invoke: testAutoPayloadCountMismatch },
+        { name: '[SYNC_14] requestId collision on another channel is dropped', invoke: testRequestIdCollision },
+        { name: '[SYNC_15] Type reject remembers, reports, discards dependents, no stall', invoke: testTypeRejectRemembersReportsAndDiscards },
+        { name: '[SYNC_16] Payload hash mismatch is not poisoned', invoke: testPayloadHashMismatchNotPoisoned },
+        { name: '[SYNC_17] rejectedEntries eviction re-admits oldest, keeps newest', invoke: testRejectedCapEviction },
     ],
 };
