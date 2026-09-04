@@ -38,13 +38,21 @@ import {
     renderStatementOutput,
     runCommand,
     runLanguageText,
+    stopAllProjections,
     stopAllSyncs,
     type SyncMeshFactory,
 } from "../src/index.js";
+import { runProjectParseTests } from "./project_parse_tests.js";
 import { runSyncAuthorizerTests, runSyncParseTests } from "./sync_parse_tests.js";
 
 function assert(condition: unknown, message: string): asserts condition {
     if (!condition) throw new Error(message);
+}
+
+function startedProjectId(output: string): number {
+    const match = /started projection (\d+)/.exec(output);
+    assert(match !== null, `expected started projection id (got: ${JSON.stringify(output)})`);
+    return Number(match[1]);
 }
 
 function assertEqual(actual: unknown, expected: unknown, message: string): void {
@@ -106,7 +114,7 @@ class FlakyTarget implements BidirectionalTarget {
 
 // Exercises the new projection-notice wiring end to end through the portable
 // command surface: reactive throws -> onProjectionError, a failed initial
-// materialization -> failed \projection start, and ingest rejections ->
+// materialization -> failed \project start, and ingest rejections ->
 // "projection warning:" (hook + command output). Self-contained workspace.
 async function runProjectionNoticeTests(): Promise<void> {
     const workspace = await openMemWorkspace();
@@ -132,8 +140,9 @@ ADD TABLEGROUP flaky_a_g TO flaky_a_db;
 
         // Succeed the initial materialization (call 1), fail every reactive apply.
         session.projectionTargetFactory = async () => new FlakyTarget(new MemoryTarget({ captureChanges: true }), 2);
-        const startA = await runCommand(session, '\\projection start flaky_a_db');
-        assert(startA.exitCode === 0 && startA.output.includes('projection started'), 'scenario A start succeeds');
+        const startA = await runCommand(session, '\\project start flaky_a_db as alice to :memory:');
+        assert(startA.exitCode === 0 && startA.output.includes('started projection'), 'scenario A start succeeds');
+        const idA = startedProjectId(startA.output);
 
         const beforeA = notices.length;
         const insertA = await runCommand(session, "INSERT INTO flaky_a_g.items (label) VALUES ('x');");
@@ -141,9 +150,9 @@ ADD TABLEGROUP flaky_a_g TO flaky_a_db;
         const gotErrorA = await waitFor(() => notices.slice(beforeA).some((m) => m.startsWith('projection error:')));
         assert(gotErrorA, `scenario A reactive throw surfaced (got: ${JSON.stringify(notices)})`);
 
-        const statusA = await runCommand(session, '\\projection status');
-        assert(statusA.output.includes('simulated apply failure'), 'scenario A error shows on \\projection status');
-        await runCommand(session, '\\projection stop flaky_a_db');
+        const statusA = await runCommand(session, '\\project status');
+        assert(statusA.output.includes('simulated apply failure'), 'scenario A error shows on \\project status');
+        await runCommand(session, `\\project stop ${idA}`);
 
         // --- Scenario B: a throw during the initial materialization fails start ---
         const setupB = await runCommand(session, `
@@ -156,10 +165,10 @@ ADD TABLEGROUP flaky_b_g TO flaky_b_db;
 
         // Fail the very first apply (the awaited initial materialization).
         session.projectionTargetFactory = async () => new FlakyTarget(new MemoryTarget({ captureChanges: true }), 1);
-        const startB = await runCommand(session, '\\projection start flaky_b_db');
+        const startB = await runCommand(session, '\\project start flaky_b_db as alice to :memory:');
         assert(startB.exitCode !== 0, 'scenario B start fails when initial materialization throws');
         assert(startB.output.includes('simulated apply failure'), 'scenario B start reports the real error');
-        const statusB = await runCommand(session, '\\projection status');
+        const statusB = await runCommand(session, '\\project status');
         assertEqual(statusB.output, '(no active projections)', 'scenario B leaves no active projection');
 
         // --- Scenario C: an ingest rejection surfaces as a projection warning ---
@@ -176,8 +185,9 @@ ADD TABLEGROUP blog_g TO blog_db;
 
         let captured: MemoryTarget | undefined;
         session.projectionTargetFactory = async () => { captured = new MemoryTarget({ captureChanges: true }); return captured; };
-        const startC = await runCommand(session, '\\projection start blog_db');
+        const startC = await runCommand(session, '\\project start blog_db as alice to :memory:');
         assert(startC.exitCode === 0 && captured !== undefined, `scenario C start succeeds (${startC.output})`);
+        const idC = startedProjectId(startC.output);
         // Tables are group-qualified in the shared projection (`<group>_<table>`).
         const commentsTable = captured!.listTables().find((t) => t.endsWith('_comments'));
         assert(commentsTable !== undefined, `scenario C materialized comments (tables: ${captured!.listTables().join(', ')})`);
@@ -191,16 +201,15 @@ ADD TABLEGROUP blog_g TO blog_db;
         assert(gotWarningC, `scenario C ingest rejection surfaced as a warning (got: ${JSON.stringify(notices)})`);
 
         // The command-output path: a fresh dangling insert drained by an
-        // immediate \projection sync (which wins the db lock before the 50ms
+        // immediate \project update (which wins the db lock before the 50ms
         // debounced reactive cycle can consume the outbox).
         captured!.localInsert(commentsTable, { body: 'orphan2', post_id: 98 });
-        const syncC = await runCommand(session, '\\projection sync blog_db');
-        assert(syncC.exitCode === 0, 'scenario C explicit sync succeeds despite rejects');
-        assert(syncC.output.includes('projection warning:'), `scenario C sync output includes the reject warning (got: ${JSON.stringify(syncC.output)})`);
-        await runCommand(session, '\\projection stop blog_db');
+        const syncC = await runCommand(session, `\\project update ${idC}`);
+        assert(syncC.exitCode === 0, 'scenario C explicit update succeeds despite rejects');
+        assert(syncC.output.includes('projection warning:'), `scenario C update output includes the reject warning (got: ${JSON.stringify(syncC.output)})`);
+        await runCommand(session, `\\project stop ${idC}`);
     } finally {
-        for (const projection of session.projections.values()) await projection.stop();
-        session.projections.clear();
+        await stopAllProjections(session);
         await stopAllSyncs(session);
         await workspace.close();
     }
@@ -315,8 +324,8 @@ CREATE TABLEGROUP observer USING SCHEMA observer_schema BIND users => users;
 
         await runCommand(session, '\\output table');
 
-        // --- \projection meta command ---
-        const noProj = await runCommand(session, '\\projection status');
+        // --- \project meta command ---
+        const noProj = await runCommand(session, '\\project status');
         assertEqual(noProj.output, '(no active projections)', 'projection status with none active');
 
         const dbSetup = await runCommand(session, `
@@ -325,29 +334,42 @@ ADD TABLEGROUP shop_prod TO shopdb;
 `);
         assertEqual(dbSetup.exitCode, 0, 'database + membership setup');
 
-        const started = await runCommand(session, '\\projection start shopdb');
-        assert(started.exitCode === 0 && started.output.includes('projection started'), 'projection start');
-        assert(started.output.includes('bidirectional'), 'projection is bidirectional (author selected)');
+        const missingTo = await runCommand(session, '\\project start shopdb as alice');
+        assert(missingTo.exitCode === 1 && missingTo.output.includes("Expected 'to'"), 'start without to is refused');
 
-        const projStatus = await runCommand(session, '\\projection status');
-        assert(projStatus.exitCode === 0 && projStatus.output.includes('database'), 'projection status lists the projection');
+        const started = await runCommand(session, '\\project start shopdb as alice to :memory:');
+        assert(started.exitCode === 0 && started.output.includes('started projection 1'), 'projection start');
+        assert(started.output.includes('as alice'), 'projection start names the local id');
+        assert(started.output.includes('to :memory:'), 'projection start names the destination');
 
-        const synced = await runCommand(session, '\\projection sync shopdb');
-        assert(synced.exitCode === 0 && synced.output.includes('synced'), 'projection sync');
+        const projStatus = await runCommand(session, '\\project status');
+        assert(projStatus.exitCode === 0 && projStatus.output.includes('shopdb'), 'projection status lists the projection');
+        assert(projStatus.output.includes('alice') && projStatus.output.includes(':memory:'), 'projection status shows as and to');
 
-        const dup = await runCommand(session, '\\projection start shopdb');
-        assert(dup.exitCode === 1 && dup.output.includes('already running'), 'starting a second projection is refused');
+        const synced = await runCommand(session, '\\project update 1');
+        assert(synced.exitCode === 0 && synced.output.includes('updated projection 1'), 'projection update');
 
-        const stopped = await runCommand(session, '\\projection stop shopdb');
-        assert(stopped.exitCode === 0 && stopped.output.includes('stopped'), 'projection stop');
-        const afterStop = await runCommand(session, '\\projection status');
+        const dup = await runCommand(session, '\\project start shopdb as alice to :memory:');
+        assert(dup.exitCode === 1 && dup.output.includes('already projecting'), 'starting a second projection is refused');
+
+        const stopByName = await runCommand(session, '\\project stop shopdb');
+        assert(stopByName.exitCode === 1 && stopByName.output.includes('numeric session id'), 'stop by database name is refused');
+
+        const stopped = await runCommand(session, '\\project stop 1');
+        assert(stopped.exitCode === 0 && stopped.output.includes('stopped projection 1'), 'projection stop');
+        const afterStop = await runCommand(session, '\\project status');
         assertEqual(afterStop.output, '(no active projections)', 'projection removed after stop');
+
+        const reused = await runCommand(session, '\\project start shopdb as alice to :memory:');
+        assert(reused.exitCode === 0 && reused.output.includes('started projection 2'), 'ids are never reused after stop');
+        await runCommand(session, '\\project stop 2');
 
         const quit = await runCommand(session, '\\quit');
         assert(quit.quit === true, 'portable quit outcome');
 
         await runSyncCommandTests(session);
     } finally {
+        await stopAllProjections(session);
         await stopAllSyncs(session);
         await workspace.close();
     }
@@ -355,6 +377,7 @@ ADD TABLEGROUP shop_prod TO shopdb;
     await runProjectionNoticeTests();
     await runSyncFetchNonDefaultBackendTest();
     await runSyncParseTests();
+    await runProjectParseTests();
     await runSyncAuthorizerTests();
 }
 
@@ -378,7 +401,6 @@ function memSyncFactory(): SyncMeshFactory {
             mesh,
             discovery,
             listenAddresses: [addr],
-            announcedAddresses: [addr],
             discoveryNotes: ['mem'],
             closeables: [],
         };
@@ -511,7 +533,6 @@ function sharedMemSyncFactory(provider: MemTransportProvider, registry: SharedPe
             mesh,
             discovery,
             listenAddresses: [addr],
-            announcedAddresses: [addr],
             discoveryNotes: ['mem-shared'],
             closeables: [],
         };

@@ -1,5 +1,5 @@
 import { testing } from '@hyper-hyper-space/hhs3_util';
-import { WsTransportProvider } from '../src/ws_transport_provider.js';
+import { WsTransportProvider, type WsClientCtor } from '../src/ws_transport_provider.js';
 import type { Transport } from '@hyper-hyper-space/hhs3_mesh';
 
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
@@ -229,6 +229,42 @@ async function testBinaryIntegrity() {
     provider.close();
 }
 
+async function testConnectTimeout() {
+    const hung: HungSocket[] = [];
+
+    class HungSocket {
+        binaryType = 'nodebuffer';
+        closed = false;
+        constructor(_url: string) {
+            hung.push(this);
+        }
+        on(_event: string, _cb: (...args: unknown[]) => void): void {}
+        close(): void {
+            this.closed = true;
+        }
+    }
+
+    const provider = new WsTransportProvider('ws', {
+        connectTimeoutMs: 50,
+        WebSocketCtor: HungSocket as unknown as WsClientCtor,
+    });
+    const started = Date.now();
+    let threw = false;
+    try {
+        await provider.connect('ws://127.0.0.1:9');
+    } catch (e) {
+        threw = true;
+        testing.assertTrue(
+            (e as Error).message.includes('timeout'),
+            `connect should mention timeout (got: ${(e as Error).message})`,
+        );
+    }
+    testing.assertTrue(threw, 'hung connect should reject');
+    testing.assertTrue(Date.now() - started < 1000, 'hung connect should fail well under a second');
+    testing.assertTrue(hung.length === 1 && hung[0]!.closed, 'timed-out socket should be closed');
+    provider.close();
+}
+
 // --- main ---
 
 const allSuites = [
@@ -242,6 +278,7 @@ const allSuites = [
             { name: '[WS_04] Provider close', invoke: testProviderClose },
             { name: '[WS_05] Binary integrity', invoke: testBinaryIntegrity },
             { name: '[WS_06] Scheme default and wss listen guard', invoke: testSchemeDefaultAndWss },
+            { name: '[WS_07] Connect timeout closes hung socket', invoke: testConnectTimeout },
         ],
     },
 ];

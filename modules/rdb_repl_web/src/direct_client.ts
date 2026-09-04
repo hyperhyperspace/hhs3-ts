@@ -10,12 +10,14 @@ import {
     ReplSession,
     promptForSession,
     runCommand,
+    stopAllProjections,
     stopAllSyncs,
     type PassphraseRequest,
 } from "@hyper-hyper-space/hhs3_rdb_repl";
 
+import { createBrowserMesh } from "@hyper-hyper-space/hhs3_mesh_browser";
+
 import type { ExecuteResult, ReplClient, ReplInteractions } from "./protocol.js";
-import { createBrowserSyncMeshFactory } from "./sync_mesh.js";
 
 export class DirectReplClient implements ReplClient {
     private workspace?: RdbWorkspace;
@@ -63,8 +65,7 @@ export class DirectReplClient implements ReplClient {
         this.workspace = undefined;
         this.session = undefined;
         if (session !== undefined) {
-            for (const projection of session.projections.values()) await projection.stop();
-            session.projections.clear();
+            await stopAllProjections(session);
             await stopAllSyncs(session);
         }
         if (workspace !== undefined) await workspace.close();
@@ -75,10 +76,16 @@ export class DirectReplClient implements ReplClient {
         const session = new ReplSession({
             workspace,
             keyVault: new MemoryKeyVault(workspace.replica.getHashSuite()),
-            // `\projection ...` backend for the browser: an ephemeral in-memory
+            // `\project ...` backend for the browser: an ephemeral in-memory
             // target (capture-provisioned so local edits round-trip to rdb).
-            projectionTargetFactory: async () => new MemoryTarget({ captureChanges: true }),
-            syncMeshFactory: createBrowserSyncMeshFactory(),
+            // The only legal destination is `to :memory:`.
+            projectionTargetFactory: async ({ path }) => {
+                if (path !== ':memory:') {
+                    throw new Error('this host only supports to :memory:');
+                }
+                return new MemoryTarget({ captureChanges: true });
+            },
+            syncMeshFactory: createBrowserMesh,
         });
         session.enableReplDefaults();
         this.workspace = workspace;

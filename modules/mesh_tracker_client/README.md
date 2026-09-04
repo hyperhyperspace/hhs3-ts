@@ -25,6 +25,8 @@ All messages are JSON-encoded over an `AuthenticatedChannel`. Each message type 
 
 The client does not keep a persistent connection. Each operation (announce, query, leave, heartbeat) opens a fresh connection, performs a Noise handshake, exchanges one request/response, and disconnects. This keeps server resources proportional to active requests, avoids reconnection logic, and is NAT-friendly.
 
+Operations on a given client are **serialized**: at most one connection is in flight at a time. `swarm.activate()` issues announce and discover together; overlapping handshakes can drop the first post-handshake frame, so the second op waits until the first finishes. The per-exchange timeout starts when that op begins connecting, not while it is queued.
+
 A periodic heartbeat re-announces all active topics in a single ANNOUNCE message to keep registrations alive before their TTL expires.
 
 ## Usage

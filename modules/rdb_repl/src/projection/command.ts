@@ -1,17 +1,16 @@
-// The `\projection` meta command: create and manage a replica-wide relational
-// projection of the current (or named) RDb. It is a thin driver over
-// rdb_projection's RdbProjection - the host injects the concrete backend via
+// The `\project` meta command: create and manage a replica-wide relational
+// projection of a named RDb. It is a thin driver over rdb_projection's
+// RdbProjection - the host injects the concrete backend via
 // session.projectionTargetFactory, so this stays browser-safe and engine-
 // agnostic. Subcommands:
 //
-//   \projection start [<database>] [label]   open + materialize + keep synced
-//   \projection sync  [<database>]           force one sync cycle now
-//   \projection status                       list active projections + results
-//   \projection stop  [<database>]           stop + drop a projection
-//   \projection register-key <keyHash> <publicKey> [<database>]
-//                                            intern a key into rdb_keys (returns id)
-//   \projection resolve-key <id|keyHash> [<database>]
-//                                            look up key_hash / public_key / id
+//   \project start <db> as <local-id> to <path>   open + materialize + keep synced
+//   \project update <id>                          force one cycle now
+//   \project status [<db>]                        list active projections
+//   \project stop <id>                            stop a projection session
+//   \project events <id>                          durable op-event backlog
+//   \project register-key <id> <keyHash> <publicKey>
+//   \project resolve-key <id> <token>
 
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { formatOpVoidDetail } from "@hyper-hyper-space/hhs3_rdb";
@@ -19,9 +18,19 @@ import type { RDb } from "@hyper-hyper-space/hhs3_rdb";
 import type { IngestResult, OpEvent } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import { RdbProjection } from "@hyper-hyper-space/hhs3_rdb_projection";
 
-import { formatDisplayString } from "../format/display.js";
+import { formatDisplayString, formatSessionRows } from "../format/display.js";
 import { formatRows } from "../format/rows.js";
 import type { ReplSession } from "../session.js";
+import {
+    parseProjectCommand,
+    type ProjectStartCommand,
+} from "./parse.js";
+import type { ProjectSessionEntry } from "./types.js";
+
+export type ProjectCommandResult = {
+    output?: string;
+    needsUnlock?: { label: string };
+};
 
 function ref(text = '') {
     const span = { start: 0, end: text.length, line: 1, column: 1 };
@@ -30,15 +39,10 @@ function ref(text = '') {
         : { kind: 'name' as const, text, parts: text.split('.'), span };
 }
 
-// Resolve the target database (named arg, else the session's current database).
-async function resolveDatabase(session: ReplSession, name?: string): Promise<{ id: B64Hash; db: RDb }> {
-    const which = name ?? session.currentDatabase;
-    if (which === undefined) throw new Error('No current database; use \\projection start <database> or \\use database <name>');
-    const isHash = typeof which === 'string' && which.length > 0 && name === undefined;
-    const root = await session.workspace.roots.resolveDatabase(
-        isHash ? ref('#' + which) : ref(which), { aliases: session.aliases });
+async function resolveDatabase(session: ReplSession, name: string): Promise<{ id: B64Hash; db: RDb; name: string }> {
+    const root = await session.workspace.roots.resolveDatabase(ref(name), { aliases: session.aliases });
     if (root.db === undefined) throw new Error('Database is not loaded');
-    return { id: root.id, db: root.db as RDb };
+    return { id: root.id, db: root.db as RDb, name };
 }
 
 function summarizeResults(results: Map<B64Hash, IngestResult>): string {
@@ -58,8 +62,6 @@ function formatRejectWarning(results: Map<B64Hash, IngestResult>): string | unde
     return `projection warning: ${rejected.length} rejected: ${reasons.join('; ')}`;
 }
 
-// The human reason behind an op-event: the structured void detail for a
-// concurrency flip, or the bundle() validation message for an ingestion failure.
 function formatEventReason(event: OpEvent): string {
     if (event.reason === undefined) return '';
     return event.reason.source === 'void'
@@ -67,9 +69,6 @@ function formatEventReason(event: OpEvent): string {
         : event.reason.failure.reason;
 }
 
-// One op-event as a single line: origin/direction, op kind, the affected row,
-// and the reason. Shared by the reactive push (routed through the error hook)
-// and the `\projection events` backlog listing.
 function formatOpEvent(session: ReplSession, event: OpEvent): string {
     const where = event.table === undefined ? ''
         : ` ${event.table}` + (event.rowId === undefined ? ''
@@ -78,143 +77,179 @@ function formatOpEvent(session: ReplSession, event: OpEvent): string {
     return `${event.origin}/${event.direction} ${event.kind}${where}${reason === '' ? '' : ` - ${reason}`}`;
 }
 
-export async function runProjectionCommand(session: ReplSession, args: string[]): Promise<string> {
-    const [sub, ...rest] = args;
+function isMemoryPath(path: string): boolean {
+    return path === ':memory:';
+}
 
-    switch (sub) {
-        case 'start': return await start(session, rest[0], rest[1]);
-        case 'sync': return await sync(session, rest[0]);
-        case 'stop': return await stop(session, rest[0]);
-        case 'events': return await events(session, rest[0]);
-        case 'register-key': return await registerKey(session, rest);
-        case 'resolve-key': return await resolveKey(session, rest);
-        case 'status':
-        case undefined: return status(session);
-        default: throw new Error(
-            'Usage: \\projection start|sync|status|stop|events|register-key|resolve-key [<database>] ...');
+function destinationsCollide(a: string, b: string): boolean {
+    if (isMemoryPath(a) || isMemoryPath(b)) return false;
+    return a === b;
+}
+
+function requireEntry(session: ReplSession, id: number): ProjectSessionEntry {
+    const entry = session.projections.get(id);
+    if (entry === undefined) throw new Error(`No projection session ${id}`);
+    return entry;
+}
+
+export async function runProjectCommand(session: ReplSession, remainder: string): Promise<ProjectCommandResult> {
+    const cmd = parseProjectCommand(remainder);
+    switch (cmd.kind) {
+        case 'start': return await start(session, cmd);
+        case 'status': return { output: await status(session, cmd.database) };
+        case 'stop': return { output: await stop(session, cmd.id) };
+        case 'update': return { output: await update(session, cmd.id) };
+        case 'events': return { output: await events(session, cmd.id) };
+        case 'register-key': return { output: await registerKey(session, cmd.id, cmd.keyHash, cmd.publicKey) };
+        case 'resolve-key': return { output: await resolveKey(session, cmd.id, cmd.token) };
     }
 }
 
-async function start(session: ReplSession, name?: string, label?: string): Promise<string> {
+export async function stopAllProjections(session: ReplSession): Promise<void> {
+    const ids = [...session.projections.keys()];
+    for (const id of ids) {
+        try {
+            await teardown(session, id);
+        } catch {
+            session.projections.delete(id);
+        }
+    }
+}
+
+async function start(session: ReplSession, cmd: ProjectStartCommand): Promise<ProjectCommandResult> {
     if (session.projectionTargetFactory === undefined) {
         throw new Error('No projection backend configured for this host');
     }
-    const { id, db } = await resolveDatabase(session, name);
-    if (session.projections.has(id)) {
-        throw new Error(`A projection is already running for database ${formatDisplayString(session, id, { role: 'hash' })}`);
+    if (session.keyVault === undefined) throw new Error('No keystore configured');
+
+    const { id, db, name } = await resolveDatabase(session, cmd.database);
+    for (const existing of session.projections.values()) {
+        if (existing.dbId === id) {
+            throw new Error(`Database is already projecting as session ${existing.id}; use \\project stop ${existing.id}`);
+        }
+        if (destinationsCollide(existing.path, cmd.path)) {
+            throw new Error(`Path '${cmd.path}' is already in use by session ${existing.id}; use \\project stop ${existing.id}`);
+        }
     }
 
-    const target = await session.projectionTargetFactory({ databaseId: id, label });
-    const writer = await session.currentAuthor();
-    // Reactive cycles run from timers / DAG listeners: thrown failures and ingest
-    // rejections would otherwise be swallowed. Route both through the host hook.
-    // These callbacks must never throw (they run off the command path).
-    const projection = await RdbProjection.open(db, session.workspace.replica, target, {
-        writer,
-        createUuid: () => session.createUuid(),
-        onError: (err) => {
-            const message = err instanceof Error ? err.message : String(err);
-            session.onProjectionError?.(`projection error: ${message}`);
-        },
-        onResult: (results) => {
-            const warning = formatRejectWarning(results);
-            if (warning !== undefined) session.onProjectionError?.(warning);
-        },
-        // Ingestion failures + p2p concurrency void/reinstate flips. Route each
-        // through the same display hook as errors/warnings so the CLI stderr /
-        // web transcript shows them; the durable backlog is listable via
-        // \projection events.
-        onOpEvents: (opEvents) => {
-            for (const event of opEvents) {
-                session.onProjectionError?.(`op-event: ${formatOpEvent(session, event)}`);
-            }
-        },
-    });
-    session.projections.set(id, projection);
+    const record = session.keyVault.resolveRecord(session.resolveKeyRef(cmd.localId));
+    const identity = session.resolveIdentity(record.label);
+    if (identity === undefined) {
+        return { needsUnlock: { label: record.label } };
+    }
 
-    const groups = projection.memberGroupIds();
-    const lines = [
-        `projection started for database ${formatDisplayString(session, id, { role: 'hash' })}`
-        + ` (${writer === undefined ? 'read-only' : 'bidirectional'}, ${groups.length} group(s))`,
-    ];
-    if (groups.length > 0) {
-        lines.push(formatRows(groups.map((g) => ({ group: formatDisplayString(session, g, { role: 'hash' }) }))));
+    const projectId = session.nextProjectId;
+    session.nextProjectId += 1;
+    try {
+        const target = await session.projectionTargetFactory({ databaseId: id, path: cmd.path });
+        // Reactive cycles run from timers / DAG listeners: thrown failures and ingest
+        // rejections would otherwise be swallowed. Route both through the host hook.
+        // These callbacks must never throw (they run off the command path).
+        const projection = await RdbProjection.open(db, session.workspace.replica, target, {
+            writer: identity,
+            createUuid: () => session.createUuid(),
+            onError: (err) => {
+                const message = err instanceof Error ? err.message : String(err);
+                session.onProjectionError?.(`projection error: ${message}`);
+            },
+            onResult: (results) => {
+                const warning = formatRejectWarning(results);
+                if (warning !== undefined) session.onProjectionError?.(warning);
+            },
+            onOpEvents: (opEvents) => {
+                for (const event of opEvents) {
+                    session.onProjectionError?.(`op-event: ${formatOpEvent(session, event)}`);
+                }
+            },
+        });
+        session.projections.set(projectId, {
+            id: projectId,
+            dbId: id,
+            dbName: name,
+            path: cmd.path,
+            identityLabel: record.label,
+            identityKeyId: identity.keyId,
+            projection,
+        });
+
+        const groups = projection.memberGroupIds();
+        const lines = [
+            `started projection ${projectId} for ${name} as ${record.label} to ${cmd.path}`,
+        ];
+        if (groups.length > 0) {
+            lines.push(formatRows(groups.map((g) => ({ group: formatDisplayString(session, g, { role: 'hash' }) }))));
+        }
+        const warning = formatRejectWarning(projection.lastResult());
+        if (warning !== undefined) {
+            session.onProjectionError?.(warning);
+            lines.push(warning);
+        }
+        return { output: lines.join('\n') };
+    } catch (err) {
+        const entry = session.projections.get(projectId);
+        if (entry !== undefined) {
+            await teardown(session, projectId);
+        }
+        throw err;
     }
-    // The initial materialization runs through sync(), which does not fire
-    // onResult; surface any rejections here (command output + hook, so the CLI
-    // stderr / web transcript match the reactive style).
-    const warning = formatRejectWarning(projection.lastResult());
-    if (warning !== undefined) {
-        session.onProjectionError?.(warning);
-        lines.push(warning);
-    }
-    return lines.join('\n');
 }
 
-async function sync(session: ReplSession, name?: string): Promise<string> {
-    const { id } = await resolveDatabase(session, name);
-    const projection = session.projections.get(id);
-    if (projection === undefined) throw new Error('No projection running for this database; use \\projection start');
-    const results = await projection.sync();
-    const line = `synced ${formatDisplayString(session, id, { role: 'hash' })}: ${summarizeResults(results)}`;
-    // Rejections are not command failures; append them to stdout rather than
-    // firing the hook, so the user does not get a duplicate stderr line.
+async function update(session: ReplSession, id: number): Promise<string> {
+    const entry = requireEntry(session, id);
+    const results = await entry.projection.sync();
+    const line = `updated projection ${id}: ${summarizeResults(results)}`;
     const warning = formatRejectWarning(results);
     return warning === undefined ? line : `${line}\n${warning}`;
 }
 
-async function stop(session: ReplSession, name?: string): Promise<string> {
-    const { id } = await resolveDatabase(session, name);
-    const projection = session.projections.get(id);
-    if (projection === undefined) throw new Error('No projection running for this database');
-    await projection.stop();
-    session.projections.delete(id);
-    return `projection stopped for database ${formatDisplayString(session, id, { role: 'hash' })}`;
+async function stop(session: ReplSession, id: number): Promise<string> {
+    requireEntry(session, id);
+    await teardown(session, id);
+    return `stopped projection ${id}`;
 }
 
-// List the durable op-event backlog (ingestion failures + concurrency flips),
-// oldest first, for the current (or named) database's projection.
-async function events(session: ReplSession, name?: string): Promise<string> {
-    const projection = await activeProjection(session, name);
-    const backlog = await projection.opEvents();
+async function events(session: ReplSession, id: number): Promise<string> {
+    const entry = requireEntry(session, id);
+    const backlog = await entry.projection.opEvents();
     if (backlog.length === 0) return '(no op-events)';
     return backlog.map((s) => `#${s.id} ${formatOpEvent(session, s.event)}`).join('\n');
 }
 
-function status(session: ReplSession): string {
-    if (session.projections.size === 0) return '(no active projections)';
-    const rows = [...session.projections.entries()].map(([id, projection]) => ({
-        database: formatDisplayString(session, id, { role: 'hash' }),
-        groups: projection.memberGroupIds().length,
-        last: summarizeResults(projection.lastResult()),
-        error: projection.lastError() ?? '',
+async function status(session: ReplSession, database?: string): Promise<string> {
+    let rows = [...session.projections.values()].map((entry) => ({
+        id: entry.id,
+        db: entry.dbName,
+        as: entry.identityLabel,
+        to: entry.path,
+        groups: entry.projection.memberGroupIds().length,
+        last: summarizeResults(entry.projection.lastResult()),
+        error: entry.projection.lastError() ?? '',
     }));
-    return formatRows(rows);
-}
-
-async function activeProjection(session: ReplSession, name?: string): Promise<RdbProjection> {
-    const { id } = await resolveDatabase(session, name);
-    const projection = session.projections.get(id);
-    if (projection === undefined) throw new Error('No projection running for this database; use \\projection start');
-    return projection;
-}
-
-async function registerKey(session: ReplSession, args: string[]): Promise<string> {
-    const [keyHash, publicKey, dbName] = args;
-    if (keyHash === undefined || publicKey === undefined) {
-        throw new Error('Usage: \\projection register-key <keyHash> <publicKey> [<database>]');
+    if (database !== undefined) {
+        const { id } = await resolveDatabase(session, database);
+        rows = rows.filter((row) => {
+            const entry = session.projections.get(row.id as number);
+            return entry?.dbId === id;
+        });
     }
-    const projection = await activeProjection(session, dbName);
-    const id = await projection.registerKey(keyHash, publicKey);
-    return `registered key id=${id} key_hash=${formatDisplayString(session, keyHash, { role: 'hash', identity: true })}`;
+    if (rows.length === 0) return '(no active projections)';
+    return formatSessionRows(session, rows, ['id', 'db', 'as', 'to', 'groups', 'last', 'error']);
 }
 
-async function resolveKey(session: ReplSession, args: string[]): Promise<string> {
-    const [token, dbName] = args;
-    if (token === undefined) {
-        throw new Error('Usage: \\projection resolve-key <id|keyHash> [<database>]');
-    }
-    const projection = await activeProjection(session, dbName);
+async function teardown(session: ReplSession, id: number): Promise<void> {
+    const entry = session.projections.get(id);
+    if (entry === undefined) return;
+    session.projections.delete(id);
+    await entry.projection.stop();
+}
+
+async function registerKey(session: ReplSession, id: number, keyHash: string, publicKey: string): Promise<string> {
+    const allocated = await requireEntry(session, id).projection.registerKey(keyHash, publicKey);
+    return `registered key id=${allocated} key_hash=${formatDisplayString(session, keyHash, { role: 'hash', identity: true })}`;
+}
+
+async function resolveKey(session: ReplSession, id: number, token: string): Promise<string> {
+    const projection = requireEntry(session, id).projection;
     const asId = Number(token);
     if (Number.isSafeInteger(asId) && String(asId) === token) {
         const keyHash = await projection.keyHashForId(asId);
@@ -226,11 +261,11 @@ async function resolveKey(session: ReplSession, args: string[]): Promise<string>
             public_key: publicKey ?? '(null)',
         }]);
     }
-    const id = await projection.idForKeyHash(token);
-    if (id === undefined) return `(no key with hash ${formatDisplayString(session, token, { role: 'hash' })})`;
-    const publicKey = await projection.publicKeyForId(id);
+    const keyId = await projection.idForKeyHash(token);
+    if (keyId === undefined) return `(no key with hash ${formatDisplayString(session, token, { role: 'hash' })})`;
+    const publicKey = await projection.publicKeyForId(keyId);
     return formatRows([{
-        id,
+        id: keyId,
         key_hash: formatDisplayString(session, token, { role: 'hash', identity: true }),
         public_key: publicKey ?? '(null)',
     }]);

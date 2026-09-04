@@ -18,7 +18,6 @@ export type BuiltSyncMesh = {
     mesh: Mesh;
     discovery: PeerDiscovery;
     listenAddresses: string[];
-    announcedAddresses: string[];
     discoveryNotes: string[];
     closeables: SyncCloseable[];
 };
@@ -36,7 +35,7 @@ export type SyncSessionEntry = {
     identityKeyId: KeyId;
     scope: SyncScope;
     sources: AllowSource[];
-    announcedAddresses: string[];
+    listenAddresses: string[];
     discoveryNotes: string[];
     closeables: SyncCloseable[];
 };

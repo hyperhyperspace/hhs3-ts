@@ -16,7 +16,11 @@ A `Mesh` instance represents a single **network environment** (e.g. local LAN, p
 
 The `Mesh` defines the endpoints and identity for listening. Each `Swarm` independently controls its own announce/leave lifecycle based on mode transitions, and its own authorization policy via an optional `PeerAuthorizer`.
 
-Multiple `Mesh` instances can coexist (e.g. one for LAN discovery, another for internet overlay) and operate independently.
+Multiple `Mesh` instances can coexist (e.g. one for LAN discovery, another for internet overlay) and operate independently. The `MeshScope` type (`'localhost' | 'internet'`) names the two built-in environments that factories map to concrete listen addresses and tracker defaults.
+
+**Advertise == listen.** Within one environment a Mesh does not distinguish "bind" from "advertise": `localPeer.addresses` is exactly `listenAddresses`, so the addresses peers dial are the ones the Mesh actually listens on. Do not pass a bind-all placeholder such as `0.0.0.0` as a listen address — it is not dialable. A Mesh with **no** listen addresses is a first-class dial-out-only state: it initiates connections but announces nothing (swarms skip `announce` when the local address set is empty).
+
+**No self-dial.** A swarm never dials its own `keyId` at an address in its own listen set (traced as `why=self`); the same key at a *different* address is still a valid peer (multi-device). `TrackerClient` additionally strips the caller's own advertised addresses from discovery results as defense-in-depth.
 
 ### Layers
 
@@ -198,7 +202,20 @@ Mode transitions drive the announce/leave lifecycle. The `Mesh` provides a `loca
 - `sleep()` — calls `discovery.leave(topic, localPeer.keyId)` and drops all peers
 - `destroy()` — calls `discovery.leave(topic, localPeer.keyId)` and tears down
 
-The `targetPeers` config caps total swarm peer count (not just outbound connections). Both `adoptPeer` and `wouldAccept` enforce this cap.
+#### Peer water marks: `targetPeers` and `maxPeers`
+
+The swarm keeps two limits (defaults: `targetPeers = 6`, `maxPeers = targetPeers + 2`; `maxPeers` must be greater than `targetPeers`):
+
+- **`targetPeers`** — the outbound **seek goal** (low water). While active and below this, the swarm runs discovery and dials candidates; it stops *initiating* new dials once `size >= targetPeers`.
+- **`maxPeers`** — the **hard cap** (high water). No peer is adopted once `size >= maxPeers`. Both `adoptPeer` and `wouldAccept` enforce this.
+
+The band `(targetPeers, maxPeers]` is therefore an **inbound reserve**: outbound seeking stops at `targetPeers`, leaving those slots free to accept inbound / pool-reuse connections. Peers are not tagged inbound vs outbound — the band is inferred from `size` alone.
+
+Enforcement detail: `ConnectionPool.add` fires connect callbacks synchronously, so an outbound dial actually joins via the pool `onConnect` path (which only knows `maxPeers`). The seek goal is therefore enforced at **dial initiation** — a new dial starts only while `size + inFlightDials < targetPeers` — not in `adoptPeer`.
+
+**Parallel dials.** Candidates are dialed concurrently (up to the seek-goal budget), so a slow or dead address (e.g. a stale `bc://` entry hitting its connect timeout) does not block a live one behind it.
+
+**Low-water refill.** While active, a peer leaving that drops `size` below `targetPeers` schedules a debounced discovery pass, so the swarm re-seeks toward the goal instead of only searching once at `activate()`.
 
 ```typescript
 interface Swarm {
@@ -240,7 +257,8 @@ class Mesh {
     constructor(config: MeshConfig);
 
     createSwarm(topic: TopicId, opts?: {
-        targetPeers?: number;
+        targetPeers?: number;   // outbound seek goal (low water), default 6
+        maxPeers?: number;      // hard cap (high water), default targetPeers + 2
         mode?: SwarmMode;
         authorizer?: PeerAuthorizer;
     }): Swarm;

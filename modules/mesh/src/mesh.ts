@@ -20,6 +20,7 @@ import {
     encodeControlTopicInterest, encodeControlTopicAccept, encodeControlTopicReject,
     awaitMessage,
 } from './mux.js';
+import { TRACE_MESH, trace } from './trace.js';
 
 const DEFAULT_NEGOTIATION_TIMEOUT_MS = 10_000;
 
@@ -60,7 +61,7 @@ export class Mesh {
 
     createSwarm(
         topic: TopicId,
-        opts?: { targetPeers?: number; mode?: SwarmMode; authorizer?: PeerAuthorizer },
+        opts?: { targetPeers?: number; maxPeers?: number; mode?: SwarmMode; authorizer?: PeerAuthorizer },
     ): Swarm {
         if (this.closed) throw new Error('mesh is closed');
 
@@ -76,6 +77,7 @@ export class Mesh {
                     // EncryptedChannel is ready to receive.
                     await new Promise(resolve => setTimeout(resolve, 0));
                     channel.send(encodeControlTopicInterest(topic));
+                    if (TRACE_MESH) trace('mesh.topic interest', { topic, role: 'initiator' });
                     const response = await awaitMessage(channel, timeoutMs);
                     const decoded = decodeMessage(response);
                     if (decoded.type !== MSG_TYPE_CONTROL) {
@@ -84,9 +86,11 @@ export class Mesh {
                     }
                     const ctrl = decodeControlPayload(decoded.payload);
                     if (ctrl.ctrl !== CTRL_TOPIC_ACCEPT || ctrl.topic !== topic) {
+                        if (TRACE_MESH) trace('mesh.topic reject', { topic, via: 'initiator' });
                         channel.close();
                         throw new Error('topic rejected by remote');
                     }
+                    if (TRACE_MESH) trace('mesh.topic accept', { topic, via: 'initiator' });
                 }
                 return channel;
             },
@@ -96,6 +100,7 @@ export class Mesh {
             {
                 topic,
                 targetPeers: opts?.targetPeers,
+                maxPeers: opts?.maxPeers,
                 mode: opts?.mode,
                 authorizer: opts?.authorizer,
             },
@@ -154,6 +159,8 @@ export class Mesh {
             if (provider === undefined) continue;
             provider.listen(addr, (transport) => {
                 this.handleIncoming(transport, addr).catch(() => {});
+            }).then(() => {
+                if (TRACE_MESH) trace('mesh.listen', { addr });
             }).catch(() => {});
         }
     }
@@ -178,11 +185,17 @@ export class Mesh {
 
         const swarm = await this.evaluateTopicInterest(ctrl.topic, channel.remoteKeyId);
         if (swarm === undefined) {
+            if (TRACE_MESH) {
+                trace('mesh.topic reject', { topic: ctrl.topic, peer: channel.remoteKeyId, via: 'inbound' });
+            }
             channel.send(encodeControlTopicReject(ctrl.topic));
             channel.close();
             return;
         }
 
+        if (TRACE_MESH) {
+            trace('mesh.topic accept', { topic: ctrl.topic, peer: channel.remoteKeyId, via: 'inbound' });
+        }
         channel.send(encodeControlTopicAccept(ctrl.topic));
         const remoteEndpoint = transport.remoteAddress ?? localListenAddress;
         this.pool.add(channel, remoteEndpoint);
@@ -205,9 +218,11 @@ export class Mesh {
 
         const swarm = await this.evaluateTopicInterest(ctrl.topic, peerId);
         if (swarm !== undefined) {
+            if (TRACE_MESH) trace('mesh.topic accept', { topic: ctrl.topic, peer: peerId, via: 'reuse' });
             conn.channel.send(encodeControlTopicAccept(ctrl.topic));
             swarm.adopt(peerId, endpoint);
         } else {
+            if (TRACE_MESH) trace('mesh.topic reject', { topic: ctrl.topic, peer: peerId, via: 'reuse' });
             conn.channel.send(encodeControlTopicReject(ctrl.topic));
         }
     }

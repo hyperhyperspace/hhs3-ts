@@ -44,7 +44,7 @@ A delta reports how the database differs between two versions, on three channels
 
 A row-channel liveness transition pinpoints operations discarded by reconciliation: an insert that never went live, or a row revoked when a concurrent revoke or deploy came into view, appears as a row going from live to dead. The op channel names the underlying entry-level void flip and explains *why* at the voided horizon; the row channel does not.
 
-Deltas project the database into ordinary SQL. The delta from the version an application last saw to the latest one projects current state into a plain local relational database, queried with normal SQL. [rdb_adapter](../rdb_adapter) projects deltas into a conventional store to keep it in sync.
+Deltas project the database into ordinary SQL. The delta from the version an application last saw to the latest one projects current state into a plain local relational database, queried with normal SQL. [rdb_adapter](../rdb_adapter) projects deltas into a conventional store; [rdb_projection](../rdb_projection) is the reactive supervisor over a whole `RDb`.
 
 ## C-SQL
 

@@ -198,6 +198,42 @@ async function testProviderClose() {
     });
 }
 
+async function testConnectTimeout() {
+    const hung: HungWebSocket[] = [];
+
+    class HungWebSocket {
+        binaryType = 'arraybuffer';
+        closed = false;
+        constructor(_url: string) {
+            hung.push(this);
+        }
+        addEventListener(_type: string, _listener: EventListenerOrEventListenerObject): void {}
+        close(): void {
+            this.closed = true;
+        }
+    }
+
+    const clientProvider = new BrowserWsTransportProvider({
+        WebSocketCtor: HungWebSocket as unknown as WebSocketCtor,
+        connectTimeoutMs: 50,
+    });
+    const started = Date.now();
+    let threw = false;
+    try {
+        await clientProvider.connect('ws://127.0.0.1:9');
+    } catch (e) {
+        threw = true;
+        testing.assertTrue(
+            (e as Error).message.includes('timeout'),
+            `connect should mention timeout (got: ${(e as Error).message})`,
+        );
+    }
+    testing.assertTrue(threw, 'hung connect should reject');
+    testing.assertTrue(Date.now() - started < 1000, 'hung connect should fail well under a second');
+    testing.assertTrue(hung.length === 1 && hung[0]!.closed, 'timed-out socket should be closed');
+    clientProvider.close();
+}
+
 export const browserWsTests = {
     title: '[BROWSER_WS] Browser WebSocket transport',
     tests: [
@@ -209,5 +245,6 @@ export const browserWsTests = {
         { name: '[BWS_05] Binary integrity', invoke: testBinaryIntegrity },
         { name: '[BWS_06] Connect failure', invoke: testConnectFailure },
         { name: '[BWS_07] Provider close', invoke: testProviderClose },
+        { name: '[BWS_08] Connect timeout closes hung socket', invoke: testConnectTimeout },
     ],
 };

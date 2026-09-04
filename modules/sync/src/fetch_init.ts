@@ -6,6 +6,7 @@ import { extractCreatePayloadType } from '@hyper-hyper-space/hhs3_mvt';
 
 import { encode, decode } from './codec.js';
 import type { InitRequest, SyncMsg } from './protocol.js';
+import { TRACE_SYNC, trace } from './trace.js';
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const RETRY_INTERVAL_MS = 200;
@@ -20,11 +21,15 @@ export function fetchInit(
     return new Promise<Payload>((resolve, reject) => {
         let settled = false;
         const retryTimers: ReturnType<typeof setInterval>[] = [];
+        const started = Date.now();
 
         const timer = setTimeout(() => {
             if (settled) return;
             settled = true;
             cleanup();
+            if (TRACE_SYNC) {
+                trace('sync.init timeout', { objectId, ms: Date.now() - started });
+            }
             reject(new Error(`fetchInit timed out after ${timeoutMs}ms for object ${objectId}`));
         }, timeoutMs);
 
@@ -44,6 +49,9 @@ export function fetchInit(
             if (settled) return;
             settled = true;
             cleanup();
+            if (TRACE_SYNC) {
+                trace('sync.init fail', { objectId, ms: Date.now() - started, err: reason });
+            }
             reject(new Error(reason));
         }
 
@@ -51,9 +59,15 @@ export function fetchInit(
             if (settled) return;
 
             const request: InitRequest = { type: 'init-request', objectId };
+            const peer = `${sp.keyId}@${sp.endpoint}`;
+            let attempt = 0;
 
             function sendRequest() {
                 if (settled || !sp.channel.open) return;
+                attempt++;
+                if (TRACE_SYNC) {
+                    trace('sync.init send', { objectId, peer, attempt });
+                }
                 try { sp.channel.send(encode(request)); } catch { /* channel may close */ }
             }
 
@@ -86,6 +100,9 @@ export function fetchInit(
                     return;
                 }
 
+                if (TRACE_SYNC) {
+                    trace('sync.init recv', { objectId, peer, ms: Date.now() - started });
+                }
                 finish(msg.createPayload);
             });
         }

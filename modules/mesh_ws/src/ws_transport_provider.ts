@@ -6,15 +6,28 @@ import WebSocket, { WebSocketServer } from 'ws';
 import type { Transport, TransportProvider, NetworkAddress } from '@hyper-hyper-space/hhs3_mesh';
 import { WsTransport } from './ws_transport.js';
 
+export const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
+
+export type WsClientCtor = new (address: string) => WebSocket;
+
+export interface WsTransportProviderOptions {
+    connectTimeoutMs?: number;
+    WebSocketCtor?: WsClientCtor;
+}
+
 export class WsTransportProvider implements TransportProvider {
 
     readonly scheme: string;
+    private readonly connectTimeoutMs: number;
+    private readonly WS: WsClientCtor;
 
     private server?: WebSocketServer;
     private sockets = new Set<WebSocket>();
 
-    constructor(scheme: string = 'ws') {
+    constructor(scheme: string = 'ws', opts?: WsTransportProviderOptions) {
         this.scheme = scheme;
+        this.connectTimeoutMs = opts?.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
+        this.WS = opts?.WebSocketCtor ?? WebSocket;
     }
 
     async listen(
@@ -45,17 +58,30 @@ export class WsTransportProvider implements TransportProvider {
 
     async connect(remote: NetworkAddress): Promise<Transport> {
         return new Promise<Transport>((resolve, reject) => {
-            const ws = new WebSocket(remote);
+            let settled = false;
+            const ws = new this.WS(remote);
             ws.binaryType = 'nodebuffer';
-
             this.sockets.add(ws);
-            ws.on('close', () => this.sockets.delete(ws));
 
+            const timer = setTimeout(() => {
+                if (settled) return;
+                settled = true;
+                this.sockets.delete(ws);
+                try { ws.close(); } catch { /* ignore */ }
+                reject(new Error(`ws connect timeout: ${remote}`));
+            }, this.connectTimeoutMs);
+
+            ws.on('close', () => this.sockets.delete(ws));
             ws.on('open', () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
                 resolve(new WsTransport(ws));
             });
-
             ws.on('error', (err) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
                 this.sockets.delete(ws);
                 reject(err);
             });

@@ -3,7 +3,7 @@ import { random } from '@hyper-hyper-space/hhs3_crypto';
 import type { Dag, Header } from '@hyper-hyper-space/hhs3_dag';
 import { json } from '@hyper-hyper-space/hhs3_json';
 import type { TopicChannel } from '@hyper-hyper-space/hhs3_mesh';
-import type { RObject, Version, RContext } from '@hyper-hyper-space/hhs3_mvt';
+import { formatValidationFailure, type RObject, type Version, type RContext } from '@hyper-hyper-space/hhs3_mvt';
 
 import { stringToUint8Array } from '@hyper-hyper-space/hhs3_crypto';
 import type {
@@ -17,29 +17,12 @@ import type {
     SyncMsg,
 } from './protocol.js';
 import type { SendResult, PeerIssue } from './session.js';
+import { TRACE_SYNC, trace } from './trace.js';
 
 const MAX_HEADERS_PER_REQUEST = 1024;
 const MAX_PAYLOAD_REQUESTS_PER_PEER = 2;
 const PAYLOAD_CHUNK_SIZE = 64;
 const REQUEST_TIMEOUT_MS = 30_000;
-
-/** Set `HHS3_SYNC_FRONTIER_LOG=1` to log new-frontier gossip (dag id + hash prefixes). */
-function frontierLogEnabled(): boolean {
-    try {
-        const proc = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process;
-        return proc?.env?.['HHS3_SYNC_FRONTIER_LOG'] === '1';
-    } catch {
-        return false;
-    }
-}
-
-function shortHash(h: B64Hash): string {
-    return h.length <= 16 ? h : `${h.slice(0, 12)}…`;
-}
-
-function frontierShort(frontier: Iterable<B64Hash>): string[] {
-    return [...frontier].map(shortHash);
-}
 
 type PeerHandle = {
     key: string;
@@ -58,6 +41,9 @@ type HeaderRequestState = {
     autoPayload: boolean;
     expectedPayloadCount: number | undefined;
     timeout: ReturnType<typeof setTimeout>;
+    // The peer's frontier Set (by reference) at the time this request was sent.
+    // Used to stamp negative-cache misses; see headerMisses.
+    peerFrontierAtSend: Set<B64Hash>;
 };
 
 type PayloadRequestState = {
@@ -71,7 +57,7 @@ type PayloadRequestState = {
 };
 
 export interface DagSynchronizer {
-    handleMessage(msg: SyncMsg, channel: TopicChannel): void;
+    handleMessage(msg: SyncMsg, channel: TopicChannel): void | Promise<void>;
     addPeer(peer: PeerHandle): void;
     removePeer(peerKey: string): void;
     broadcastFrontier(): Promise<void>;
@@ -92,8 +78,24 @@ export function createDagSynchronizer(
 
     // --- accumulative state ---
 
+    // The value Set for each peer is always REPLACED wholesale (never mutated in
+    // place); see handleNewFrontier. The headerMisses negative cache relies on
+    // this: reference equality against the current value is a "frontier unchanged"
+    // test. Do not `.add`/`.delete` on a stored Set.
     const peerFrontiers         = new Map<string, Set<B64Hash>>();
     const peerDiscoveredFrontier = new Map<string, Set<B64Hash>>();
+
+    // Negative cache: hash -> (peerKey -> the peer's frontier Set ref when it
+    // answered "complete" without providing the hash). A miss is honored only
+    // while the recorded ref === the peer's current peerFrontiers value; once the
+    // peer gossips a new frontier (a fresh Set), the ref differs and the miss is
+    // ignored, so the peer is retried. This makes the cache independent of the
+    // order in which an empty reply and a new-frontier are processed. Depends on
+    // peerFrontiers Sets being replaced wholesale, never mutated in place.
+    // Entries are evicted per-hash the moment the header is learned (see
+    // forgetHeaderMiss), and per-peer on disconnect (see removePeer), so the
+    // cache stays bounded to hashes we've asked about but do not yet have.
+    const headerMisses = new Map<B64Hash, Map<string, Set<B64Hash>>>();
 
     const discoveredHeaders  = new Map<B64Hash, Header>();
     const readyToApply       = new Map<B64Hash, Header>();
@@ -115,6 +117,21 @@ export function createDagSynchronizer(
     }
 
     let autoPayloadRequestId: string | undefined;
+
+    function traceDrop(
+        kind: 'header-meta' | 'header-batch' | 'payload-meta' | 'payload-msg',
+        requestId: string,
+        extra?: Record<string, unknown>,
+    ) {
+        if (!TRACE_SYNC) return;
+        trace('sync.drop', {
+            dag: dagId,
+            kind,
+            requestId,
+            why: pendingHeaderRequests.has(requestId) ? 'pending-headers' : 'unknown',
+            ...extra,
+        });
+    }
 
     let destroyed = false;
 
@@ -146,8 +163,7 @@ export function createDagSynchronizer(
 
     function ensureNewObjectListener() {
         if (newObjectCb !== undefined || ctx === undefined || ctx.subscribeNewObject === undefined) return;
-        const subscribe = ctx.subscribeNewObject;
-        newObjectCb = (obj: RObject) => {
+        const cb = (obj: RObject) => {
             if (destroyed) return;
             const id = obj.getId();
             if (!waitingMissing.has(id)) return;
@@ -155,7 +171,10 @@ export function createDagSynchronizer(
             void watchRef(obj).then(() => attemptWork());
             if (waitingMissing.size === 0) detachNewObjectListener();
         };
-        subscribe(newObjectCb);
+        // Call as a method so `this` binds (Replica.subscribeNewObject reads
+        // this.newObjectCallbacks); only record the handle once subscribe succeeds.
+        ctx.subscribeNewObject(cb);
+        newObjectCb = cb;
     }
 
     function detachNewObjectListener() {
@@ -189,13 +208,12 @@ export function createDagSynchronizer(
             dagId,
             frontier: [...frontier],
         };
-        if (frontierLogEnabled()) {
+        if (TRACE_SYNC) {
             const peers = getPeers();
-            console.debug('[hhs3:sync:frontier] broadcast', {
-                dagId: shortHash(dagId),
-                frontier: frontierShort(frontier),
-                peerCount: peers.length,
-                peerKeys: peers.map(p => p.key),
+            trace('sync.frontier broadcast', {
+                dag: dagId,
+                frontier: [...frontier],
+                peers: peers.length,
             });
         }
         const now = Date.now();
@@ -214,11 +232,11 @@ export function createDagSynchronizer(
             dagId,
             frontier: [...frontier],
         };
-        if (frontierLogEnabled()) {
-            console.debug('[hhs3:sync:frontier] push-back send', {
-                dagId: shortHash(dagId),
-                toPeer: peer.key,
-                frontier: frontierShort(frontier),
+        if (TRACE_SYNC) {
+            trace('sync.frontier send', {
+                dag: dagId,
+                peer: peer.key,
+                frontier: [...frontier],
             });
         }
         sendTo(peer, msg);
@@ -226,11 +244,11 @@ export function createDagSynchronizer(
     }
 
     async function handleNewFrontier(msg: NewFrontierMsg, peerKey: string) {
-        if (frontierLogEnabled()) {
-            console.debug('[hhs3:sync:frontier] recv', {
-                dagId: shortHash(msg.dagId),
-                fromPeer: peerKey,
-                remoteFrontier: frontierShort(msg.frontier),
+        if (TRACE_SYNC) {
+            trace('sync.frontier recv', {
+                dag: msg.dagId,
+                peer: peerKey,
+                frontier: [...msg.frontier],
             });
         }
 
@@ -251,11 +269,8 @@ export function createDagSynchronizer(
         const remoteFrontier = new Set(msg.frontier);
 
         if (frontiersEqual(localFrontier, remoteFrontier)) {
-            if (frontierLogEnabled()) {
-                console.debug('[hhs3:sync:frontier] push-back skip (identical)', {
-                    dagId: shortHash(dagId),
-                    fromPeer: peerKey,
-                });
+            if (TRACE_SYNC) {
+                trace('sync.frontier skip', { dag: dagId, peer: peerKey, why: 'identical' });
             }
             return;
         }
@@ -264,23 +279,20 @@ export function createDagSynchronizer(
         if (prev !== undefined
             && frontiersEqual(prev.frontier, localFrontier)
             && Date.now() - prev.timestamp < PUSHBACK_INTERVAL_MS) {
-            if (frontierLogEnabled()) {
-                console.debug('[hhs3:sync:frontier] push-back skip (rate-limited)', {
-                    dagId: shortHash(dagId),
-                    fromPeer: peerKey,
-                });
+            if (TRACE_SYNC) {
+                trace('sync.frontier skip', { dag: dagId, peer: peerKey, why: 'rate-limited' });
             }
             return;
         }
 
         const peer = getPeers().find(p => p.key === peerKey);
         if (peer !== undefined) {
-            if (frontierLogEnabled()) {
-                console.debug('[hhs3:sync:frontier] push-back trigger', {
-                    dagId: shortHash(dagId),
-                    toPeer: peerKey,
-                    localFrontier: frontierShort(localFrontier),
-                    remoteFrontier: frontierShort(remoteFrontier),
+            if (TRACE_SYNC) {
+                trace('sync.frontier push-back', {
+                    dag: dagId,
+                    peer: peerKey,
+                    local: [...localFrontier],
+                    remote: [...remoteFrontier],
                 });
             }
             sendFrontierTo(peer);
@@ -353,22 +365,64 @@ export function createDagSynchronizer(
                 }
             }
         }
+
+        if (TRACE_SYNC) {
+            trace('sync.work', {
+                dag: dagId,
+                pendingHeaders: pendingHeaderRequests.size,
+                pendingPayloads: pendingPayloadRequests.size,
+                ready: readyToApply.size,
+                discovered: discoveredHeaders.size,
+            });
+        }
     }
 
     // --- header dispatch ---
 
+    // A (hash, peer) pair is a cached miss only while the peer's frontier is
+    // unchanged since it answered empty. Reference equality works because
+    // peerFrontiers Sets are replaced wholesale on every gossip (see declaration).
+    function isCachedMiss(hash: B64Hash, peerKey: string): boolean {
+        const recorded = headerMisses.get(hash)?.get(peerKey);
+        return recorded !== undefined && recorded === peerFrontiers.get(peerKey);
+    }
+
+    function recordHeaderMiss(hash: B64Hash, peerKey: string, frontier: Set<B64Hash>) {
+        let byPeer = headerMisses.get(hash);
+        if (byPeer === undefined) {
+            byPeer = new Map();
+            headerMisses.set(hash, byPeer);
+        }
+        byPeer.set(peerKey, frontier);
+    }
+
+    // Once a header is learned it is never requested again, so its miss row is
+    // dead weight; drop it to bound the negative cache to not-yet-known hashes.
+    function forgetHeaderMiss(hash: B64Hash) {
+        headerMisses.delete(hash);
+    }
+
     async function dispatchHeaderRequests() {
         const localFrontier = await dag.getFrontier();
 
-        // Collect unresolved prevs: hashes referenced by discoveredHeaders but not in
-        // discoveredHeaders, readyToApply, appliedEntries, or local DAG
+        // Collect unresolved prevs of every header we already know. Snapshot
+        // both maps: a live walk of discoveredHeaders skips a later key if a
+        // concurrent payload moves it to readyToApply during loadEntry, and
+        // that header's prevs would never be requested.
         const unresolvedPrevs = new Set<B64Hash>();
-        for (const [_hash, header] of discoveredHeaders) {
+        const knownHeaders = new Map<B64Hash, Header>([
+            ...readyToApply,
+            ...discoveredHeaders,
+        ]);
+        for (const [_hash, header] of knownHeaders) {
             for (const prev of json.fromSet(header.prevEntryHashes)) {
                 if (!discoveredHeaders.has(prev) && !readyToApply.has(prev)
                     && !appliedEntries.has(prev) && !requestedPayloads.has(prev)) {
                     const local = await dag.loadEntry(prev);
-                    if (local === undefined) {
+                    if (local === undefined
+                        && !discoveredHeaders.has(prev) && !readyToApply.has(prev)
+                        && !requestedPayloads.has(prev)
+                        && !appliedEntries.has(prev)) {
                         unresolvedPrevs.add(prev);
                     }
                 }
@@ -405,7 +459,12 @@ export function createDagSynchronizer(
 
         for (const peer of peersWithSlots) {
             const peerFrontier = peerFrontiers.get(peer.key);
-            if (peerFrontier === undefined) continue;
+            if (peerFrontier === undefined) {
+                if (TRACE_SYNC) {
+                    trace('sync.header-req skip', { dag: dagId, peer: peer.key });
+                }
+                continue;
+            }
 
             // Already has a header request in flight to this peer? Skip.
             let hasActiveRequest = false;
@@ -417,18 +476,20 @@ export function createDagSynchronizer(
             }
             if (hasActiveRequest) continue;
 
-            // Collect hashes from this peer's frontier that we need
+            // Ancestors (unresolved prevs) are not in any peer's frontier, so we
+            // broadcast them to any peer with a slot. Skip pairs the peer already
+            // answered empty for (negative cache), unless it has since re-gossiped.
             const startHashes: B64Hash[] = [];
-            for (const h of needed) {
-                if (!activelyFetching.has(h)) {
+            for (const h of unresolvedPrevs) {
+                if (!activelyFetching.has(h) && !isCachedMiss(h, peer.key)) {
                     startHashes.push(h);
                 }
             }
 
-            // Also add unknown frontier hashes that this peer specifically announced
+            // Unknown frontier hashes go ONLY to the peer that advertised them.
             for (const h of peerFrontier) {
                 if (unknownFrontierHashes.has(h) && !activelyFetching.has(h)
-                    && !startHashes.includes(h)) {
+                    && !isCachedMiss(h, peer.key) && !startHashes.includes(h)) {
                     startHashes.push(h);
                 }
             }
@@ -464,6 +525,7 @@ export function createDagSynchronizer(
                 autoPayload: useAutoPayload,
                 expectedPayloadCount: undefined,
                 timeout,
+                peerFrontierAtSend: peerFrontier,
             });
 
             if (useAutoPayload) {
@@ -484,6 +546,13 @@ export function createDagSynchronizer(
                 if (result === 'closed') {
                     removePeer(peer.key);
                 }
+            } else if (TRACE_SYNC) {
+                trace('sync.header-req', {
+                    dag: dagId,
+                    peer: peer.key,
+                    n: startHashes.length,
+                    autoPayload: useAutoPayload,
+                });
             }
         }
     }
@@ -492,7 +561,10 @@ export function createDagSynchronizer(
 
     function handleHeaderResponseMeta(msg: HeaderResponseMeta) {
         const state = pendingHeaderRequests.get(msg.requestId);
-        if (state === undefined) return;
+        if (state === undefined) {
+            traceDrop('header-meta', msg.requestId);
+            return;
+        }
 
         if (msg.headerCount > MAX_HEADERS_PER_REQUEST) {
             failHeaderRequest(msg.requestId, 'headerCount exceeds maxHeaders');
@@ -508,16 +580,30 @@ export function createDagSynchronizer(
         state.complete = msg.complete;
         state.expectedPayloadCount = msg.payloadCount > 0 ? msg.payloadCount : undefined;
 
+        if (TRACE_SYNC) {
+            trace('sync.header-meta', {
+                dag: dagId,
+                peer: state.peer.key,
+                headers: msg.headerCount,
+                payloads: msg.payloadCount,
+                complete: msg.complete,
+            });
+        }
+
         resetHeaderTimeout(state);
 
         if (msg.headerCount === 0 && msg.complete) {
-            onHeaderRequestComplete(msg.requestId);
+            return onHeaderRequestComplete(msg.requestId);
         }
+        return;
     }
 
     async function handleHeaderBatch(msg: HeaderBatch) {
         const state = pendingHeaderRequests.get(msg.requestId);
-        if (state === undefined) return;
+        if (state === undefined) {
+            traceDrop('header-batch', msg.requestId);
+            return;
+        }
 
         if (msg.sequence !== state.nextSequence) {
             failHeaderRequest(msg.requestId, `expected sequence ${state.nextSequence}, got ${msg.sequence}`);
@@ -548,6 +634,7 @@ export function createDagSynchronizer(
             const localHeader = await dag.loadHeader(item.hash);
             if (localHeader !== undefined) {
                 addToPeerDiscoveredFrontier(state.peer.key, item.hash);
+                forgetHeaderMiss(item.hash);
                 continue;
             }
 
@@ -555,6 +642,7 @@ export function createDagSynchronizer(
             if (!discoveredHeaders.has(item.hash) && !readyToApply.has(item.hash)
                 && !appliedEntries.has(item.hash)) {
                 discoveredHeaders.set(item.hash, item.header);
+                forgetHeaderMiss(item.hash);
             }
         }
 
@@ -563,7 +651,7 @@ export function createDagSynchronizer(
 
         if (state.expectedHeaderCount !== undefined &&
             state.receivedHeaderCount >= state.expectedHeaderCount) {
-            onHeaderRequestComplete(msg.requestId);
+            await onHeaderRequestComplete(msg.requestId);
         }
 
         await attemptWork();
@@ -576,16 +664,25 @@ export function createDagSynchronizer(
         clearTimeout(state.timeout);
         pendingHeaderRequests.delete(requestId);
 
-        // Update peerDiscoveredFrontier for the serving peer
+        // Update peerDiscoveredFrontier for the serving peer, and figure out which
+        // start hashes this peer did NOT provide so we can negatively cache them.
+        let learnedAny = false;
         for (const h of state.startHashes) {
             if (discoveredHeaders.has(h) || readyToApply.has(h) || appliedEntries.has(h)) {
                 addToPeerDiscoveredFrontier(state.peer.key, h);
+                learnedAny = true;
+            } else {
+                // The peer answered without giving us this hash. Remember the miss
+                // against the frontier it had when we asked, so we don't spin
+                // re-asking the same peer until it gossips a newer frontier.
+                recordHeaderMiss(h, state.peer.key, state.peerFrontierAtSend);
             }
         }
 
         // Handle auto-payload transition: use receivedHashes (all hashes from this
         // request's batches) rather than discoveredHeaders.keys(), because some entries
         // may have already been applied by a concurrent auto-payload stream.
+        let autoPayloadSetup = false;
         if (state.autoPayload && state.expectedPayloadCount !== undefined
             && state.expectedPayloadCount > 0) {
             const autoHashes = state.receivedHashes;
@@ -607,13 +704,18 @@ export function createDagSynchronizer(
             for (const h of autoHashes) {
                 requestedPayloads.add(h);
             }
+            autoPayloadSetup = true;
         }
 
         if (autoPayloadRequestId === requestId) {
             autoPayloadRequestId = undefined;
         }
 
-        await attemptWork();
+        // Only re-run the work loop if this completion actually made progress.
+        // An empty "complete" reply that taught us nothing would otherwise spin.
+        if (learnedAny || autoPayloadSetup) {
+            await attemptWork();
+        }
     }
 
     function handleHeaderTimeout(requestId: string) {
@@ -631,12 +733,20 @@ export function createDagSynchronizer(
         attemptWork();
     }
 
-    function failHeaderRequest(requestId: string, _reason: string) {
+    function failHeaderRequest(requestId: string, reason: string) {
         const state = pendingHeaderRequests.get(requestId);
         if (state === undefined) return;
 
         clearTimeout(state.timeout);
         pendingHeaderRequests.delete(requestId);
+        if (TRACE_SYNC) {
+            trace('sync.fail', {
+                dag: dagId,
+                peer: state.peer.key,
+                issue: 'validation-failed',
+                reason,
+            });
+        }
         reportIssue(state.peer.key, 'validation-failed');
 
         if (autoPayloadRequestId === requestId) {
@@ -778,6 +888,8 @@ export function createDagSynchronizer(
             if (result === 'closed') {
                 removePeer(peer.key);
             }
+        } else if (TRACE_SYNC) {
+            trace('sync.payload-req', { dag: dagId, peer: peer.key, n: hashes.length });
         }
     }
 
@@ -785,7 +897,10 @@ export function createDagSynchronizer(
 
     function handlePayloadResponseMeta(msg: PayloadResponseMeta) {
         const state = pendingPayloadRequests.get(msg.requestId);
-        if (state === undefined) return;
+        if (state === undefined) {
+            traceDrop('payload-meta', msg.requestId);
+            return;
+        }
 
         if (msg.payloadCount !== state.requestedHashes.size) {
             failPayloadRequest(msg.requestId, 'payloadCount mismatch');
@@ -798,7 +913,10 @@ export function createDagSynchronizer(
 
     async function handlePayloadMsg(msg: PayloadMsg) {
         const state = pendingPayloadRequests.get(msg.requestId);
-        if (state === undefined) return;
+        if (state === undefined) {
+            traceDrop('payload-msg', msg.requestId, { seq: msg.sequence });
+            return;
+        }
 
         if (msg.sequence !== state.nextSequence) {
             failPayloadRequest(msg.requestId, `expected sequence ${state.nextSequence}, got ${msg.sequence}`);
@@ -818,6 +936,13 @@ export function createDagSynchronizer(
                 state.receivedPayloadCount >= state.expectedPayloadCount) {
                 clearTimeout(state.timeout);
                 pendingPayloadRequests.delete(msg.requestId);
+                if (TRACE_SYNC) {
+                    trace('sync.payload done', {
+                        dag: dagId,
+                        peer: state.peer.key,
+                        n: state.receivedPayloadCount,
+                    });
+                }
             }
             return;
         }
@@ -857,6 +982,13 @@ export function createDagSynchronizer(
             state.receivedPayloadCount >= state.expectedPayloadCount) {
             clearTimeout(state.timeout);
             pendingPayloadRequests.delete(msg.requestId);
+            if (TRACE_SYNC) {
+                trace('sync.payload done', {
+                    dag: dagId,
+                    peer: state.peer.key,
+                    n: state.receivedPayloadCount,
+                });
+            }
         }
 
         await attemptWork();
@@ -879,12 +1011,20 @@ export function createDagSynchronizer(
         attemptWork();
     }
 
-    function failPayloadRequest(requestId: string, _reason: string) {
+    function failPayloadRequest(requestId: string, reason: string) {
         const state = pendingPayloadRequests.get(requestId);
         if (state === undefined) return;
 
         clearTimeout(state.timeout);
         pendingPayloadRequests.delete(requestId);
+        if (TRACE_SYNC) {
+            trace('sync.fail', {
+                dag: dagId,
+                peer: state.peer.key,
+                issue: 'validation-failed',
+                reason,
+            });
+        }
         reportIssue(state.peer.key, 'validation-failed');
 
         for (const h of state.requestedHashes) {
@@ -918,28 +1058,38 @@ export function createDagSynchronizer(
 
                 const prevHashes = [...json.fromSet(header.prevEntryHashes)];
                 let allPredecessorsReady = true;
+                let missingPrev: B64Hash | undefined;
                 for (const prev of prevHashes) {
                     if (!appliedEntries.has(prev)) {
                         const localEntry = await dag.loadEntry(prev);
                         if (localEntry === undefined) {
                             allPredecessorsReady = false;
+                            missingPrev = prev;
                             break;
                         }
                     }
                 }
-                if (!allPredecessorsReady) continue;
+                if (!allPredecessorsReady) {
+                    if (TRACE_SYNC) {
+                        trace('sync.defer', { dag: dagId, hash, missingHash: missingPrev });
+                    }
+                    continue;
+                }
 
                 const version: Version = new Set(prevHashes);
 
                 const foreignDeps = rObject.extractForeignDeps(payload, version);
                 if (foreignDeps !== undefined && ctx !== undefined) {
                     let allDepsAvailable = true;
+                    let missingObject: B64Hash | undefined;
+                    let missingHash: B64Hash | undefined;
                     for (const dep of foreignDeps) {
                         const obj = await ctx.getObject(dep.objectId);
                         if (obj === undefined) {
                             waitingMissing.add(dep.objectId);
                             ensureNewObjectListener();
                             allDepsAvailable = false;
+                            missingObject = dep.objectId;
                             break;
                         }
                         waitingMissing.delete(dep.objectId);
@@ -948,18 +1098,33 @@ export function createDagSynchronizer(
                         for (const requiredHash of dep.requiredHashes) {
                             if (await scoped.loadEntry(requiredHash) === undefined) {
                                 allDepsAvailable = false;
+                                missingHash = requiredHash;
                                 break;
                             }
                         }
                         if (!allDepsAvailable) break;
                     }
-                    if (!allDepsAvailable) continue;
+                    if (!allDepsAvailable) {
+                        if (TRACE_SYNC) {
+                            trace('sync.defer', { dag: dagId, hash, missingObject, missingHash });
+                        }
+                        continue;
+                    }
                 }
 
                 const result = await rObject.validatePayload(payload, version);
                 if (!result.valid) {
                     const source = hashSourcePeer.get(hash);
                     if (source !== undefined) reportIssue(source, 'validation-failed');
+                    if (TRACE_SYNC) {
+                        trace('sync.apply', {
+                            dag: dagId,
+                            hash,
+                            result: 'reject',
+                            why: 'invalid',
+                            reason: formatValidationFailure(result.why),
+                        });
+                    }
                     receivedPayloads.delete(hash);
                     readyToApply.delete(hash);
                     discardDependents(hash);
@@ -970,6 +1135,9 @@ export function createDagSynchronizer(
                 if (resultHash !== hash) {
                     const source = hashSourcePeer.get(hash);
                     if (source !== undefined) reportIssue(source, 'validation-failed');
+                    if (TRACE_SYNC) {
+                        trace('sync.apply', { dag: dagId, hash, result: 'reject', why: 'hash' });
+                    }
                     receivedPayloads.delete(hash);
                     readyToApply.delete(hash);
                     discardDependents(hash);
@@ -979,6 +1147,9 @@ export function createDagSynchronizer(
                 appliedEntries.add(hash);
                 receivedPayloads.delete(hash);
                 readyToApply.delete(hash);
+                if (TRACE_SYNC) {
+                    trace('sync.apply', { dag: dagId, hash, result: 'ok' });
+                }
                 progress = true;
                 anyProgress = true;
             }
@@ -1030,29 +1201,25 @@ export function createDagSynchronizer(
 
     // --- message handling ---
 
-    function handleMessage(msg: SyncMsg, channel: TopicChannel) {
+    function handleMessage(msg: SyncMsg, channel: TopicChannel): void | Promise<void> {
         if (destroyed) return;
 
         const pk = `${channel.peerId}@${channel.endpoint}`;
 
         switch (msg.type) {
             case 'new-frontier':
-                if (msg.dagId === dagId) handleNewFrontier(msg, pk);
-                break;
+                if (msg.dagId === dagId) return handleNewFrontier(msg, pk);
+                return;
             case 'header-response-meta':
-                handleHeaderResponseMeta(msg);
-                break;
+                return handleHeaderResponseMeta(msg);
             case 'header-batch':
-                handleHeaderBatch(msg);
-                break;
+                return handleHeaderBatch(msg);
             case 'payload-response-meta':
-                handlePayloadResponseMeta(msg);
-                break;
+                return handlePayloadResponseMeta(msg);
             case 'payload-msg':
-                handlePayloadMsg(msg);
-                break;
+                return handlePayloadMsg(msg);
             default:
-                break;
+                return;
         }
     }
 
@@ -1065,6 +1232,12 @@ export function createDagSynchronizer(
         peerFrontiers.delete(peerKey);
         peerDiscoveredFrontier.delete(peerKey);
         lastSentFrontier.delete(peerKey);
+
+        // Drop this peer from the negative cache, discarding now-empty entries.
+        for (const [hash, byPeer] of headerMisses) {
+            byPeer.delete(peerKey);
+            if (byPeer.size === 0) headerMisses.delete(hash);
+        }
 
         for (const [rid, state] of pendingHeaderRequests) {
             if (state.peer.key === peerKey) {

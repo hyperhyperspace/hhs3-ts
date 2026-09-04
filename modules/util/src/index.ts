@@ -6,3 +6,4 @@ export { PriorityQueue } from "./priority_queue.js"
 export * as testing from "./test.js";
 export * as set from "./set.js";
 export * as iterators from "./iterators.js";
+export { trace } from "./trace.js";

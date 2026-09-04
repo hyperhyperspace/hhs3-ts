@@ -8,9 +8,10 @@ import { RootScopedDag, ScopedDagSubscription, validationOk } from '@hyper-hyper
 
 import { createDagProvider } from '../src/provider.js';
 import { createDagSynchronizer } from '../src/synchronizer.js';
+import { createSyncSession } from '../src/session.js';
 import { encode, decode } from '../src/codec.js';
 import { fetchInit } from '../src/fetch_init.js';
-import type { SyncMsg, NewFrontierMsg, InitResponse } from '../src/protocol.js';
+import type { SyncMsg, NewFrontierMsg, InitResponse, HeaderRequest } from '../src/protocol.js';
 import type { Swarm, SwarmPeer } from '@hyper-hyper-space/hhs3_mesh';
 
 // --- Helpers ---
@@ -82,6 +83,21 @@ class MockChannel implements TopicChannel {
     onClose(callback: () => void): void {
         this.closeCbs.push(callback);
     }
+}
+
+function fifoOnMessage(ch: MockChannel, handler: (data: Uint8Array) => void | Promise<void>): void {
+    let chain: Promise<void> = Promise.resolve();
+    ch.onMessage((data) => {
+        chain = chain.then(() => handler(data)).catch(() => {});
+    });
+}
+
+function wrapLoadHeader(d: dag.Dag, delayMs: number): void {
+    const orig = d.loadHeader.bind(d);
+    d.loadHeader = async (h: B64Hash) => {
+        await wait(delayMs);
+        return orig(h);
+    };
 }
 
 function createChannelPair(topic: string, peerAId: string, peerBId: string): ChannelPair {
@@ -175,16 +191,12 @@ function wireUpSync(
         (peer, msg) => { try { peer.channel.send(encode(msg)); return 'sent' as const; } catch { return 'error' as const; } },
     );
 
-    // chBLocal.onMessage: fires when chALocal.send() delivers → A sent to B → provider handles
-    chBLocal.onMessage((data) => {
-        const msg = decode(data);
-        providerB.handleMessage(msg, chBLocal);
+    fifoOnMessage(chBLocal, (data) => {
+        providerB.handleMessage(decode(data), chBLocal);
     });
 
-    // chALocal.onMessage: fires when chBLocal.send() delivers → B sent to A → synchronizer handles
-    chALocal.onMessage((data) => {
-        const msg = decode(data);
-        synchronizerA.handleMessage(msg, chALocal);
+    fifoOnMessage(chALocal, async (data) => {
+        await synchronizerA.handleMessage(decode(data), chALocal);
     });
 
     synchronizerA.addPeer(peerBHandle);
@@ -588,20 +600,18 @@ async function testMultiPeerSync() {
         (peer, msg) => { try { peer.channel.send(encode(msg)); return 'sent' as const; } catch { return 'error' as const; } },
     );
 
-    // Wire B's provider
-    chBA.onMessage((data) => {
+    fifoOnMessage(chBA, (data) => {
         providerB.handleMessage(decode(data), chBA);
     });
-    chAB.onMessage((data) => {
-        synchronizerA.handleMessage(decode(data), chAB);
+    fifoOnMessage(chAB, async (data) => {
+        await synchronizerA.handleMessage(decode(data), chAB);
     });
 
-    // Wire C's provider
-    chCA.onMessage((data) => {
+    fifoOnMessage(chCA, (data) => {
         providerC.handleMessage(decode(data), chCA);
     });
-    chAC.onMessage((data) => {
-        synchronizerA.handleMessage(decode(data), chAC);
+    fifoOnMessage(chAC, async (data) => {
+        await synchronizerA.handleMessage(decode(data), chAC);
     });
 
     synchronizerA.addPeer(peerBHandle);
@@ -657,14 +667,12 @@ function wireUpSyncWithCtx(
         ctx,
     );
 
-    chBLocal.onMessage((data) => {
-        const msg = decode(data);
-        providerB.handleMessage(msg, chBLocal);
+    fifoOnMessage(chBLocal, (data) => {
+        providerB.handleMessage(decode(data), chBLocal);
     });
 
-    chALocal.onMessage((data) => {
-        const msg = decode(data);
-        synchronizerA.handleMessage(msg, chALocal);
+    fifoOnMessage(chALocal, async (data) => {
+        await synchronizerA.handleMessage(decode(data), chALocal);
     });
 
     synchronizerA.addPeer(peerBHandle);
@@ -874,6 +882,130 @@ async function testFetchInitHashMismatch() {
     local.close();
 }
 
+async function testAutoPayloadFifo() {
+    const dagId = 'test-dag-auto-payload-fifo';
+    const topic = 'sync-auto-payload-fifo';
+
+    const dagA = createTestDag();
+    const dagB = createTestDag();
+
+    const root = await dagB.append({ op: 'root' }, {});
+    await dagA.append({ op: 'root' }, {});
+    const a = await dagB.append({ op: 'A' }, {}, new Set([root]));
+    const b = await dagB.append({ op: 'B' }, {}, new Set([a]));
+    const c = await dagB.append({ op: 'C' }, {}, new Set([b]));
+
+    // Yield inside loadHeader so auto-payload frames arrive while the header
+    // batch is still in flight. FIFO must hold them until hashes are bound.
+    wrapLoadHeader(dagA, 20);
+
+    const rObjectA = createMockRObject(dagA, dagId);
+    const { local: chALocal, remote: chBLocal } = createChannelPair(topic, 'peerA', 'peerB');
+    const swarmPeer: SwarmPeer = { keyId: 'peerB', endpoint: 'mem://peerB', channel: chALocal };
+    const swarm = stubSwarm([swarmPeer]);
+
+    const providerB = createDagProvider(dagB);
+    fifoOnMessage(chBLocal, (data) => {
+        providerB.handleMessage(decode(data), chBLocal);
+    });
+
+    const session = createSyncSession(
+        { dagId, dag: dagA, rObject: rObjectA, hashSuite: sha256 },
+        [swarm],
+    );
+
+    const started = Date.now();
+    const frontierB = await dagB.getFrontier();
+    chBLocal.send(encode({
+        type: 'new-frontier',
+        dagId,
+        frontier: [...frontierB],
+    }));
+
+    await waitUntil(async () => {
+        const ea = await dagA.loadEntry(a);
+        const eb = await dagA.loadEntry(b);
+        const ec = await dagA.loadEntry(c);
+        return ea !== undefined && eb !== undefined && ec !== undefined;
+    }, 20, 3000);
+
+    testing.assertTrue(Date.now() - started < 3000, 'auto-payload FIFO must apply without the 30s request timeout');
+    testing.assertEquals(session.getDiagnostics().pendingPayloadRequests, 0, 'no leftover payload wait');
+
+    session.destroy();
+    providerB.destroy();
+    chALocal.close();
+}
+
+async function testAutoPayloadCountMismatch() {
+    const dagId = 'test-dag-payload-count-mismatch';
+    const topic = 'sync-payload-count-mismatch';
+
+    const dagA = createTestDag();
+    const dagB = createTestDag();
+
+    const root = await dagB.append({ op: 'root' }, {});
+    await dagA.append({ op: 'root' }, {});
+    const a = await dagB.append({ op: 'A' }, {}, new Set([root]));
+
+    const rObjectA = createMockRObject(dagA, dagId);
+    const { local: chALocal, remote: chBLocal } = createChannelPair(topic, 'peerA', 'peerB');
+    const swarmPeer: SwarmPeer = { keyId: 'peerB', endpoint: 'mem://peerB', channel: chALocal };
+    const swarm = stubSwarm([swarmPeer]);
+
+    let captured: HeaderRequest | undefined;
+    fifoOnMessage(chBLocal, (data) => {
+        const msg = decode(data);
+        if (msg.type === 'header-request' && captured === undefined) {
+            captured = msg;
+            return;
+        }
+    });
+
+    const issues: string[] = [];
+    const session = createSyncSession(
+        { dagId, dag: dagA, rObject: rObjectA, hashSuite: sha256 },
+        [swarm],
+    );
+    session.onPeerIssue((_peer, issue) => { issues.push(issue); });
+
+    chBLocal.send(encode({
+        type: 'new-frontier',
+        dagId,
+        frontier: [a],
+    }));
+
+    await waitUntil(async () => captured !== undefined, 20, 2000);
+    const req = captured!;
+    const header = await dagB.loadHeader(a);
+    testing.assertTrue(header !== undefined, 'B should have header A');
+
+    chBLocal.send(encode({
+        type: 'header-response-meta',
+        requestId: req.requestId,
+        headerCount: 1,
+        complete: true,
+        payloadCount: 1,
+    }));
+    chBLocal.send(encode({
+        type: 'header-batch',
+        requestId: req.requestId,
+        sequence: 0,
+        headers: [{ hash: a, header: header! }],
+    }));
+    chBLocal.send(encode({
+        type: 'payload-response-meta',
+        requestId: req.requestId,
+        payloadCount: 99,
+    }));
+
+    await waitUntil(async () => issues.includes('validation-failed'), 20, 2000);
+    testing.assertTrue(issues.includes('validation-failed'), 'wrong payloadCount must fail the request');
+
+    session.destroy();
+    chALocal.close();
+}
+
 export const syncSuite = {
     title: '[SYNC] DAG sync protocol',
     tests: [
@@ -889,5 +1021,7 @@ export const syncSuite = {
         { name: '[SYNC_09] Foreign dep deferral', invoke: testForeignDepDeferral },
         { name: '[SYNC_10] fetchInit rejects createPayload hash mismatch', invoke: testFetchInitHashMismatch },
         { name: '[SYNC_11] Foreign dep appearance then growth', invoke: testForeignDepAppearance },
+        { name: '[SYNC_12] Auto-payload FIFO survives yielding loadHeader', invoke: testAutoPayloadFifo },
+        { name: '[SYNC_13] Auto-payload payloadCount mismatch fails', invoke: testAutoPayloadCountMismatch },
     ],
 };

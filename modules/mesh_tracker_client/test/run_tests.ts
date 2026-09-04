@@ -9,6 +9,12 @@ import {
     type TrackerRequest, type AnnounceAck, type QueryResponse, type LeaveAck,
 } from '../src/protocol.js';
 import { TrackerClient } from '../src/tracker_client.js';
+import {
+    DEFAULT_INTERNET_TRACKER,
+    DEFAULT_INTERNET_TRACKER_KEY,
+    DEFAULT_LOCAL_TRACKER,
+    resolveTrackerConfig,
+} from '../src/tracker_config.js';
 
 // ---------------------------------------------------------------------------
 // In-memory transport (same as mesh test helper)
@@ -225,11 +231,77 @@ async function testAnnounceAndQuery() {
     const topic = 'topic-a' as TopicId;
     await client.announce(topic, localPeer);
 
-    const peers = await collectAll(client.discover(topic));
+    // Query from a distinct identity: a client filters its own advertised
+    // addresses out of discovery results (self-dial defense).
+    const querier = new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        transportProvider: provider,
+        authenticator: clientAuth,
+        localPeer: fakePeerInfo('querier', []),
+        heartbeatInterval: 999_999,
+    });
+
+    const peers = await collectAll(querier.discover(topic));
     testing.assertEquals(peers.length, 1, 'should find one peer after announce');
     testing.assertEquals(peers[0].keyId, localPeer.keyId, 'keyId should match');
 
     await client.close();
+    await querier.close();
+}
+
+async function testDiscoverFiltersSelf() {
+    const tracker = createMockTracker();
+    const clientKeyId = fakeKeyId('client');
+    const clientPk = fakePk('client');
+    const trackerKeyId = fakeKeyId('tracker');
+    const trackerPk = fakePk('tracker');
+
+    const clientAuth = makePassthroughAuth(clientKeyId, clientPk, trackerKeyId, trackerPk);
+    const serverAuth = makePassthroughAuth(trackerKeyId, trackerPk, clientKeyId, clientPk);
+
+    const provider = makeMockProvider(tracker, serverAuth);
+    const localPeer = fakePeerInfo('client', ['ws://client:1234']);
+
+    const client = new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        transportProvider: provider,
+        authenticator: clientAuth,
+        localPeer,
+        heartbeatInterval: 999_999,
+    });
+
+    const topic = 'topic-self' as TopicId;
+    await client.announce(topic, localPeer);
+
+    // The client itself must not discover its own advertised endpoint.
+    const selfView = await collectAll(client.discover(topic));
+    testing.assertEquals(selfView.length, 0, 'client should filter its own address');
+
+    // A different identity still sees the announced peer, and multi-device
+    // (same key, different address) survives the filter.
+    const querier = new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        transportProvider: provider,
+        authenticator: clientAuth,
+        localPeer: fakePeerInfo('querier', []),
+        heartbeatInterval: 999_999,
+    });
+    const otherView = await collectAll(querier.discover(topic));
+    testing.assertEquals(otherView.length, 1, 'a different identity still sees the peer');
+
+    const otherDevice = new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        transportProvider: provider,
+        authenticator: clientAuth,
+        localPeer: { keyId: localPeer.keyId, addresses: ['ws://client:9999'] },
+        heartbeatInterval: 999_999,
+    });
+    const deviceView = await collectAll(otherDevice.discover(topic));
+    testing.assertEquals(deviceView.length, 1, 'same key at a different address is still a peer');
+
+    await client.close();
+    await querier.close();
+    await otherDevice.close();
 }
 
 async function testLeaveRemovesPeer() {
@@ -299,16 +371,27 @@ async function testQueryWithSchemeFilter() {
     });
     await client2.announce(topic, peerWss);
 
+    // Query from a distinct identity so neither announced peer is filtered as
+    // self.
+    const querier = new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        transportProvider: provider,
+        authenticator: clientAuth,
+        localPeer: fakePeerInfo('querier', []),
+        heartbeatInterval: 999_999,
+    });
+
     // Query with ws scheme only
-    const allPeers = await collectAll(client1.discover(topic));
+    const allPeers = await collectAll(querier.discover(topic));
     testing.assertEquals(allPeers.length, 2, 'should find both peers without filter');
 
-    const wsPeers = await collectAll(client1.discover(topic, ['ws']));
+    const wsPeers = await collectAll(querier.discover(topic, ['ws']));
     testing.assertEquals(wsPeers.length, 1, 'should find only ws peer');
     testing.assertEquals(wsPeers[0].keyId, peerWs.keyId, 'filtered peer should be ws-peer');
 
     await client1.close();
     await client2.close();
+    await querier.close();
 }
 
 async function testTtlClamping() {
@@ -337,12 +420,20 @@ async function testTtlClamping() {
     const topic = 'topic-ttl' as TopicId;
     await client.announce(topic, localPeer);
 
-    // The client should have updated its internal TTL to 120
-    // We verify indirectly: the announce succeeded without error
-    const peers = await collectAll(client.discover(topic));
+    // The client should have updated its internal TTL to 120. We verify
+    // indirectly via a separate querier (a client filters its own address).
+    const querier = new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        transportProvider: provider,
+        authenticator: clientAuth,
+        localPeer: fakePeerInfo('querier', []),
+        heartbeatInterval: 999_999,
+    });
+    const peers = await collectAll(querier.discover(topic));
     testing.assertEquals(peers.length, 1, 'announce should succeed with clamped TTL');
 
     await client.close();
+    await querier.close();
 }
 
 async function testQueryUnknownTopic() {
@@ -417,6 +508,159 @@ async function testDiscoverRespectsTargetPeers() {
     await queryClient.close();
 }
 
+async function testConcurrentAnnounceAndDiscoverDoNotOverlap() {
+    const tracker = createMockTracker();
+    const clientKeyId = fakeKeyId('client');
+    const clientPk = fakePk('client');
+    const trackerKeyId = fakeKeyId('tracker');
+    const trackerPk = fakePk('tracker');
+
+    const clientAuth = makePassthroughAuth(clientKeyId, clientPk, trackerKeyId, trackerPk);
+    const serverAuth = makePassthroughAuth(trackerKeyId, trackerPk, clientKeyId, clientPk);
+
+    const inner = makeMockProvider(tracker, serverAuth);
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let connects = 0;
+    const provider: TransportProvider = {
+        scheme: inner.scheme,
+        async listen(addr, onConn) { return inner.listen(addr, onConn); },
+        async connect(remote) {
+            connects += 1;
+            inFlight += 1;
+            if (inFlight > maxInFlight) maxInFlight = inFlight;
+            try {
+                // Hold the slot long enough that a second overlapping connect
+                // would bump maxInFlight if the client did not serialize.
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                return await inner.connect(remote);
+            } finally {
+                inFlight -= 1;
+            }
+        },
+        close() { inner.close(); },
+    };
+
+    const localPeer = fakePeerInfo('client', ['ws://client:1234']);
+    const client = new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        transportProvider: provider,
+        authenticator: clientAuth,
+        localPeer,
+        heartbeatInterval: 999_999,
+    });
+
+    const topic = 'topic-serial' as TopicId;
+    const [, peers] = await Promise.all([
+        client.announce(topic, localPeer),
+        collectAll(client.discover(topic)),
+    ]);
+
+    testing.assertEquals(connects, 2, 'announce and discover each open a connection');
+    testing.assertEquals(maxInFlight, 1, 'exchanges must not overlap');
+    testing.assertEquals(peers.length, 0, 'discover filters the client own announce');
+
+    await client.close();
+}
+
+async function testExchangeTimesOutOnHungConnect() {
+    const hanging: TransportProvider = {
+        scheme: 'mem',
+        async listen() {},
+        connect() {
+            return new Promise<Transport>(() => {});
+        },
+        close() {},
+    };
+
+    const localPeer = fakePeerInfo('client', ['ws://client:1234']);
+    const client = new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        transportProvider: hanging,
+        authenticator: makePassthroughAuth(
+            fakeKeyId('client'), fakePk('client'),
+            fakeKeyId('tracker'), fakePk('tracker'),
+        ),
+        localPeer,
+        heartbeatInterval: 999_999,
+        timeoutMs: 50,
+    });
+
+    const started = Date.now();
+    let threw = false;
+    try {
+        await collectAll(client.discover('topic-hang' as TopicId));
+    } catch (e) {
+        threw = true;
+        testing.assertTrue(
+            (e as Error).message.includes('timed out'),
+            `discover should mention timeout (got: ${(e as Error).message})`,
+        );
+    }
+    testing.assertTrue(threw, 'discover should reject when connect never completes');
+    testing.assertTrue(Date.now() - started < 1000, 'discover should fail well under a second');
+    await client.close();
+}
+
+async function testCloseTimesOutOnHungLeave() {
+    const tracker = createMockTracker();
+    const clientKeyId = fakeKeyId('client');
+    const clientPk = fakePk('client');
+    const trackerKeyId = fakeKeyId('tracker');
+    const trackerPk = fakePk('tracker');
+    const clientAuth = makePassthroughAuth(clientKeyId, clientPk, trackerKeyId, trackerPk);
+    const serverAuth = makePassthroughAuth(trackerKeyId, trackerPk, clientKeyId, clientPk);
+    const working = makeMockProvider(tracker, serverAuth);
+
+    let connects = 0;
+    const provider: TransportProvider = {
+        scheme: 'mem',
+        async listen() {},
+        connect(remote) {
+            connects += 1;
+            if (connects === 1) return working.connect(remote);
+            return new Promise<Transport>(() => {});
+        },
+        close() {},
+    };
+
+    const localPeer = fakePeerInfo('client', ['ws://client:1234']);
+    const client = new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        transportProvider: provider,
+        authenticator: clientAuth,
+        localPeer,
+        heartbeatInterval: 999_999,
+        timeoutMs: 50,
+    });
+
+    await client.announce('topic-hang' as TopicId, localPeer);
+
+    const started = Date.now();
+    await client.close();
+    testing.assertTrue(Date.now() - started < 1000, 'close should return well under a second when leave hangs');
+}
+
+async function testResolveTrackerConfig() {
+    const local = resolveTrackerConfig('localhost', {});
+    testing.assertEquals(local.address, DEFAULT_LOCAL_TRACKER, 'localhost tracker default');
+    testing.assertTrue(local.keyId === undefined, 'localhost tracker is TOFU');
+
+    const internet = resolveTrackerConfig('internet', {});
+    testing.assertEquals(internet.address, DEFAULT_INTERNET_TRACKER, 'internet tracker default');
+    testing.assertEquals(internet.keyId, DEFAULT_INTERNET_TRACKER_KEY, 'internet tracker is pinned');
+
+    const override = resolveTrackerConfig('internet', { tracker: 'wss://other:4610' });
+    testing.assertEquals(override.address, 'wss://other:4610', 'flag overrides tracker URL');
+    testing.assertTrue(override.keyId === undefined, 'overridden tracker is TOFU unless keyed');
+
+    const envWinsOverDefault = resolveTrackerConfig('localhost', {}, { tracker: 'ws://env:1' });
+    testing.assertEquals(envWinsOverDefault.address, 'ws://env:1', 'env overrides scope default');
+
+    const flagWinsOverEnv = resolveTrackerConfig('localhost', { tracker: 'ws://flag:1' }, { tracker: 'ws://env:1' });
+    testing.assertEquals(flagWinsOverEnv.address, 'ws://flag:1', 'flag overrides env');
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -426,11 +670,16 @@ const allSuites = [
         title: '[TRACKER_CLIENT] Tracker client',
         tests: [
             { name: '[TRACKER_CLIENT_00] Announce then query returns announced peer', invoke: testAnnounceAndQuery },
+            { name: '[TRACKER_CLIENT_00b] Discover filters self, keeps others and multi-device', invoke: testDiscoverFiltersSelf },
             { name: '[TRACKER_CLIENT_01] Leave removes peer from query results', invoke: testLeaveRemovesPeer },
             { name: '[TRACKER_CLIENT_02] Query with scheme filter', invoke: testQueryWithSchemeFilter },
             { name: '[TRACKER_CLIENT_03] TTL clamping by server', invoke: testTtlClamping },
             { name: '[TRACKER_CLIENT_04] Query for unknown topic returns empty list', invoke: testQueryUnknownTopic },
             { name: '[TRACKER_CLIENT_05] Discover respects targetPeers cap', invoke: testDiscoverRespectsTargetPeers },
+            { name: '[TRACKER_CLIENT_05b] Concurrent announce and discover do not overlap connects', invoke: testConcurrentAnnounceAndDiscoverDoNotOverlap },
+            { name: '[TRACKER_CLIENT_06] Exchange times out on hung connect', invoke: testExchangeTimesOutOnHungConnect },
+            { name: '[TRACKER_CLIENT_07] Close times out on hung leave', invoke: testCloseTimesOutOnHungLeave },
+            { name: '[TRACKER_CLIENT_08] resolveTrackerConfig scope defaults and overrides', invoke: testResolveTrackerConfig },
         ],
     },
 ];

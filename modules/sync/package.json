@@ -19,10 +19,10 @@
     "@hyper-hyper-space/hhs3_mvt": "^0.1.0",
     "@hyper-hyper-space/hhs3_mesh": "^0.1.0",
     "@hyper-hyper-space/hhs3_crypto": "^0.1.0",
-    "@hyper-hyper-space/hhs3_json": "^0.1.0"
+    "@hyper-hyper-space/hhs3_json": "^0.1.0",
+    "@hyper-hyper-space/hhs3_util": "^0.1.0"
   },
   "devDependencies": {
-    "@hyper-hyper-space/hhs3_util": "^0.1.0",
     "typescript": "6.0.3",
     "ts-node": "^10.9.2",
     "@types/node": "^22.2.0"

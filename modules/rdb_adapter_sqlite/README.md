@@ -2,6 +2,19 @@
 
 SQLite [`MaterializationTarget`](../rdb_adapter) for [rdb_adapter](../rdb_adapter): a self-contained, capture-provisioned backend that materializes Rdb groups into a [`better-sqlite3`](https://github.com/WiseLibs/better-sqlite3) database and captures local edits for ingestion back into Rdb.
 
+```typescript
+import Database from 'better-sqlite3';
+import { projectGroup } from '@hyper-hyper-space/hhs3_rdb_adapter';
+import { SqliteTarget } from '@hyper-hyper-space/hhs3_rdb_adapter_sqlite';
+
+const path = 'my-projection.sqlite';
+const db = new Database(path);
+const target = new SqliteTarget(db, { captureChanges: true, dbPath: path });
+await projectGroup(group, target);
+```
+
+For a whole `RDb`, [rdb_projection](../rdb_projection) is the usual supervisor: `RdbProjection.open(rdb, ctx, target, { writer })` materializes every member under group-qualified table names and keeps both directions in sync. You still read and write the SQLite `db` handle.
+
 ## What it does
 
 - Applies schema actions, row actions, and the **per-group checkpoint** in one transaction (`SqliteTarget`), with native column affinity, sync tables for a stable local-id ↔ rowId mapping, and advisory local FKs. A co-projected cross-group FK carries an integer id but declares **no** DB-level `FOREIGN KEY` (its referenced table belongs to another group, materialized in a separate apply). Adding a required column without a default to a non-empty table is add-nullable, then a post-backfill table rebuild restores `NOT NULL` (SQLite's `ADD COLUMN` rule).

@@ -15,7 +15,9 @@ import {
     type SyncFetchCommand,
     type SyncStartCommand,
 } from "./parse.js";
-import type { BuiltSyncMesh, SyncSessionEntry } from "./types.js";
+import type { BuiltSyncMesh, SyncCloseable, SyncSessionEntry } from "./types.js";
+
+const MESH_CLOSEABLE_WAIT_MS = 1_000;
 
 export type SyncCommandResult = {
     output?: string;
@@ -104,7 +106,7 @@ async function start(session: ReplSession, cmd: SyncStartCommand): Promise<SyncC
         identityKeyId: identity.keyId,
         scope: cmd.scope,
         sources: cmd.sources,
-        announcedAddresses: built.announcedAddresses,
+        listenAddresses: built.listenAddresses,
         discoveryNotes: built.discoveryNotes,
         closeables: built.closeables,
     };
@@ -192,7 +194,7 @@ async function status(session: ReplSession, database?: string): Promise<string> 
         scope: entry.scope,
         as: entry.identityLabel,
         allow: formatAllow(entry.sources),
-        listen: entry.announcedAddresses.join(', '),
+        listen: entry.listenAddresses.join(', '),
         discovery: entry.discoveryNotes.join('; '),
         peers: countPeers(entry),
     }));
@@ -247,18 +249,7 @@ async function teardown(session: ReplSession, id: number): Promise<void> {
     } catch {
         // already stopped
     }
-    for (const closeable of entry.closeables) {
-        try {
-            await closeable.close();
-        } catch {
-            // best-effort
-        }
-    }
-    try {
-        entry.mesh.close();
-    } catch {
-        // best-effort
-    }
+    await closeBuiltMesh(entry.mesh, entry.closeables);
     session.workspace.replica.detachMesh(entry.meshLabel);
 }
 
@@ -293,20 +284,31 @@ async function closeTempMesh(
     built: BuiltSyncMesh | undefined,
 ): Promise<void> {
     if (built !== undefined) {
-        for (const closeable of built.closeables) {
-            try {
-                await closeable.close();
-            } catch {
-                // best-effort
-            }
-        }
+        await closeBuiltMesh(built.mesh, built.closeables);
+    }
+    session.workspace.replica.detachMesh(meshLabel);
+}
+
+async function closeBuiltMesh(
+    mesh: { close(): void },
+    closeables: SyncCloseable[],
+): Promise<void> {
+    const closing = Promise.all(closeables.map(async (closeable) => {
         try {
-            built.mesh.close();
+            await closeable.close();
         } catch {
             // best-effort
         }
+    }));
+    await Promise.race([
+        closing,
+        new Promise<void>((resolve) => setTimeout(resolve, MESH_CLOSEABLE_WAIT_MS)),
+    ]);
+    try {
+        mesh.close();
+    } catch {
+        // best-effort
     }
-    session.workspace.replica.detachMesh(meshLabel);
 }
 
 function makeLookup(session: ReplSession) {

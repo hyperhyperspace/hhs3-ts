@@ -19,7 +19,7 @@ import type { AuthenticatedChannel } from '../src/authenticator.js';
 import type { PeerDiscovery, PeerInfo } from '../src/discovery.js';
 import type { TopicId } from '../src/discovery.js';
 import type { PeerAuthenticator } from '../src/authenticator.js';
-import type { Transport, NetworkAddress } from '../src/transport.js';
+import type { Transport, TransportProvider, NetworkAddress } from '../src/transport.js';
 import { createSwarm } from '../src/swarm.js';
 import type { PeerAuthorizer } from '../src/swarm.js';
 import { Mesh } from '../src/mesh.js';
@@ -569,6 +569,119 @@ async function testSwarmDiscoveryAndConnect() {
 
     swarm.destroy();
     provider.close();
+}
+
+async function testSwarmSelfSkip() {
+    const pool = new ConnectionPool();
+    const topic = sha256.hashToB64(stringToUint8Array('swarm-self-skip-topic'));
+
+    const selfPeer = makeFakePeer('mem://self');
+    const other = makeFakePeer('mem://other');
+
+    const provider = new MemTransportProvider();
+    await provider.listen('mem://self', (_t) => {});
+    await provider.listen('mem://other', (_t) => {});
+
+    const peerMap = new Map<string, PublicKey>();
+    peerMap.set(selfPeer.keyId, selfPeer.publicKey);
+    peerMap.set(other.keyId, other.publicKey);
+
+    // Discovery echoes ourselves back (the self-dial trigger) alongside a real peer.
+    const discovered: PeerInfo[] = [
+        { keyId: selfPeer.keyId, addresses: ['mem://self'] },
+        { keyId: other.keyId, addresses: ['mem://other'] },
+    ];
+
+    const swarm = createSwarm({ topic, targetPeers: 4 }, {
+        pool,
+        discovery: makeStubDiscovery(discovered),
+        authenticator: makeStubAuthenticator(peerMap),
+        transports: [provider],
+        localPeer: { keyId: selfPeer.keyId, addresses: ['mem://self'] },
+    });
+
+    swarm.activate();
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    testing.assertEquals(swarm.peers().length, 1, 'self endpoint is skipped; only the real peer connects');
+    testing.assertEquals(swarm.peers()[0]?.keyId, other.keyId, 'connected peer is the other node, not self');
+
+    swarm.destroy();
+    provider.close();
+}
+
+async function testSwarmMultiDeviceSameKey() {
+    const pool = new ConnectionPool();
+    const topic = sha256.hashToB64(stringToUint8Array('swarm-multidevice-topic'));
+
+    const selfPeer = makeFakePeer('mem://device-a');
+
+    const provider = new MemTransportProvider();
+    await provider.listen('mem://device-a', (_t) => {});
+    await provider.listen('mem://device-b', (_t) => {});
+
+    const peerMap = new Map<string, PublicKey>();
+    peerMap.set(selfPeer.keyId, selfPeer.publicKey);
+
+    // Same identity (keyId) advertised at a different address: a second device.
+    const discovered: PeerInfo[] = [
+        { keyId: selfPeer.keyId, addresses: ['mem://device-a'] }, // self endpoint, must skip
+        { keyId: selfPeer.keyId, addresses: ['mem://device-b'] }, // other device, must dial
+    ];
+
+    const swarm = createSwarm({ topic, targetPeers: 4 }, {
+        pool,
+        discovery: makeStubDiscovery(discovered),
+        authenticator: makeStubAuthenticator(peerMap),
+        transports: [provider],
+        localPeer: { keyId: selfPeer.keyId, addresses: ['mem://device-a'] },
+    });
+
+    swarm.activate();
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    testing.assertEquals(swarm.peers().length, 1, 'same key at a different address is still dialed');
+
+    swarm.destroy();
+    provider.close();
+}
+
+async function testSwarmDialOutDoesNotAnnounce() {
+    const topic = sha256.hashToB64(stringToUint8Array('swarm-dialout-topic'));
+    const selfPeer = makeFakePeer('mem://self');
+
+    const announced: TopicId[] = [];
+    const recordingDiscovery: PeerDiscovery = {
+        async *discover() { /* no peers */ },
+        async announce(t: TopicId) { announced.push(t); },
+        async leave() {},
+    };
+
+    // Dial-out mesh: empty local addresses. activate() must not announce.
+    const dialOut = createSwarm({ topic }, {
+        pool: new ConnectionPool(),
+        discovery: recordingDiscovery,
+        authenticator: makeStubAuthenticator(new Map()),
+        transports: [],
+        localPeer: { keyId: selfPeer.keyId, addresses: [] },
+    });
+    dialOut.activate();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    testing.assertEquals(announced.length, 0, 'dial-out mesh (empty addresses) issues no announce');
+    dialOut.destroy();
+
+    // Control: a listening mesh with an address does announce.
+    const listening = createSwarm({ topic }, {
+        pool: new ConnectionPool(),
+        discovery: recordingDiscovery,
+        authenticator: makeStubAuthenticator(new Map()),
+        transports: [],
+        localPeer: { keyId: selfPeer.keyId, addresses: ['mem://self'] },
+    });
+    listening.activate();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    testing.assertEquals(announced.length, 1, 'a mesh with a listen address announces');
+    listening.destroy();
 }
 
 async function testSwarmPoolReuse() {
@@ -1444,11 +1557,13 @@ async function testAuthorizerFiltersOutbound() {
     provider.close();
 }
 
-async function testTargetPeersCapsInbound() {
+async function testMaxPeersCapsInbound() {
     const pool = new ConnectionPool();
     const topic = sha256.hashToB64(stringToUint8Array('cap-topic'));
 
-    const swarm = createSwarm({ topic, mode: 'passive', targetPeers: 1 }, {
+    // targetPeers=1, maxPeers=2: pool adoption is capped at maxPeers, so two
+    // peers join and a third is rejected.
+    const swarm = createSwarm({ topic, mode: 'passive', targetPeers: 1, maxPeers: 2 }, {
         pool,
         discovery: makeStubDiscovery([]),
         authenticator: makeStubAuthenticator(new Map()),
@@ -1458,14 +1573,166 @@ async function testTargetPeersCapsInbound() {
 
     const peer1 = makeFakePeer('mem://p1');
     const peer2 = makeFakePeer('mem://p2');
+    const peer3 = makeFakePeer('mem://p3');
 
     const { channel: ch1 } = makeFakeChannel(peer1);
     const { channel: ch2 } = makeFakeChannel(peer2);
+    const { channel: ch3 } = makeFakeChannel(peer3);
 
     pool.add(ch1, peer1.endpoint);
     pool.add(ch2, peer2.endpoint);
+    pool.add(ch3, peer3.endpoint);
 
-    testing.assertEquals(swarm.peers().length, 1, 'should cap at targetPeers=1');
+    testing.assertEquals(swarm.peers().length, 2, 'should cap pool adoption at maxPeers=2');
+
+    swarm.destroy();
+}
+
+async function testMaxPeersDefaultsAboveTarget() {
+    const pool = new ConnectionPool();
+    const topic = sha256.hashToB64(stringToUint8Array('cap-default-topic'));
+
+    // maxPeers omitted -> defaults to targetPeers + 2 = 3.
+    const swarm = createSwarm({ topic, mode: 'passive', targetPeers: 1 }, {
+        pool,
+        discovery: makeStubDiscovery([]),
+        authenticator: makeStubAuthenticator(new Map()),
+        transports: [],
+    });
+    swarm.deactivate();
+
+    const peers = [
+        makeFakePeer('mem://d1'),
+        makeFakePeer('mem://d2'),
+        makeFakePeer('mem://d3'),
+        makeFakePeer('mem://d4'),
+    ];
+    for (const p of peers) {
+        const { channel } = makeFakeChannel(p);
+        pool.add(channel, p.endpoint);
+    }
+
+    testing.assertEquals(swarm.peers().length, 3, 'inbound accepted up to default maxPeers=3');
+
+    swarm.destroy();
+}
+
+async function testMaxPeersMustExceedTarget() {
+    const topic = sha256.hashToB64(stringToUint8Array('cap-invalid-topic'));
+    let threw = false;
+    try {
+        createSwarm({ topic, targetPeers: 2, maxPeers: 2 }, {
+            pool: new ConnectionPool(),
+            discovery: makeStubDiscovery([]),
+            authenticator: makeStubAuthenticator(new Map()),
+            transports: [],
+        });
+    } catch {
+        threw = true;
+    }
+    testing.assertTrue(threw, 'maxPeers <= targetPeers should throw');
+}
+
+// A transport provider whose connect resolves/rejects after a fixed delay,
+// used to prove dials run in parallel (a slow one does not block a fast one).
+function makeDelayedProvider(
+    scheme: string,
+    delayMs: number,
+    outcome: 'resolve' | 'reject',
+): TransportProvider {
+    return {
+        scheme,
+        async listen() {},
+        connect(_remote: NetworkAddress): Promise<Transport> {
+            return new Promise<Transport>((resolve, reject) => {
+                setTimeout(() => {
+                    if (outcome === 'reject') {
+                        reject(new Error(`${scheme} connect timeout`));
+                    } else {
+                        const [a] = createMemTransportPair();
+                        resolve(a);
+                    }
+                }, delayMs);
+            });
+        },
+        close() {},
+    };
+}
+
+async function testSwarmParallelDialSlowDoesNotBlockFast() {
+    const pool = new ConnectionPool();
+    const topic = sha256.hashToB64(stringToUint8Array('parallel-dial-topic'));
+
+    const slowPeer = makeFakePeer('slow://dead');
+    const fastPeer = makeFakePeer('fast://live');
+
+    const peerMap = new Map<string, PublicKey>();
+    peerMap.set(fastPeer.keyId, fastPeer.publicKey);
+
+    const swarm = createSwarm({ topic, targetPeers: 2 }, {
+        pool,
+        discovery: makeStubDiscovery([
+            { keyId: slowPeer.keyId, addresses: ['slow://dead'] },
+            { keyId: fastPeer.keyId, addresses: ['fast://live'] },
+        ]),
+        authenticator: makeStubAuthenticator(peerMap),
+        transports: [
+            makeDelayedProvider('slow', 400, 'reject'),
+            makeDelayedProvider('fast', 10, 'resolve'),
+        ],
+    });
+
+    swarm.activate();
+
+    // Well before the slow dial's 400ms rejection, the fast peer should already
+    // have joined -- proving the dials ran concurrently rather than in series.
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    testing.assertEquals(swarm.peers().length, 1, 'fast peer joins without waiting for slow dial');
+    testing.assertEquals(swarm.peers()[0].keyId, fastPeer.keyId, 'the joined peer is the fast one');
+
+    swarm.destroy();
+}
+
+async function testSwarmRefillsAfterLeave() {
+    const pool = new ConnectionPool();
+    const topic = sha256.hashToB64(stringToUint8Array('refill-topic'));
+
+    let discoverCalls = 0;
+    const peer = makeFakePeer('mem://refill-peer');
+    const discovery: PeerDiscovery = {
+        async *discover(_topic: TopicId, _schemes?: string[], _target?: number) {
+            discoverCalls++;
+            // Yield nothing; we only care that another pass is triggered.
+        },
+        async announce() {},
+        async leave() {},
+    };
+
+    const swarm = createSwarm({ topic, targetPeers: 2 }, {
+        pool,
+        discovery,
+        authenticator: makeStubAuthenticator(new Map()),
+        transports: [],
+    });
+
+    swarm.activate();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const afterActivate = discoverCalls;
+    testing.assertTrue(afterActivate >= 1, 'activate runs an initial discovery pass');
+
+    // A peer joins via the pool, then leaves; dropping below targetPeers should
+    // schedule a debounced refill discovery pass.
+    const { channel } = makeFakeChannel(peer);
+    pool.add(channel, peer.endpoint);
+    testing.assertEquals(swarm.peers().length, 1, 'peer adopted from pool');
+
+    channel.close();
+    testing.assertEquals(swarm.peers().length, 0, 'peer left');
+
+    // Wait past the refill debounce (150ms).
+    await new Promise(resolve => setTimeout(resolve, 250));
+    testing.assertTrue(discoverCalls > afterActivate, 'leave below target triggers another discovery pass');
 
     swarm.destroy();
 }
@@ -1858,6 +2125,11 @@ const swarmTests = {
         { name: '[SWARM_03] Discovery and connect', invoke: testSwarmDiscoveryAndConnect },
         { name: '[SWARM_04] Pool reuse across topics', invoke: testSwarmPoolReuse },
         { name: '[SWARM_05] Dormant ignores pool', invoke: testSwarmDormantIgnoresPool },
+        { name: '[SWARM_06] Parallel dial: slow does not block fast', invoke: testSwarmParallelDialSlowDoesNotBlockFast },
+        { name: '[SWARM_07] Low-water refill after leave', invoke: testSwarmRefillsAfterLeave },
+        { name: '[SWARM_08] Self endpoint is skipped in discovery', invoke: testSwarmSelfSkip },
+        { name: '[SWARM_09] Same key at a different address is still dialed', invoke: testSwarmMultiDeviceSameKey },
+        { name: '[SWARM_10] Dial-out mesh (empty addresses) does not announce', invoke: testSwarmDialOutDoesNotAnnounce },
     ],
 };
 
@@ -1931,7 +2203,9 @@ const authZTests = {
         { name: '[AUTH_Z_01] wouldAccept returns false when dormant', invoke: testAuthorizerWouldAcceptFalseDormant },
         { name: '[AUTH_Z_02] wouldAccept returns false when authorizer rejects', invoke: testAuthorizerWouldAcceptFalseRejected },
         { name: '[AUTH_Z_03] authorizer filters outbound discovery candidates', invoke: testAuthorizerFiltersOutbound },
-        { name: '[AUTH_Z_04] targetPeers caps inbound adoption', invoke: testTargetPeersCapsInbound },
+        { name: '[AUTH_Z_04] maxPeers caps inbound adoption', invoke: testMaxPeersCapsInbound },
+        { name: '[AUTH_Z_05] maxPeers defaults above targetPeers', invoke: testMaxPeersDefaultsAboveTarget },
+        { name: '[AUTH_Z_06] maxPeers must exceed targetPeers', invoke: testMaxPeersMustExceedTarget },
     ],
 };
 

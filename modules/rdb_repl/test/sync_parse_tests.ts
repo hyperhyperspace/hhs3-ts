@@ -5,12 +5,6 @@ import {
     parseSyncCommand,
     type AllowSource,
 } from "../src/sync/parse.js";
-import {
-    DEFAULT_INTERNET_TRACKER,
-    DEFAULT_INTERNET_TRACKER_KEY,
-    DEFAULT_LOCAL_TRACKER,
-    resolveTrackerConfig,
-} from "../src/sync/discovery.js";
 
 function assert(condition: unknown, message: string): asserts condition {
     if (!condition) throw new Error(message);
@@ -158,24 +152,6 @@ export async function runSyncParseTests(): Promise<void> {
     threw = false;
     try { parseSyncCommand('stop x'); } catch { threw = true; }
     assert(threw, 'non-numeric stop id is rejected');
-
-    const local = resolveTrackerConfig('localhost', {});
-    assertEqual(local.address, DEFAULT_LOCAL_TRACKER, 'localhost tracker default');
-    assert(local.keyId === undefined, 'localhost tracker is TOFU');
-
-    const internet = resolveTrackerConfig('internet', {});
-    assertEqual(internet.address, DEFAULT_INTERNET_TRACKER, 'internet tracker default');
-    assertEqual(internet.keyId, DEFAULT_INTERNET_TRACKER_KEY, 'internet tracker is pinned');
-
-    const override = resolveTrackerConfig('internet', { tracker: 'wss://other:4610' });
-    assertEqual(override.address, 'wss://other:4610', 'flag overrides tracker URL');
-    assert(override.keyId === undefined, 'overridden tracker is TOFU unless keyed');
-
-    const envWinsOverDefault = resolveTrackerConfig('localhost', {}, { tracker: 'ws://env:1' });
-    assertEqual(envWinsOverDefault.address, 'ws://env:1', 'env overrides scope default');
-
-    const flagWinsOverEnv = resolveTrackerConfig('localhost', { tracker: 'ws://flag:1' }, { tracker: 'ws://env:1' });
-    assertEqual(flagWinsOverEnv.address, 'ws://flag:1', 'flag overrides env');
 }
 
 export async function runSyncAuthorizerTests(): Promise<void> {

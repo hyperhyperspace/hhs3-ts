@@ -3,7 +3,7 @@ import { stderr, stdin, stdout } from "node:process";
 import Database from "better-sqlite3";
 
 import { SqliteTarget } from "@hyper-hyper-space/hhs3_rdb_adapter_sqlite";
-import { stopAllSyncs } from "@hyper-hyper-space/hhs3_rdb_repl";
+import { stopAllProjections, stopAllSyncs } from "@hyper-hyper-space/hhs3_rdb_repl";
 
 import { defaultKeystorePath, KeyStore } from "../src/keys/keystore.js";
 import { startRepl } from "../src/repl/repl.js";
@@ -31,13 +31,11 @@ async function main(): Promise<void> {
     // entry point (interactive REPL, -c, -f, piped stdin) reports them.
     session.onProjectionError = (message) => { stderr.write(message + '\n'); };
 
-    // `\projection ...` backend: a capture-provisioned SQLite file, separate from
-    // the workspace DAG store. A `label` arg is taken as the file path; otherwise
-    // it defaults to a per-database sidecar next to the workspace file.
-    session.projectionTargetFactory = async ({ databaseId, label }) => {
-        const path = label ?? `${workspacePath}.proj-${databaseId.replace(/[^A-Za-z0-9]/g, '_').slice(0, 16)}.sqlite`;
+    // `\project ...` backend: a capture-provisioned SQLite file, separate from
+    // the workspace DAG store. `to <path>` is the file (`:memory:` is allowed).
+    session.projectionTargetFactory = async ({ path }) => {
         // Pass dbPath so the target uses kernel-driven WAL watching (not polling)
-        // to detect local edits waiting in its capture outbox.
+        // to detect local edits waiting in its capture outbox. `:memory:` has no WAL.
         return new SqliteTarget(new Database(path), { captureChanges: true, dbPath: path });
     };
 
@@ -79,8 +77,7 @@ async function main(): Promise<void> {
 
         await startRepl(session);
     } finally {
-        for (const projection of session.projections.values()) await projection.stop();
-        session.projections.clear();
+        await stopAllProjections(session);
         await stopAllSyncs(session);
         await workspace.close();
     }

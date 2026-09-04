@@ -104,6 +104,20 @@ async function collectAll(iter: AsyncIterable<PeerInfo>): Promise<PeerInfo[]> {
     return out;
 }
 
+// A dial-out (empty-address) client under a fresh identity, used to observe the
+// tracker without triggering the client-side self-address filter.
+async function makeQuerier(provider: TransportProvider, serverKp: OwnIdentity): Promise<TrackerClient> {
+    const kp = await makeKeyPair();
+    return new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        trackerKeyId: serverKp.keyId,
+        transportProvider: provider,
+        authenticator: makeAuth(kp),
+        localPeer: { keyId: kp.keyId, addresses: [] },
+        heartbeatInterval: 999_999,
+    });
+}
+
 function delay(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -141,13 +155,18 @@ async function testAnnounceQueryRoundTrip() {
     });
 
     await client.announce(topic, localPeer);
-    const peers = await collectAll(client.discover(topic));
+
+    // Query from a distinct identity: a client filters its own advertised
+    // address out of discovery results (self-dial defense).
+    const querier = await makeQuerier(provider, serverKp);
+    const peers = await collectAll(querier.discover(topic));
 
     testing.assertEquals(peers.length, 1, 'should find one peer');
     testing.assertEquals(peers[0].keyId, clientKp.keyId, 'keyId should match');
     testing.assertEquals(peers[0].addresses[0], 'ws://client:1234', 'address should match');
 
     await client.close();
+    await querier.close();
     server.stop();
 }
 
@@ -223,10 +242,12 @@ async function testTtlClamping() {
 
     await client.announce(topic, localPeer);
     // If announce succeeded, the server clamped without error
-    const peers = await collectAll(client.discover(topic));
+    const querier = await makeQuerier(provider, serverKp);
+    const peers = await collectAll(querier.discover(topic));
     testing.assertEquals(peers.length, 1, 'announce should succeed with clamped TTL');
 
     await client.close();
+    await querier.close();
     server.stop();
 }
 
@@ -304,16 +325,18 @@ async function testExpiredEntriesAreSwept() {
     });
 
     await client.announce(topic, localPeer);
-    const before = await collectAll(client.discover(topic));
+    const querier = await makeQuerier(provider, serverKp);
+    const before = await collectAll(querier.discover(topic));
     testing.assertEquals(before.length, 1, 'should find peer before expiry');
 
     // Wait for TTL + sweep
     await delay(1200);
 
-    const after = await collectAll(client.discover(topic));
+    const after = await collectAll(querier.discover(topic));
     testing.assertEquals(after.length, 0, 'should find no peers after expiry + sweep');
 
     await client.close();
+    await querier.close();
     server.stop();
 }
 
@@ -358,23 +381,27 @@ async function testMultipleClientsSeeEachOther() {
     await c1.announce(topic, peer1);
     await c2.announce(topic, peer2);
 
+    // Each client sees the other but filters itself (self-dial defense).
     const fromC1 = await collectAll(c1.discover(topic));
     const fromC2 = await collectAll(c2.discover(topic));
 
-    testing.assertEquals(fromC1.length, 2, 'client1 should see both peers');
-    testing.assertEquals(fromC2.length, 2, 'client2 should see both peers');
+    testing.assertEquals(fromC1.length, 1, 'client1 should see the other peer, not itself');
+    testing.assertEquals(fromC1[0].keyId, client2Kp.keyId, 'client1 sees client2');
+    testing.assertEquals(fromC2.length, 1, 'client2 should see the other peer, not itself');
+    testing.assertEquals(fromC2[0].keyId, client1Kp.keyId, 'client2 sees client1');
 
-    const keyIds1 = fromC1.map(p => p.keyId).sort();
-    const keyIds2 = fromC2.map(p => p.keyId).sort();
+    // A neutral observer still sees both registrations.
+    const observer = await makeQuerier(provider, serverKp);
+    const fromObserver = await collectAll(observer.discover(topic));
+    const observed = fromObserver.map(p => p.keyId).sort();
     const expected = [client1Kp.keyId, client2Kp.keyId].sort();
-
-    testing.assertEquals(keyIds1[0], expected[0], 'c1 sees correct peer A');
-    testing.assertEquals(keyIds1[1], expected[1], 'c1 sees correct peer B');
-    testing.assertEquals(keyIds2[0], expected[0], 'c2 sees correct peer A');
-    testing.assertEquals(keyIds2[1], expected[1], 'c2 sees correct peer B');
+    testing.assertEquals(fromObserver.length, 2, 'observer sees both peers');
+    testing.assertEquals(observed[0], expected[0], 'observer sees correct peer A');
+    testing.assertEquals(observed[1], expected[1], 'observer sees correct peer B');
 
     await c1.close();
     await c2.close();
+    await observer.close();
     server.stop();
 }
 

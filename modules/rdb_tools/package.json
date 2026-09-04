@@ -31,6 +31,7 @@
     "@hyper-hyper-space/hhs3_rdb_runtime": "^0.1.0",
     "@hyper-hyper-space/hhs3_mesh": "^0.1.0",
     "@hyper-hyper-space/hhs3_mesh_folder_discovery": "^0.1.0",
+    "@hyper-hyper-space/hhs3_mesh_node": "^0.1.0",
     "@hyper-hyper-space/hhs3_mesh_tracker_client": "^0.1.0",
     "@hyper-hyper-space/hhs3_mesh_ws": "^0.1.0",
     "@hyper-hyper-space/hhs3_replica": "^0.1.0",

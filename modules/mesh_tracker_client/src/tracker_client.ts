@@ -6,6 +6,7 @@
 import type {
     TopicId, PeerInfo, PeerDiscovery,
     NetworkAddress, TransportProvider, PeerAuthenticator,
+    Transport, AuthenticatedChannel,
 } from '@hyper-hyper-space/hhs3_mesh';
 import type { KeyId } from '@hyper-hyper-space/hhs3_crypto';
 import {
@@ -13,6 +14,9 @@ import {
     type TrackerRequest, type TrackerResponse,
     type AnnounceRequest, type QueryRequest, type LeaveRequest,
 } from './protocol.js';
+import { TRACE_TRACKER, trace } from './trace.js';
+
+export const DEFAULT_EXCHANGE_TIMEOUT_MS = 5_000;
 
 export interface TrackerClientConfig {
     trackerAddress: NetworkAddress;
@@ -22,6 +26,7 @@ export interface TrackerClientConfig {
     localPeer: PeerInfo;
     announceTtl?: number;
     heartbeatInterval?: number;
+    timeoutMs?: number;
 }
 
 const DEFAULT_TTL = 180;
@@ -35,9 +40,14 @@ export class TrackerClient implements PeerDiscovery {
     private readonly localPeer: PeerInfo;
     private readonly requestedTtl: number;
     private readonly heartbeatMs: number;
+    private readonly timeoutMs: number;
 
     private activeTopics = new Map<TopicId, number>();
     private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+    // One in-flight connect-on-demand exchange at a time. Overlapping
+    // handshakes can drop the first post-handshake frame (browser \sync fetch
+    // raced announce vs query). Failures must not stall the chain.
+    private chain: Promise<void> = Promise.resolve();
 
     constructor(config: TrackerClientConfig) {
         this.address = config.trackerAddress;
@@ -47,6 +57,7 @@ export class TrackerClient implements PeerDiscovery {
         this.localPeer = config.localPeer;
         this.requestedTtl = config.announceTtl ?? DEFAULT_TTL;
         this.heartbeatMs = config.heartbeatInterval ?? DEFAULT_HEARTBEAT_MS;
+        this.timeoutMs = config.timeoutMs ?? DEFAULT_EXCHANGE_TIMEOUT_MS;
     }
 
     // -- PeerDiscovery ---------------------------------------------------------
@@ -64,9 +75,24 @@ export class TrackerClient implements PeerDiscovery {
         let count = 0;
         for (const peer of peers) {
             if (targetPeers !== undefined && count >= targetPeers) break;
-            yield peer;
+            const filtered = this.stripSelf(peer);
+            if (filtered === undefined) continue;
+            yield filtered;
             count++;
         }
+    }
+
+    // Defense-in-depth against self-dial: a tracker returns everyone registered
+    // for a topic, including us. Drop our own advertised addresses for our key;
+    // if nothing remains, drop the peer entirely. Same key at a different
+    // address (multi-device) still passes through.
+    private stripSelf(peer: PeerInfo): PeerInfo | undefined {
+        if (peer.keyId !== this.localPeer.keyId) return peer;
+        const addresses = peer.addresses.filter(
+            (addr) => !this.localPeer.addresses.includes(addr),
+        );
+        if (addresses.length === 0) return undefined;
+        return { keyId: peer.keyId, addresses };
     }
 
     async announce(topic: TopicId, _self: PeerInfo): Promise<void> {
@@ -107,26 +133,75 @@ export class TrackerClient implements PeerDiscovery {
 
     // -- internal -------------------------------------------------------------
 
+    /** Enqueue an exchange so announce/query/leave/heartbeat never overlap. */
+    private exchange(req: TrackerRequest): Promise<TrackerResponse> {
+        const run = this.chain.then(() => this.exchangeOnce(req));
+        this.chain = run.then(() => {}, () => {});
+        return run;
+    }
+
     /** Connect, register a response listener, send the request, await the
-     *  response, then close. A macrotask yield after authentication gives
-     *  the responder time to finish its handshake and register its message
-     *  handler (needed with synchronous transports where the Noise initiator
-     *  completes before the responder). */
-    private async exchange(req: TrackerRequest): Promise<TrackerResponse> {
-        const raw = await this.transport.connect(this.address);
-        const channel = await this.authenticator.authenticate(
-            raw, 'initiator', this.trackerKeyId,
-        );
+     *  response, then close. Timeout is measured here, not while queued.
+     *  A macrotask yield after authentication gives the responder time to
+     *  finish its handshake and register its message handler (needed with
+     *  synchronous transports where the Noise initiator completes before
+     *  the responder). */
+    private async exchangeOnce(req: TrackerRequest): Promise<TrackerResponse> {
+        let raw: Transport | undefined;
+        let channel: AuthenticatedChannel | undefined;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const started = Date.now();
+        const fields = exchangeFields(req, this.address);
+        if (TRACE_TRACKER) trace('tracker.exchange start', fields);
+
+        const timeout = new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+                try { channel?.close(); } catch { /* ignore */ }
+                try { raw?.close(); } catch { /* ignore */ }
+                reject(new Error(`tracker exchange timed out after ${this.timeoutMs}ms`));
+            }, this.timeoutMs);
+        });
+
+        const work = (async () => {
+            raw = await this.transport.connect(this.address);
+            channel = await this.authenticator.authenticate(
+                raw, 'initiator', this.trackerKeyId,
+            );
+            try {
+                await new Promise(resolve => setTimeout(resolve, 0));
+                const responsePromise = new Promise<TrackerResponse>((resolve, reject) => {
+                    channel!.onMessage((data) => resolve(decodeResponse(data)));
+                    channel!.onClose(() => reject(new Error('channel closed before response')));
+                });
+                channel.send(encodeMessage(req));
+                return await responsePromise;
+            } finally {
+                channel.close();
+            }
+        })();
+
         try {
-            await new Promise(resolve => setTimeout(resolve, 0));
-            const responsePromise = new Promise<TrackerResponse>((resolve, reject) => {
-                channel.onMessage((data) => resolve(decodeResponse(data)));
-                channel.onClose(() => reject(new Error('channel closed before response')));
-            });
-            channel.send(encodeMessage(req));
-            return await responsePromise;
+            const res = await Promise.race([work, timeout]);
+            if (TRACE_TRACKER) {
+                const extra: Record<string, unknown> = { ...fields, ms: Date.now() - started };
+                if (res.type === 'query_response') {
+                    extra.peers = Object.values(res.results).reduce((n, list) => n + list.length, 0);
+                }
+                trace('tracker.exchange ok', extra);
+            }
+            return res;
+        } catch (err) {
+            if (TRACE_TRACKER) {
+                trace('tracker.exchange fail', {
+                    ...fields,
+                    ms: Date.now() - started,
+                    err: err instanceof Error ? err.message : String(err),
+                });
+            }
+            throw err;
         } finally {
-            channel.close();
+            if (timer !== undefined) clearTimeout(timer);
+            void work.catch(() => {});
         }
     }
 
@@ -168,4 +243,11 @@ export class TrackerClient implements PeerDiscovery {
             // transient failure; will retry on next tick
         }
     }
+}
+
+function exchangeFields(req: TrackerRequest, addr: NetworkAddress): Record<string, unknown> {
+    if (req.type === 'announce') {
+        return { op: req.type, topic: req.entries.map((e) => e.topic), addr };
+    }
+    return { op: req.type, topic: req.topics, addr };
 }

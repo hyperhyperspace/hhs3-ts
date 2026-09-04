@@ -1511,8 +1511,8 @@ const tests = [
                     'folder backup is present',
                 );
                 assertTrue(
-                    builtA.announcedAddresses.every((a) => a.startsWith('ws://127.0.0.1:') && !a.endsWith(':0')),
-                    `announced a concrete loopback port (${builtA.announcedAddresses.join(', ')})`,
+                    builtA.listenAddresses.every((a) => a.startsWith('ws://127.0.0.1:') && !a.endsWith(':0')),
+                    `listens on a concrete loopback port (${builtA.listenAddresses.join(', ')})`,
                 );
                 assertTrue(
                     !builtA.listenAddresses.some((a) => a.includes('0.0.0.0')),
@@ -1522,11 +1522,11 @@ const tests = [
                 const topic = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=';
                 await builtA.discovery.announce(topic, {
                     keyId: alice.keyId,
-                    addresses: builtA.announcedAddresses,
+                    addresses: builtA.listenAddresses,
                 });
                 await builtB.discovery.announce(topic, {
                     keyId: bob.keyId,
-                    addresses: builtB.announcedAddresses,
+                    addresses: builtB.listenAddresses,
                 });
 
                 const found: string[] = [];

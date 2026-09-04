@@ -1,6 +1,3 @@
-import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
-import type { BidirectionalTarget } from "@hyper-hyper-space/hhs3_rdb_adapter";
-import type { RdbProjection } from "@hyper-hyper-space/hhs3_rdb_projection";
 import {
     RdbSession,
     type KeyVault,
@@ -10,17 +7,11 @@ import {
     type SessionView,
 } from "@hyper-hyper-space/hhs3_rdb_runtime";
 
+import type { ProjectionTargetFactory, ProjectSessionEntry } from "./projection/types.js";
 import type { SyncMeshFactory, SyncSessionEntry } from "./sync/types.js";
 
 export type OutputMode = 'table' | 'json' | 'vertical';
 export type HashWidth = 'auto' | 'full' | number;
-
-// Host-injected factory for the relational projection backend. The core repl is
-// browser-safe and engine-agnostic, so a host that wants `\projection` commands
-// supplies the concrete BidirectionalTarget: rdb_tools opens a SQLite file,
-// rdb_repl_web uses an in-memory target. Absent => projection commands report
-// that no backend is configured.
-export type ProjectionTargetFactory = (info: { databaseId: B64Hash; label?: string }) => Promise<BidirectionalTarget>;
 
 // Host-injected sink for asynchronous projection notices (reactive sync throws
 // and ingest-rejection warnings). Kept as a plain string callback so the core
@@ -53,11 +44,12 @@ export class ReplSession extends RdbSession {
     promptForKeys: boolean;
     stopOnError: boolean;
 
-    // Host-injected projection backend factory + the active projections, keyed
-    // by database id (managed by the `\projection` meta commands).
+    // Host-injected projection backend factory + the active \\project sessions,
+    // keyed by a session-global incrementing id that is never reused after stop.
     projectionTargetFactory?: ProjectionTargetFactory;
     onProjectionError?: ProjectionErrorHandler;
-    readonly projections = new Map<B64Hash, RdbProjection>();
+    readonly projections = new Map<number, ProjectSessionEntry>();
+    nextProjectId = 1;
 
     // Host-injected mesh factory + the active \\sync sessions, keyed by a
     // session-global incrementing id that is never reused after stop.

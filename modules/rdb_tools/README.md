@@ -63,6 +63,11 @@ C-SQL statements terminate with `;` (multi-line and paste supported). Backslash 
 \dump schema|group|database <name> [full|schema]
 \dump op [group] #hash          reverse-render one group op
 \delta schema|group <name> <start> <end>
+\project start <db> as <id> to <path>
+\project status [<db>]  \project stop|update|events <id>
+\sync start <db> as <id> [allow …] on localhost|internet
+\sync fetch #<rdb-id> as <id> on localhost|internet
+\sync status [<db>]  \sync stop <id>  \sync peers <id>
 \quit
 ```
 

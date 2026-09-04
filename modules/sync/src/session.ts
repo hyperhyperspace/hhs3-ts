@@ -10,6 +10,7 @@ import { createDagSynchronizer } from './synchronizer.js';
 import type { DagProvider } from './provider.js';
 import type { DagSynchronizer } from './synchronizer.js';
 import type { SyncMsg, InitResponse } from './protocol.js';
+import { TRACE_SYNC, trace } from './trace.js';
 
 export type SendResult = 'sent' | 'closed' | 'error';
 
@@ -55,6 +56,7 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[]): SyncSess
     const issueCallbacks: Array<(peerKey: string, issue: PeerIssue) => void> = [];
 
     function reportIssue(peerKey: string, issue: PeerIssue) {
+        if (TRACE_SYNC) trace('sync.issue', { peer: peerKey, issue });
         for (const cb of issueCallbacks) cb(peerKey, issue);
     }
 
@@ -97,6 +99,7 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[]): SyncSess
     function cleanupPeer(key: string) {
         if (!activePeers.has(key)) return;
         activePeers.delete(key);
+        if (TRACE_SYNC) trace('sync.peer remove', { dag: target.dagId, peer: key });
         provider.cancelPeer(key);
         synchronizer.removePeer(key);
     }
@@ -105,14 +108,42 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[]): SyncSess
         return `${sp.keyId}@${sp.endpoint}`;
     }
 
+    async function handleInitRequest(sp: SwarmPeer, key: string): Promise<void> {
+        const rootEntry = await target.dag.loadEntry(target.dagId);
+        if (!activePeers.has(key) || rootEntry === undefined) return;
+
+        const payloadType = extractCreatePayloadType(rootEntry.payload);
+        if (payloadType !== target.rObject.getType()) {
+            reportIssue(key, 'validation-failed');
+            return;
+        }
+        const resp: InitResponse = {
+            type: 'init-response',
+            objectId: target.dagId,
+            createPayload: rootEntry.payload,
+        };
+        if (TRACE_SYNC) {
+            trace('sync.init send', { objectId: target.dagId, peer: key });
+        }
+        if (sp.channel.open) sp.channel.send(encode(resp));
+    }
+
     function onPeerJoin(sp: SwarmPeer) {
         const key = peerKeyOf(sp);
         if (activePeers.has(key)) return;
 
         const handle: PeerHandle = { key, channel: sp.channel };
         activePeers.set(key, handle);
+        if (TRACE_SYNC) trace('sync.peer add', { dag: target.dagId, peer: key });
 
-        sp.channel.onMessage((data: Uint8Array) => {
+        // Per-peer inbound FIFO: message N fully settles before N+1 starts.
+        // Isolates the auto-payload race where payload frames arrived during
+        // handleHeaderBatch's loadHeader awaits and were dropped.
+        let chain: Promise<void> = Promise.resolve();
+
+        async function processMessage(data: Uint8Array): Promise<void> {
+            if (!activePeers.has(key)) return;
+
             let msg: SyncMsg;
             try {
                 msg = decode(data);
@@ -122,28 +153,17 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[]): SyncSess
             }
 
             if (msg.type === 'init-request' && msg.objectId === target.dagId) {
-                target.dag.loadEntry(target.dagId).then(rootEntry => {
-                    if (rootEntry !== undefined) {
-                        const payloadType = extractCreatePayloadType(rootEntry.payload);
-                        if (payloadType !== target.rObject.getType()) {
-                            reportIssue(key, 'validation-failed');
-                            return;
-                        }
-                        const resp: InitResponse = {
-                            type: 'init-response',
-                            objectId: target.dagId,
-                            createPayload: rootEntry.payload,
-                        };
-                        sp.channel.send(encode(resp));
-                    }
-                });
+                await handleInitRequest(sp, key);
                 return;
             }
-
             if (REQUEST_TYPES.has(msg.type) || msg.type === 'new-frontier') {
                 provider.handleMessage(msg, sp.channel);
             }
-            synchronizer.handleMessage(msg, sp.channel);
+            await synchronizer.handleMessage(msg, sp.channel);
+        }
+
+        sp.channel.onMessage((data: Uint8Array) => {
+            chain = chain.then(() => processMessage(data)).catch(() => { /* isolate */ });
         });
 
         sp.channel.onClose(() => {

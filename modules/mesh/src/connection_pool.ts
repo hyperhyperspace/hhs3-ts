@@ -10,6 +10,7 @@ import type { TopicId } from './discovery.js';
 import {
     TopicChannel, encodeTopicMessage, decodeMessage, MSG_TYPE_TOPIC, MSG_TYPE_CONTROL,
 } from './mux.js';
+import { TRACE_MESH, trace } from './trace.js';
 
 export function connectionKey(keyId: KeyId, endpoint: NetworkAddress): string {
     return `${keyId}@${endpoint}`;
@@ -71,10 +72,12 @@ export class ConnectionPool {
 
         this.connections.set(key, conn);
         this.installDispatch(key, conn);
+        if (TRACE_MESH) trace('mesh.pool add', { peer: key, size: this.connections.size });
 
         channel.onClose(() => {
             this.connections.delete(key);
             this.closeTopicsForConnection(key);
+            if (TRACE_MESH) trace('mesh.pool drop', { peer: key, size: this.connections.size });
             for (const cb of this.disconnectCallbacks) cb(key);
         });
 

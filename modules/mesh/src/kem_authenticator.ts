@@ -18,6 +18,7 @@ import {
 } from '@hyper-hyper-space/hhs3_crypto';
 import type { Transport } from './transport.js';
 import type { AuthenticatedChannel, PeerAuthenticator } from './authenticator.js';
+import { TRACE_MESH, trace } from './trace.js';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -424,15 +425,34 @@ export function createAuthenticator(config: AuthenticatorConfig): PeerAuthentica
             role: 'initiator' | 'responder',
             expectedRemote?: KeyId,
         ): Promise<AuthenticatedChannel> {
+            const started = Date.now();
             const queue = new MessageQueue(transport);
-            if (role === 'initiator') {
-                return handshakeAsInitiator(
-                    transport, queue, localKey, signing, kemPrefs, kdf, aead, expectedRemote,
-                );
-            } else {
-                return handshakeAsResponder(
-                    transport, queue, localKey, signing, kemPrefs, kdf, aead,
-                );
+            try {
+                const channel = role === 'initiator'
+                    ? await handshakeAsInitiator(
+                        transport, queue, localKey, signing, kemPrefs, kdf, aead, expectedRemote,
+                    )
+                    : await handshakeAsResponder(
+                        transport, queue, localKey, signing, kemPrefs, kdf, aead,
+                    );
+                if (TRACE_MESH) {
+                    trace('mesh.handshake ok', {
+                        role,
+                        remote: channel.remoteKeyId,
+                        ms: Date.now() - started,
+                    });
+                }
+                return channel;
+            } catch (err) {
+                if (TRACE_MESH) {
+                    trace('mesh.handshake fail', {
+                        role,
+                        remote: expectedRemote,
+                        ms: Date.now() - started,
+                        err: err instanceof Error ? err.message : String(err),
+                    });
+                }
+                throw err;
             }
         },
     };

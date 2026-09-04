@@ -13,6 +13,7 @@ import type {
     PayloadMsg,
     SyncMsg,
 } from './protocol.js';
+import { TRACE_SYNC, trace } from './trace.js';
 
 const HEADER_BATCH_SIZE    = 128;
 const PAYLOAD_BURST_SIZE   = 1024;
@@ -153,6 +154,14 @@ export function createDagProvider(dag: Dag): DagProvider {
         const { request, headers, complete } = resp;
         let autoPayloadHashes: B64Hash[] | undefined;
 
+        if (TRACE_SYNC) {
+            trace('sync.provide headers', {
+                dag: request.dagId,
+                peer: pk,
+                n: headers.length,
+            });
+        }
+
         if (request.autoPayload && complete) {
             autoPayloadHashes = headers.map(h => h.hash).reverse();
         }
@@ -183,7 +192,8 @@ export function createDagProvider(dag: Dag): DagProvider {
                     headers: batch,
                 };
                 trySend(channel, msg);
-                return false;
+                if (offset < headers.length) return false;
+                // last batch sent: fall through and enqueue auto-payloads
             }
 
             if (autoPayloadHashes !== undefined && autoPayloadHashes.length > 0) {
@@ -253,6 +263,10 @@ export function createDagProvider(dag: Dag): DagProvider {
         channel: TopicChannel,
     ) {
         const { requestId, hashes } = resp;
+
+        if (TRACE_SYNC) {
+            trace('sync.provide payloads', { peer: pk, n: hashes.length });
+        }
 
         const meta: PayloadResponseMeta = {
             type: 'payload-response-meta',

@@ -9,11 +9,12 @@
 import type { KeyId } from '@hyper-hyper-space/hhs3_crypto';
 import type { PeerInfo, PeerDiscovery, TopicId } from './discovery.js';
 import type { NetworkAddress } from './transport.js';
-import { ConnectionPool } from './connection_pool.js';
+import { ConnectionPool, connectionKey } from './connection_pool.js';
 import {
     encodeControlTopicInterest, decodeControlPayload,
     CTRL_TOPIC_ACCEPT, CTRL_TOPIC_REJECT,
 } from './mux.js';
+import { TRACE_MESH, trace } from './trace.js';
 
 const DEFAULT_TIMEOUT_MS = 5_000;
 
@@ -65,14 +66,31 @@ export class PoolReuseDiscovery implements PeerDiscovery {
             if (this.pool.hasTopicChannel(conn.peerId, conn.endpoint, topic)) continue;
             if (this.rejected.has(`${conn.peerId}@${conn.endpoint}#${topic}`)) continue;
 
+            const started = Date.now();
             try {
                 conn.channel.send(encodeControlTopicInterest(topic));
                 const accepted = await this.waitForResponse(conn.peerId, conn.endpoint, topic);
+                if (TRACE_MESH) {
+                    trace('mesh.reuse probe', {
+                        topic,
+                        peer: connectionKey(conn.peerId, conn.endpoint),
+                        result: accepted ? 'accept' : 'reject',
+                        ms: Date.now() - started,
+                    });
+                }
                 if (accepted) {
                     count++;
                     yield { keyId: conn.peerId, addresses: [conn.endpoint] };
                 }
             } catch {
+                if (TRACE_MESH) {
+                    trace('mesh.reuse probe', {
+                        topic,
+                        peer: connectionKey(conn.peerId, conn.endpoint),
+                        result: 'timeout',
+                        ms: Date.now() - started,
+                    });
+                }
                 continue;
             }
         }
