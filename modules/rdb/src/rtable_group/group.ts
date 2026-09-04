@@ -623,7 +623,7 @@ export class RTableGroupImpl implements RTableGroupContract {
         // A cycle on the authorization-recursion stack: DENY (least fixpoint —
         // the whole cycle is treated as voided). The guard is transient, so
         // this only fires within one top-level computation (see the field note).
-        if (this._voidVisiting.has(key)) {console.log('cycle', key); return true};
+        if (this._voidVisiting.has(key)) return true;
 
         this._voidVisiting.add(key);
         try {
