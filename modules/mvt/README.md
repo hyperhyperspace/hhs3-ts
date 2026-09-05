@@ -116,7 +116,7 @@ type RObject = {
     // inter-DAG dependency discovery (used by the sync layer)
     extractForeignDeps(payload: Payload, at: Version): ForeignDep[] | undefined;
 
-    subscribe(callback: (version: Version) => void): void;
+    subscribe(callback: (version: Version) => void): Promise<void>;
     unsubscribe(callback: (version: Version) => void): void;
 
     getBackendLabel(): string;
@@ -127,7 +127,7 @@ type RObject = {
 - `Version` is a DAG position — a set of entry hashes representing a point in the causal history.
 - `Payload` is a JSON literal, the unit of replication.
 - `View` is a read-only snapshot of the object's state at a given version, when observed from another version (see below).
-- `subscribe`/`unsubscribe` register reactivity callbacks: the callback receives the raw DAG frontier (`Version`) whenever the object's own sub-DAG advances (never on sibling changes). Register first, then read the current state to establish a cursor; at-least-once delivery follows any later change. See [Reactivity](#reactivity) for the full contract and concurrency guarantees.
+- `subscribe`/`unsubscribe` register reactivity callbacks: the callback receives the raw DAG frontier (`Version`) whenever the object's own sub-DAG advances (never on sibling changes). **Await `subscribe`** (the DAG listener is armed when it resolves), then read the current state to establish a cursor; at-least-once delivery follows any later change. See [Reactivity](#reactivity) for the full contract and concurrency guarantees.
 - `ForeignDep` identifies another **RObject** (`objectId`) plus entry hashes on that object's scoped history that must be present before a payload can be validated. Lookup is `getObject(objectId)` then `getScopedDag().loadEntry` — never `getDag(objectId)`. The sync layer uses `extractForeignDeps` to defer (rather than reject) entries whose cross-object dependencies are not yet available, and retries when the referenced object grows (`subscribe`) or appears (`subscribeNewObject`).
 - `computeDelta` reports what changed between two versions (type-specific `Delta` implementation).
 - `getScopedDag` returns this object's logical history surface (`ScopedDag`), including `loadAllEntries` for full scans at the correct scope.
@@ -260,12 +260,12 @@ Because each layer arms the layer below it only while it holds a listener, an ob
 ### Consumer contract
 
 ```typescript
-obj.subscribe(onChange);           // 1. register first
+await obj.subscribe(onChange);     // 1. await until the DAG listener is armed
 const view = await obj.getView();  // 2. then read to establish your cursor
 // 3. onChange(version) fires at-least-once for every later change
 ```
 
-- **Register, then read.** Subscribing first and *then* taking a baseline read guarantees you cannot miss a change that lands in the gap.
+- **Await subscribe, then read.** `subscribe` returns `Promise<void>` that resolves once this object's scoped listener is on the DAG. Reading the baseline after that promise resolves guarantees you cannot miss a change that lands in the attach gap. `unsubscribe` stays synchronous.
 - **At-least-once, deduplicate yourself.** A callback may fire more than once for the same change, and the delivered `entries` may be a superset of the strictly-new ones (e.g. a local commit that is also re-observed by the external monitor). Consumers track how far they have ingested (a `Version` cursor) and pull deltas / de-duplicate / debounce as they see fit.
 - **Scoped, never spurious across siblings.** The callback fires only when *this* object's scope advances — never for changes to sibling objects sharing the same physical DAG.
 - **Raw version delivered.** The callback receives the DAG frontier, not a computed delta. React by calling `computeDelta(cursor, version)` (or `getView`) to learn what actually changed.

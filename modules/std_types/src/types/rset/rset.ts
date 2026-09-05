@@ -558,8 +558,8 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
         return this._subscription;
     }
 
-    subscribe(callback: (version: Version) => void): void {
-        this.subscription().subscribe(callback);
+    subscribe(callback: (version: Version) => void): Promise<void> {
+        return this.subscription().subscribe(callback);
     }
 
     unsubscribe(callback: (version: Version) => void): void {

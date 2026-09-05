@@ -326,8 +326,8 @@ export class RDbImpl implements RDbContract, SyncableObject {
         return this._subscription;
     }
 
-    subscribe(callback: (version: Version) => void): void {
-        this.subscription().subscribe(callback);
+    subscribe(callback: (version: Version) => void): Promise<void> {
+        return this.subscription().subscribe(callback);
     }
 
     unsubscribe(callback: (version: Version) => void): void {
@@ -373,7 +373,7 @@ export class RDbImpl implements RDbContract, SyncableObject {
         try {
             await this.getScopedDag();
             if (!this.isCurrent(epoch)) throw new SyncAbortedError();
-            this.subscribe(this.onMembershipChange);
+            await this.subscribe(this.onMembershipChange);
             this.attachNewObjectListener();
             // The first pass sets up the reachable part and registers pending
             // creates; it does NOT block on a schema advancing to a pinned
@@ -700,6 +700,20 @@ export class RDbImpl implements RDbContract, SyncableObject {
 
         if (this.syncSessions.has(id)) return;
 
+        if (id !== this.createOpId && !this.watchedObjects.has(id)) {
+            try {
+                await rObject.subscribe(this.onDepChange);
+            } catch (err) {
+                rObject.unsubscribe(this.onDepChange);
+                throw err;
+            }
+            if (!this.isCurrent(epoch) || this.syncSessions.has(id)) {
+                rObject.unsubscribe(this.onDepChange);
+                return;
+            }
+            this.watchedObjects.set(id, rObject);
+        }
+
         const swarm = mesh.createSwarm(id, {
             authorizer: this.runtimeConfig.authorizer,
         });
@@ -720,11 +734,6 @@ export class RDbImpl implements RDbContract, SyncableObject {
             }
             this.syncSessions.set(id, { swarm, session });
             swarm.activate();
-
-            if (id !== this.createOpId && !this.watchedObjects.has(id)) {
-                rObject.subscribe(this.onDepChange);
-                this.watchedObjects.set(id, rObject);
-            }
         } catch (err) {
             session?.destroy();
             swarm.destroy();

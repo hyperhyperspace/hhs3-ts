@@ -101,7 +101,7 @@ export class RdbProjection {
         const p = new RdbProjection(rdb, ctx, target, options);
         await p.reconfigure();
         await p.sync();   // initial materialization (awaited; rethrows on failure)
-        p.arm();
+        await p.arm();
         return p;
     }
 
@@ -226,14 +226,14 @@ export class RdbProjection {
             const id = group.getId();
             if (this.groupCallbacks.has(id)) continue;
             const cb = (): void => this.schedule();
-            group.subscribe(cb);
+            await group.subscribe(cb);
             this.groupCallbacks.set(id, { group, cb });
         }
     }
 
-    private arm(): void {
+    private async arm(): Promise<void> {
         this.rdbCallback = (): void => { void this.onMembershipChange(); };
-        this.rdb.subscribe(this.rdbCallback);
+        await this.rdb.subscribe(this.rdbCallback);
         if (isChangeSignalSource(this.target)) {
             this.changeListener = (): void => this.schedule();
             this.target.addChangeListener(this.changeListener);

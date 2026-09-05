@@ -58,7 +58,7 @@ export interface RSet<T extends json.Literal = json.Literal> extends RObject, Sy
     extractForeignDeps(payload: Payload, at: Version): ForeignDep[] | undefined;
     loadRCap(): Promise<RCap | undefined>;
 
-    subscribe(callback: (version: Version) => void): void;
+    subscribe(callback: (version: Version) => void): Promise<void>;
     unsubscribe(callback: (version: Version) => void): void;
     setDeltaStrategy(strategy: "full" | "bounded"): void;
     computeDelta(start: Version, end: Version): Promise<Delta>;

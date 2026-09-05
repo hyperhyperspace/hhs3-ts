@@ -95,10 +95,11 @@ export type RObject = {
 
     // Reactivity. The callback receives the raw DAG frontier (Version) whenever
     // this object's own sub-DAG advances -- never on sibling changes. Consumers
-    // deduplicate by their own cursor and pull deltas/views as needed. Register
-    // the callback first, then read the current state to establish a cursor:
-    // at-least-once delivery follows any subsequent change.
-    subscribe(callback: (version: Version) => void): void;
+    // deduplicate by their own cursor and pull deltas/views as needed. Await
+    // subscribe (the DAG listener is armed when it resolves), then read the
+    // current state to establish a cursor: at-least-once delivery follows any
+    // subsequent change.
+    subscribe(callback: (version: Version) => void): Promise<void>;
     unsubscribe(callback: (version: Version) => void): void;
 
     getBackendLabel(): string;
@@ -198,15 +199,19 @@ export class ScopedDagSubscription {
     private callbacks = new Set<(version: Version) => void>();
     private scopedDag: ScopedDag | undefined = undefined;
     private listener: ((growth: { frontier: Version }) => void) | undefined = undefined;
+    private attachGate: Promise<void> | undefined = undefined;
+    private attachGen = 0;
 
     constructor(private readonly scopedDagProvider: () => Promise<ScopedDag>) {}
 
-    subscribe(callback: (version: Version) => void): void {
-        const wasEmpty = this.callbacks.size === 0;
+    subscribe(callback: (version: Version) => void): Promise<void> {
         this.callbacks.add(callback);
-        if (wasEmpty) {
-            void this.attach();
+        if (this.listener !== undefined) return Promise.resolve();
+        if (this.attachGate === undefined) {
+            const gen = ++this.attachGen;
+            this.attachGate = this.attach(gen);
         }
+        return this.attachGate;
     }
 
     unsubscribe(callback: (version: Version) => void): void {
@@ -216,21 +221,29 @@ export class ScopedDagSubscription {
         }
     }
 
-    private async attach(): Promise<void> {
-        if (this.listener !== undefined) return;
-        const scopedDag = await this.scopedDagProvider();
-        // Guard the async gap: a fast subscribe/unsubscribe may have emptied the
-        // set, or another attach may have won the race.
-        if (this.callbacks.size === 0 || this.listener !== undefined) return;
+    private async attach(gen: number): Promise<void> {
+        try {
+            if (this.listener !== undefined) return;
+            const scopedDag = await this.scopedDagProvider();
+            // Guard the async gap: a fast subscribe/unsubscribe may have emptied the
+            // set, or another attach may have won the race.
+            if (this.callbacks.size === 0 || this.listener !== undefined) return;
 
-        const listener = (growth: { frontier: Version }) => {
-            for (const cb of [...this.callbacks]) {
-                try { cb(growth.frontier); } catch (_e) { /* keep firing even if a callback throws */ }
+            const listener = (growth: { frontier: Version }) => {
+                for (const cb of [...this.callbacks]) {
+                    try { cb(growth.frontier); } catch (_e) { /* keep firing even if a callback throws */ }
+                }
+            };
+            this.listener = listener;
+            this.scopedDag = scopedDag;
+            scopedDag.addListener(listener);
+        } finally {
+            // Generation check: unsubscribe-all + a fresh subscribe can start gate B
+            // while stale gate A is still awaiting; A must not clear B when it bails.
+            if (this.listener === undefined && this.attachGen === gen) {
+                this.attachGate = undefined;
             }
-        };
-        this.listener = listener;
-        this.scopedDag = scopedDag;
-        scopedDag.addListener(listener);
+        }
     }
 
     private detach(): void {
@@ -238,6 +251,9 @@ export class ScopedDagSubscription {
             this.scopedDag.removeListener(this.listener);
         }
         this.listener = undefined;
+        this.scopedDag = undefined;
+        this.attachGate = undefined;
+        this.attachGen++;
     }
 }
 

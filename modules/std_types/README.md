@@ -27,7 +27,7 @@ Each type lives in its own directory under `src/types/<type>/` and is split into
 
 `view.ts` and `delta.ts` depend only on `interfaces.ts`, not on the concrete impl class in `<type>.ts`, so there is no import cycle with the main file.
 
-Both types are `RObject`s and expose `subscribe(callback: (version: Version) => void)` for reactivity, delegating to MVT's shared subscription machinery — see [mvt Reactivity](../mvt#reactivity).
+Both types are `RObject`s and expose `subscribe(callback: (version: Version) => void): Promise<void>` for reactivity, delegating to MVT's shared subscription machinery — see [mvt Reactivity](../mvt#reactivity). Await `subscribe` (the DAG listener is armed when it resolves), then read.
 
 `RSet` additionally has **`hash.ts`**, a shared helper for element hashing used by the main file, validation, and the view.
 

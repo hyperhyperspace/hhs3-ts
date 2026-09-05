@@ -260,14 +260,18 @@ export function createDagSynchronizer(
 
     async function watchRef(obj: RObject): Promise<void> {
         const id = obj.getId();
-        if (refSubs.has(id)) return;
-        const cb = () => { if (!destroyed) attemptWork(); };
-        obj.subscribe(cb);
-        refSubs.set(id, { obj, cb });
-        // Subscribe-then-read: wait for ScopedDagSubscription.attach (async
-        // getScopedDag + addListener) before the caller checks loadEntry.
-        await obj.getScopedDag();
-        await Promise.resolve();
+        let entry = refSubs.get(id);
+        if (entry === undefined) {
+            entry = { obj, cb: () => { if (!destroyed) attemptWork(); } };
+            refSubs.set(id, entry);
+        }
+        try {
+            await obj.subscribe(entry.cb);
+        } catch (e) {
+            refSubs.delete(id);
+            obj.unsubscribe(entry.cb);
+            throw e;
+        }
     }
 
     function ensureNewObjectListener() {

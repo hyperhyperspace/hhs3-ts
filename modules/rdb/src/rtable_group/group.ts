@@ -959,8 +959,8 @@ export class RTableGroupImpl implements RTableGroupContract {
         return this._subscription;
     }
 
-    subscribe(callback: (version: Version) => void): void {
-        this.subscription().subscribe(callback);
+    subscribe(callback: (version: Version) => void): Promise<void> {
+        return this.subscription().subscribe(callback);
     }
 
     unsubscribe(callback: (version: Version) => void): void {

@@ -1,4 +1,4 @@
-import { RContext, RootScopedDag, Version, version } from "@hyper-hyper-space/hhs3_mvt";
+import { RContext, RootScopedDag, Version } from "@hyper-hyper-space/hhs3_mvt";
 import { RSet, rSetFactory } from "../src/types/rset/rset.js";
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { createMockRContext } from "./mock_rcontext.js";
@@ -7,13 +7,6 @@ function createTestCtx(): RContext {
     const ctx = createMockRContext({ selfValidate: true });
     ctx.getRegistry().register(RSet.typeId, rSetFactory);
     return ctx;
-}
-
-// Let the lazy, async subscription machinery attach/detach and let any pending
-// growth callbacks run. subscribe() arms its listener on a microtask that
-// awaits getScopedDag(); a macrotask turn flushes that reliably.
-function flush(): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 function versionsEqual(a: Version, b: Version): boolean {
@@ -52,12 +45,10 @@ export const subscribeTests = {
                 let aCount = 0;
                 let bCount = 0;
 
-                outerSet.subscribe(() => { outerCount++; });
-                setA.subscribe(() => { aCount++; });
-                setB.subscribe(() => { bCount++; });
+                await outerSet.subscribe(() => { outerCount++; });
+                await setA.subscribe(() => { aCount++; });
+                await setB.subscribe(() => { bCount++; });
 
-                // Register first, then establish a baseline read (per the consumer contract).
-                await flush();
                 await outerSet.getView();
                 await setA.getView();
                 await setB.getView();
@@ -65,7 +56,6 @@ export const subscribeTests = {
                 const outerBefore = outerCount;
 
                 await setA.add('only-in-a');
-                await flush();
 
                 assertTrue(aCount >= 1, 'the mutated nested set A should be notified');
                 assertTrue(outerCount > outerBefore, 'the ancestor (root) set should be notified of nested growth');
@@ -125,13 +115,11 @@ export const subscribeTests = {
 
                 let notifications = 0;
                 let lastVersion: Version | undefined = undefined;
-                set.subscribe((v: Version) => { notifications++; lastVersion = v; });
+                await set.subscribe((v: Version) => { notifications++; lastVersion = v; });
 
-                await flush();
                 const baseline = await set.getScopedDag().then((sd) => sd.getFrontier());
 
                 const addHash = await set.add('hello');
-                await flush();
 
                 assertTrue(notifications >= 1, 'at least one notification should follow the change');
                 assertTrue(lastVersion !== undefined, 'the notification should carry a version');

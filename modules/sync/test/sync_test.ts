@@ -132,7 +132,7 @@ function createMockRObject(d: dag.Dag, id: B64Hash, opts?: {
         getScopedDag: async () => scoped,
         getCausalDag: async () => d,
         extractForeignDeps: opts?.extractForeignDeps ?? ((_payload: Payload, _at: Version) => undefined),
-        subscribe: (cb: (version: Version) => void) => { subscription.subscribe(cb); },
+        subscribe: (cb: (version: Version) => void) => subscription.subscribe(cb),
         unsubscribe: (cb: (version: Version) => void) => { subscription.unsubscribe(cb); },
         destroy: async () => {},
     };

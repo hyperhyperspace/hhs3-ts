@@ -24,7 +24,7 @@ export interface RCap extends RObject, SyncableObject {
     applyPayload(payload: Payload, at: Version): Promise<B64Hash>;
     getView(at?: Version, from?: Version): Promise<RCapView>;
     extractForeignDeps(payload: Payload, at: Version): ForeignDep[] | undefined;
-    subscribe(callback: (version: Version) => void): void;
+    subscribe(callback: (version: Version) => void): Promise<void>;
     unsubscribe(callback: (version: Version) => void): void;
 
     setDeltaStrategy(strategy: "full" | "bounded"): void;
