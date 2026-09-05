@@ -1,15 +1,17 @@
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
-import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
+import type { B64Hash, KeyId, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
+import { json } from "@hyper-hyper-space/hhs3_json";
 import type { RContext, Version } from "@hyper-hyper-space/hhs3_mvt";
-import { formatValidationFailure, ValidationRejectedError } from "@hyper-hyper-space/hhs3_mvt";
+import { formatValidationFailure, signPayload, ValidationRejectedError } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
 import { RTableGroupImpl, rTableGroupFactory } from "../src/rtable_group/group.js";
+import { deriveRowId } from "../src/rtable/hash.js";
 import type { Predicate, TableDef } from "../src/rschema/payload.js";
 import {
-    usersSchemaTables, identityRow, capRow, revokeCap,
+    usersSchemaTables, identityRow, capRow, grantCap, revokeCap,
     IDENTITIES_TABLE, CAPS_TABLE, USERS_MANAGER_LABEL, USERS_SCHEMA_NAME,
     USERS_BINDING, USERS_IDENTITIES_PROVIDER,
 } from "../src/users/users.js";
@@ -51,6 +53,20 @@ async function expectThrow(fn: () => Promise<unknown>, why: string, messageInclu
 const MUST_BE_MANAGER: Predicate = {
     p: 'exists', table: CAPS_TABLE, where: { label: USERS_MANAGER_LABEL, grantee: '$author' },
 };
+
+// A signed caps-insert row envelope (for direct validatePayload assertions):
+// granting `grantee` a manager cap, authored by `author` (valid only while the
+// author holds a live manager cap — the insert restriction gates on it).
+async function authoredManagerCapInsert(
+    uuid: string, grantee: KeyId, author: OwnIdentity,
+): Promise<json.LiteralMap> {
+    const base = {
+        action: 'insert', rowId: deriveRowId(uuid, author.keyId), uuid,
+        values: { label: USERS_MANAGER_LABEL, grantee },
+    };
+    const op = await signPayload(base as unknown as json.LiteralMap, author);
+    return { action: 'row', table: CAPS_TABLE, op: op as unknown as json.Literal };
+}
 
 // A Users group whose genesis carries an identity row for every `identities`
 // member and a root manager cap for every `managers` member. Putting identities
@@ -283,6 +299,74 @@ export const rtableObserveGateTests = {
                 await compareGroupDeltaStrategies(a.group, genesis, end, { seed: 0, start: genesis, end });
                 assertTrue(await a.group.isEntryVoided(hP, end),
                     'the back-dated former-principal observe is voided in the parity history too');
+            },
+        },
+        {
+            // Regression for the transient payload-validation rejection: two
+            // independent void computations on the SAME cached group instance
+            // (a caps read and a canObserve-gate evaluation, plus a cap-insert
+            // validation) interleave at await points. With the old per-instance
+            // `_voidVisiting` Set, one computation could observe the other's
+            // transient visiting mark for the same (entry, from) and falsely
+            // conclude a cycle — voiding a live manager cap and flipping the
+            // result to empty/false/invalid at some phase offset. With the
+            // per-computation VoidClosure each computation is isolated, so all
+            // results are deterministically live.
+            name: '[OBSGATE07] interleaved concurrent void computations on one shared group instance never cross-talk',
+            invoke: async () => {
+                const ctx = newCtx();
+                const admin = await makeIdentity();   // genesis manager
+                const m2 = await makeIdentity();       // genesis identity; granted a manager cap post-genesis
+                const b = await makeUsers(ctx, 'og07-b', { identities: [admin, m2], managers: [admin] });
+
+                // grant m2 a manager cap via a NON-genesis, restriction-gated
+                // insert: this is the entry whose voiding the shared guard could
+                // falsely trigger under interleaving.
+                const capX = await grantCap(b.group, admin, m2.keyId, USERS_MANAGER_LABEL);
+                assertTrue(capX !== undefined, 'admin grants m2 a manager cap');
+
+                // a gated doc group: its canObserve gate reads the users caps in
+                // the users frame, so evaluating it runs void computations on the
+                // SAME cached users instance as the direct caps reads below.
+                const a = await makeApp(ctx, 'og07-a', b.group.getId(), { gated: true });
+
+                const at = await frontier(b.group);
+                const usersId = b.group.getId();
+
+                // a signed cap insert authored by m2 (valid only while m2's
+                // manager cap X is live) — a third concurrent void consumer.
+                const newGrantee = await makeIdentity();
+                const capInsert = await authoredManagerCapInsert('og07-x', newGrantee.keyId, m2);
+
+                // Fan out many interleaved computations at the same anchor,
+                // each staggered by 0..4 microtask hops so the phase offset
+                // between the shared reads varies (the memory store is
+                // microtask-only, so the chains interleave in lockstep).
+                const ITER = 40;
+                const hop = async (n: number) => { for (let h = 0; h < n; h++) await Promise.resolve(); };
+                const tasks: Promise<void>[] = [];
+                for (let i = 0; i < ITER; i++) {
+                    tasks.push((async () => {
+                        await hop(i % 5);
+                        const caps = await (await b.group.getView(at, at)).getTableView(CAPS_TABLE);
+                        const found = await caps.findRowIds({ label: USERS_MANAGER_LABEL, grantee: m2.keyId });
+                        assertTrue(found.length > 0,
+                            `iter ${i}: m2's manager cap must be found (a dropped/shared VoidClosure falsely voids it)`);
+                    })());
+                    tasks.push((async () => {
+                        await hop((i + 2) % 5);
+                        const ok = await a.group.evaluateObserveGate(usersId, m2.keyId, at, at);
+                        assertTrue(ok,
+                            `iter ${i}: m2 must pass the manager observe gate (a dropped/shared VoidClosure falsely fails it)`);
+                    })());
+                    tasks.push((async () => {
+                        await hop((i + 4) % 5);
+                        const result = await b.group.validatePayload(capInsert, at);
+                        assertTrue(result.valid,
+                            `iter ${i}: a cap insert authored by manager m2 must validate (a dropped/shared VoidClosure falsely rejects it)`);
+                    })());
+                }
+                await Promise.all(tasks);
             },
         },
     ],

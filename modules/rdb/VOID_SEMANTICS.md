@@ -87,11 +87,16 @@ extension ≈ stable model; an odd attack cycle has no stable extension).
 
 ## 4. What ships today: deny the whole cycle, no cache
 
-`isEntryVoided` keeps a single transient cycle guard (`_voidVisiting`, a set of
-`entryHash|fromKey` keys), added before recursing and removed in `finally`. On a
-back-edge it returns `true` — **the entire cycle is treated as voided**, both
-positive and negative. This is the conservative least fixpoint for the positive
-fragment and a deliberate, safe collapse for the negative fragment.
+`isEntryVoided` keeps a transient cycle guard: a set of
+`createOpId|entryHash|fromKey` keys carried in a per-computation `VoidClosure`
+(see [src/rtable_group/void_closure.ts](src/rtable_group/void_closure.ts)),
+added before recursing and removed in `finally`. On a back-edge it returns
+`true` — **the entire cycle is treated as voided**, both positive and negative.
+This is the conservative least fixpoint for the positive fragment and a
+deliberate, safe collapse for the negative fragment. The keys are
+group-namespaced (prefixed by `createOpId`) so one closure flowing across a
+bound-group boundary keeps each group's marks distinct — an A→B→A ring still
+DENIES without a shared cross-group guard.
 
 Worked example — 2-party mutual revoke (`[PERM12]`): co-admins A and B
 concurrently revoke each other.
@@ -120,7 +125,9 @@ the final answer depends on query order — and query order can differ across
 replicas. Removing the cache makes each top-level computation self-contained and
 a pure function of `(entry, from)`: every replica agrees. The guard is transient
 (per-computation) precisely so it can detect a cycle *within* one computation
-without persisting anything *across* computations.
+without persisting anything *across* computations — which is exactly why the
+visiting set lives in a per-computation `VoidClosure` and not on the group
+instance (see §5).
 
 A previous iteration shipped a `(entry, from)` cache plus a 2-party
 seniority special case (senior cap survives). It was removed because the cache
@@ -130,20 +137,39 @@ analysis below is the principled version that special case was reaching for.
 Group delta's op channel attaches structured void reasons via `explainEntryVoided`
 (a sibling of `isEntryVoided` sharing the same `diagnoseEntryVoided` traversal).
 
-## 5. Reentrancy note
+## 5. Reentrancy: the per-computation VoidClosure
 
-`_voidVisiting` is an instance field mutated across `await` points. JS is
-single-threaded, so this is not a data race, but it *is* an async-reentrancy
-hazard: two interleaved void computations on the same group instance would share
-one set. Predicate evaluation elsewhere on the read path is strictly sequential
-(`for … await`; no `Promise.all`). `executeLog` in rdb_lang was updated to
-iterate log rows sequentially as well, so the invariant "void computations are
-never interleaved per group instance" is upheld by callers today but not enforced
-by the engine. If concurrent void evaluation is ever desired, carry the visiting
-set as a per-computation value (e.g. stored on the `RTableViewImpl` recursion
-context and threaded through the two recursive view-construction sites in
-`computeEntryVoided` and `resolveForeignTableView`) instead of as an instance
-field.
+The visiting set is a **per-computation value**, not an instance field. An
+earlier version kept it as `RTableGroupImpl._voidVisiting` (one `Set` per group
+instance) and relied on the invariant "void computations are never interleaved
+per group instance." That invariant was NOT enforced by the engine and did not
+hold: two independent top-level evaluations on the same *cached* group instance
+(e.g. a synchronizer validating a payload while another validates a gated
+observe, both anchored at the same version) interleave at `await` points, and
+because `Replica.getObject` returns one shared instance, one computation could
+observe the other's transient visiting mark and falsely detect a cycle — voiding
+a live witness row and rejecting a valid write nondeterministically.
+
+The fix carries the visiting set in a `VoidClosure`
+([src/rtable_group/void_closure.ts](src/rtable_group/void_closure.ts)) minted at
+each top-level entry (`isEntryVoided` / `explainEntryVoided` / `getView` /
+`resolveForeignTableView` / `evaluateObserveGate`) and threaded — mandatory —
+through every `*Closure` helper and every `RTableViewImpl` those helpers build
+(the constructor requires it). Interleaved computations get distinct closures,
+so they cannot cross-talk; the type system enforces threading, since every
+internal function and the view constructor take a non-optional `closure`.
+Convention (greppable): a `*Closure` body may only call other `*Closure` helpers
+or `new RTableViewImpl(..., closure)`, never a minting wrapper.
+
+The residual hole the types cannot close is internal code accidentally calling a
+minting wrapper (legal TypeScript). A dropped closure does not corrupt a verdict;
+on cyclic data it recurses forever through fresh closures — an unbounded
+microtask chain that never yields, so a `setTimeout` test timeout would never
+fire. A per-instance in-flight frame counter (`_voidInflight`, bumped on each
+`isEntryVoidedClosure` / `explainEntryVoidedClosure` entry, released in
+`finally`) throws past `VOID_MAX_INFLIGHT`, turning that hang into an immediate,
+self-explaining error. It is a fail-safe, never a verdict: additive under
+concurrency and far above any legitimate recursion depth.
 
 ## 5.5 The gated observe: stratification by the observed version
 
@@ -186,7 +212,7 @@ stratification exists *here* but not in general.
 
 - **Benign concurrent observes** (G-incomparable versions, no revoke): neither
   is G-above the other, so neither recurses into the other — both live, and the
-  `_voidVisiting` guard never fires. (Equating `barrier` with negative edge
+  closure's visiting guard never fires. (Equating `barrier` with negative edge
   would have over-stratified and voided both — see §2.)
 - **Back-dated former-principal observe** (attack 1): the legit revoke-import
   publishes a strictly-G-greater version, so it widens the back-dated op's cut
@@ -206,15 +232,16 @@ and Layer 2's monotone union neutralizes his authority the instant the revoke is
 co-observed. A third-party concurrent cross-revoke (C revokes A, D revokes B,
 cross-carried) is the one irreducible even cycle with `G`-incomparable versions;
 it has no causal stratification and falls back to the existing
-**deny-the-whole-cycle** collapse via `_voidVisiting` (all-survive, convergent),
-exactly as a mutual intra-group revoke does (§4). The guard therefore remains as
-a backstop, but in the entire use-before-revoke regime it is dormant.
+**deny-the-whole-cycle** collapse via the closure's visiting set (all-survive,
+convergent), exactly as a mutual intra-group revoke does (§4). The guard
+therefore remains as a backstop, but in the entire use-before-revoke regime it
+is dormant.
 
 ### Where it lives
 
-`computeObserveVoided`, `resolveObserveGateRefAt` (the G-upward filtered
-widening), `evaluateObserveGate` (frame rebasing into `G`), and the
-`filterVoided` path of `resolveForeignTableView` in
+`diagnoseObserveVoidedClosure`, `resolveObserveGateRefAtClosure` (the G-upward
+filtered widening), `evaluateObserveGateClosure` (frame rebasing into `G`), and
+the `filterVoided` path of `resolveForeignTableViewClosure` in
 [src/rtable_group/group.ts](src/rtable_group/group.ts). The MVT
 `resolveRefVersionAtPosition` `isLive` hook ([modules/mvt/src/refs.ts](../mvt/src/refs.ts))
 is the generic seam for Layer 2.

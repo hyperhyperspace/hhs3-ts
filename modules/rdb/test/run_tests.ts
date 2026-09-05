@@ -64,7 +64,14 @@ async function main() {
             }
 
             if (match) {
-                testing.exitIfFailed(await testing.run(test.name, test.invoke));
+                // A default per-test timeout so a hung test fails the run
+                // instead of blocking CI. Delta-parity sweeps legitimately run
+                // long, so they get a wider bound. NOTE: the void guard's
+                // in-flight fail-safe (group.ts) is what catches a dropped
+                // VoidClosure — that spins purely in microtasks and would never
+                // reach this timer; the timer covers everything that does yield.
+                const timeoutMs = title.indexOf('DELTA_PARITY') >= 0 ? 600_000 : 60_000;
+                testing.exitIfFailed(await testing.run(test.name, test.invoke, { timeoutMs }));
             } else {
                 await testing.skip(test.name);
             }

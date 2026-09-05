@@ -1,9 +1,27 @@
 
 
-async function run(name:string, test: () => Promise<void>, options?: {silent?: boolean}) {
+async function run(name:string, test: () => Promise<void>, options?: {silent?: boolean, timeoutMs?: number}) {
     console.log("\nRunning \"" + name + "\"");
     try {
-        await test();
+        // A `timeoutMs` fails a hung test instead of blocking the whole run.
+        // Note this only catches tests that eventually yield to the macrotask
+        // queue; a pure-microtask spin (e.g. a lost recursion guard) never
+        // reaches the timer and must be caught by an in-loop fail-safe instead.
+        if (options?.timeoutMs !== undefined) {
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const timeout = new Promise<never>((_, reject) => {
+                timer = setTimeout(
+                    () => reject(new Error(`test "${name}" timed out after ${options.timeoutMs}ms`)),
+                    options.timeoutMs);
+            });
+            try {
+                await Promise.race([test(), timeout]);
+            } finally {
+                if (timer !== undefined) clearTimeout(timer);
+            }
+        } else {
+            await test();
+        }
         if (!options?.silent) {
             console.log("Success");
         }

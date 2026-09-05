@@ -66,6 +66,7 @@ import type { RSchemaView } from "../rschema/interfaces.js";
 import { deriveRowOpInnerMeta } from "../rtable_group/scopes.js";
 import type { RowEnvelopePayload } from "../rtable_group/payload.js";
 import type { OpVoidDetail } from "../rtable_group/op_void.js";
+import { VoidClosure, freshVoidClosure } from "../rtable_group/void_closure.js";
 
 import type { RTable as RTableContract, RTableView as RTableViewContract, RowValues } from "./interfaces.js";
 import { InsertRowPayload, UpdateRowPayload, DeleteRowPayload, RowOpPayload } from "./payload.js";
@@ -88,10 +89,8 @@ export type TableGroupHost = {
     validatePayload(payload: Payload, at: Version): Promise<ValidationResult>;
     makeTable(name: string): RTableImpl;
     isEntryVoided(entryHash: B64Hash, from: Version): Promise<boolean>;
+    isEntryVoidedClosure(closure: VoidClosure, entryHash: B64Hash, from: Version): Promise<boolean>;
     explainEntryVoided(entryHash: B64Hash, from: Version): Promise<OpVoidDetail | undefined>;
-    resolveForeignTableView(
-        group: string, table: string, at: Version, from: Version,
-    ): Promise<RTableViewContract | undefined>;
 };
 
 export class RTableImpl implements RTableContract {
@@ -124,18 +123,16 @@ export class RTableImpl implements RTableContract {
         return this.group.resolveSchemaView(at, from);
     }
 
-    // A cross-group FK / exists target: the group resolves it through the
-    // bound foreign group at the observed foreign version (see group.ts).
-    resolveForeignTableView(
-        group: string, table: string, at: Version, from: Version,
-    ): Promise<RTableViewContract | undefined> {
-        return this.group.resolveForeignTableView(group, table, at, from);
-    }
-
     // Entry voiding is the group's computation (an entry may carry ops for
-    // several tables and voids as a unit); see isEntryVoided in group.ts.
+    // several tables and voids as a unit); see isEntryVoided in group.ts. The
+    // closure-threaded variant is what views built inside a void computation
+    // call; the bare public ones mint a fresh closure through the group.
     isEntryVoided(entryHash: B64Hash, from: Version): Promise<boolean> {
         return this.group.isEntryVoided(entryHash, from);
+    }
+
+    isEntryVoidedClosure(closure: VoidClosure, entryHash: B64Hash, from: Version): Promise<boolean> {
+        return this.group.isEntryVoidedClosure(closure, entryHash, from);
     }
 
     explainEntryVoided(entryHash: B64Hash, from: Version) {
@@ -146,7 +143,7 @@ export class RTableImpl implements RTableContract {
     // view-time restriction recheck — see view.ts). An undeleted but FK-hidden
     // row is still a valid update target (it can be repaired).
     async baseHasRow(rowId: B64Hash, at: Version): Promise<boolean> {
-        return new RTableViewImpl(this, at, at).hasRowBase(rowId);
+        return new RTableViewImpl(this, at, at, freshVoidClosure()).hasRowBase(rowId);
     }
 
     // Row writers. `at` defaults to the GROUP frontier: by default a write
@@ -239,7 +236,8 @@ export class RTableImpl implements RTableContract {
         at = at ?? frontier;
         from = from ?? frontier;
 
-        return new RTableViewImpl(this, at, from);
+        // top-level read: mint a fresh per-computation void closure.
+        return new RTableViewImpl(this, at, from, freshVoidClosure());
     }
 
     // A nested table never leads a delta (the group orchestrates bounds + walk);

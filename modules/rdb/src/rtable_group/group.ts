@@ -80,6 +80,7 @@ import { RTableViewImpl } from "../rtable/view.js";
 import type { RTableGroup as RTableGroupContract, RTableGroupView as RTableGroupViewContract, BundleWrite } from "./interfaces.js";
 import { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload, RTABLE_GROUP_TYPE_ID } from "./payload.js";
 import { TableScope, deriveCreateMeta, deriveEnvelopeMeta, deriveBundleMeta } from "./scopes.js";
+import { VoidClosure, freshVoidClosure, VOID_MAX_INFLIGHT } from "./void_closure.js";
 import { validateTableGroupPayload } from "./validate_ops.js";
 import { evaluatePredicate, explainRowOpRestriction, explainRowOpFKReach } from "./predicates.js";
 import type { OpVoidDetail } from "./op_void.js";
@@ -210,13 +211,36 @@ export class RTableGroupImpl implements RTableGroupContract {
     // of which node a top-level query first touches. A delete-vs-delete negation
     // cycle (mutual revocation) therefore resolves to BOTH deletes voided (both
     // caps survive) — the conservative least fixpoint, not a single survivor.
+    //
+    // The visiting set lives in a PER-COMPUTATION VoidClosure (see
+    // void_closure.ts), NOT on the instance: one closure is minted at each
+    // top-level entry and threaded, mandatory, through every `*Closure` helper
+    // and every RTableViewImpl they build. This is what makes the guard safe
+    // under interleaved async evaluations on the same cached group instance — a
+    // shared instance Set let one computation observe another's transient
+    // visiting mark and falsely detect a cycle. Convention: a `*Closure` body
+    // may only call other `*Closure` helpers or `new RTableViewImpl(..., closure)`,
+    // never a minting wrapper. Keys are group-namespaced (createOpId | entry |
+    // from), so one closure flowing into a bound foreign group keeps today's
+    // per-group cycle semantics (an A->B->A ring still DENIES) without a shared
+    // cross-group guard.
+    //
     // NOTE: there is deliberately NO memo cache here. A cache keyed only by
     // (entry, from) would leak a traversal-dependent intermediate verdict across
-    // independent top-level queries and break replica convergence; the guard
-    // below is transient (added before recursing, removed in finally), so it
+    // independent top-level queries and break replica convergence; the visiting
+    // mark is transient (added before recursing, removed in finally), so it
     // only ever detects a cycle within ONE computation. See VOID_SEMANTICS.md
     // for the logic-program framing and the future stratified/seniority design.
-    private _voidVisiting: Set<string> = new Set();
+    //
+    // `_voidInflight` is a FAIL-SAFE, not a verdict: the type system forces a
+    // closure onto every `*Closure` helper, but internal code could still call
+    // a minting wrapper by mistake, which on cyclic data would recurse forever
+    // through fresh closures (an unbounded microtask chain no timer can
+    // interrupt). The counter (bumped on each isEntryVoidedClosure /
+    // explainEntryVoidedClosure entry, released in finally) throws past
+    // VOID_MAX_INFLIGHT so such a bug surfaces as an immediate error, not a
+    // hang. It is additive under concurrency and never affects a verdict.
+    private _voidInflight = 0;
 
     // Memoized inverse of the (injective) bindings map: group id -> binding
     // name. Injectivity is enforced at create-validation, so the inverse is a
@@ -357,19 +381,32 @@ export class RTableGroupImpl implements RTableGroupContract {
     // Throws only if the bound group OBJECT is not present in the replica.
     //
     // FK reach across the group boundary recurses through the foreign group's
-    // own least-fixpoint void guard (each group's _voidVisiting self-
-    // terminates), so a mutual A->B->A FK ring resolves to DENY without a
-    // shared cross-group guard.
+    // own least-fixpoint void guard (each group's per-closure visiting set
+    // self-terminates), so a mutual A->B->A FK ring resolves to DENY without a
+    // shared cross-group guard. The group-namespaced keys keep the marks of A
+    // and B distinct within the one closure that flows across the boundary.
+    //
+    // Public entry: mints a fresh void closure (validation / view / auth call
+    // sites are top-level and never filter voided observes, so this wrapper
+    // hard-codes filterVoided=false). The internal, closure-threaded variant is
+    // resolveForeignTableViewClosure.
+    async resolveForeignTableView(
+        groupName: string, table: string, at: Version, from: Version,
+    ): Promise<RTableView | undefined> {
+        return this.resolveForeignTableViewClosure(freshVoidClosure(), groupName, table, at, from, false);
+    }
+
+    // Cross-group table resolution threaded with the caller's void closure.
     //
     // `filterVoided` (view-time enforcement only): drop observations VOIDED at
     // this `from` from the observed-version fold (Layer 2 of the observe gate),
     // so a back-dated observation by a former principal contributes no foreign
-    // state. Validation / view / authentication call sites leave it false (the
-    // geometric resolution); only computeEntryVoided enables it. Note the
+    // state. Only the void computation (diagnoseEntryVoidedClosure) enables it;
+    // the public wrapper leaves it false (the geometric resolution). Note the
     // observed `from` stays geometric: voided-observe filtering is an `at`-fold
     // property (which versions participate), not a negative-evidence horizon.
-    async resolveForeignTableView(
-        groupName: string, table: string, at: Version, from: Version, filterVoided: boolean = false,
+    async resolveForeignTableViewClosure(
+        closure: VoidClosure, groupName: string, table: string, at: Version, from: Version, filterVoided: boolean,
     ): Promise<RTableView | undefined> {
         const groupId = this.getBindings()[groupName];
         if (groupId === undefined) return undefined;   // unbound name
@@ -377,24 +414,24 @@ export class RTableGroupImpl implements RTableGroupContract {
         const foreign = await this.loadForeignGroup(groupId, groupName);
 
         const dag = await this.getScopedDag();
-        const isLive = filterVoided ? (h: B64Hash) => this.isObserveLive(groupId, h, from) : undefined;
+        const isLive = filterVoided ? (h: B64Hash) => this.isObserveLiveClosure(closure, groupId, h, from) : undefined;
         const foreignAt = await resolveRefVersionAtPosition(dag, groupId, at, from, isLive);
         const foreignFrom = await resolveRefVersionAtPosition(dag, groupId, from, from);
 
         const foreignSchema = await foreign.resolveSchemaView(foreignAt, foreignFrom);
         if (!foreignSchema.hasTable(table)) return undefined;   // missing table
 
-        return new RTableViewImpl(foreign.makeTable(table), foreignAt, foreignFrom);
+        return new RTableViewImpl(foreign.makeTable(table), foreignAt, foreignFrom, closure);
     }
 
     // Whether the observation entry `entryHash` (a ref-advance of bound group
     // `groupId`) is LIVE at this `from` horizon: ungated bindings are always
     // live; a gated binding consults the at-use observe gate (the negation of
     // isEntryVoided's verdict for the observe). Used as the `isLive` filter for
-    // the Layer 2 observed-version fold.
-    private async isObserveLive(groupId: B64Hash, entryHash: B64Hash, from: Version): Promise<boolean> {
+    // the Layer 2 observed-version fold; threaded with the caller's closure.
+    private async isObserveLiveClosure(closure: VoidClosure, groupId: B64Hash, entryHash: B64Hash, from: Version): Promise<boolean> {
         if (this.observeGateFor(groupId) === undefined) return true;   // ungated
-        return !await this.isEntryVoided(entryHash, from);
+        return !await this.isEntryVoidedClosure(closure, entryHash, from);
     }
 
     // Evaluate a binding's canObserve gate in the OBSERVED group's frame
@@ -402,17 +439,25 @@ export class RTableGroupImpl implements RTableGroupContract {
     // group's tables at the observed foreign version (refAt, refFrom). 'object'
     // context (no subject row). Returns true when the binding is ungated. Both
     // the validation path and the at-use path call this with their own anchors.
+    // Public entry: mints a fresh void closure. The internal, closure-threaded
+    // variant is evaluateObserveGateClosure.
     async evaluateObserveGate(
         refId: B64Hash, author: KeyId | undefined, refAt: Version, refFrom: Version,
+    ): Promise<boolean> {
+        return this.evaluateObserveGateClosure(freshVoidClosure(), refId, author, refAt, refFrom);
+    }
+
+    async evaluateObserveGateClosure(
+        closure: VoidClosure, refId: B64Hash, author: KeyId | undefined, refAt: Version, refFrom: Version,
     ): Promise<boolean> {
         const gate = this.observeGateFor(refId);
         if (gate === undefined) return true;   // ungated binding
 
         const foreign = await this.loadForeignGroup(refId, this.bindingNameForId(refId));
         return evaluatePredicate(gate, {
-            getTableView: (table) => foreign.makeTable(table).getView(refAt, refFrom),
+            getTableView: async (table) => new RTableViewImpl(foreign.makeTable(table), refAt, refFrom, closure),
             getForeignTableView: (groupName, table) =>
-                foreign.resolveForeignTableView(groupName, table, refAt, refFrom),
+                foreign.resolveForeignTableViewClosure(closure, groupName, table, refAt, refFrom, false),
             author,
             context: 'object',
         });
@@ -429,7 +474,7 @@ export class RTableGroupImpl implements RTableGroupContract {
     // never recurse into each other. A negative edge (a revoke of this observe's
     // author) rides a strictly-dominating version under use-before-revoke, so
     // restricting to G-upward loses no security-relevant widening.
-    async resolveObserveGateRefAt(refId: B64Hash, opPos: Version, from: Version): Promise<Version> {
+    async resolveObserveGateRefAtClosure(closure: VoidClosure, refId: B64Hash, opPos: Version, from: Version): Promise<Version> {
         const dag = await this.getScopedDag();
         const base = await resolveRefVersionAtPosition(dag, refId, opPos, opPos);   // causal base (no widening)
 
@@ -448,7 +493,7 @@ export class RTableGroupImpl implements RTableGroupContract {
             const below = await refVersionAtOrAbove(foreignDag, base, vz);
             if (below) continue;   // equal / not strict -> not a widening candidate
 
-            if (await this.isEntryVoided(z, from)) continue;   // skip voided concurrent observes
+            if (await this.isEntryVoidedClosure(closure, z, from)) continue;   // skip voided concurrent observes
 
             for (const h of vz) refAt.add(h);
         }
@@ -496,14 +541,17 @@ export class RTableGroupImpl implements RTableGroupContract {
 
         const [groupName, table] = splitTableRef(providerRef);
         if (groupName === undefined) {
-            return new RTableViewImpl(this.makeTable(table), at, at).rawProviderPublicKey(keyId);
+            // liveness-bypassed provider read: rawProviderPublicKey never
+            // reaches the void guard, but the view constructor requires a
+            // closure, so mint a throwaway one.
+            return new RTableViewImpl(this.makeTable(table), at, at, freshVoidClosure()).rawProviderPublicKey(keyId);
         }
 
         const groupId = this.getBindings()[groupName];
         if (groupId === undefined) return undefined;   // unbound (create-time validated; defensive)
         const foreign = await this.loadForeignGroup(groupId, groupName);   // missing object -> throw -> defer
         const foreignAt = await this.resolveObservedForeignVersion(groupId, at, at);
-        return new RTableViewImpl(foreign.makeTable(table), foreignAt, foreignAt).rawProviderPublicKey(keyId);
+        return new RTableViewImpl(foreign.makeTable(table), foreignAt, foreignAt, freshVoidClosure()).rawProviderPublicKey(keyId);
     }
 
     // Deploy: THE schema deploy moment — a barrier ref-advance of the schema
@@ -614,39 +662,69 @@ export class RTableGroupImpl implements RTableGroupContract {
     // or schema/observation revisions can still void the entry. Written FK
     // columns use the same view-time path. Bundles are all-or-nothing. The
     // genesis create entry is fiat (never voided);
-    // ref-advances carry no row restrictions. Memoized per (entry, from);
-    // a cycle on the authorization-recursion stack DENIES (treated as voided —
-    // least fixpoint; see the _voidVisiting note above).
+    // ref-advances carry no row restrictions. A cycle on the
+    // authorization-recursion stack DENIES (treated as voided — least fixpoint;
+    // see the closure note above). Public entry: mints a fresh void closure;
+    // the internal, closure-threaded variant is isEntryVoidedClosure.
     async isEntryVoided(entryHash: B64Hash, from: Version): Promise<boolean> {
-        const key = entryHash + '|' + [...from].sort().join(',');
+        return this.isEntryVoidedClosure(freshVoidClosure(), entryHash, from);
+    }
+
+    async isEntryVoidedClosure(closure: VoidClosure, entryHash: B64Hash, from: Version): Promise<boolean> {
+        // group-namespaced key: one closure may span bound foreign groups, and
+        // each group's marks must stay distinct (see the closure note).
+        const key = this.createOpId + '|' + entryHash + '|' + [...from].sort().join(',');
 
         // A cycle on the authorization-recursion stack: DENY (least fixpoint —
-        // the whole cycle is treated as voided). The guard is transient, so
-        // this only fires within one top-level computation (see the field note).
-        if (this._voidVisiting.has(key)) return true;
+        // the whole cycle is treated as voided). The mark is transient, so this
+        // only fires within one computation (this closure).
+        if (closure.visiting.has(key)) return true;
 
-        this._voidVisiting.add(key);
+        closure.visiting.add(key);
         try {
-            return (await this.diagnoseEntryVoided(entryHash, from)) !== undefined;
+            this.enterVoidFrame();
+            return (await this.diagnoseEntryVoidedClosure(closure, entryHash, from)) !== undefined;
         } finally {
-            this._voidVisiting.delete(key);
+            this._voidInflight--;
+            closure.visiting.delete(key);
         }
     }
 
     async explainEntryVoided(entryHash: B64Hash, from: Version): Promise<OpVoidDetail | undefined> {
-        const key = entryHash + '|' + [...from].sort().join(',');
+        return this.explainEntryVoidedClosure(freshVoidClosure(), entryHash, from);
+    }
 
-        if (this._voidVisiting.has(key)) return { kind: 'authorization-cycle' };
+    async explainEntryVoidedClosure(closure: VoidClosure, entryHash: B64Hash, from: Version): Promise<OpVoidDetail | undefined> {
+        const key = this.createOpId + '|' + entryHash + '|' + [...from].sort().join(',');
 
-        this._voidVisiting.add(key);
+        if (closure.visiting.has(key)) return { kind: 'authorization-cycle' };
+
+        closure.visiting.add(key);
         try {
-            return await this.diagnoseEntryVoided(entryHash, from);
+            this.enterVoidFrame();
+            return await this.diagnoseEntryVoidedClosure(closure, entryHash, from);
         } finally {
-            this._voidVisiting.delete(key);
+            this._voidInflight--;
+            closure.visiting.delete(key);
         }
     }
 
-    private async diagnoseEntryVoided(entryHash: B64Hash, from: Version): Promise<OpVoidDetail | undefined> {
+    // Fail-safe (not a verdict): a lost closure would recurse forever through
+    // fresh closures — an unbounded microtask chain no timer can interrupt — so
+    // bound the in-flight void frames and throw past it, turning the hang into
+    // an immediate, self-explaining error. Called as the first statement inside
+    // the try, so the caller's finally always balances the increment (even on
+    // the throw). See void_closure.ts.
+    private enterVoidFrame(): void {
+        if (++this._voidInflight > VOID_MAX_INFLIGHT) {
+            throw new Error(
+                `void recursion exceeded VOID_MAX_INFLIGHT (${VOID_MAX_INFLIGHT}) frames ` +
+                `— a VoidClosure was almost certainly dropped (a *Closure helper called a ` +
+                `minting wrapper instead of threading its closure)`);
+        }
+    }
+
+    private async diagnoseEntryVoidedClosure(closure: VoidClosure, entryHash: B64Hash, from: Version): Promise<OpVoidDetail | undefined> {
         if (entryHash === this.createOpId) return undefined;   // genesis fiat
 
         const scopedDag = await this.getScopedDag();
@@ -655,7 +733,7 @@ export class RTableGroupImpl implements RTableGroupContract {
 
         const payload = entry.payload as json.LiteralMap;
         if (isRefAdvancePayload(payload)) {
-            return this.diagnoseObserveVoided(payload as unknown as RefAdvancePayload, entryHash, from);
+            return this.diagnoseObserveVoidedClosure(closure, payload as unknown as RefAdvancePayload, entryHash, from);
         }
 
         const ops: { table: string; op: RowOpPayload }[] = [];
@@ -673,9 +751,9 @@ export class RTableGroupImpl implements RTableGroupContract {
 
         const opPos = version(entryHash);
         const schemaView = await this.resolveSchemaView(opPos, from);
-        const getTableView = (table: string) => this.makeTable(table).getView(opPos, from);
+        const getTableView = async (table: string) => new RTableViewImpl(this.makeTable(table), opPos, from, closure);
         const getForeignTableView = (group: string, table: string) =>
-            this.resolveForeignTableView(group, table, opPos, from, true);
+            this.resolveForeignTableViewClosure(closure, group, table, opPos, from, true);
 
         const selfInserted = new Map<string, Set<B64Hash>>();
         const selfDeleted = new Map<string, Set<B64Hash>>();
@@ -740,8 +818,8 @@ export class RTableGroupImpl implements RTableGroupContract {
         return undefined;
     }
 
-    private async diagnoseObserveVoided(
-        payload: RefAdvancePayload, entryHash: B64Hash, from: Version,
+    private async diagnoseObserveVoidedClosure(
+        closure: VoidClosure, payload: RefAdvancePayload, entryHash: B64Hash, from: Version,
     ): Promise<OpVoidDetail | undefined> {
         const refId = payload.refId;
         if (refId === this.getSchemaRef()) return undefined;
@@ -750,11 +828,11 @@ export class RTableGroupImpl implements RTableGroupContract {
 
         const dag = await this.getScopedDag();
         const opPos = version(entryHash);
-        const refAt = await this.resolveObserveGateRefAt(refId, opPos, from);
+        const refAt = await this.resolveObserveGateRefAtClosure(closure, refId, opPos, from);
         const refFrom = await resolveRefVersionAtPosition(dag, refId, from, from);
         const author = extractAuthor(payload as unknown as json.LiteralMap);
 
-        const ok = await this.evaluateObserveGate(refId, author, refAt, refFrom);
+        const ok = await this.evaluateObserveGateClosure(closure, refId, author, refAt, refFrom);
         if (ok) return undefined;
 
         const binding = this.bindingNameForId(refId);

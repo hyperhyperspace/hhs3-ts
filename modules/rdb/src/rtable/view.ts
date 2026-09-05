@@ -69,23 +69,23 @@ import type { RSchemaView } from "../rschema/interfaces.js";
 import type { IncarnationId } from "../rschema/incarnation.js";
 import type { ColumnType, Operand } from "../rschema/payload.js";
 import { colTag, rowTag, type RowsSlicePayload } from "../rtable_group/scopes.js";
+import type { VoidClosure } from "../rtable_group/void_closure.js";
 
 import type { RTable, RTableView, Row, RowValues, DeltaRowState } from "./interfaces.js";
 import type { InsertRowPayload, RowOpPayload } from "./payload.js";
 import type { ColumnTypes, RowFilter, RowQuery } from "./query.js";
 import { evalRowFilter, orderRows, projectRow, validateRowQuery } from "./query.js";
 
-// What the view needs from its table beyond the public contract.
+// What the view needs from its table beyond the public contract. Entry voiding
+// is threaded with the view's VoidClosure (the per-computation cycle guard, see
+// ../rtable_group/void_closure.ts): a view built inside a void computation
+// carries that computation's closure so recursive voiding shares one visiting
+// set. (resolveForeignTableView is intentionally absent: the view never does a
+// closure-less foreign lookup — that path lives entirely in the group's
+// *Closure helpers.)
 export type TableViewTarget = RTable & {
     resolveSchemaView(at: Version, from?: Version): Promise<RSchemaView>;
-    isEntryVoided(entryHash: B64Hash, from: Version): Promise<boolean>;
-    // Resolve a `group.table` FK target through the bound foreign group at the
-    // foreign version observed at (at, from). undefined = unbound name or table
-    // absent at that version (a missing reference -> target not live); throws
-    // on a missing bound object.
-    resolveForeignTableView(
-        group: string, table: string, at: Version, from: Version,
-    ): Promise<RTableView | undefined>;
+    isEntryVoidedClosure(closure: VoidClosure, entryHash: B64Hash, from: Version): Promise<boolean>;
 };
 
 // Enumerate ALL entries matching `filter` at or below `at` (covers only
@@ -130,13 +130,18 @@ export class RTableViewImpl implements RTableView {
     private target: TableViewTarget;
     private at: Version;
     private from: Version;
+    private closure: VoidClosure;
 
     private _schemaView: RSchemaView | undefined;
 
-    constructor(target: TableViewTarget, at: Version, from: Version) {
+    // `closure` is mandatory: every view is built inside some void computation
+    // (top-level callers mint a fresh one), so entry-voiding recursion always
+    // has a per-computation cycle guard to thread. See void_closure.ts.
+    constructor(target: TableViewTarget, at: Version, from: Version, closure: VoidClosure) {
         this.target = target;
         this.at = at;
         this.from = from;
+        this.closure = closure;
     }
 
     getObject(): RTable {
@@ -171,7 +176,7 @@ export class RTableViewImpl implements RTableView {
     }
 
     private entryVoided(entryHash: B64Hash): Promise<boolean> {
-        return this.target.isEntryVoided(entryHash, this.from);
+        return this.target.isEntryVoidedClosure(this.closure, entryHash, this.from);
     }
 
     // The winning insert by BASE delete-state liveness only: inserted at or
