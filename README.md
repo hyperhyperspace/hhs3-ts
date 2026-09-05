@@ -8,7 +8,7 @@ This new version has three main goals:
 
 - **Greater modularization**. Previous versions of Hyper Hyper Space were bundled as a monolithic JavaScript app for usage in web browsers. While we still see the browser as a possible target, we're now trying to build a collection of modules that can be re-used on any platform. See below for the modules that have been ported to v3 so far.
 - **A new data model**. We've developed a new formalism for coordination-free replication, **Monotone View Types**, in which observations are monotonic but explicitly version-scoped, allowing historical views to be refined as additional information becomes available. MVTs are a powerful *monotonic transformation* mechanism, that helps application developers create coordination-free approximations for applications in any domain. Learn more in the [**mvt** module](modules/mvt).
-- **Database integration**. While HHSv3 can still be used to share live program state, we've added support for using HHS as a secure, self-verifying bi-directional database replication protocol through the **[Rdb](modules/rdb)**co-transactional database engine and its **[projection](modules/rdb_projection)** mechanism, with **[adapters](modules/rdb_adapter/)** for [SQLite](modules/rdb_adapter_sqlite/) and [IndexedDb](modules/rdb_adapter_idb/).
+- **Database integration**. HHSv3 can be used as a secure, self-verifying bi-directional database replication protocol through the **[Rdb](modules/rdb)**co-transactional database engine and its **[projection](modules/rdb_projection)** mechanism, with **[adapters](modules/rdb_adapter/)** for [SQLite](modules/rdb_adapter_sqlite/) and [IndexedDb](modules/rdb_adapter_idb/).
 
 
 
