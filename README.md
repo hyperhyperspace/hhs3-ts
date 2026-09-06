@@ -22,44 +22,44 @@ This monorepo is organized as a collection of modules. This is of course WIP.
 
 **Data**
 
-- `[modules/mvt](modules/mvt)` Monotone-View Types: DAG-based replicable object type system with nesting support
-- `[modules/replica](modules/replica)` A replica that orchestrates Monotone View Type instances for synchronization
-- `[modules/dag](modules/dag)` A DAG-based append-only log with fast fork/merge & covering operations
-- `[modules/dag_sql](modules/dag_sql)` SQL-backed storage for DAG entries and indices, using an abstract SQL connection interface
-- `[modules/dag_sqlite](modules/dag_sqlite)` SQLite bindings for the SQL DAG storage layer
-- `[modules/dag_test](modules/dag_test)` Shared test suites (backend parity, DAG creation helpers) reusable across DAG storage backends
-- `[modules/std_types](modules/std_types)` Standard replicable types (**RSet**, **RCap**, and permissioned RSet) built on the MVT framework
+- [modules/mvt](modules/mvt) Monotone-View Types: DAG-based replicable object type system with nesting support
+- [modules/replica](modules/replica) A replica that orchestrates Monotone View Type instances for synchronization
+- [modules/dag](modules/dag) A DAG-based append-only log with fast fork/merge & covering operations
+- [modules/dag_sql](modules/dag_sql) SQL-backed storage for DAG entries and indices, using an abstract SQL connection interface
+- [modules/dag_sqlite](modules/dag_sqlite) SQLite bindings for the SQL DAG storage layer
+- [modules/dag_test](modules/dag_test) Shared test suites (backend parity, DAG creation helpers) reusable across DAG storage backends
+- [modules/std_types](modules/std_types) Standard replicable types (**RSet**, **RCap**, and permissioned RSet) built on the MVT framework
 
 **Causal/Relational database**
 
-- `[modules/rdb](modules/rdb)` Causal/Relational database engine MVTs: RSchema, RTableGroup, RTable, and RDb
-- `[modules/rdb_lang](modules/rdb_lang)` C-SQL: SQL-like language to parse, bind, compile, execute, and reverse-render RDb operations
-- `[modules/rdb_runtime](modules/rdb_runtime)` Browser-safe runtime: workspace, session, and C-SQL execution
-- `[modules/rdb_repl](modules/rdb_repl)` Portable presentation and command tooling for RDb
-- `[modules/rdb_tools](modules/rdb_tools)` Node REPL, CLI (`rdb`), workspace and key management, script runner
-- `[modules/rdb_repl_web](modules/rdb_repl_web)` Ephemeral browser REPL ([live demo](https://www.hyperhyperspace.org/db-demo/))
-- `[modules/rdb_adapter](modules/rdb_adapter)` Engine-agnostic projection/ingestion core (Rdb ⇄ relational database)
-- `[modules/rdb_adapter_sqlite](modules/rdb_adapter_sqlite)` SQLite `MaterializationTarget` for rdb_adapter
-- `[modules/rdb_adapter_idb](modules/rdb_adapter_idb)` IndexedDB `MaterializationTarget` for rdb_adapter
-- `[modules/rdb_adapter_test](modules/rdb_adapter_test)` Backend-agnostic conformance suites + fixtures for rdb_adapter targets
-- `[modules/rdb_projection](modules/rdb_projection)` Reactive supervisor for replica-wide, bidirectional projection of an RDb
+- [modules/rdb](modules/rdb) Causal/Relational database engine MVTs: RSchema, RTableGroup, RTable, and RDb
+- [modules/rdb_lang](modules/rdb_lang) C-SQL: SQL-like language to parse, bind, compile, execute, and reverse-render RDb operations
+- [modules/rdb_runtime](modules/rdb_runtime) Browser-safe runtime: workspace, session, and C-SQL execution
+- [modules/rdb_repl](modules/rdb_repl) Portable presentation and command tooling for RDb
+- [modules/rdb_tools](modules/rdb_tools) Node REPL, CLI (`rdb`), workspace and key management, script runner
+- [modules/rdb_repl_web](modules/rdb_repl_web) Ephemeral browser REPL ([live demo](https://www.hyperhyperspace.org/db-demo/))
+- [modules/rdb_adapter](modules/rdb_adapter) Engine-agnostic projection/ingestion core (Rdb ⇄ relational database)
+- [modules/rdb_adapter_sqlite](modules/rdb_adapter_sqlite) SQLite `MaterializationTarget` for rdb_adapter
+- [modules/rdb_adapter_idb](modules/rdb_adapter_idb) IndexedDB `MaterializationTarget` for rdb_adapter
+- [modules/rdb_adapter_test](modules/rdb_adapter_test) Backend-agnostic conformance suites + fixtures for rdb_adapter targets
+- [modules/rdb_projection](modules/rdb_projection) Reactive supervisor for replica-wide, bidirectional projection of an RDb
 
 **Synchronization**
 
-- `[modules/sync](modules/sync)` Synchronizer for the replica module, using the mesh
+- [modules/sync](modules/sync) Synchronizer for the replica module, using the mesh
 
 **Networking**
 
-- `[modules/mesh](modules/mesh)` Peer discovery, authentication, connection pooling, topic multiplexing, swarm management, incoming connection handling with topic negotiation, and per-swarm authorization
-- `[modules/mesh_ws](modules/mesh_ws)` WebSocket transport implementation for the mesh module
-- `[modules/mesh_tracker_client](modules/mesh_tracker_client)` Tracker-based peer discovery client (PeerDiscovery implementation)
-- `[modules/mesh_tracker](modules/mesh_tracker)` Tracker server for peer discovery with identity management
+- [modules/mesh](modules/mesh) Peer discovery, authentication, connection pooling, topic multiplexing, swarm management, incoming connection handling with topic negotiation, and per-swarm authorization
+- [modules/mesh_ws](modules/mesh_ws) WebSocket transport implementation for the mesh module
+- [modules/mesh_tracker_client](modules/mesh_tracker_client) Tracker-based peer discovery client (PeerDiscovery implementation)
+- [modules/mesh_tracker](modules/mesh_tracker) Tracker server for peer discovery with identity management
 
 **Libraries**
 
-- `[modules/crypto](modules/crypto)` Cryptographic primitives: hashing, signing, KEM, AEAD, KDF with classical, hybrid and post-quantum suites
-- `[modules/json](modules/json)` JSON module for content-based addressing data structures
-- `[modules/util](modules/util)` Collection of helper utilities used across HHS v3.0
+- [modules/crypto](modules/crypto) Cryptographic primitives: hashing, signing, KEM, AEAD, KDF with classical, hybrid and post-quantum suites
+- [modules/json](modules/json) JSON module for content-based addressing data structures
+- [modules/util](modules/util) Collection of helper utilities used across HHS v3.0
 
 
 
@@ -72,7 +72,7 @@ npm install
 npm run build
 ```
 
-The latest LTS versions of Node (v24.16.0) and NPM (11.13.0) are supported.
+The latest LTS versions of Node (v24.20.0) and NPM (11.13.0) are supported.
 
 ### Tests
 
