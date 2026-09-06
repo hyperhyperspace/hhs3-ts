@@ -27,6 +27,7 @@ This monorepo is organized as a collection of modules. This is of course WIP.
 - [modules/dag](modules/dag) A DAG-based append-only log with fast fork/merge & covering operations
 - [modules/dag_sql](modules/dag_sql) SQL-backed storage for DAG entries and indices, using an abstract SQL connection interface
 - [modules/dag_sqlite](modules/dag_sqlite) SQLite bindings for the SQL DAG storage layer
+- [modules/dag_idb](modules/dag_idb) IndexedDB storage backend for DAG entries and indices
 - [modules/dag_test](modules/dag_test) Shared test suites (backend parity, DAG creation helpers) reusable across DAG storage backends
 - [modules/std_types](modules/std_types) Standard replicable types (**RSet**, **RCap**, and permissioned RSet) built on the MVT framework
 
@@ -42,6 +43,7 @@ This monorepo is organized as a collection of modules. This is of course WIP.
 - [modules/rdb_adapter_sqlite](modules/rdb_adapter_sqlite) SQLite `MaterializationTarget` for rdb_adapter
 - [modules/rdb_adapter_idb](modules/rdb_adapter_idb) IndexedDB `MaterializationTarget` for rdb_adapter
 - [modules/rdb_adapter_test](modules/rdb_adapter_test) Backend-agnostic conformance suites + fixtures for rdb_adapter targets
+- [modules/rdb_adapter_test_gen](modules/rdb_adapter_test_gen) Shared pseudo-random RDb history generator for adapter fuzzers
 - [modules/rdb_projection](modules/rdb_projection) Reactive supervisor for replica-wide, bidirectional projection of an RDb
 
 **Synchronization**
@@ -52,13 +54,19 @@ This monorepo is organized as a collection of modules. This is of course WIP.
 
 - [modules/mesh](modules/mesh) Peer discovery, authentication, connection pooling, topic multiplexing, swarm management, incoming connection handling with topic negotiation, and per-swarm authorization
 - [modules/mesh_ws](modules/mesh_ws) WebSocket transport implementation for the mesh module
+- [modules/mesh_ws_browser](modules/mesh_ws_browser) Outbound-only browser WebSocket transport for the mesh module
+- [modules/mesh_bc](modules/mesh_bc) BroadcastChannel transport and peer discovery for cross-tab mesh
+- [modules/mesh_folder_discovery](modules/mesh_folder_discovery) Node-only peer discovery via presence files in a shared directory
 - [modules/mesh_tracker_client](modules/mesh_tracker_client) Tracker-based peer discovery client (PeerDiscovery implementation)
 - [modules/mesh_tracker](modules/mesh_tracker) Tracker server for peer discovery with identity management
+- [modules/mesh_node](modules/mesh_node) Node mesh factory (WebSocket, folder discovery, optional tracker)
+- [modules/mesh_browser](modules/mesh_browser) Browser mesh factory (dial-only WebSocket, BroadcastChannel, optional tracker)
 
 **Libraries**
 
 - [modules/crypto](modules/crypto) Cryptographic primitives: hashing, signing, KEM, AEAD, KDF with classical, hybrid and post-quantum suites
 - [modules/json](modules/json) JSON module for content-based addressing data structures
+- [modules/file_watch](modules/file_watch) Kernel-driven file change watcher (`fs.watch` with rearm)
 - [modules/util](modules/util) Collection of helper utilities used across HHS v3.0
 
 
