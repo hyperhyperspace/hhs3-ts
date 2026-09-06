@@ -1,4 +1,4 @@
-# rdb_projection
+# Rdb Projection
 
 Reactive **supervisor** that keeps a replica-wide relational projection of an [Rdb](../rdb) `RDb` in sync. The concrete [`MaterializationTarget`](../rdb_adapter) (SQLite, IDB, in-memory, …) is injected by the host. Built on [rdb_adapter](../rdb_adapter)'s pure planners and database-level orchestrators.
 

@@ -1,4 +1,4 @@
-# rdb_adapter_test_gen
+# Synthetic test-case generation for Rdb testing
 
 Shared **pseudo-random rdb history generator** for adapter fuzzers. Depends only on [rdb](../rdb) (plus crypto/dag/mvt). It sits *beside* [rdb_adapter](../rdb_adapter) so both the planner-parity fuzzer and [rdb_adapter_test](../rdb_adapter_test) can import one generator without a cycle.
 

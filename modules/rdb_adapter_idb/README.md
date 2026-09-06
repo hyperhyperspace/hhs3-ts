@@ -1,4 +1,4 @@
-# rdb_adapter_idb
+# Rdb Projection Adapter for IndexedDb
 
 IndexedDB [`MaterializationTarget`](../rdb_adapter) for [rdb_adapter](../rdb_adapter): a self-contained backend that materializes Rdb groups into a browser-native [IndexedDB](https://developer.mozilla.org/en-US/docs/Web/API/IndexedDB_API) database and captures local edits for ingestion back into Rdb.
 

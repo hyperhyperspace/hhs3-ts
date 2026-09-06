@@ -1,4 +1,4 @@
-# rdb_adapter_sqlite
+# Rdb Projection Adapter for SQLite
 
 SQLite [`MaterializationTarget`](../rdb_adapter) for [rdb_adapter](../rdb_adapter): a self-contained, capture-provisioned backend that materializes Rdb groups into a [`better-sqlite3`](https://github.com/WiseLibs/better-sqlite3) database and captures local edits for ingestion back into Rdb.
 

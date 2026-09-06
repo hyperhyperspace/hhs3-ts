@@ -1,4 +1,4 @@
-# rdb_adapter_test
+# Conformance test suite for Rdb Adapters
 
 Backend-agnostic **conformance suites + fixtures** for [rdb_adapter](../rdb_adapter) targets. A concrete backend package parameterizes the shared suites with a target factory and asserts behavior in logical terms; engine-specific facts stay in the per-backend package.
 

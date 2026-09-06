@@ -6,7 +6,7 @@
 
 This module (**rdb_adapter**) provides an abstract bi-directional projection mechanism, mapping an instance of Rdb's `RTableGroup` into a local database. The projection flattens all the history present in Rdb's DAG, omits validation metadata, and continuously exports the contents of the latest version. It includes an *outbox* construction that marshalls all the changes in the local database back into `RTableGroup` operations and the Rdb's DAG.
 
-The export (rdb → relational) is powered by a planner, that generates abstract schema and row changes starting for an Rdb delta. These changes are then applied by a `MaterializationTarget`.
+The export (rdb → relational) is powered by a planner, that generates abstract schema and row changes starting from an Rdb delta. These changes are then applied by a `MaterializationTarget`.
 
 For ingesting changes (relational → rdb) an inverse planner is used, that maps the raw contents of the outbox back into Rdb operations, and optionally groups FK-related consecutive operations into bundles, providing atomicity. The job of draining the outbox into the inverse planner is done by a `MaterializedChangeSource` instance.
 
@@ -25,13 +25,13 @@ While projection is a new concept in HHS, the test suite includes a synthetic te
 
 The forward projection planner is universal, and should be usable without limitations. The revererse planner doing change ingestion can only guess the app's bundling intent (based on FK structure). If the app has sophisticated atomicity requirements, it may be necessary to apply the changes directly at the [Rdb](../rdb/) level (or using [C-SQL](../rdb_lang/) for convenience).
 
-Change ingestion works at data level. Schema changes can only be performed directly on the **Rdb** instance, since the schema change logic imposes limitations that make concurrent state reconciliation in the face of schema changes more straightforward. The forward planner then applies schema changes safely on any projections.
+Change ingestion works at the data level only. Schema changes can only be performed directly on the **Rdb** instance, since the schema change logic imposes limitations that make concurrent state reconciliation in the face of schema updates more straightforward. The forward planner then applies schema changes safely on any projections.
 
 ## Usage
 
 ### REPL
 
-Projection can be configured from the CLI REPL using the `\project` meta-command:
+Projection can be configured from the [CLI-based REPL](../rdb_tools/) using the `\project` meta-command:
 
 ```
 \project start <db> as <id> to <path>
@@ -43,7 +43,7 @@ The identity passed as `<id>` is used to sign the operations that are ingested b
 
 If changes in the projection generate any ingestion failures, or Rdb concurrency generates op cancellations, those are reported back on the REPL console.
 
-While `\project` is also supported in the web REPL demo, the only supported path is `:memory:` and the contents of the projection are not inspectable at the moment.
+While `\project` is also supported in the [web REPL demo](../rdb_repl_web/), the only supported path is `:memory:` and the contents of the projection are not inspectable at the moment.
 
 ### Library
 
