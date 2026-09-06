@@ -9,6 +9,7 @@ From the monorepo root:
 ```
 npm install
 npm run build
+npm link --workspace=@hyper-hyper-space/hhs3_rdb_tools
 ```
 
 This compiles `src/` and `bin/rdb.ts` to `dist/` and links the `rdb` bin into `node_modules/.bin/`.
@@ -19,24 +20,24 @@ This compiles `src/` and `bin/rdb.ts` to `dist/` and links the `rdb` bin into `n
 
 ```
 # interactive REPL
-npx rdb my.db
+rdb my.db
 
 # run one statement
-npx rdb my.db -c "SELECT * FROM g.t;"
+rdb my.db -c "SELECT * FROM g.t;"
 
 # run a script file
-npx rdb my.db -f script.sql
+rdb my.db -f script.sql
 
 # run a script from stdin
-npx rdb my.db < script.sql
-npx rdb my.db -f -
+rdb my.db < script.sql
+rdb my.db -f -
 
 # prompt for locked keys when running scripts (reads passphrases from the terminal)
-npx rdb my.db -k -f script.sql
-npx rdb my.db -k < script.sql
+rdb my.db -k -f script.sql
+rdb my.db -k < script.sql
 
 # JSON output instead of tables
-npx rdb my.db --json
+rdb my.db --json
 ```
 
 This is a local workspace bin, not published to npm. Plain `npx rdb` outside the monorepo will not work until we release this package.
