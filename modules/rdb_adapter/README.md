@@ -1,19 +1,53 @@
-# rdb_adapter
+# Rdb Adapter
 
-Rdb's data structures are designed to be self-verifiable and to resolve distributed concurrency. An app will need fast querying over the last resolved and verified version, and hence a different data representation. Since this will depend on the application domain, the best solution is to use a bi-directional **projection** of the last state into a database system chosen by the application developer.
+## Intro
 
-[rdb_projection](../rdb_projection) is the projection supervisor. **rdb_adapter** implements the generic machinery for bi-directional projection (plus a simple in-memory `MaterializationTarget`). Other targets are provided in derived modules: [rdb_adapter_sqlite](../rdb_adapter_sqlite), [rdb_adapter_idb](../rdb_adapter_idb). They are injected into the rdb_projection supervisor at runtime.
+**[Rdb](../rdb)**'s data structures are designed for **self-verification** and **distributed state reconciliation**. To get fast querying over the last resolved & verified version, apps can use a **bi-directional projection** into a local database. **[SQLite](../rdb_adapter_sqlite/)**, **[IndexedDb](../rdb_adapter_idb/)** (for in-browser usage) and an ephemeral **memory-backed store** (packaged within this module) are available as projection targets.
 
-## What **rdb_adapter** does
+This module (**rdb_adapter**) provides an abstract bi-directional projection mechanism, mapping an instance of Rdb's `RTableGroup` into a local database. The projection flattens all the history present in Rdb's DAG, omits validation metadata, and continuously exports the contents of the latest version. It includes an *outbox* construction that marshalls all the changes in the local database back into `RTableGroup` operations and the Rdb's DAG.
 
-- **Project** (rdb → relational): pure mappers turn an `RTableGroup`'s resolved schema and row deltas into ordered `SchemaAction` / `RowAction` lists (`schema_actions.ts`, `row_actions.ts`), which a `MaterializationTarget` applies transactionally per group checkpoint (`project.ts`). A same-shape **reincarnation** (a drop+re-add whose resolved def is unchanged, see [Rdb incarnations](../rdb#schema-evolution-and-incarnations)) is a reset, not an in-place diff: a table reincarnation projects as `drop-table` + `create-table` + a live-row backfill, and a column reincarnation as `drop-column` + `add-column`, so stale cells cannot survive an incremental apply. FK columns are reshaped to a companion form: a local (or co-projected cross-group) FK becomes an integer `<col>_id` referencing the target's serial id; a non-co-projected cross-group FK becomes a text `<col>_row_hash` passthrough. Authorship projects as integer `author_key_id` into a shared `rdb_keys(id, key_hash, public_key)` side table (duplicates of a key hash collapse to one id). An identity-provider table's keyId column projects as `key_id` (same side table); its publicKey column is **not** projected — crypto material lives only in `rdb_keys`. A first-class `identity` column type likewise projects as `<col>_key_id`.
-- **Ingest** (relational → rdb): the inverse planner (`ingest.ts`) replays the captured outbox in **commit order** — coalesce per row, mint rowIds, reverse-map names, rewrite FK / key-ref values (including reconstructing provider `keyId`+`publicKey` from `rdb_keys`) — then submits signed bundles via `group.bundle()` (`ingest_orchestrator.ts`). Commit order is already FK-respecting (a local FK can only be written against an already-local row), so nothing is reordered. Consecutive same-group ops joined by an explicit FK arc are bundled into one atomic entry (`fkBundling`, default on); to get parent-child atomicity, make the inserts consecutive. New keys are introduced with `KeyIndex.registerKey(domain, keyHash, publicKey)` (public key mandatory).
-- **Replica-wide**: `projectDatabase` / `ingestDatabaseChanges` / `syncDatabase` materialize several groups of one `RDb` into **one shared target** so cross-group FKs resolve to serial ids; group-qualified names keep tables from colliding. Ingestion advances co-projected cross-group refs as it drains: a dirty map (`ref_advance.ts`) tracks which observed groups changed, and before an observer's write is appended it observes them to the version present at that point — so cross-group FKs **and** `exists` / restriction reads validate against freshly-ingested rows. A closing drain advances observers that never wrote, transitively.
-- **Reactive inbound**: an optional `ChangeSignalSource` lets a target signal "the outbox advanced" so a runtime can ingest without polling.
+The export (rdb → relational) is powered by a planner, that generates abstract schema and row changes starting for an Rdb delta. These changes are then applied by a `MaterializationTarget`.
+
+For ingesting changes (relational → rdb) an inverse planner is used, that maps the raw contents of the outbox back into Rdb operations, and optionally groups FK-related consecutive operations into bundles, providing atomicity. The job of draining the outbox into the inverse planner is done by a `MaterializedChangeSource` instance.
+
+Hence to create a new a bi-directional projection, both `MaterializationTarget` and `MaterializedChangeSource` have to be implemented and injected into the generic adapter.
+
+To project an entire database (`Rdb`), the module **[rdb_projection](../rdb_projection/)** acts as a reactive supervisor, creating instances of **rdb_adapter** as `RTableGroup` are added to the database, resolving group naming and managing cross-group interactions by mapping foreign key columns.
+
+## Event monitoring
+
+Co-transactional failures (Rdb changes reverted because of concurrency) and ingestion failures (changes in the local projection that cannot be ingested back into Rdb, either because of programming errors or concurrent Rdb changes) are reported using the `OpEvent` data structure. The app can register an `onOpEvent` callback when configuring the projetion, or can be pulled using the `projection.opEvents(sinceId)` interface.
+
+
+## Status and limitations
+
+While projection is a new concept in HHS, the test suite includes a synthetic test generator and an extensive reproducible stress test runner over the generic planner and the SQLite and IndexedDB adapters. The adapters have been extensively tested using this tooling.
+
+The forward projection planner is universal, and should be usable without limitations. The revererse planner doing change ingestion can only guess the app's bundling intent (based on FK structure). If the app has sophisticated atomicity requirements, it may be necessary to apply the changes directly at the [Rdb](../rdb/) level (or using [C-SQL](../rdb_lang/) for convenience).
+
+Change ingestion works at data level. Schema changes can only be performed directly on the **Rdb** instance, since the schema change logic imposes limitations that make concurrent state reconciliation in the face of schema changes more straightforward. The forward planner then applies schema changes safely on any projections.
 
 ## Usage
 
-Single group:
+### REPL
+
+Projection can be configured from the CLI REPL using the `\project` meta-command:
+
+```
+\project start <db> as <id> to <path>
+\project status [<db>]
+\project stop|update|events <idx>
+```
+
+The identity passed as `<id>` is used to sign the operations that are ingested back into Rdb. A SQLite databse is created on `<path>`, and can be queried and modified using standard SQLite tooling.
+
+If changes in the projection generate any ingestion failures, or Rdb concurrency generates op cancellations, those are reported back on the REPL console.
+
+While `\project` is also supported in the web REPL demo, the only supported path is `:memory:` and the contents of the projection are not inspectable at the moment.
+
+### Library
+
+A table group can be projected using the library:
 
 ```typescript
 import Database from 'better-sqlite3';
@@ -26,6 +60,7 @@ await projectGroup(group, target);
 
 For a whole `RDb`, inject the same target into [rdb_projection](../rdb_projection).
 
+
 ## Layout
 
 - `types.ts` — vocabulary + `MaterializationTarget` / `MaterializedChangeSource` / `ChangeSignalSource` / `AdapterConfig`.
@@ -35,6 +70,13 @@ For a whole `RDb`, inject the same target into [rdb_projection](../rdb_projectio
 - `ref_advance.ts` — cross-group ref-advance mechanism (observed→observer index + observe wrapper).
 - `project.ts`, `ingest_orchestrator.ts` — single-group and database-level orchestrators.
 - `memory_target.ts` — a self-contained in-memory backend (used in tests).
+
+## Implementation details
+
+- **Project** (rdb → relational): pure mappers turn an `RTableGroup`'s resolved schema and row deltas into ordered `SchemaAction` / `RowAction` lists (`schema_actions.ts`, `row_actions.ts`), which a `MaterializationTarget` applies transactionally per group checkpoint (`project.ts`). A same-shape **reincarnation** (a drop+re-add whose resolved def is unchanged, see [Rdb incarnations](../rdb#schema-evolution-and-incarnations)) is a reset, not an in-place diff: a table reincarnation projects as `drop-table` + `create-table` + a live-row backfill, and a column reincarnation as `drop-column` + `add-column`, so stale cells cannot survive an incremental apply. FK columns are reshaped to a companion form: a local (or co-projected cross-group) FK becomes an integer `<col>_id` referencing the target's serial id; a non-co-projected cross-group FK becomes a text `<col>_row_hash` passthrough. Authorship projects as integer `author_key_id` into a shared `rdb_keys(id, key_hash, public_key)` side table (duplicates of a key hash collapse to one id). An identity-provider table's keyId column projects as `key_id` (same side table); its publicKey column is **not** projected — crypto material lives only in `rdb_keys`. A first-class `identity` column type likewise projects as `<col>_key_id`.
+- **Ingest** (relational → rdb): the inverse planner (`ingest.ts`) replays the captured outbox in **commit order** — coalesce per row, mint rowIds, reverse-map names, rewrite FK / key-ref values (including reconstructing provider `keyId`+`publicKey` from `rdb_keys`) — then submits signed bundles via `group.bundle()` (`ingest_orchestrator.ts`). Commit order is already FK-respecting (a local FK can only be written against an already-local row), so nothing is reordered. Consecutive same-group ops joined by an explicit FK arc are bundled into one atomic entry (`fkBundling`, default on); to get parent-child atomicity, make the inserts consecutive. New keys are introduced with `KeyIndex.registerKey(domain, keyHash, publicKey)` (public key mandatory).
+- **Replica-wide**: `projectDatabase` / `ingestDatabaseChanges` / `syncDatabase` materialize several groups of one `RDb` into **one shared target** so cross-group FKs resolve to serial ids; group-qualified names keep tables from colliding. Ingestion advances co-projected cross-group refs as it drains: a dirty map (`ref_advance.ts`) tracks which observed groups changed, and before an observer's write is appended it observes them to the version present at that point — so cross-group FKs **and** `exists` / restriction reads validate against freshly-ingested rows. A closing drain advances observers that never wrote, transitively.
+- **Reactive inbound**: an optional `ChangeSignalSource` lets a target signal "the outbox advanced" so a runtime can ingest without polling.
 
 ## Test
 
