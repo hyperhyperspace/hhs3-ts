@@ -420,7 +420,9 @@ export function versionsEqual(a: Version | undefined, b: Version | undefined): b
 // ingest reactively instead of polling. Shaped after dag's DagGrowthListener:
 // at-least-once, dedup-yourself (an ingest pass is idempotent - it drains the
 // outbox and re-derives from the persisted checkpoint), and lazily armed (a
-// backend with no listeners pays no monitoring cost).
+// backend with no listeners pays no monitoring cost). A file-watch hint (e.g.
+// SQLite WAL) must still be filtered to outbox growth: adapter writes that
+// dirty the WAL without inserting into the outbox are not a signal.
 // ---------------------------------------------------------------------------
 
 // Opaque wake-up: the outbox advanced. Carries no payload; the observer reacts

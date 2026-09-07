@@ -147,8 +147,11 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     //   - poll (fallback): a same-process interval poll of the monotonic
     //     AUTOINCREMENT outbox id. Used for `:memory:` (no WAL file) and when no
     //     dbPath is supplied, and on platforms where fs.watch is unreliable.
-    // Either way the signal is opaque (ChangeSignal = {}): observers react by
-    // re-draining authoritatively, so over-notifying is harmless.
+    // The WAL is a hint: we only fire when rdb_outbox's MAX(id) grew (same
+    // filter as the poll). Adapter writes (apply checkpoint, applying flags)
+    // dirty the WAL without advancing the outbox; signalling those would
+    // schedule idle projection cycles. The signal is opaque (ChangeSignal = {}):
+    // observers re-drain authoritatively.
     // Lazily armed on the first listener, disarmed (epoch-bumped) on the last.
     private readonly pollMs: number;
     private readonly walPath: string | undefined;
@@ -208,6 +211,19 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         checkpoint: Version, events?: OpEvent[], expectFrom?: Version | null,
     ): Promise<void> {
         this.ensureBookkeeping();
+        // CAS on a read so a stale/null expectFrom still throws without opening a
+        // write transaction. An empty batch already at `checkpoint` is a no-op:
+        // rewriting the same row + toggling applying would dirty the WAL and
+        // wake the change monitor. A catch-up that advances the stored version
+        // with empty actions still persists (below).
+        const stored = this.readCheckpoint(groupId);
+        if (expectFrom !== undefined && !versionsEqual(stored, expectFrom ?? undefined)) {
+            throw new CheckpointMovedError(groupId);
+        }
+        const empty = schemaActions.length === 0 && rowActions.length === 0
+            && (events === undefined || events.length === 0);
+        if (empty && versionsEqual(stored, checkpoint)) return;
+
         const run = this.db.transaction(() => {
             // Compare-and-set guard (concurrent projectors). BEGIN IMMEDIATE took
             // the write lock, so this read of the stored checkpoint cannot race a
@@ -923,8 +939,8 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     // the app writes through its own db handle, so we detect the outbox
     // advancing either by watching the WAL file (default, file-backed db) or by
     // polling the monotonic AUTOINCREMENT outbox id (fallback: `:memory:`, no
-    // path, or unreliable fs.watch). Both paths are epoch-gated so a disarm/
-    // re-arm can never let a stale notification fire.
+    // path, or unreliable fs.watch). Both paths fire only when MAX(id) grew, and
+    // are epoch-gated so a disarm/re-arm can never let a stale notification fire.
     // -----------------------------------------------------------------------
 
     addChangeListener(listener: ChangeSignalListener): void {
@@ -943,17 +959,14 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         else this.armPoll();
     }
 
-    // Kernel-driven wake-up: fs.watch on the WAL file. Unlike the poll, the WAL
-    // signal carries no id, so we fire on any notification (observers re-drain
-    // authoritatively); a prime fire on arm wakes an observer for an
-    // already-pending outbox promptly.
+    // Kernel-driven wake-up: fs.watch on the WAL file as a hint, then the same
+    // MAX(id) filter as the poll. A prime on arm (and a second after kernel
+    // registration) wakes an observer for an already-pending outbox; empty
+    // outbox primes are silent.
     private armWalWatch(): void {
         const epoch = ++this.monitorEpoch;
-        const notify = (): void => {
-            if (epoch !== this.monitorEpoch) return;   // disarmed / re-armed: stale
-            if (!this.capture) return;
-            for (const l of [...this.changeListeners]) l({});
-        };
+        this.lastOutboxId = 0;   // fire once for any already-pending rows
+        const notify = (): void => { this.fireIfOutboxGrew(epoch); };
         this.walHandle = watchFile(this.walPath!, notify);
         notify();   // prime: wake an observer for an already-pending outbox promptly
         // Second prime once the kernel watcher is guaranteed registered. This
@@ -968,26 +981,32 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     private armPoll(): void {
         const epoch = ++this.monitorEpoch;
         this.lastOutboxId = 0;   // fire once for any already-pending rows
-
-        const tick = (): void => {
-            if (epoch !== this.monitorEpoch) return;   // disarmed / re-armed: stale
-            if (!this.capture) return;
-            let maxId = 0;
-            try {
-                maxId = (this.db.prepare('SELECT COALESCE(MAX(id), 0) AS m FROM rdb_outbox').get() as { m: number }).m;
-            } catch {
-                return;   // outbox not present yet
-            }
-            if (maxId > this.lastOutboxId) {
-                this.lastOutboxId = maxId;
-                for (const l of [...this.changeListeners]) l({});
-            }
-        };
+        const tick = (): void => { this.fireIfOutboxGrew(epoch); };
 
         this.monitorTimer = setInterval(tick, this.pollMs);
         (this.monitorTimer as unknown as { unref?: () => void }).unref?.();
         tick();   // prime: wake an observer for an already-pending outbox promptly
         this.monitorReady = Promise.resolve();   // the interval is live on arm
+    }
+
+    // Fire listeners iff the outbox AUTOINCREMENT high-water mark advanced.
+    // Shared by WAL notify and the poll tick. Missing outbox -> silent (0).
+    private fireIfOutboxGrew(epoch: number): void {
+        if (epoch !== this.monitorEpoch) return;   // disarmed / re-armed: stale
+        if (!this.capture) return;
+        const maxId = this.outboxMaxId();
+        if (maxId > this.lastOutboxId) {
+            this.lastOutboxId = maxId;
+            for (const l of [...this.changeListeners]) l({});
+        }
+    }
+
+    private outboxMaxId(): number {
+        try {
+            return (this.db.prepare('SELECT COALESCE(MAX(id), 0) AS m FROM rdb_outbox').get() as { m: number }).m;
+        } catch {
+            return 0;   // outbox not present yet
+        }
     }
 
     private disarmMonitor(): void {

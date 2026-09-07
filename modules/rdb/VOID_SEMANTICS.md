@@ -1,9 +1,10 @@
 # Void semantics: cycles, negation, and the road to stratified resolution
 
 This document records the reasoning behind RTableGroup's entry-voiding
-computation (`isEntryVoided` / `computeEntryVoided` in
-[src/rtable_group/group.ts](src/rtable_group/group.ts)). It explains what the
-code does today (deny the whole cycle, no cache), *why* that is the sound and
+computation (`isEntryVoided` / `resolveVoidDetail` / `diagnoseEntryVoidedClosure`
+in [src/rtable_group/group.ts](src/rtable_group/group.ts)). It explains what the
+code does today (deny the whole cycle; a memo that lives and dies with one
+computation, never across computations), *why* that is the sound and
 replica-convergent choice, and what a more sophisticated future implementation
 would look like. The current implementation is deliberately basic; this is the
 reference for anyone who later wants to make it cleverer without re-deriving the
@@ -85,7 +86,7 @@ odd loops come out *undefined*), **stable-model / answer-set semantics**
 **Dung abstract argumentation frameworks** (grounded ≈ well-founded, stable
 extension ≈ stable model; an odd attack cycle has no stable extension).
 
-## 4. What ships today: deny the whole cycle, no cache
+## 4. What ships today: deny the whole cycle, no cross-computation cache
 
 `isEntryVoided` keeps a transient cycle guard: a set of
 `createOpId|entryHash|fromKey` keys carried in a per-computation `VoidClosure`
@@ -115,27 +116,139 @@ are nullified, both caps survive. Same outcome for the N-party ring. It is not
 the "single survivor" a stable-model semantics would pick — it is the safe
 all-survive (for revokes) / all-deny (for grants) collapse.
 
-### Why there is deliberately NO cache
+### Why there is deliberately NO cross-computation cache
 
-A memo keyed only by `(entryHash, from)` is **unsound for replica
-convergence**. With negation in a cycle, the value computed for a shared node
-depends on which back-edge the traversal closed first. A position-keyed cache
-serves that traversal-dependent intermediate to a later independent query, so
-the final answer depends on query order — and query order can differ across
-replicas. Removing the cache makes each top-level computation self-contained and
-a pure function of `(entry, from)`: every replica agrees. The guard is transient
-(per-computation) precisely so it can detect a cycle *within* one computation
-without persisting anything *across* computations — which is exactly why the
-visiting set lives in a per-computation `VoidClosure` and not on the group
-instance (see §5).
+A memo keyed only by `(entryHash, from)` and kept on the group instance is
+**unsound for replica convergence**. With negation in a cycle, the value
+computed for a shared node depends on which back-edge the traversal closed
+first. A position-keyed cache serves that traversal-dependent intermediate to a
+later independent query, so the final answer depends on query order — and query
+order can differ across replicas. Removing the cache makes each top-level
+computation self-contained and a pure function of `(entry, from)`: every
+replica agrees. The guard is transient (per-computation) precisely so it can
+detect a cycle *within* one computation without persisting anything *across*
+computations — which is exactly why the visiting set lives in a per-computation
+`VoidClosure` and not on the group instance (see §5).
 
-A previous iteration shipped a `(entry, from)` cache plus a 2-party
-seniority special case (senior cap survives). It was removed because the cache
-broke convergence and the special case only covered the isolated 2-cycle. The
-analysis below is the principled version that special case was reaching for.
+A previous iteration shipped an instance-level `(entry, from)` cache plus a
+2-party seniority special case (senior cap survives). It was removed because the
+cache broke convergence and the special case only covered the isolated 2-cycle.
+The analysis in §6 is the principled version that special case was reaching for.
+
+### The per-computation memo: `VoidClosure.completed`
+
+The prohibition above is about caching *across* computations. *Within* one
+computation the closure memoizes finished verdicts, and it must: without that
+memo the engine is exponential in the number of updates to a row.
+
+**The problem.** Every update/delete restriction — including the default
+`rowAuthor = $author` — is evaluated against the subject row, so diagnosing an
+update \(U_k\) calls `getRow` at `version(U_k)`. `liveInsert` walks the row's
+full history visible there (`insert, U_1 … U_k`) and void-checks every write;
+each of those diagnoses does the same at its own position. The recursion tree
+for \(U_k\) is therefore \(T(k) = 1 + \sum_{j<k} T(j) \approx 2^{k-1}\). Twenty
+updates take seconds, twenty-five take minutes, thirty take hours, and because
+the recursion *depth* is only \(k\) the `VOID_MAX_INFLIGHT` fail-safe never
+trips: it presents as a hang at 100% CPU. The `visiting` set alone cannot help —
+it is a DFS stack, popped in `finally`, so a finished subtree is forgotten the
+moment it completes.
+
+**The memo.** `VoidClosure` carries, next to `visiting`:
+
+- `completed: Map<key, OpVoidDetail | undefined>` — finished diagnose results
+  (`undefined` = live; `has(key)` vs `get(key) === undefined` distinguishes
+  uncached from diagnosed-live);
+- `stack: string[]` — the same keys as `visiting`, in DFS order, so the current
+  frame (`stack.top`) is known;
+- `foreignCycleHits: number` — a monotonic counter, described below.
+
+`resolveVoidDetail` (the single body behind `isEntryVoidedClosure` and
+`explainEntryVoidedClosure`, so boolean and explain cannot drift) is:
+
+```
+completed.has(key)   ->  return the stored verdict            (no new frame)
+visiting.has(key)    ->  DENY; if stack.top !== key then foreignCycleHits++
+                                                              (never stored)
+otherwise            ->  push; diagnose; store iff foreignCycleHits is
+                         unchanged since the push; pop (in finally)
+```
+
+**Why it is sound.** A frame's verdict is a pure function of its key with one
+exception: a descendant may ask about a key that is currently `visiting` and
+receive the transient deny. `completed` hits are stack-independent by
+induction, so that deny is the *only* channel through which the shape of the
+stack can influence a verdict. Classify it by who is being asked about:
+
+- *Self hit* (`stack.top === key`). The op under diagnosis asked about itself
+  from inside its own subtree: `getRow` at `version(U_k)` sees \(U_k\) in the
+  row's history; `hasRow` at `version(D)` sees the delete \(D\). This happens at
+  the same structural point in *every* evaluation of that key, fresh or nested,
+  so the verdict is still stack-independent and may be stored. Not storing it
+  would forfeit the memo entirely, since every update frame has a self hit.
+- *Foreign hit* (`stack.top !== key`). A strictly lower ancestor was assumed
+  voided. Every frame from that ancestor up to the top now depends on the stack
+  shape; all of them are open when the counter increments and all compare it at
+  their end, so none of them store. Frames that finished before the hit, or
+  opened after it, are unaffected and store normally.
+
+The ancestor that was hit must be excluded too, not only the frames above it.
+The mutual revoke of `[PERM12]` on a single view shows why:
+
+```
+hasRow(capA)
+  isVoided(deleteB→A)                    push  [deleteB]
+    live(capB)?  concurrent cover: deleteA→B
+      isVoided(deleteA→B)                push  [deleteB, deleteA]
+        live(capA)?  concurrent cover: deleteB→A
+          isVoided(deleteB→A)            visiting; top = deleteA ≠ deleteB
+                                         -> FOREIGN hit, DENY
+        capA live  ->  deleteA NOT voided          (not stored)
+    capB dead  ->  deleteB VOIDED                  (not stored)
+  capA survives
+
+hasRow(capB)                             symmetric, from scratch
+  -> deleteA VOIDED, capB survives
+```
+
+A fresh `isEntryVoided(deleteB)` says *voided*; inside `deleteA`'s frame the
+same key comes out *live*. Cycle participants are root-dependent — that is what
+the least-fixpoint collapse means — so storing either verdict and reusing it
+from the other side yields a single survivor and disagrees with an independent
+evaluation of the same entry. (The first attempt at this memo stored every
+finished verdict and failed `[PERM12]` exactly this way.)
+
+**What is and is not stored.** Stored: every verdict in an acyclic subtree,
+which includes the whole update chain above — \(U_j\) only sees writes at or
+below its own position, so no later or concurrent write can produce a foreign
+hit inside it. Not stored: the in-stack deny itself; any frame open during a
+foreign hit — the cycle participants and, conservatively, every frame below
+them on the stack (those verdicts are in fact root-independent; tracking the
+minimum hit depth instead of a counter would let them store, but cycles are
+rare and small and their acyclic children still memoize, so the simpler rule
+ships); and nothing on throw, since the `set` follows the `await`. A cache hit
+is not a frame: it does not call `enterVoidFrame` and does not push.
+
+**Cost.** One diagnose per `(group, entry, from)` per computation: the chain is
+\(O(k)\) diagnoses, each with an \(O(k)\) history scan. `[VOID_MEMO01]` (one
+authored insert, 24 authored updates, then `getRow` + `query` on one view) runs
+in tens of milliseconds where the unmemoized engine needs \(2^{23}\) diagnoses.
+The public `isEntryVoided` / `explainEntryVoided` still mint a fresh closure per
+call, so a per-entry sweep such as the REPL's `LOG` pays \(O(n)\) per line,
+\(O(n^2)\) overall — acceptable; threading one closure through such sweeps is a
+separate change.
+
+**Constraint: one closure, one sequential traversal.** `stack.top` identifies
+the asker only if the closure is never shared by *interleaved* traversals.
+Today every void check in `view.ts` is sequentially awaited and the rdb engine
+contains no `Promise.all`; independent computations mint their own closure
+(`[OBSGATE07]`). Parallelizing per-row `getRow` on a single view would already
+break `visiting` (false cycles between siblings) and would additionally let a
+foreign hit be misread as a self hit and stored. If parallelism is ever wanted
+there, mint one closure per parallel branch.
 
 Group delta's op channel attaches structured void reasons via `explainEntryVoided`
-(a sibling of `isEntryVoided` sharing the same `diagnoseEntryVoided` traversal).
+(a sibling of `isEntryVoided`; both go through `resolveVoidDetail`, so they share
+one traversal, one memo, and cannot disagree).
 
 ## 5. Reentrancy: the per-computation VoidClosure
 
@@ -159,7 +272,11 @@ through every `*Closure` helper and every `RTableViewImpl` those helpers build
 so they cannot cross-talk; the type system enforces threading, since every
 internal function and the view constructor take a non-optional `closure`.
 Convention (greppable): a `*Closure` body may only call other `*Closure` helpers
-or `new RTableViewImpl(..., closure)`, never a minting wrapper.
+or `new RTableViewImpl(..., closure)`, never a minting wrapper. The same closure
+also carries the per-computation memo of §4 (`completed`, `stack`,
+`foreignCycleHits`); those fields die with the computation for the same reason
+the visiting set does, and they assume the closure is driven by one sequential
+traversal.
 
 The residual hole the types cannot close is internal code accidentally calling a
 minting wrapper (legal TypeScript). A dropped closure does not corrupt a verdict;

@@ -17,7 +17,7 @@ import type {
     OpVerdictChange, Row, RSchemaView, RTableGroup, RTableGroupDelta, RTableGroupView,
 } from "@hyper-hyper-space/hhs3_rdb";
 
-import { AdapterConfig, MaterializationTarget, OpEvent, RowAction } from "./types.js";
+import { AdapterConfig, MaterializationTarget, OpEvent, RowAction, versionsEqual } from "./types.js";
 import { projectedColumnName, projectedIdentityColumnName, providerColumnRole, targetTableName } from "./names.js";
 import { initialSchemaActions, reprojectedTables, schemaDeltaActions } from "./schema_actions.js";
 import { rowActionsForDelta } from "./row_actions.js";
@@ -111,6 +111,8 @@ export async function initialRowActions(
 // live-row backfill at `to`. Incremental: the schema + row channels of
 // group.computeDelta(checkpoint, to). Both apply atomically in one call.
 // Callers must pass a `to` that extends the target's current checkpoint.
+// Already at `to`: no-op (no getView, no apply) so an idle re-project cannot
+// rewrite the checkpoint and wake a WAL watcher.
 export async function projectGroupTo(
     group: RTableGroup,
     target: MaterializationTarget,
@@ -118,10 +120,11 @@ export async function projectGroupTo(
     config: AdapterConfig = {},
 ): Promise<void> {
     const groupId = group.getId();
+    const checkpoint = await target.getCheckpoint(groupId);
+    if (versionsEqual(checkpoint, to)) return;
+
     const view = await group.getView(to, to);
     const endView = view.getSchemaView();
-
-    const checkpoint = await target.getCheckpoint(groupId);
 
     if (checkpoint === undefined) {
         const schemaActions = initialSchemaActions(endView, config);

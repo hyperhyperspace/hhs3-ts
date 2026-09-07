@@ -175,6 +175,10 @@ export class RTableViewImpl implements RTableView {
         return this._schemaView;
     }
 
+    // Every call below is sequentially awaited on purpose: the closure's cycle
+    // guard and verdict memo (void_closure.ts) assume one traversal per closure.
+    // Do not Promise.all per-row work on a single view without minting a
+    // closure per branch.
     private entryVoided(entryHash: B64Hash): Promise<boolean> {
         return this.target.isEntryVoidedClosure(this.closure, entryHash, this.from);
     }

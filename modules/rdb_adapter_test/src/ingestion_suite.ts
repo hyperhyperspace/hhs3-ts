@@ -774,7 +774,8 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                         const afterCp = await target.getCheckpoint(groupId);
                         assertTrue(afterCp !== undefined && afterCp.size === current!.size, 'the checkpoint is unchanged');
 
-                        // A correct expectFrom still applies (advancing to the same version).
+                        // A correct expectFrom still succeeds. An empty batch already
+                        // at this checkpoint is a no-op (no checkpoint rewrite).
                         await target.apply(groupId, [], [], current!, undefined, current!);
                     } finally {
                         await cleanup?.();

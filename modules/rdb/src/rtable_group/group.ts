@@ -225,12 +225,19 @@ export class RTableGroupImpl implements RTableGroupContract {
     // per-group cycle semantics (an A->B->A ring still DENIES) without a shared
     // cross-group guard.
     //
-    // NOTE: there is deliberately NO memo cache here. A cache keyed only by
-    // (entry, from) would leak a traversal-dependent intermediate verdict across
-    // independent top-level queries and break replica convergence; the visiting
-    // mark is transient (added before recursing, removed in finally), so it
-    // only ever detects a cycle within ONE computation. See VOID_SEMANTICS.md
-    // for the logic-program framing and the future stratified/seniority design.
+    // An INSTANCE-level (entry, from) cache is forbidden: it would leak a
+    // traversal-dependent intermediate (the in-stack deny) across independent
+    // top-level queries and break replica convergence (PERM12). The visiting
+    // mark stays transient (added before recursing, removed in finally).
+    //
+    // WITHIN one computation the closure memoizes finished verdicts
+    // (`completed`); without that, an update chain is exponential (each
+    // update's getRow re-diagnoses every earlier write of the row). The rule
+    // that keeps the memo sound is in resolveVoidDetail: a verdict is stored
+    // unless its frame was open while some descendant was denied on a LOWER
+    // ancestor (a foreign cycle hit). A frame denied on its own key — getRow
+    // at version(U_k) seeing U_k — is a self hit and does not block storing.
+    // See VOID_SEMANTICS.md §4 for the argument and the PERM12 trace.
     //
     // `_voidInflight` is a FAIL-SAFE, not a verdict: the type system forces a
     // closure onto every `*Closure` helper, but internal code could still call
@@ -671,23 +678,7 @@ export class RTableGroupImpl implements RTableGroupContract {
     }
 
     async isEntryVoidedClosure(closure: VoidClosure, entryHash: B64Hash, from: Version): Promise<boolean> {
-        // group-namespaced key: one closure may span bound foreign groups, and
-        // each group's marks must stay distinct (see the closure note).
-        const key = this.createOpId + '|' + entryHash + '|' + [...from].sort().join(',');
-
-        // A cycle on the authorization-recursion stack: DENY (least fixpoint —
-        // the whole cycle is treated as voided). The mark is transient, so this
-        // only fires within one computation (this closure).
-        if (closure.visiting.has(key)) return true;
-
-        closure.visiting.add(key);
-        try {
-            this.enterVoidFrame();
-            return (await this.diagnoseEntryVoidedClosure(closure, entryHash, from)) !== undefined;
-        } finally {
-            this._voidInflight--;
-            closure.visiting.delete(key);
-        }
+        return (await this.resolveVoidDetail(closure, entryHash, from)) !== undefined;
     }
 
     async explainEntryVoided(entryHash: B64Hash, from: Version): Promise<OpVoidDetail | undefined> {
@@ -695,16 +686,55 @@ export class RTableGroupImpl implements RTableGroupContract {
     }
 
     async explainEntryVoidedClosure(closure: VoidClosure, entryHash: B64Hash, from: Version): Promise<OpVoidDetail | undefined> {
+        return this.resolveVoidDetail(closure, entryHash, from);
+    }
+
+    // Shared diagnose + memo for isEntryVoidedClosure / explainEntryVoidedClosure
+    // (one body, so boolean and explain cannot drift). Protocol:
+    //
+    //   completed hit  -> return stored verdict; NOT a frame (no enterVoidFrame,
+    //                     no push).
+    //   visiting hit   -> DENY (authorization-cycle), never stored. If the asked
+    //                     key is not the current top it is a FOREIGN hit: bump
+    //                     the counter so every frame open right now declines to
+    //                     store. A hit on the top itself is getRow/hasRow at the
+    //                     op's own position seeing the op (self hit) — structural
+    //                     in every evaluation of that key, so it is harmless.
+    //   otherwise      -> push, diagnose, store iff no foreign hit happened in
+    //                     between (including `undefined` = live), pop in finally.
+    //
+    // Nothing is stored on throw (the set follows the await); finally still
+    // balances the in-flight counter and the stack. `stack` mirrors `visiting`
+    // and both assume one sequential traversal per closure (void_closure.ts).
+    private async resolveVoidDetail(
+        closure: VoidClosure, entryHash: B64Hash, from: Version,
+    ): Promise<OpVoidDetail | undefined> {
+        // group-namespaced key: one closure may span bound foreign groups, and
+        // each group's marks must stay distinct (see the closure note).
         const key = this.createOpId + '|' + entryHash + '|' + [...from].sort().join(',');
 
-        if (closure.visiting.has(key)) return { kind: 'authorization-cycle' };
+        if (closure.completed.has(key)) return closure.completed.get(key);
+
+        // A cycle on the authorization-recursion stack: DENY (least fixpoint).
+        if (closure.visiting.has(key)) {
+            const top = closure.stack[closure.stack.length - 1];
+            if (top !== key) closure.foreignCycleHits++;
+            return { kind: 'authorization-cycle' };
+        }
 
         closure.visiting.add(key);
+        closure.stack.push(key);
+        const cycleHitsBefore = closure.foreignCycleHits;
         try {
             this.enterVoidFrame();
-            return await this.diagnoseEntryVoidedClosure(closure, entryHash, from);
+            const detail = await this.diagnoseEntryVoidedClosure(closure, entryHash, from);
+            if (closure.foreignCycleHits === cycleHitsBefore) {
+                closure.completed.set(key, detail);
+            }
+            return detail;
         } finally {
             this._voidInflight--;
+            closure.stack.pop();
             closure.visiting.delete(key);
         }
     }

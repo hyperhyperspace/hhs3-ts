@@ -8,6 +8,7 @@ import { rowIdTests } from "./row_id_tests.js";
 import { rschemaTests } from "./rschema_tests.js";
 import { rtableGroupTests } from "./rtable_group_tests.js";
 import { rtableLwwTests } from "./rtable_lww_tests.js";
+import { rtableVoidMemoTests } from "./rtable_void_memo_tests.js";
 import { rtableBundleTests } from "./rtable_bundle_tests.js";
 import { rtableEnforceTests } from "./rtable_enforce_tests.js";
 import { rtableXGroupTests } from "./rtable_xgroup_tests.js";
@@ -37,6 +38,7 @@ async function main() {
     allTests.set(rschemaTests.title, rschemaTests.tests);
     allTests.set(rtableGroupTests.title, rtableGroupTests.tests);
     allTests.set(rtableLwwTests.title, rtableLwwTests.tests);
+    allTests.set(rtableVoidMemoTests.title, rtableVoidMemoTests.tests);
     allTests.set(rtableBundleTests.title, rtableBundleTests.tests);
     allTests.set(rtableEnforceTests.title, rtableEnforceTests.tests);
     allTests.set(rtableXGroupTests.title, rtableXGroupTests.tests);

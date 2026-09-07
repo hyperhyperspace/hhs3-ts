@@ -335,15 +335,12 @@ export const sqliteSpecificTests = {
 
                     let fires = 0;
                     listener = (): void => { fires++; };
-                    target.addChangeListener(listener);   // prime fires synchronously
-                    assertEquals(fires, 1, 'WAL watch primes one signal on arm');
-
-                    // Await kernel registration of the WAL watcher (a loop hop on
-                    // Darwin, near-instant on Linux) instead of sleeping past the
-                    // attach race. This also delivers a second prime, so baseline
-                    // the fire count AFTER it: the assertion below then isolates
-                    // the wake caused by the write, not a prime.
+                    target.addChangeListener(listener);
+                    // Empty outbox: arm primes are silent (MAX(id) filter). Await
+                    // kernel registration so the INSERT below is not lost in the
+                    // attach window.
                     await target.whenChangeMonitorReady();
+                    assertEquals(fires, 0, 'empty outbox does not prime the WAL watcher');
                     const baseline = fires;
 
                     // A genuine local write on the same handle (as the host app would).
@@ -358,6 +355,81 @@ export const sqliteSpecificTests = {
                     }
                     assertTrue(fires > baseline,
                         `a local write should wake the WAL watcher (baseline ${baseline}, got ${fires})`);
+                } finally {
+                    target.removeChangeListener(listener);
+                    db.close();
+                    cleanupDb(dbPath);
+                }
+            },
+        },
+        {
+            name: '[ADPTS-SQL04c] empty apply at the current checkpoint is a no-op (no sqlite writes)',
+            invoke: async () => {
+                const { group, admin } = await createGroup();
+                const ledger = await group.getTable('ledger');
+                await ledger.insert('l1', { ref: 'R-1', amount: '10.00' }, admin);
+
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db, { captureChanges: true });
+                await projectGroup(group, target);
+
+                const gid = group.getId();
+                const current = await target.getCheckpoint(gid);
+                assertTrue(current !== undefined, 'checkpoint exists after projection');
+
+                const before = (db.prepare('SELECT total_changes() AS n').get() as { n: number }).n;
+                await target.apply(gid, [], [], current!, undefined, current);
+                const after = (db.prepare('SELECT total_changes() AS n').get() as { n: number }).n;
+                assertEquals(after, before, 'empty apply at the current checkpoint writes nothing');
+
+                await projectGroup(group, target);
+                const afterIdle = (db.prepare('SELECT total_changes() AS n').get() as { n: number }).n;
+                assertEquals(afterIdle, before, 'idle projectGroup does not apply');
+                db.close();
+            },
+        },
+        {
+            name: '[ADPTS-SQL04d] WAL watch ignores checkpoint writes; fires only when the outbox grows',
+            invoke: async () => {
+                const { group, admin } = await createGroup();
+                const ledger = await group.getTable('ledger');
+                await ledger.insert('l1', { ref: 'R-1', amount: '10.00' }, admin);
+
+                const dbPath = tmpDbPath('waloutbox');
+                const db = new Database(dbPath);
+                const target = new SqliteTarget(db, { captureChanges: true, dbPath });
+                let listener = (): void => undefined;
+                try {
+                    await projectGroup(group, target);
+
+                    let fires = 0;
+                    listener = (): void => { fires++; };
+                    target.addChangeListener(listener);
+                    await target.whenChangeMonitorReady();
+                    assertEquals(fires, 0, 'empty outbox on arm does not signal');
+
+                    await projectGroup(group, target);
+                    await new Promise((resolve) => setTimeout(resolve, 50));
+                    assertEquals(fires, 0, 'idle projectGroup does not signal');
+
+                    // Catch-up persist of a new checkpoint with empty actions still
+                    // writes WAL (setApplying + INSERT OR REPLACE) but must not signal.
+                    const gid = group.getId();
+                    const current = await target.getCheckpoint(gid);
+                    const ahead = new Set([...(current ?? []), 'idle-catchup']);
+                    await target.apply(gid, [], [], ahead, undefined, current);
+                    const deadlineQuiet = Date.now() + 400;
+                    while (Date.now() < deadlineQuiet) {
+                        await new Promise((resolve) => setTimeout(resolve, 20));
+                    }
+                    assertEquals(fires, 0, 'checkpoint-only apply does not signal (outbox unchanged)');
+
+                    db.prepare('INSERT INTO tags (code) VALUES (?)').run('urgent');
+                    const deadline = Date.now() + 3000;
+                    while (fires === 0 && Date.now() < deadline) {
+                        await new Promise((resolve) => setTimeout(resolve, 20));
+                    }
+                    assertTrue(fires > 0, `an app INSERT should signal (got ${fires})`);
                 } finally {
                     target.removeChangeListener(listener);
                     db.close();

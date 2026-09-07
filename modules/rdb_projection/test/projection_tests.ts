@@ -187,6 +187,12 @@ export const projectionTests = {
                 await products.insert('p1', { title: 'Widget' }, catalog.admin);
 
                 const target = new MemoryTarget();
+                let applyCount = 0;
+                const origApply = target.apply.bind(target);
+                target.apply = async (g, s, r, c, e, from) => {
+                    applyCount++;
+                    return origApply(g, s, r, c, e, from);
+                };
                 const projection = await RdbProjection.open(rdb, ctx, target);
                 try {
                     const ids = projection.memberGroupIds().sort();
@@ -195,8 +201,10 @@ export const projectionTests = {
                         'scope contains catalog + orders');
 
                     const before = target.getRowIds('catalog_products').length;
+                    const appliesAfterOpen = applyCount;
                     await projection.sync();   // no intervening rdb change
                     assertEquals(target.getRowIds('catalog_products').length, before, 're-sync is idempotent');
+                    assertEquals(applyCount, appliesAfterOpen, 'idle re-sync does not apply');
                 } finally {
                     await projection.stop();
                 }
