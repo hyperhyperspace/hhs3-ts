@@ -3,7 +3,7 @@ import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from 
 import type { B64Hash, KeyId, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { Version } from "@hyper-hyper-space/hhs3_mvt";
-import { signPayload, serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
+import { signPayload, serializePublicKeyToBase64, formatValidationFailure, ValidationRejectedError } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
@@ -44,6 +44,22 @@ async function expectThrow(fn: () => Promise<unknown>, why: string): Promise<voi
     let threw = false;
     try { await fn(); } catch { threw = true; }
     assertTrue(threw, why);
+}
+
+async function expectFailure(fn: () => Promise<unknown>, why: string, messageIncludes?: string): Promise<void> {
+    let error: unknown;
+    try {
+        await fn();
+    } catch (e) {
+        error = e;
+    }
+    assertTrue(error !== undefined, why);
+    if (messageIncludes !== undefined) {
+        const msg = error instanceof ValidationRejectedError
+            ? formatValidationFailure(error.why)
+            : error instanceof Error ? error.message : String(error);
+        assertTrue(msg.includes(messageIncludes), `expected message to include '${messageIncludes}', got: ${msg}`);
+    }
 }
 
 function sameVersion(a: Version, b: Version): boolean {
@@ -534,6 +550,121 @@ export const rtablePermTests = {
                 const updateReason = formatOpVoidDetail(updateDetail!);
                 assertTrue(updateReason.includes("is not live in table 'docs'"), 'update reason names absent liveness');
                 assertFalse(updateReason.includes('rowAuthor'), 'update reason does not cite rowAuthor');
+            },
+        },
+        {
+            name: '[PERM09e] update/delete of a causally-already-voided insert reject at write time',
+            invoke: async () => {
+                const ctx = newCtx();
+                const admin = await makeIdentity();
+
+                const tables: TableDef[] = [
+                    ...usersSchemaTables(),
+                    { name: 'wcaps', columns: { label: { type: 'string', pub: true, readonly: true }, grantee: { type: 'string', pub: true, readonly: true } },
+                      concurrentDeletes: true, restrictions: [{ on: 'all', rule: { p: 'true' } }] },
+                    { name: 'docs', columns: { body: { type: 'string' } },
+                      restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'wcaps', where: { label: 'writer', grantee: '$author' } } }] },
+                ];
+                const schemaInit = await RSchemaImpl.create({
+                    name: 'perm09e:schema',
+                    creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
+                    tables,
+                });
+                const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
+                const pinned = await (await schema.getScopedDag()).getFrontier();
+                const groupInit = await RTableGroupImpl.create({
+                    name: 'perm09e-group', seed: 'perm09e-group', schemaRef: schema.getId(), schemaVersion: pinned,
+                    idProvider: IDENTITIES_TABLE,
+                    initialRows: {
+                        [IDENTITIES_TABLE]: [{ action: 'insert', rowId: deriveRowId('admin'), uuid: 'admin', values: { keyId: admin.keyId, publicKey: serializePublicKeyToBase64(admin.publicKey) } }],
+                    },
+                });
+                const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
+
+                const alice = await makeIdentity();
+                await registerIdentity(group, alice);
+
+                const wcaps = await group.getTable('wcaps');
+                const capId = deriveRowId('w-alice');
+                await wcaps.insert('w-alice', { label: 'writer', grantee: alice.keyId });
+
+                const base0 = await frontier(group);
+                const docs = await group.getTable('docs');
+                const dId = deriveRowId('d-1', alice.keyId);
+
+                await docs.insert('d-1', { body: 'a' }, alice, base0);
+                await wcaps.delete(capId, undefined, base0);
+
+                const merged = await frontier(group);
+                assertFalse(await (await tableView(group, 'docs', merged)).hasRow(dId),
+                    'row is not live after the concurrent cap revoke merges');
+
+                await expectFailure(() => docs.update(dId, { body: 'c' }, alice, merged),
+                    'update of a voided-insert row rejects at validation',
+                    "is not live in table 'docs'");
+                await expectFailure(() => docs.delete(dId, alice, merged),
+                    'delete of a voided-insert row rejects at validation',
+                    "is not live in table 'docs'");
+            },
+        },
+        {
+            name: '[PERM09f] a voided delete in causal past still allows an authored update',
+            invoke: async () => {
+                const ctx = newCtx();
+                const admin = await makeIdentity();
+
+                const tables: TableDef[] = [
+                    ...usersSchemaTables(),
+                    { name: 'wcaps', columns: { label: { type: 'string', pub: true, readonly: true }, grantee: { type: 'string', pub: true, readonly: true } },
+                      concurrentDeletes: true, restrictions: [{ on: 'all', rule: { p: 'true' } }] },
+                    { name: 'docs', columns: { body: { type: 'string' } },
+                      restrictions: [
+                          { on: 'insert', rule: { p: 'true' } },
+                          { on: 'delete', rule: { p: 'exists', table: 'wcaps', where: { label: 'writer', grantee: '$author' } } },
+                      ] },
+                ];
+                const schemaInit = await RSchemaImpl.create({
+                    name: 'perm09f:schema',
+                    creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
+                    tables,
+                });
+                const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
+                const pinned = await (await schema.getScopedDag()).getFrontier();
+                const groupInit = await RTableGroupImpl.create({
+                    name: 'perm09f-group', seed: 'perm09f-group', schemaRef: schema.getId(), schemaVersion: pinned,
+                    idProvider: IDENTITIES_TABLE,
+                    initialRows: {
+                        [IDENTITIES_TABLE]: [{ action: 'insert', rowId: deriveRowId('admin'), uuid: 'admin', values: { keyId: admin.keyId, publicKey: serializePublicKeyToBase64(admin.publicKey) } }],
+                    },
+                });
+                const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
+
+                const alice = await makeIdentity();
+                await registerIdentity(group, alice);
+
+                const docs = await group.getTable('docs');
+                const dId = deriveRowId('d-1', alice.keyId);
+                await docs.insert('d-1', { body: 'a' }, alice);
+
+                const wcaps = await group.getTable('wcaps');
+                const capId = deriveRowId('w-alice');
+                await wcaps.insert('w-alice', { label: 'writer', grantee: alice.keyId });
+
+                const fork = await frontier(group);
+                const deleteHash = await docs.delete(dId, alice, fork);
+                await wcaps.delete(capId, undefined, fork);
+
+                const merged = await frontier(group);
+                assertTrue(await group.isEntryVoided(deleteHash, merged), 'delete voided at merge (concurrent cap revoke)');
+                assertTrue(await (await tableView(group, 'docs', merged)).hasRow(dId),
+                    'row stays live: the voided delete does not kill');
+
+                await docs.update(dId, { body: 'repaired' }, alice, merged);
+                assertEquals((await (await tableView(group, 'docs', merged)).getRow(dId))!.values['body'], 'a',
+                    'the update is at merged; read at merged does not include it');
+                const after = await frontier(group);
+                assertEquals((await (await tableView(group, 'docs', after)).getRow(dId))!.values['body'], 'repaired',
+                    'authored update of a row whose only delete is voided lands');
             },
         },
         {

@@ -15,16 +15,15 @@ async function makeIdentity(): Promise<OwnIdentity> {
     return createIdentity(SIGNING_ED25519, hashSuite);
 }
 
-// Regression net for the per-computation verdict memo (VOID_SEMANTICS.md §4,
-// "The per-computation memo"). The table deliberately has NO explicit
-// restrictions, so updates run under the default `rowAuthor = $author` rule —
-// the projection / `doc.pages` path that surfaced the bug. That rule getRow's
-// the subject at the update's own position, which void-checks every earlier
-// write of the row, each of which getRow's again: T(k) ~ 2^(k-1) without the
-// memo. N = 24 is chosen so the unmemoized engine (2^23 diagnoses) blows the
-// 60s suite timeout while the memoized one finishes in tens of milliseconds.
-// PERM12 / OBSGATE07 are the matching soundness nets (cycle participants are
-// not memoized; independent computations do not share a closure).
+// Regression net for the per-computation verdict memo (VOID_SEMANTICS.md §4).
+// The table has NO explicit restrictions, so updates run under the default
+// `rowAuthor = $author` rule — that getRow's the subject at the update's own
+// position (identity cover + column-tag covers; see-through `entryVoided`).
+// `visiting` is a stack, so without `completed` shared nodes are re-diagnosed
+// once per path (exponential). N = 24 is a long authored chain on one view;
+// getRow + query must stay snappy. PERM12 / OBSGATE07 are the matching
+// soundness nets (cycle participants are not memoized; independent
+// computations do not share a closure).
 function pagesTable(): TableDef {
     return {
         name: 'pages',

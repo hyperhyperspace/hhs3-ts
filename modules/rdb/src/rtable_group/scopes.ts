@@ -11,16 +11,20 @@
 // meta is unhashed):
 //
 //   tables: [touched table names]            - every row-carrying entry
-//   t-<table>-rows: ['<tableIncarnationId>:<rowId>'] - row cover queries
-//                                              (liveness), scoped to the table
-//                                              incarnation active at write time
-//                                              so a table drop+re-add resets
-//                                              liveness (see resolve.ts).
+//   t-<table>-rows: ['<tableIncarnationId>:<rowId>'] - identity ops only
+//                                              (insert and delete). Liveness
+//                                              and write-once uniqueness cover
+//                                              this tag. Updates do NOT carry
+//                                              it (they are column writes).
+//                                              Scoped to the table incarnation
+//                                              active at write time so a table
+//                                              drop+re-add resets liveness
+//                                              (see ../rtable/view.ts).
 //   t-<table>-cols: ['<rowId>:<incarnationId>:<column>'] - column writes
-//                                              updates): the per-column LWW
-//                                              cover queries, keyed by the
-//                                              schema birth write active at
-//                                              write time (see resolve.ts).
+//                                              (insert and update): the
+//                                              per-column LWW cover queries,
+//                                              keyed by the schema birth write
+//                                              active at write time.
 //   t-<table>-pub-<column>: [normalized]     - pub export (inserts and updates;
 //                                              stale values in old entries are
 //                                              candidate noise, filtered by the
@@ -104,22 +108,26 @@ export function tableOpsFromGroupPayload(payload: json.Literal, table: string): 
     }
 }
 
-// Inner (table-scope) meta for one row op. `rows` indexes the touched row;
-// inserts and updates tag every carried column (`cols`) and export their
-// carried pub column values; deletes are ALWAYS barrier-tagged. Whether that
-// barrier is HONORED (reaches concurrent branches) is decided at view time by
-// the (at, from)-resolved concurrentDeletes flag, NOT here: the tag is baked
-// permanently at write, but the flag is mutable + resolved at the horizon, so
-// gating honoring on the tag's write-time value would make enabling the flag
-// unable to honor a delete authored while it was off. Tagging unconditionally
-// makes concurrentDeletes resolve fully at the view horizon (like restrictions
-// / FKs); see liveInsert / baseLiveInsert in ../rtable/view.ts.
+// Inner (table-scope) meta for one row op. `rows` is identity-only (insert
+// and delete). Inserts and updates tag every carried column (`cols`) and
+// export their carried pub column values; deletes are ALWAYS barrier-tagged.
+// Whether that barrier is HONORED (reaches concurrent branches) is decided at
+// view time by the (at, from)-resolved concurrentDeletes flag, NOT here: the
+// tag is baked permanently at write, but the flag is mutable + resolved at the
+// horizon, so gating honoring on the tag's write-time value would make
+// enabling the flag unable to honor a delete authored while it was off.
+// Tagging unconditionally makes concurrentDeletes resolve fully at the view
+// horizon (like restrictions / FKs); see liveInsert /
+// killedByConcurrentDelete in ../rtable/view.ts.
 export function deriveRowOpInnerMeta(op: RowOpPayload, table: string, schemaView: RSchemaView): MetaProps {
     const tableIncarnation = schemaView.getTableIncarnation(table);
     if (tableIncarnation === undefined) {
         throw new Error(`deriveRowOpInnerMeta: table '${table}' is not live`);
     }
-    const meta: MetaProps = { rows: json.toSet([rowTag(tableIncarnation, op.rowId)]) };
+    const meta: MetaProps = {};
+    if (op.action === 'insert' || op.action === 'delete') {
+        meta['rows'] = json.toSet([rowTag(tableIncarnation, op.rowId)]);
+    }
 
     if (op.action === 'insert' || op.action === 'update') {
         const columns = Object.keys(op.values);

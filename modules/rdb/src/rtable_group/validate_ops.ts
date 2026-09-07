@@ -7,10 +7,10 @@
 //                  insert against the pinned schema.
 //   row          - format + table exists in the effective schema at `at` +
 //                  the op conforms to it + identity rules: rowIds are
-//                  write-once (an insert is valid only if NO op for its
-//                  rowId — insert or delete — is at or below `at`, so a
+//                  write-once (an insert is valid only if NO insert or
+//                  delete for its rowId is at or below `at`, so a
 //                  deleted rowId can never be re-inserted); updates and
-//                  deletes need a live row + the row restriction passes at the
+//                  deletes need a view-live row at `(at, at)` (`hasRow`) + the row restriction passes at the
 //                  parent frontier `(at, at)`.
 //   ref-advance  - EITHER the schema deploy (refId is the group's schema ref:
 //                  monotonic against the schema DAG, at or above the pinned
@@ -68,12 +68,6 @@ import { rowTag } from "./scopes.js";
 
 // What op-mode validation needs from the group (implemented by
 // RTableGroupImpl; a structural type to avoid an import cycle).
-// The member table as op-validation sees it: the public contract plus the
-// write-time base-liveness probe.
-export type ValidationTable = RTable & {
-    baseHasRow(rowId: B64Hash, at: Version): Promise<boolean>;
-};
-
 export type GroupOpHost = {
     getId(): B64Hash;
     getSchemaRef(): B64Hash;
@@ -96,7 +90,7 @@ export type GroupOpHost = {
     // liveness-bypassed. undefined = unresolvable (reject); throws on a missing
     // bound provider object (defer).
     resolveAuthorKey(keyId: KeyId, at: Version): Promise<PublicKey | undefined>;
-    makeTable(name: string): ValidationTable;
+    makeTable(name: string): RTable;
     // A bound foreign group's member-table view at the resolved foreign
     // version. undefined = unbound name or table absent at that version (the
     // caller treats both as a missing reference); throws if the bound object
@@ -307,20 +301,23 @@ async function validateRowEnvelope(envelope: RowEnvelopePayload, group: GroupOpH
     const table = group.makeTable(envelope.table);
 
     if (op.action === 'insert') {
-        // rowIds are write-once WITHIN a table incarnation: any prior op for
-        // this rowId (insert OR delete) at or below `at` makes the insert
-        // invalid — in particular a deleted rowId can never be re-inserted. The
-        // cover is incarnation-scoped, so a table drop+re-add starts a fresh
-        // rowId namespace (a prior incarnation's rows do not block re-insert).
+        // rowIds are write-once WITHIN a table incarnation: any prior insert
+        // or delete for this rowId at or below `at` makes the insert invalid
+        // (a deleted rowId can never be re-inserted). The `rows` cover is
+        // identity-only (updates do not match) and has no void predicate — a
+        // voided insert still occupies the rowId. Incarnation-scoped, so a
+        // table drop+re-add starts a fresh rowId namespace.
         const incarnation = schemaView.getTableIncarnation(envelope.table);
         if (incarnation === undefined) return validationFailure(`table '${envelope.table}' is not live`);
         const tableDag = await table.getScopedDag();
         const cover = await tableDag.findCoverWithFilter(at, { containsValues: { rows: [rowTag(incarnation, op.rowId)] } });
         if (cover.size !== 0) return validationFailure(`rowId '${op.rowId}' already exists or was deleted in table '${envelope.table}'`);
     } else {
-        // updates and deletes need an undeleted row at the op's own position
-        // (base liveness: an FK-hidden but undeleted row can still be updated)
-        if (!await table.baseHasRow(op.rowId, at)) return validationFailure(`rowId '${op.rowId}' is not live in table '${envelope.table}'`);
+        // updates and deletes need a view-live row at the parent frontier
+        // (same hasRow / liveInsert as FK targets and reads)
+        if (!await (await table.getView(at, at)).hasRow(op.rowId)) {
+            return validationFailure(`rowId '${op.rowId}' is not live in table '${envelope.table}'`);
+        }
     }
 
     // Restrictions must pass at the parent frontier `(at, at)`; concurrent
@@ -426,13 +423,17 @@ async function validateBundle(bundle: BundlePayload, group: GroupOpHost, at: Ver
 
         const tbl = group.makeTable(table);
         if (op.action === 'insert') {
+            // cover of identity-only `rows` (insert/delete); no void predicate
+            // — a voided insert still occupies the rowId.
             const incarnation = schemaView.getTableIncarnation(table);
             if (incarnation === undefined) return validationFailure(`table '${table}' is not live`);
             const tableDag = await tbl.getScopedDag();
             const cover = await tableDag.findCoverWithFilter(at, { containsValues: { rows: [rowTag(incarnation, op.rowId)] } });
             if (cover.size !== 0) return validationFailure(`bundle insert rowId '${op.rowId}' already exists or was deleted in table '${table}'`);
         } else {
-            if (!await tbl.baseHasRow(op.rowId, at)) return validationFailure(`bundle op rowId '${op.rowId}' is not live in table '${table}'`);
+            if (!await (await tbl.getView(at, at)).hasRow(op.rowId)) {
+                return validationFailure(`bundle op rowId '${op.rowId}' is not live in table '${table}'`);
+            }
         }
 
         // Authorization reads only the parent frontier; sibling writes in this

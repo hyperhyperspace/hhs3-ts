@@ -44,9 +44,9 @@
 // DENY. Cross-group FK / exists targets resolve through bound foreign groups.
 // When the group selects an identity provider, an authored op's signature is
 // verified AT VALIDATION (hard reject / defer), so view-time evaluation trusts
-// op.author. Write-time validation rejects dangling FKs (local and cross-group);
-// the subject-row liveness check for update/delete is BASE delete-state only
-// (an undeleted row stays repairable). Delta is the group's (a table never leads
+// op.author. Write-time validation rejects dangling FKs (local and cross-group)
+// and requires the subject row of an update/delete to be view-live at `(at, at)`
+// (`hasRow` / `liveInsert`). Delta is the group's (a table never leads
 // one): a member table contributes a per-table row-change accumulator
 // (createDeltaAccumulator -> ./delta.ts) that the group routes walked entries
 // to; computeDelta throws here.
@@ -137,13 +137,6 @@ export class RTableImpl implements RTableContract {
 
     explainEntryVoided(entryHash: B64Hash, from: Version) {
         return this.group.explainEntryVoided(entryHash, from);
-    }
-
-    // Write-time identity check: base delete-state liveness (no FK reach, no
-    // view-time restriction recheck — see view.ts). An undeleted but FK-hidden
-    // row is still a valid update target (it can be repaired).
-    async baseHasRow(rowId: B64Hash, at: Version): Promise<boolean> {
-        return new RTableViewImpl(this, at, at, freshVoidClosure()).hasRowBase(rowId);
     }
 
     // Row writers. `at` defaults to the GROUP frontier: by default a write

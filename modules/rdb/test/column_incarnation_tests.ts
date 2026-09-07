@@ -231,6 +231,56 @@ export const columnIncarnationTests = {
             }
         },
         {
+            name: '[INC04b] identity-only rows tags: insert/delete have rows, update has cols only',
+            invoke: async () => {
+                const { group } = await createEnv([
+                    open('orders', { customer: { type: 'string' }, status: { type: 'string' } }),
+                ]);
+                const at = await groupFrontier(group);
+                const schemaView = await group.resolveSchemaView(at);
+                const rowId = deriveRowId('o-1');
+
+                const insertMeta = deriveEnvelopeMeta({
+                    action: 'row',
+                    table: 'orders',
+                    op: {
+                        action: 'insert',
+                        rowId,
+                        uuid: 'o-1',
+                        values: { customer: 'ada', status: 'open' },
+                    },
+                }, schemaView);
+                assertTrue(insertMeta['t-orders-rows'] !== undefined,
+                    'insert identity should tag t-<table>-rows');
+                assertTrue(insertMeta['t-orders-cols'] !== undefined,
+                    'insert column writes should tag t-<table>-cols');
+
+                const updateMeta = deriveEnvelopeMeta({
+                    action: 'row',
+                    table: 'orders',
+                    op: {
+                        action: 'update',
+                        rowId,
+                        values: { status: 'closed' },
+                    },
+                }, schemaView);
+                assertTrue(updateMeta['t-orders-rows'] === undefined,
+                    'update should not tag t-<table>-rows');
+                assertTrue(updateMeta['t-orders-cols'] !== undefined,
+                    'update column writes should tag t-<table>-cols');
+
+                const deleteMeta = deriveEnvelopeMeta({
+                    action: 'row',
+                    table: 'orders',
+                    op: { action: 'delete', rowId },
+                }, schemaView);
+                assertTrue(deleteMeta['t-orders-rows'] !== undefined,
+                    'delete identity should tag t-<table>-rows');
+                assertTrue(deleteMeta['t-orders-cols'] === undefined,
+                    'delete should not tag t-<table>-cols');
+            }
+        },
+        {
             name: '[INC05] concurrent add-column default activates without a per-row write',
             invoke: async () => {
                 const { group, schema, admin } = await createEnv([

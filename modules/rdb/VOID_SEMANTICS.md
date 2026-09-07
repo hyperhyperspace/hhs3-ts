@@ -138,20 +138,60 @@ The analysis in §6 is the principled version that special case was reaching for
 ### The per-computation memo: `VoidClosure.completed`
 
 The prohibition above is about caching *across* computations. *Within* one
-computation the closure memoizes finished verdicts, and it must: without that
-memo the engine is exponential in the number of updates to a row.
+computation the closure memoizes finished verdicts. Diagnosing an entry reads
+the DAG through the path below; those reads ask `entryVoided` of other entries.
+`visiting` is a DFS stack, popped in `finally`, so a finished subtree is
+forgotten the moment it completes. Unmemoized, every path through the
+dependency DAG re-diagnoses shared nodes — exponential in the number of paths
+(column-tag peel, `EXISTS` / FK diamonds, a query that `getRow`s many rows that
+share writes). Depth stays small, so `VOID_MAX_INFLIGHT` does not catch it.
 
-**The problem.** Every update/delete restriction — including the default
-`rowAuthor = $author` — is evaluated against the subject row, so diagnosing an
-update \(U_k\) calls `getRow` at `version(U_k)`. `liveInsert` walks the row's
-full history visible there (`insert, U_1 … U_k`) and void-checks every write;
-each of those diagnoses does the same at its own position. The recursion tree
-for \(U_k\) is therefore \(T(k) = 1 + \sum_{j<k} T(j) \approx 2^{k-1}\). Twenty
-updates take seconds, twenty-five take minutes, thirty take hours, and because
-the recursion *depth* is only \(k\) the `VOID_MAX_INFLIGHT` fail-safe never
-trips: it presents as a hang at 100% CPU. The `visiting` set alone cannot help —
-it is a DFS stack, popped in `finally`, so a finished subtree is forgotten the
-moment it completes.
+**Reads.** Liveness and column values are DAG covers, not a scan of every write
+that touched a row. Entry meta carries two indexes (table-scoped keys `rows` /
+`cols`, stored on the group DAG as `t-<table>-rows` / `t-<table>-cols`):
+
+- **Identity** (`liveInsert` / `hasRow`): cover of `rows` among entries that
+  are not voided. Insert and delete carry this tag; updates do not. Any leftover
+  **delete** → the row is dead; otherwise the max-hash **insert**. A concurrent
+  delete can still kill via `killedByConcurrentDelete` (same not-voided
+  predicate).
+- **Values** (`resolveColumn`): cover of `cols` among entries that are not
+  voided. Insert and update carry this tag for every column they write.
+  Concurrent maxima tiebreak by larger entry hash. `getRow` still starts at
+  `liveInsert`; `resolveColumn` does not ask whether the row is live.
+
+A **plain** cover (`findCoverWithFilter` with no predicate) stops at the causal
+maxima that match the tag. If that maximum is voided, two things go wrong: its
+write must not count, and it must not *hide* a valid write below it. The
+predicate `!entryVoided` makes the cover **see through** voided matches: a
+tagged entry that fails the predicate is treated like a non-match, and the walk
+continues to its predecessors. The leftover maxima are the latest *valid*
+writes. Example: `insert → U₁ → U₂(voided)` at `U₂`'s position — the plain
+`cols` cover is `{U₂}`; the see-through cover is `{U₁}`. Tiebreaks, incarnation
+scoping, and `liveRowIds` live in `view.ts`. Diagnosing an entry **is** those
+`entryVoided` calls on cover candidates.
+
+**Why diagnose recurses.** An update or delete restriction — including the
+default `rowAuthor = $author` — is evaluated against the subject row, so
+diagnosing \(U\) or \(D\) calls `getRow` at that op's own position. `getRow` =
+identity cover + per-column covers. Each cover candidate is `entryVoided`,
+which is another diagnose. `EXISTS` / FK do the same for other rows. The
+dependency graph is therefore "this op's restriction / FK / `EXISTS`" → "void
+verdicts of the entries those covers return," not "every prior toggle of this
+row."
+
+A **self-hit** is when `entryVoided` is asked about the entry already on top of
+`visiting`:
+
+- **Delete \(D\):** the identity cover at `version(D)` includes \(D\) (deletes
+  carry the identity tag), so `entryVoided(D)` runs while \(D\) is still on the
+  stack.
+- **Update \(U\):** the identity cover does **not** include \(U\). The self-hit
+  is the column-tag cover: \(U\) wrote `cols`, `resolveColumn` asks
+  `entryVoided(U)` while \(U\) is still `visiting`, peels \(U\) as voided, and
+  continues below.
+
+Either hit is at the same structural point in every evaluation of that key.
 
 **The memo.** `VoidClosure` carries, next to `visiting`:
 
@@ -180,11 +220,12 @@ induction, so that deny is the *only* channel through which the shape of the
 stack can influence a verdict. Classify it by who is being asked about:
 
 - *Self hit* (`stack.top === key`). The op under diagnosis asked about itself
-  from inside its own subtree: `getRow` at `version(U_k)` sees \(U_k\) in the
-  row's history; `hasRow` at `version(D)` sees the delete \(D\). This happens at
+  from inside its own subtree (identity cover for a delete; column-tag cover
+  for an update — see **Reads** / **Why diagnose recurses**). This happens at
   the same structural point in *every* evaluation of that key, fresh or nested,
   so the verdict is still stack-independent and may be stored. Not storing it
-  would forfeit the memo entirely, since every update frame has a self hit.
+  would forfeit the memo on the column-tag peel (every update that `getRow`s)
+  and on delete liveness.
 - *Foreign hit* (`stack.top !== key`). A strictly lower ancestor was assumed
   voided. Every frame from that ancestor up to the top now depends on the stack
   shape; all of them are open when the counter increments and all compare it at
@@ -218,7 +259,7 @@ evaluation of the same entry. (The first attempt at this memo stored every
 finished verdict and failed `[PERM12]` exactly this way.)
 
 **What is and is not stored.** Stored: every verdict in an acyclic subtree,
-which includes the whole update chain above — \(U_j\) only sees writes at or
+including the column-tag peel \(U_1 … U_j\) — \(U_j\) only sees writes at or
 below its own position, so no later or concurrent write can produce a foreign
 hit inside it. Not stored: the in-stack deny itself; any frame open during a
 foreign hit — the cycle participants and, conservatively, every frame below
@@ -228,14 +269,13 @@ rare and small and their acyclic children still memoize, so the simpler rule
 ships); and nothing on throw, since the `set` follows the `await`. A cache hit
 is not a frame: it does not call `enterVoidFrame` and does not push.
 
-**Cost.** One diagnose per `(group, entry, from)` per computation: the chain is
-\(O(k)\) diagnoses, each with an \(O(k)\) history scan. `[VOID_MEMO01]` (one
-authored insert, 24 authored updates, then `getRow` + `query` on one view) runs
-in tens of milliseconds where the unmemoized engine needs \(2^{23}\) diagnoses.
-The public `isEntryVoided` / `explainEntryVoided` still mint a fresh closure per
-call, so a per-entry sweep such as the REPL's `LOG` pays \(O(n)\) per line,
-\(O(n^2)\) overall — acceptable; threading one closure through such sweeps is a
-separate change.
+**Cost.** With the memo, one diagnose per `(group, entry, from)` per
+computation. `[VOID_MEMO01]` (one authored insert, 24 authored updates, then
+`getRow` + `query` on one view) is the regression net for that path. The public
+`isEntryVoided` / `explainEntryVoided` still mint a fresh closure per call, so a
+per-entry sweep such as the REPL's `LOG` pays \(O(n)\) per line, \(O(n^2)\)
+overall — acceptable; threading one closure through such sweeps is a separate
+change.
 
 **Constraint: one closure, one sequential traversal.** `stack.top` identifies
 the asker only if the closure is never shared by *interleaved* traversals.
