@@ -37,8 +37,9 @@ import Database from "better-sqlite3";
 
 import {
     CapturedBatch, CapturedChange, ChangeSignalListener, ChangeSignalSource,
-    DEFAULT_KEY_TABLE, IngestSettle, KeyIndex, MaterializationTarget, MaterializedChangeSource, OpEvent,
-    OpEventReason, RowAction, RowIdentityIndex, SchemaAction, StoredOpEvent, SyncMapping,
+    CheckpointMovedError, DEFAULT_KEY_TABLE, IngestSettle, KeyIndex, MaterializationTarget,
+    MaterializedChangeSource, OpEvent, OpEventReason, RowAction, RowIdentityIndex, SchemaAction,
+    StoredOpEvent, SyncMapping, versionsEqual,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 // Per-table bookkeeping, mirrored in rdb_table_meta. Cached in memory within a
@@ -156,6 +157,12 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     private walHandle: FileWatchHandle | undefined;
     private monitorEpoch = 0;
     private lastOutboxId = 0;
+    // Resolves once the armed change monitor is guaranteed live: for the WAL
+    // watch, once the kernel file watcher is registered (see FileWatchHandle.
+    // ready); for the poll, immediately (the interval is live on arm). Undefined
+    // while disarmed. Awaited by observers/tests that need a write's wake to be
+    // deterministic rather than racing kernel registration.
+    private monitorReady: Promise<void> | undefined;
 
     // Two-level change capture:
     //   - provisioning (constructor `captureChanges`, PERSISTED by the presence
@@ -184,6 +191,12 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
 
     async getCheckpoint(groupId: B64Hash): Promise<Version | undefined> {
         this.ensureBookkeeping();
+        return this.readCheckpoint(groupId);
+    }
+
+    // Synchronous checkpoint read (assumes bookkeeping is ready). Used inside the
+    // apply() transaction for the compare-and-set guard.
+    private readCheckpoint(groupId: B64Hash): Version | undefined {
         const row = this.db.prepare('SELECT version FROM rdb_checkpoint WHERE group_id = ?').get(groupId) as
             { version: string } | undefined;
         if (row === undefined) return undefined;
@@ -192,10 +205,17 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
 
     async apply(
         groupId: B64Hash, schemaActions: SchemaAction[], rowActions: RowAction[],
-        checkpoint: Version, events?: OpEvent[],
+        checkpoint: Version, events?: OpEvent[], expectFrom?: Version | null,
     ): Promise<void> {
         this.ensureBookkeeping();
         const run = this.db.transaction(() => {
+            // Compare-and-set guard (concurrent projectors). BEGIN IMMEDIATE took
+            // the write lock, so this read of the stored checkpoint cannot race a
+            // committing writer: exactly one projector wins. On mismatch throw so
+            // better-sqlite3 rolls the whole transaction back (nothing applied).
+            if (expectFrom !== undefined && !versionsEqual(this.readCheckpoint(groupId), expectFrom ?? undefined)) {
+                throw new CheckpointMovedError(groupId);
+            }
             // Echo suppression: mark the whole batch as adapter-authored so the
             // capture triggers no-op on our own materialization writes.
             const tighten: { table: string; column: string }[] = [];
@@ -208,7 +228,11 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             if (events !== undefined) for (const e of events) this.logOpEvent(e);
             if (this.capture) this.setApplying(false);
         });
-        run();
+        // BEGIN IMMEDIATE: this transaction reads (the checkpoint CAS compare)
+        // and then writes, so it must take the write lock up front. A deferred
+        // transaction would take a read snapshot and fail with SQLITE_BUSY_SNAPSHOT
+        // when it later tried to upgrade while another connection had written.
+        run.immediate();
     }
 
     // -----------------------------------------------------------------------
@@ -355,7 +379,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
 
     private persistCheckpoint(groupId: B64Hash, checkpoint: Version): void {
         this.db.prepare('INSERT OR REPLACE INTO rdb_checkpoint (group_id, version) VALUES (?, ?)')
-            .run(groupId, JSON.stringify([...checkpoint]));
+            .run(groupId, JSON.stringify([...checkpoint].sort()));
     }
 
     private writeMeta(table: string, meta: TableMeta): void {
@@ -410,15 +434,20 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     }
 
     private createTable(action: Extract<SchemaAction, { kind: 'create-table' }>): void {
-        // The app table OWNS the serial `id` (INTEGER PRIMARY KEY). Ids are set
-        // explicitly (allocated via the sync table) so a void-flip reinstatement
-        // reuses the same id; no AUTOINCREMENT needed. Local FK columns declare an
-        // advisory (UNENFORCED) DB FK to the target's id - unenforced because rdb
-        // permits dangling references and keeps id mappings across deletes
-        // (PRAGMA foreign_keys is left OFF; see the class header note). The author
-        // column is an integer key-ref into rdb_keys, emitted LAST so SELECT *
-        // reads as id, business columns, then author_key_id.
-        const cols: string[] = [`${quoteId(action.primaryKey)} INTEGER PRIMARY KEY`];
+        // The app table OWNS the serial `id` (INTEGER PRIMARY KEY AUTOINCREMENT).
+        // Explicit ids (allocated via the sync table) still work - SQLite raises
+        // sqlite_sequence to any larger explicit rowid, so a void-flip
+        // reinstatement reuses the same id AND an app-side (e.g. CLI) insert with
+        // no id NEVER reuses an id freed by a delete/revert. That monotonicity is
+        // the contract "a local id is never reused" the rdb_adapter relies on; a
+        // reused id would let a stale insert image collide with a genuinely new
+        // row. Local FK columns declare an advisory (UNENFORCED) DB FK to the
+        // target's id - unenforced because rdb permits dangling references and
+        // keeps id mappings across deletes (PRAGMA foreign_keys is left OFF; see
+        // the class header note). The author column is an integer key-ref into
+        // rdb_keys, emitted LAST so SELECT * reads as id, business columns, then
+        // author_key_id.
+        const cols: string[] = [`${quoteId(action.primaryKey)} INTEGER PRIMARY KEY AUTOINCREMENT`];
         for (const c of action.columns) cols.push(columnDecl(c.name, c.def));
         if (action.authorColumn !== undefined) {
             cols.push(`${quoteId(action.authorColumn)} INTEGER`);
@@ -451,6 +480,13 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             + `"row_hash" TEXT PRIMARY KEY, "id" INTEGER, "uuid" TEXT, `
             + `"status" TEXT NOT NULL DEFAULT 'active', `
             + `FOREIGN KEY ("id") REFERENCES ${quoteId(action.table)} (${quoteId(action.primaryKey)}))`);
+        // A local id maps to exactly one rdb identity: two row_hashes can never
+        // share an id. This makes reserveMint's claim-or-adopt (a second minter of
+        // the same id adopts the first's identity) well-defined and resolveRow
+        // unambiguous. Mirrors the idb target's unique (table, id) index.
+        this.db.exec(
+            `CREATE UNIQUE INDEX ${quoteId(action.syncTable + '_id_uk')} `
+            + `ON ${quoteId(action.syncTable)} ("id")`);
 
         const columnTypes: { [column: string]: ColumnType } = {};
         const fkColumns: { [column: string]: { targetTable: string } } = {};
@@ -551,11 +587,14 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             .all() as { name: string; type: string; notnull: number; dflt_value: string | null; pk: number }[];
         const keep = info.filter((c) => c.name !== opts.dropColumn);
 
-        // The id column is `INTEGER PRIMARY KEY` (owned serial); every other
-        // column re-renders its stored type + NOT NULL + DEFAULT verbatim, with
-        // forceNotNull overriding a currently-nullable column after backfill.
+        // The id column is `INTEGER PRIMARY KEY AUTOINCREMENT` (owned serial, never
+        // reused); every other column re-renders its stored type + NOT NULL +
+        // DEFAULT verbatim, with forceNotNull overriding a currently-nullable
+        // column after backfill. The AUTOINCREMENT must survive the rebuild or the
+        // first NOT NULL tighten / FK-column drop would silently drop the
+        // never-reuse guarantee.
         const decls: string[] = keep.map((c) => {
-            if (c.name === meta.idColumn) return `${quoteId(c.name)} INTEGER PRIMARY KEY`;
+            if (c.name === meta.idColumn) return `${quoteId(c.name)} INTEGER PRIMARY KEY AUTOINCREMENT`;
             const nn = c.notnull || opts.forceNotNull?.has(c.name) ? ' NOT NULL' : '';
             return `${quoteId(c.name)} ${c.type}${nn}`
                 + `${c.dflt_value !== null ? ' DEFAULT ' + c.dflt_value : ''}`;
@@ -580,6 +619,25 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         this.db.exec(`INSERT INTO ${quoteId(tmp)} (${cols}) SELECT ${cols} FROM ${quoteId(table)}`);
         this.db.exec(`DROP TABLE ${quoteId(table)}`);
         this.db.exec(`ALTER TABLE ${quoteId(tmp)} RENAME TO ${quoteId(table)}`);
+
+        // DROP TABLE cleared this table's sqlite_sequence row, and the copy above
+        // only re-seeded it to MAX(app.id) among surviving rows. The sync table is
+        // the ledger of every id ever handed out (rows survive deletes), so re-seed
+        // to at least MAX(sync.id) - otherwise a subsequent auto id could reuse an
+        // id whose app row was deleted but whose sync mapping still lives.
+        // sqlite_sequence exists (the AUTOINCREMENT CREATE TABLE above ensures it)
+        // but has no UNIQUE(name), so upsert by hand rather than ON CONFLICT.
+        const maxSync = (this.db.prepare(
+            `SELECT COALESCE(MAX("id"), 0) AS n FROM ${quoteId(meta.syncTable)}`).get() as { n: number }).n;
+        if (maxSync > 0) {
+            const cur = this.db.prepare('SELECT seq FROM sqlite_sequence WHERE name = ?')
+                .get(table) as { seq: number } | undefined;
+            if (cur === undefined) {
+                this.db.prepare('INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)').run(table, maxSync);
+            } else if (maxSync > cur.seq) {
+                this.db.prepare('UPDATE sqlite_sequence SET seq = ? WHERE name = ?').run(maxSync, table);
+            }
+        }
     }
 
     // Restore NOT NULL on columns that addColumn had to add as nullable (SQLite
@@ -776,21 +834,35 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     }
 
     // Durably persist minted identities (row_hash, id, uuid, status='active')
-    // BEFORE the append walk, in their own transaction. Idempotent: an existing
-    // reserved row (a crash-replay read-back) is kept as-is (ON CONFLICT DO
-    // NOTHING) so its uuid/status survive.
-    async reserveMint(reservations: SyncMapping[]): Promise<void> {
+    // BEFORE the append walk, in their own transaction. Claim-or-adopt: INSERT OR
+    // IGNORE lets a conflict on EITHER the row_hash PK (a crash-replay of this
+    // pass) OR the unique id index (another ingester / a projection got there
+    // first) fall through without error; the read-back by id then returns the
+    // mapping that actually holds the id, which the caller adopts.
+    async reserveMint(reservations: SyncMapping[]): Promise<SyncMapping[]> {
         this.requireCapture();
+        const effective: SyncMapping[] = [];
         const run = this.db.transaction(() => {
             for (const m of reservations) {
                 const meta = this.loadMeta(m.table);
                 this.db.prepare(
-                    `INSERT INTO ${quoteId(meta.syncTable)} ("row_hash", "id", "uuid", "status") `
-                    + `VALUES (?, ?, ?, ?) ON CONFLICT("row_hash") DO NOTHING`)
+                    `INSERT OR IGNORE INTO ${quoteId(meta.syncTable)} ("row_hash", "id", "uuid", "status") `
+                    + `VALUES (?, ?, ?, ?)`)
                     .run(m.rowId, m.localId, m.uuid === '' ? null : m.uuid, m.status ?? 'active');
+                const row = this.db.prepare(
+                    `SELECT "row_hash" AS rh, "uuid" AS uuid, "status" AS status `
+                    + `FROM ${quoteId(meta.syncTable)} WHERE "id" = ?`)
+                    .get(m.localId) as { rh: string; uuid: string | null; status: string } | undefined;
+                // Our row_hash holds the id -> claim (or identical replay): keep the
+                // reservation verbatim (preserves author). A different row_hash ->
+                // adopt the incumbent identity.
+                if (row === undefined || row.rh === m.rowId) { effective.push(m); continue; }
+                effective.push({ table: m.table, localId: m.localId, rowId: row.rh,
+                    uuid: row.uuid ?? '', status: row.status as SyncMapping['status'] });
             }
         });
-        run();
+        run.immediate();
+        return effective;
     }
 
     async commitIngest(settle: IngestSettle): Promise<void> {
@@ -818,7 +890,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
                 this.db.prepare('DELETE FROM rdb_outbox WHERE id = ?').run(id);
             }
         });
-        run();
+        run.immediate();
     }
 
     async drainOpEvents(sinceId?: number): Promise<StoredOpEvent[]> {
@@ -884,6 +956,13 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         };
         this.walHandle = watchFile(this.walPath!, notify);
         notify();   // prime: wake an observer for an already-pending outbox promptly
+        // Second prime once the kernel watcher is guaranteed registered. This
+        // closes the arm-to-registration window where a write produces no vnode
+        // event (an edge-triggered kqueue filter misses writes issued before its
+        // EV_ADD): an observer that primes, then writes, then awaits is otherwise
+        // never woken for that write. The epoch guard makes it a no-op if we were
+        // disarmed in the meantime.
+        this.monitorReady = this.walHandle.ready.then(notify);
     }
 
     private armPoll(): void {
@@ -908,10 +987,12 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         this.monitorTimer = setInterval(tick, this.pollMs);
         (this.monitorTimer as unknown as { unref?: () => void }).unref?.();
         tick();   // prime: wake an observer for an already-pending outbox promptly
+        this.monitorReady = Promise.resolve();   // the interval is live on arm
     }
 
     private disarmMonitor(): void {
         this.monitorEpoch++;
+        this.monitorReady = undefined;
         if (this.monitorTimer !== undefined) {
             clearInterval(this.monitorTimer);
             this.monitorTimer = undefined;
@@ -920,6 +1001,16 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             this.walHandle.close();
             this.walHandle = undefined;
         }
+    }
+
+    // Resolves once the currently-armed change monitor is guaranteed live (the
+    // WAL file watcher is registered with the kernel, or immediately for the
+    // poll). Resolves immediately when no monitor is armed. Await this after
+    // addChangeListener, before a local write whose wake must be observed
+    // deterministically - it removes the need to sleep past kernel-registration
+    // latency (see armWalWatch / FileWatchHandle.ready).
+    async whenChangeMonitorReady(): Promise<void> {
+        await this.monitorReady;
     }
 
     // -----------------------------------------------------------------------

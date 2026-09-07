@@ -254,5 +254,104 @@ export const ingestTests = {
                 assertTrue(plan.rejects[0].reason.includes('unknown key id'), 'reason identifies the unknown key id');
             },
         },
+        {
+            name: '[ADPTI14] an insert on a poisoned (ingestion_failure) local id is dropped, not re-minted',
+            invoke: async () => {
+                // The local id already maps to a poisoned identity (a prior insert
+                // rdb rejected). A fresh insert capture on that id is a stale replay:
+                // drop it (acked warning), never mint a NEW identity for it.
+                const lookup: MappingLookup = (table, localId) =>
+                    table === 'comments' && localId === 1
+                        ? { table, localId, rowId: 'POISON', uuid: 'u-old', status: 'ingestion_failure' }
+                        : undefined;
+                const batch: CapturedBatch = { changes: [
+                    { id: 1, kind: 'insert', table: 'comments', localId: 1, values: { body: 'stale' } },
+                ] };
+                const plan = changesToEntries(batch, mockView(), lookup, {}, WRITER, counterUuid());
+
+                assertEquals(plan.entries.length, 0, 'no op emitted for the poisoned id');
+                assertEquals(plan.reservations.length, 0, 'no identity reserved');
+                assertEquals(plan.rejects.length, 1, 'one acked warning');
+                assertTrue(plan.rejects[0].reason.includes('cannot be reused'), 'reason names the un-reusable identity');
+                assertEquals(plan.rejects[0].table, undefined, 'a drop carries no table (no op-event / mark)');
+                assertEquals(plan.rejects[0].kind, undefined, 'a drop carries no kind');
+            },
+        },
+        {
+            name: '[ADPTI15] an insert on a deleted local id is dropped (id never reused)',
+            invoke: async () => {
+                const lookup: MappingLookup = (table, localId) =>
+                    table === 'comments' && localId === 1
+                        ? { table, localId, rowId: 'GONE', uuid: 'u-old', status: 'deleted' }
+                        : undefined;
+                const batch: CapturedBatch = { changes: [
+                    { id: 1, kind: 'insert', table: 'comments', localId: 1, values: { body: 'stale' } },
+                ] };
+                const plan = changesToEntries(batch, mockView(), lookup, {}, WRITER, counterUuid());
+
+                assertEquals(plan.entries.length, 0, 'no op emitted for a deleted id');
+                assertEquals(plan.reservations.length, 0, 'no identity reserved');
+                assertEquals(plan.rejects.length, 1, 'one acked warning');
+            },
+        },
+        {
+            name: '[ADPTI16] an insert on an ACTIVE mapping reuses its uuid (crash-replay read-back), no new mint',
+            invoke: async () => {
+                const reusedUuid = 'u-existing';
+                const lookup: MappingLookup = (table, localId) =>
+                    table === 'comments' && localId === 1
+                        ? { table, localId, rowId: deriveRowId(reusedUuid, WRITER), uuid: reusedUuid, status: 'active' }
+                        : undefined;
+                const batch: CapturedBatch = { changes: [
+                    { id: 1, kind: 'insert', table: 'comments', localId: 1, values: { body: 'again' } },
+                ] };
+                const plan = changesToEntries(batch, mockView(), lookup, {}, WRITER, counterUuid());
+
+                assertEquals(plan.rejects.length, 0, 'nothing dropped');
+                assertEquals(plan.entries.length, 1, 'one entry');
+                const op = plan.entries[0].ops[0].write.op;
+                assertTrue(op.action === 'insert', 'insert op');
+                if (op.action !== 'insert') return;
+                assertEquals(op.rowId, deriveRowId(reusedUuid, WRITER), 'the reserved uuid is reused (identical rowId)');
+                assertEquals(op.uuid, reusedUuid, 'no fresh uuid was minted');
+                assertEquals(plan.reservations[0].uuid, reusedUuid, 'the reservation carries the reused uuid');
+            },
+        },
+        {
+            name: '[ADPTI17] two insert captures for one local id: mint once, drop the duplicate',
+            invoke: async () => {
+                const batch: CapturedBatch = { changes: [
+                    { id: 1, kind: 'insert', table: 'comments', localId: 1, values: { body: 'first' } },
+                    { id: 2, kind: 'insert', table: 'comments', localId: 1, values: { body: 'dup' } },
+                ] };
+                const plan = changesToEntries(batch, mockView(), noLookup, {}, WRITER, counterUuid());
+
+                assertEquals(plan.entries.length, 1, 'exactly one insert lands');
+                assertEquals(plan.reservations.length, 1, 'exactly one identity reserved for the id');
+                assertEquals(plan.rejects.length, 1, 'the duplicate is dropped');
+                assertTrue(plan.rejects[0].reason.includes('duplicate'), 'reason names the duplicate capture');
+            },
+        },
+        {
+            name: '[ADPTI18] an update/delete on a poisoned local id is dropped',
+            invoke: async () => {
+                const lookup: MappingLookup = (table, localId) =>
+                    table === 'comments' && localId === 1
+                        ? { table, localId, rowId: 'POISON', uuid: 'u-old', status: 'ingestion_failure' }
+                        : undefined;
+                const upd = changesToEntries(
+                    { changes: [{ id: 1, kind: 'update', table: 'comments', localId: 1, values: { body: 'x' } }] },
+                    mockView(), lookup, {}, WRITER, counterUuid());
+                assertEquals(upd.entries.length, 0, 'no update op on a poisoned id');
+                assertEquals(upd.rejects.length, 1, 'the update is dropped');
+                assertTrue(upd.rejects[0].reason.includes('previously failed ingestion'), 'reason explains the drop');
+
+                const del = changesToEntries(
+                    { changes: [{ id: 1, kind: 'delete', table: 'comments', localId: 1 }] },
+                    mockView(), lookup, {}, WRITER, counterUuid());
+                assertEquals(del.entries.length, 0, 'no delete op on a poisoned id');
+                assertEquals(del.rejects.length, 1, 'the delete is dropped');
+            },
+        },
     ],
 };

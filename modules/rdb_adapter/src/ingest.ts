@@ -43,10 +43,12 @@ import {
 // in-batch same-group local-FK row keys this op references (they drive
 // FK-consecutive bundling). `mapping` is present for a minted insert.
 // `reusedIdentity` marks an insert whose uuid/rowId came from an EXISTING
-// reserved sync mapping (a crash-replay read-back) - so if bundle() reports the
-// rowId as already-present the orchestrator treats it as already-applied
-// (idempotent) rather than a duplicate. `fallback` (a merged update only) holds
-// the per-change ops to re-submit if the merged op is rejected.
+// reserved sync mapping (a crash-replay read-back or an adopted concurrent
+// identity) rather than a fresh mint. Informational only: the orchestrator now
+// treats ANY write-once conflict on an insert's own rowId as already-applied
+// (the uuid is unique, so a conflict can only be this same identity). `fallback`
+// (a merged update only) holds the per-change ops to re-submit if the merged op
+// is rejected.
 export type PlannedOp = {
     key: string;              // keyOf(target table, localId)
     table: string;            // target (projected) table
@@ -181,28 +183,71 @@ function planOps(batch: CapturedBatch, updateMergeFor: (table: string) => boolea
 
 type Minted = { rowId: string; uuid: string; reused: boolean };
 
+// A dropped change: acked-and-warned, never submitted. Distinct from a reject
+// with a rowId (which records an op-event + a revert mark): a drop leaves no
+// trace beyond the warning because there is nothing new to reconcile.
+type MintResult = {
+    minted: Map<string, Minted>;
+    reservations: SyncMapping[];
+    // key -> human reason. Only insert keys appear here (update/delete drops are
+    // decided in translateNet from the subject's status).
+    drops: Map<string, string>;
+};
+
 function mintInserts(
     nets: NetChange[],
     ctxFor: (table: string) => NodeContext | undefined,
     lookup: MappingLookup,
     newUuid: () => string,
-): { minted: Map<string, Minted>; reservations: SyncMapping[] } {
+): MintResult {
     const minted = new Map<string, Minted>();
     const reservations: SyncMapping[] = [];
+    const drops = new Map<string, string>();
     for (const net of nets) {
         if (net.kind !== 'insert') continue;
         const ctx = ctxFor(net.table);
         if (ctx === undefined) continue;
+        const key = keyOf(net.table, net.localId);
+
+        // Two insert captures for one local id in a batch: rowIds are write-once,
+        // so only the first can become a row. Mint once here; planNodes rejects
+        // the later nets as duplicates (distinguished from a non-reusable drop by
+        // the id being present in `minted`).
+        if (minted.has(key) || drops.has(key)) continue;
+
         const existing = lookup(net.table, net.localId);
-        const reusable = existing !== undefined && existing.uuid !== ''
-            && (existing.status === undefined || existing.status === 'active');
-        const uuid = reusable ? existing!.uuid : newUuid();
+        if (existing !== undefined) {
+            // The local id already maps to an rdb identity. Reuse it ONLY when it
+            // is a live minted row (active, with a uuid) - the crash-replay
+            // read-back that keeps replays idempotent. Otherwise this insert is a
+            // stale replay of a change whose identity cannot be reused: a poisoned
+            // (ingestion_failure) mapping, a deleted one, or a projected row we
+            // never minted a uuid for. Drop it - with monotonic local ids
+            // (never reused) a genuinely new row would carry a fresh id, so an
+            // insert on an id that already has a non-reusable mapping is always
+            // stale.
+            const reusable = existing.uuid !== ''
+                && (existing.status === undefined || existing.status === 'active');
+            if (!reusable) {
+                drops.set(key,
+                    `local row ${net.table}#${net.localId} already has an rdb identity that `
+                    + `cannot be reused (status ${existing.status ?? 'active'}); insert dropped`);
+                continue;
+            }
+            const rowId = deriveRowId(existing.uuid, ctx.writerKeyId);
+            minted.set(key, { uuid: existing.uuid, rowId, reused: true });
+            reservations.push({ table: net.table, localId: net.localId, rowId, uuid: existing.uuid,
+                author: ctx.writerKeyId, status: 'active' });
+            continue;
+        }
+
+        const uuid = newUuid();
         const rowId = deriveRowId(uuid, ctx.writerKeyId);
-        minted.set(keyOf(net.table, net.localId), { uuid, rowId, reused: reusable });
+        minted.set(key, { uuid, rowId, reused: false });
         reservations.push({ table: net.table, localId: net.localId, rowId, uuid,
             author: ctx.writerKeyId, status: 'active' });
     }
-    return { minted, reservations };
+    return { minted, reservations, drops };
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +356,20 @@ function translateNet(
             reason: `no rdb table '${rdbTable}' for target table '${net.table}'` }] };
     }
 
+    // An update/delete whose subject is a poisoned (ingestion_failure) mapping is
+    // a follow-on to an insert that rdb rejected: the row has no rdb counterpart,
+    // so drop it (acked warning, no op-event, no mark). An insert in this same
+    // batch would have re-minted the identity (minted overrides lookup), so this
+    // only fires for a genuine leftover on the poisoned id.
+    if (net.kind !== 'insert' && minted.get(key) === undefined) {
+        const subject = lookup(net.table, net.localId);
+        if (subject?.status === 'ingestion_failure') {
+            return { rejects: [{ change: lastSource,
+                reason: `local row ${net.table}#${net.localId} previously failed ingestion; `
+                    + `${net.kind} dropped` }] };
+        }
+    }
+
     // Subject of an update/delete: a row inserted EARLIER in this same batch
     // (minted) resolves first (faithful insert-then-update / insert-then-delete),
     // else an already-materialized row via the prefetched lookup.
@@ -410,13 +469,32 @@ function planNodes(
     keyLookup: KeyLookup,
     newUuid: () => string,
 ): { ops: PlannedOp[]; rejects: PlannedReject[]; reservations: SyncMapping[] } {
-    const { minted, reservations } = mintInserts(nets, ctxFor, lookup, newUuid);
+    const { minted, reservations, drops } = mintInserts(nets, ctxFor, lookup, newUuid);
 
     const ops: PlannedOp[] = [];
     const rejects: PlannedReject[] = [];
+    const mintedUsed = new Set<string>();   // an id whose single insert already planned
     for (const net of nets) {
         const ctx = ctxFor(net.table);
         if (ctx === undefined) continue;   // acked-and-dropped (untranslatable)
+        if (net.kind === 'insert') {
+            const key = keyOf(net.table, net.localId);
+            if (!minted.has(key)) {
+                // Never minted -> a non-reusable id (poisoned / deleted / uuid-less
+                // projected row). Acked warning, no op, no reservation.
+                rejects.push({ change: net.sources[net.sources.length - 1],
+                    reason: drops.get(key) ?? `insert on ${net.table}#${net.localId} dropped` });
+                continue;
+            }
+            if (mintedUsed.has(key)) {
+                // A second insert capture for an id already planned: write-once, so
+                // it can never become its own row. Drop it (acked warning).
+                rejects.push({ change: net.sources[net.sources.length - 1],
+                    reason: `duplicate insert capture for ${net.table}#${net.localId}; dropped` });
+                continue;
+            }
+            mintedUsed.add(key);
+        }
         const result = translateNet(net, ctx, lookup, keyLookup, minted);
         rejects.push(...result.rejects);
         if (result.op !== undefined) ops.push(result.op);

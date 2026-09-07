@@ -24,8 +24,9 @@ import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 
 import {
     CapturedBatch, CapturedChange, ChangeSignalListener, ChangeSignalSource,
-    IngestSettle, KeyIndex, MaterializationTarget, MaterializedChangeSource, OpEvent, RowAction,
-    RowIdentityIndex, SchemaAction, StoredOpEvent, SyncMapping, SyncStatus,
+    CheckpointMovedError, IngestSettle, KeyIndex, MaterializationTarget, MaterializedChangeSource,
+    OpEvent, RowAction, RowIdentityIndex, SchemaAction, StoredOpEvent, SyncMapping, SyncStatus,
+    versionsEqual,
 } from "./types.js";
 
 type RowValues = { [column: string]: json.Literal };
@@ -176,8 +177,14 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
 
     async apply(
         groupId: B64Hash, schemaActions: SchemaAction[], rowActions: RowAction[],
-        checkpoint: Version, events?: OpEvent[],
+        checkpoint: Version, events?: OpEvent[], expectFrom?: Version | null,
     ): Promise<void> {
+        // Compare-and-set guard (concurrent projectors): reject if the stored
+        // checkpoint is not what this delta was computed against. Nothing mutates.
+        if (expectFrom !== undefined
+            && !versionsEqual(this.store.checkpoints.get(groupId), expectFrom ?? undefined)) {
+            throw new CheckpointMovedError(groupId);
+        }
         // Atomicity: mutate a clone, swap in only on full success.
         const working = cloneStore(this.store);
         for (const action of schemaActions) applySchemaAction(working, action);
@@ -274,17 +281,47 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
         return undefined;
     }
 
-    async reserveMint(reservations: SyncMapping[]): Promise<void> {
+    async reserveMint(reservations: SyncMapping[]): Promise<SyncMapping[]> {
         this.requireCapture();
+        const effective: SyncMapping[] = [];
         for (const m of reservations) {
             const state = this.store.tables.get(m.table);
-            if (state === undefined) continue;
+            if (state === undefined) { effective.push(m); continue; }
+            // Claim-or-adopt: does another row_hash already hold this local id?
+            // (Same resolution as resolveRow: a minted/ingested row via syncInfo,
+            // or a uuid-less projected row via the sync map.)
+            const incumbent = this.incumbentFor(state, m.table, m.localId);
+            if (incumbent !== undefined && incumbent.rowId !== m.rowId) {
+                effective.push(incumbent);   // adopt
+                continue;
+            }
             state.sync.set(m.rowId, m.localId);
             const info: { rowId: string; uuid: string; author?: KeyId } = { rowId: m.rowId, uuid: m.uuid };
             if (m.author !== undefined) info.author = m.author;
             state.syncInfo.set(m.localId, info);
             if (!state.syncStatus.has(m.rowId)) state.syncStatus.set(m.rowId, m.status ?? 'active');
+            effective.push(m);   // claim (or identical replay)
         }
+        return effective;
+    }
+
+    // The identity currently mapped to `localId` in `state`, or undefined. Mirrors
+    // resolveRow's two-source resolution (minted row via syncInfo; uuid-less
+    // projected row via the sync map).
+    private incumbentFor(
+        state: TableState, table: string, localId: number,
+    ): SyncMapping | undefined {
+        const info = state.syncInfo.get(localId);
+        if (info !== undefined) {
+            return { table, localId, rowId: info.rowId, uuid: info.uuid,
+                status: state.syncStatus.get(info.rowId) ?? 'active' };
+        }
+        for (const [rowId, id] of state.sync) {
+            if (id === localId) {
+                return { table, localId, rowId, uuid: '', status: state.syncStatus.get(rowId) ?? 'active' };
+            }
+        }
+        return undefined;
     }
 
     async commitIngest(settle: IngestSettle): Promise<void> {

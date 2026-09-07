@@ -23,6 +23,15 @@ import * as path from "node:path";
 export type FileWatchHandle = {
     // Idempotent: safe to call more than once.
     close(): void;
+    // Resolves once the direct file watcher is guaranteed registered with the
+    // kernel. Kernel registration is deferred to the next event-loop poll phase
+    // on some platforms (libuv's kqueue backend on Darwin appends the watcher to
+    // loop->watcher_queue and only issues the kevent EV_ADD at the top of the
+    // next uv__io_poll; the vnode filter is edge-triggered from that point, so a
+    // write landing before it is never observed). inotify on Linux registers
+    // synchronously, so awaiting this is a harmless near-instant no-op there.
+    // Await it before performing a write whose wake you must observe.
+    ready: Promise<void>;
 };
 
 // Note: named to avoid shadowing node:fs `watchFile` (a distinct polling API);
@@ -34,6 +43,14 @@ export function watchFile(filePath: string, notify: () => void): FileWatchHandle
     let fileWatcher: fs.FSWatcher | undefined;
     let dirWatcher: fs.FSWatcher | undefined;
     let closed = false;
+    // The inode the direct watcher is currently bound to (undefined when the
+    // file was absent at arm time). Used to distinguish a real delete/recreate
+    // from an in-place content write when a directory event arrives.
+    let armedInode: number | undefined;
+
+    const currentInode = (): number | undefined => {
+        try { return fs.statSync(filePath).ino; } catch (_e) { return undefined; }
+    };
 
     const armFileWatcher = (): void => {
         if (closed) return;
@@ -50,18 +67,18 @@ export function watchFile(filePath: string, notify: () => void): FileWatchHandle
                     fileWatcher = undefined;
                 }
             });
+            armedInode = currentInode();
         } catch (_e) {
             // The file may not exist yet (it will appear on first write); the
             // directory watcher will rearm us when it does.
+            armedInode = undefined;
         }
     };
 
     // Rebind the direct watcher onto the file's CURRENT inode. A deleted +
     // recreated file (e.g. a WAL under checkpoint truncate) leaves the old
     // watcher bound to a stale inode that no longer delivers content events, so
-    // we drop it and re-arm. Called on every directory event for our basename
-    // (create / delete / rename) - not on content appends, which reach the
-    // direct watcher instead - so this is not hot.
+    // we drop it and re-arm.
     const rearmFileWatcher = (): void => {
         if (closed) return;
         if (fileWatcher !== undefined) {
@@ -74,10 +91,20 @@ export function watchFile(filePath: string, notify: () => void): FileWatchHandle
     try {
         dirWatcher = fs.watch(dir, (_event, filename) => {
             if (closed) return;
-            if (filename === basename) {
-                rearmFileWatcher();
-                notify();
-            }
+            if (filename !== basename) return;
+            // Rearm the direct watcher ONLY when the file's INODE changed - i.e.
+            // a genuine delete/recreate (e.g. a WAL under checkpoint truncate),
+            // not an in-place content append. On Darwin, FSEvents surfaces every
+            // directory event - including plain appends - as an `event` of
+            // 'rename' with our basename, so the event type cannot distinguish
+            // them; the inode can (an append keeps it, a recreate changes it). A
+            // blind rearm on every event would close and reopen the kqueue
+            // watcher on each write, reintroducing the deferred-registration
+            // window each time. (A delete resets armedInode to undefined, so a
+            // recreate that happens to reuse the inode number still rearms,
+            // since undefined !== the reused inode.)
+            if (currentInode() !== armedInode) rearmFileWatcher();
+            notify();
         });
         dirWatcher.on('error', () => { /* ignore */ });
     } catch (_e) {
@@ -86,7 +113,18 @@ export function watchFile(filePath: string, notify: () => void): FileWatchHandle
 
     armFileWatcher();
 
+    // Two setImmediate hops guarantee the loop has passed through at least one
+    // poll-phase flush (where libuv issues the deferred kevent EV_ADD)
+    // regardless of which phase watchFile was called from: a single hop is
+    // insufficient when called from a poll-phase I/O callback, whose
+    // setImmediate runs in the very next check phase without an intervening
+    // poll.
+    const ready = new Promise<void>((resolve) => {
+        setImmediate(() => setImmediate(() => resolve()));
+    });
+
     return {
+        ready,
         close(): void {
             closed = true;
             if (fileWatcher !== undefined) {

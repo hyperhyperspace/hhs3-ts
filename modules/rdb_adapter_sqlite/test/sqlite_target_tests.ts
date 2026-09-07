@@ -7,14 +7,23 @@ import type { ColumnType } from "@hyper-hyper-space/hhs3_rdb";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import Database from "better-sqlite3";
 
-import { projectGroup, SchemaAction, RowAction } from "@hyper-hyper-space/hhs3_rdb_adapter";
+import {
+    CheckpointMovedError, ingestChanges, projectGroup, SchemaAction, RowAction, SyncMapping,
+} from "@hyper-hyper-space/hhs3_rdb_adapter";
 import {
     createGroup, sameVersion,
     TargetHarness, ProjectionReader, ReadRow, RowValues,
     IngestionHarness, LocalMutator,
 } from "@hyper-hyper-space/hhs3_rdb_adapter_test";
+import type { Row, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 
 import { SqliteTarget } from "../src/sqlite_target.js";
+
+// Live rows of an rdb group table (what ingestion/projection actually wrote).
+async function groupRows(group: RTableGroup, table: string): Promise<Row[]> {
+    const view = await (await group.getTable(table)).getView();
+    return view.query({});
+}
 
 function quoteId(name: string): string {
     return '"' + name.replace(/"/g, '""') + '"';
@@ -325,23 +334,30 @@ export const sqliteSpecificTests = {
                     await projectGroup(group, target);
 
                     let fires = 0;
-                    const wroteSignal = new Promise<void>((resolve, reject) => {
-                        const timer = setTimeout(
-                            () => reject(new Error('no WAL change signal within timeout after write')), 3000);
-                        listener = (): void => {
-                            fires++;
-                            // The first fire is the synchronous prime on arm; a
-                            // later fire is the fs.watch wake for the write below.
-                            if (fires >= 2) { clearTimeout(timer); resolve(); }
-                        };
-                    });
+                    listener = (): void => { fires++; };
                     target.addChangeListener(listener);   // prime fires synchronously
                     assertEquals(fires, 1, 'WAL watch primes one signal on arm');
+
+                    // Await kernel registration of the WAL watcher (a loop hop on
+                    // Darwin, near-instant on Linux) instead of sleeping past the
+                    // attach race. This also delivers a second prime, so baseline
+                    // the fire count AFTER it: the assertion below then isolates
+                    // the wake caused by the write, not a prime.
+                    await target.whenChangeMonitorReady();
+                    const baseline = fires;
 
                     // A genuine local write on the same handle (as the host app would).
                     db.prepare('INSERT INTO tags (code) VALUES (?)').run('urgent');
 
-                    await wroteSignal;
+                    // With the watcher registered, the write must produce an
+                    // fs.watch wake. Delivery is inherently asynchronous, so wait
+                    // (bounded) for the fire count to advance past the baseline.
+                    const deadline = Date.now() + 3000;
+                    while (fires <= baseline && Date.now() < deadline) {
+                        await new Promise((resolve) => setTimeout(resolve, 20));
+                    }
+                    assertTrue(fires > baseline,
+                        `a local write should wake the WAL watcher (baseline ${baseline}, got ${fires})`);
                 } finally {
                     target.removeChangeListener(listener);
                     db.close();
@@ -515,6 +531,183 @@ export const sqliteSpecificTests = {
                     'lines.order_id still references orders.id after the target rebuild');
                 const child = db.prepare('SELECT qty FROM lines').get() as { qty: number };
                 assertEquals(child.qty, 2, 'referencing row survived the target rebuild');
+                db.close();
+            },
+        },
+        {
+            name: '[ADPTS-SQL10] the app PK is AUTOINCREMENT: a local id is never reused after a delete, and sync id is unique',
+            invoke: async () => {
+                const { group } = await createGroup();
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db, { captureChanges: true });
+                await projectGroup(group, target);
+
+                // The DDL declares AUTOINCREMENT on the PK and a UNIQUE index on the
+                // sync table's id (the never-reuse contract the adapter relies on).
+                const tagsSql = (db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='tags'")
+                    .get() as { sql: string }).sql;
+                assertTrue(/AUTOINCREMENT/i.test(tagsSql), 'the app PK is INTEGER PRIMARY KEY AUTOINCREMENT');
+                const syncIdx = db.prepare(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND tbl_name='tags_sync' AND sql LIKE '%UNIQUE%'").get();
+                assertTrue(syncIdx !== undefined, 'the sync table has a unique index on id');
+
+                // Insert, delete, insert: the second insert must NOT reuse id 1.
+                const first = Number(db.prepare('INSERT INTO tags (code) VALUES (?)').run('a').lastInsertRowid);
+                assertEquals(first, 1, 'first local id is 1');
+                db.prepare('DELETE FROM tags WHERE id = ?').run(first);
+                const second = Number(db.prepare('INSERT INTO tags (code) VALUES (?)').run('b').lastInsertRowid);
+                assertEquals(second, 2, 'the reused-after-delete id is 2, never 1');
+                db.close();
+            },
+        },
+        {
+            name: '[ADPTS-SQL11] reserveMint is claim-or-adopt: a second identity for one local id adopts the first',
+            invoke: async () => {
+                const { group } = await createGroup();
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db, { captureChanges: true });
+                await projectGroup(group, target);
+
+                const first: SyncMapping = { table: 'tags', localId: 1, rowId: 'ROWA', uuid: 'ua', status: 'active' };
+                const claimed = await target.reserveMint([first]);
+                assertEquals(claimed.length, 1, 'one effective mapping returned');
+                assertEquals(claimed[0].rowId, 'ROWA', 'the free id is claimed by the caller');
+
+                // A DIFFERENT identity for the same id: INSERT OR IGNORE hits the
+                // unique-id index and the read-back returns the incumbent (adopt).
+                const second: SyncMapping = { table: 'tags', localId: 1, rowId: 'ROWB', uuid: 'ub', status: 'active' };
+                const adopted = await target.reserveMint([second]);
+                assertEquals(adopted[0].rowId, 'ROWA', 'the second minter adopts the incumbent identity');
+                assertEquals(adopted[0].uuid, 'ua', 'and its uuid');
+
+                const rows = db.prepare('SELECT "row_hash" AS rh, "id" FROM tags_sync WHERE "id" = 1').all() as
+                    { rh: string; id: number }[];
+                assertEquals(rows.length, 1, 'exactly one sync row for the id (no duplicate)');
+                assertEquals(rows[0].rh, 'ROWA', 'the incumbent row_hash is kept');
+            },
+        },
+        {
+            name: '[ADPTS-SQL12] two handles ingesting one file converge to a single rdb row per local insert',
+            invoke: async () => {
+                const { group, admin } = await createGroup();
+                const dbPath = tmpDbPath('ingest-race');
+                const dbA = new Database(dbPath); dbA.pragma('busy_timeout = 5000');
+                const targetA = new SqliteTarget(dbA, { captureChanges: true, dbPath });
+                try {
+                    await projectGroup(group, targetA);   // schema + capture triggers on the file
+                    dbA.prepare('INSERT INTO tags (code) VALUES (?)').run('x');   // one local insert
+
+                    // A second handle/target on the SAME file, same in-memory group.
+                    const dbB = new Database(dbPath); dbB.pragma('busy_timeout = 5000');
+                    const targetB = new SqliteTarget(dbB, { captureChanges: true, dbPath });
+
+                    const [rA, rB] = await Promise.all([
+                        ingestChanges(group, targetA, { writer: admin }),
+                        ingestChanges(group, targetB, { writer: admin }),
+                    ]);
+
+                    // Claim-or-adopt makes both submit the same identity. The
+                    // second append is usually a write-once skip, but two
+                    // concurrent bundle()s on the same in-memory group can both
+                    // pass validation and still converge (same incarnation).
+                    // The guarantee is one rdb row, not one accepted count.
+                    assertEquals(rA.rejected.length + rB.rejected.length, 0, 'no rejections');
+
+                    const rows = (await groupRows(group, 'tags')).filter((r) => r.values.code === 'x');
+                    assertEquals(rows.length, 1, 'exactly one rdb tag row, not two');
+
+                    const syncRows = dbA.prepare('SELECT "id" FROM tags_sync').all() as { id: number }[];
+                    assertEquals(syncRows.length, 1, 'one sync mapping (ids are unique)');
+                    assertEquals((dbA.prepare('SELECT COUNT(*) AS n FROM rdb_outbox').get() as { n: number }).n, 0,
+                        'the outbox is acked by both passes');
+                    assertEquals((dbA.prepare("SELECT COUNT(*) AS n FROM rdb_op_events WHERE direction='failure'")
+                        .get() as { n: number }).n, 0, 'no ingestion/failure events');
+                    dbB.close();
+                } finally {
+                    dbA.close();
+                    cleanupDb(dbPath);
+                }
+            },
+        },
+        {
+            name: '[ADPTS-SQL13] two handles projecting one file: exactly one applies the delta, the other gets CheckpointMovedError',
+            invoke: async () => {
+                const { group, admin } = await createGroup();
+                const dbPath = tmpDbPath('project-race');
+                const dbA = new Database(dbPath); dbA.pragma('busy_timeout = 5000');
+                const targetA = new SqliteTarget(dbA, { dbPath });
+                try {
+                    await projectGroup(group, targetA);   // initial: creates tables + checkpoint v1
+
+                    // Advance the rdb group so both handles have a real delta to apply.
+                    await (await group.getTable('tags')).insert('t1', { code: 'y' }, admin);
+
+                    const dbB = new Database(dbPath); dbB.pragma('busy_timeout = 5000');
+                    const targetB = new SqliteTarget(dbB, { dbPath });
+
+                    const outcomes = await Promise.allSettled([
+                        projectGroup(group, targetA),
+                        projectGroup(group, targetB),
+                    ]);
+                    const fulfilled = outcomes.filter((o) => o.status === 'fulfilled');
+                    const rejected = outcomes.filter((o) => o.status === 'rejected') as PromiseRejectedResult[];
+                    assertEquals(fulfilled.length, 1, 'exactly one projector applied the delta');
+                    assertEquals(rejected.length, 1, 'the other was rejected');
+                    assertTrue(rejected[0].reason instanceof CheckpointMovedError,
+                        'the loser got a CheckpointMovedError (compare-and-set)');
+
+                    // Final state is correct and applied exactly once.
+                    const read = sqliteReader(dbA);
+                    const rowIds = await read.getRowIds('tags');
+                    assertEquals(rowIds.length, 1, 'the new tag is materialized exactly once');
+                    const cp = await targetA.getCheckpoint(group.getId());
+                    const frontier = await (await group.getScopedDag()).getFrontier();
+                    assertTrue(sameVersion(cp, frontier), 'the file checkpoint advanced to the group frontier');
+                    dbB.close();
+                } finally {
+                    dbA.close();
+                    cleanupDb(dbPath);
+                }
+            },
+        },
+        {
+            name: '[ADPTS-SQL14] a table rebuild preserves AUTOINCREMENT and re-seeds the sequence from the sync table',
+            invoke: async () => {
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db);
+                const gid = 'g';
+                // Three rows materialized (sync ids 1..3), then two deleted: the sync
+                // ledger keeps ids 1..3, the app table keeps only id 1.
+                await target.apply(gid, [{
+                    kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+                    columns: [{ name: 'ref', def: { type: 'string' } }],
+                }], [
+                    { kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { ref: 'a' } },
+                    { kind: 'upsert-row', table: 'acct', rowId: 'r2', values: { ref: 'b' } },
+                    { kind: 'upsert-row', table: 'acct', rowId: 'r3', values: { ref: 'c' } },
+                ], new Set(['v1']));
+                await target.apply(gid, [], [
+                    { kind: 'delete-row', table: 'acct', rowId: 'r2' },
+                    { kind: 'delete-row', table: 'acct', rowId: 'r3' },
+                ], new Set(['v2']));
+
+                const maxSync = (db.prepare('SELECT MAX("id") AS n FROM acct_sync').get() as { n: number }).n;
+                assertEquals(maxSync, 3, 'the sync ledger still holds ids 1..3 (rows survive delete)');
+
+                // A NOT NULL add on the (non-empty) table forces a table rebuild;
+                // backfill the surviving row so the tighten passes.
+                await target.apply(gid, [{
+                    kind: 'add-column', table: 'acct', column: 'note', def: { type: 'string' },
+                }], [{ kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { note: 'n' } }], new Set(['v3']));
+
+                // AUTOINCREMENT survived the rebuild AND the sequence was re-seeded
+                // from MAX(sync.id)=3, so a fresh app insert gets id 4 - never 2,
+                // which the surviving-but-deleted sync mapping still occupies.
+                const acctSql = (db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='acct'")
+                    .get() as { sql: string }).sql;
+                assertTrue(/AUTOINCREMENT/i.test(acctSql), 'the rebuilt table keeps AUTOINCREMENT');
+                const nextId = Number(db.prepare('INSERT INTO acct (ref, note) VALUES (?, ?)').run('d', 'm').lastInsertRowid);
+                assertEquals(nextId, 4, 'the next auto id is 4 (re-seeded from the sync ledger), not a reused 2');
                 db.close();
             },
         },

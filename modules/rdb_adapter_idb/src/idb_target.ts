@@ -16,9 +16,9 @@ import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import type { ColumnType } from "@hyper-hyper-space/hhs3_rdb";
 import {
     CapturedBatch, CapturedChange, ChangeSignalListener, ChangeSignalSource,
-    DEFAULT_KEY_TABLE, IngestSettle, KeyIndex, MaterializationTarget,
+    CheckpointMovedError, DEFAULT_KEY_TABLE, IngestSettle, KeyIndex, MaterializationTarget,
     MaterializedChangeSource, OpEvent, OpEventReason, RowAction, RowIdentityIndex,
-    SchemaAction, StoredOpEvent, SyncMapping,
+    SchemaAction, StoredOpEvent, SyncMapping, versionsEqual,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 import { FacadeDatabase, type FacadeHost } from "./idb_facade.js";
@@ -136,11 +136,20 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
 
     async apply(
         groupId: B64Hash, schemaActions: SchemaAction[], rowActions: RowAction[],
-        checkpoint: Version, events?: OpEvent[],
+        checkpoint: Version, events?: OpEvent[], expectFrom?: Version | null,
     ): Promise<void> {
         this.ensureOpen();
         await this.env.withReadWrite(async (tx) => {
             const ctx: ApplyCtx = { tx, meta: new Map() };
+            // Compare-and-set guard (concurrent projectors): read the stored
+            // checkpoint inside this same readwrite transaction and reject if it is
+            // not what the delta was computed against. Throwing aborts the tx, so
+            // nothing is applied.
+            if (expectFrom !== undefined) {
+                const rec = await storeGet<CheckpointRecord>(tx, CHECKPOINT, groupId);
+                const stored = rec === undefined ? undefined : new Set(rec.version);
+                if (!versionsEqual(stored, expectFrom ?? undefined)) throw new CheckpointMovedError(groupId);
+            }
             for (const action of schemaActions) await this.applySchemaAction(ctx, action);
             for (const action of rowActions) await this.applyRowAction(ctx, action);
             await storePut(tx, CHECKPOINT, {
@@ -393,24 +402,37 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         };
     }
 
-    async reserveMint(reservations: SyncMapping[]): Promise<void> {
+    async reserveMint(reservations: SyncMapping[]): Promise<SyncMapping[]> {
         this.requireCapture();
+        const effective: SyncMapping[] = [];
         await this.env.withReadWrite(async (tx) => {
             const ctx: ApplyCtx = { tx, meta: new Map() };
             for (const m of reservations) {
-                const existing = await storeGet<SyncRecord>(tx, SYNC, [m.table, m.rowId]);
-                if (existing !== undefined) continue;
-                const meta = await this.loadMeta(ctx, m.table);
-                if (m.localId >= meta.nextId) {
-                    meta.nextId = m.localId + 1;
-                    await storePut(tx, TABLE_META, meta);
+                // Claim-or-adopt: the unique (table, id) index tells us whether
+                // another row_hash already holds this local id (a concurrent
+                // ingester or a projection that materialized it first).
+                const byId = await indexGet<SyncRecord>(tx, SYNC, 'by_local_id', [m.table, m.localId]);
+                if (byId !== undefined && byId.rowHash !== m.rowId) {
+                    effective.push({ table: m.table, localId: m.localId, rowId: byId.rowHash,
+                        uuid: byId.uuid ?? '', status: byId.status });   // adopt
+                    continue;
                 }
-                await storePut(tx, SYNC, {
-                    table: m.table, rowHash: m.rowId, id: m.localId,
-                    uuid: m.uuid, status: m.status ?? 'active',
-                } satisfies SyncRecord);
+                const existing = await storeGet<SyncRecord>(tx, SYNC, [m.table, m.rowId]);
+                if (existing === undefined) {
+                    const meta = await this.loadMeta(ctx, m.table);
+                    if (m.localId >= meta.nextId) {
+                        meta.nextId = m.localId + 1;
+                        await storePut(tx, TABLE_META, meta);
+                    }
+                    await storePut(tx, SYNC, {
+                        table: m.table, rowHash: m.rowId, id: m.localId,
+                        uuid: m.uuid, status: m.status ?? 'active',
+                    } satisfies SyncRecord);
+                }
+                effective.push(m);   // claim (or identical replay)
             }
         });
+        return effective;
     }
 
     async commitIngest(settle: IngestSettle): Promise<void> {

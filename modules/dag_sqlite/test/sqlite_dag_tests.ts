@@ -70,13 +70,18 @@ async function testWalWatcherDetectsExternalWrite() {
         const listener = () => { listenerCalled++; };
         dagA.addListener(listener);
 
-        // Small delay so fs.watch has time to attach
-        await new Promise(resolve => setTimeout(resolve, 100));
+        // Await kernel registration of the WAL watcher (a loop hop on Darwin)
+        // instead of sleeping to let fs.watch attach.
+        await (dagA.getStore() as unknown as { whenExternalObserverReady(): Promise<void> })
+            .whenExternalObserverReady();
 
         await dagB.append({ external: true }, {});
 
-        // Wait for fs.watch to deliver the event
-        await new Promise(resolve => setTimeout(resolve, 500));
+        // Delivery is inherently asynchronous; wait (bounded) for the event.
+        const deadline = Date.now() + 3000;
+        while (listenerCalled === 0 && Date.now() < deadline) {
+            await new Promise(resolve => setTimeout(resolve, 20));
+        }
 
         dagA.removeListener(listener);
 

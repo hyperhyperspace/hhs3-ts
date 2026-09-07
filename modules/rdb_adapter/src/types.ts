@@ -254,8 +254,18 @@ export interface MaterializedChangeSource {
     // between append and settle, a replay reads the SAME uuid back (via
     // resolveRow) and reproduces the identical insert payload / rowId, letting
     // the reappended op be recognized as already-applied instead of duplicated.
-    // Idempotent (upsert by row_hash).
-    reserveMint(reservations: SyncMapping[]): Promise<void>;
+    //
+    // CLAIM-OR-ADOPT (identity agreement for concurrent ingesters on one store):
+    // the local `id` is unique per sync table, so a reservation either CLAIMS a
+    // free id or finds one already taken (by a crash-replay of this same pass, by
+    // a concurrent ingester, or by a projection that materialized the row first).
+    // The return value is, IN ORDER, the mapping now stored for each reservation's
+    // (table, id): the reservation itself when it won the claim (or already held
+    // the id under the same row_hash), otherwise the EXISTING mapping (its rowId /
+    // uuid / status / author). The caller adopts a differing mapping and re-plans
+    // so every ingester submits the SAME identity - duplicate appends of one rowId
+    // are the same incarnation in rdb and converge. Idempotent.
+    reserveMint(reservations: SyncMapping[]): Promise<SyncMapping[]>;
 
     // Atomically SETTLE an ingestion pass: (re)persist mappings, append
     // op-events (idempotent by (opHash, direction)), apply reverts under
@@ -363,14 +373,44 @@ export interface MaterializationTarget {
     // does not reflect. `events` (concurrency void/reinstate flips derived from
     // the delta's opVerdictChanges) are appended to the op-event log in the SAME
     // transaction, so a flip can never be lost across the checkpoint advance.
+    //
+    // `expectFrom` is a compare-and-set guard for concurrent projectors sharing
+    // one store: `null` expects NO stored checkpoint (initial materialization), a
+    // `Version` expects set-equality with the stored one, `undefined` skips the
+    // check. On mismatch the target throws CheckpointMovedError and applies
+    // NOTHING (the whole transaction rolls back) - another projector advanced the
+    // group, and the caller must recompute the delta from the new checkpoint. The
+    // compare happens under the write lock so two projectors can never both win.
+    // A lagging replica whose frontier does not extend the new checkpoint will
+    // then fail computeDelta until it syncs; that is intended.
     apply(
         groupId: B64Hash, schemaActions: SchemaAction[], rowActions: RowAction[],
-        checkpoint: Version, events?: OpEvent[],
+        checkpoint: Version, events?: OpEvent[], expectFrom?: Version | null,
     ): Promise<void>;
 
     // The last materialized version for `groupId`, or undefined when that group
     // has never been materialized (drives the initial-vs-delta decision).
     getCheckpoint(groupId: B64Hash): Promise<Version | undefined>;
+}
+
+// Thrown by apply() when its `expectFrom` compare-and-set fails: another
+// projector advanced this group's checkpoint since the delta was computed. The
+// caller recomputes from the current checkpoint and retries. Nothing was applied.
+export class CheckpointMovedError extends Error {
+    constructor(readonly groupId: B64Hash) {
+        super(`checkpoint for group '${groupId}' moved since the delta was computed`);
+        this.name = 'CheckpointMovedError';
+    }
+}
+
+// Set-equality of two checkpoints (a Version is an unordered Set of entry
+// hashes). Used by targets to evaluate apply()'s expectFrom compare-and-set;
+// `undefined` on either side means "no checkpoint", equal only to itself.
+export function versionsEqual(a: Version | undefined, b: Version | undefined): boolean {
+    if (a === undefined || b === undefined) return a === b;
+    if (a.size !== b.size) return false;
+    for (const h of a) if (!b.has(h)) return false;
+    return true;
 }
 
 // ---------------------------------------------------------------------------

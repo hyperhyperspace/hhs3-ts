@@ -22,8 +22,8 @@ import type { B64Hash, KeyId, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto
 import type { Version, RContext } from "@hyper-hyper-space/hhs3_mvt";
 import type { RDb, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 import {
-    BidirectionalTarget, ChangeSignalListener, ChangeSignalSource, DEFAULT_KEY_DOMAIN,
-    GroupProjection, IngestResult, KeyIndex, OpEvent, StoredOpEvent, syncDatabase,
+    BidirectionalTarget, ChangeSignalListener, ChangeSignalSource, CheckpointMovedError,
+    DEFAULT_KEY_DOMAIN, GroupProjection, IngestResult, KeyIndex, OpEvent, StoredOpEvent, syncDatabase,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 import { buildScope, resolveMemberGroups, GroupConfigOverride } from "./scope.js";
@@ -125,11 +125,27 @@ export class RdbProjection {
     // Explicit, awaitable sync cycle (bypasses the debounce; still single-
     // flighted by syncDatabase's per-database lock).
     async sync(): Promise<Map<B64Hash, IngestResult>> {
-        const results = await syncDatabase(this.members, this.target, this.options.createUuid);
+        const results = await this.syncWithCasRetry();
         this.lastResults = results;
         this.lastErrorMessage = undefined;
         await this.pushOpEvents();
         return results;
+    }
+
+    // Run one syncDatabase cycle, retrying on a CheckpointMovedError: another
+    // projector on the same store advanced a group's checkpoint since our delta
+    // was computed, so recompute from the new checkpoint. Bounded so a pathological
+    // contention loop still surfaces. Other errors propagate immediately.
+    private async syncWithCasRetry(): Promise<Map<B64Hash, IngestResult>> {
+        const maxAttempts = 3;
+        for (let attempt = 1; ; attempt++) {
+            try {
+                return await syncDatabase(this.members, this.target, this.options.createUuid);
+            } catch (e) {
+                if (e instanceof CheckpointMovedError && attempt < maxAttempts) continue;
+                throw e;
+            }
+        }
     }
 
     // Inbound trigger fallback for callers that cannot wire a ChangeSignalSource
@@ -269,7 +285,7 @@ export class RdbProjection {
         try {
             do {
                 this.rerun = false;
-                const results = await syncDatabase(this.members, this.target, this.options.createUuid);
+                const results = await this.syncWithCasRetry();
                 this.lastResults = results;
                 this.lastErrorMessage = undefined;
                 this.options.onResult?.(results);

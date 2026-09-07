@@ -126,7 +126,9 @@ export async function projectGroupTo(
     if (checkpoint === undefined) {
         const schemaActions = initialSchemaActions(endView, config);
         const rowActions = await initialRowActions(view, config);
-        await target.apply(groupId, schemaActions, rowActions, to);
+        // expectFrom null: this must be the FIRST materialization; if a concurrent
+        // projector created the checkpoint meanwhile, apply() rejects (CAS).
+        await target.apply(groupId, schemaActions, rowActions, to, undefined, null);
         return;
     }
 
@@ -135,7 +137,10 @@ export async function projectGroupTo(
     const schemaActions = schemaDeltaActions(delta.schemaChanges, endView, startView, config);
     const rowActions = await planIncrementalRowActions(view, delta, startView, endView, groupId, config);
     const events = opVerdictEvents(delta.opVerdictChanges, groupId, config);
-    await target.apply(groupId, schemaActions, rowActions, to, events);
+    // expectFrom the checkpoint this delta was computed against: if another
+    // projector advanced the group in between, apply() rejects (CAS) and the
+    // caller recomputes from the new checkpoint.
+    await target.apply(groupId, schemaActions, rowActions, to, events, checkpoint);
 }
 
 // Advance `target` to the group's current frontier.

@@ -22,9 +22,11 @@ async function testDetectsAppend(): Promise<void> {
     let calls = 0;
     const handle = watchFile(file, () => { calls++; });
     try {
-        await settle(100);   // let fs.watch attach
+        await handle.ready;   // watcher registered with the kernel; no attach sleep
         fs.appendFileSync(file, "more\n");
-        await settle(500);   // let the event deliver
+        // Delivery is inherently asynchronous; wait (bounded) for the event.
+        const deadline = Date.now() + 3000;
+        while (calls === 0 && Date.now() < deadline) await settle(20);
         assertTrue(calls >= 1, `watcher should have detected the append (got ${calls})`);
     } finally {
         handle.close();

@@ -6,7 +6,9 @@ import { tmpdir } from "node:os";
 
 import { createBasicCrypto, createIdentity, HASH_SHA256, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import { version } from "@hyper-hyper-space/hhs3_mvt";
-import { stopAllSyncs } from "@hyper-hyper-space/hhs3_rdb_repl";
+import { stopAllProjections, stopAllSyncs } from "@hyper-hyper-space/hhs3_rdb_repl";
+import { SqliteTarget } from "@hyper-hyper-space/hhs3_rdb_adapter_sqlite";
+import Database from "better-sqlite3";
 import type { ResolvedTableRef } from "@hyper-hyper-space/hhs3_rdb_lang";
 import { testing } from "@hyper-hyper-space/hhs3_util";
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
@@ -1544,6 +1546,84 @@ const tests = [
             }
         },
     },
+    {
+        name: '[RDB_TOOLS52] projection fail-then-grant-then-insert yields one rdb row (sqlite file + second connection)',
+        invoke: async () => {
+            await withSession(async (session, dbPath) => {
+                const projPath = `${dbPath}.proj.sql3`;
+                session.projectionTargetFactory = async ({ path }) => {
+                    const db = new Database(path);
+                    db.pragma('busy_timeout = 5000');
+                    return new SqliteTarget(db, { captureChanges: true, dbPath: path });
+                };
+
+                const setup = await runScript(session, editorProjectionSetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                const start = await runCommand(session, `\\project start app as alice to ${projPath}`);
+                assertEquals(start.exitCode, 0, start.output);
+                assertTrue(start.output.includes('started projection'), `expected started projection (got: ${start.output})`);
+                const projectId = /started projection (\d+)/.exec(start.output)?.[1];
+                assertTrue(projectId !== undefined, 'started projection id');
+
+                const appDb = new Database(projPath);
+                appDb.pragma('busy_timeout = 5000');
+                try {
+                    const tables = (appDb.prepare(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%pages%'")
+                        .all() as { name: string }[]).map((r) => r.name);
+                    const pagesTable = tables.find((n) => !n.endsWith('_sync') && !n.startsWith('rdb_'));
+                    assertTrue(pagesTable !== undefined, `projected pages table (got: ${tables.join(', ')})`);
+
+                    // First CLI insert: no writer cap -> rejected, row reverted, id poisoned.
+                    appDb.prepare(`INSERT INTO "${pagesTable}" (title) VALUES (?)`).run('hi');
+                    const fail = await runCommand(session, `\\project update ${projectId}`);
+                    assertEquals(fail.exitCode, 0, fail.output);
+                    assertTrue(fail.output.includes('projection warning:') || fail.output.includes('rejected'),
+                        `first insert is rejected (got: ${JSON.stringify(fail.output)})`);
+
+                    const afterFail = await runCommand(session, 'SELECT title FROM doc.pages;');
+                    assertEquals(afterFail.exitCode, 0, afterFail.output);
+                    assertTrue(!afterFail.output.includes('hi'),
+                        `rejected insert must not appear in rdb (got: ${afterFail.output})`);
+
+                    // Grant the writer cap. doc's insert restriction is a cross-group
+                    // EXISTS on user.caps, so the observer ref must advance (scripts
+                    // default ref-auto-update off).
+                    session.setRefAutoUpdate('auto');
+                    const grant = await runCommand(session,
+                        "INSERT INTO user.caps (label, grantee) VALUES ('writer', $alice);");
+                    assertEquals(grant.exitCode, 0, grant.output);
+
+                    appDb.prepare(`INSERT INTO "${pagesTable}" (title) VALUES (?)`).run('hi');
+                    const ok = await runCommand(session, `\\project update ${projectId}`);
+                    assertEquals(ok.exitCode, 0, ok.output);
+                    assertTrue(!ok.output.includes('projection warning:'),
+                        `second insert should ingest cleanly (got: ${JSON.stringify(ok.output)})`);
+
+                    const pages = await runCommand(session, 'SELECT title FROM doc.pages;');
+                    assertEquals(pages.exitCode, 0, pages.output);
+                    const hiRows = pages.output.split('\n').filter((line) => /\bhi\b/.test(line));
+                    assertEquals(hiRows.length, 1, `exactly one rdb pages row titled hi (got: ${pages.output})`);
+
+                    const syncTable = `${pagesTable}_sync`;
+                    const sync = appDb.prepare(
+                        `SELECT "id", "status" FROM "${syncTable}"`).all() as { id: number; status: string }[];
+                    const active = sync.filter((s) => s.status === 'active');
+                    const poisoned = sync.filter((s) => s.status === 'ingestion_failure');
+                    assertEquals(active.length, 1, `one active mapping (got: ${JSON.stringify(sync)})`);
+                    assertEquals(poisoned.length, 1, `the rejected id stays poisoned (got: ${JSON.stringify(sync)})`);
+                    assertTrue(active[0].id !== poisoned[0].id, 'the successful insert used a new local id');
+                    assertEquals(
+                        (appDb.prepare('SELECT COUNT(*) AS n FROM rdb_outbox').get() as { n: number }).n, 0,
+                        'the outbox is empty');
+                } finally {
+                    appDb.close();
+                    await stopAllProjections(session);
+                }
+            });
+        },
+    },
 ];
 
 async function runCommandNonInteractive(session: WorkspaceSession, command: string) {
@@ -1758,6 +1838,34 @@ CREATE SCHEMA shop CREATORS ($me) AS (
 );
 CREATE TABLEGROUP shop_prod USING SCHEMA shop;
 ADD SCHEMA shop TO app BY $alice;
+`;
+}
+
+function editorProjectionSetupScript(): string {
+    return `
+\\key create alice correct
+\\author alice
+CREATE DATABASE app CREATORS ($me);
+CREATE SCHEMA users_schema CREATORS ($me) AS (
+  TABLE caps (
+    label string PUB,
+    grantee string PUB
+  ) ALLOW all IF true
+);
+CREATE TABLEGROUP user USING SCHEMA users_schema
+  WITH ROWS (
+    caps (uuid='61169c8a-4106-43a1-8d37-39373c07da7a', label='manager', grantee=$me)
+  );
+CREATE SCHEMA doc_schema CREATORS ($me) AS (
+  TABLE pages (
+    title string
+  ) ALLOW insert IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author
+);
+CREATE TABLEGROUP doc USING SCHEMA doc_schema BIND user => user;
+ADD SCHEMA users_schema TO app BY $alice;
+ADD SCHEMA doc_schema TO app BY $alice;
+ADD TABLEGROUP user TO app BY $alice;
+ADD TABLEGROUP doc TO app BY $alice;
 `;
 }
 

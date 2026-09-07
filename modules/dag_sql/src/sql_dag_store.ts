@@ -222,4 +222,15 @@ export abstract class SqlDagStore implements DagStore<SqlConnection> {
     // reads the new entries beyond its cursor and delivers them.
     protected abstract startExternalObserver(notify: () => void): unknown;
     protected abstract stopExternalObserver(handle: unknown): void;
+
+    // Resolves once the currently-armed external observer reports itself ready.
+    // An observer whose handle exposes a `ready` promise (e.g. the WAL file
+    // watcher, whose kernel registration is deferred a loop hop) surfaces it
+    // here; observers without one, and the disarmed state, resolve immediately.
+    // Await after addListener, before a write whose notification must be
+    // observed deterministically rather than racing kernel registration.
+    async whenExternalObserverReady(): Promise<void> {
+        const handle = this.externalHandle as { ready?: Promise<void> } | undefined;
+        await handle?.ready;
+    }
 }

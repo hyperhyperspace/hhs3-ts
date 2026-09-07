@@ -355,10 +355,23 @@ export async function ingestDatabaseChanges(
     };
     const fkBundlingFor = (groupId: string): boolean => contexts.get(groupId as B64Hash)?.config.fkBundling !== false;
     const updateMergeFor = (table: string): boolean => ctxForTable(table)?.config.updateMerge !== false;
-    const plan = planDatabaseEntries(batch, nodeCtxFor, lookup, keyLookup, newUuid, fkBundlingFor, updateMergeFor);
+    let plan = planDatabaseEntries(batch, nodeCtxFor, lookup, keyLookup, newUuid, fkBundlingFor, updateMergeFor);
 
-    // Durably reserve every minted identity BEFORE the append walk.
-    if (plan.reservations.length > 0) await source.reserveMint(plan.reservations);
+    // Durably reserve every minted identity BEFORE the append walk. reserveMint is
+    // claim-or-adopt: a reservation whose local id is already held by a different
+    // row_hash (a concurrent ingester or a projection that materialized the row
+    // first) comes back as the incumbent identity. When any is adopted, fold ALL
+    // effective mappings into the prefetch and re-plan once so every op submits
+    // the agreed identity (and no fresh uuid is re-minted for a claimed insert).
+    // No second reserveMint: the re-plan only reuses now-durable identities.
+    if (plan.reservations.length > 0) {
+        const effective = await source.reserveMint(plan.reservations);
+        const adopted = effective.some((eff, i) => eff.rowId !== plan.reservations[i].rowId);
+        if (adopted) {
+            for (const eff of effective) prefetched.set(eff.table + '\u0000' + eff.localId, eff);
+            plan = planDatabaseEntries(batch, nodeCtxFor, lookup, keyLookup, newUuid, fkBundlingFor, updateMergeFor);
+        }
+    }
 
     // --- failure / recovery accumulators ---
     const failureEvents: OpEvent[] = [];
@@ -421,8 +434,13 @@ export async function ingestDatabaseChanges(
         const res = await attempt(group, [op.write], writer);
         if (res.ok) { bump(groupId, 1); return; }
 
-        if (op.kind === 'insert' && op.reusedIdentity === true && isWriteOnceFor(res.why, rowId)) {
-            return;   // already applied on a prior crashed pass: idempotent skip
+        if (op.kind === 'insert' && isWriteOnceFor(res.why, rowId)) {
+            // The rowId is already in the DAG. rowId = hash(uuid, author) and the
+            // uuid is either our freshly-minted random one or a reserved/adopted
+            // one, so a write-once conflict can only mean THIS identity already
+            // landed - our own prior crashed pass, or a concurrent ingester that
+            // shares the reserved identity (claim-or-adopt). Idempotent skip.
+            return;
         }
         if (op.kind === 'delete' && isNotLiveFor(res.why, rowId)) {
             return;   // already deleted: idempotent skip
@@ -534,7 +552,6 @@ export async function ingestDatabaseChanges(
     const reverts: RowAction[] = [];
     const statuses: SyncStatusUpdate[] = [];
     for (const mark of marks.values()) {
-        if (pendingRows.has(mark.targetTable + '\u0000' + mark.localId)) continue;   // quiescence gate
         const group = groupById.get(mark.groupId)!;
         const ctx = contexts.get(mark.groupId)!;
         const to = await (await group.getScopedDag()).getFrontier();
@@ -544,10 +561,18 @@ export async function ingestDatabaseChanges(
         if (row === undefined) {
             // The op never landed (an insert orphan, or an already-deleted row):
             // remove the local app row and mark the sync record ingestion_failure.
+            // This is NOT quiescence-gated: the app row has no rdb counterpart, so
+            // a newer pending change for this local id is a follow-on to a rejected
+            // insert (a stale image). Leaving the orphan in place would replay the
+            // rejected insert next cycle; instead we poison it now and the pending
+            // rows are drained-and-dropped next cycle (planner drops a poisoned id).
             reverts.push({ kind: 'delete-row', table: mark.targetTable, rowId: mark.rowId });
             statuses.push({ table: mark.targetTable, rowId: mark.rowId, status: 'ingestion_failure' });
         } else {
-            // The row exists in rdb: re-materialize it fully (undo the local edit).
+            // The row exists in rdb: re-materialize it fully (undo the local edit) -
+            // UNLESS a newer outbox change is pending for it (quiescence gate): a
+            // later cycle ingests that write, so reverting now would clobber it.
+            if (pendingRows.has(mark.targetTable + '\u0000' + mark.localId)) continue;
             reverts.push(rowToUpsertAction(row, mark.rdbTable, view.getSchemaView(), ctx.config));
         }
     }

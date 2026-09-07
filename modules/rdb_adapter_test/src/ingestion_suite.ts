@@ -9,12 +9,13 @@
 // (triggers vs an in-memory outbox) are irrelevant here - only the contract.
 
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
-import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
+import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import { deriveRowId, Row, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 import {
-    BidirectionalTarget, CapturedBatch, IngestSettle, ingestChanges, MemoryTarget, OpEvent,
-    projectGroup, RowAction, SchemaAction, StoredOpEvent, SyncMapping,
+    BidirectionalTarget, CapturedBatch, CapturedChange, CheckpointMovedError, IngestSettle,
+    ingestChanges, MemoryTarget, OpEvent, projectGroup, RowAction, SchemaAction, StoredOpEvent,
+    SyncMapping,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 import { createFkGroup, createGroup } from "./group_fixture.js";
@@ -29,18 +30,104 @@ class CrashBeforeSettle implements BidirectionalTarget {
     private commits = 0;
     constructor(private readonly inner: BidirectionalTarget) {}
 
-    apply(g: B64Hash, s: SchemaAction[], r: RowAction[], c: Version, e?: OpEvent[]): Promise<void> {
-        return this.inner.apply(g, s, r, c, e);
+    apply(g: B64Hash, s: SchemaAction[], r: RowAction[], c: Version, e?: OpEvent[], from?: Version | null): Promise<void> {
+        return this.inner.apply(g, s, r, c, e, from);
     }
     getCheckpoint(g: B64Hash): Promise<Version | undefined> { return this.inner.getCheckpoint(g); }
     drainChanges(): Promise<CapturedBatch> { return this.inner.drainChanges(); }
     resolveRow(t: string, l: number): Promise<SyncMapping | undefined> { return this.inner.resolveRow(t, l); }
-    reserveMint(m: SyncMapping[]): Promise<void> { return this.inner.reserveMint(m); }
+    reserveMint(m: SyncMapping[]): Promise<SyncMapping[]> { return this.inner.reserveMint(m); }
     drainOpEvents(sinceId?: number): Promise<StoredOpEvent[]> { return this.inner.drainOpEvents(sinceId); }
     async commitIngest(settle: IngestSettle): Promise<void> {
         this.commits += 1;
         if (this.commits === 1) return;   // the "crash": drop the settle
         return this.inner.commitIngest(settle);
+    }
+}
+
+// A wrapper that, before delegating its FIRST reserveMint, injects a COMPETING
+// identity (a different row_hash) for a chosen (table, localId) directly through
+// the inner target - simulating a concurrent ingester (or a projection) that
+// claimed that local id first. The delegated reserveMint must then ADOPT the
+// competitor, so the pass re-plans and submits the agreed identity.
+class RaceReserve implements BidirectionalTarget {
+    private injected = false;
+    constructor(private readonly inner: BidirectionalTarget, private readonly competitor: SyncMapping) {}
+
+    apply(g: B64Hash, s: SchemaAction[], r: RowAction[], c: Version, e?: OpEvent[], from?: Version | null): Promise<void> {
+        return this.inner.apply(g, s, r, c, e, from);
+    }
+    getCheckpoint(g: B64Hash): Promise<Version | undefined> { return this.inner.getCheckpoint(g); }
+    drainChanges(): Promise<CapturedBatch> { return this.inner.drainChanges(); }
+    resolveRow(t: string, l: number): Promise<SyncMapping | undefined> { return this.inner.resolveRow(t, l); }
+    drainOpEvents(sinceId?: number): Promise<StoredOpEvent[]> { return this.inner.drainOpEvents(sinceId); }
+    commitIngest(settle: IngestSettle): Promise<void> { return this.inner.commitIngest(settle); }
+    async reserveMint(m: SyncMapping[]): Promise<SyncMapping[]> {
+        if (!this.injected) {
+            this.injected = true;
+            await this.inner.reserveMint([this.competitor]);   // the competitor claims the id first
+        }
+        return this.inner.reserveMint(m);
+    }
+}
+
+// A wrapper whose SECOND drainChanges (the orchestrator's recovery-time drain,
+// used to compute pending rows) returns an extra injected change for a chosen
+// local id - so the quiescence gate sees a "newer pending" change. Proves an
+// insert orphan is still reverted+poisoned despite the pending row.
+class InjectPendingOnRecovery implements BidirectionalTarget {
+    private drains = 0;
+    constructor(private readonly inner: BidirectionalTarget, private readonly inject: CapturedChange) {}
+
+    apply(g: B64Hash, s: SchemaAction[], r: RowAction[], c: Version, e?: OpEvent[], from?: Version | null): Promise<void> {
+        return this.inner.apply(g, s, r, c, e, from);
+    }
+    getCheckpoint(g: B64Hash): Promise<Version | undefined> { return this.inner.getCheckpoint(g); }
+    resolveRow(t: string, l: number): Promise<SyncMapping | undefined> { return this.inner.resolveRow(t, l); }
+    reserveMint(m: SyncMapping[]): Promise<SyncMapping[]> { return this.inner.reserveMint(m); }
+    drainOpEvents(sinceId?: number): Promise<StoredOpEvent[]> { return this.inner.drainOpEvents(sinceId); }
+    commitIngest(settle: IngestSettle): Promise<void> { return this.inner.commitIngest(settle); }
+    async drainChanges(): Promise<CapturedBatch> {
+        this.drains += 1;
+        const batch = await this.inner.drainChanges();
+        if (this.drains === 2) return { changes: [...batch.changes, this.inject] };
+        return batch;
+    }
+}
+
+// After the first reserveMint, append the reserved identity to the group
+// BEFORE the orchestrator's submit walk. Proves a write-once conflict on a
+// freshly minted (not reusedIdentity) insert is an idempotent skip, not a
+// recorded failure: the adopter / a racing replica may land first.
+class LandBeforeWalk implements BidirectionalTarget {
+    private landed = false;
+    constructor(
+        private readonly inner: BidirectionalTarget,
+        private readonly group: RTableGroup,
+        private readonly writer: OwnIdentity,
+        private readonly rdbTable: string,
+        private readonly values: { [column: string]: string },
+    ) {}
+
+    apply(g: B64Hash, s: SchemaAction[], r: RowAction[], c: Version, e?: OpEvent[], from?: Version | null): Promise<void> {
+        return this.inner.apply(g, s, r, c, e, from);
+    }
+    getCheckpoint(g: B64Hash): Promise<Version | undefined> { return this.inner.getCheckpoint(g); }
+    drainChanges(): Promise<CapturedBatch> { return this.inner.drainChanges(); }
+    resolveRow(t: string, l: number): Promise<SyncMapping | undefined> { return this.inner.resolveRow(t, l); }
+    drainOpEvents(sinceId?: number): Promise<StoredOpEvent[]> { return this.inner.drainOpEvents(sinceId); }
+    commitIngest(settle: IngestSettle): Promise<void> { return this.inner.commitIngest(settle); }
+    async reserveMint(m: SyncMapping[]): Promise<SyncMapping[]> {
+        const effective = await this.inner.reserveMint(m);
+        if (!this.landed && effective.length > 0) {
+            this.landed = true;
+            const mapping = effective[0];
+            await this.group.bundle([{
+                table: this.rdbTable,
+                op: { action: 'insert', rowId: mapping.rowId, uuid: mapping.uuid, values: this.values },
+            }], this.writer);
+        }
+        return effective;
     }
 }
 
@@ -510,6 +597,217 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                         assertEquals(after!.rowId, rowId, 'the replay reused the reserved uuid (identical rowId)');
                         assertEquals(after!.status, 'active', 'the row is active, not a failure');
                         assertEquals((await target.drainChanges()).changes.length, 0, 'the outbox is now acked');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN14] fail -> fix -> re-insert: one rdb row at a NEW local id, the rejected identity is never used`,
+                invoke: async () => {
+                    const { group, admin } = await createFkGroup();
+
+                    const { target, local, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+
+                        // 1. A dangling-FK insert fails and its local id is poisoned.
+                        const failedId = await local.insert('comments', { body: 'orphan', post_id: 9999 });
+                        const r1 = await ingestChanges(group, target, { writer: admin });
+                        assertEquals(r1.accepted, 0, 'the dangling insert lands nothing');
+                        const poisoned = await target.resolveRow('comments', failedId);
+                        assertEquals(poisoned!.status, 'ingestion_failure', 'the failed id is poisoned');
+                        const poisonRowId = poisoned!.rowId;
+
+                        // 2. Make the write legal: insert a real post and ingest it.
+                        const postId = await local.insert('posts', { title: 'T' });
+                        const r2 = await ingestChanges(group, target, { writer: admin });
+                        assertEquals(r2.accepted, 1, 'the post ingests');
+
+                        // 3. Re-insert the comment against the real post: a NEW local id.
+                        const newId = await local.insert('comments', { body: 'real', post_id: postId });
+                        assertTrue(newId !== failedId, 'the re-insert gets a new local id (ids are never reused)');
+                        const r3 = await ingestChanges(group, target, { writer: admin });
+                        assertEquals(r3.accepted, 1, 'the comment ingests');
+
+                        // The guarantee (the user-reported bug): EXACTLY ONE comment in
+                        // rdb, and it is NOT the rejected identity.
+                        const comments = await rdbRows(group, 'comments');
+                        assertEquals(comments.length, 1, 'exactly one comment row in rdb (no duplicate)');
+                        assertTrue(comments[0].rowId !== poisonRowId, 'the row is not the rejected identity');
+                        assertEquals(comments[0].values.body, 'real', 'it is the legal re-insert');
+
+                        assertEquals((await target.resolveRow('comments', failedId))!.status, 'ingestion_failure',
+                            'the poisoned mapping is kept, never reused');
+                        assertEquals((await target.resolveRow('comments', newId))!.status, 'active', 'the new id is active');
+                        assertEquals((await target.drainChanges()).changes.length, 0, 'the outbox is acked');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN15] crash-replay after a prior failure: the replay reuses the reserved uuid, no duplicate`,
+                invoke: async () => {
+                    const { group, admin } = await createFkGroup();
+
+                    const { target, local, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+
+                        // Poison comments#1, then legalize and re-insert at a new id.
+                        await local.insert('comments', { body: 'orphan', post_id: 9999 });
+                        await ingestChanges(group, target, { writer: admin });
+                        const postId = await local.insert('posts', { title: 'T' });
+                        await ingestChanges(group, target, { writer: admin });
+                        const newId = await local.insert('comments', { body: 'real', post_id: postId });
+
+                        // Pass A: the append lands, the settle is dropped (crash).
+                        const a = await ingestChanges(group, new CrashBeforeSettle(target), { writer: admin });
+                        assertEquals(a.accepted, 1, 'the comment appended before the crash');
+                        const reserved = await target.resolveRow('comments', newId);
+                        assertTrue(reserved !== undefined && reserved.uuid !== '', 'the uuid is durable pre-append');
+                        const rowId = reserved!.rowId;
+
+                        // Pass B (restart): the replay reads the reserved uuid back,
+                        // re-appends (idempotent skip), and acks. resolveRow must not be
+                        // confused by the poisoned mapping at the other local id.
+                        const b = await ingestChanges(group, target, { writer: admin });
+                        assertEquals(b.accepted, 0, 'the replay recognizes the op as already-applied');
+                        assertEquals(b.rejected.length, 0, 'and it is not a failure');
+
+                        const comments = await rdbRows(group, 'comments');
+                        assertEquals(comments.length, 1, 'exactly one comment, no duplicate after replay');
+                        assertEquals(comments[0].rowId, rowId, 'the replay reused the reserved uuid (identical rowId)');
+                        assertEquals((await target.resolveRow('comments', newId))!.status, 'active', 'active mapping');
+                        assertEquals((await target.drainChanges()).changes.length, 0, 'the outbox is acked');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN16] claim-or-adopt: a concurrent identity for the same local id is adopted, one rdb row`,
+                invoke: async () => {
+                    const { group, admin } = await createGroup();
+
+                    const { target, local, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+                        const localId = await local.insert('tags', { code: 'x' });
+
+                        // A concurrent ingester claimed this local id first with a
+                        // DIFFERENT identity. reserveMint adopts it; the pass re-plans
+                        // and submits the adopted identity, converging to ONE row.
+                        const competitorUuid = 'competitor-uuid';
+                        const competitor: SyncMapping = {
+                            table: 'tags', localId, rowId: deriveRowId(competitorUuid, admin.keyId),
+                            uuid: competitorUuid, author: admin.keyId, status: 'active',
+                        };
+                        const result = await ingestChanges(group, new RaceReserve(target, competitor), { writer: admin });
+                        assertEquals(result.accepted, 1, 'one op submitted (the adopted identity)');
+
+                        const mine = (await rdbRows(group, 'tags')).filter((r) => r.values.code === 'x');
+                        assertEquals(mine.length, 1, 'exactly one tag row, not two');
+                        assertEquals(mine[0].rowId, competitor.rowId, 'the adopted identity landed, not a fresh mint');
+                        const mapping = await target.resolveRow('tags', localId);
+                        assertEquals(mapping!.uuid, competitorUuid, 'the sync mapping is the adopted identity');
+                        assertEquals((await target.drainChanges()).changes.length, 0, 'the outbox is acked');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN17] an insert orphan is reverted+poisoned even when a newer change for its id is pending`,
+                invoke: async () => {
+                    const { group, admin } = await createFkGroup();
+
+                    const { target, read, local, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+                        const failedId = await local.insert('comments', { body: 'orphan', post_id: 9999 });
+
+                        // Inject a newer pending change for the SAME local id into the
+                        // recovery drain. Pre-fix the quiescence gate would skip the
+                        // orphan revert; now the orphan is poisoned regardless.
+                        const injected: CapturedChange = {
+                            id: 9_000_001, kind: 'update', table: 'comments', localId: failedId, values: { body: 'later' },
+                        };
+                        const result = await ingestChanges(group, new InjectPendingOnRecovery(target, injected), { writer: admin });
+                        assertEquals(result.accepted, 0, 'the dangling insert lands nothing');
+
+                        const mapping = await target.resolveRow('comments', failedId);
+                        assertEquals(mapping!.status, 'ingestion_failure', 'the orphan is poisoned despite the pending row');
+                        assertTrue(await read.getRow('comments', mapping!.rowId) === undefined, 'the orphan app row is reverted');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN18] apply() compare-and-set: a stale expectFrom is rejected and applies nothing`,
+                invoke: async () => {
+                    const { group } = await createGroup();
+
+                    const { target, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);   // establishes a checkpoint
+                        const groupId = group.getId();
+                        const current = await target.getCheckpoint(groupId);
+                        assertTrue(current !== undefined && current.size > 0, 'a non-empty checkpoint exists after projection');
+
+                        // A stale expectFrom (empty version) is rejected without mutating.
+                        let stale = false;
+                        try {
+                            await target.apply(groupId, [], [], current!, undefined, new Set<string>());
+                        } catch (e) { stale = e instanceof CheckpointMovedError; }
+                        assertTrue(stale, 'a stale expectFrom throws CheckpointMovedError');
+
+                        // null (expect NO checkpoint) against an existing one is rejected too.
+                        let nullExpect = false;
+                        try {
+                            await target.apply(groupId, [], [], current!, undefined, null);
+                        } catch (e) { nullExpect = e instanceof CheckpointMovedError; }
+                        assertTrue(nullExpect, 'null expectFrom throws when a checkpoint already exists');
+
+                        const afterCp = await target.getCheckpoint(groupId);
+                        assertTrue(afterCp !== undefined && afterCp.size === current!.size, 'the checkpoint is unchanged');
+
+                        // A correct expectFrom still applies (advancing to the same version).
+                        await target.apply(groupId, [], [], current!, undefined, current!);
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN19] write-once is idempotent for any own insert (even when reusedIdentity is false)`,
+                invoke: async () => {
+                    const { group, admin } = await createGroup();
+
+                    const { target, local, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+                        await local.insert('tags', { code: 'x' });
+
+                        // The wrapper lands the reserved identity between reserveMint
+                        // and the submit walk. submitOp must treat the write-once
+                        // conflict as already-applied (not a failure) even though
+                        // this is a FRESH mint, not a crash-replay reuse.
+                        const result = await ingestChanges(
+                            group,
+                            new LandBeforeWalk(target, group, admin, 'tags', { code: 'x' }),
+                            { writer: admin },
+                        );
+                        assertEquals(result.rejected.length, 0, 'write-once is a skip, not a recorded failure');
+
+                        const mine = (await rdbRows(group, 'tags')).filter((r) => r.values.code === 'x');
+                        assertEquals(mine.length, 1, 'exactly one tag row (the pre-landed identity)');
+                        assertEquals((await target.drainChanges()).changes.length, 0, 'the outbox is acked');
+                        const events = await target.drainOpEvents();
+                        assertEquals(events.filter((e) => e.event.origin === 'ingestion').length, 0,
+                            'no ingestion/failure op-event');
                     } finally {
                         await cleanup?.();
                     }

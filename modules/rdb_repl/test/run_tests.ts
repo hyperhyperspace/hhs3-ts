@@ -78,13 +78,13 @@ class FlakyTarget implements BidirectionalTarget {
 
     async apply(
         groupId: B64Hash, schemaActions: SchemaAction[], rowActions: RowAction[],
-        checkpoint: Version, events?: OpEvent[],
+        checkpoint: Version, events?: OpEvent[], expectFrom?: Version | null,
     ): Promise<void> {
         this.applyCalls += 1;
         if (this.applyCalls >= this.failFromCall) {
             throw new Error(`simulated apply failure (call ${this.applyCalls})`);
         }
-        await this.inner.apply(groupId, schemaActions, rowActions, checkpoint, events);
+        await this.inner.apply(groupId, schemaActions, rowActions, checkpoint, events, expectFrom);
     }
 
     getCheckpoint(groupId: B64Hash): Promise<Version | undefined> {
@@ -99,7 +99,7 @@ class FlakyTarget implements BidirectionalTarget {
         return this.inner.resolveRow(table, localId);
     }
 
-    reserveMint(reservations: SyncMapping[]): Promise<void> {
+    reserveMint(reservations: SyncMapping[]): Promise<SyncMapping[]> {
         return this.inner.reserveMint(reservations);
     }
 
