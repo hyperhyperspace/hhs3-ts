@@ -50,6 +50,49 @@ export async function runProjectParseTests(): Promise<void> {
     assert(update.kind === 'update' && update.id === 12, 'update id');
     const events = parseProjectCommand('events 1');
     assert(events.kind === 'events' && events.id === 1, 'events id');
+    if (events.kind === 'events') {
+        assertEqual(events.afterId, undefined, 'bare events has no after');
+        assertEqual(events.beforeId, undefined, 'bare events has no before');
+        assertEqual(events.limit, undefined, 'bare events has no limit');
+        assertEqual(events.order, undefined, 'bare events has no order');
+    }
+
+    const eventsAfter = parseProjectCommand('events 1 after 12');
+    assert(eventsAfter.kind === 'events' && eventsAfter.afterId === 12, 'events after');
+
+    const eventsBefore = parseProjectCommand('events 1 before 51');
+    assert(eventsBefore.kind === 'events' && eventsBefore.beforeId === 51, 'events before');
+
+    const eventsLimitOrder = parseProjectCommand('events 1 limit 20 order desc');
+    assert(eventsLimitOrder.kind === 'events', 'events limit order kind');
+    if (eventsLimitOrder.kind === 'events') {
+        assertEqual(eventsLimitOrder.limit, 20, 'limit 20');
+        assertEqual(eventsLimitOrder.order, 'desc', 'order desc');
+    }
+
+    const eventsAll = parseProjectCommand('events 1 after 12 before 51 limit 20 order asc');
+    assert(eventsAll.kind === 'events', 'events full kind');
+    if (eventsAll.kind === 'events') {
+        assertEqual(eventsAll.id, 1, 'full id');
+        assertEqual(eventsAll.afterId, 12, 'full after');
+        assertEqual(eventsAll.beforeId, 51, 'full before');
+        assertEqual(eventsAll.limit, 20, 'full limit');
+        assertEqual(eventsAll.order, 'asc', 'full order');
+    }
+
+    const eventsKwOrder = parseProjectCommand('events 3 order desc after 0 before 9 limit 5');
+    assert(eventsKwOrder.kind === 'events', 'keyword order kind');
+    if (eventsKwOrder.kind === 'events') {
+        assertEqual(eventsKwOrder.afterId, 0, 'keywords after 0');
+        assertEqual(eventsKwOrder.beforeId, 9, 'keywords before');
+        assertEqual(eventsKwOrder.limit, 5, 'keywords limit');
+        assertEqual(eventsKwOrder.order, 'desc', 'keywords order');
+    }
+
+    assertThrows(() => parseProjectCommand('events 1 order sideways'), 'bad order is rejected', 'asc or desc');
+    assertThrows(() => parseProjectCommand('events 1 after x'), 'non-numeric after is rejected', 'non-negative integer');
+    assertThrows(() => parseProjectCommand('events 1 before x'), 'non-numeric before is rejected', 'non-negative integer');
+    assertThrows(() => parseProjectCommand('events 1 extra'), 'unknown events token is rejected', 'Unexpected token');
 
     const register = parseProjectCommand('register-key 2 kh pk');
     assert(register.kind === 'register-key', 'register-key');

@@ -38,8 +38,8 @@ import Database from "better-sqlite3";
 import {
     CapturedBatch, CapturedChange, ChangeSignalListener, ChangeSignalSource,
     CheckpointMovedError, DEFAULT_KEY_TABLE, IngestSettle, KeyIndex, MaterializationTarget,
-    MaterializedChangeSource, OpEvent, OpEventReason, RowAction, RowIdentityIndex, SchemaAction,
-    StoredOpEvent, SyncMapping, versionsEqual,
+    MaterializedChangeSource, OpEvent, OpEventQuery, OpEventReason, resolveOpEventQuery,
+    RowAction, RowIdentityIndex, SchemaAction, StoredOpEvent, SyncMapping, versionsEqual,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 // Per-table bookkeeping, mirrored in rdb_table_meta. Cached in memory within a
@@ -179,6 +179,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     // (safe because SQLite serializes writers).
     private readonly captureRequested: boolean;
     private capture = false;
+    private closed = false;
 
     constructor(db: Database.Database, opts: { captureChanges?: boolean; pollMs?: number; dbPath?: string } = {}) {
         this.db = db;
@@ -195,6 +196,21 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     async getCheckpoint(groupId: B64Hash): Promise<Version | undefined> {
         this.ensureBookkeeping();
         return this.readCheckpoint(groupId);
+    }
+
+    // Release this connection: disarm the WAL/poll monitor and close the
+    // better-sqlite3 handle (checkpoints and drops -wal/-shm when this is
+    // the last connection). Idempotent. RdbProjection.stop() calls this.
+    close(): void {
+        if (this.closed) return;
+        this.closed = true;
+        this.disarmMonitor();
+        try { this.db.pragma('wal_checkpoint(TRUNCATE)'); } catch { /* already closed */ }
+        try { this.db.close(); } catch { /* already closed by the caller */ }
+    }
+
+    private ensureOpen(): void {
+        if (this.closed) throw new Error('SqliteTarget is closed');
     }
 
     // Synchronous checkpoint read (assumes bookkeeping is ready). Used inside the
@@ -256,6 +272,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     // -----------------------------------------------------------------------
 
     private ensureBookkeeping(): void {
+        this.ensureOpen();
         if (this.bookkeepingReady) return;
         // FKs are ADVISORY: turn enforcement OFF on this connection so our
         // declared FKs (local `<col>_id` -> target id; sync id -> app id) are
@@ -909,12 +926,18 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         run.immediate();
     }
 
-    async drainOpEvents(sinceId?: number): Promise<StoredOpEvent[]> {
+    async drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]> {
         this.ensureBookkeeping();
-        const rows = this.db.prepare(
-            'SELECT id, origin, direction, group_id, op_hash, op_json, kind, "table" AS tbl, '
-            + 'row_hash, local_id, author, reason FROM rdb_op_events WHERE id > ? ORDER BY id')
-            .all(sinceId ?? 0) as {
+        const q = resolveOpEventQuery(opts);
+        const dir = q.order === 'desc' ? 'DESC' : 'ASC';
+        const where = q.beforeId === undefined ? 'id > ?' : 'id > ? AND id < ?';
+        const sql = 'SELECT id, origin, direction, group_id, op_hash, op_json, kind, "table" AS tbl, '
+            + 'row_hash, local_id, author, reason FROM rdb_op_events WHERE ' + where
+            + ' ORDER BY id ' + dir
+            + (q.limit !== undefined ? ' LIMIT ?' : '');
+        const params: number[] = q.beforeId === undefined ? [q.afterId] : [q.afterId, q.beforeId];
+        if (q.limit !== undefined) params.push(q.limit);
+        const rows = this.db.prepare(sql).all(...params) as {
                 id: number; origin: string; direction: string; group_id: string; op_hash: string;
                 op_json: string | null; kind: string; tbl: string | null; row_hash: string | null;
                 local_id: number | null; author: string | null; reason: string | null;

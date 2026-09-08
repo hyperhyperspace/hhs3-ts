@@ -8,14 +8,14 @@
 //   \project update <id>                          force one cycle now
 //   \project status [<db>]                        list active projections
 //   \project stop <id>                            stop a projection session
-//   \project events <id>                          durable op-event backlog
+//   \project events <id> [after <n>] [before <n>] [limit <m>] [order asc|desc]
 //   \project register-key <id> <keyHash> <publicKey>
 //   \project resolve-key <id> <token>
 
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { formatOpVoidDetail } from "@hyper-hyper-space/hhs3_rdb";
 import type { RDb } from "@hyper-hyper-space/hhs3_rdb";
-import type { IngestResult, OpEvent } from "@hyper-hyper-space/hhs3_rdb_adapter";
+import type { IngestResult, OpEvent, OpEventOrder } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import { RdbProjection } from "@hyper-hyper-space/hhs3_rdb_projection";
 
 import { formatDisplayString, formatSessionRows } from "../format/display.js";
@@ -23,6 +23,7 @@ import { formatRows } from "../format/rows.js";
 import type { ReplSession } from "../session.js";
 import {
     parseProjectCommand,
+    type ProjectEventsCommand,
     type ProjectStartCommand,
 } from "./parse.js";
 import type { ProjectSessionEntry } from "./types.js";
@@ -99,7 +100,7 @@ export async function runProjectCommand(session: ReplSession, remainder: string)
         case 'status': return { output: await status(session, cmd.database) };
         case 'stop': return { output: await stop(session, cmd.id) };
         case 'update': return { output: await update(session, cmd.id) };
-        case 'events': return { output: await events(session, cmd.id) };
+        case 'events': return { output: await events(session, cmd) };
         case 'register-key': return { output: await registerKey(session, cmd.id, cmd.keyHash, cmd.publicKey) };
         case 'resolve-key': return { output: await resolveKey(session, cmd.id, cmd.token) };
     }
@@ -208,9 +209,18 @@ async function stop(session: ReplSession, id: number): Promise<string> {
     return `stopped projection ${id}`;
 }
 
-async function events(session: ReplSession, id: number): Promise<string> {
-    const entry = requireEntry(session, id);
-    const backlog = await entry.projection.opEvents();
+const EVENTS_DEFAULT_LIMIT = 50;
+const EVENTS_DEFAULT_ORDER: OpEventOrder = 'desc';
+
+async function events(session: ReplSession, cmd: ProjectEventsCommand): Promise<string> {
+    const entry = requireEntry(session, cmd.id);
+    const order = cmd.order ?? EVENTS_DEFAULT_ORDER;
+    const backlog = await entry.projection.opEvents({
+        afterId: cmd.afterId,
+        beforeId: cmd.beforeId,
+        limit: cmd.limit ?? EVENTS_DEFAULT_LIMIT,
+        order,
+    });
     if (backlog.length === 0) return '(no op-events)';
     return backlog.map((s) => `#${s.id} ${formatOpEvent(session, s.event)}`).join('\n');
 }

@@ -3,6 +3,7 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { json } from "@hyper-hyper-space/hhs3_json";
+import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { ColumnType } from "@hyper-hyper-space/hhs3_rdb";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import Database from "better-sqlite3";
@@ -438,6 +439,37 @@ export const sqliteSpecificTests = {
             },
         },
         {
+            name: '[ADPTS-SQL04e] close() checkpoints WAL/SHM and is idempotent',
+            invoke: async () => {
+                const { group, admin } = await createGroup();
+                const ledger = await group.getTable('ledger');
+                await ledger.insert('l1', { ref: 'R-1', amount: '10.00' }, admin);
+
+                const dbPath = tmpDbPath('closewal');
+                const db = new Database(dbPath);
+                const target = new SqliteTarget(db, { captureChanges: true, dbPath });
+                try {
+                    await projectGroup(group, target);
+                    target.close();
+                    assertTrue(!fs.existsSync(dbPath + '-wal'), 'WAL file is gone after close');
+                    assertTrue(!fs.existsSync(dbPath + '-shm'), 'SHM file is gone after close');
+                    target.close();  // second close is a no-op
+
+                    let threw = false;
+                    try {
+                        await target.apply(group.getId(), [], [], new Set(['x']));
+                    } catch (e) {
+                        threw = e instanceof Error && e.message === 'SqliteTarget is closed';
+                    }
+                    assertTrue(threw, 'apply after close throws a clear error');
+                    assertTrue(fs.existsSync(dbPath), 'the main db file remains');
+                } finally {
+                    try { target.close(); } catch { /* already closed */ }
+                    cleanupDb(dbPath);
+                }
+            },
+        },
+        {
             name: '[ADPTS-SQL05] a co-projected cross-group FK declares no DB-level FOREIGN KEY',
             invoke: async () => {
                 const db = new Database(':memory:');
@@ -780,6 +812,40 @@ export const sqliteSpecificTests = {
                 assertTrue(/AUTOINCREMENT/i.test(acctSql), 'the rebuilt table keeps AUTOINCREMENT');
                 const nextId = Number(db.prepare('INSERT INTO acct (ref, note) VALUES (?, ?)').run('d', 'm').lastInsertRowid);
                 assertEquals(nextId, 4, 'the next auto id is 4 (re-seeded from the sync ledger), not a reused 2');
+                db.close();
+            },
+        },
+        {
+            name: '[ADPTS-SQL15] drainOpEvents pages with exclusive afterId / beforeId',
+            invoke: async () => {
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db);
+                const gid = 'g';
+                const events = [1, 2, 3, 4, 5].map((i) => ({
+                    origin: 'concurrency' as const, direction: 'void' as const,
+                    groupId: gid as B64Hash, opHash: `H${i}`, kind: 'insert' as const,
+                }));
+                await target.apply(gid, [], [], new Set(['v1']), events);
+
+                const asc = await target.drainOpEvents({ limit: 2 });
+                assertEquals(asc.length, 2, 'default order page size');
+                assertEquals(asc[0].event.opHash, 'H1', 'default order is asc');
+                assertEquals(asc[1].event.opHash, 'H2', 'asc second');
+                const desc = await target.drainOpEvents({ order: 'desc', limit: 1 });
+                assertEquals(desc[0]?.event.opHash, 'H5', 'desc limit 1 is the high id');
+                const low = await target.drainOpEvents({ order: 'asc', limit: 1 });
+                assertEquals(low[0]?.id, 1, 'asc limit 1 is the first event id');
+                const mid = await target.drainOpEvents({ afterId: 2, limit: 2, order: 'asc' });
+                assertEquals(mid.length, 2, 'mid page size');
+                assertEquals(mid[0].id, 3, 'afterId is exclusive');
+                assertEquals(mid[1].id, 4, 'asc pages forward');
+                const older = await target.drainOpEvents({ beforeId: 5, limit: 2, order: 'desc' });
+                assertEquals(older[0]?.id, 4, 'beforeId is exclusive');
+                assertEquals(older[1]?.id, 3, 'desc older page');
+                const window = await target.drainOpEvents({ afterId: 1, beforeId: 5, order: 'asc' });
+                assertEquals(window.length, 3, 'after+before window size');
+                assertEquals(window[0].id, 2, 'window after 1');
+                assertEquals(window[2].id, 4, 'window before 5');
                 db.close();
             },
         },

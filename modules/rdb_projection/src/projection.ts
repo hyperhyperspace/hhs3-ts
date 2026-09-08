@@ -4,7 +4,7 @@
 //
 //   const projection = await RdbProjection.open(rdb, ctx, target, { writer });
 //   // ... app reads/writes the target; rdb changes stream in ...
-//   await projection.stop();
+//   await projection.stop();  // waits for in-flight sync, then target.close()
 //
 // It resolves the RDb's member groups (scope.ts), does an initial
 // materialization, then drives syncDatabase (ingest local edits, then project
@@ -23,10 +23,14 @@ import type { Version, RContext } from "@hyper-hyper-space/hhs3_mvt";
 import type { RDb, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 import {
     BidirectionalTarget, ChangeSignalListener, ChangeSignalSource, CheckpointMovedError,
-    DEFAULT_KEY_DOMAIN, GroupProjection, IngestResult, KeyIndex, OpEvent, StoredOpEvent, syncDatabase,
+    DEFAULT_KEY_DOMAIN, GroupProjection, IngestResult, KeyIndex, OpEvent, OpEventQuery,
+    StoredOpEvent, syncDatabase,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 import { buildScope, resolveMemberGroups, GroupConfigOverride } from "./scope.js";
+
+export type OpEventListener = (events: OpEvent[]) => void;
+
 export type RdbProjectionOptions = {
     // Default writer for every member (enables local->rdb ingestion). Absent:
     // projection is read-only (rdb -> target), local edits are never pushed.
@@ -39,12 +43,12 @@ export type RdbProjectionOptions = {
     // Called after each successful sync cycle / on error.
     onResult?: (results: Map<B64Hash, IngestResult>) => void;
     onError?: (err: unknown) => void;
-    // Push channel for the durable op-event log (ingestion failures + p2p
-    // concurrency void/reinstate flips). After each cycle the supervisor reads
-    // events logged since its cursor and calls this with the (author-filtered)
-    // batch, oldest first. The durable backlog is re-read from id 0 on open, so
-    // an app that just started still learns of past failures/voids.
-    onOpEvents?: (events: OpEvent[]) => void;
+    // Live subscribe for the durable op-event log (ingestion failures + p2p
+    // concurrency void/reinstate flips). Registered BEFORE the initial sync, so
+    // this session sees events produced by that start. Historical rows are NOT
+    // replayed — subscribe snapshots high-water, then only new ids are pushed.
+    // Catch-up is the app's job via opEvents({ afterId, beforeId, limit, order }).
+    onOpEvents?: OpEventListener;
     // Which authors' CONCURRENCY events to push: 'all' (default) or an allow-list
     // of KeyIds. INGESTION failures always pass (they are always the local
     // writer's own botched edits and are never filtered).
@@ -53,6 +57,10 @@ export type RdbProjectionOptions = {
 
 function isChangeSignalSource(t: object): t is ChangeSignalSource {
     return typeof (t as ChangeSignalSource).addChangeListener === 'function';
+}
+
+function isCloseable(t: object): t is { close(): void | Promise<void> } {
+    return typeof (t as { close?: unknown }).close === 'function';
 }
 
 // Whether an op-event should be pushed under an author policy. INGESTION
@@ -83,8 +91,17 @@ export class RdbProjection {
     private rerun = false;
     private lastResults = new Map<B64Hash, IngestResult>();
     private lastErrorMessage: string | undefined;
-    // Push cursor into the target's durable op-event log (last id delivered).
+    // Live-subscribe cursor: last id delivered (or high-water at arm). 0 means
+    // empty log (first event id is 1). Not durable — the app keeps its own mark.
     private opEventCursor = 0;
+    private opEventArmed = false;
+    private opEventListeners = new Set<OpEventListener>();
+    // In-flight explicit sync() + reactive runSyncOnce. stop() awaits idle
+    // before closing the target so a mid-cycle apply cannot hit a closed db.
+    private inFlight = 0;
+    private idle: Promise<void> = Promise.resolve();
+    private idleResolve: (() => void) | undefined;
+    private stopPromise: Promise<void> | undefined;
 
     private constructor(
         private readonly rdb: RDb,
@@ -99,10 +116,18 @@ export class RdbProjection {
         rdb: RDb, ctx: RContext, target: BidirectionalTarget, options: RdbProjectionOptions = {},
     ): Promise<RdbProjection> {
         const p = new RdbProjection(rdb, ctx, target, options);
-        await p.reconfigure();
-        await p.sync();   // initial materialization (awaited; rethrows on failure)
-        await p.arm();
-        return p;
+        try {
+            await p.reconfigure();
+            // Arm live subscribe BEFORE the initial sync so this session sees
+            // events that start produces, without replaying the durable backlog.
+            if (options.onOpEvents !== undefined) await p.subscribeOpEvents(options.onOpEvents);
+            await p.sync();   // initial materialization (awaited; rethrows on failure)
+            await p.arm();
+            return p;
+        } catch (e) {
+            await p.stop();
+            throw e;
+        }
     }
 
     // The set of member group ids currently in scope.
@@ -125,11 +150,18 @@ export class RdbProjection {
     // Explicit, awaitable sync cycle (bypasses the debounce; still single-
     // flighted by syncDatabase's per-database lock).
     async sync(): Promise<Map<B64Hash, IngestResult>> {
-        const results = await this.syncWithCasRetry();
-        this.lastResults = results;
-        this.lastErrorMessage = undefined;
-        await this.pushOpEvents();
-        return results;
+        if (this.stopped) throw new Error('projection is stopped');
+        this.beginWork();
+        try {
+            if (this.stopped) throw new Error('projection is stopped');
+            const results = await this.syncWithCasRetry();
+            this.lastResults = results;
+            this.lastErrorMessage = undefined;
+            await this.pushOpEvents();
+            return results;
+        } finally {
+            this.endWork();
+        }
     }
 
     // Run one syncDatabase cycle, retrying on a CheckpointMovedError: another
@@ -154,12 +186,34 @@ export class RdbProjection {
         this.schedule();
     }
 
-    // The durable op-event backlog since `sinceId` (default: from the start),
-    // oldest first. Non-destructive; independent of the push cursor. Empty when
-    // the target has no op-event log.
-    async opEvents(sinceId = 0): Promise<StoredOpEvent[]> {
+    // Inspect the durable op-event log. Non-destructive; independent of the
+    // live-subscribe cursor. Empty when the target has no op-event log.
+    // A numeric argument is `{ afterId }` (order defaults to 'asc').
+    async opEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]> {
         if (typeof this.target.drainOpEvents !== 'function') return [];
-        return this.target.drainOpEvents(sinceId);
+        return this.target.drainOpEvents(opts);
+    }
+
+    // Await until the live cursor is snapshotted (high-water via
+    // `{ order: 'desc', limit: 1 }`, empty → 0), then receive batches of NEW
+    // events after each successful sync. Subscribe first, then opEvents() for
+    // leftover — at-least-once; the app dedups against its own mark.
+    async subscribeOpEvents(listener: OpEventListener): Promise<void> {
+        if (this.stopped) throw new Error('projection is stopped');
+        if (!this.opEventArmed) {
+            const tail = await this.opEvents({ order: 'desc', limit: 1 });
+            this.opEventCursor = tail[0]?.id ?? 0;
+            this.opEventArmed = true;
+        }
+        this.opEventListeners.add(listener);
+    }
+
+    unsubscribeOpEvents(listener: OpEventListener): void {
+        this.opEventListeners.delete(listener);
+        if (this.opEventListeners.size === 0) {
+            this.opEventArmed = false;
+            this.opEventCursor = 0;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -193,7 +247,14 @@ export class RdbProjection {
         return this.requireKeys().idForKeyHash(domain, keyHash);
     }
 
+    // Stop the supervisor: no new cycles, wait for any in-flight sync, then
+    // close the target if it implements close() (SQLite drops WAL/SHM).
     async stop(): Promise<void> {
+        this.stopPromise ??= this.doStop();
+        return this.stopPromise;
+    }
+
+    private async doStop(): Promise<void> {
         this.stopped = true;
         if (this.timer !== undefined) { clearTimeout(this.timer); this.timer = undefined; }
         for (const { group, cb } of this.groupCallbacks.values()) group.unsubscribe(cb);
@@ -203,18 +264,39 @@ export class RdbProjection {
             this.target.removeChangeListener(this.changeListener);
             this.changeListener = undefined;
         }
+        await this.idle;
+        this.opEventListeners.clear();
+        this.opEventArmed = false;
+        this.opEventCursor = 0;
+        if (isCloseable(this.target)) await this.target.close();
     }
 
-    // Read new op-events since the cursor and push the author-filtered batch.
-    // Advances the cursor past ALL drained events (even filtered-out ones) so
-    // they are not re-drained next cycle. Best-effort: a target without an
-    // op-event log, or a drain error, is swallowed (never fails a sync cycle).
+    private beginWork(): void {
+        this.inFlight++;
+        if (this.inFlight === 1) {
+            this.idle = new Promise<void>((resolve) => { this.idleResolve = resolve; });
+        }
+    }
+
+    private endWork(): void {
+        this.inFlight--;
+        if (this.inFlight === 0) {
+            this.idleResolve?.();
+            this.idleResolve = undefined;
+            this.idle = Promise.resolve();
+        }
+    }
+
+    // Read new op-events since the live cursor and push the author-filtered
+    // batch. Advances the cursor past ALL drained events (even filtered-out
+    // ones) so they are not re-drained next cycle. Best-effort: a target
+    // without an op-event log, or a drain error, is swallowed.
     private async pushOpEvents(): Promise<void> {
-        if (this.options.onOpEvents === undefined) return;
+        if (this.opEventListeners.size === 0) return;
         if (typeof this.target.drainOpEvents !== 'function') return;
         let stored;
         try {
-            stored = await this.target.drainOpEvents(this.opEventCursor);
+            stored = await this.target.drainOpEvents({ afterId: this.opEventCursor, order: 'asc' });
         } catch {
             return;
         }
@@ -222,7 +304,8 @@ export class RdbProjection {
         this.opEventCursor = stored[stored.length - 1].id;
         const authors = this.options.eventAuthors ?? 'all';
         const events = stored.map((s) => s.event).filter((e) => opEventPushable(e, authors));
-        if (events.length > 0) this.options.onOpEvents(events);
+        if (events.length === 0) return;
+        for (const listener of this.opEventListeners) listener(events);
     }
 
     // -----------------------------------------------------------------------
@@ -282,6 +365,7 @@ export class RdbProjection {
         if (this.stopped) return;
         if (this.running) { this.rerun = true; return; }
         this.running = true;
+        this.beginWork();
         try {
             do {
                 this.rerun = false;
@@ -296,6 +380,7 @@ export class RdbProjection {
             this.options.onError?.(e);
         } finally {
             this.running = false;
+            this.endWork();
         }
     }
 }

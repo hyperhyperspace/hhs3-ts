@@ -14,8 +14,8 @@ import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import { deriveRowId, Row, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 import {
     BidirectionalTarget, CapturedBatch, CapturedChange, CheckpointMovedError, IngestSettle,
-    ingestChanges, MemoryTarget, OpEvent, projectGroup, RowAction, SchemaAction, StoredOpEvent,
-    SyncMapping,
+    ingestChanges, MemoryTarget, OpEvent, OpEventQuery, projectGroup, RowAction, SchemaAction,
+    StoredOpEvent, SyncMapping,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 import { createFkGroup, createGroup } from "./group_fixture.js";
@@ -37,7 +37,7 @@ class CrashBeforeSettle implements BidirectionalTarget {
     drainChanges(): Promise<CapturedBatch> { return this.inner.drainChanges(); }
     resolveRow(t: string, l: number): Promise<SyncMapping | undefined> { return this.inner.resolveRow(t, l); }
     reserveMint(m: SyncMapping[]): Promise<SyncMapping[]> { return this.inner.reserveMint(m); }
-    drainOpEvents(sinceId?: number): Promise<StoredOpEvent[]> { return this.inner.drainOpEvents(sinceId); }
+    drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]> { return this.inner.drainOpEvents(opts); }
     async commitIngest(settle: IngestSettle): Promise<void> {
         this.commits += 1;
         if (this.commits === 1) return;   // the "crash": drop the settle
@@ -60,7 +60,7 @@ class RaceReserve implements BidirectionalTarget {
     getCheckpoint(g: B64Hash): Promise<Version | undefined> { return this.inner.getCheckpoint(g); }
     drainChanges(): Promise<CapturedBatch> { return this.inner.drainChanges(); }
     resolveRow(t: string, l: number): Promise<SyncMapping | undefined> { return this.inner.resolveRow(t, l); }
-    drainOpEvents(sinceId?: number): Promise<StoredOpEvent[]> { return this.inner.drainOpEvents(sinceId); }
+    drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]> { return this.inner.drainOpEvents(opts); }
     commitIngest(settle: IngestSettle): Promise<void> { return this.inner.commitIngest(settle); }
     async reserveMint(m: SyncMapping[]): Promise<SyncMapping[]> {
         if (!this.injected) {
@@ -85,7 +85,7 @@ class InjectPendingOnRecovery implements BidirectionalTarget {
     getCheckpoint(g: B64Hash): Promise<Version | undefined> { return this.inner.getCheckpoint(g); }
     resolveRow(t: string, l: number): Promise<SyncMapping | undefined> { return this.inner.resolveRow(t, l); }
     reserveMint(m: SyncMapping[]): Promise<SyncMapping[]> { return this.inner.reserveMint(m); }
-    drainOpEvents(sinceId?: number): Promise<StoredOpEvent[]> { return this.inner.drainOpEvents(sinceId); }
+    drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]> { return this.inner.drainOpEvents(opts); }
     commitIngest(settle: IngestSettle): Promise<void> { return this.inner.commitIngest(settle); }
     async drainChanges(): Promise<CapturedBatch> {
         this.drains += 1;
@@ -115,7 +115,7 @@ class LandBeforeWalk implements BidirectionalTarget {
     getCheckpoint(g: B64Hash): Promise<Version | undefined> { return this.inner.getCheckpoint(g); }
     drainChanges(): Promise<CapturedBatch> { return this.inner.drainChanges(); }
     resolveRow(t: string, l: number): Promise<SyncMapping | undefined> { return this.inner.resolveRow(t, l); }
-    drainOpEvents(sinceId?: number): Promise<StoredOpEvent[]> { return this.inner.drainOpEvents(sinceId); }
+    drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]> { return this.inner.drainOpEvents(opts); }
     commitIngest(settle: IngestSettle): Promise<void> { return this.inner.commitIngest(settle); }
     async reserveMint(m: SyncMapping[]): Promise<SyncMapping[]> {
         const effective = await this.inner.reserveMint(m);

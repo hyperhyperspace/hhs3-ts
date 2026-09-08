@@ -1,4 +1,5 @@
 import { mkdtemp, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { stdin as input } from "node:process";
 import type { Interface } from "node:readline/promises";
 import { join } from "node:path";
@@ -1620,6 +1621,8 @@ const tests = [
                 } finally {
                     appDb.close();
                     await stopAllProjections(session);
+                    assertTrue(!existsSync(projPath + '-wal'), 'projection WAL is gone after stop');
+                    assertTrue(!existsSync(projPath + '-shm'), 'projection SHM is gone after stop');
                 }
             });
         },

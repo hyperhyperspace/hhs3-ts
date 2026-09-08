@@ -10,6 +10,7 @@ import {
     type CapturedBatch,
     type IngestSettle,
     type OpEvent,
+    type OpEventQuery,
     type RowAction,
     type SchemaAction,
     type StoredOpEvent,
@@ -107,8 +108,8 @@ class FlakyTarget implements BidirectionalTarget {
         return this.inner.commitIngest(settle);
     }
 
-    drainOpEvents(sinceId?: number): Promise<StoredOpEvent[]> {
-        return this.inner.drainOpEvents(sinceId);
+    drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]> {
+        return this.inner.drainOpEvents(opts);
     }
 }
 

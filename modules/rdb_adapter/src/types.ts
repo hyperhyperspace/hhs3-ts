@@ -172,10 +172,10 @@ export type SyncStatusUpdate = { table: string; rowId: B64Hash; status: SyncStat
 // ---------------------------------------------------------------------------
 // Op-event log: the single, durable, app-observable channel for BOTH ingestion
 // failures (a local change rdb rejected) and p2p concurrency verdict flips (an
-// op voided or reinstated by a later barrier). The app monitors it (via the
-// projection's push channel, or by reading rdb_op_events directly) to learn
-// that a change it made - or observed - was voided, exactly as it learns of a
-// concurrency void. Append-only, idempotent by (opHash, direction).
+// op voided or reinstated by a later barrier). The app inspects the log
+// (`drainOpEvents` / `opEvents`) and optionally subscribes to new ids; the
+// supervisor does not persist the app's cursor. Append-only, idempotent by
+// (opHash, direction).
 // ---------------------------------------------------------------------------
 
 // Why an op-event fired. A concurrency flip carries the STRUCTURED OpVoidDetail
@@ -213,6 +213,66 @@ export type OpEvent = {
 
 // An op-event as stored, carrying its durable monotonic id (the push cursor).
 export type StoredOpEvent = { id: number; event: OpEvent };
+
+// Inspect query over the durable op-event log. Bounds are exclusive and
+// independent of sort: `id > afterId` (default 0 = no floor) and, when set,
+// `id < beforeId` (omit = no ceiling). `order` only chooses ASC vs DESC — it
+// is never inferred from the other fields. Default `order: 'asc'` is the
+// catch-up cursor. Range endpoints are the same query with `limit: 1`:
+//   low  = { order: 'asc',  limit: 1 }
+//   high = { order: 'desc', limit: 1 }
+export type OpEventOrder = 'asc' | 'desc';
+export type OpEventQuery = {
+    afterId?: number;
+    beforeId?: number;
+    limit?: number;
+    order?: OpEventOrder;
+};
+
+export type ResolvedOpEventQuery = {
+    afterId: number;
+    beforeId: number | undefined;
+    limit: number | undefined;
+    order: OpEventOrder;
+};
+
+function requireNonNegInt(value: number | undefined, label: string): number {
+    if (value === undefined || !Number.isSafeInteger(value) || value < 0) {
+        throw new Error(`op-event query: ${label} must be a non-negative integer, got ${String(value)}`);
+    }
+    return value;
+}
+
+// Accept the options bag, or a numeric `afterId` (legacy positional drain).
+export function resolveOpEventQuery(opts?: OpEventQuery | number): ResolvedOpEventQuery {
+    const q: OpEventQuery = typeof opts === 'number' ? { afterId: opts } : (opts ?? {});
+    const afterId = q.afterId === undefined ? 0 : requireNonNegInt(q.afterId, 'afterId');
+    const beforeId = q.beforeId === undefined ? undefined : requireNonNegInt(q.beforeId, 'beforeId');
+    const order = q.order ?? 'asc';
+    if (order !== 'asc' && order !== 'desc') {
+        throw new Error(`op-event query: order must be 'asc' or 'desc', got '${String(order)}'`);
+    }
+    let limit: number | undefined;
+    if (q.limit !== undefined) {
+        limit = requireNonNegInt(q.limit, 'limit');
+    }
+    return { afterId, beforeId, limit, order };
+}
+
+export function opEventInRange(id: number, q: ResolvedOpEventQuery): boolean {
+    if (id <= q.afterId) return false;
+    if (q.beforeId !== undefined && id >= q.beforeId) return false;
+    return true;
+}
+
+// In-memory page of a pre-loaded log (MemoryTarget / IdbTarget). Rows need
+// not be pre-sorted; the result is a new array in `order`.
+export function pageOpEvents(rows: StoredOpEvent[], opts?: OpEventQuery | number): StoredOpEvent[] {
+    const q = resolveOpEventQuery(opts);
+    const filtered = rows.filter((e) => opEventInRange(e.id, q));
+    filtered.sort((a, b) => q.order === 'desc' ? b.id - a.id : a.id - b.id);
+    return q.limit === undefined ? filtered : filtered.slice(0, q.limit);
+}
 
 // Everything the settle transaction persists atomically at the end of an
 // ingestion pass (see MaterializedChangeSource.commitIngest).
@@ -275,10 +335,12 @@ export interface MaterializedChangeSource {
     // with the rdb DAG, so idempotent replay + idempotent logging bridge the gap.
     commitIngest(settle: IngestSettle): Promise<void>;
 
-    // Read op-events logged after `sinceId` (cursor-based, non-destructive),
-    // oldest id first. The supervisor advances its cursor by the max returned
-    // id; the durable backlog is re-read on restart.
-    drainOpEvents(sinceId?: number): Promise<StoredOpEvent[]>;
+    // Read the durable op-event log (cursor-based, non-destructive). Filter is
+    // `id > afterId` (default 0) and, when set, `id < beforeId`. `order`
+    // (default 'asc') is explicit and never inferred. A numeric argument is
+    // `{ afterId }`. Live subscribe snapshots high-water with
+    // `{ order: 'desc', limit: 1 }` (empty → 0).
+    drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]>;
 }
 
 // A change the inverse planner / a bundle submission / a cross-group ref-advance
@@ -391,6 +453,12 @@ export interface MaterializationTarget {
     // The last materialized version for `groupId`, or undefined when that group
     // has never been materialized (drives the initial-vs-delta decision).
     getCheckpoint(groupId: B64Hash): Promise<Version | undefined>;
+
+    // Optional: release engine resources. `RdbProjection.stop()` calls this
+    // after in-flight sync finishes. SqliteTarget closes the better-sqlite3
+    // handle (checkpointing WAL/SHM); IdbTarget closes the IDB connection.
+    // Idempotent. Absent on MemoryTarget (nothing to release).
+    close?(): void | Promise<void>;
 }
 
 // Thrown by apply() when its `expectFrom` compare-and-set fails: another

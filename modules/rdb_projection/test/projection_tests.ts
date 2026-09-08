@@ -14,7 +14,7 @@ import type { TableDef } from "@hyper-hyper-space/hhs3_rdb";
 import {
     RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory, RDbImpl, rDbFactory, deriveRowId,
 } from "@hyper-hyper-space/hhs3_rdb";
-import { MemoryTarget, type OpEvent } from "@hyper-hyper-space/hhs3_rdb_adapter";
+import { MemoryTarget, type OpEvent, type BidirectionalTarget, type CapturedBatch, type IngestSettle, type SyncMapping, type StoredOpEvent, type SchemaAction, type RowAction, type OpEventQuery } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 import { createMockRContext } from "../../rdb/test/mock_rcontext.js";
 import { RdbProjection, opEventPushable } from "../src/index.js";
@@ -82,6 +82,49 @@ async function poll(fn: () => boolean, timeoutMs = 2000): Promise<void> {
         if (Date.now() - start > timeoutMs) throw new Error('poll timed out');
         await new Promise((r) => setTimeout(r, 10));
     }
+}
+
+// BidirectionalTarget that can stall apply() so stop() can be shown to wait
+// for an in-flight cycle before close().
+class DelayCloseTarget implements BidirectionalTarget {
+    holdApplies = false;
+    applyStarted = false;
+    applyFinished = false;
+    closeCalls = 0;
+    private releaseApply: () => void = () => undefined;
+    private readonly applyGate = new Promise<void>((resolve) => { this.releaseApply = resolve; });
+
+    constructor(private readonly inner: MemoryTarget) {}
+
+    release(): void { this.releaseApply(); }
+
+    async apply(
+        groupId: B64Hash, schemaActions: SchemaAction[], rowActions: RowAction[],
+        checkpoint: Version, events?: OpEvent[], expectFrom?: Version | null,
+    ): Promise<void> {
+        if (this.holdApplies) {
+            this.applyStarted = true;
+            await this.applyGate;
+        }
+        await this.inner.apply(groupId, schemaActions, rowActions, checkpoint, events, expectFrom);
+        if (this.holdApplies) this.applyFinished = true;
+    }
+
+    getCheckpoint(groupId: B64Hash): Promise<Version | undefined> {
+        return this.inner.getCheckpoint(groupId);
+    }
+    drainChanges(): Promise<CapturedBatch> { return this.inner.drainChanges(); }
+    resolveRow(table: string, localId: number): Promise<SyncMapping | undefined> {
+        return this.inner.resolveRow(table, localId);
+    }
+    reserveMint(reservations: SyncMapping[]): Promise<SyncMapping[]> {
+        return this.inner.reserveMint(reservations);
+    }
+    commitIngest(settle: IngestSettle): Promise<void> { return this.inner.commitIngest(settle); }
+    drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]> {
+        return this.inner.drainOpEvents(opts);
+    }
+    close(): void { this.closeCalls += 1; }
 }
 
 // A single-group RDb whose `comments` table carries a local FK into `posts`, so
@@ -312,6 +355,165 @@ export const projectionTests = {
 
                     // The voided insert never materializes in the target.
                     assertEquals(target.getRowIds('perm_items').length, 0, 'voided row is not projected');
+                } finally {
+                    await projection.stop();
+                }
+            },
+        },
+        {
+            name: '[RDBPROJ07] stop() waits for an in-flight reactive apply before target.close()',
+            invoke: async () => {
+                const ctx = newCtx();
+                const { catalog, rdb } = await makeCatalogAndOrders(ctx);
+                const target = new DelayCloseTarget(new MemoryTarget());
+                const projection = await RdbProjection.open(rdb, ctx, target, { debounceMs: 10 });
+                try {
+                    target.holdApplies = true;
+                    const products = await catalog.group.getTable('products');
+                    await products.insert('p1', { title: 'Widget' }, catalog.admin);
+                    await poll(() => target.applyStarted);
+
+                    const stopping = projection.stop();
+                    const raced = await Promise.race([
+                        stopping.then(() => 'stop' as const),
+                        new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 50)),
+                    ]);
+                    assertEquals(raced, 'timeout', 'stop does not resolve while apply is in flight');
+                    assertEquals(target.closeCalls, 0, 'close waits for apply');
+                    assertEquals(target.applyFinished, false, 'apply is still held');
+
+                    target.release();
+                    await stopping;
+                    assertEquals(target.applyFinished, true, 'apply finished before close');
+                    assertEquals(target.closeCalls, 1, 'close ran once after apply');
+
+                    let threw = false;
+                    try {
+                        await projection.sync();
+                    } catch (e) {
+                        threw = e instanceof Error && e.message === 'projection is stopped';
+                    }
+                    assertTrue(threw, 'sync() after stop throws');
+                } finally {
+                    target.release();
+                    await projection.stop();
+                }
+            },
+        },
+        {
+            name: '[RDBPROJ08] a failed open() still closes the target',
+            invoke: async () => {
+                const ctx = newCtx();
+                const { rdb } = await makeCatalogAndOrders(ctx);
+                const inner = new MemoryTarget();
+                let closeCalls = 0;
+                inner.apply = async () => { throw new Error('nope'); };
+                const target = Object.assign(inner, { close: () => { closeCalls += 1; } });
+
+                let threw = false;
+                try {
+                    await RdbProjection.open(rdb, ctx, target);
+                } catch (e) {
+                    threw = e instanceof Error && e.message === 'nope';
+                }
+                assertTrue(threw, 'open rethrows the initial sync failure');
+                assertEquals(closeCalls, 1, 'failed open closes the target');
+            },
+        },
+        {
+            name: '[RDBPROJ09] opEvents pages with explicit order; omitted order is always asc',
+            invoke: async () => {
+                const target = new MemoryTarget();
+                const g = 'GROUP' as unknown as B64Hash;
+                const v = new Set(['V1']) as unknown as Version;
+                const events: OpEvent[] = [1, 2, 3, 4, 5].map((i) => ({
+                    origin: 'concurrency', direction: 'void', groupId: g, opHash: `OP${i}`, kind: 'update',
+                }));
+                await target.apply(g, [], [], v, events);
+
+                const ascPage = await target.drainOpEvents({ limit: 2 });
+                assertEquals(ascPage.length, 2, 'asc page size');
+                assertEquals(ascPage[0].event.opHash, 'OP1', 'omitted order is asc (first)');
+                assertEquals(ascPage[1].event.opHash, 'OP2', 'omitted order is asc (second)');
+                const descPage = await target.drainOpEvents({ limit: 2, order: 'desc' });
+                assertEquals(descPage.length, 2, 'desc page size');
+                assertEquals(descPage[0].event.opHash, 'OP5', 'desc returns newest first');
+                assertEquals(descPage[1].event.opHash, 'OP4', 'desc second is next-newest');
+
+                const low = await target.drainOpEvents({ order: 'asc', limit: 1 });
+                const high = await target.drainOpEvents({ order: 'desc', limit: 1 });
+                assertEquals(low[0]?.id, 1, 'asc limit 1 is the low id');
+                assertEquals(high[0]?.id, 5, 'desc limit 1 is the high id');
+
+                const mid = await target.drainOpEvents({ afterId: 2, limit: 2, order: 'asc' });
+                assertEquals(mid.length, 2, 'mid page size');
+                assertEquals(mid[0].id, 3, 'afterId is exclusive; first is 3');
+                assertEquals(mid[1].id, 4, 'asc pages forward to 4');
+
+                const older = await target.drainOpEvents({ beforeId: 5, limit: 2, order: 'desc' });
+                assertEquals(older.length, 2, 'older page size');
+                assertEquals(older[0].id, 4, 'beforeId is exclusive; desc starts at 4');
+                assertEquals(older[1].id, 3, 'desc continues to 3');
+
+                const window = await target.drainOpEvents({ afterId: 1, beforeId: 5, order: 'asc' });
+                assertEquals(window.length, 3, 'window size');
+                assertEquals(window[0].id, 2, 'window after 1');
+                assertEquals(window[2].id, 4, 'window before 5');
+            },
+        },
+        {
+            name: '[RDBPROJ10] a pre-seeded op-event log is not replayed on open({ onOpEvents })',
+            invoke: async () => {
+                const ctx = newCtx();
+                const { rdb } = await makeCatalogAndOrders(ctx);
+                const target = new MemoryTarget();
+                const g = 'SEEDED' as unknown as B64Hash;
+                const seeded: OpEvent = {
+                    origin: 'concurrency', direction: 'void', groupId: g, opHash: 'OLD', kind: 'update',
+                };
+                await target.apply(g, [], [], new Set(['V1']) as unknown as Version, [seeded]);
+
+                const received: OpEvent[] = [];
+                const projection = await RdbProjection.open(rdb, ctx, target, {
+                    eventAuthors: 'all',
+                    onOpEvents: (ev) => { received.push(...ev); },
+                });
+                try {
+                    assertEquals(received.length, 0, 'historical events are not pushed on open');
+                    const leftover = await projection.opEvents({ order: 'asc' });
+                    assertTrue(leftover.some((s) => s.event.opHash === 'OLD'),
+                        'inspect still returns the seeded event');
+                } finally {
+                    await projection.stop();
+                }
+            },
+        },
+        {
+            name: '[RDBPROJ11] subscribe first, then inspect leftover below the live cursor',
+            invoke: async () => {
+                const ctx = newCtx();
+                const { forum, rdb } = await makeForum(ctx);
+                const target = new MemoryTarget({ captureChanges: true });
+                const g = 'SEEDED' as unknown as B64Hash;
+                const seeded: OpEvent = {
+                    origin: 'concurrency', direction: 'void', groupId: g, opHash: 'OLD', kind: 'update',
+                };
+                await target.apply(g, [], [], new Set(['V1']) as unknown as Version, [seeded]);
+
+                const live: OpEvent[] = [];
+                const projection = await RdbProjection.open(rdb, ctx, target, { writer: forum.admin });
+                try {
+                    await projection.subscribeOpEvents((ev) => { live.push(...ev); });
+                    const leftover = await projection.opEvents({ afterId: 0, order: 'asc' });
+                    assertTrue(leftover.some((s) => s.event.opHash === 'OLD'),
+                        'inspect returns leftover below the live cursor');
+                    assertEquals(live.length, 0, 'subscribe after open does not dump history');
+
+                    target.localInsert('forum_comments', { body: 'orphan', post_id: 9999 });
+                    await projection.sync();
+                    assertEquals(live.length, 1, 'a later ingestion failure is streamed');
+                    assertEquals(live[0].origin, 'ingestion', 'the live event is the new failure');
+                    assertTrue(!live.some((e) => e.opHash === 'OLD'), 'the seeded event is not streamed');
                 } finally {
                     await projection.stop();
                 }

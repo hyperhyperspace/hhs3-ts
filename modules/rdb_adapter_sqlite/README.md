@@ -11,6 +11,8 @@ const path = 'my-projection.sqlite';
 const db = new Database(path);
 const target = new SqliteTarget(db, { captureChanges: true, dbPath: path });
 await projectGroup(group, target);
+// ...
+target.close();  // checkpoints WAL; drops -wal/-shm when this is the last connection
 ```
 
 For a whole `RDb`, [rdb_projection](../rdb_projection) is the usual supervisor: `RdbProjection.open(rdb, ctx, target, { writer })` materializes every member under group-qualified table names and keeps both directions in sync. You still read and write the SQLite `db` handle.
@@ -21,6 +23,7 @@ For a whole `RDb`, [rdb_projection](../rdb_projection) is the usual supervisor: 
 - Owns the shared `rdb_keys(id, key_hash, public_key)` side table and implements `KeyIndex`: authors, provider `key_id`, and `identity` `<col>_key_id` intern to numeric ids (advisory FKs to `rdb_keys`); the public key stays out of the app tables.
 - Implements `MaterializedChangeSource` (capture triggers + an outbox) and `RowIdentityIndex`, so it is a full bidirectional backend.
 - Implements `ChangeSignalSource`: wakes observers when local edits are waiting, no commit hook required. Defaults to kernel-driven WAL watching (via [file_watch](../file_watch)) for a file-backed db (pass `dbPath`), and falls back to an epoch-gated, unref'd poll of the monotonic `AUTOINCREMENT` outbox id for `:memory:` / no path.
+- `close()` disarms that monitor and closes the `better-sqlite3` handle (idempotent). A file-backed db checkpoints and drops `-wal`/`-shm` when this is the last connection. `RdbProjection.stop()` calls this.
 
 ## Test
 

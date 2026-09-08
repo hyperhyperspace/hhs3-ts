@@ -16,7 +16,7 @@ To project an entire database (`Rdb`), the module **[rdb_projection](../rdb_proj
 
 ## Event monitoring
 
-Co-transactional failures (Rdb changes reverted because of concurrency) and ingestion failures (changes in the local projection that cannot be ingested back into Rdb, either because of programming errors or concurrent Rdb changes) are reported using the `OpEvent` data structure. The app can register an `onOpEvent` callback when configuring the projetion, or can be pulled using the `projection.opEvents(sinceId)` interface.
+Co-transactional failures (Rdb changes reverted because of concurrency) and ingestion failures (changes in the local projection that cannot be ingested back into Rdb, either because of programming errors or concurrent Rdb changes) are reported using the `OpEvent` data structure. The app can **subscribe** to new events (`onOpEvents` at open, or `subscribeOpEvents` after) and **inspect** the durable log with `projection.opEvents({ afterId, beforeId, limit, order })`. Subscribe snapshots high-water and streams only later ids; catch-up is the app's own `afterId`. Delivery is at-least-once.
 
 
 ## Status and limitations
@@ -38,12 +38,13 @@ Projection can be configured from the [CLI-based REPL](../rdb_tools/) using the 
 ```
 \project start <db> as <id> to <path>
 \project status [<db>]
-\project stop|update|events <idx>
+\project stop|update <idx>
+\project events <idx> [after <n>] [before <n>] [limit <m>] [order asc|desc]
 ```
 
 The identity passed as `<id>` is used to sign the operations that are ingested back into Rdb. A SQLite databse is created on `<path>`, and can be queried and modified using standard SQLite tooling.
 
-If changes in the projection generate any ingestion failures, or Rdb concurrency generates op cancellations, those are reported back on the REPL console.
+If changes in the projection generate any ingestion failures, or Rdb concurrency generates op cancellations, those are reported live on the REPL console while the projection is running. `\project events` pages the durable log (default: newest 50, `order desc`).
 
 While `\project` is also supported in the [web REPL demo](../rdb_repl_web/), the only supported path is `:memory:` and the contents of the projection are not inspectable at the moment.
 

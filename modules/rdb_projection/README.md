@@ -11,11 +11,12 @@ An `RDb` already names a set of member table groups, so it is the natural unit o
 - **ingests local edits in commit order**, advancing co-projected cross-group refs on demand so an observer's cross-group FKs and `exists` reads validate against sibling groups ingested in the same pass; `fkBundling` (a per-member option, default on) bundles consecutive FK-linked inserts atomically;
 - **interns authors and identity keys** into a shared `rdb_keys` table as `author_key_id` / `<col>_key_id` (`registerKey` / `keyHashForId` / `publicKeyForId` on the projection);
 - **stays in sync reactively** — a debounced, coalesced `syncDatabase` fires on three triggers: each member group's `subscribe` (the rdb side advanced), the target's optional `ChangeSignalSource` (local edits are waiting), and the `RDb`'s own `subscribe` (membership changed). An explicit `sync()` and a `nudge()` fallback are also provided.
+- **exposes the op-event log** as inspect (`opEvents({ afterId, beforeId, limit, order })`) plus live subscribe (`subscribeOpEvents` / `onOpEvents`). Subscribe does not replay history.
 
 ## Layout
 
 - `scope.ts` — resolve members → `GroupProjection`s (group-qualified names + a cross-group resolver).
-- `projection.ts` — `RdbProjection` lifecycle: `open` / `sync` / `nudge` / `status` / `stop`.
+- `projection.ts` — `RdbProjection` lifecycle: `open` / `sync` / `nudge` / `status` / `stop` (waits for in-flight sync, then `target.close()` if the target implements it).
 
 ## Test
 

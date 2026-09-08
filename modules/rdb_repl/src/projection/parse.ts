@@ -3,7 +3,7 @@ export const PROJECT_USAGE =
     '       \\project status [<db>]\n' +
     '       \\project stop <id>\n' +
     '       \\project update <id>\n' +
-    '       \\project events <id>\n' +
+    '       \\project events <id> [after <n>] [before <n>] [limit <m>] [order asc|desc]\n' +
     '       \\project register-key <id> <keyHash> <publicKey>\n' +
     '       \\project resolve-key <id> <token>';
 
@@ -14,12 +14,21 @@ export type ProjectStartCommand = {
     path: string;
 };
 
+export type ProjectEventsCommand = {
+    kind: 'events';
+    id: number;
+    afterId?: number;
+    beforeId?: number;
+    limit?: number;
+    order?: 'asc' | 'desc';
+};
+
 export type ProjectCommand =
     | ProjectStartCommand
     | { kind: 'status'; database?: string }
     | { kind: 'stop'; id: number }
     | { kind: 'update'; id: number }
-    | { kind: 'events'; id: number }
+    | ProjectEventsCommand
     | { kind: 'register-key'; id: number; keyHash: string; publicKey: string }
     | { kind: 'resolve-key'; id: number; token: string };
 
@@ -39,14 +48,14 @@ export function parseProjectCommand(remainder: string): ProjectCommand {
             return { kind: 'status', database };
         }
         case 'stop':
-        case 'update':
-        case 'events': {
+        case 'update': {
             p.skipWs();
             if (p.done()) throw new Error(PROJECT_USAGE);
             const id = parseSessionId(p.readToken());
             p.expectEnd();
             return { kind: sub, id };
         }
+        case 'events': return p.parseEvents();
         case 'register-key': {
             p.skipWs();
             if (p.done()) throw new Error(PROJECT_USAGE);
@@ -67,6 +76,13 @@ export function parseProjectCommand(remainder: string): ProjectCommand {
         default:
             throw new Error(PROJECT_USAGE);
     }
+}
+
+function parseNonNegInt(raw: string, label: string): number {
+    if (!/^\d+$/.test(raw)) {
+        throw new Error(`\\project events ${label} requires a non-negative integer, got '${raw}'`);
+    }
+    return Number(raw);
 }
 
 function parseSessionId(raw: string): number {
@@ -113,6 +129,32 @@ class Parser {
         const path = this.readPath();
         this.expectEnd();
         return { kind: 'start', database, localId, path };
+    }
+
+    parseEvents(): ProjectEventsCommand {
+        this.skipWs();
+        if (this.done()) throw new Error(PROJECT_USAGE);
+        const id = parseSessionId(this.readToken());
+        const out: ProjectEventsCommand = { kind: 'events', id };
+        while (!this.done()) {
+            const kw = this.readToken();
+            if (kw === 'after') {
+                out.afterId = parseNonNegInt(this.readToken(), 'after');
+            } else if (kw === 'before') {
+                out.beforeId = parseNonNegInt(this.readToken(), 'before');
+            } else if (kw === 'limit') {
+                out.limit = parseNonNegInt(this.readToken(), 'limit');
+            } else if (kw === 'order') {
+                const order = this.readToken();
+                if (order !== 'asc' && order !== 'desc') {
+                    throw new Error(`\\project events order must be asc or desc, got '${order}'`);
+                }
+                out.order = order;
+            } else {
+                throw new Error(`Unexpected token '${kw}'. ${PROJECT_USAGE}`);
+            }
+        }
+        return out;
     }
 
     readPath(): string {

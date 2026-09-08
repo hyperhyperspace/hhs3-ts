@@ -25,8 +25,8 @@ import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import {
     CapturedBatch, CapturedChange, ChangeSignalListener, ChangeSignalSource,
     CheckpointMovedError, IngestSettle, KeyIndex, MaterializationTarget, MaterializedChangeSource,
-    OpEvent, RowAction, RowIdentityIndex, SchemaAction, StoredOpEvent, SyncMapping, SyncStatus,
-    versionsEqual,
+    OpEvent, OpEventQuery, pageOpEvents, RowAction, RowIdentityIndex, SchemaAction, StoredOpEvent,
+    SyncMapping, SyncStatus, versionsEqual,
 } from "./types.js";
 
 type RowValues = { [column: string]: json.Literal };
@@ -349,11 +349,10 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
         this.outbox = this.outbox.filter((c) => !consumedSet.has(c.id));
     }
 
-    async drainOpEvents(sinceId?: number): Promise<StoredOpEvent[]> {
+    async drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]> {
         // No requireCapture: concurrency void/reinstate events are logged by
         // apply() even on a read-only projection, so the log is always readable.
-        const since = sinceId ?? 0;
-        return this.opEvents.filter((e) => e.id > since).map((e) => ({ id: e.id, event: e.event }));
+        return pageOpEvents(this.opEvents, opts);
     }
 
     private requireCapture(): void {

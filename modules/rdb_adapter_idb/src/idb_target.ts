@@ -17,8 +17,8 @@ import type { ColumnType } from "@hyper-hyper-space/hhs3_rdb";
 import {
     CapturedBatch, CapturedChange, ChangeSignalListener, ChangeSignalSource,
     CheckpointMovedError, DEFAULT_KEY_TABLE, IngestSettle, KeyIndex, MaterializationTarget,
-    MaterializedChangeSource, OpEvent, OpEventReason, RowAction, RowIdentityIndex,
-    SchemaAction, StoredOpEvent, SyncMapping, versionsEqual,
+    MaterializedChangeSource, OpEvent, OpEventQuery, OpEventReason, pageOpEvents, RowAction,
+    RowIdentityIndex, SchemaAction, StoredOpEvent, SyncMapping, versionsEqual,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 import { FacadeDatabase, type FacadeHost } from "./idb_facade.js";
@@ -468,27 +468,24 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         });
     }
 
-    async drainOpEvents(sinceId?: number): Promise<StoredOpEvent[]> {
+    async drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]> {
         this.ensureOpen();
         const rows = await this.env.withRead(OP_EVENTS, (tx) => storeGetAll<OpEventRecord>(tx, OP_EVENTS));
-        const since = sinceId ?? 0;
-        return rows
-            .filter((r) => (r.id ?? 0) > since)
-            .sort((a, b) => (a.id ?? 0) - (b.id ?? 0))
-            .map((r) => {
-                const { id, ...rest } = r;
-                const event: OpEvent = {
-                    origin: rest.origin, direction: rest.direction, groupId: rest.groupId,
-                    opHash: rest.opHash, kind: rest.kind,
-                };
-                if (rest.table !== undefined) event.table = rest.table;
-                if (rest.rowId !== undefined) event.rowId = rest.rowId;
-                if (rest.localId !== undefined) event.localId = rest.localId;
-                if (rest.author !== undefined) event.author = rest.author;
-                if (rest.op !== undefined) event.op = rest.op;
-                if (rest.reason !== undefined) event.reason = rest.reason as OpEventReason;
-                return { id: id!, event };
-            });
+        const stored: StoredOpEvent[] = rows.map((r) => {
+            const { id, ...rest } = r;
+            const event: OpEvent = {
+                origin: rest.origin, direction: rest.direction, groupId: rest.groupId,
+                opHash: rest.opHash, kind: rest.kind,
+            };
+            if (rest.table !== undefined) event.table = rest.table;
+            if (rest.rowId !== undefined) event.rowId = rest.rowId;
+            if (rest.localId !== undefined) event.localId = rest.localId;
+            if (rest.author !== undefined) event.author = rest.author;
+            if (rest.op !== undefined) event.op = rest.op;
+            if (rest.reason !== undefined) event.reason = rest.reason as OpEventReason;
+            return { id: id!, event };
+        });
+        return pageOpEvents(stored, opts);
     }
 
     async setCaptureEnabled(on: boolean): Promise<void> {
