@@ -86,7 +86,7 @@ odd loops come out *undefined*), **stable-model / answer-set semantics**
 **Dung abstract argumentation frameworks** (grounded ≈ well-founded, stable
 extension ≈ stable model; an odd attack cycle has no stable extension).
 
-## 4. What ships today: deny the whole cycle, no cross-computation cache
+## 4. What ships today: deny the whole cycle
 
 `isEntryVoided` keeps a transient cycle guard: a set of
 `createOpId|entryHash|fromKey` keys carried in a per-computation `VoidClosure`
@@ -116,29 +116,29 @@ are nullified, both caps survive. Same outcome for the N-party ring. It is not
 the "single survivor" a stable-model semantics would pick — it is the safe
 all-survive (for revokes) / all-deny (for grants) collapse.
 
-### Why there is deliberately NO cross-computation cache
+### Why a naive `(entry, from)` instance cache is unsound
 
-A memo keyed only by `(entryHash, from)` and kept on the group instance is
-**unsound for replica convergence**. With negation in a cycle, the value
-computed for a shared node depends on which back-edge the traversal closed
-first. A position-keyed cache serves that traversal-dependent intermediate to a
-later independent query, so the final answer depends on query order — and query
-order can differ across replicas. Removing the cache makes each top-level
-computation self-contained and a pure function of `(entry, from)`: every
-replica agrees. The guard is transient (per-computation) precisely so it can
-detect a cycle *within* one computation without persisting anything *across*
-computations — which is exactly why the visiting set lives in a per-computation
-`VoidClosure` and not on the group instance (see §5).
+A memo that stores **whatever the DFS just computed** for `(entryHash, from)`
+on the group instance is **unsound for replica convergence**. With negation in
+a cycle, a nested answer depends on which back-edge the traversal closed first.
+That map serves a traversal-dependent intermediate to a later independent
+query, so the final answer depends on query order — and query order can differ
+across replicas. The visiting set is transient (per-computation) precisely so
+it can detect a cycle *within* one computation without leaking those
+intermediates *across* computations (see §5). What *would* be sound to keep
+across computations is a different map: published answers only (next
+subsection).
 
 A previous iteration shipped an instance-level `(entry, from)` cache plus a
-2-party seniority special case (senior cap survives). It was removed because the
-cache broke convergence and the special case only covered the isolated 2-cycle.
-The analysis in §6 is the principled version that special case was reaching for.
+2-party seniority special case (senior cap survives). It was removed because
+the naive map broke convergence and the special case only covered the isolated
+2-cycle. The analysis in §6 is the principled version that special case was
+reaching for.
 
 ### The per-computation memo: `VoidClosure.completed`
 
-The prohibition above is about caching *across* computations. *Within* one
-computation the closure memoizes finished verdicts. Diagnosing an entry reads
+The prohibition above is about caching **nested DFS intermediates** across
+computations. *Within* one computation the closure memoizes finished verdicts. Diagnosing an entry reads
 the DAG through the path below; those reads ask `entryVoided` of other entries.
 `visiting` is a DFS stack, popped in `finally`, so a finished subtree is
 forgotten the moment it completes. Unmemoized, every path through the
@@ -289,6 +289,60 @@ there, mint one closure per parallel branch.
 Group delta's op channel attaches structured void reasons via `explainEntryVoided`
 (a sibling of `isEntryVoided`; both go through `resolveVoidDetail`, so they share
 one traversal, one memo, and cannot disagree).
+
+### Sound caching under deny-the-cycle (not implemented)
+
+A naive map `(entry, from) → verdict` is unsound because it will store the
+*nested* answer for a cycle member. Under deny-the-cycle that nested answer is
+not a function of `(entry, from)`: it depends on which ancestor was already
+assumed voided. Caching it and reusing it from the other side of a mutual
+revoke yields a single survivor (PERM12) and query-order divergence across
+replicas.
+
+The **published** answers *are* a function of `(entry, from)`:
+
+- An acyclic diagnose (no foreign hit in the frame) — live or voided.
+- Every member of a detected cycle — **voided**. Independent top-level
+  `isVoided` of any participant is `true`; that is the least fixpoint. The
+  nested "this revoke looks live" is an in-walk artifact, never an observable.
+
+A sound cache stores only those published answers. Equivalently: **never store
+nested live for a cycle member; do store "this set is a cycle → all voided."**
+
+**On a foreign hit.** The cycle is the stack slice from the visiting key that
+was asked about up to `stack.top` — not every frame on the stack. Frames
+*below* the hit can be live and stack-independent; marking them voided would
+be wrong. The slice may be smaller than the full SCC; members not on this path
+are simply discovered by a later walk. Conservative, still convergent.
+
+For each key in that slice, store `voided` (boolean, or a cycle-reason
+`OpVoidDetail`). Do **not** store the nested live the inner frame is about to
+compute.
+
+**Do not feed that store into the same DFS.** The open walk still needs the
+nested "A's delete looks live" to conclude "capB is dead, so B's delete is
+voided." If, at the back-edge, you rewrite the nested call to `voided` and
+continue, capB looks live, B's delete looks authorized, and the outer verdict
+flips. Cycle-as-deny is what a *later root* (or a later computation) sees,
+not a mid-walk substitution.
+
+**Lifetime.** Same rule, two maps:
+
+- **Closure `completed`.** After a hit, the slice is voided for the rest of
+  this view / this `isEntryVoided`. Today we store nothing for those frames;
+  storing deny is stricter about *what* we remember, not *how long*.
+- **Instance `(createOpId, entry, from)`.** The same published answers, kept
+  across `getView` / `LOG` lines. Acyclic lives from the existing
+  store-iff-no-foreign-hit rule belong here too. Then a second computation
+  does not re-walk a cycle it already collapsed, and replicas still agree:
+  both orders cache the same voided set.
+
+The key must include `from` (concurrent barriers change the graph) and the
+group (`createOpId`). It must not include the stack.
+
+This is still deny-the-cycle, tabulated — not §6 (a unique stable model). §6
+would cache a different assignment (one survivor). Mixing the two in one map
+would reintroduce query-order disagreement.
 
 ## 5. Reentrancy: the per-computation VoidClosure
 
