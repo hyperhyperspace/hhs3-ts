@@ -23,8 +23,8 @@ import type { Version, RContext } from "@hyper-hyper-space/hhs3_mvt";
 import type { RDb, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 import {
     BidirectionalTarget, ChangeSignalListener, ChangeSignalSource, CheckpointMovedError,
-    DEFAULT_KEY_DOMAIN, GroupProjection, IngestResult, KeyIndex, OpEvent, OpEventQuery,
-    StoredOpEvent, syncDatabase,
+    DEFAULT_KEY_DOMAIN, GroupProjection, IndexReconcileReport, IndexSpec, IngestResult, KeyIndex, OpEvent,
+    OpEventQuery, reconcileIndexes, ReconcileIndexesOptions, StoredOpEvent, syncDatabase,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 import { buildScope, resolveMemberGroups, GroupConfigOverride } from "./scope.js";
@@ -177,6 +177,23 @@ export class RdbProjection {
                 if (e instanceof CheckpointMovedError && attempt < maxAttempts) continue;
                 throw e;
             }
+        }
+    }
+
+    // Install a new projection index spec (the app's migration step when it
+    // ships one; never triggered by sync, and open() takes no spec). Diffs the
+    // spec against what the target materialized, at each member's current
+    // checkpoint, and from then on every sync keeps it maintained across schema
+    // changes. Forward-only by `spec.version`; see IndexReconcileReport for the
+    // outcome and the declarations still pending. Throws when the target does
+    // not support indexes or the spec is invalid.
+    async reconcileIndexes(spec: IndexSpec, opts: ReconcileIndexesOptions = {}): Promise<IndexReconcileReport> {
+        if (this.stopped) throw new Error('projection is stopped');
+        this.beginWork();
+        try {
+            return await reconcileIndexes(this.members, this.target, spec, opts);
+        } finally {
+            this.endWork();
         }
     }
 

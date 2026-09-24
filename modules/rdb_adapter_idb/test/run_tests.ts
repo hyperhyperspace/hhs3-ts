@@ -5,6 +5,8 @@ import {
     parseTestFilters,
 } from "@hyper-hyper-space/hhs3_rdb_adapter_test";
 import { idbHarness, idbIngestionHarness, idbSpecificTests } from "./idb_target_tests.js";
+import { idbIndexTests } from "./idb_index_tests.js";
+import { idbFacadeErrorTests } from "./idb_facade_error_tests.js";
 
 async function main() {
     const allTests = new Map<string, Array<{ name: string, invoke: () => Promise<void> }>>();
@@ -19,6 +21,8 @@ async function main() {
     const projectionSuite = createProjectionParitySuite('IDB', idbHarness);
     allTests.set(projectionSuite.title, projectionSuite.tests);
     allTests.set(idbSpecificTests.title, idbSpecificTests.tests);
+    allTests.set(idbIndexTests.title, idbIndexTests.tests);
+    allTests.set(idbFacadeErrorTests.title, idbFacadeErrorTests.tests);
 
     console.log('Running tests for Hyper Hyper Space v3 rdb_adapter_idb module'
         + (filters.length > 0 ? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');

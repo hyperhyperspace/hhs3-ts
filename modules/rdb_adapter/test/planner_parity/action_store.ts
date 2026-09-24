@@ -1,7 +1,7 @@
 import type { json } from "@hyper-hyper-space/hhs3_json";
 
 import type { ColumnDef } from "@hyper-hyper-space/hhs3_rdb";
-import type { RowAction, SchemaAction, SchemaActionColumn } from "../../src/types.js";
+import type { ResolvedIndex, RowAction, SchemaAction, SchemaActionColumn } from "../../src/types.js";
 
 import {
     canonicalFingerprint, sortFingerprint, type ColumnFp, type RowFp, type StoreFingerprint, type TableFp,
@@ -11,19 +11,33 @@ type ColState = { def: ColumnDef; fkTarget?: string };
 
 type TableState = {
     columns: Map<string, ColState>;
+    authorColumn?: string;
     rows: Map<string, { author?: string; values: { [column: string]: json.Literal } }>;
 };
 
 // Test-only interpreter of SchemaAction / RowAction lists. Rows are keyed by
 // rdb rowId; FK values stay rowIds (no serial-id interning). add-column and
 // new-row upserts materialize schema defaults so the store matches an rdb live
-// view after those actions.
+// view after those actions. Index actions are tracked as records with the same
+// strictness as a real engine: an ensure needs its table + columns, an indexed
+// column cannot be dropped, and a table cannot be recreated under a live index
+// record (the planner must drop it first).
 export class ActionStore {
     private tables = new Map<string, TableState>();
+    private indexes = new Map<string, ResolvedIndex>();
 
     apply(schemaActions: SchemaAction[], rowActions: RowAction[]): void {
         for (const a of schemaActions) this.applySchema(a);
         for (const a of rowActions) this.applyRow(a);
+    }
+
+    materializedIndexes(): ResolvedIndex[] {
+        return [...this.indexes.values()];
+    }
+
+    // Order-independent canonical form of the materialized index set.
+    indexFingerprint(): string {
+        return [...this.indexes.values()].map((i) => i.fingerprint).sort().join('\n');
     }
 
     fingerprint(): StoreFingerprint {
@@ -53,13 +67,37 @@ export class ActionStore {
     private applySchema(action: SchemaAction): void {
         switch (action.kind) {
             case 'create-table': {
+                for (const index of this.indexes.values()) {
+                    if (index.table === action.table) {
+                        throw new Error(`ActionStore: '${action.table}' recreated under live index '${index.name}'`);
+                    }
+                }
                 const columns = new Map<string, ColState>();
                 for (const c of action.columns) columns.set(c.name, colState(c));
-                this.tables.set(action.table, { columns, rows: new Map() });
+                this.tables.set(action.table, { columns, authorColumn: action.authorColumn, rows: new Map() });
                 return;
             }
             case 'drop-table': {
                 this.tables.delete(action.table);
+                for (const [key, index] of this.indexes) {
+                    if (index.table === action.table) this.indexes.delete(key);
+                }
+                return;
+            }
+            case 'ensure-index': {
+                const table = requireTable(this.tables, action.index.table);
+                for (const c of action.index.columns) {
+                    if (!table.columns.has(c.target) && c.target !== table.authorColumn) {
+                        throw new Error(`ActionStore: cannot index '${action.index.table}.${c.target}'`);
+                    }
+                }
+                const key = action.index.table + '\u0000' + action.index.name;
+                if (this.indexes.has(key)) throw new Error(`ActionStore: index '${action.index.name}' already exists`);
+                this.indexes.set(key, action.index);
+                return;
+            }
+            case 'drop-index': {
+                this.indexes.delete(action.table + '\u0000' + action.name);
                 return;
             }
             case 'add-column': {
@@ -77,6 +115,11 @@ export class ActionStore {
             }
             case 'drop-column': {
                 const table = requireTable(this.tables, action.table);
+                for (const index of this.indexes.values()) {
+                    if (index.table === action.table && index.columns.some((c) => c.target === action.column)) {
+                        throw new Error(`ActionStore: '${action.table}.${action.column}' is indexed by '${index.name}'`);
+                    }
+                }
                 table.columns.delete(action.column);
                 for (const row of table.rows.values()) delete row.values[action.column];
                 return;

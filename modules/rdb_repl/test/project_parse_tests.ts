@@ -105,6 +105,24 @@ export async function runProjectParseTests(): Promise<void> {
     const resolve = parseProjectCommand('resolve-key 2 7');
     assert(resolve.kind === 'resolve-key' && resolve.id === 2 && resolve.token === '7', 'resolve-key');
 
+    const idxPath = parseProjectCommand('indexes 2 ./idx.json');
+    assert(idxPath.kind === 'indexes', 'indexes kind');
+    if (idxPath.kind === 'indexes') {
+        assertEqual(idxPath.id, 2, 'indexes id');
+        assert('path' in idxPath.spec && idxPath.spec.path === './idx.json', 'indexes path');
+        assertEqual(idxPath.dryRun, false, 'indexes default is not a dry run');
+    }
+    const idxQuoted = parseProjectCommand('indexes 2 "./my idx.json" dry-run');
+    assert(idxQuoted.kind === 'indexes' && 'path' in idxQuoted.spec
+        && idxQuoted.spec.path === './my idx.json' && idxQuoted.dryRun, 'indexes quoted path + dry-run');
+    const inline = '{"version": 1, "indexes": [{"name": "by_x", "group": "g", "table": "t", "columns": [{"column": "x}"}]}]}';
+    const idxInline = parseProjectCommand(`indexes 3 ${inline} dry-run`);
+    assert(idxInline.kind === 'indexes' && 'inline' in idxInline.spec
+        && idxInline.spec.inline === inline && idxInline.dryRun, 'indexes inline json (brace inside a string) + dry-run');
+    assertThrows(() => parseProjectCommand('indexes 3 {"version": 1'), 'unclosed inline spec is rejected', 'Unclosed');
+    assertThrows(() => parseProjectCommand('indexes 3 ./idx.json extra'), 'indexes trailing token is rejected', 'Unexpected token');
+    assertThrows(() => parseProjectCommand('indexes 3'), 'indexes without spec is rejected');
+
     assertThrows(() => parseProjectCommand('start shopdb to :memory:'), 'start without as is rejected', "Expected 'as'");
     assertThrows(() => parseProjectCommand('start shopdb as alice'), 'start without to is rejected', "Expected 'to'");
     assertThrows(() => parseProjectCommand('start'), 'start without args is rejected');

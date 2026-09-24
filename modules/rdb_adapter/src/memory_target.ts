@@ -13,6 +13,10 @@
 //     atomically: it works on a clone and swaps it in only if the whole batch
 //     succeeds, so a throw never leaves a partially-applied state or a
 //     checkpoint the target does not reflect.
+//   - projection-local indexes as BOOKKEEPING only (the installed spec plus the
+//     materialized index records; nothing is physically indexed), so the core
+//     index lifecycle can be exercised without SQLite. It has no options
+//     format, so a declaration carrying `options` is refused.
 //
 // Values are stored as their logical json.Literal (no engine coercion), so the
 // read accessors return exactly what was projected.
@@ -24,9 +28,9 @@ import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 
 import {
     CapturedBatch, CapturedChange, ChangeSignalListener, ChangeSignalSource,
-    CheckpointMovedError, IngestSettle, KeyIndex, MaterializationTarget, MaterializedChangeSource,
-    OpEvent, OpEventQuery, pageOpEvents, RowAction, RowIdentityIndex, SchemaAction, StoredOpEvent,
-    SyncMapping, SyncStatus, versionsEqual,
+    CheckpointMovedError, IndexDecl, IndexSpec, IndexState, IndexTarget, IngestSettle, KeyIndex,
+    MaterializationTarget, MaterializedChangeSource, OpEvent, OpEventQuery, pageOpEvents, ResolvedIndex,
+    RowAction, RowIdentityIndex, SchemaAction, StoredOpEvent, SyncMapping, SyncStatus, versionsEqual,
 } from "./types.js";
 
 type RowValues = { [column: string]: json.Literal };
@@ -86,7 +90,15 @@ type Store = {
     keysByHash: Map<string, KeyEntry>;
     keysById: Map<number, KeyEntry>;
     nextKeyId: number;
+    // Installed index spec and the materialized index records, keyed by
+    // (table, name). Records are immutable, so a shallow map copy clones.
+    indexSpec: { spec: IndexSpec; fingerprint: string } | undefined;
+    indexes: Map<string, ResolvedIndex>;
 };
+
+function indexKey(table: string, name: string): string {
+    return table + '\u0000' + name;
+}
 
 function cloneRow(row: MemoryRow): MemoryRow {
     const clone: MemoryRow = { values: { ...row.values } };
@@ -126,13 +138,18 @@ function cloneStore(store: Store): Store {
         keysByHash.set(hash, clone);
         keysById.set(clone.id, clone);
     }
-    return { tables, checkpoints, keysByHash, keysById, nextKeyId: store.nextKeyId };
+    return {
+        tables, checkpoints, keysByHash, keysById, nextKeyId: store.nextKeyId,
+        indexSpec: store.indexSpec, indexes: new Map(store.indexes),
+    };
 }
 
-export class MemoryTarget implements MaterializationTarget, MaterializedChangeSource, ChangeSignalSource, RowIdentityIndex, KeyIndex {
+export class MemoryTarget implements MaterializationTarget, MaterializedChangeSource, ChangeSignalSource,
+    RowIdentityIndex, KeyIndex, IndexTarget {
     private store: Store = {
         tables: new Map(), checkpoints: new Map(),
         keysByHash: new Map(), keysById: new Map(), nextKeyId: 1,
+        indexSpec: undefined, indexes: new Map(),
     };
     private changeListeners = new Set<ChangeSignalListener>();
 
@@ -178,11 +195,15 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
     async apply(
         groupId: B64Hash, schemaActions: SchemaAction[], rowActions: RowAction[],
         checkpoint: Version, events?: OpEvent[], expectFrom?: Version | null,
+        expectIndexSpec?: string | null,
     ): Promise<void> {
         // Compare-and-set guard (concurrent projectors): reject if the stored
         // checkpoint is not what this delta was computed against. Nothing mutates.
         if (expectFrom !== undefined
             && !versionsEqual(this.store.checkpoints.get(groupId), expectFrom ?? undefined)) {
+            throw new CheckpointMovedError(groupId);
+        }
+        if (expectIndexSpec !== undefined && (this.store.indexSpec?.fingerprint ?? null) !== expectIndexSpec) {
             throw new CheckpointMovedError(groupId);
         }
         // Atomicity: mutate a clone, swap in only on full success.
@@ -442,6 +463,39 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
     async idForKeyHash(_domain: string, keyHash: string): Promise<number | undefined> {
         return this.store.keysByHash.get(keyHash)?.id;
     }
+
+    // -----------------------------------------------------------------------
+    // IndexTarget (bookkeeping only)
+    // -----------------------------------------------------------------------
+
+    async getIndexState(): Promise<IndexState> {
+        const state: IndexState = { materialized: [...this.store.indexes.values()] };
+        if (this.store.indexSpec !== undefined) {
+            state.spec = this.store.indexSpec.spec;
+            state.specFingerprint = this.store.indexSpec.fingerprint;
+        }
+        return state;
+    }
+
+    validateIndexOptions(decl: IndexDecl): string | undefined {
+        return decl.options === undefined ? undefined : 'the memory target takes no index options';
+    }
+
+    async installIndexSpec(
+        spec: IndexSpec, specFingerprint: string, actions: SchemaAction[],
+        expect: { specFingerprint: string | undefined; checkpoints: Map<B64Hash, Version> },
+    ): Promise<void> {
+        if (this.store.indexSpec?.fingerprint !== expect.specFingerprint) {
+            throw new CheckpointMovedError([...expect.checkpoints.keys()][0] ?? '');
+        }
+        for (const [groupId, cp] of expect.checkpoints) {
+            if (!versionsEqual(this.store.checkpoints.get(groupId), cp)) throw new CheckpointMovedError(groupId);
+        }
+        const working = cloneStore(this.store);
+        for (const action of actions) applySchemaAction(working, action);
+        working.indexSpec = { spec, fingerprint: specFingerprint };
+        this.store = working;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -454,7 +508,25 @@ function applySchemaAction(store: Store, action: SchemaAction): void {
         case 'drop-table': return dropTable(store, action);
         case 'add-column': return addColumn(store, action);
         case 'drop-column': return dropColumn(store, action);
+        case 'ensure-index': return ensureIndex(store, action.index);
+        case 'drop-index':
+            store.indexes.delete(indexKey(action.table, action.name));
+            return;
     }
+}
+
+// Mirrors a real CREATE INDEX: the table and every column must exist, and the
+// name must be free (a surviving identical index is never re-ensured).
+function ensureIndex(store: Store, index: ResolvedIndex): void {
+    const state = requireTable(store, index.table);
+    for (const c of index.columns) {
+        if (state.columnTypes[c.target] === undefined && c.target !== state.authorColumn) {
+            throw new Error(`cannot index '${index.table}.${c.target}': no such column`);
+        }
+    }
+    const key = indexKey(index.table, index.name);
+    if (store.indexes.has(key)) throw new Error(`index '${index.name}' already exists on '${index.table}'`);
+    store.indexes.set(key, index);
 }
 
 function requireTable(store: Store, table: string): TableState {
@@ -464,6 +536,11 @@ function requireTable(store: Store, table: string): TableState {
 }
 
 function createTable(store: Store, action: Extract<SchemaAction, { kind: 'create-table' }>): void {
+    for (const index of store.indexes.values()) {
+        if (index.table === action.table) {
+            throw new Error(`cannot recreate '${action.table}': index '${index.name}' is still recorded on it`);
+        }
+    }
     const columnTypes: { [column: string]: ColumnType } = {};
     const fkColumns: { [column: string]: { targetTable: string } } = {};
     const keyRefColumns = new Set<string>();
@@ -492,6 +569,10 @@ function createTable(store: Store, action: Extract<SchemaAction, { kind: 'create
 
 function dropTable(store: Store, action: Extract<SchemaAction, { kind: 'drop-table' }>): void {
     store.tables.delete(action.table);
+    // A dropped table takes its indexes with it (as DROP TABLE does in SQL).
+    for (const [key, index] of store.indexes) {
+        if (index.table === action.table) store.indexes.delete(key);
+    }
 }
 
 function addColumn(store: Store, action: Extract<SchemaAction, { kind: 'add-column' }>): void {
@@ -512,6 +593,13 @@ function addColumn(store: Store, action: Extract<SchemaAction, { kind: 'add-colu
 
 function dropColumn(store: Store, action: Extract<SchemaAction, { kind: 'drop-column' }>): void {
     const state = requireTable(store, action.table);
+    // As SQLite: an indexed column cannot be dropped (the planner drops the
+    // index first).
+    for (const index of store.indexes.values()) {
+        if (index.table === action.table && index.columns.some((c) => c.target === action.column)) {
+            throw new Error(`cannot drop '${action.table}.${action.column}': index '${index.name}' uses it`);
+        }
+    }
     delete state.columnTypes[action.column];
     delete state.fkColumns[action.column];
     state.keyRefColumns.delete(action.column);

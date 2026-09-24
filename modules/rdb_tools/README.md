@@ -67,6 +67,9 @@ C-SQL statements terminate with `;` (multi-line and paste supported). Backslash 
 \project start <db> as <id> to <path>
 \project status [<db>]  \project stop|update <id>
 \project events <id> [after <n>] [before <n>] [limit <m>] [order asc|desc]
+\project register-key <id> <keyHash> <publicKey>
+\project resolve-key <id> <token>
+\project indexes <id> <spec.json | {inline json}> [dry-run]
 \sync start <db> as <id> [allow …] on localhost|internet
 \sync fetch #<rdb-id> as <id> on localhost|internet
 \sync status [<db>]  \sync stop <idx>  \sync peers <idx>

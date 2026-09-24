@@ -9,7 +9,8 @@ import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import Database from "better-sqlite3";
 
 import {
-    CheckpointMovedError, ingestChanges, projectGroup, SchemaAction, RowAction, SyncMapping,
+    CheckpointMovedError, ingestChanges, projectGroup, reconcileIndexes, SchemaAction, RowAction, SyncMapping,
+    type GroupProjection, type IndexDecl, type IndexSpec, type ResolvedIndex,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import {
     createGroup, sameVersion,
@@ -191,6 +192,43 @@ function cleanupDb(p: string): void {
     for (const suffix of ['', '-wal', '-shm']) {
         try { fs.unlinkSync(p + suffix); } catch (_e) { /* ignore */ }
     }
+}
+
+// Physical (non-autoindex) indexes on `table`, as name -> CREATE sql.
+function physicalIndexes(db: Database.Database, table: string): Map<string, string> {
+    const rows = db.prepare(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL ORDER BY name")
+        .all(table) as { name: string; sql: string }[];
+    return new Map(rows.map((r) => [r.name, r.sql]));
+}
+
+type IndexXInfo = { name: string | null; desc: number; coll: string; key: number };
+function indexKeyColumns(db: Database.Database, index: string): IndexXInfo[] {
+    return (db.prepare('SELECT name, "desc", coll, "key" FROM pragma_index_xinfo(?)').all(index) as IndexXInfo[])
+        .filter((c) => c.key === 1);
+}
+
+function indexMetaNames(db: Database.Database): string[] {
+    return (db.prepare('SELECT "table" || \'.\' || name AS n FROM rdb_index_meta ORDER BY n').all() as { n: string }[])
+        .map((r) => r.n);
+}
+
+function financeDecl(name: string, table: string, columns: IndexDecl['columns'], options?: IndexDecl['options']): IndexDecl {
+    const d: IndexDecl = { name, group: 'finance-prod', table, columns };
+    if (options !== undefined) d.options = options;
+    return d;
+}
+
+function handIndex(name: string, table: string, rdb: string, fingerprint = name): ResolvedIndex {
+    return { name, groupId: 'g', table, columns: [{ rdb, target: rdb }], fingerprint };
+}
+
+async function expectThrows(fn: () => Promise<unknown>, match: string | typeof CheckpointMovedError, why: string) {
+    let err: unknown;
+    try { await fn(); } catch (e) { err = e; }
+    assertTrue(err !== undefined, `${why}: expected a throw`);
+    if (typeof match === 'string') assertTrue(err instanceof Error && err.message.includes(match), `${why}: got ${String(err)}`);
+    else assertTrue(err instanceof match, `${why}: got ${String(err)}`);
 }
 
 export const sqliteSpecificTests = {
@@ -846,6 +884,194 @@ export const sqliteSpecificTests = {
                 assertEquals(window.length, 3, 'after+before window size');
                 assertEquals(window[0].id, 2, 'window after 1');
                 assertEquals(window[2].id, 4, 'window before 5');
+                db.close();
+            },
+        },
+        {
+            name: '[ADPTS-IDX01] reconcile builds real indexes: columns, DESC, COLLATE, partial WHERE, author, query plan',
+            invoke: async () => {
+                const { group, admin } = await createGroup();
+                await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', amount: '10.00', memo: 'x' }, admin);
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db);
+                await projectGroup(group, target);
+                const members: GroupProjection[] = [{ group, config: {} }];
+
+                const report = await reconcileIndexes(members, target, {
+                    version: 1,
+                    indexes: [
+                        financeDecl('by_memo', 'ledger', ['memo'], { columns: { memo: { collate: 'NOCASE', whereNotNull: true } } }),
+                        financeDecl('by_amount', 'ledger', ['amount', '@author'], { columns: { amount: { desc: true } } }),
+                    ],
+                });
+                assertEquals(report.status, 'installed', 'spec installed');
+
+                const physical = physicalIndexes(db, 'ledger');
+                assertEquals([...physical.keys()].join(','), 'ledger__by_amount,ledger__by_memo',
+                    'physical names are <table>__<name>');
+                assertTrue(physical.get('ledger__by_memo')!.includes('WHERE "memo" IS NOT NULL'), 'partial index WHERE clause');
+                const memo = indexKeyColumns(db, 'ledger__by_memo');
+                assertEquals(memo.length, 1, 'by_memo has one key column');
+                assertEquals(memo[0]!.name, 'memo', 'by_memo column');
+                assertEquals(memo[0]!.coll, 'NOCASE', 'by_memo collation');
+                const amount = indexKeyColumns(db, 'ledger__by_amount');
+                assertEquals(amount.map((c) => `${c.name}:${c.desc}`).join(','), 'amount:1,author_key_id:0',
+                    'DESC column + @author resolved to author_key_id');
+                assertEquals(indexMetaNames(db).join(','), 'ledger.by_amount,ledger.by_memo', 'index records kept');
+
+                const plan = db.prepare('EXPLAIN QUERY PLAN SELECT id FROM ledger WHERE amount = ?').all('10.00') as
+                    { detail: string }[];
+                assertTrue(plan.some((p) => p.detail.includes('ledger__by_amount')),
+                    `the planner uses the index (plan: ${plan.map((p) => p.detail).join(' | ')})`);
+
+                // State survives reopening the database with a fresh target.
+                const reopened = await new SqliteTarget(db).getIndexState();
+                assertEquals(reopened.spec?.version, 1, 'installed spec persisted');
+                assertEquals(reopened.materialized.map((m) => m.name).sort().join(','), 'by_amount,by_memo',
+                    'materialized records persisted');
+                db.close();
+            },
+        },
+        {
+            name: '[ADPTS-IDX02] invalid sqlite options are refused before anything is installed',
+            invoke: async () => {
+                const { group } = await createGroup();
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db);
+                await projectGroup(group, target);
+                const members: GroupProjection[] = [{ group, config: {} }];
+                const attempt = (options: IndexDecl['options']) =>
+                    reconcileIndexes(members, target, { version: 1, indexes: [financeDecl('ix', 'ledger', ['memo'], options)] });
+
+                await expectThrows(() => attempt({ columns: { memo: { collate: 'FANCY' } } }), 'unknown collation', 'bad collation');
+                await expectThrows(() => attempt({ columns: { ref: { collate: 'NOCASE' } } }), 'does not list',
+                    'options on an unlisted column');
+                await expectThrows(() => attempt({ columns: { memo: { unique: true } } }),
+                    "unknown sqlite column option 'unique' on 'memo'", 'unknown column option');
+                await expectThrows(() => attempt({ unique: true }), "unknown sqlite index option 'unique'", 'unknown top-level key');
+                await expectThrows(() => attempt({ collate: { memo: 'NOCASE' } }), "unknown sqlite index option 'collate'",
+                    'the old top-level format is refused');
+                await expectThrows(() => attempt({ columns: { memo: { desc: 'yes' } } }), 'must be true or false', 'non-boolean desc');
+                await expectThrows(() => attempt({ columns: { memo: 'x' } }), "options for 'memo' must be an object",
+                    'non-object column value');
+                await expectThrows(() => attempt({ columns: ['memo'] }), "'columns' must map", 'non-object columns');
+                await expectThrows(() => attempt([1, 2]), 'must be an object', 'non-object options');
+                assertEquals((await target.getIndexState()).spec, undefined, 'no spec was installed');
+                assertEquals(physicalIndexes(db, 'ledger').size, 0, 'no index was built');
+
+                assertEquals(target.validateIndexOptions(financeDecl('ix', 'ledger', ['memo'], {})), undefined, '{} is no options');
+                assertEquals(target.validateIndexOptions(financeDecl('ix', 'ledger', ['memo'], { columns: {} })), undefined,
+                    '{ columns: {} } is no options');
+                db.close();
+            },
+        },
+        {
+            name: '[ADPTS-IDX03] a remote drop-column on an indexed column succeeds (index dropped first) and rebuilds on re-add',
+            invoke: async () => {
+                const { schema, group, admin } = await createGroup();
+                await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', amount: '10.00', memo: 'x' }, admin);
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db);
+                await projectGroup(group, target);
+                const members: GroupProjection[] = [{ group, config: {} }];
+                await reconcileIndexes(members, target, {
+                    version: 1,
+                    indexes: [financeDecl('by_memo', 'ledger', ['memo', 'ref']), financeDecl('by_ref', 'ledger', ['ref'])],
+                });
+
+                const deploy = async (rules: Parameters<typeof schema.updateSchema>[0]) => {
+                    await schema.updateSchema(rules, admin, 'migrate');
+                    await group.deploy(await (await schema.getScopedDag()).getFrontier());
+                    await projectGroup(group, target);
+                };
+                await deploy([{ rule: 'drop-column', table: 'ledger', column: 'memo' }]);
+                assertTrue(!tableInfo(db, 'ledger').some((c) => c.name === 'memo'), 'memo is gone');
+                assertEquals([...physicalIndexes(db, 'ledger').keys()].join(','), 'ledger__by_ref', 'only by_ref remains');
+                assertEquals(indexMetaNames(db).join(','), 'ledger.by_ref', 'by_memo record removed');
+
+                await deploy([{ rule: 'add-column', table: 'ledger', column: 'memo', def: { type: 'string', nullable: true } }]);
+                assertEquals([...physicalIndexes(db, 'ledger').keys()].join(','), 'ledger__by_memo,ledger__by_ref',
+                    'the declaration completes again when memo returns');
+                db.close();
+            },
+        },
+        {
+            name: '[ADPTS-IDX04] table rebuilds (NOT NULL tighten, FK-column drop) preserve managed and hand-made indexes',
+            invoke: async () => {
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db);
+                const gid = 'g';
+                const create: SchemaAction = {
+                    kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+                    columns: [
+                        { name: 'ref', def: { type: 'string' } },
+                        { name: 'parent_id', def: { type: 'integer', nullable: true }, fk: { targetTable: 'acct' } },
+                    ],
+                };
+                const row: RowAction = { kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { ref: 'a' } };
+                await target.apply(gid, [create, { kind: 'ensure-index', index: handIndex('by_ref', 'acct', 'ref') }],
+                    [row], new Set(['v1']));
+                db.exec('CREATE INDEX hand_ref ON acct (ref)');
+                db.exec('CREATE INDEX hand_parent ON acct (parent_id)');
+
+                // A required column added to a non-empty table: relaxed on ADD, then
+                // tightened by a table rebuild after the backfill.
+                await target.apply(gid,
+                    [{ kind: 'add-column', table: 'acct', column: 'status', def: { type: 'string' } }],
+                    [{ kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { status: 'open' } }],
+                    new Set(['v2']));
+                assertEquals(tableInfo(db, 'acct').find((c) => c.name === 'status')?.notnull, 1, 'sanity: status tightened');
+                assertEquals([...physicalIndexes(db, 'acct').keys()].join(','), 'acct__by_ref,hand_parent,hand_ref',
+                    'the tighten rebuild kept every index');
+
+                // Dropping an FK column goes through the rebuild; an index on that column cannot survive.
+                await target.apply(gid, [{ kind: 'drop-column', table: 'acct', column: 'parent_id' }], [], new Set(['v3']));
+                assertEquals([...physicalIndexes(db, 'acct').keys()].join(','), 'acct__by_ref,hand_ref',
+                    'the FK-drop rebuild kept the unrelated indexes and removed the one on the dropped column');
+                assertEquals(indexMetaNames(db).join(','), 'acct.by_ref', 'managed record intact');
+                db.close();
+            },
+        },
+        {
+            name: '[ADPTS-IDX05] installIndexSpec is atomic and compare-and-set guarded; apply checks expectIndexSpec',
+            invoke: async () => {
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db);
+                const gid = 'g';
+                const v1: Version = new Set(['v1']);
+                await target.apply(gid, [{
+                    kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+                    columns: [{ name: 'ref', def: { type: 'string' } }],
+                }], [], v1);
+                const spec: IndexSpec = { version: 1, indexes: [] };
+                const expect = { specFingerprint: undefined, checkpoints: new Map([[gid, v1]]) };
+
+                await expectThrows(() => target.installIndexSpec(spec, 'fp1', [
+                    { kind: 'ensure-index', index: handIndex('by_ref', 'acct', 'ref') },
+                    { kind: 'ensure-index', index: handIndex('by_ghost', 'acct', 'ghost') },
+                ], expect), 'ghost', 'an unbuildable ensure fails the install');
+                assertEquals(physicalIndexes(db, 'acct').size, 0, 'the valid ensure was rolled back');
+                assertEquals((await target.getIndexState()).spec, undefined, 'no spec was recorded');
+
+                await expectThrows(() => target.installIndexSpec(spec, 'fp1', [],
+                    { specFingerprint: undefined, checkpoints: new Map([[gid, new Set(['elsewhere'])]]) }),
+                    CheckpointMovedError, 'a moved checkpoint aborts the install');
+                await target.installIndexSpec(spec, 'fp1',
+                    [{ kind: 'ensure-index', index: handIndex('by_ref', 'acct', 'ref') }], expect);
+                assertEquals((await target.getIndexState()).specFingerprint, 'fp1', 'installed');
+                await expectThrows(() => target.installIndexSpec(spec, 'fp2', [], expect),
+                    CheckpointMovedError, 'a stale installed-spec expectation aborts the install');
+
+                await expectThrows(() => target.apply(gid, [], [], new Set(['v2']), undefined, v1, null),
+                    CheckpointMovedError, 'apply planned against no spec is refused once one is installed');
+                await target.apply(gid, [], [], new Set(['v2']), undefined, v1, 'fp1');
+                assertTrue(sameVersion(await target.getCheckpoint(gid), new Set(['v2'])), 'apply with the right spec lands');
+
+                // Collisions with an unmanaged index are refused, never adopted.
+                db.exec('CREATE INDEX "acct__by_hand" ON acct (ref)');
+                await expectThrows(() => target.apply(gid,
+                    [{ kind: 'ensure-index', index: handIndex('by_hand', 'acct', 'ref') }], [], new Set(['v3'])),
+                    'already exists', 'a name collision with an unmanaged index fails the apply');
                 db.close();
             },
         },

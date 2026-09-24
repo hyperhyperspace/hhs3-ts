@@ -18,15 +18,18 @@ import {
 export class IdbEnv {
 
     readonly db: IDBDatabase;
+    // Kept for its native key comparison / validation (`cmp`).
+    readonly factory: IDBFactory;
     private queue: Promise<unknown> = Promise.resolve();
 
-    constructor(db: IDBDatabase) {
+    constructor(db: IDBDatabase, factory: IDBFactory) {
         this.db = db;
+        this.factory = factory;
     }
 
     static async open(name: string, factory: IDBFactory): Promise<IdbEnv> {
         const db = await openDatabase(name, factory);
-        return new IdbEnv(db);
+        return new IdbEnv(db, factory);
     }
 
     close(): void {

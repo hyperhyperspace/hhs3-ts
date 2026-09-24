@@ -40,13 +40,16 @@ Projection can be configured from the [CLI-based REPL](../rdb_tools/) using the 
 \project status [<db>]
 \project stop|update <idx>
 \project events <idx> [after <n>] [before <n>] [limit <m>] [order asc|desc]
+\project indexes <idx> <spec.json | {inline json}> [dry-run]
 ```
 
 The identity passed as `<id>` is used to sign the operations that are ingested back into Rdb. A SQLite databse is created on `<path>`, and can be queried and modified using standard SQLite tooling.
 
 If changes in the projection generate any ingestion failures, or Rdb concurrency generates op cancellations, those are reported live on the REPL console while the projection is running. `\project events` pages the durable log (default: newest 50, `order desc`).
 
-While `\project` is also supported in the [web REPL demo](../rdb_repl_web/), the only supported path is `:memory:` and the contents of the projection are not inspectable at the moment.
+`\project indexes` installs a projection index spec (see [Indexes](#indexes)) and prints the outcome, the index actions, and any pending declarations.
+
+While `\project` is also supported in the [web REPL demo](../rdb_repl_web/), the only supported path is `:memory:` and the contents of the projection are not inspectable at the moment. The web REPL cannot read files, so `\project indexes` takes the spec inline there.
 
 ### Library
 
@@ -63,6 +66,72 @@ await projectGroup(group, target);
 
 For a whole `RDb`, inject the same target into [rdb_projection](../rdb_projection).
 
+## Indexes
+
+A projection can carry its own indexes to speed up local queries. They belong to the projection, not to the Rdb schema: other replicas never see them, and two projections of the same data can index differently. Indexes never enforce anything (there is no `UNIQUE` index); they only make reads faster.
+
+### The index spec
+
+An `IndexSpec` is written in **rdb names**, the names in the `RSchema`, not the projected ones:
+
+```json
+{
+  "version": 3,
+  "indexPub": true,
+  "indexes": [
+    { "name": "by_customer", "group": "orders", "table": "orders",
+      "columns": ["customer", "placed_at"],
+      "options": { "columns": { "placed_at": { "desc": true } } } },
+    { "name": "by_title", "group": "catalog", "table": "products",
+      "columns": ["title"], "options": { "columns": { "title": { "collate": "NOCASE" } } } },
+    { "name": "mine", "group": "orders", "table": "orders", "columns": ["@author"] }
+  ]
+}
+```
+
+- `group` is the rdb group name and `table` the rdb table name. `name` must be unique within its group; the same name can be reused in another group.
+- `columns` is the ordered list of columns in the index key, and it is the only part of the declaration the adapter core interprets: the index is dropped whenever one of these columns goes away. The pseudo-column `@author` stands for the row's author.
+- The adapter maps rdb names to target names exactly as the schema mapper does: table renames and the group prefix (`<group>_<table>` in a replica-wide projection), column renames, foreign key companions (`<col>_id` or `<col>_row_hash`), identity columns (`<col>_key_id`), provider key-id columns (`key_id`), and `@author` to `author_key_id`.
+- `options` holds everything else, per-column settings such as descending order included. Its format is defined and validated by each target (see [Targets](#targets)); the core never looks inside it. A spec is therefore written for one kind of target: an app that projects into both SQLite and IndexedDB ships one spec per target.
+- `indexPub: true` adds one single-column index named `pub__<column>` for every `pub` column of every projected table. The `pub__` prefix is reserved for this.
+
+### Pending declarations
+
+A declaration whose group, table, or column is not projected (yet) is **pending**, not an error. It is built automatically when a later schema change adds what it needs. If something an index depends on is dropped by a schema change, the index is dropped first, in the same transaction, and the declaration goes back to pending. A provider's public-key column is never projected, so an index on it stays pending.
+
+### Installing a spec
+
+The target stores the installed spec, and syncing never changes it. The app installs a new spec explicitly, as a migration step when it ships a new version:
+
+```typescript
+// Replica-wide, with rdb_projection. For hand-wired members, this package's
+// reconcileIndexes(members, target, spec) does the same.
+const report = await projection.reconcileIndexes(spec);
+console.log(report.status, report.actions, report.pending);
+```
+
+Reconciling only moves forward, by `version`:
+
+- nothing installed yet, or a higher version: the spec is installed (`installed`);
+- the same version with the same content: nothing happens (`unchanged`);
+- the same version with different content: it throws, asking you to bump the version;
+- a lower version: it is ignored (`skipped-older`), so an older app build sharing the same database does not flip the indexes back.
+
+Reconcile compares the new spec with the indexes actually built, then drops, builds, and records the new spec in one transaction. A declaration that changed in any way, `options` included, is a different index: the old one is dropped and the new one built. It holds the same per-database lock as sync, so the two never interleave. `{ dryRun: true }` returns the plan without changing anything. After that, every sync keeps the installed spec up to date across remote schema changes.
+
+On first launch, open the projection (the initial backfill runs without indexes) and then call `reconcileIndexes`, which builds them. After a restart, the installed spec is already there and nothing needs to happen until the spec changes.
+
+### Targets
+
+- **SQLite** builds real indexes, named `<table>__<name>`, after the batch's rows are written. Its options are `{ "columns": { "<rdb column>": { "desc": true, "collate": "NOCASE" | "RTRIM" | "BINARY", "whereNotNull": true } } }`, every key optional. `whereNotNull` makes a partial index (on several columns, the conditions are ANDed). Validation is strict: any other key, at either level, and any column not listed in `columns`, is rejected before anything is installed. The installed spec and the index records live in the `rdb_index_spec` and `rdb_index_meta` tables.
+- **Memory** keeps the bookkeeping only (the spec and index records, nothing physical) and takes no options: a declaration with `options` is rejected. It exists so the lifecycle can be tested without SQLite.
+- **IndexedDB** builds shadow indexes that behave like native `IDBIndex`es, read through `store.index(name)` on `target.database` (see [rdb_adapter_idb](../rdb_adapter_idb#indexes)). It takes no options: a declaration with `options` is rejected. So there is no descending order, collation, or partial index, and, as natively, `null`, booleans, and objects are not keys (a row holding one is absent from that index).
+
+### Known limits
+
+- **Unmanaged indexes block remote column drops (SQLite).** Only indexes recorded in `rdb_index_meta` are dropped before a `drop-column`. If the app creates its own index on a projected column and a remote schema change drops that column, SQLite's `ALTER TABLE ... DROP COLUMN` fails, the whole apply rolls back, and that group's sync stalls until the index is removed. (Table rebuilds, used for NOT NULL tightening and foreign key column drops, keep hand-made indexes and skip the ones on a dropped column instead of failing.) Declare indexes in the spec instead of creating them by hand.
+- **A stale spec costs performance, never correctness.** A declaration whose table or column was dropped or renamed upstream (in rdb a rename is a drop plus an add) shows up in `report.pending` and stays inactive until the spec is updated. Check the `pending` list after each release.
+- **Only reconcile applies spec changes.** A new spec does nothing until `reconcileIndexes` runs; tables that are already caught up keep their previous indexes until then.
 
 ## Layout
 
@@ -72,6 +141,8 @@ For a whole `RDb`, inject the same target into [rdb_projection](../rdb_projectio
 - `ingest.ts` — pure inverse planner (coalesce, mint, translate, FK-consecutive bundling).
 - `ref_advance.ts` — cross-group ref-advance mechanism (observed→observer index + observe wrapper).
 - `project.ts`, `ingest_orchestrator.ts` — single-group and database-level orchestrators.
+- `index_actions.ts` — pure index planner (spec validation, rdb → target name resolution, diff against the built indexes).
+- `index_reconcile.ts` — `reconcileIndexes`: the version gate and the atomic install of a new index spec.
 - `memory_target.ts` — a self-contained in-memory backend (used in tests).
 
 ## Implementation details
@@ -83,7 +154,7 @@ For a whole `RDb`, inject the same target into [rdb_projection](../rdb_projectio
 
 ## Test
 
-The suite is driven by a small custom runner, `test/run_tests.ts`, which registers five groups and applies positional name filters plus `--profile / --seeds / --ops / --max-pairs` flags before running.
+The suite is driven by a small custom runner, `test/run_tests.ts`, which registers six groups and applies positional name filters plus `--profile / --seeds / --ops / --max-pairs` flags before running.
 
 ```
 npm test                  # full suite; planner parity runs under the default `smoke` profile
@@ -100,12 +171,13 @@ Deterministic, fast checks on the pure planners (each prints under its own conso
 - `[ADPTR] rdb_adapter row planner` (`row_actions_tests.ts`) — project-side row-action planner.
 - `[ADPTI] rdb_adapter inverse planner` (`ingest_tests.ts`) — ingest planner (coalesce, mint, reverse-map, FK bundling).
 - `[ADPTV] rdb_adapter concurrency op-events (verdict flips)` (`verdict_events_tests.ts`).
+- `[IDX] rdb_adapter projection-local indexes` (`index_actions_tests.ts`) — index planner, plus reconcile and apply-time index maintenance end to end on the memory target.
 
 ### Planner-parity fuzzer
 
 `[PLANNER] rdb_adapter planner-parity fuzzer` (`test/planner_parity/`) is a seeded, generative cross-check with two tests:
 
-- **project** (`project_parity.ts`, generator `@hyper-hyper-space/hhs3_rdb_adapter_test_gen`): for every extending checkpoint pair in a random schema+row history, the `full` re-projection, the `incremental` projection, and the live `rdb` projection must all agree (in-process `ActionStore`). The same generator feeds the real-target suite in [rdb_adapter_test](../rdb_adapter_test), which walks a linear checkpoint chain on a concrete backend instead of all pairs.
+- **project** (`project_parity.ts`, generator `@hyper-hyper-space/hhs3_rdb_adapter_test_gen`): for every extending checkpoint pair in a random schema+row history, the `full` re-projection, the `incremental` projection, and the live `rdb` projection must all agree (in-process `ActionStore`). A generated index spec covering every column of both versions rides along, and both paths must end with the same index set, equal to the spec resolved at the end version. The same generator feeds the real-target suite in [rdb_adapter_test](../rdb_adapter_test), which walks a linear checkpoint chain on a concrete backend instead of all pairs.
 - **ingest** (`ingest_parity.ts`, generator `ingest_generate.ts` in this package): the `optimized` adapter config (`updateMerge` + `fkBundling`) and a `naive` config must produce equivalent live views for the same captured outbox.
 
 Both run against a mock context with `selfValidate: true` (every mutation and view build is re-validated), which is what makes this suite heavy compared to the unit tests.

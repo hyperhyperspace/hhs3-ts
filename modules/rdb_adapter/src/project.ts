@@ -17,10 +17,13 @@ import type {
     OpVerdictChange, Row, RSchemaView, RTableGroup, RTableGroupDelta, RTableGroupView,
 } from "@hyper-hyper-space/hhs3_rdb";
 
-import { AdapterConfig, MaterializationTarget, OpEvent, RowAction, versionsEqual } from "./types.js";
+import {
+    AdapterConfig, isIndexTarget, MaterializationTarget, OpEvent, RowAction, SchemaAction, versionsEqual,
+} from "./types.js";
 import { projectedColumnName, projectedIdentityColumnName, providerColumnRole, targetTableName } from "./names.js";
 import { initialSchemaActions, reprojectedTables, schemaDeltaActions } from "./schema_actions.js";
 import { rowActionsForDelta } from "./row_actions.js";
+import { groupIndexDecls, planIndexActions, resolveIndexes, withIndexActions } from "./index_actions.js";
 
 // Project one live rdb Row into a full-row upsert action (all written columns).
 // Shared by the initial backfill and the ingestion-failure recovery path (which
@@ -127,23 +130,44 @@ export async function projectGroupTo(
     const endView = view.getSchemaView();
 
     if (checkpoint === undefined) {
-        const schemaActions = initialSchemaActions(endView, config);
+        const planned = await withGroupIndexes(
+            group, target, endView, initialSchemaActions(endView, config), config);
         const rowActions = await initialRowActions(view, config);
         // expectFrom null: this must be the FIRST materialization; if a concurrent
         // projector created the checkpoint meanwhile, apply() rejects (CAS).
-        await target.apply(groupId, schemaActions, rowActions, to, undefined, null);
+        await target.apply(groupId, planned.schemaActions, rowActions, to, undefined, null, planned.expectIndexSpec);
         return;
     }
 
     const delta = (await group.computeDelta(checkpoint, to)) as RTableGroupDelta;
     const startView = (await group.getView(checkpoint, checkpoint)).getSchemaView();
-    const schemaActions = schemaDeltaActions(delta.schemaChanges, endView, startView, config);
+    const planned = await withGroupIndexes(
+        group, target, endView, schemaDeltaActions(delta.schemaChanges, endView, startView, config), config);
     const rowActions = await planIncrementalRowActions(view, delta, startView, endView, groupId, config);
     const events = opVerdictEvents(delta.opVerdictChanges, groupId, config);
     // expectFrom the checkpoint this delta was computed against: if another
     // projector advanced the group in between, apply() rejects (CAS) and the
     // caller recomputes from the new checkpoint.
-    await target.apply(groupId, schemaActions, rowActions, to, events, checkpoint);
+    await target.apply(groupId, planned.schemaActions, rowActions, to, events, checkpoint, planned.expectIndexSpec);
+}
+
+// Splice this group's index maintenance into the schema channel. The desired
+// set is the INSTALLED spec (never one passed at open time) resolved at the
+// end view; the materialized records are this group's. The spec fingerprint
+// rides apply() as a compare-and-set so a concurrent reconcile forces a replan.
+// A target that is not an IndexTarget gets the schema actions unchanged.
+async function withGroupIndexes(
+    group: RTableGroup, target: MaterializationTarget, endView: RSchemaView,
+    schemaActions: SchemaAction[], config: AdapterConfig,
+): Promise<{ schemaActions: SchemaAction[]; expectIndexSpec?: string | null }> {
+    if (!isIndexTarget(target)) return { schemaActions };
+    const groupId = group.getId();
+    const state = await target.getIndexState();
+    const decls = groupIndexDecls(state.spec, group.getName(), endView);
+    const { resolved } = resolveIndexes(decls, groupId, endView, config);
+    const materialized = state.materialized.filter((m) => m.groupId === groupId);
+    const plan = planIndexActions(resolved, materialized, schemaActions);
+    return { schemaActions: withIndexActions(schemaActions, plan), expectIndexSpec: state.specFingerprint ?? null };
 }
 
 // Advance `target` to the group's current frontier.

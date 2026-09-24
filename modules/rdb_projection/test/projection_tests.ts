@@ -519,5 +519,91 @@ export const projectionTests = {
                 }
             },
         },
+        {
+            name: '[RDBPROJ12] reconcileIndexes across groups: group-qualified tables, the same name in two groups, FK companions',
+            invoke: async () => {
+                const ctx = newCtx();
+                const { catalog, orders, rdb } = await makeCatalogAndOrders(ctx);
+                const target = new MemoryTarget();
+                const projection = await RdbProjection.open(rdb, ctx, target);
+                try {
+                    const report = await projection.reconcileIndexes({
+                        version: 1,
+                        indexes: [
+                            { name: 'by_x', group: 'catalog', table: 'products', columns: ['title'] },
+                            { name: 'by_x', group: 'orders', table: 'orders', columns: ['item', '@author'] },
+                        ],
+                    });
+                    assertEquals(report.status, 'installed', 'installed over both members');
+                    assertEquals(report.pending.length, 0, 'nothing pending');
+
+                    const state = await target.getIndexState();
+                    const byTable = new Map(state.materialized.map((m) => [m.table, m]));
+                    assertEquals([...byTable.keys()].sort().join(','), 'catalog_products,orders_orders',
+                        'each group\'s index lands on its group-qualified table');
+                    assertEquals(byTable.get('catalog_products')!.groupId, catalog.group.getId(), 'catalog record group');
+                    assertEquals(byTable.get('orders_orders')!.groupId, orders.group.getId(), 'orders record group');
+                    assertEquals(byTable.get('orders_orders')!.columns.map((c) => c.target).join(','), 'item_id,author_key_id',
+                        'cross-group FK resolves to its co-projected id companion');
+
+                    // A later sync keeps the installed spec; nothing is rebuilt.
+                    await catalog.group.getTable('products').then((t) => t.insert('p1', { title: 'W' }, catalog.admin));
+                    await projection.sync();
+                    assertEquals((await target.getIndexState()).materialized.length, 2, 'sync leaves the indexes in place');
+                    assertEquals((await projection.reconcileIndexes({
+                        version: 1,
+                        indexes: [
+                            { name: 'by_x', group: 'catalog', table: 'products', columns: ['title'] },
+                            { name: 'by_x', group: 'orders', table: 'orders', columns: ['item', '@author'] },
+                        ],
+                    })).status, 'unchanged', 're-running the same spec is a no-op');
+                } finally {
+                    await projection.stop();
+                }
+            },
+        },
+        {
+            name: '[RDBPROJ13] a declaration for a group not in the database is pending, then built when the group joins',
+            invoke: async () => {
+                const ctx = newCtx();
+                const { rdb } = await makeForum(ctx);
+                const target = new MemoryTarget();
+                const projection = await RdbProjection.open(rdb, ctx, target, { debounceMs: 10 });
+                try {
+                    const report = await projection.reconcileIndexes({
+                        version: 1,
+                        indexes: [
+                            { name: 'by_title', group: 'forum', table: 'posts', columns: ['title'] },
+                            { name: 'by_body', group: 'late', table: 'notes', columns: ['body'] },
+                        ],
+                    });
+                    assertEquals(report.status, 'installed', 'installed despite the absent group');
+                    assertEquals(report.pending.map((p) => `${p.group}:${p.missing.join(',')}`).join(';'), "late:group 'late'",
+                        'the absent group is reported pending');
+                    assertEquals((await target.getIndexState()).materialized.map((m) => m.table).join(','), 'forum_posts',
+                        'only the present group is indexed');
+
+                    const late = await makeSchemaGroup(ctx, 'late', [open('notes', { body: { type: 'string' } })]);
+                    await rdb.addGroup(late.group.getId());
+                    let tables: string[] = [];
+                    await poll(() => {
+                        void target.getIndexState().then((s) => { tables = s.materialized.map((m) => m.table).sort(); });
+                        return tables.includes('late_notes');
+                    });
+                    assertEquals(tables.join(','), 'forum_posts,late_notes',
+                        'the joining group is built with the installed spec by its initial projection');
+                } finally {
+                    await projection.stop();
+                }
+                await expectRejects(() => projection.reconcileIndexes({ version: 2, indexes: [] }), 'stopped',
+                    'reconcile after stop is refused');
+            },
+        },
     ],
 };
+
+async function expectRejects(fn: () => Promise<unknown>, match: string, why: string): Promise<void> {
+    let err: unknown;
+    try { await fn(); } catch (e) { err = e; }
+    assertTrue(err instanceof Error && err.message.includes(match), `${why}: got ${String(err)}`);
+}

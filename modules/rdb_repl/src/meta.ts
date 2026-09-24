@@ -357,6 +357,7 @@ function help(args: string[]): string {
         '\\project start <db> as <local-id> to <path>',
         '\\project status [<db>], \\project stop <id>, \\project update <id>, \\project events <id> [after <n>] [before <n>] [limit <m>] [order asc|desc]',
         '\\project register-key <id> <keyHash> <publicKey>, \\project resolve-key <id> <token>',
+        '\\project indexes <id> <spec.json | {inline json}> [dry-run]',
         '\\sync fetch #<rdb-id> as <local-id> on <localhost|internet> [--tracker URL] [--tracker-key KEYID] [--listen ADDR]',
         '\\sync start <db> as <local-id> [allow <sources>] on <localhost|internet> [--tracker URL] [--tracker-key KEYID] [--listen ADDR]',
         '\\sync status [<db>], \\sync stop <id>, \\sync peers <id>',

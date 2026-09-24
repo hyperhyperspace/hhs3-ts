@@ -15,3 +15,5 @@ export * from "./ref_advance.js";
 export * from "./ingest_orchestrator.js";
 export * from "./memory_target.js";
 export * from "./project.js";
+export * from "./index_actions.js";
+export * from "./index_reconcile.js";

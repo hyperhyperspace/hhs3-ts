@@ -5,7 +5,8 @@ export const PROJECT_USAGE =
     '       \\project update <id>\n' +
     '       \\project events <id> [after <n>] [before <n>] [limit <m>] [order asc|desc]\n' +
     '       \\project register-key <id> <keyHash> <publicKey>\n' +
-    '       \\project resolve-key <id> <token>';
+    '       \\project resolve-key <id> <token>\n' +
+    '       \\project indexes <id> <spec.json | {inline json}> [dry-run]';
 
 export type ProjectStartCommand = {
     kind: 'start';
@@ -23,6 +24,13 @@ export type ProjectEventsCommand = {
     order?: 'asc' | 'desc';
 };
 
+export type ProjectIndexesCommand = {
+    kind: 'indexes';
+    id: number;
+    spec: { path: string } | { inline: string };
+    dryRun: boolean;
+};
+
 export type ProjectCommand =
     | ProjectStartCommand
     | { kind: 'status'; database?: string }
@@ -30,7 +38,8 @@ export type ProjectCommand =
     | { kind: 'update'; id: number }
     | ProjectEventsCommand
     | { kind: 'register-key'; id: number; keyHash: string; publicKey: string }
-    | { kind: 'resolve-key'; id: number; token: string };
+    | { kind: 'resolve-key'; id: number; token: string }
+    | ProjectIndexesCommand;
 
 export function parseProjectCommand(remainder: string): ProjectCommand {
     const p = new Parser(remainder);
@@ -73,6 +82,7 @@ export function parseProjectCommand(remainder: string): ProjectCommand {
             p.expectEnd();
             return { kind: 'resolve-key', id, token };
         }
+        case 'indexes': return p.parseIndexes();
         default:
             throw new Error(PROJECT_USAGE);
     }
@@ -155,6 +165,44 @@ class Parser {
             }
         }
         return out;
+    }
+
+    parseIndexes(): ProjectIndexesCommand {
+        this.skipWs();
+        if (this.done()) throw new Error(PROJECT_USAGE);
+        const id = parseSessionId(this.readToken());
+        this.skipWs();
+        if (this.done()) throw new Error(PROJECT_USAGE);
+        const spec = this.peek() === '{' ? { inline: this.readJsonObject() } : { path: this.readPath() };
+        const dryRun = this.tryKeyword('dry-run');
+        this.expectEnd();
+        return { kind: 'indexes', id, spec, dryRun };
+    }
+
+    // A balanced {...} span; JSON.parse validates it later. Brackets inside
+    // string literals do not count.
+    readJsonObject(): string {
+        const start = this.i;
+        let depth = 0;
+        let inString = false;
+        for (; this.i < this.s.length; this.i += 1) {
+            const c = this.s[this.i]!;
+            if (inString) {
+                if (c === '\\') this.i += 1;
+                else if (c === '"') inString = false;
+            } else if (c === '"') {
+                inString = true;
+            } else if (c === '{' || c === '[') {
+                depth += 1;
+            } else if (c === '}' || c === ']') {
+                depth -= 1;
+                if (depth === 0) {
+                    this.i += 1;
+                    return this.s.slice(start, this.i);
+                }
+            }
+        }
+        throw new Error('Unclosed { in inline index spec');
     }
 
     readPath(): string {

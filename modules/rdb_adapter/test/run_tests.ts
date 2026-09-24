@@ -5,6 +5,7 @@ import { rowActionsTests } from "./row_actions_tests.js";
 import { ingestTests } from "./ingest_tests.js";
 import { verdictEventsTests } from "./verdict_events_tests.js";
 import { plannerParityTests } from "./planner_parity/planner_parity_tests.js";
+import { indexActionsTests } from "./index_actions_tests.js";
 import { parseTestFilters } from "@hyper-hyper-space/hhs3_rdb_adapter_test_gen";
 
 async function main() {
@@ -15,6 +16,7 @@ async function main() {
     allTests.set(rowActionsTests.title, rowActionsTests.tests);
     allTests.set(ingestTests.title, ingestTests.tests);
     allTests.set(verdictEventsTests.title, verdictEventsTests.tests);
+    allTests.set(indexActionsTests.title, indexActionsTests.tests);
     allTests.set(plannerParityTests.title, plannerParityTests.tests);
 
     console.log('Running tests for Hyper Hyper Space v3 rdb_adapter module'

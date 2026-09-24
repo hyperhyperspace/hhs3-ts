@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readFile } from "node:fs/promises";
 import { stderr, stdin, stdout } from "node:process";
 import Database from "better-sqlite3";
 
@@ -38,6 +39,8 @@ async function main(): Promise<void> {
         // to detect local edits waiting in its capture outbox. `:memory:` has no WAL.
         return new SqliteTarget(new Database(path), { captureChanges: true, dbPath: path });
     };
+
+    session.readTextFile = (path) => readFile(path, 'utf8');
 
     session.syncMeshFactory = createNodeSyncMeshFactory();
 

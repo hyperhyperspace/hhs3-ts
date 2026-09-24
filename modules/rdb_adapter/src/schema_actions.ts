@@ -31,7 +31,9 @@ import {
 // A plain column carries its ColumnDef verbatim; an FK column is RETYPED to its
 // companion form; a provider keyIdColumn becomes integer `key_id` (keyRef);
 // an identity-typed column becomes integer `<col>_key_id` (keyRef).
-function reshapeColumn(
+// Shared with index resolution (index_actions.ts) so an index names exactly
+// the column the mapper created.
+export function reshapeColumn(
     config: AdapterConfig, rdbTable: string, rdbColumn: string, colDef: ColumnDef, fks: FKs,
     provider?: IdProvider,
 ): SchemaActionColumn | undefined {

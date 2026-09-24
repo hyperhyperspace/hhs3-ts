@@ -392,13 +392,101 @@ export type SchemaActionColumn = {
 // so the target owns no naming config; the mapper resolves it from the rename
 // config + sync-table suffix. The author column (when present) is an integer
 // key-ref into `rdb_keys` — not a text KeyId.
+//
+// `drop-index` / `ensure-index` maintain projection-local secondary indexes
+// (see "Projection-local indexes" below). The planner orders every drop-index
+// BEFORE the table/column actions and every ensure-index AFTER them; a target
+// may defer ensures further (e.g. past the row channel) within the same apply.
 export type SchemaAction =
     | { kind: 'create-table'; table: string; syncTable: string; primaryKey: string;
         authorColumn?: string; columns: SchemaActionColumn[] }
     | { kind: 'drop-table'; table: string; syncTable: string }
     | { kind: 'add-column'; table: string; column: string; def: ColumnDef;
         fk?: FkColumnInfo; keyRef?: true }
-    | { kind: 'drop-column'; table: string; column: string };
+    | { kind: 'drop-column'; table: string; column: string }
+    | { kind: 'ensure-index'; index: ResolvedIndex }
+    | { kind: 'drop-index'; table: string; name: string };
+
+// ---------------------------------------------------------------------------
+// Projection-local indexes. An index is a property of ONE projection, not of
+// the replicated schema: each target stores one installed IndexSpec (written
+// in rdb names) plus a record of the indexes it actually materialized (in
+// target names). The core owns the ordered column list and the lifecycle
+// (name resolution, completeness, drop/recreate across schema deltas); each
+// target owns its `options` format (direction, collation, ...), which the core
+// never inspects. A spec is therefore written for one target kind. Indexes
+// never enforce anything (no UNIQUE): uniqueness is an rdb concern and a
+// projection only accelerates reads.
+// ---------------------------------------------------------------------------
+
+// The pseudo-column naming the projected author column (`author_key_id`).
+export const AUTHOR_INDEX_COLUMN = '@author';
+
+export type IndexDecl = {
+    // Unique within its group.
+    name: string;
+    // The rdb group name (RTableGroup.getName()).
+    group: string;
+    // The rdb table name.
+    table: string;
+    // Ordered rdb column names (or '@author'). The index is dropped whenever
+    // any of these dies.
+    columns: string[];
+    // Target-defined and opaque to the core; validated by
+    // IndexTarget.validateIndexOptions.
+    options?: json.Literal;
+};
+
+export type IndexSpec = {
+    // Monotonic: reconcile installs only a strictly newer version (an older
+    // one is skipped; the same version with different content is an error).
+    version: number;
+    indexes: IndexDecl[];
+    // Default policy: one single-column index per `pub` column of every
+    // projected table (named `pub__<column>`), in addition to `indexes`.
+    indexPub?: boolean;
+};
+
+// An IndexDecl resolved against one group's schema view + AdapterConfig:
+// target table/column names, ready for a target to realize.
+export type ResolvedIndex = {
+    name: string;
+    groupId: B64Hash;
+    table: string;
+    columns: { rdb: string; target: string }[];
+    options?: json.Literal;
+    // Canonical JSON of name, table, columns and options: two resolutions are
+    // the same physical index iff their fingerprints match.
+    fingerprint: string;
+};
+
+export type IndexState = {
+    spec?: IndexSpec;
+    specFingerprint?: string;
+    // What the target has actually built (all groups).
+    materialized: ResolvedIndex[];
+};
+
+// Optional target capability (detected by duck typing, like KeyIndex). A
+// target without it never receives index actions.
+export interface IndexTarget {
+    getIndexState(): Promise<IndexState>;
+    // A reason string when `decl.options` is not acceptable to this target.
+    validateIndexOptions(decl: IndexDecl): string | undefined;
+    // Atomically: check `expect` (compare-and-set on the installed spec
+    // fingerprint and on each listed group's checkpoint; on mismatch throw
+    // CheckpointMovedError and change nothing), apply the index actions, and
+    // store `spec` as the installed spec.
+    installIndexSpec(
+        spec: IndexSpec, specFingerprint: string, actions: SchemaAction[],
+        expect: { specFingerprint: string | undefined; checkpoints: Map<B64Hash, Version> },
+    ): Promise<void>;
+}
+
+export function isIndexTarget(t: object): t is IndexTarget {
+    const c = t as Partial<IndexTarget>;
+    return typeof c.getIndexState === 'function' && typeof c.installIndexSpec === 'function';
+}
 
 // The data-side vocabulary, the sibling of SchemaAction. Rows are addressed by
 // their content-addressed `rowId`; the target maps that to the projection-local
@@ -445,9 +533,15 @@ export interface MaterializationTarget {
     // compare happens under the write lock so two projectors can never both win.
     // A lagging replica whose frontier does not extend the new checkpoint will
     // then fail computeDelta until it syncs; that is intended.
+    //
+    // `expectIndexSpec` is the same kind of guard for an IndexTarget: the
+    // fingerprint of the installed index spec the planner resolved against
+    // (`null` = none installed, `undefined` = skip). On mismatch (a reconcile
+    // installed a new spec meanwhile) throw CheckpointMovedError, apply nothing.
     apply(
         groupId: B64Hash, schemaActions: SchemaAction[], rowActions: RowAction[],
         checkpoint: Version, events?: OpEvent[], expectFrom?: Version | null,
+        expectIndexSpec?: string | null,
     ): Promise<void>;
 
     // The last materialized version for `groupId`, or undefined when that group

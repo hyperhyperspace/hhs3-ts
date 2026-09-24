@@ -363,6 +363,38 @@ ADD TABLEGROUP shop_prod TO shopdb;
 
         const reused = await runCommand(session, '\\project start shopdb as alice to :memory:');
         assert(reused.exitCode === 0 && reused.output.includes('started projection 2'), 'ids are never reused after stop');
+
+        const idxSpec = JSON.stringify({
+            version: 1,
+            indexes: [
+                { name: 'by_name', group: 'shop_prod', table: 'products', columns: ['name', 'sku'] },
+                { name: 'by_x', group: 'not_here', table: 't', columns: ['x'] },
+            ],
+        });
+        const withOptions = JSON.stringify({
+            version: 1,
+            indexes: [{ name: 'by_name', group: 'shop_prod', table: 'products', columns: ['name'], options: {} }],
+        });
+        const refused = await runCommand(session, `\\project indexes 2 ${withOptions}`);
+        assert(refused.exitCode === 1 && refused.output.includes('takes no index options'),
+            `the target's options validation is reported (${refused.output})`);
+        const dry = await runCommand(session, `\\project indexes 2 ${idxSpec} dry-run`);
+        assert(dry.exitCode === 0 && dry.output.includes('indexes dry-run'), `indexes dry run (${dry.output})`);
+        assert(dry.output.includes('by_name') && dry.output.includes('ensure'), 'dry run lists the ensure');
+        assert(dry.output.includes('not_here') && dry.output.includes('pending'), 'dry run lists the pending decl');
+        const installed = await runCommand(session, `\\project indexes 2 ${idxSpec}`);
+        assert(installed.exitCode === 0 && installed.output.includes('indexes installed'), `indexes install (${installed.output})`);
+        const again = await runCommand(session, `\\project indexes 2 ${idxSpec}`);
+        assert(again.exitCode === 0 && again.output.includes('indexes unchanged'), 'reinstalling the same spec is a no-op');
+        const noReader = await runCommand(session, '\\project indexes 2 ./idx.json');
+        assert(noReader.exitCode === 1 && noReader.output.includes('cannot read files'), 'file spec needs a host reader');
+        session.readTextFile = async () => JSON.stringify({ version: 1, indexes: [] });
+        const conflict = await runCommand(session, '\\project indexes 2 ./idx.json');
+        assert(conflict.exitCode === 1 && conflict.output.includes('bump the version'), 'same version, other content is refused');
+        session.readTextFile = undefined;
+        const badJson = await runCommand(session, '\\project indexes 2 {"version": 1,}');
+        assert(badJson.exitCode === 1 && badJson.output.includes('Invalid index spec JSON'), 'bad inline JSON is reported');
+
         await runCommand(session, '\\project stop 2');
 
         const quit = await runCommand(session, '\\quit');

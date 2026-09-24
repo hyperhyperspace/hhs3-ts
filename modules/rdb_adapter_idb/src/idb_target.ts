@@ -7,8 +7,13 @@
 // commitIngest reverts talk to the physical stores directly and never write
 // the outbox, so materialization cannot echo.
 //
-// Post-projection extras (secondary indexes, query helpers, ...) belong on
-// IdbTarget, not MaterializationTarget, and are out of scope for v1.
+// Projection-local indexes (IndexTarget) are shadow entries in the fixed
+// `index_entries` store, maintained in the same transaction as the rows they
+// index (apply(), commitIngest reverts, and facade writes). A native
+// createIndex on `rows` would need a versionchange, which cannot run inside
+// apply(). Entries behave like a native IDBIndex over the table's documents
+// (key path, sparse keys, native order) and are read through the facade's
+// `index()`. The target takes no index options.
 
 import type { json } from "@hyper-hyper-space/hhs3_json";
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
@@ -16,9 +21,10 @@ import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import type { ColumnType } from "@hyper-hyper-space/hhs3_rdb";
 import {
     CapturedBatch, CapturedChange, ChangeSignalListener, ChangeSignalSource,
-    CheckpointMovedError, DEFAULT_KEY_TABLE, IngestSettle, KeyIndex, MaterializationTarget,
-    MaterializedChangeSource, OpEvent, OpEventQuery, OpEventReason, pageOpEvents, RowAction,
-    RowIdentityIndex, SchemaAction, StoredOpEvent, SyncMapping, versionsEqual,
+    CheckpointMovedError, DEFAULT_KEY_TABLE, IndexDecl, IndexSpec, IndexState, IndexTarget, IngestSettle,
+    KeyIndex, MaterializationTarget, MaterializedChangeSource, OpEvent, OpEventQuery, OpEventReason,
+    pageOpEvents, ResolvedIndex, RowAction, RowIdentityIndex, SchemaAction, StoredOpEvent, SyncMapping,
+    versionsEqual,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 import { FacadeDatabase, type FacadeHost } from "./idb_facade.js";
@@ -27,11 +33,14 @@ import {
     storeGetAllPrefix, storePut,
 } from "./idb_env.js";
 import {
+    deleteRange, indexKeyOf, syncEntryRequests, wholeIndexRange, wholeTableRange,
+} from "./idb_index_keys.js";
+import {
     CAPTURE_CONFIG, CAPTURE_KEY, CHECKPOINT, COUNTER_NEXT_KEY_ID, COUNTERS,
-    KEYS, OP_EVENTS, OUTBOX, ROWS, SYNC, TABLE_META,
-    type CaptureConfigRecord, type CheckpointRecord, type CounterRecord,
-    type KeyRecord, type OpEventRecord, type OutboxRecord, type RowRecord,
-    type SyncRecord, type TableMetaRecord,
+    INDEX_ENTRIES, INDEX_META, INDEX_SPEC, KEYS, OP_EVENTS, OUTBOX, ROWS, SYNC, TABLE_META,
+    type CaptureConfigRecord, type CheckpointRecord, type CounterRecord, type IndexEntryRecord,
+    type IndexSpecRecord, type KeyRecord, type OpEventRecord, type OutboxRecord, type RowRecord,
+    type SyncRecord, type TableMetaRecord, reqToPromise,
 } from "./idb_schema.js";
 
 export type IdbTargetOptions = {
@@ -42,10 +51,18 @@ export type IdbTargetOptions = {
 type ApplyCtx = {
     tx: IDBTransaction;
     meta: Map<string, TableMetaRecord>;
+    // Per table, the materialized indexes (read from index_meta inside tx).
+    indexes: Map<string, ResolvedIndex[]>;
 };
 
+function newCtx(tx: IDBTransaction): ApplyCtx {
+    return { tx, meta: new Map(), indexes: new Map() };
+}
+
+const NO_INDEX_OPTIONS = 'the indexeddb target takes no index options';
+
 export class IdbTarget implements MaterializationTarget, MaterializedChangeSource,
-    ChangeSignalSource, RowIdentityIndex, KeyIndex, FacadeHost {
+    ChangeSignalSource, RowIdentityIndex, KeyIndex, IndexTarget, FacadeHost {
 
     readonly name: string;
     readonly env: IdbEnv;
@@ -53,6 +70,9 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
     private capture = false;
     private captureEnabled = false;
     private tableNameSet = new Set<string>();
+    // table -> its indexes, sorted by name. Only feeds the facade's synchronous
+    // `indexNames` / `index()`; reads and writes consult index_meta in-tx.
+    private indexCache = new Map<string, ResolvedIndex[]>();
     private changeListeners = new Set<ChangeSignalListener>();
     private observerChannel: BroadcastChannel | undefined;
     private readonly channelName: string;
@@ -69,6 +89,10 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
     get db(): IDBDatabase { return this.env.db; }
 
     appTables(): string[] { return [...this.tableNameSet]; }
+
+    cachedIndexes(table: string): ResolvedIndex[] { return this.indexCache.get(table) ?? []; }
+
+    cmp(a: unknown, b: unknown): number { return this.env.factory.cmp(a, b); }
 
     isCaptureOn(): boolean { return this.capture && this.captureEnabled; }
 
@@ -94,6 +118,7 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
     private async init(): Promise<void> {
         const metas = await this.env.withRead(TABLE_META, (tx) => storeGetAll<TableMetaRecord>(tx, TABLE_META));
         for (const m of metas) this.tableNameSet.add(m.table);
+        await this.loadIndexCache();
 
         const cfg = await this.env.withRead(CAPTURE_CONFIG, (tx) =>
             storeGet<CaptureConfigRecord>(tx, CAPTURE_CONFIG, CAPTURE_KEY));
@@ -137,10 +162,11 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
     async apply(
         groupId: B64Hash, schemaActions: SchemaAction[], rowActions: RowAction[],
         checkpoint: Version, events?: OpEvent[], expectFrom?: Version | null,
+        expectIndexSpec?: string | null,
     ): Promise<void> {
         this.ensureOpen();
         await this.env.withReadWrite(async (tx) => {
-            const ctx: ApplyCtx = { tx, meta: new Map() };
+            const ctx = newCtx(tx);
             // Compare-and-set guard (concurrent projectors): read the stored
             // checkpoint inside this same readwrite transaction and reject if it is
             // not what the delta was computed against. Throwing aborts the tx, so
@@ -149,6 +175,10 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
                 const rec = await storeGet<CheckpointRecord>(tx, CHECKPOINT, groupId);
                 const stored = rec === undefined ? undefined : new Set(rec.version);
                 if (!versionsEqual(stored, expectFrom ?? undefined)) throw new CheckpointMovedError(groupId);
+            }
+            if (expectIndexSpec !== undefined) {
+                const rec = await storeGet<IndexSpecRecord>(tx, INDEX_SPEC, 1);
+                if ((rec?.fingerprint ?? null) !== expectIndexSpec) throw new CheckpointMovedError(groupId);
             }
             for (const action of schemaActions) await this.applySchemaAction(ctx, action);
             for (const action of rowActions) await this.applyRowAction(ctx, action);
@@ -163,6 +193,9 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
             if (action.kind === 'create-table') this.tableNameSet.add(action.table);
             if (action.kind === 'drop-table') this.tableNameSet.delete(action.table);
         }
+        if (schemaActions.some((a) => a.kind === 'ensure-index' || a.kind === 'drop-index' || a.kind === 'drop-table')) {
+            await this.loadIndexCache();
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -175,6 +208,8 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
             case 'drop-table': return this.dropTable(ctx, action);
             case 'add-column': return this.addColumn(ctx, action);
             case 'drop-column': return this.dropColumn(ctx, action);
+            case 'ensure-index': return this.ensureIndex(ctx, action.index);
+            case 'drop-index': return this.dropIndex(ctx, action.table, action.name);
         }
     }
 
@@ -214,6 +249,11 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         ctx.meta.delete(action.table);
         await deletePrefix(ctx.tx, ROWS, [action.table], (r: RowRecord) => [r.table, r.id]);
         await deletePrefix(ctx.tx, SYNC, [action.table], (r: SyncRecord) => [r.table, r.rowHash]);
+        // The planner drops the table's indexes first; this only guarantees a
+        // table drop never leaves entries behind.
+        await deleteRange(ctx.tx, INDEX_ENTRIES, wholeTableRange(action.table));
+        await deleteRange(ctx.tx, INDEX_META, wholeTableRange(action.table));
+        ctx.indexes.delete(action.table);
     }
 
     private async addColumn(ctx: ApplyCtx, action: Extract<SchemaAction, { kind: 'add-column' }>): Promise<void> {
@@ -236,6 +276,13 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
 
     private async dropColumn(ctx: ApplyCtx, action: Extract<SchemaAction, { kind: 'drop-column' }>): Promise<void> {
         const meta = await this.loadMeta(ctx, action.table);
+        // As SQLite: an indexed column cannot be dropped (the planner drops the
+        // index first).
+        for (const index of await this.tableIndexes(ctx, action.table)) {
+            if (index.columns.some((c) => c.target === action.column)) {
+                throw new Error(`cannot drop '${action.table}.${action.column}': index '${index.name}' uses it`);
+            }
+        }
         delete meta.columnTypes[action.column];
         delete meta.fkColumns[action.column];
         meta.keyRefColumns = meta.keyRefColumns.filter((c) => c !== action.column);
@@ -248,6 +295,67 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
             }
         }
         await storePut(ctx.tx, TABLE_META, meta);
+    }
+
+    // -----------------------------------------------------------------------
+    // Index channel (ensure-index / drop-index, entry maintenance)
+    // -----------------------------------------------------------------------
+
+    private async tableIndexes(ctx: ApplyCtx, table: string): Promise<ResolvedIndex[]> {
+        const cached = ctx.indexes.get(table);
+        if (cached !== undefined) return cached;
+        const list = await storeGetAll<ResolvedIndex>(ctx.tx, INDEX_META, wholeTableRange(table));
+        ctx.indexes.set(table, list);
+        return list;
+    }
+
+    // (Re)build an index from the table's current documents. Idempotent: any
+    // existing entries of the same (table, name) are replaced.
+    private async ensureIndex(ctx: ApplyCtx, index: ResolvedIndex): Promise<void> {
+        const meta = await this.loadMeta(ctx, index.table);
+        for (const c of index.columns) {
+            if (meta.columnTypes[c.target] === undefined && c.target !== meta.authorColumn) {
+                throw new Error(`cannot index '${index.table}.${c.target}': no such column`);
+            }
+        }
+        const others = (await this.tableIndexes(ctx, index.table)).filter((i) => i.name !== index.name);
+        await deleteRange(ctx.tx, INDEX_ENTRIES, wholeIndexRange(index.table, index.name));
+        const rows = await storeGetAllPrefix<RowRecord>(ctx.tx, ROWS, [index.table]);
+        const entries = ctx.tx.objectStore(INDEX_ENTRIES);
+        const puts: Promise<unknown>[] = [];
+        for (const row of rows) {
+            const key = indexKeyOf(row, index);
+            if (key === undefined) continue;
+            const rec: IndexEntryRecord = { table: index.table, name: index.name, key, id: row.id };
+            puts.push(reqToPromise(entries.put(rec)));
+        }
+        await Promise.all(puts);
+        await storePut(ctx.tx, INDEX_META, index);
+        ctx.indexes.set(index.table, [...others, index]);
+    }
+
+    private async dropIndex(ctx: ApplyCtx, table: string, name: string): Promise<void> {
+        const remaining = (await this.tableIndexes(ctx, table)).filter((i) => i.name !== name);
+        await deleteRange(ctx.tx, INDEX_ENTRIES, wholeIndexRange(table, name));
+        await storeDelete(ctx.tx, INDEX_META, [table, name]);
+        ctx.indexes.set(table, remaining);
+    }
+
+    private async syncIndexEntries(
+        ctx: ApplyCtx, table: string, id: number, oldRow: RowRecord | undefined, newRow: RowRecord | undefined,
+    ): Promise<void> {
+        const indexes = await this.tableIndexes(ctx, table);
+        if (indexes.length === 0) return;
+        const reqs = syncEntryRequests(ctx.tx.objectStore(INDEX_ENTRIES), indexes, id, oldRow, newRow);
+        await Promise.all(reqs.map((r) => reqToPromise(r)));
+    }
+
+    // index_meta is keyed [table, name], so each table's list comes out sorted.
+    private async loadIndexCache(): Promise<void> {
+        const metas = await this.env.withRead(INDEX_META, (tx) => storeGetAll<ResolvedIndex>(tx, INDEX_META));
+        const byTable = new Map<string, ResolvedIndex[]>();
+        for (const m of metas) byTable.set(m.table, [...(byTable.get(m.table) ?? []), m]);
+        this.indexCache = byTable;
     }
 
     private async loadMeta(ctx: ApplyCtx, table: string): Promise<TableMetaRecord> {
@@ -333,11 +441,13 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         const authorId = setAuthor ? await this.internKey(ctx.tx, action.author!) : undefined;
 
         if (existing !== undefined) {
+            const before: RowRecord = { ...existing };
             for (const [column, value] of Object.entries(action.values)) {
                 existing[column] = await this.valueForColumn(ctx, meta, column, value, action.keyMaterial);
             }
             if (setAuthor && meta.authorColumn !== undefined) existing[meta.authorColumn] = authorId;
             await storePut(ctx.tx, ROWS, existing);
+            await this.syncIndexEntries(ctx, action.table, id, before, existing);
             return;
         }
 
@@ -351,12 +461,15 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         }
         if (setAuthor && meta.authorColumn !== undefined) rec[meta.authorColumn] = authorId;
         await storePut(ctx.tx, ROWS, rec);
+        await this.syncIndexEntries(ctx, action.table, id, undefined, rec);
     }
 
     private async deleteRow(ctx: ApplyCtx, action: Extract<RowAction, { kind: 'delete-row' }>): Promise<void> {
         const sync = await storeGet<SyncRecord>(ctx.tx, SYNC, [action.table, action.rowId]);
         if (sync !== undefined) {
+            const old = await storeGet<RowRecord>(ctx.tx, ROWS, [action.table, sync.id]);
             await storeDelete(ctx.tx, ROWS, [action.table, sync.id]);
+            await this.syncIndexEntries(ctx, action.table, sync.id, old, undefined);
             sync.status = 'deleted';
             await storePut(ctx.tx, SYNC, sync);
         }
@@ -406,7 +519,7 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         this.requireCapture();
         const effective: SyncMapping[] = [];
         await this.env.withReadWrite(async (tx) => {
-            const ctx: ApplyCtx = { tx, meta: new Map() };
+            const ctx = newCtx(tx);
             for (const m of reservations) {
                 // Claim-or-adopt: the unique (table, id) index tells us whether
                 // another row_hash already holds this local id (a concurrent
@@ -438,7 +551,7 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
     async commitIngest(settle: IngestSettle): Promise<void> {
         this.requireCapture();
         await this.env.withReadWrite(async (tx) => {
-            const ctx: ApplyCtx = { tx, meta: new Map() };
+            const ctx = newCtx(tx);
             for (const m of settle.mappings ?? []) {
                 const existing = await storeGet<SyncRecord>(tx, SYNC, [m.table, m.rowId]);
                 const rec: SyncRecord = existing ?? {
@@ -548,6 +661,53 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         setTimeout(() => {
             try { channel.close(); } catch { /* ignore */ }
         }, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // IndexTarget
+    // -----------------------------------------------------------------------
+
+    async getIndexState(): Promise<IndexState> {
+        this.ensureOpen();
+        return this.env.withRead([INDEX_SPEC, INDEX_META], async (tx) => {
+            const state: IndexState = { materialized: await storeGetAll<ResolvedIndex>(tx, INDEX_META) };
+            const rec = await storeGet<IndexSpecRecord>(tx, INDEX_SPEC, 1);
+            if (rec !== undefined) {
+                state.spec = rec.spec;
+                state.specFingerprint = rec.fingerprint;
+            }
+            return state;
+        });
+    }
+
+    validateIndexOptions(decl: IndexDecl): string | undefined {
+        return decl.options === undefined ? undefined : NO_INDEX_OPTIONS;
+    }
+
+    async installIndexSpec(
+        spec: IndexSpec, specFingerprint: string, actions: SchemaAction[],
+        expect: { specFingerprint: string | undefined; checkpoints: Map<B64Hash, Version> },
+    ): Promise<void> {
+        this.ensureOpen();
+        await this.env.withReadWrite(async (tx) => {
+            const ctx = newCtx(tx);
+            const installed = await storeGet<IndexSpecRecord>(tx, INDEX_SPEC, 1);
+            if (installed?.fingerprint !== expect.specFingerprint) {
+                throw new CheckpointMovedError([...expect.checkpoints.keys()][0] ?? '');
+            }
+            for (const [groupId, cp] of expect.checkpoints) {
+                const rec = await storeGet<CheckpointRecord>(tx, CHECKPOINT, groupId);
+                const stored = rec === undefined ? undefined : new Set(rec.version);
+                if (!versionsEqual(stored, cp)) throw new CheckpointMovedError(groupId);
+            }
+            for (const action of actions) {
+                if (action.kind === 'drop-index') await this.dropIndex(ctx, action.table, action.name);
+                else if (action.kind === 'ensure-index') await this.ensureIndex(ctx, action.index);
+                else throw new Error(`installIndexSpec accepts only index actions, got '${action.kind}'`);
+            }
+            await storePut(tx, INDEX_SPEC, { id: 1, spec, fingerprint: specFingerprint } satisfies IndexSpecRecord);
+        });
+        await this.loadIndexCache();
     }
 
     // -----------------------------------------------------------------------

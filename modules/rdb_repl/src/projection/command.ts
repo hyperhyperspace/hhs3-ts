@@ -11,11 +11,15 @@
 //   \project events <id> [after <n>] [before <n>] [limit <m>] [order asc|desc]
 //   \project register-key <id> <keyHash> <publicKey>
 //   \project resolve-key <id> <token>
+//   \project indexes <id> <spec.json | {inline json}> [dry-run]
+//                                                 install a projection index spec
 
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { formatOpVoidDetail } from "@hyper-hyper-space/hhs3_rdb";
 import type { RDb } from "@hyper-hyper-space/hhs3_rdb";
-import type { IngestResult, OpEvent, OpEventOrder } from "@hyper-hyper-space/hhs3_rdb_adapter";
+import type {
+    IndexReconcileReport, IndexSpec, IngestResult, OpEvent, OpEventOrder,
+} from "@hyper-hyper-space/hhs3_rdb_adapter";
 import { RdbProjection } from "@hyper-hyper-space/hhs3_rdb_projection";
 
 import { formatDisplayString, formatSessionRows } from "../format/display.js";
@@ -24,6 +28,7 @@ import type { ReplSession } from "../session.js";
 import {
     parseProjectCommand,
     type ProjectEventsCommand,
+    type ProjectIndexesCommand,
     type ProjectStartCommand,
 } from "./parse.js";
 import type { ProjectSessionEntry } from "./types.js";
@@ -103,6 +108,7 @@ export async function runProjectCommand(session: ReplSession, remainder: string)
         case 'events': return { output: await events(session, cmd) };
         case 'register-key': return { output: await registerKey(session, cmd.id, cmd.keyHash, cmd.publicKey) };
         case 'resolve-key': return { output: await resolveKey(session, cmd.id, cmd.token) };
+        case 'indexes': return { output: await indexes(session, cmd) };
     }
 }
 
@@ -256,6 +262,50 @@ async function teardown(session: ReplSession, id: number): Promise<void> {
 async function registerKey(session: ReplSession, id: number, keyHash: string, publicKey: string): Promise<string> {
     const allocated = await requireEntry(session, id).projection.registerKey(keyHash, publicKey);
     return `registered key id=${allocated} key_hash=${formatDisplayString(session, keyHash, { role: 'hash', identity: true })}`;
+}
+
+async function indexes(session: ReplSession, cmd: ProjectIndexesCommand): Promise<string> {
+    const projection = requireEntry(session, cmd.id).projection;
+    let text: string;
+    if ('inline' in cmd.spec) {
+        text = cmd.spec.inline;
+    } else {
+        if (session.readTextFile === undefined) {
+            throw new Error('This host cannot read files; pass the index spec inline as {...}');
+        }
+        text = await session.readTextFile(cmd.spec.path);
+    }
+    let spec: IndexSpec;
+    try {
+        spec = JSON.parse(text) as IndexSpec;
+    } catch (e) {
+        throw new Error(`Invalid index spec JSON: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    const report = await projection.reconcileIndexes(spec, { dryRun: cmd.dryRun });
+    return formatIndexReport(cmd.id, spec, report);
+}
+
+function formatIndexReport(id: number, spec: IndexSpec, report: IndexReconcileReport): string {
+    const lines = [`indexes ${report.status} for projection ${id} (spec version ${spec.version})`];
+    if (report.actions.length > 0) {
+        lines.push(formatRows(report.actions.map((a) => a.kind === 'ensure-index'
+            ? {
+                action: 'ensure', table: a.index.table, index: a.index.name,
+                columns: a.index.columns.map((c) => c.target).join(', '),
+            }
+            : a.kind === 'drop-index'
+                ? { action: 'drop', table: a.table, index: a.name, columns: '' }
+                : { action: a.kind, table: '', index: '', columns: '' })));
+    } else if (report.status === 'installed' || report.status === 'dry-run') {
+        lines.push('(no index changes)');
+    }
+    if (report.pending.length > 0) {
+        lines.push('pending (not buildable yet):');
+        lines.push(formatRows(report.pending.map((p) => ({
+            group: p.group, index: p.name, table: p.table, missing: p.missing.join(', '),
+        }))));
+    }
+    return lines.join('\n');
 }
 
 async function resolveKey(session: ReplSession, id: number, token: string): Promise<string> {

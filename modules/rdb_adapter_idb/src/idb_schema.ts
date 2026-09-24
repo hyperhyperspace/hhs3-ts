@@ -7,7 +7,7 @@
 
 import type { json } from "@hyper-hyper-space/hhs3_json";
 import type { ColumnType } from "@hyper-hyper-space/hhs3_rdb";
-import type { OpEvent, SyncStatus } from "@hyper-hyper-space/hhs3_rdb_adapter";
+import type { IndexSpec, OpEvent, SyncStatus } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 export const SCHEMA_VERSION = 1;
 
@@ -20,9 +20,16 @@ export const COUNTERS = 'counters';
 export const OUTBOX = 'outbox';
 export const OP_EVENTS = 'op_events';
 export const CAPTURE_CONFIG = 'capture_config';
+// Projection-local indexes: one shadow entry per (index, indexed row), keyed
+// [table, name, key, id] so IndexedDB orders them exactly like a native index
+// (by key, then primary key). See idb_index_keys.ts.
+export const INDEX_ENTRIES = 'index_entries';
+export const INDEX_META = 'index_meta';
+export const INDEX_SPEC = 'index_spec';
 
 export const ALL_STORES = [
     TABLE_META, CHECKPOINT, ROWS, SYNC, KEYS, COUNTERS, OUTBOX, OP_EVENTS, CAPTURE_CONFIG,
+    INDEX_ENTRIES, INDEX_META, INDEX_SPEC,
 ];
 
 export const COUNTER_NEXT_KEY_ID = 'nextKeyId';
@@ -85,6 +92,21 @@ export type CaptureConfigRecord = {
     enabled: boolean;
 };
 
+export type IndexEntryRecord = {
+    table: string;
+    name: string;
+    key: IDBValidKey;
+    id: number;
+};
+
+// index_meta records are the ResolvedIndex itself (keyed by its table + name).
+
+export type IndexSpecRecord = {
+    id: 1;
+    spec: IndexSpec;
+    fingerprint: string;
+};
+
 export function reqToPromise<T>(req: IDBRequest<T>): Promise<T> {
     return new Promise<T>((resolve, reject) => {
         req.onsuccess = () => resolve(req.result);
@@ -142,4 +164,8 @@ function createStores(db: IDBDatabase): void {
     events.createIndex('by_op', ['opHash', 'direction'], { unique: true });
 
     db.createObjectStore(CAPTURE_CONFIG, { keyPath: 'key' });
+
+    db.createObjectStore(INDEX_ENTRIES, { keyPath: ['table', 'name', 'key', 'id'] });
+    db.createObjectStore(INDEX_META, { keyPath: ['table', 'name'] });
+    db.createObjectStore(INDEX_SPEC, { keyPath: 'id' });
 }

@@ -21,6 +21,10 @@ export type HashWidth = 'auto' | 'full' | number;
 // client forwards to the transcript. Absent => reactive notices are dropped.
 export type ProjectionErrorHandler = (message: string) => void;
 
+// Host-injected file reader for commands that take a file argument (e.g.
+// `\project indexes <id> spec.json`). Absent => only inline arguments work.
+export type TextFileReader = (path: string) => Promise<string>;
+
 export { type RefAutoUpdateMode, type SessionView };
 export { KeyPassphraseRequiredError } from "@hyper-hyper-space/hhs3_rdb_runtime";
 
@@ -36,6 +40,7 @@ export type ReplSessionOptions = {
     createUuid?: () => string;
     projectionTargetFactory?: ProjectionTargetFactory;
     onProjectionError?: ProjectionErrorHandler;
+    readTextFile?: TextFileReader;
     syncMeshFactory?: SyncMeshFactory;
     report?: IssueReporter;
 };
@@ -53,6 +58,8 @@ export class ReplSession extends RdbSession {
     onProjectionError?: ProjectionErrorHandler;
     readonly projections = new Map<number, ProjectSessionEntry>();
     nextProjectId = 1;
+
+    readTextFile?: TextFileReader;
 
     // Host-injected mesh factory + the active \\sync sessions, keyed by a
     // session-global incrementing id that is never reused after stop.
@@ -80,6 +87,7 @@ export class ReplSession extends RdbSession {
         this.stopOnError = options.stopOnError ?? true;
         this.projectionTargetFactory = options.projectionTargetFactory;
         this.onProjectionError = options.onProjectionError;
+        this.readTextFile = options.readTextFile;
         this.syncMeshFactory = options.syncMeshFactory;
         this.report = options.report;
     }

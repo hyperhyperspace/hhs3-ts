@@ -10,6 +10,10 @@
 //   - rdb_table_meta(...): one row per materialized app table recording its
 //     system-column names, its sync table, and a {col: ColumnType} map. Read at
 //     row-application time (and after a restart) so the target never introspects.
+//   - rdb_index_spec(...): the single INSTALLED projection index spec (written
+//     by installIndexSpec) and rdb_index_meta(...): one row per index this
+//     target materialized, with its resolved definition. The core diffs
+//     against these; physical indexes are named `<table>__<name>`.
 //
 // Row identity: the content-addressed rowId maps to the projection-local serial
 // `id` through the per-table sync table (`<table>_sync`, keyed by `row_hash`).
@@ -23,10 +27,18 @@
 // references and keeps id mappings across deletes, which enforced FKs would
 // reject. Callers must not enable foreign_keys on this connection.
 //
+// Indexes: only indexes recorded in rdb_index_meta (declared in the installed
+// spec) are dropped ahead of a remote drop-column. An index the app created by
+// hand on a projected column makes that `ALTER TABLE ... DROP COLUMN` fail, so
+// the whole apply() rolls back and the group's sync stalls until the index is
+// removed. (Table rebuilds preserve hand-made indexes, skipping any on the
+// dropped column.) Declare indexes in the spec rather than creating them.
+//
 // Atomicity: apply() runs schema actions THEN row actions THEN any NOT NULL
-// tighten rebuilds THEN the checkpoint commit inside ONE better-sqlite3
-// transaction; a throw rolls the whole batch back, so the target never claims
-// a checkpoint it does not reflect.
+// tighten rebuilds THEN deferred index ensures (built after the data is
+// loaded) THEN the checkpoint commit inside ONE better-sqlite3 transaction; a
+// throw rolls the whole batch back, so the target never claims a checkpoint
+// it does not reflect.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
@@ -37,9 +49,10 @@ import Database from "better-sqlite3";
 
 import {
     CapturedBatch, CapturedChange, ChangeSignalListener, ChangeSignalSource,
-    CheckpointMovedError, DEFAULT_KEY_TABLE, IngestSettle, KeyIndex, MaterializationTarget,
-    MaterializedChangeSource, OpEvent, OpEventQuery, OpEventReason, resolveOpEventQuery,
-    RowAction, RowIdentityIndex, SchemaAction, StoredOpEvent, SyncMapping, versionsEqual,
+    CheckpointMovedError, DEFAULT_KEY_TABLE, IndexDecl, IndexSpec, IndexState, IndexTarget, IngestSettle,
+    KeyIndex, MaterializationTarget, MaterializedChangeSource, OpEvent, OpEventQuery, OpEventReason,
+    ResolvedIndex, resolveOpEventQuery, RowAction, RowIdentityIndex, SchemaAction, StoredOpEvent, SyncMapping,
+    versionsEqual,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 // Per-table bookkeeping, mirrored in rdb_table_meta. Cached in memory within a
@@ -119,6 +132,79 @@ function columnDecl(name: string, def: ColumnDef): string {
 }
 
 // ---------------------------------------------------------------------------
+// Index options: the SQLite format for the opaque IndexDecl `options`,
+// validated strictly (any other key, at either level, is refused):
+//   { columns?: { [rdbColumn]: { desc?: boolean,
+//                                collate?: 'NOCASE' | 'RTRIM' | 'BINARY',
+//                                whereNotNull?: boolean } } }
+// Only columns the index lists may be named: the core drops an index before
+// one of its listed columns dies, and SQLite refuses to drop a column an index
+// still uses. `whereNotNull` columns form a partial index (ANDed).
+// ---------------------------------------------------------------------------
+
+type SqliteColumnOptions = { desc?: boolean; collate?: 'NOCASE' | 'RTRIM' | 'BINARY'; whereNotNull?: boolean };
+type SqliteIndexOptions = { columns?: { [rdbColumn: string]: SqliteColumnOptions } };
+
+const COLLATIONS = new Set(['NOCASE', 'RTRIM', 'BINARY']);
+const COLUMN_OPTION_KEYS = new Set(['desc', 'collate', 'whereNotNull']);
+
+function isPlainObject(v: json.Literal | undefined): v is json.LiteralMap {
+    return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+// A reason when `options` is not valid for an index over `listed` columns.
+function sqliteIndexOptionsProblem(options: json.Literal | undefined, listed: Set<string>): string | undefined {
+    if (options === undefined) return undefined;
+    if (!isPlainObject(options)) return 'sqlite index options must be an object';
+    for (const key of Object.keys(options)) {
+        if (key !== 'columns') return `unknown sqlite index option '${key}'`;
+    }
+    const columns = options.columns;
+    if (columns === undefined) return undefined;
+    if (!isPlainObject(columns)) return "'columns' must map column names to their options";
+    for (const [column, colOpts] of Object.entries(columns)) {
+        if (!listed.has(column)) return `'columns' names '${column}', which the index does not list`;
+        if (!isPlainObject(colOpts)) return `the options for '${column}' must be an object`;
+        for (const key of Object.keys(colOpts)) {
+            if (!COLUMN_OPTION_KEYS.has(key)) return `unknown sqlite column option '${key}' on '${column}'`;
+        }
+        for (const flag of ['desc', 'whereNotNull'] as const) {
+            if (colOpts[flag] !== undefined && typeof colOpts[flag] !== 'boolean') {
+                return `'${flag}' on '${column}' must be true or false`;
+            }
+        }
+        const collation = colOpts.collate;
+        if (collation !== undefined && (typeof collation !== 'string' || !COLLATIONS.has(collation))) {
+            return `unknown collation '${String(collation)}' for '${column}'`;
+        }
+    }
+    return undefined;
+}
+
+function physicalIndexName(table: string, name: string): string {
+    return `${table}__${name}`;
+}
+
+// CREATE INDEX for a resolved index. Plain CREATE INDEX (no IF NOT EXISTS): a
+// name collision with an index we do not own must fail, not be adopted.
+function createIndexSql(index: ResolvedIndex): string {
+    const problem = sqliteIndexOptionsProblem(index.options, new Set(index.columns.map((c) => c.rdb)));
+    if (problem !== undefined) throw new Error(`index '${index.name}' on '${index.table}': ${problem}`);
+    const perColumn = ((index.options ?? {}) as SqliteIndexOptions).columns ?? {};
+    const cols = index.columns.map((c) => {
+        const o = perColumn[c.rdb];
+        return quoteId(c.target) + (o?.collate !== undefined ? ` COLLATE ${o.collate}` : '') + (o?.desc === true ? ' DESC' : '');
+    });
+    let sql = `CREATE INDEX ${quoteId(physicalIndexName(index.table, index.name))} `
+        + `ON ${quoteId(index.table)} (${cols.join(', ')})`;
+    const notNull = index.columns.filter((c) => perColumn[c.rdb]?.whereNotNull === true);
+    if (notNull.length > 0) {
+        sql += ' WHERE ' + notNull.map((c) => `${quoteId(c.target)} IS NOT NULL`).join(' AND ');
+    }
+    return sql;
+}
+
+// ---------------------------------------------------------------------------
 
 // Convert a stored SQLite value back to its logical rdb value, inverting
 // toParam: booleans from 0/1, json from canonical text, everything else as-is.
@@ -130,7 +216,8 @@ function toLogical(value: unknown, type: ColumnType): json.Literal | undefined {
     return value as json.Literal;
 }
 
-export class SqliteTarget implements MaterializationTarget, MaterializedChangeSource, ChangeSignalSource, RowIdentityIndex, KeyIndex {
+export class SqliteTarget implements MaterializationTarget, MaterializedChangeSource, ChangeSignalSource,
+    RowIdentityIndex, KeyIndex, IndexTarget {
     private db: Database.Database;
     private metaCache = new Map<string, TableMeta>();
     private bookkeepingReady = false;
@@ -225,6 +312,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     async apply(
         groupId: B64Hash, schemaActions: SchemaAction[], rowActions: RowAction[],
         checkpoint: Version, events?: OpEvent[], expectFrom?: Version | null,
+        expectIndexSpec?: string | null,
     ): Promise<void> {
         this.ensureBookkeeping();
         // CAS on a read so a stale/null expectFrom still throws without opening a
@@ -234,6 +322,9 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         // with empty actions still persists (below).
         const stored = this.readCheckpoint(groupId);
         if (expectFrom !== undefined && !versionsEqual(stored, expectFrom ?? undefined)) {
+            throw new CheckpointMovedError(groupId);
+        }
+        if (expectIndexSpec !== undefined && (this.readIndexSpecFingerprint() ?? null) !== expectIndexSpec) {
             throw new CheckpointMovedError(groupId);
         }
         const empty = schemaActions.length === 0 && rowActions.length === 0
@@ -248,13 +339,20 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             if (expectFrom !== undefined && !versionsEqual(this.readCheckpoint(groupId), expectFrom ?? undefined)) {
                 throw new CheckpointMovedError(groupId);
             }
+            if (expectIndexSpec !== undefined && (this.readIndexSpecFingerprint() ?? null) !== expectIndexSpec) {
+                throw new CheckpointMovedError(groupId);
+            }
             // Echo suppression: mark the whole batch as adapter-authored so the
             // capture triggers no-op on our own materialization writes.
             const tighten: { table: string; column: string }[] = [];
+            const ensures: ResolvedIndex[] = [];
             if (this.capture) this.setApplying(true);
-            for (const action of schemaActions) this.applySchemaAction(action, tighten);
+            for (const action of schemaActions) this.applySchemaAction(action, tighten, ensures);
             for (const action of rowActions) this.applyRowAction(action);
             this.applyTightens(tighten);
+            // Indexes are built last: over the loaded rows (faster than
+            // maintaining them per insert) and after any tighten rebuild.
+            for (const index of ensures) this.createIndex(index);
             this.persistCheckpoint(groupId, checkpoint);
             // Concurrency void/reinstate flips ride the same checkpoint advance.
             if (events !== undefined) for (const e of events) this.logOpEvent(e);
@@ -301,7 +399,15 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             + 'id INTEGER PRIMARY KEY AUTOINCREMENT, origin TEXT NOT NULL, direction TEXT NOT NULL, '
             + 'group_id TEXT NOT NULL, op_hash TEXT NOT NULL, op_json TEXT, kind TEXT NOT NULL, '
             + '"table" TEXT, row_hash TEXT, local_id INTEGER, author TEXT, reason TEXT, '
-            + "created_at TEXT NOT NULL DEFAULT (datetime('now')), UNIQUE (op_hash, direction));");
+            + "created_at TEXT NOT NULL DEFAULT (datetime('now')), UNIQUE (op_hash, direction));"
+            // Projection-local indexes: the installed spec (one row) and the
+            // indexes actually materialized (resolved definition as JSON).
+            + 'CREATE TABLE IF NOT EXISTS rdb_index_spec ('
+            + 'id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL, spec TEXT NOT NULL, '
+            + 'fingerprint TEXT NOT NULL);'
+            + 'CREATE TABLE IF NOT EXISTS rdb_index_meta ('
+            + '"table" TEXT NOT NULL, name TEXT NOT NULL, group_id TEXT NOT NULL, def TEXT NOT NULL, '
+            + 'fingerprint TEXT NOT NULL, PRIMARY KEY ("table", name));');
 
         // Migration: older sync tables predate the `status` column. Add it where
         // missing so upsert/delete/reserve can record lifecycle status.
@@ -456,14 +562,84 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     // -----------------------------------------------------------------------
 
     private applySchemaAction(
-        action: SchemaAction, tighten: { table: string; column: string }[],
+        action: SchemaAction, tighten: { table: string; column: string }[], ensures: ResolvedIndex[],
     ): void {
         switch (action.kind) {
             case 'create-table': return this.createTable(action);
             case 'drop-table': return this.dropTable(action);
             case 'add-column': return this.addColumn(action, tighten);
             case 'drop-column': return this.dropColumn(action);
+            case 'drop-index': return this.dropIndex(action.table, action.name);
+            case 'ensure-index': ensures.push(action.index); return;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Projection-local indexes
+    // -----------------------------------------------------------------------
+
+    private readIndexSpecFingerprint(): string | undefined {
+        const row = this.db.prepare('SELECT fingerprint FROM rdb_index_spec WHERE id = 1').get() as
+            { fingerprint: string } | undefined;
+        return row?.fingerprint;
+    }
+
+    private createIndex(index: ResolvedIndex): void {
+        this.db.exec(createIndexSql(index));
+        this.db.prepare(
+            'INSERT INTO rdb_index_meta ("table", name, group_id, def, fingerprint) VALUES (?, ?, ?, ?, ?)')
+            .run(index.table, index.name, index.groupId, JSON.stringify(index), index.fingerprint);
+    }
+
+    // IF EXISTS: a DROP TABLE (or a rebuild skipping it) may already have
+    // removed the physical index; the record goes either way.
+    private dropIndex(table: string, name: string): void {
+        this.db.exec(`DROP INDEX IF EXISTS ${quoteId(physicalIndexName(table, name))}`);
+        this.db.prepare('DELETE FROM rdb_index_meta WHERE "table" = ? AND name = ?').run(table, name);
+    }
+
+    async getIndexState(): Promise<IndexState> {
+        this.ensureBookkeeping();
+        const rows = this.db.prepare('SELECT def FROM rdb_index_meta ORDER BY "table", name').all() as
+            { def: string }[];
+        const state: IndexState = { materialized: rows.map((r) => JSON.parse(r.def) as ResolvedIndex) };
+        const spec = this.db.prepare('SELECT spec, fingerprint FROM rdb_index_spec WHERE id = 1').get() as
+            { spec: string; fingerprint: string } | undefined;
+        if (spec !== undefined) {
+            state.spec = JSON.parse(spec.spec) as IndexSpec;
+            state.specFingerprint = spec.fingerprint;
+        }
+        return state;
+    }
+
+    validateIndexOptions(decl: IndexDecl): string | undefined {
+        return sqliteIndexOptionsProblem(decl.options, new Set(decl.columns));
+    }
+
+    async installIndexSpec(
+        spec: IndexSpec, specFingerprint: string, actions: SchemaAction[],
+        expect: { specFingerprint: string | undefined; checkpoints: Map<B64Hash, Version> },
+    ): Promise<void> {
+        this.ensureBookkeeping();
+        const run = this.db.transaction(() => {
+            if (this.readIndexSpecFingerprint() !== expect.specFingerprint) {
+                throw new CheckpointMovedError([...expect.checkpoints.keys()][0] ?? '');
+            }
+            for (const [groupId, cp] of expect.checkpoints) {
+                if (!versionsEqual(this.readCheckpoint(groupId), cp)) throw new CheckpointMovedError(groupId);
+            }
+            const ensures: ResolvedIndex[] = [];
+            for (const action of actions) {
+                if (action.kind === 'drop-index') this.dropIndex(action.table, action.name);
+                else if (action.kind === 'ensure-index') ensures.push(action.index);
+                else throw new Error(`installIndexSpec accepts only index actions, got '${action.kind}'`);
+            }
+            for (const index of ensures) this.createIndex(index);
+            this.db.prepare(
+                'INSERT OR REPLACE INTO rdb_index_spec (id, version, spec, fingerprint) VALUES (1, ?, ?, ?)')
+                .run(spec.version, JSON.stringify(spec), specFingerprint);
+        });
+        run.immediate();
     }
 
     private createTable(action: Extract<SchemaAction, { kind: 'create-table' }>): void {
@@ -545,6 +721,8 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         this.db.exec(`DROP TABLE ${quoteId(action.table)}`);
         this.db.exec(`DROP TABLE ${quoteId(action.syncTable)}`);
         this.db.prepare('DELETE FROM rdb_table_meta WHERE "table" = ?').run(action.table);
+        // DROP TABLE took the table's indexes with it.
+        this.db.prepare('DELETE FROM rdb_index_meta WHERE "table" = ?').run(action.table);
         this.metaCache.delete(action.table);
     }
 
@@ -646,12 +824,29 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             decls.push(`FOREIGN KEY (${froms}) REFERENCES ${quoteId(group[0].table)} (${tos})`);
         }
 
+        // DROP TABLE removes every index on the table (projection-managed and
+        // hand-made alike), so capture their DDL and replay it on the rebuilt
+        // table. An index on the dropped column cannot survive; its record (if
+        // managed) goes with it.
+        const indexes = (this.db.prepare(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL")
+            .all(table) as { name: string; sql: string }[])
+            .filter((ix) => {
+                if (opts.dropColumn === undefined) return true;
+                const cols = this.db.prepare(`PRAGMA index_info(${quoteId(ix.name)})`).all() as { name: string | null }[];
+                if (!cols.some((c) => c.name === opts.dropColumn)) return true;
+                this.db.prepare('DELETE FROM rdb_index_meta WHERE "table" = ? AND "table" || \'__\' || name = ?')
+                    .run(table, ix.name);
+                return false;
+            });
+
         const tmp = table + '__rebuild';
         const cols = keep.map((c) => quoteId(c.name)).join(', ');
         this.db.exec(`CREATE TABLE ${quoteId(tmp)} (${decls.join(', ')})`);
         this.db.exec(`INSERT INTO ${quoteId(tmp)} (${cols}) SELECT ${cols} FROM ${quoteId(table)}`);
         this.db.exec(`DROP TABLE ${quoteId(table)}`);
         this.db.exec(`ALTER TABLE ${quoteId(tmp)} RENAME TO ${quoteId(table)}`);
+        for (const ix of indexes) this.db.exec(ix.sql);
 
         // DROP TABLE cleared this table's sqlite_sequence row, and the copy above
         // only re-seeded it to MAX(app.id) among surviving rows. The sync table is

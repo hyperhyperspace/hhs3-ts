@@ -4,7 +4,10 @@
 // in @hyper-hyper-space/hhs3_rdb_adapter.
 
 export { IdbTarget, type IdbTargetOptions } from "./idb_target.js";
-export { FacadeDatabase, FacadeTransaction, FacadeObjectStore, FacadeRequest } from "./idb_facade.js";
+export {
+    FacadeDatabase, FacadeTransaction, FacadeObjectStore, FacadeRequest, FacadeIndex, FacadeCursor,
+} from "./idb_facade.js";
 export {
     SCHEMA_VERSION, TABLE_META, CHECKPOINT, ROWS, SYNC, KEYS, COUNTERS, OUTBOX, OP_EVENTS, CAPTURE_CONFIG,
+    INDEX_ENTRIES, INDEX_META, INDEX_SPEC,
 } from "./idb_schema.js";

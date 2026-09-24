@@ -1,8 +1,12 @@
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
-import type { RTableGroupDelta } from "@hyper-hyper-space/hhs3_rdb";
+import type { RSchemaView, RTableGroupDelta } from "@hyper-hyper-space/hhs3_rdb";
 
 import { initialRowActions, planIncrementalRowActions } from "../../src/project.js";
 import { initialSchemaActions, reprojectedTables, schemaDeltaActions } from "../../src/schema_actions.js";
+import {
+    groupIndexDecls, planIndexActions, resolveIndexes, validateIndexSpec, withIndexActions,
+} from "../../src/index_actions.js";
+import { AUTHOR_INDEX_COLUMN, type IndexDecl, type IndexSpec, type ResolvedIndex, type SchemaAction } from "../../src/types.js";
 import {
     collectExtendingPairs, generateProjectHistory, resolveFuzzSweepOptions, subsamplePairs,
     mergeTallies, assertPathologicalCoverage,
@@ -19,24 +23,84 @@ function mismatch(kind: string, history: ProjectHistory, startIdx: number, endId
     );
 }
 
+// An index spec covering every column either view knows (so the delta both
+// kills and completes declarations): one single-column index per column, an
+// author index and a two-column composite per table, plus indexPub.
+function fuzzIndexSpec(groupName: string, views: RSchemaView[]): IndexSpec {
+    const columnsByTable = new Map<string, Set<string>>();
+    for (const view of views) {
+        for (const table of view.getTableNames()) {
+            const cols = columnsByTable.get(table) ?? new Set<string>();
+            for (const c of Object.keys(view.getTable(table)?.columns ?? {})) cols.add(c);
+            columnsByTable.set(table, cols);
+        }
+    }
+    const indexes: IndexDecl[] = [];
+    for (const table of [...columnsByTable.keys()].sort()) {
+        const cols = [...columnsByTable.get(table)!].sort();
+        for (const c of cols) indexes.push({ name: `ix_${table}_${c}`, group: groupName, table, columns: [c] });
+        indexes.push({ name: `ix_${table}_author`, group: groupName, table, columns: [AUTHOR_INDEX_COLUMN] });
+        if (cols.length >= 2) {
+            indexes.push({ name: `ix_${table}_pair`, group: groupName, table, columns: [cols[0]!, cols[1]!] });
+        }
+    }
+    const spec: IndexSpec = { version: 1, indexes, indexPub: true };
+    const invalid = validateIndexSpec(spec);
+    if (invalid !== undefined) throw new Error(`fuzz index spec is invalid: ${invalid}`);
+    return spec;
+}
+
+function desiredIndexes(spec: IndexSpec, groupName: string, groupId: string, view: RSchemaView): ResolvedIndex[] {
+    return resolveIndexes(groupIndexDecls(spec, groupName, view), groupId, view, {}).resolved;
+}
+
+function withPlannedIndexes(
+    spec: IndexSpec, groupName: string, groupId: string, view: RSchemaView,
+    materialized: ResolvedIndex[], schemaActions: SchemaAction[],
+): SchemaAction[] {
+    const plan = planIndexActions(desiredIndexes(spec, groupName, groupId, view), materialized, schemaActions);
+    return withIndexActions(schemaActions, plan);
+}
+
 async function checkPair(history: ProjectHistory, startIdx: number, endIdx: number, start: Version, end: Version): Promise<void> {
     const { group } = history;
     const groupId = group.getId();
+    const groupName = group.getName();
     const startGroupView = await group.getView(start, start);
     const endGroupView = await group.getView(end, end);
     const startView = startGroupView.getSchemaView();
     const endView = endGroupView.getSchemaView();
     const delta = (await group.computeDelta(start, end)) as RTableGroupDelta;
+    const indexSpec = fuzzIndexSpec(groupName, [startView, endView]);
 
     const full = new ActionStore();
-    full.apply(initialSchemaActions(endView), await initialRowActions(endGroupView));
+    full.apply(
+        withPlannedIndexes(indexSpec, groupName, groupId, endView, [], initialSchemaActions(endView)),
+        await initialRowActions(endGroupView),
+    );
 
     const inc = new ActionStore();
-    inc.apply(initialSchemaActions(startView), await initialRowActions(startGroupView));
     inc.apply(
-        schemaDeltaActions(delta.schemaChanges, endView, startView),
-        await planIncrementalRowActions(endGroupView, delta, startView, endView, groupId),
+        withPlannedIndexes(indexSpec, groupName, groupId, startView, [], initialSchemaActions(startView)),
+        await initialRowActions(startGroupView),
     );
+    try {
+        inc.apply(
+            withPlannedIndexes(indexSpec, groupName, groupId, endView, inc.materializedIndexes(),
+                schemaDeltaActions(delta.schemaChanges, endView, startView)),
+            await planIncrementalRowActions(endGroupView, delta, startView, endView, groupId),
+        );
+    } catch (e) {
+        throw mismatch('project-index-apply', history, startIdx, endIdx, String(e));
+    }
+
+    const fullIdx = full.indexFingerprint();
+    const incIdx = inc.indexFingerprint();
+    const wantIdx = desiredIndexes(indexSpec, groupName, groupId, endView).map((i) => i.fingerprint).sort().join('\n');
+    if (fullIdx !== incIdx || fullIdx !== wantIdx) {
+        throw mismatch('project-indexes', history, startIdx, endIdx,
+            `fullIdx=${fullIdx}\nincIdx=${incIdx}\nwantIdx=${wantIdx}`);
+    }
 
     const fullFp = full.fingerprint();
     const incFp = inc.fingerprint();

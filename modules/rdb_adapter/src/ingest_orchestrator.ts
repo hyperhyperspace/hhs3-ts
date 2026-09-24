@@ -583,6 +583,14 @@ export async function ingestDatabaseChanges(
     return toResults();
 }
 
+// The per-database single-flight lock shared by the sync cycle and index
+// reconciliation, so a reconcile can never interleave with a sync over the
+// same member set in this process.
+export async function withDatabaseLock<T>(members: GroupProjection[], fn: () => Promise<T>): Promise<T> {
+    const lockKey = members.map((m) => m.group.getId()).sort().join('|');
+    return withLock('db:' + lockKey, fn);
+}
+
 // The replica-wide coordinated cycle: ingest all members' local edits, THEN
 // project every member back into the shared target. Single-flighted across the
 // whole database (the shared outbox is drained once).
@@ -591,8 +599,7 @@ export async function syncDatabase(
     backend: BidirectionalTarget,
     newUuid: () => string = defaultNewUuid,
 ): Promise<Map<B64Hash, IngestResult>> {
-    const lockKey = members.map((m) => m.group.getId()).sort().join('|');
-    return withLock('db:' + lockKey, async () => {
+    return withDatabaseLock(members, async () => {
         const ingestable = members.filter((m) => m.config.writer !== undefined);
         let results = new Map<B64Hash, IngestResult>();
         if (ingestable.length > 0) {
