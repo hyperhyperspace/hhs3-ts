@@ -141,7 +141,7 @@ export const rschemaTests = {
                 const signed = await signPayload({
                     action: 'schema-update',
                     migration: [{ rule: 'set-concurrent-deletes', table: 'orders', value: true }],
-                } as unknown as json.LiteralMap, admin);
+                } as unknown as json.LiteralMap, admin, at);
 
                 assertTrue((await schema.validatePayload(signed, at)).valid, 'intact signed update should validate');
                 assertFalse((await schema.validatePayload({ ...signed, note: 'tampered' }, at)).valid,
@@ -156,7 +156,7 @@ export const rschemaTests = {
                 const at = await scopedDag.getFrontier();
 
                 const signedUpdate = async (migration: json.Literal) =>
-                    signPayload({ action: 'schema-update', migration } as unknown as json.LiteralMap, admin);
+                    signPayload({ action: 'schema-update', migration } as unknown as json.LiteralMap, admin, at);
 
                 assertFalse((await schema.validatePayload(await signedUpdate(
                     [{ rule: 'add-table', def: ordersTable() }]), at)).valid,

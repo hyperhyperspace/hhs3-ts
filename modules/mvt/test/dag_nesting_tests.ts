@@ -49,8 +49,20 @@ async function testRootScopedLoadAllEntries() {
 const CHILD_SCOPE_ID = 'child-scope-test';
 
 class MockChildScope implements DagScope {
+    private start: Position;
+    private context: string;
+
+    constructor(start: Position = position(), context: string = CHILD_SCOPE_ID) {
+        this.start = start;
+        this.context = context;
+    }
+
+    signingContext(): Literal {
+        return { child: this.context };
+    }
+
     startAt(): Position {
-        return position();
+        return this.start;
     }
 
     startEmpty(): boolean {
@@ -121,10 +133,59 @@ async function testNestedScopedLoadAllEntries() {
     testing.assertTrue(rootCount === 3, 'root scoped stream should still include all physical entries');
 }
 
+function samePosition(a: Position, b: Position): boolean {
+    return a.size === b.size && [...a].every((h) => b.has(h));
+}
+
+async function testResolvePosition() {
+    const rawDag = createTestDag();
+    const rootScoped = new RootScopedDag(rawDag);
+
+    const h0 = await rootScoped.append({ label: 'parent' }, { scope: json.toSet(['other-scope']) });
+    testing.assertTrue(samePosition(await rootScoped.resolvePosition(), position(h0)),
+        'root resolvePosition() should default to the frontier');
+    testing.assertTrue(samePosition(await rootScoped.resolvePosition(position('x')), position('x')),
+        'root resolvePosition(at) should pass at through');
+
+    const childScoped = new NestedScopedDag(rootScoped, new MockChildScope(position(h0)));
+
+    testing.assertTrue(samePosition(await childScoped.resolvePosition(), position(h0)),
+        'an empty nested scope should resolve to its start position');
+    testing.assertTrue(samePosition(await childScoped.resolvePosition(position()), position(h0)),
+        'an explicit empty position should resolve to the start position');
+
+    const resolved = await childScoped.resolvePosition();
+    const h1 = await childScoped.append({ label: 'alpha' }, {}, resolved);
+    const entry = await rawDag.loadEntry(h1);
+    const prevs = position(...json.fromSet(entry!.header.prevEntryHashes));
+    testing.assertTrue(samePosition(prevs, resolved),
+        'the resolved position should be exactly the appended entry predecessors');
+
+    testing.assertTrue(samePosition(await childScoped.resolvePosition(), position(h1)),
+        'a non-empty nested scope should resolve to its own frontier');
+    testing.assertTrue(samePosition(await childScoped.resolvePosition(position(h0, h1)), position(h0, h1)),
+        'a non-empty explicit position should pass through');
+}
+
+async function testSigningScope() {
+    const rootScoped = new RootScopedDag(createTestDag());
+    const childA = new NestedScopedDag(rootScoped, new MockChildScope(position(), 'a'));
+    const childAB = new NestedScopedDag(childA, new MockChildScope(position(), 'b'));
+
+    testing.assertTrue(json.toStringNormalized(rootScoped.signingScope()) === '[]',
+        'the root signing scope should be empty');
+    testing.assertTrue(json.toStringNormalized(childA.signingScope()) === json.toStringNormalized([{ child: 'a' }]),
+        'one nesting level should contribute its context');
+    testing.assertTrue(json.toStringNormalized(childAB.signingScope()) === json.toStringNormalized([{ child: 'a' }, { child: 'b' }]),
+        'two nesting levels should accumulate contexts outermost first');
+}
+
 export const dagNestingSuite = {
     title: 'DAG nesting (ScopedDag)',
     tests: [
         { name: '[DNS00] RootScopedDag loadAllEntries returns all entries in topo order', invoke: testRootScopedLoadAllEntries },
         { name: '[DNS01] NestedScopedDag loadAllEntries filters and unwraps one layer', invoke: testNestedScopedLoadAllEntries },
+        { name: '[DNS02] resolvePosition matches the position append records', invoke: testResolvePosition },
+        { name: '[DNS03] signingScope accumulates contexts through nesting', invoke: testSigningScope },
     ],
 };

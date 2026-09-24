@@ -14,6 +14,7 @@ import { rtableEnforceTests } from "./rtable_enforce_tests.js";
 import { rtableXGroupTests } from "./rtable_xgroup_tests.js";
 import { rtableObserveGateTests } from "./rtable_observe_gate_tests.js";
 import { rtablePermTests } from "./rtable_perm_tests.js";
+import { replayTests } from "./replay_tests.js";
 import { rtableQueryTests } from "./rtable_query_tests.js";
 import { rtableDeployTests } from "./rtable_deploy_tests.js";
 import { columnIncarnationTests } from "./column_incarnation_tests.js";
@@ -44,6 +45,7 @@ async function main() {
     allTests.set(rtableXGroupTests.title, rtableXGroupTests.tests);
     allTests.set(rtableObserveGateTests.title, rtableObserveGateTests.tests);
     allTests.set(rtablePermTests.title, rtablePermTests.tests);
+    allTests.set(replayTests.title, replayTests.tests);
     allTests.set(rtableQueryTests.title, rtableQueryTests.tests);
     allTests.set(rtableDeployTests.title, rtableDeployTests.tests);
     allTests.set(columnIncarnationTests.title, columnIncarnationTests.tests);

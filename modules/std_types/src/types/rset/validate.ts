@@ -154,7 +154,7 @@ async function validateRefAdvancePayload(payload: Payload, rset: RSet, at: Versi
         return validationFailure("RSet ref-advance is not monotonic");
     }
 
-    if (!await verifyPayloadSignature(payload as json.LiteralMap, (keyId) => rcap.lookupKey(keyId))) {
+    if (!await verifyPayloadSignature(payload as json.LiteralMap, at, (keyId) => rcap.lookupKey(keyId), observerDag.signingScope())) {
         return validationFailure("RSet ref-advance signature could not be verified");
     }
 
@@ -176,7 +176,8 @@ async function checkPayloadAuth(payload: Payload, rset: RSet, at: Version, capNa
     const rcap = await rset.loadRCap();
     if (rcap === undefined) return validationFailure("permissioned set capability object is not available");
 
-    if (!await verifyPayloadSignature(payload as json.LiteralMap, (keyId) => rcap.lookupKey(keyId))) {
+    const scope = (await rset.getScopedDag()).signingScope();
+    if (!await verifyPayloadSignature(payload as json.LiteralMap, at, (keyId) => rcap.lookupKey(keyId), scope)) {
         return validationFailure("RSet payload signature could not be verified");
     }
 

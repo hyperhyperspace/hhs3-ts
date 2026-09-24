@@ -49,6 +49,7 @@ import type { RSchemaView } from "../rschema/interfaces.js";
 import type { IncarnationId } from "../rschema/incarnation.js";
 import type { RowOpPayload, InsertRowPayload } from "../rtable/payload.js";
 import type { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload } from "./payload.js";
+import { tableSigningContext } from "./payload.js";
 
 // The unwrapped shape of a multi-row entry (group create / bundle) within a
 // table scope: this table's slice of the entry's ops.
@@ -257,6 +258,10 @@ export class TableScope implements DagScope {
 
     baseFilter(): EntryMetaFilter {
         return { containsValues: { tables: [this.table] } };
+    }
+
+    signingContext(): json.Literal {
+        return tableSigningContext(this.table);
     }
 
     wrapPayload(payload: json.Literal, _at: Position): json.Literal {

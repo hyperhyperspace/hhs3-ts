@@ -575,7 +575,7 @@ export class RTableGroupImpl implements RTableGroupContract {
 
         const { payload: base, meta } = prepareRefAdvance(this.getSchemaRef(), refVersion);
         const payload = author !== undefined
-            ? await signPayloadHelper(base as unknown as json.LiteralMap, author)
+            ? await signPayloadHelper(base as unknown as json.LiteralMap, author, at)
             : base as unknown as json.LiteralMap;
 
         if (this.selfValidate()) {
@@ -614,7 +614,7 @@ export class RTableGroupImpl implements RTableGroupContract {
 
         const base = createRefAdvancePayload(groupId, refVersion);
         const payload = author !== undefined
-            ? await signPayloadHelper(base as unknown as json.LiteralMap, author)
+            ? await signPayloadHelper(base as unknown as json.LiteralMap, author, at)
             : base as unknown as json.LiteralMap;
         const meta = createRefAdvanceMeta(groupId);   // barrier (default)
 
@@ -638,21 +638,25 @@ export class RTableGroupImpl implements RTableGroupContract {
     // Single-entry atomic multi-table write. `writes` is ORDERED (the bundle
     // order, carried explicitly because entry hashing sorts map keys): op i's
     // FK conditions are checked at the sequential cut `at` ∪ earlier ops.
-    // `author` signs every op; the whole entry validates and applies as a
-    // unit (all-or-nothing).
+    // `author` signs the bundle once, as a whole; each op only carries the
+    // `author` claim (no signature of its own), so ops cannot be lifted out or
+    // recombined. The whole entry validates and applies as a unit
+    // (all-or-nothing).
     async bundle(writes: BundleWrite[], author?: OwnIdentity, at?: Version): Promise<B64Hash> {
         const scopedDag = await this.getScopedDag();
         at = at ?? await scopedDag.getFrontier();
 
-        const signed: BundlePayload['writes'] = [];
-        for (const write of writes) {
-            const op = author !== undefined
-                ? await signPayloadHelper(write.op as unknown as json.LiteralMap, author)
-                : write.op as unknown as json.Literal;
-            signed.push({ table: write.table, op });
-        }
+        const claimed: BundlePayload['writes'] = writes.map((write) => ({
+            table: write.table,
+            op: author !== undefined
+                ? { ...(write.op as unknown as json.LiteralMap), author: author.keyId }
+                : write.op as unknown as json.Literal,
+        }));
 
-        const payload: BundlePayload = { action: 'bundle', writes: signed };
+        const base: BundlePayload = { action: 'bundle', writes: claimed };
+        const payload = author !== undefined
+            ? await signPayloadHelper(base as unknown as json.LiteralMap, author, at) as unknown as BundlePayload
+            : base;
 
         const result = await this.validatePayload(payload, at);
         if (!result.valid) {

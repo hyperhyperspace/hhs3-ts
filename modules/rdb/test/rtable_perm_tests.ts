@@ -8,6 +8,7 @@ import { signPayload, serializePublicKeyToBase64, formatValidationFailure, Valid
 import { createMockRContext } from "./mock_rcontext.js";
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
 import { RTableGroupImpl, rTableGroupFactory } from "../src/rtable_group/group.js";
+import { tableSigningContext } from "../src/rtable_group/payload.js";
 import { deriveRowId } from "../src/rtable/hash.js";
 import type { TableDef, Predicate } from "../src/rschema/payload.js";
 import type { RContext } from "@hyper-hyper-space/hhs3_mvt";
@@ -98,10 +99,10 @@ async function makeAppGroup(ctx: RContext, seed: string, tables: TableDef[], use
 
 // A signed row-envelope payload (for direct validatePayload assertions).
 async function authoredInsertEnvelope(
-    table: string, uuid: string, values: { [c: string]: json.Literal }, author: OwnIdentity,
+    table: string, uuid: string, values: { [c: string]: json.Literal }, author: OwnIdentity, at: Version,
 ): Promise<json.LiteralMap> {
     const base: { [k: string]: json.Literal } = { action: 'insert', rowId: deriveRowId(uuid, author.keyId), uuid, values };
-    const op = await signPayload(base, author);
+    const op = await signPayload(base, author, at, [tableSigningContext(table)]);
     return { action: 'row', table, op: op as unknown as json.Literal };
 }
 
@@ -162,7 +163,7 @@ export const rtablePermTests = {
                 await app.group.observe('users', await frontier(users.group));
 
                 const at = await frontier(app.group);
-                const env = await authoredInsertEnvelope('docs', 'd-1', { body: 'x' }, alice);
+                const env = await authoredInsertEnvelope('docs', 'd-1', { body: 'x' }, alice, at);
                 assertTrue((await app.group.validatePayload(env, at)).valid,
                     "a registered author's signed insert validates");
 
@@ -237,7 +238,7 @@ export const rtablePermTests = {
                 await app.group.observe('users', await frontier(users.group));
 
                 const at = await frontier(app.group);
-                const env = await authoredInsertEnvelope('docs', 'd-1', { body: 'x' }, bob);
+                const env = await authoredInsertEnvelope('docs', 'd-1', { body: 'x' }, bob, at);
                 assertFalse((await app.group.validatePayload(env, at)).valid,
                     'a signed op whose author is unresolvable is rejected (no anonymous downgrade)');
 
@@ -713,7 +714,7 @@ export const rtablePermTests = {
 
                 // while the provider is present, alice's authored op validates
                 const at1 = await frontier(app.group);
-                const env1 = await authoredInsertEnvelope('docs', 'd-1', { body: 'x' }, alice);
+                const env1 = await authoredInsertEnvelope('docs', 'd-1', { body: 'x' }, alice, at1);
                 assertTrue((await app.group.validatePayload(env1, at1)).valid, 'authored op validates while the provider is present');
 
                 // drop the identities table in the Users schema, deploy, observe
@@ -726,7 +727,7 @@ export const rtablePermTests = {
                 // foreign group -> the authored op is REJECTED at validation, and
                 // crucially this is `false`, not a throw (the object IS present)
                 const at2 = await frontier(app.group);
-                const env2 = await authoredInsertEnvelope('docs', 'd-2', { body: 'y' }, alice);
+                const env2 = await authoredInsertEnvelope('docs', 'd-2', { body: 'y' }, alice, at2);
                 assertFalse((await app.group.validatePayload(env2, at2)).valid,
                     'a present-but-unresolvable provider fail-closes (reject), without throwing');
             }

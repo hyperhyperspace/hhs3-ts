@@ -49,7 +49,7 @@ import {
     isRefAdvancePayload, extractRefVersion, validateRefAdvanceMonotonicity, refVersionAtOrAbove,
     extractAuthor, verifyPayloadSignature,
 } from "@hyper-hyper-space/hhs3_mvt";
-import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
+import type { RefAdvancePayload, SigningScope } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchema, RSchemaView } from "../rschema/interfaces.js";
 import type { Predicate } from "../rschema/payload.js";
@@ -61,7 +61,7 @@ import type { RTable, RTableView } from "../rtable/interfaces.js";
 import type { InsertRowPayload, RowOpPayload } from "../rtable/payload.js";
 import { validateInsertAgainstSchema, validateRowOpAgainstSchema, validateProviderInsertIntegrity } from "../rtable/validate_ops.js";
 
-import { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload } from "./payload.js";
+import { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload, tableSigningContext } from "./payload.js";
 import { validateTableGroupPayloadFormat } from "./validate.js";
 import { evaluatePredicate, evaluateRowOpRestriction } from "./predicates.js";
 import { rowTag } from "./scopes.js";
@@ -253,11 +253,15 @@ function qualifiedTargetGroups(schemaView: RSchemaView): Set<string> {
 // authentication — the claimed author is trusted (configure an idProvider to
 // make authorship sound). Verdict is monotone, so the view-time `from` never
 // refines it (computeEntryVoided then TRUSTS op.author).
-async function verifyOpAuthorship(op: json.Literal, group: GroupOpHost, at: Version): Promise<ValidationResult> {
+//
+// `scope` is the signing scope the op was signed in: [tableSigningContext(t)]
+// for a single row op (signed by its RTable), [] for group-level ops (bundles,
+// deploys, observations). Groups are always root objects.
+async function verifyOpAuthorship(op: json.Literal, group: GroupOpHost, at: Version, scope: SigningScope): Promise<ValidationResult> {
     const author = extractAuthor(op);
     if (author === undefined) return validationOk();                   // anonymous: nothing to verify
     if (group.getIdProvider() === undefined) return validationOk();    // no authentication configured
-    return await verifyPayloadSignature(op as json.LiteralMap, (keyId) => group.resolveAuthorKey(keyId, at))
+    return await verifyPayloadSignature(op as json.LiteralMap, at, (keyId) => group.resolveAuthorKey(keyId, at), scope)
         ? validationOk()
         : validationFailure(`signature from author '${author}' could not be verified`);
 }
@@ -294,7 +298,7 @@ async function validateRowEnvelope(envelope: RowEnvelopePayload, group: GroupOpH
     if (!providerResult.valid) return wrapValidationFailure(`provider row for table '${envelope.table}' is not self-certifying`, providerResult);
 
     // authentication (validation, at the op's own position)
-    const authorshipResult = await verifyOpAuthorship(op, group, at);
+    const authorshipResult = await verifyOpAuthorship(op, group, at, [tableSigningContext(envelope.table)]);
     if (!authorshipResult.valid) return authorshipResult;
 
     // identity / liveness at the op's own position
@@ -378,6 +382,11 @@ async function fkTargetsLive(
 //     at `at` and not deleted by an earlier op, OR inserted by an earlier op
 //     (and not since deleted) — bundle order matters (decision 4).
 async function validateBundle(bundle: BundlePayload, group: GroupOpHost, at: Version): Promise<ValidationResult> {
+    // single signer, verified once over the whole bundle; format validation
+    // already pinned every op's author claim to the bundle author
+    const authorshipResult = await verifyOpAuthorship(bundle as unknown as json.Literal, group, at, []);
+    if (!authorshipResult.valid) return wrapValidationFailure("bundle has invalid authorship", authorshipResult);
+
     const schemaView = await group.resolveSchemaView(at);
 
     const seenRowIds = new Set<B64Hash>();
@@ -408,13 +417,10 @@ async function validateBundle(bundle: BundlePayload, group: GroupOpHost, at: Ver
             return wrapValidationFailure(`bundle write ${index} for table '${table}' does not match schema`, schemaResult);
         }
 
-        // provider content-integrity + authentication (each bundle op is signed)
         const providerResult = validateProviderInsertIntegrity(op, schemaView, table, group.getHashSuite());
         if (!providerResult.valid) {
             return wrapValidationFailure(`bundle write ${index} provider row for table '${table}' is not self-certifying`, providerResult);
         }
-        const authorshipResult = await verifyOpAuthorship(op, group, at);
-        if (!authorshipResult.valid) return wrapValidationFailure(`bundle write ${index} has invalid authorship`, authorshipResult);
 
         if (seenRowIds.has(op.rowId)) {
             return validationFailure(`bundle writes rowId '${op.rowId}' more than once`);
@@ -506,7 +512,7 @@ async function validateObserveGate(
     // AUTHENTICATION at the op's own position (the group's OWN provider), like
     // a deploy: a present-but-unverifiable signature is a hard reject.
     if (group.getIdProvider() !== undefined) {
-        if (!await verifyPayloadSignature(p, (keyId) => group.resolveAuthorKey(keyId, at))) {
+        if (!await verifyPayloadSignature(p, at, (keyId) => group.resolveAuthorKey(keyId, at))) {
             return validationFailure(`observation signature from author '${author}' could not be verified`);
         }
     }
@@ -533,7 +539,7 @@ async function validateDeploy(payload: RefAdvancePayload, group: GroupOpHost, at
     // missing bound provider object throws (defer). canDeploy then evaluates
     // $author against the VERIFIED author.
     if (author !== undefined && group.getIdProvider() !== undefined) {
-        if (!await verifyPayloadSignature(p, (keyId) => group.resolveAuthorKey(keyId, at))) {
+        if (!await verifyPayloadSignature(p, at, (keyId) => group.resolveAuthorKey(keyId, at))) {
             return validationFailure(`deploy signature from author '${author}' could not be verified`);
         }
     }

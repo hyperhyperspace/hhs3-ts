@@ -13,6 +13,14 @@ export type ScopedDag = {
     computeEntryHash(payload: Literal, after?: Position): Promise<B64Hash>;
     loadEntry(h: B64Hash): Promise<Entry | undefined>;
     getFrontier(): Promise<Position>;
+    // The position an append at `at` (defaulting to this scope's frontier)
+    // will actually record as the entry's predecessors. Writers that sign
+    // must sign, validate and append at this resolved position.
+    resolvePosition(at?: Position): Promise<Position>;
+    // The wrapping contexts from the root object down to this scope, bound
+    // into op signatures so a signed op cannot be re-wrapped into a sibling
+    // scope. Empty for root objects.
+    signingScope(): Literal[];
     findCoverWithFilter(from: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position>;
     findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position>;
     findMinimalCover(p: Position): Promise<Position>;
@@ -64,6 +72,14 @@ export class RootScopedDag implements ScopedDag {
         return this.dag.getFrontier();
     }
 
+    async resolvePosition(at?: Position): Promise<Position> {
+        return at ?? await this.dag.getFrontier();
+    }
+
+    signingScope(): Literal[] {
+        return [];
+    }
+
     findCoverWithFilter(from: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
         return this.dag.findCoverWithFilter(from, meta, predicate);
     }
@@ -112,6 +128,11 @@ export interface DagScope {
     startAt(): Position;
     startEmpty(): boolean;
     baseFilter(): EntryMetaFilter;
+
+    // Identifies this scope among its siblings. wrapPayload must be a
+    // deterministic function of this context and the inner payload, so that
+    // signing (at, scope path, inner payload) binds the whole wrapped payload.
+    signingContext(): Literal;
 
     wrapPayload(payload: Literal, at: Position): Literal;
     unwrapPayload(payload: Literal, at: Position): Literal;
@@ -197,6 +218,16 @@ export class NestedScopedDag implements ScopedDag {
     
     async getFrontier(): Promise<Position> {
         return this.dag.findCoverWithFilter(await this.dag.getFrontier(), this.scope.baseFilter());
+    }
+
+    // Mirrors append's substitution of an empty position by the scope start.
+    async resolvePosition(at?: Position): Promise<Position> {
+        const p = at ?? await this.getFrontier();
+        return p.size === 0 ? this.scope.startAt() : p;
+    }
+
+    signingScope(): Literal[] {
+        return [...this.dag.signingScope(), this.scope.signingContext()];
     }
     
     findMinimalCover(p: Position): Promise<Position> {

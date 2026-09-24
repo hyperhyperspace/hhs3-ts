@@ -8,7 +8,7 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { KeyId, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
 import {
-    RContext,
+    RContext, Version,
     validationFailure, validationOk, ValidationResult,
 } from "@hyper-hyper-space/hhs3_mvt";
 import { verifyPayloadSignature, deserializePublicKeyFromBase64, computeKeyId } from "@hyper-hyper-space/hhs3_mvt";
@@ -27,7 +27,7 @@ export type RDbOpHost = {
 
 export type RDbValidationContext =
     | { mode: 'create'; ctx: RContext }
-    | { mode: 'op'; rdb: RDbOpHost };
+    | { mode: 'op'; rdb: RDbOpHost; at: Version };
 
 export async function validateRDbPayload(payload: json.Literal, context: RDbValidationContext): Promise<ValidationResult> {
     const formatResult = validateRDbPayloadFormat(payload);
@@ -39,10 +39,10 @@ export async function validateRDbPayload(payload: json.Literal, context: RDbVali
 
     const action = (payload as json.LiteralMap)['action'];
     if (action === 'add-schema') {
-        return validateMembership(payload as AddSchemaPayload, context.rdb, 'add-schema');
+        return validateMembership(payload as AddSchemaPayload, context.rdb, context.at, 'add-schema');
     }
     if (action === 'add-group') {
-        return validateMembership(payload as AddGroupPayload, context.rdb, 'add-group');
+        return validateMembership(payload as AddGroupPayload, context.rdb, context.at, 'add-group');
     }
 
     return validationFailure(`unknown RDb action '${String(action)}'`, { objectHash: context.rdb.getId() });
@@ -88,6 +88,7 @@ function hasAuthFields(payload: AddSchemaPayload | AddGroupPayload): boolean {
 async function validateMembership(
     payload: AddSchemaPayload | AddGroupPayload,
     rdb: RDbOpHost,
+    at: Version,
     actionLabel: string,
 ): Promise<ValidationResult> {
     const creators = rdb.getCreators();
@@ -108,7 +109,7 @@ async function validateMembership(
         return validationFailure(`${actionLabel} author '${payload.author}' is not an RDb creator`, { objectHash });
     }
 
-    if (!await verifyPayloadSignature(payload as unknown as json.LiteralMap, creatorKeyLookup(creators))) {
+    if (!await verifyPayloadSignature(payload as unknown as json.LiteralMap, at, creatorKeyLookup(creators))) {
         return validationFailure(`${actionLabel} signature from '${payload.author}' could not be verified`, { objectHash });
     }
 

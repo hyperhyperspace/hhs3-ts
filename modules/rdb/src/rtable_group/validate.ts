@@ -105,10 +105,21 @@ export function validateTableGroupPayloadFormat(payload: json.Literal): Validati
 
         if (bundle.writes.length === 0) return validationFailure("bundle must carry at least one write");
 
+        // single signer: the bundle is signed as a whole, its ops only claim
+        // the bundle's author
+        if ((bundle.author === undefined) !== (bundle.signature === undefined)) {
+            return validationFailure("bundle author and signature must be both present or both absent");
+        }
+
         for (const [index, write] of bundle.writes.entries()) {
             if (!isValidName(write.table)) return validationFailure(`bundle write ${index} has invalid table name '${write.table}'`);
             const result = validateRowOpFormat(write.op);
             if (!result.valid) return wrapValidationFailure(`bundle write ${index} for table '${write.table}' has invalid format`, result);
+            const op = write.op as json.LiteralMap;
+            if (op['signature'] !== undefined) return validationFailure(`bundle write ${index} must not carry its own signature`);
+            if (op['author'] !== bundle.author) {
+                return validationFailure(`bundle write ${index} author must match the bundle author`);
+            }
         }
 
         return validationOk();

@@ -1,12 +1,13 @@
 import { assertTrue, assertFalse, assertEquals } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { HASH_SHA256, createBasicCrypto, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
-import { version } from "@hyper-hyper-space/hhs3_mvt";
+import { json } from "@hyper-hyper-space/hhs3_json";
+import { formatValidationFailure, version } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
 import { RCap, rCapFactory } from "../src/types/rcap/rcap.js";
 import { RSet, rSetFactory } from "../src/types/rset/rset.js";
-import { serializePublicKeyToBase64 } from "../src/authorship.js";
+import { serializePublicKeyToBase64, signPayload } from "../src/authorship.js";
 
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
@@ -822,6 +823,83 @@ export const permissionedSetTests = {
                     threw = true;
                 }
                 assertTrue(threw, 'backward ref-advance should be rejected');
+            }
+        },
+        {
+            name: '[PSET27] A signed add replayed at a later position is rejected',
+            invoke: async () => {
+                const { cap, rset, admin } = await createTestEnv();
+
+                const alice = await makeIdentity();
+                await registerAndGrant(cap, alice, 'write', admin);
+                await rset.refAdvance(await (await cap.getScopedDag()).getFrontier(), admin);
+
+                const hAdd = await rset.addSigned('hello', alice);
+                await rset.deleteSigned('hello', alice);
+
+                const dag = await rset.getScopedDag();
+                const entry = (await dag.loadEntry(hAdd))!;
+                const original = version(...json.fromSet(entry.header.prevEntryHashes));
+                assertTrue((await rset.validatePayload(entry.payload, original)).valid,
+                    'the stored add validates at its own position');
+
+                const replayed = await rset.validatePayload(entry.payload, await dag.getFrontier());
+                assertFalse(replayed.valid, 'the stored add replayed after the delete should not validate');
+                assertTrue(!replayed.valid && formatValidationFailure(replayed.why).includes('signature'),
+                    'the replayed add should fail signature verification');
+            }
+        },
+        {
+            name: '[PSET28] A signed inner op re-wrapped for a sibling nested element is rejected',
+            invoke: async () => {
+                const { ctx, cap, admin } = await createTestEnv();
+
+                const alice = await makeIdentity();
+                await registerAndGrant(cap, alice, 'write', admin);
+                const capFrontier = await (await cap.getScopedDag()).getFrontier();
+
+                const outer = (await ctx.createObject(await RSet.create({
+                    seed: 'pset28-outer',
+                    contentType: RSet.typeId,
+                    initialElements: [],
+                    hashAlgorithm: 'sha256',
+                }))) as RSet;
+
+                const addInner = async (seed: string) => {
+                    const hash = await outer.add(await RSet.create({
+                        seed,
+                        initialElements: [],
+                        hashAlgorithm: 'sha256',
+                        capabilityRef: cap.getId(),
+                        capRequirements: { add: 'write', delete: 'write' },
+                    }));
+                    const inner = await (await outer.getView()).loadRObjectByHash(hash) as RSet;
+                    await inner.refAdvance(capFrontier, admin);
+                    return { hash, inner };
+                };
+                const a = await addInner('pset28-inner-a');
+                const b = await addInner('pset28-inner-b');
+
+                // at the outer frontier both elements have advanced to alice's grant
+                const outerDag = await outer.getScopedDag();
+                const hAdd = await a.inner.addSigned('hello', alice, await outerDag.getFrontier());
+
+                const entry = (await outerDag.loadEntry(hAdd))!;
+                const at = version(...json.fromSet(entry.header.prevEntryHashes));
+                const stored = entry.payload as json.LiteralMap;
+                assertTrue(stored['elementHash'] === a.hash, 'the stored entry is an update of element A');
+                assertTrue((await outer.validatePayload(stored, at)).valid,
+                    'the stored update validates at its own position');
+
+                const inner = stored['updatePayload'] as json.LiteralMap;
+                const resignedForB = await signPayload(inner, alice, at, [{ elmt: b.hash }]);
+                assertTrue((await outer.validatePayload({ ...stored, elementHash: b.hash, updatePayload: resignedForB }, at)).valid,
+                    'the same add signed for element B would be accepted at this position');
+
+                const rewrapped = await outer.validatePayload({ ...stored, elementHash: b.hash }, at);
+                assertFalse(rewrapped.valid, 'the stored add re-wrapped for element B should not validate');
+                assertTrue(!rewrapped.valid && formatValidationFailure(rewrapped.why).includes('signature'),
+                    'the re-wrapped add should fail signature verification');
             }
         },
     ]

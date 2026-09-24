@@ -152,9 +152,7 @@ export class RTableImpl implements RTableContract {
             values,
         };
 
-        const payload = author !== undefined
-            ? await signPayloadHelper(base as unknown as json.LiteralMap, author) as unknown as InsertRowPayload
-            : base;
+        const payload = author !== undefined ? await this.signRowOp(base, author, at) : base;
 
         return this.appendRowOp(payload, at);
     }
@@ -163,9 +161,7 @@ export class RTableImpl implements RTableContract {
         at = at ?? await (await this.group.getScopedDag()).getFrontier();
 
         const base: UpdateRowPayload = { action: 'update', rowId, values };
-        const payload = author !== undefined
-            ? await signPayloadHelper(base as unknown as json.LiteralMap, author) as unknown as UpdateRowPayload
-            : base;
+        const payload = author !== undefined ? await this.signRowOp(base, author, at) : base;
 
         return this.appendRowOp(payload, at);
     }
@@ -174,11 +170,16 @@ export class RTableImpl implements RTableContract {
         at = at ?? await (await this.group.getScopedDag()).getFrontier();
 
         const base: DeleteRowPayload = { action: 'delete', rowId };
-        const payload = author !== undefined
-            ? await signPayloadHelper(base as unknown as json.LiteralMap, author) as unknown as DeleteRowPayload
-            : base;
+        const payload = author !== undefined ? await this.signRowOp(base, author, at) : base;
 
         return this.appendRowOp(payload, at);
+    }
+
+    // Signed within this table's scope, so the op cannot be re-enveloped for
+    // another table.
+    private async signRowOp<T extends RowOpPayload>(base: T, author: OwnIdentity, at: Version): Promise<T> {
+        const scope = (await this.getScopedDag()).signingScope();
+        return await signPayloadHelper(base as unknown as json.LiteralMap, author, at, scope) as unknown as T;
     }
 
     // Append one row op through the table's scoped DAG: the TableScope wraps

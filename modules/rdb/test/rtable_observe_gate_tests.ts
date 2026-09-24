@@ -8,6 +8,7 @@ import { formatValidationFailure, signPayload, ValidationRejectedError } from "@
 import { createMockRContext } from "./mock_rcontext.js";
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
 import { RTableGroupImpl, rTableGroupFactory } from "../src/rtable_group/group.js";
+import { tableSigningContext } from "../src/rtable_group/payload.js";
 import { deriveRowId } from "../src/rtable/hash.js";
 import type { Predicate, TableDef } from "../src/rschema/payload.js";
 import {
@@ -58,13 +59,13 @@ const MUST_BE_MANAGER: Predicate = {
 // granting `grantee` a manager cap, authored by `author` (valid only while the
 // author holds a live manager cap — the insert restriction gates on it).
 async function authoredManagerCapInsert(
-    uuid: string, grantee: KeyId, author: OwnIdentity,
+    uuid: string, grantee: KeyId, author: OwnIdentity, at: Version,
 ): Promise<json.LiteralMap> {
     const base = {
         action: 'insert', rowId: deriveRowId(uuid, author.keyId), uuid,
         values: { label: USERS_MANAGER_LABEL, grantee },
     };
-    const op = await signPayload(base as unknown as json.LiteralMap, author);
+    const op = await signPayload(base as unknown as json.LiteralMap, author, at, [tableSigningContext(CAPS_TABLE)]);
     return { action: 'row', table: CAPS_TABLE, op: op as unknown as json.Literal };
 }
 
@@ -336,7 +337,7 @@ export const rtableObserveGateTests = {
                 // a signed cap insert authored by m2 (valid only while m2's
                 // manager cap X is live) — a third concurrent void consumer.
                 const newGrantee = await makeIdentity();
-                const capInsert = await authoredManagerCapInsert('og07-x', newGrantee.keyId, m2);
+                const capInsert = await authoredManagerCapInsert('og07-x', newGrantee.keyId, m2, at);
 
                 // Fan out many interleaved computations at the same anchor,
                 // each staggered by 0..4 microtask hops so the phase offset

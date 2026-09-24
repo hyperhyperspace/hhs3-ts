@@ -1,7 +1,8 @@
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { HASH_SHA256, createBasicCrypto, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
-import { version } from "@hyper-hyper-space/hhs3_mvt";
+import { json } from "@hyper-hyper-space/hhs3_json";
+import { formatValidationFailure, version } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
 import { RCap, rCapFactory } from "../src/types/rcap/rcap.js";
@@ -958,6 +959,28 @@ export const rcapTests = {
                 const afterRevoke = await cap.getView(version(u), version(u));
                 assertFalse(await afterRevoke.hasCapability(alice.keyId, 'write'),
                     'write is gone once the revoke is in the use\'s own past (sequential revoke)');
+            }
+        },
+        {
+            name: '[CAP31] A signed grant replayed at a later position is rejected',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv();
+                const alice = await makeIdentity();
+
+                await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), admin);
+                const g = await cap.grant(alice.keyId, 'write', admin);
+                await cap.revoke(alice.keyId, 'write', admin);
+
+                const dag = await cap.getScopedDag();
+                const entry = (await dag.loadEntry(g))!;
+                const original = version(...json.fromSet(entry.header.prevEntryHashes));
+                assertTrue((await cap.validatePayload(entry.payload, original)).valid,
+                    'the stored grant validates at its own position');
+
+                const replayed = await cap.validatePayload(entry.payload, await dag.getFrontier());
+                assertFalse(replayed.valid, 'the stored grant replayed after the revoke should not validate');
+                assertTrue(!replayed.valid && formatValidationFailure(replayed.why).includes('signature'),
+                    'the replayed grant should fail signature verification');
             }
         },
     ]

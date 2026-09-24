@@ -256,8 +256,34 @@ async function testBundle() {
             { table: 'orders', op: validInsert() },
             { table: 'lines', op: lineInsert },
         ],
+        author: 'alice',
+        signature: 'sig',
     };
     assertTrue(validateTableGroupPayloadFormat(bundle), 'well-formed bundle should validate');
+
+    const anonymousInsert: InsertRowPayload = {
+        action: 'insert', rowId: deriveRowId('uuid-4', undefined), uuid: 'uuid-4', values: { customer: 'c#8', total: 1 },
+    };
+    assertTrue(validateTableGroupPayloadFormat({ action: 'bundle', writes: [{ table: 'orders', op: anonymousInsert }] }),
+        'anonymous bundle of unauthored ops should validate');
+
+    const { signature: _signature, ...unsigned } = bundle;
+    assertFalse(validateTableGroupPayloadFormat(unsigned),
+        'authored bundle without a signature should not validate');
+    const { author: _author, ...authorless } = bundle;
+    assertFalse(validateTableGroupPayloadFormat({ ...authorless, writes: [{ table: 'orders', op: anonymousInsert }] }),
+        'bundle signature without an author should not validate');
+    assertFalse(validateTableGroupPayloadFormat({ action: 'bundle', writes: bundle.writes }),
+        'author claims in an anonymous bundle should not validate');
+    assertFalse(validateTableGroupPayloadFormat({
+        ...bundle,
+        writes: [{ table: 'orders', op: { ...validInsert(), signature: 'op-sig' } }, bundle.writes[1]],
+    }), 'bundle op carrying its own signature should not validate');
+    const bobInsert: InsertRowPayload = {
+        action: 'insert', rowId: deriveRowId('uuid-5', 'bob'), uuid: 'uuid-5', author: 'bob', values: { customer: 'c#9', total: 2 },
+    };
+    assertFalse(validateTableGroupPayloadFormat({ ...bundle, writes: [bundle.writes[0], { table: 'orders', op: bobInsert }] }),
+        'bundle op with a mismatched author should not validate');
 
     assertFalse(validateTableGroupPayloadFormat({ action: 'bundle', writes: [] }), 'empty bundle should not validate');
     assertFalse(validateTableGroupPayloadFormat({ action: 'bundle', writes: [{ table: '2bad', op: validInsert() }] }),

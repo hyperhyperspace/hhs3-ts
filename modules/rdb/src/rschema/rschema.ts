@@ -153,7 +153,7 @@ export class RSchemaImpl implements RSchemaContract {
         };
         if (note !== undefined) base.note = note;
 
-        const signed = await signPayloadHelper(base as unknown as json.LiteralMap, author);
+        const signed = await signPayloadHelper(base as unknown as json.LiteralMap, author, at);
 
         if (this.selfValidate()) {
             const result = await this.validatePayload(signed, at);

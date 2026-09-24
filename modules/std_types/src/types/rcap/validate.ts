@@ -91,9 +91,9 @@ async function validateCreate(payload: json.Literal, ctx: RContext): Promise<Val
     return validationOk();
 }
 
-async function verifySignedPayload(payload: json.Literal, cap: RCap): Promise<boolean> {
+async function verifySignedPayload(payload: json.Literal, cap: RCap, at: Version): Promise<boolean> {
     const keyLookup: KeyLookup = (keyId) => cap.lookupKey(keyId);
-    return verifyPayloadSignature(payload as json.LiteralMap, keyLookup);
+    return verifyPayloadSignature(payload as json.LiteralMap, at, keyLookup);
 }
 
 async function validateAddIdentity(payload: json.Literal, cap: RCap, at: Version): Promise<ValidationResult> {
@@ -107,7 +107,7 @@ async function validateAddIdentity(payload: json.Literal, cap: RCap, at: Version
         return validationFailure(`identity public key for '${p.keyId}' is invalid`);
     }
 
-    if (!await verifySignedPayload(payload, cap)) return validationFailure("add-identity signature could not be verified");
+    if (!await verifySignedPayload(payload, cap, at)) return validationFailure("add-identity signature could not be verified");
 
     const authorId = p.author as KeyId;
     if (!cap.isCreator(authorId)) {
@@ -124,7 +124,7 @@ async function validateCreateCap(payload: json.Literal, cap: RCap, at: Version):
     if (!json.checkFormat(createCapabilityFormat, payload)) return validationFailure("create-cap payload format is invalid");
     const p = payload as CreateCapabilityPayload;
 
-    if (!await verifySignedPayload(payload, cap)) return validationFailure("create-cap signature could not be verified");
+    if (!await verifySignedPayload(payload, cap, at)) return validationFailure("create-cap signature could not be verified");
     if (!cap.isCreator(p.author as KeyId)) return validationFailure(`author '${p.author}' is not a creator`);
 
     const view = await cap.getView(at, at);
@@ -141,7 +141,7 @@ async function validateDeleteCap(payload: json.Literal, cap: RCap, at: Version):
     if (!json.checkFormat(deleteCapabilityFormat, payload)) return validationFailure("delete-cap payload format is invalid");
     const p = payload as DeleteCapabilityPayload;
 
-    if (!await verifySignedPayload(payload, cap)) return validationFailure("delete-cap signature could not be verified");
+    if (!await verifySignedPayload(payload, cap, at)) return validationFailure("delete-cap signature could not be verified");
     if (!cap.isCreator(p.author as KeyId)) return validationFailure(`author '${p.author}' is not a creator`);
 
     const view = await cap.getView(at, at);
@@ -154,7 +154,7 @@ async function validateGrant(payload: json.Literal, cap: RCap, at: Version): Pro
     if (!json.checkFormat(grantFormat, payload)) return validationFailure("grant payload format is invalid");
     const p = payload as GrantPayload;
 
-    if (!await verifySignedPayload(payload, cap)) return validationFailure("grant signature could not be verified");
+    if (!await verifySignedPayload(payload, cap, at)) return validationFailure("grant signature could not be verified");
 
     const authorId = p.author as KeyId;
     const view = await cap.getView(at, at);
@@ -190,7 +190,7 @@ async function validateRevoke(payload: json.Literal, cap: RCap, at: Version): Pr
     if (!json.checkFormat(revokeFormat, payload)) return validationFailure("revoke payload format is invalid");
     const p = payload as RevokePayload;
 
-    if (!await verifySignedPayload(payload, cap)) return validationFailure("revoke signature could not be verified");
+    if (!await verifySignedPayload(payload, cap, at)) return validationFailure("revoke signature could not be verified");
 
     const authorId = p.author as KeyId;
     const view = await cap.getView(at, at);

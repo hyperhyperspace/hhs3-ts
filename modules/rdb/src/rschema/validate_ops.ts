@@ -82,7 +82,7 @@ async function validateUpdate(update: SchemaUpdatePayload, schema: RSchema, at: 
     const view = await schema.getView(at, at);
 
     if (!view.isCreator(update.author)) return validationFailure(`schema-update author '${update.author}' is not a creator`);
-    if (!await verifyPayloadSignature(update as unknown as json.LiteralMap, creatorKeyLookup(view.getCreators()))) {
+    if (!await verifyPayloadSignature(update as unknown as json.LiteralMap, at, creatorKeyLookup(view.getCreators()))) {
         return validationFailure(`schema-update signature from '${update.author}' could not be verified`);
     }
 

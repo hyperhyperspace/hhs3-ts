@@ -16,14 +16,14 @@
 // in v1; rotating deploy authority = granting/revoking cap rows it points at.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash, KeyId } from "@hyper-hyper-space/hhs3_crypto";
 import { createPayloadTypeFormat } from "@hyper-hyper-space/hhs3_mvt";
 
 import {
     Predicate,
     MAX_NAME_LENGTH, MAX_QUALIFIED_NAME_LENGTH, MAX_TABLES,
     MAX_SEED_LENGTH, MAX_HASH_ALGORITHM_LENGTH,
-    MAX_HASH_LENGTH,
+    MAX_HASH_LENGTH, MAX_KEY_ID_LENGTH, MAX_SIGNATURE_LENGTH,
 } from "../rschema/payload.js";
 export const MAX_INITIAL_ROWS_PER_TABLE = 1024;
 export const MAX_BINDINGS = 256;
@@ -129,6 +129,13 @@ export const rowEnvelopeFormat: json.Format = {
     op: json.Type.Something,
 };
 
+// The TableScope's signing context: a signed row op is bound to its table, so
+// it cannot be re-enveloped for another table. Shared by the writer side
+// (TableScope) and the group-level verifier, which must produce the same value.
+export function tableSigningContext(table: string): json.Literal {
+    return { table };
+}
+
 // Bundle: a single-entry atomic write across several member tables.
 
 // The parts hash, validate and apply together and can never exist apart, even
@@ -141,11 +148,19 @@ export const rowEnvelopeFormat: json.Format = {
 // explicitly because entry hashing normalizes payloads with sorted map keys
 // (json.toStringNormalized) — array order survives normalization and is
 // hash-stable across replicas.
+//
+// A bundle has a single signer: an authored bundle carries one author and one
+// signature over the whole payload (group scope), and its ops carry the same
+// `author` as a claim but no signature of their own. No op can therefore be
+// lifted out of a bundle, and no bundle can be truncated or recombined,
+// without breaking the bundle signature. An anonymous bundle has anonymous ops.
 
 export type BundlePayload = {
     action: 'bundle';
     // ordered (the bundle order); op is an RTable row op (insert/update/delete)
     writes: Array<{ table: string; op: json.Literal }>;
+    author?: KeyId;
+    signature?: string;
 };
 
 export const bundleWriteFormat: json.Format = {
@@ -156,4 +171,6 @@ export const bundleWriteFormat: json.Format = {
 export const bundleFormat: json.Format = {
     action: [json.Type.Constant, 'bundle'],
     writes: [json.Type.BoundedArray, bundleWriteFormat, MAX_BUNDLE_OPS],
+    author: [json.Type.Option, [json.Type.BoundedString, MAX_KEY_ID_LENGTH]],
+    signature: [json.Type.Option, [json.Type.BoundedString, MAX_SIGNATURE_LENGTH]],
 };

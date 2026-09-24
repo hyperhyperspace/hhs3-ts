@@ -184,9 +184,9 @@ export class RCapImpl implements RCapContract {
         const payload: Omit<AddIdentityPayload, 'author' | 'signature'> = {
             action: 'add-identity', keyId, publicKey,
         };
-        const signed = await signPayloadHelper(payload as json.LiteralMap, author);
         const dag = await this.getScopedDag();
-        at = at || await dag.getFrontier();
+        at = await dag.resolvePosition(at);
+        const signed = await signPayloadHelper(payload as json.LiteralMap, author, at);
         return this.applyValidatedPayload(signed, at);
     }
 
@@ -198,9 +198,9 @@ export class RCapImpl implements RCapContract {
         const payload: Omit<CreateCapabilityPayload, 'author' | 'signature'> = {
             action: 'create-cap', capName, managedBy,
         };
-        const signed = await signPayloadHelper(payload as json.LiteralMap, author);
         const dag = await this.getScopedDag();
-        at = at || await dag.getFrontier();
+        at = await dag.resolvePosition(at);
+        const signed = await signPayloadHelper(payload as json.LiteralMap, author, at);
         return this.applyValidatedPayload(signed, at);
     }
 
@@ -212,9 +212,9 @@ export class RCapImpl implements RCapContract {
         const payload: Omit<DeleteCapabilityPayload, 'author' | 'signature'> = {
             action: 'delete-cap', capName,
         };
-        const signed = await signPayloadHelper(payload as json.LiteralMap, author);
         const dag = await this.getScopedDag();
-        at = at || await dag.getFrontier();
+        at = await dag.resolvePosition(at);
+        const signed = await signPayloadHelper(payload as json.LiteralMap, author, at);
         return this.applyValidatedPayload(signed, at);
     }
 
@@ -224,7 +224,7 @@ export class RCapImpl implements RCapContract {
         at?: Version,
     ): Promise<B64Hash> {
         const scopedDag = await this.getScopedDag();
-        at = at || await scopedDag.getFrontier();
+        at = await scopedDag.resolvePosition(at);
         const view = await this.getView(at, at);
         const capOrigins = Array.from(await view.currentCapCreationVersion(capName))
             .sort()
@@ -232,7 +232,7 @@ export class RCapImpl implements RCapContract {
         const payload: Omit<GrantPayload, 'author' | 'signature'> = {
             action: 'grant', grantee, capName, capOrigins,
         };
-        const signed = await signPayloadHelper(payload as json.LiteralMap, author);
+        const signed = await signPayloadHelper(payload as json.LiteralMap, author, at);
         return this.applyValidatedPayload(signed, at);
     }
 
@@ -244,9 +244,9 @@ export class RCapImpl implements RCapContract {
         const payload: Omit<RevokePayload, 'author' | 'signature'> = {
             action: 'revoke', grantee, capName,
         };
-        const signed = await signPayloadHelper(payload as json.LiteralMap, author);
         const dag = await this.getScopedDag();
-        at = at || await dag.getFrontier();
+        at = await dag.resolvePosition(at);
+        const signed = await signPayloadHelper(payload as json.LiteralMap, author, at);
         return this.applyValidatedPayload(signed, at);
     }
 

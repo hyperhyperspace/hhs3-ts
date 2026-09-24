@@ -306,17 +306,17 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
 
     async addSigned(element: T, author: OwnIdentity, at?: Version): Promise<B64Hash> {
         const d = await this.getScopedDag();
-        at = at || await d.getFrontier();
+        at = await d.resolvePosition(at);
         const base = await this.createAddPayload(element, false, at);
-        const signed = await signPayloadHelper(base as json.LiteralMap, author);
+        const signed = await signPayloadHelper(base as json.LiteralMap, author, at, d.signingScope());
         return this.applyValidatedPayload(signed, at);
     }
 
     async addWithBarrierSigned(element: T, author: OwnIdentity, at?: Version): Promise<B64Hash> {
         const d = await this.getScopedDag();
-        at = at || await d.getFrontier();
+        at = await d.resolvePosition(at);
         const base = await this.createAddPayload(element, true, at);
-        const signed = await signPayloadHelper(base as json.LiteralMap, author);
+        const signed = await signPayloadHelper(base as json.LiteralMap, author, at, d.signingScope());
         return this.applyValidatedPayload(signed, at);
     }
 
@@ -330,9 +330,9 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
 
     async deleteByHashSigned(elementHash: B64Hash, author: OwnIdentity, at?: Version): Promise<B64Hash> {
         const d = await this.getScopedDag();
-        at = at || await d.getFrontier();
+        at = await d.resolvePosition(at);
         const base = await this.createDeletePayload(elementHash, false, at);
-        const signed = await signPayloadHelper(base as json.LiteralMap, author);
+        const signed = await signPayloadHelper(base as json.LiteralMap, author, at, d.signingScope());
         return this.applyValidatedPayload(signed, at);
     }
 
@@ -343,18 +343,18 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
 
     async deleteWithBarrierByHashSigned(elementHash: B64Hash, author: OwnIdentity, at?: Version): Promise<B64Hash> {
         const d = await this.getScopedDag();
-        at = at || await d.getFrontier();
+        at = await d.resolvePosition(at);
         const base = await this.createDeletePayload(elementHash, true, at);
-        const signed = await signPayloadHelper(base as json.LiteralMap, author);
+        const signed = await signPayloadHelper(base as json.LiteralMap, author, at, d.signingScope());
         return this.applyValidatedPayload(signed, at);
     }
 
     async refAdvance(refVersion: Version, author: OwnIdentity, at?: Version): Promise<B64Hash> {
         if (!this.isPermissioned()) throw new Error("refAdvance is only for permissioned sets");
         const d = await this.getScopedDag();
-        at = at || await d.getFrontier();
+        at = await d.resolvePosition(at);
         const { payload: base } = prepareRefAdvance(this.capabilityRef()!, refVersion);
-        const signed = await signPayloadHelper(base as unknown as json.LiteralMap, author);
+        const signed = await signPayloadHelper(base as unknown as json.LiteralMap, author, at, d.signingScope());
         return this.applyValidatedPayload(signed, at);
     }
 
@@ -706,6 +706,10 @@ class NestedElementScope implements DagScope {
 
     baseFilter(): EntryMetaFilter {
         return {containsValues: {"inner-elmts": [this.elementHash]}};
+    }
+
+    signingContext(): json.Literal {
+        return { elmt: this.elementHash };
     }
 
     wrapPayload(payload: json.Literal, at: Position): json.Literal {

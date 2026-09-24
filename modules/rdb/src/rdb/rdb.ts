@@ -242,7 +242,7 @@ export class RDbImpl implements RDbContract, SyncableObject {
             if (author === undefined) {
                 throw new Error(`RDb membership op '${(base as json.LiteralMap)['action']}' requires an author when the database declares creators`);
             }
-            payload = await signPayloadHelper(base as unknown as json.LiteralMap, author);
+            payload = await signPayloadHelper(base as unknown as json.LiteralMap, author, at);
         } else {
             payload = base as Payload;
         }
@@ -278,7 +278,7 @@ export class RDbImpl implements RDbContract, SyncableObject {
 
     // --- RObject interface ---
 
-    async validatePayload(payload: Payload, _at: Version): Promise<ValidationResult> {
+    async validatePayload(payload: Payload, at: Version): Promise<ValidationResult> {
         if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
             return validationFailure("RDb membership payload must be an object", { objectHash: this.createOpId });
         }
@@ -287,7 +287,7 @@ export class RDbImpl implements RDbContract, SyncableObject {
         if (action !== 'add-schema' && action !== 'add-group') {
             return validationFailure(`action '${String(action)}' is not an RDb membership op`, { objectHash: this.createOpId });
         }
-        return validateRDbPayload(payload, { mode: 'op', rdb: this });
+        return validateRDbPayload(payload, { mode: 'op', rdb: this, at });
     }
 
     async applyPayload(payload: Payload, at: Version): Promise<B64Hash> {
