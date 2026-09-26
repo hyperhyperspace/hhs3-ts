@@ -60,26 +60,59 @@ export function lex(source: string): Result<Token[]> {
             continue;
         }
 
-        if (isIdentStart(ch)) {
-            i += 1;
-            while (i < source.length) {
-                if (isIdentPart(source[i])) {
+        // An identifier is one or more '.' / ':' separated parts, each bare or
+        // "quoted" ("" escapes a quote). Token text is the unquoted name, and
+        // any quoted part makes the token an identifier even if it spells a
+        // keyword: `t."identity"` is the column t.identity.
+        if (isIdentStart(ch) || ch === '"') {
+            let text = '';
+            let quoted = false;
+            while (true) {
+                if (source[i] === '"') {
+                    const partStart = i;
                     i += 1;
-                    continue;
-                }
-                if (source[i] === '.' && i + 1 < source.length && isIdentStart(source[i + 1])) {
-                    i += 2;
+                    let part = '';
+                    let closed = false;
+                    while (i < source.length) {
+                        if (source[i] === '"') {
+                            if (source[i + 1] === '"') {
+                                part += '"';
+                                i += 2;
+                                continue;
+                            }
+                            i += 1;
+                            closed = true;
+                            break;
+                        }
+                        part += source[i];
+                        i += 1;
+                    }
+                    if (!closed) {
+                        diagnostics.add('LEX_UNEXPECTED_CHAR', 'Unterminated quoted identifier', spanFromOffsets(source, partStart, i));
+                    } else if (part === '' || /[.:]/.test(part)) {
+                        diagnostics.add('LEX_UNEXPECTED_CHAR', "A quoted identifier must be non-empty and cannot contain '.' or ':'", spanFromOffsets(source, partStart, i));
+                    }
+                    text += part;
+                    quoted = true;
+                } else {
+                    const partStart = i;
+                    i += 1;
                     while (i < source.length && isIdentPart(source[i])) i += 1;
-                    continue;
+                    text += source.substring(partStart, i);
                 }
-                if (source[i] === ':' && i + 1 < source.length && isIdentStart(source[i + 1])) {
-                    i += 2;
-                    while (i < source.length && isIdentPart(source[i])) i += 1;
+                const sep = source[i];
+                const next = source[i + 1] ?? '';
+                if ((sep === '.' || sep === ':') && (isIdentStart(next) || next === '"')) {
+                    text += sep;
+                    i += 1;
                     continue;
                 }
                 break;
             }
-            const text = source.substring(start, i);
+            if (quoted) {
+                tokens.push({ ...token(source, 'identifier', text, start, i), quoted: true });
+                continue;
+            }
             const upper = text.toUpperCase();
             if (upper === 'TRUE') push('keyword', text, start, i, true);
             else if (upper === 'FALSE') push('keyword', text, start, i, false);
@@ -139,11 +172,17 @@ export function lex(source: string): Result<Token[]> {
             continue;
         }
 
-        if (/[0-9]/.test(ch) || (ch === '-' && /[0-9]/.test(source[i + 1] ?? ''))) {
+        // Numbers are unsigned; a leading '-' is the unary minus operator.
+        if (/[0-9]/.test(ch)) {
             i += 1;
             while (i < source.length && /[0-9]/.test(source[i])) i += 1;
             if (source[i] === '.' && /[0-9]/.test(source[i + 1] ?? '')) {
                 i += 1;
+                while (i < source.length && /[0-9]/.test(source[i])) i += 1;
+            }
+            if ((source[i] === 'e' || source[i] === 'E')
+                && (/[0-9]/.test(source[i + 1] ?? '') || (/[+-]/.test(source[i + 1] ?? '') && /[0-9]/.test(source[i + 2] ?? '')))) {
+                i += 2;
                 while (i < source.length && /[0-9]/.test(source[i])) i += 1;
             }
             const text = source.substring(start, i);
@@ -158,7 +197,7 @@ export function lex(source: string): Result<Token[]> {
             continue;
         }
 
-        if (['=', '<', '>', '*'].includes(ch)) {
+        if (['=', '<', '>', '*', '+', '-'].includes(ch)) {
             i += 1;
             push('operator', ch, start, i);
             continue;

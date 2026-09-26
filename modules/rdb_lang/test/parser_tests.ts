@@ -1,8 +1,10 @@
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 
-import { lowerRestrictionPredicate } from "../src/compile/query.js";
+import { compileTable } from "../src/compile/create.js";
+import { lowerRestrictionPredicate, lowerRowFilter } from "../src/compile/query.js";
 import { columnSetFromTableDecl, columnsOfFromTableDecls } from "../src/compile/rule_scope.js";
 import { parseStatement } from "../src/syntax/parser.js";
+import { createTestBindContext } from "./mock_bind_context.js";
 
 export const parserTests = {
     title: '[RDB_LANG:PARSE] Parser',
@@ -654,5 +656,254 @@ export const parserTests = {
                 assertTrue(rule.column.constraints?.min !== undefined, 'MIN bound present');
             },
         },
+        {
+            name: '[PARSE34] LIKE lowers to a like atom: verbatim pattern, column pattern, ESCAPE normalized',
+            invoke: async () => {
+                const json = (v: unknown) => JSON.stringify(v);
+
+                assertEquals(json(lowerAllow("name LIKE 'ok-%'")),
+                    json({ p: 'like', value: { col: 'name' }, pattern: { lit: 'ok-%' } }), 'prefix pattern kept verbatim');
+                assertEquals(json(lowerAllow("name LIKE 'a_c'")),
+                    json({ p: 'like', value: { col: 'name' }, pattern: { lit: 'a_c' } }), 'no wildcard splitting, _ kept');
+                assertEquals(json(lowerAllow("name LIKE 'exact'")),
+                    json({ p: 'like', value: { col: 'name' }, pattern: { lit: 'exact' } }), 'no-wildcard LIKE stays a like');
+                assertEquals(json(lowerAllow("name LIKE t.tag")),
+                    json({ p: 'like', value: { col: 'name' }, pattern: { col: 'tag' } }), 'column pattern');
+                assertEquals(json(lowerAllow("name LIKE '100!%!_x!!' ESCAPE '!'")),
+                    json({ p: 'like', value: { col: 'name' }, pattern: { lit: '100\\%\\_x!' } }), 'ESCAPE rewritten to canonical backslash form');
+                assertEquals(json(lowerAllow("name LIKE 'a\\b%' ESCAPE ''")),
+                    json({ p: 'like', value: { col: 'name' }, pattern: { lit: 'a\\\\b%' } }), "ESCAPE '' makes backslash literal");
+                assertEquals(json(lowerAllow("name LIKE 'a\\%' escape '\\'")),
+                    json({ p: 'like', value: { col: 'name' }, pattern: { lit: 'a\\%' } }), 'ESCAPE is case-insensitive and backslash is a no-op');
+
+                expectLowerThrows("name LIKE 'a\\'", 'unescaped', 'trailing lone backslash');
+                expectLowerThrows("name LIKE 'a!' ESCAPE '!'", 'ESCAPE character', 'pattern ending with its escape char');
+                expectLowerThrows("name LIKE 'a' ESCAPE '!!'", 'single character', 'multi-character ESCAPE');
+                expectLowerThrows("name LIKE t.tag ESCAPE '!'", 'literal pattern', 'ESCAPE on a column pattern');
+                expectLowerThrows("name LIKE 5", 'must be a string', 'non-string literal pattern');
+
+                const where = await lowerWhere("kind LIKE 'fr_it%'");
+                assertEquals(json(where), json({ p: 'like', value: { col: 'kind' }, pattern: { lit: 'fr_it%' } }), 'SELECT WHERE LIKE');
+                const whereEscaped = await lowerWhere("kind LIKE '#_%' ESCAPE '#'");
+                assertEquals(json(whereEscaped), json({ p: 'like', value: { col: 'kind' }, pattern: { lit: '\\_%' } }), 'SELECT WHERE LIKE ESCAPE');
+                const whereCol = await lowerWhere('kind LIKE label');
+                assertEquals(json(whereCol), json({ p: 'like', value: { col: 'kind' }, pattern: { col: 'label' } }), 'SELECT WHERE LIKE column');
+            },
+        },
+        {
+            name: '[PARSE35] expression grammar: arithmetic precedence, length(), unary minus, exponents',
+            invoke: async () => {
+                const json = (v: unknown) => JSON.stringify(v);
+                const col = (c: string) => ({ col: c });
+                const lit = (v: unknown) => ({ lit: v });
+                const fn = (f: string, ...args: unknown[]) => ({ fn: f, args });
+
+                assertEquals(json(lowerAllow('n + 1 * 2 >= m - 3')),
+                    json({ p: 'cmp', cmp: 'ge', left: fn('add', col('n'), fn('mul', lit(1), lit(2))), right: fn('sub', col('m'), lit(3)) }),
+                    '* binds tighter than +, and both tighter than comparison');
+                assertEquals(json(lowerAllow('(n + 1) * 2 = 6')),
+                    json({ p: 'cmp', cmp: 'eq', left: fn('mul', fn('add', col('n'), lit(1)), lit(2)), right: lit(6) }),
+                    'parentheses group arithmetic');
+                assertEquals(json(lowerAllow('n - m - 1 = 0')),
+                    json({ p: 'cmp', cmp: 'eq', left: fn('sub', fn('sub', col('n'), col('m')), lit(1)), right: lit(0) }),
+                    '- is left-associative');
+                assertEquals(json(lowerAllow('length(name) < 8')),
+                    json({ p: 'cmp', cmp: 'lt', left: fn('len', col('name')), right: lit(8) }), 'length() lowers to len');
+                assertEquals(json(lowerAllow('LENGTH(name) + 1 < 8')),
+                    json({ p: 'cmp', cmp: 'lt', left: fn('add', fn('len', col('name')), lit(1)), right: lit(8) }), 'LENGTH is case-insensitive');
+                assertEquals(json(lowerAllow('n = -1')), json({ p: 'cmp', cmp: 'eq', left: col('n'), right: lit(-1) }), 'negative literal');
+                assertEquals(json(lowerAllow('n - -1 = 0')),
+                    json({ p: 'cmp', cmp: 'eq', left: fn('sub', col('n'), lit(-1)), right: lit(0) }), 'binary minus of a negative literal');
+                assertEquals(json(lowerAllow('n = -(2)')), json({ p: 'cmp', cmp: 'eq', left: col('n'), right: lit(-2) }), 'unary minus folds through parentheses');
+                assertEquals(json(lowerAllow('n = 0 - 0')), json({ p: 'cmp', cmp: 'eq', left: col('n'), right: fn('sub', lit(0), lit(0)) }), '0 - 0 stays arithmetic');
+                assertEquals(json(lowerAllow('n < 1.5e3')), json({ p: 'cmp', cmp: 'lt', left: col('n'), right: lit(1500) }), 'exponent literal');
+                assertEquals(json(lowerAllow('n < 1e-7')), json({ p: 'cmp', cmp: 'lt', left: col('n'), right: lit(1e-7) }), 'negative exponent literal');
+                assertEquals(json(lowerAllow('n = 1 -- trailing comment\n')), json({ p: 'cmp', cmp: 'eq', left: col('n'), right: lit(1) }), '-- is still a comment');
+
+                expectParseError('ALLOW insert IF -n = 1', 'Unary minus', 'unary minus on a column');
+                expectParseError('ALLOW insert IF name', 'Expected a condition', 'a bare value is not a condition');
+                expectParseError('ALLOW insert IF n = (m > 1)', 'Expected a value', 'a condition is not a value');
+                expectLowerThrows("name = '$author'", 'reserved', "quoted '$author' is rejected");
+                expectLowerThrows("EXISTS t AS t2 WHERE t2.name = '$row.name'", 'reserved', "quoted '$row' term in EXISTS WHERE is rejected");
+
+                const where = await lowerWhere('qty * 2 > price - 1');
+                assertEquals(json(where),
+                    json({ p: 'cmp', cmp: 'gt', left: fn('mul', col('qty'), lit(2)), right: fn('sub', col('price'), lit(1)) }),
+                    'SELECT WHERE arithmetic');
+                const whereLen = await lowerWhere("length(kind) = 5 AND kind != '$x'");
+                assertEquals(json(whereLen),
+                    json({ p: 'and', args: [{ p: 'cmp', cmp: 'eq', left: fn('len', col('kind')), right: lit(5) }, { p: 'cmp', cmp: 'ne', left: col('kind'), right: lit('$x') }] }),
+                    "SELECT WHERE length(), and '$' strings stay plain literals in queries");
+            },
+        },
+        {
+            name: '[PARSE36] expression grammar: AND/OR/NOT precedence and grouping',
+            invoke: async () => {
+                const json = (v: unknown) => JSON.stringify(v);
+                const eq = (c: string, v: number) => ({ p: 'cmp', cmp: 'eq', left: { col: c }, right: { lit: v } });
+
+                assertEquals(json(lowerAllow('n = 1 OR n = 2 AND m = 3')),
+                    json({ p: 'or', args: [eq('n', 1), { p: 'and', args: [eq('n', 2), eq('m', 3)] }] }), 'AND binds tighter than OR');
+                assertEquals(json(lowerAllow('(n = 1 OR n = 2) AND m = 3')),
+                    json({ p: 'and', args: [{ p: 'or', args: [eq('n', 1), eq('n', 2)] }, eq('m', 3)] }), 'parenthesized OR inside AND');
+                assertEquals(json(lowerAllow('n = 1 AND n = 2 AND m = 3')),
+                    json({ p: 'and', args: [eq('n', 1), eq('n', 2), eq('m', 3)] }), 'an unparenthesized chain is one group');
+                assertEquals(json(lowerAllow('(n = 1 AND n = 2) AND m = 3')),
+                    json({ p: 'and', args: [{ p: 'and', args: [eq('n', 1), eq('n', 2)] }, eq('m', 3)] }), 'a parenthesized group keeps its nesting');
+                assertEquals(json(lowerAllow('n = 1 AND (n = 2 AND m = 3)')),
+                    json({ p: 'and', args: [eq('n', 1), { p: 'and', args: [eq('n', 2), eq('m', 3)] }] }), 'nesting on the right is kept too');
+                assertEquals(json(lowerAllow('((n = 1))')), json(eq('n', 1)), 'redundant parentheses collapse');
+                assertEquals(json(lowerAllow('TRUE')), json({ p: 'true' }), 'TRUE as a condition');
+                assertEquals(json(lowerAllow('flag = TRUE')),
+                    json({ p: 'cmp', cmp: 'eq', left: { col: 'flag' }, right: { lit: true } }), 'TRUE as a value');
+                assertEquals(json(lowerAllow("(EXISTS t AS t2 WHERE t2.name = 'x') OR n = 1")),
+                    json({ p: 'or', args: [{ p: 'exists', table: 't', where: { name: 'x' } }, eq('n', 1)] }), 'a parenthesized EXISTS ends its WHERE');
+
+                const not = await lowerWhere('NOT qty = 1 AND qty = 2');
+                assertEquals(json(not),
+                    json({ p: 'and', args: [{ p: 'not', arg: eq('qty', 1) }, eq('qty', 2)] }), 'NOT binds tighter than AND');
+            },
+        },
+        {
+            name: '[PARSE37] negative literals in value positions',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE SCHEMA s AS (
+                      TABLE t (a integer DEFAULT -1 MIN -10 MAX -2, b float DEFAULT -1.5e-3)
+                    );
+                `);
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok || result.value.kind !== 'create-schema') return;
+                const [a, b] = result.value.tables[0].columns;
+                const litOf = (v: unknown) => (v as { kind: string; value: unknown }).value;
+                assertEquals(litOf(a.defaultValue), -1, 'negative DEFAULT');
+                assertEquals(litOf(a.constraints?.min), -10, 'negative MIN');
+                assertEquals(litOf(a.constraints?.max), -2, 'negative MAX');
+                assertEquals(litOf(b.defaultValue), -0.0015, 'negative float DEFAULT with exponent');
+
+                const insert = parseStatement("INSERT INTO g.t (a, b) VALUES (-3, [-1, 2]);");
+                assertTrue(insert.ok && insert.value.kind === 'insert', 'insert parse');
+                if (!insert.ok || insert.value.kind !== 'insert') return;
+                assertEquals(litOf(insert.value.values[0]), -3, 'negative VALUES literal');
+                assertEquals(JSON.stringify(litOf(insert.value.values[1])), '[-1,2]', 'negative number inside a JSON literal');
+
+                const update = parseStatement("UPDATE g.t SET a = -4 WHERE rowId = #abc;");
+                assertTrue(update.ok && update.value.kind === 'update', 'update parse');
+                if (update.ok && update.value.kind === 'update') assertEquals(litOf(update.value.values[0].value), -4, 'negative SET literal');
+            },
+        },
+        {
+            name: '[PARSE38] double-quoted identifiers name keyword-colliding tables and columns',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE SCHEMA s AS (
+                      TABLE "table" ("identity" identity READONLY, "length" integer READONLY, "escape" string READONLY, "string" string)
+                        ALLOW insert IF "table"."identity" = $author AND length("table"."escape") < "table"."length"
+                          AND "table"."escape" LIKE 'x%' AND (EXISTS "table" AS t WHERE t."identity" = "table"."identity")
+                    );
+                `);
+                assertTrue(result.ok, `parse should succeed: ${JSON.stringify(result.ok ? '' : result.diagnostics.map((d) => d.message))}`);
+                if (!result.ok || result.value.kind !== 'create-schema') return;
+                const def = compileTable(result.value.tables[0]);
+                assertEquals(def.name, 'table', 'quoted table name');
+                assertEquals(Object.keys(def.columns).join(','), 'identity,length,escape,string', 'quoted column names');
+                assertEquals(def.columns['string'].type, 'string', 'a quoted name is never a type');
+                assertEquals(JSON.stringify(def.restrictions?.[0].rule), JSON.stringify({
+                    p: 'and',
+                    args: [
+                        { p: 'cmp', cmp: 'eq', left: { col: 'identity' }, right: { lit: '$author' } },
+                        { p: 'cmp', cmp: 'lt', left: { fn: 'len', args: [{ col: 'escape' }] }, right: { col: 'length' } },
+                        { p: 'like', value: { col: 'escape' }, pattern: { lit: 'x%' } },
+                        { p: 'exists', table: 'table', where: { identity: '$row.identity' } },
+                    ],
+                }), 'quoted names lower like bare ones');
+
+                const notFn = parseStatement('CREATE SCHEMA s AS (TABLE t (a integer) ALLOW insert IF "length"(1) = 1);');
+                assertTrue(!notFn.ok, 'a quoted "length" is not the length function');
+                const unquoted = parseStatement('CREATE SCHEMA s AS (TABLE t (identity identity));');
+                assertTrue(!unquoted.ok, 'an unquoted keyword is still not a column name');
+            },
+        },
+        {
+            name: "[PARSE39] JSON '<json text>' writes any json value; null inside JSON is rejected",
+            invoke: async () => {
+                const doc = { k: ['v', "it's", 'a\nb'], n: [1, 2.5] };
+                const text = `JSON '{"k": ["v", "it''s", "a\\nb"], "n": [1, 2.5]}'`;
+                const same = (a: unknown, what: string) =>
+                    assertEquals(JSON.stringify(a), JSON.stringify(doc), what);
+
+                const schema = parseStatement(`CREATE SCHEMA s AS (
+                    TABLE docs ("json" json PUB READONLY DEFAULT ${text})
+                      ALLOW insert IF EXISTS docs AS d WHERE d."json" = ${text}
+                );`);
+                assertTrue(schema.ok, `schema parses: ${JSON.stringify(schema.ok ? '' : schema.diagnostics.map((d) => d.message))}`);
+                if (!schema.ok || schema.value.kind !== 'create-schema') return;
+                const def = compileTable(schema.value.tables[0]);
+                same(def.columns['json'].default, 'DEFAULT JSON literal');
+                const rule = def.restrictions?.[0].rule;
+                same(rule?.p === 'exists' ? rule.where['json'] : undefined, 'EXISTS where-value JSON literal');
+
+                const insert = parseStatement(`INSERT INTO docs ("json") VALUES (${text});`);
+                assertTrue(insert.ok && insert.value.kind === 'insert', 'INSERT parses');
+                if (insert.ok && insert.value.kind === 'insert') {
+                    const v = insert.value.values[0];
+                    same(v.kind === 'literal' ? v.value : undefined, 'INSERT JSON literal');
+                }
+                const update = parseStatement(`UPDATE docs SET "json" = ${text} WHERE rowId = #abc;`);
+                assertTrue(update.ok && update.value.kind === 'update', 'UPDATE parses');
+                if (update.ok && update.value.kind === 'update') {
+                    const v = update.value.values[0].value;
+                    same(v.kind === 'literal' ? v.value : undefined, 'UPDATE SET JSON literal');
+                }
+
+                const errorOf = (value: string) => {
+                    const r = parseStatement(`INSERT INTO docs (d) VALUES (${value});`);
+                    return r.ok ? '' : r.diagnostics.map((d) => d.message).join('; ');
+                };
+                assertTrue(errorOf(`JSON 'nope'`).includes('Invalid JSON in JSON literal'), 'invalid JSON text');
+                assertTrue(errorOf(`JSON 'null'`).includes('cannot contain null'), 'JSON null');
+                assertTrue(errorOf(`JSON '[1, null]'`).includes('cannot contain null'), 'nested null');
+                assertTrue(errorOf('[1, null]').includes('cannot contain null'), 'nested null in the bracket form');
+                assertTrue(errorOf('["x"]').includes(`JSON '...'`), 'the bracket form points strings at JSON literals');
+            },
+        },
     ],
 };
+
+function expectParseError(allow: string, messagePart: string, why: string) {
+    const result = parseStatement(`CREATE SCHEMA s AS (TABLE t (name string READONLY, n integer READONLY, m integer READONLY) ${allow});`);
+    const messages = result.ok ? [] : result.diagnostics.map((d) => d.message);
+    assertTrue(messages.some((m) => m.includes(messagePart)), `${why}: expected a diagnostic mentioning '${messagePart}', got ${JSON.stringify(messages)}`);
+}
+
+function lowerAllow(predicate: string) {
+    const result = parseStatement(`CREATE SCHEMA s AS (TABLE t (name string READONLY, tag string READONLY, n integer READONLY, m integer READONLY, flag boolean READONLY) ALLOW insert IF ${predicate});`);
+    if (!result.ok || result.value.kind !== 'create-schema') {
+        throw new Error(`parse failed for '${predicate}': ${JSON.stringify(result.ok ? result.value.kind : result.diagnostics)}`);
+    }
+    const table = result.value.tables[0];
+    const allow = table.options.find((o) => o.kind === 'allow-rule');
+    if (allow === undefined || allow.kind !== 'allow-rule') throw new Error('no allow rule');
+    return lowerRestrictionPredicate(allow.predicate, {
+        gated: { name: table.name, columns: columnSetFromTableDecl(table) },
+        columnsOf: columnsOfFromTableDecls(result.value.tables),
+    });
+}
+
+function expectLowerThrows(predicate: string, messagePart: string, why: string) {
+    let message = '';
+    try {
+        lowerAllow(predicate);
+    } catch (e) {
+        message = e instanceof Error ? e.message : String(e);
+    }
+    assertTrue(message.includes(messagePart), `${why}: expected an error mentioning '${messagePart}', got '${message}'`);
+}
+
+async function lowerWhere(where: string) {
+    const result = parseStatement(`SELECT * FROM g.items WHERE ${where};`);
+    if (!result.ok || result.value.kind !== 'select' || result.value.where === undefined) {
+        throw new Error(`parse failed for '${where}'`);
+    }
+    return lowerRowFilter(result.value.where, createTestBindContext(undefined as never));
+}

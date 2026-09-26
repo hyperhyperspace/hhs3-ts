@@ -1,6 +1,7 @@
+import { createBasicCrypto, getSigningSuite, HASH_SHA256 } from "@hyper-hyper-space/hhs3_crypto";
 import type { KeyId, OwnIdentity, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
 import type { json } from "@hyper-hyper-space/hhs3_json";
-import { serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
+import { computeKeyId, deserializePublicKeyFromBase64, serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 import type { ColumnDef } from "@hyper-hyper-space/hhs3_rdb";
 import { normalizeBigint, normalizeDecimal, normalizeBase64, columnValueValidReason } from "@hyper-hyper-space/hhs3_rdb";
 
@@ -137,7 +138,29 @@ export async function resolveCreator(
         }
         return resolveCreatorKey(context, `'${expr.value}'`, expr.value);
     }
+    if (expr.kind === 'call' && expr.name === 'publicKey' && expr.args.length === 1
+        && expr.args[0].kind === 'literal' && typeof expr.args[0].value === 'string') {
+        return creatorFromPublicKeyLiteral(expr.args[0].value, context);
+    }
     return asCreator(await resolveValue(expr, context));
+}
+
+function creatorFromPublicKeyLiteral(base64: string, context: LangBindContext): { keyId: KeyId; publicKey: PublicKey } {
+    const invalid = new Error(`CREATORS publicKey('${base64}') is not a valid public key`);
+    let publicKey: PublicKey;
+    try {
+        publicKey = deserializePublicKeyFromBase64(base64);
+    } catch {
+        throw invalid;
+    }
+    // Decoding accepts arbitrary bytes, so check the suite and size, and that
+    // the text is the key's canonical encoding.
+    const suite = getSigningSuite(publicKey.suite);
+    if (suite === undefined || publicKey.key.length !== suite.publicKeySize || serializePublicKeyToBase64(publicKey) !== base64) {
+        throw invalid;
+    }
+    const hashSuite = context.hashSuite?.() ?? createBasicCrypto().hash(HASH_SHA256);
+    return { keyId: computeKeyId(publicKey, hashSuite), publicKey };
 }
 
 async function resolveCreatorKey(

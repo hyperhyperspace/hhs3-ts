@@ -12,7 +12,7 @@
   "scripts": {
     "test": "node --import ../../register.mjs ./test/run_tests.ts",
     "debug": "node --inspect-brk --import ../../register.mjs ./test/run_tests.ts",
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && chmod +x dist/bin/rdb.js",
     "clean": "rm -rf dist test-build"
   },
   "author": "Santiago Bazerque",

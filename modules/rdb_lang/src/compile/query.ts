@@ -1,6 +1,7 @@
 import type { json } from "@hyper-hyper-space/hhs3_json";
 import type { Operand, Predicate } from "@hyper-hyper-space/hhs3_rdb";
 import type { RowFilter, RowQuery } from "@hyper-hyper-space/hhs3_rdb";
+import { isValidLikePattern } from "@hyper-hyper-space/hhs3_rdb";
 
 import type { OperandExpr, PredicateExpr, SelectStatement, ValueExpr } from "../syntax/ast.js";
 import type { LangBindContext } from "../bind/context.js";
@@ -26,6 +27,8 @@ const CMP: Record<string, 'eq' | 'ne' | 'lt' | 'le' | 'gt' | 'ge'> = {
     '>': 'gt',
     '>=': 'ge',
 };
+
+const ARITH_FN = { '+': 'add', '-': 'sub', '*': 'mul' } as const;
 
 const EMPTY_SCOPE: RuleScope = {
     columnsOf: () => undefined,
@@ -55,7 +58,11 @@ export async function lowerRowFilter(expr: PredicateExpr, context: LangBindConte
                 right: await lowerQueryOperand(expr.right, context),
             };
         case 'like':
-            return lowerLike(expr.left, expr.pattern, context);
+            return {
+                p: 'like',
+                value: await lowerQueryOperand(expr.left, context),
+                pattern: lowerLikePattern(expr, await lowerQueryOperand(expr.pattern, context)),
+            };
         case 'not':
             return { p: 'not', arg: await lowerRowFilter(expr.arg, context) };
         case 'and':
@@ -67,24 +74,57 @@ export async function lowerRowFilter(expr: PredicateExpr, context: LangBindConte
     }
 }
 
-async function lowerLike(left: OperandExpr, pattern: ValueExpr, context: LangBindContext): Promise<RowFilter> {
-    const value = await resolveValue(pattern, context);
-    if (typeof value !== 'string') throw new Error('LIKE pattern must be a string');
-    const operand = await lowerQueryOperand(left, context);
-    if (value.startsWith('%') && value.endsWith('%') && value.length >= 2) {
-        return { p: 'str', str: 'contains', value: operand, sub: { lit: value.slice(1, -1) } };
+type LikeExpr = Extract<PredicateExpr, { kind: 'like' }>;
+
+// The payload pattern for a lowered LIKE: a column pattern passes through; a
+// literal pattern must be a string, and an ESCAPE clause (literal patterns
+// only) is rewritten into the canonical `\` escape form.
+function lowerLikePattern(expr: LikeExpr, pattern: Operand): Operand {
+    if (expr.escape !== undefined && expr.pattern.kind !== 'literal') {
+        throw new Error('LIKE ... ESCAPE requires a literal pattern');
     }
-    if (value.startsWith('%')) {
-        return { p: 'str', str: 'suffix', value: operand, sub: { lit: value.slice(1) } };
+    if (!('lit' in pattern)) return pattern;
+    if (typeof pattern.lit !== 'string') throw new Error('LIKE pattern must be a string');
+    const canonical = expr.escape !== undefined ? canonicalLikePattern(pattern.lit, expr.escape) : pattern.lit;
+    if (!isValidLikePattern(canonical)) throw new Error("LIKE pattern ends in an unescaped '\\'");
+    return { lit: canonical };
+}
+
+// Rewrite a pattern written with `ESCAPE '<c>'` into the payload's form, where
+// `\` is the escape character. An empty ESCAPE means no escape character.
+export function canonicalLikePattern(pattern: string, escape: string): string {
+    const esc = Array.from(escape);
+    if (esc.length > 1) throw new Error('ESCAPE must be a single character');
+    const escapeChar = esc[0];
+    const cps = Array.from(pattern);
+    let out = '';
+    for (let k = 0; k < cps.length; k++) {
+        const c = cps[k];
+        if (c === escapeChar) {
+            if (k + 1 === cps.length) throw new Error('LIKE pattern ends with its ESCAPE character');
+            const next = cps[++k];
+            out += next === '%' || next === '_' || next === '\\' ? `\\${next}` : next;
+        } else if (c === '\\') {
+            out += '\\\\';
+        } else {
+            out += c;
+        }
     }
-    if (value.endsWith('%')) {
-        return { p: 'str', str: 'prefix', value: operand, sub: { lit: value.slice(0, -1) } };
-    }
-    return { p: 'cmp', cmp: 'eq', left: operand, right: { lit: value } };
+    return out;
 }
 
 async function lowerQueryOperand(expr: OperandExpr, context: LangBindContext): Promise<Operand> {
-    if (expr.kind === 'column') return { col: expr.name };
+    switch (expr.kind) {
+        case 'column':
+            return { col: expr.name };
+        case 'arith':
+            return {
+                fn: ARITH_FN[expr.op],
+                args: [await lowerQueryOperand(expr.left, context), await lowerQueryOperand(expr.right, context)],
+            };
+        case 'length':
+            return { fn: 'len', args: [await lowerQueryOperand(expr.arg, context)] };
+    }
     const value = asJsonLiteral(await resolveValue(expr, context));
     if (!isScalarQueryLiteral(value)) throw new Error('query literal must be a string, number or boolean');
     return { lit: value };
@@ -103,19 +143,12 @@ export function lowerRestrictionPredicate(expr: PredicateExpr, scope: RuleScope 
                 left: lowerRestrictionOperand(expr.left, scope),
                 right: lowerRestrictionOperand(expr.right, scope),
             };
-        case 'like': {
-            const left = lowerRestrictionOperand(expr.left, scope);
-            if (expr.pattern.kind !== 'literal' || typeof expr.pattern.value !== 'string') {
-                throw new Error('allow rule LIKE pattern must be a string literal');
-            }
-            const pattern = expr.pattern.value;
-            if (pattern.startsWith('%') && pattern.endsWith('%') && pattern.length >= 2) {
-                return { p: 'str', str: 'contains', value: left, sub: { lit: pattern.slice(1, -1) } };
-            }
-            if (pattern.startsWith('%')) return { p: 'str', str: 'suffix', value: left, sub: { lit: pattern.slice(1) } };
-            if (pattern.endsWith('%')) return { p: 'str', str: 'prefix', value: left, sub: { lit: pattern.slice(0, -1) } };
-            return { p: 'cmp', cmp: 'eq', left, right: { lit: pattern } };
-        }
+        case 'like':
+            return {
+                p: 'like',
+                value: lowerRestrictionOperand(expr.left, scope),
+                pattern: lowerLikePattern(expr, lowerRestrictionOperand(expr.pattern, scope)),
+            };
         case 'exists': {
             if (isSelfReferentialExists(scope, expr.table) && expr.alias === undefined) {
                 throw new Error(`EXISTS ${expr.table} is self-referential; use AS alias`);
@@ -260,8 +293,15 @@ function lowerRestrictionOperand(expr: OperandExpr, scope: RuleScope): Operand {
         }
         return { col: resolved.column };
     }
+    if (expr.kind === 'arith') {
+        return { fn: ARITH_FN[expr.op], args: [lowerRestrictionOperand(expr.left, scope), lowerRestrictionOperand(expr.right, scope)] };
+    }
+    if (expr.kind === 'length') {
+        return { fn: 'len', args: [lowerRestrictionOperand(expr.arg, scope)] };
+    }
     if (expr.kind === 'literal') {
         if (expr.value === null) throw new Error('NULL is not supported in allow rule operands');
+        rejectReservedString(expr.value);
         return { lit: expr.value };
     }
     if (expr.kind === 'variable') {
@@ -274,9 +314,18 @@ function lowerRestrictionOperand(expr: OperandExpr, scope: RuleScope): Operand {
     throw new Error('Only $author is supported in allow rule operands');
 }
 
+// In allow rules a '$'-prefixed string payload value is a term ($author,
+// $row.<col>), so a quoted '$...' literal would silently change meaning.
+function rejectReservedString(value: json.Literal): void {
+    if (typeof value === 'string' && value.startsWith('$')) {
+        throw new Error(`string literal '${value}' is reserved in allow rules: strings starting with '$' denote terms (write $author, not '$author')`);
+    }
+}
+
 function lowerExistsWhereValue(expr: OperandExpr, scope: RuleScope): json.Literal | '$author' | string {
     if (expr.kind === 'literal') {
         if (expr.value === null) throw new Error('NULL is not supported in EXISTS WHERE values');
+        rejectReservedString(expr.value);
         return expr.value;
     }
     if (expr.kind === 'variable') {

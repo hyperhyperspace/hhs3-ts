@@ -124,6 +124,8 @@ A column has a base type and, optionally, a set of type-scoped `constraints`. Va
 
 Value validation is a synchronous Layer-1 write-time gate (`columnValueValid`): a value that is non-canonical, out of range, or (for `decimal`) carries more fractional digits than the column scale is **hard-rejected at write time — never rounded or coerced**. Comparisons and ordering on `integer` / `float` / `bigint` / `decimal` are numeric (bigint via `BigInt`, decimal via scaled-integer), not lexical; `bytes` supports equality only. `add` / `sub` / `mul` are exact on `integer`, `bigint`, and `decimal` (operands must share a type family).
 
+`like` (`{ p: 'like', value, pattern }`, in restrictions and queries) is SQL `LIKE` over strings: `%` matches any run of characters (including none), `_` matches exactly one Unicode code point, and `\` makes the next character literal (`'100\%'`). Matching is case-sensitive and covers the whole value, so a pattern without wildcards is an equality test. The pattern may be a literal or a column; a literal pattern ending in a lone `\` fails validation, and a malformed pattern read from a column matches nothing.
+
 Deeper notes: [CAPABILITIES.md](./CAPABILITIES.md) (capabilities from rows and at-use predicates), [VOID_SEMANTICS.md](./VOID_SEMANTICS.md) (discarding rule-breaking operations under concurrency), [mvt](../mvt) (the underlying type system and SOaD), [rdb_lang](../rdb_lang) (the C-SQL reference).
 
 ## Tests

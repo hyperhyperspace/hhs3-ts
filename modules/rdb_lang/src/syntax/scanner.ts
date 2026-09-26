@@ -53,13 +53,14 @@ export function scanStatement(text: string): ScanStatus {
             continue;
         }
 
-        // String literal (single-quoted, '' escaping)
-        if (ch === "'") {
+        // String literal (single-quoted, '' escaping) or quoted identifier
+        // (double-quoted, "" escaping)
+        if (ch === "'" || ch === '"') {
             i++;
             let closed = false;
             while (i < text.length) {
-                if (text[i] === "'") {
-                    if (text[i + 1] === "'") { i += 2; continue; }
+                if (text[i] === ch) {
+                    if (text[i + 1] === ch) { i += 2; continue; }
                     i++;
                     closed = true;
                     break;
@@ -164,12 +165,12 @@ export function splitStatements(text: string): string[] {
             continue;
         }
 
-        // String literal
-        if (ch === "'") {
+        // String literal or quoted identifier
+        if (ch === "'" || ch === '"') {
             i++;
             while (i < text.length) {
-                if (text[i] === "'") {
-                    if (text[i + 1] === "'") { i += 2; continue; }
+                if (text[i] === ch) {
+                    if (text[i + 1] === ch) { i += 2; continue; }
                     i++;
                     break;
                 }

@@ -12,6 +12,27 @@ import {
 import { lex } from "./lexer.js";
 import { Token } from "./tokens.js";
 
+const CMP_OPERATORS = ['=', '!=', '<', '<=', '>', '>='] as const;
+type CmpOperator = typeof CMP_OPERATORS[number];
+
+// Parse-time expression tree, before it is sorted into conditions
+// (PredicateExpr) and values (OperandExpr).
+type Expr =
+    | { e: 'or' | 'and'; args: Expr[]; span: TextSpan }
+    | { e: 'not'; arg: Expr; span: TextSpan }
+    | { e: 'cmp'; op: CmpOperator; left: Expr; right: Expr; span: TextSpan }
+    | { e: 'like'; left: Expr; pattern: Expr; escape?: string; span: TextSpan }
+    | { e: 'arith'; op: '+' | '-' | '*'; left: Expr; right: Expr; span: TextSpan }
+    | { e: 'neg'; arg: Expr; span: TextSpan }
+    | { e: 'length'; arg: Expr; span: TextSpan }
+    | { e: 'paren'; inner: Expr; span: TextSpan }
+    | { e: 'pred'; pred: PredicateExpr; span: TextSpan }
+    | { e: 'operand'; operand: OperandExpr; span: TextSpan };
+
+function negate(n: number): number {
+    return n === 0 ? 0 : -n;
+}
+
 class Parser {
     private pos = 0;
     private readonly diagnostics = new DiagnosticBag();
@@ -115,8 +136,11 @@ class Parser {
             }
             end = this.expectPunctuation(')').span;
         }
+        const hashAlgorithm = this.matchHashAlgorithm();
+        if (hashAlgorithm !== undefined) end = hashAlgorithm.span;
         const stmt: CreateDatabaseStatement = { kind: 'create-database', name: nameTok.text, creators, span: combineSpans(start, end) };
         if (seed !== undefined) stmt.seed = seed;
+        if (hashAlgorithm !== undefined) stmt.hashAlgorithm = hashAlgorithm.value as string;
         return stmt;
     }
 
@@ -132,6 +156,7 @@ class Parser {
             }
             this.expectPunctuation(')');
         }
+        const hashAlgorithm = this.matchHashAlgorithm();
         this.expectKeyword('AS');
         this.expectPunctuation('(');
         const tables: TableDecl[] = [];
@@ -140,7 +165,21 @@ class Parser {
             if (!this.matchPunctuation(',')) break;
         }
         const close = this.expectPunctuation(')');
-        return { kind: 'create-schema', name, creators, tables, span: combineSpans(start, close.span) };
+        const stmt: CreateSchemaStatement = { kind: 'create-schema', name, creators, tables, span: combineSpans(start, close.span) };
+        if (hashAlgorithm !== undefined) stmt.hashAlgorithm = hashAlgorithm.value as string;
+        return stmt;
+    }
+
+    // `HASH ALGORITHM '<name>'` on CREATE statements. HASH and ALGORITHM are
+    // contextual, so they stay usable as names elsewhere.
+    private matchHashAlgorithm(): Token | undefined {
+        const tok = this.peek();
+        const next = this.peekNext();
+        if (tok.kind !== 'identifier' || tok.quoted || tok.upper !== 'HASH') return undefined;
+        if (next.kind !== 'identifier' || next.quoted || next.upper !== 'ALGORITHM') return undefined;
+        this.advance();
+        this.advance();
+        return this.expectKind('string', 'HASH ALGORITHM name');
     }
 
     private parseTableDecl(): TableDecl {
@@ -266,10 +305,15 @@ class Parser {
         let canDeploy: PredicateExpr | undefined;
         const canObserve: CreateTableGroupStatement['canObserve'] = [];
         const initialRows: InitialRow[] = [];
+        let hashAlgorithm: string | undefined;
         let end = schema.span;
 
         while (!this.isEof() && !this.checkPunctuation(';') && !this.checkPunctuation(')')) {
-            if (this.matchKeyword('AT')) {
+            const hashTok = this.matchHashAlgorithm();
+            if (hashTok !== undefined) {
+                hashAlgorithm = hashTok.value as string;
+                end = hashTok.span;
+            } else if (this.matchKeyword('AT')) {
                 schemaVersion = this.parseVersion();
                 end = schemaVersion.span;
             } else if (this.matchKeyword('BIND')) {
@@ -333,6 +377,7 @@ class Parser {
         if (schemaVersion !== undefined) stmt.schemaVersion = schemaVersion;
         if (idProvider !== undefined) stmt.idProvider = idProvider;
         if (canDeploy !== undefined) stmt.canDeploy = canDeploy;
+        if (hashAlgorithm !== undefined) stmt.hashAlgorithm = hashAlgorithm;
         return stmt;
     }
 
@@ -392,10 +437,15 @@ class Parser {
             if (!this.matchPunctuation(',')) break;
         }
         let end = this.expectPunctuation(')').span;
+        let note: string | undefined;
         let at: VersionExpr | undefined;
         let author: AuthorExpr | undefined;
         while (!this.isEof() && !this.checkPunctuation(';')) {
-            if (this.matchKeyword('AT')) {
+            if (this.matchKeyword('NOTE')) {
+                const tok = this.expectKind('string', 'NOTE text');
+                note = tok.value as string;
+                end = tok.span;
+            } else if (this.matchKeyword('AT')) {
                 at = this.parseVersion();
                 end = at.span;
             } else if (this.matchKeyword('BY')) {
@@ -407,6 +457,7 @@ class Parser {
             }
         }
         const stmt: AlterSchemaStatement = { kind: 'alter-schema', schema, rules, span: combineSpans(start, end) };
+        if (note !== undefined) stmt.note = note;
         if (author !== undefined) stmt.author = author;
         if (at !== undefined) stmt.at = at;
         return stmt;
@@ -806,105 +857,218 @@ class Parser {
     }
 
     private parsePredicate(): PredicateExpr {
-        return this.parseOr();
+        return this.toPredicate(this.parseExpr());
     }
 
-    private parseOr(): PredicateExpr {
-        let expr = this.parseAnd();
-        while (this.matchKeyword('OR')) {
-            const right = this.parseAnd();
-            expr = expr.kind === 'or'
-                ? { ...expr, args: [...expr.args, right], span: combineSpans(expr.span, right.span) }
-                : { kind: 'or', args: [expr, right], span: combineSpans(expr.span, right.span) };
-        }
-        return expr;
+    // Conditions and values share one precedence-climbing grammar, loosest
+    // to tightest: OR, AND, NOT, comparison / LIKE, + -, *, unary minus,
+    // primary. toPredicate / toOperand then sort the result into the AST.
+    private parseExpr(): Expr {
+        return this.parseOrExpr();
     }
 
-    private parseAnd(): PredicateExpr {
-        let expr = this.parseNot();
-        while (this.matchKeyword('AND')) {
-            const right = this.parseNot();
-            expr = expr.kind === 'and'
-                ? { ...expr, args: [...expr.args, right], span: combineSpans(expr.span, right.span) }
-                : { kind: 'and', args: [expr, right], span: combineSpans(expr.span, right.span) };
-        }
-        return expr;
+    // Only an unparenthesized chain becomes one group: `(A AND B) AND C`
+    // keeps its nesting, so the AST mirrors the text.
+    private parseOrExpr(): Expr {
+        const first = this.parseAndExpr();
+        if (!this.checkKeyword('OR')) return first;
+        const args = [first];
+        while (this.matchKeyword('OR')) args.push(this.parseAndExpr());
+        return { e: 'or', args, span: combineSpans(first.span, args[args.length - 1].span) };
     }
 
-    private parseNot(): PredicateExpr {
+    private parseAndExpr(): Expr {
+        const first = this.parseNotExpr();
+        if (!this.checkKeyword('AND')) return first;
+        const args = [first];
+        while (this.matchKeyword('AND')) args.push(this.parseNotExpr());
+        return { e: 'and', args, span: combineSpans(first.span, args[args.length - 1].span) };
+    }
+
+    private parseNotExpr(): Expr {
         if (this.matchKeyword('NOT')) {
             const start = this.previous().span;
-            const arg = this.parseNot();
-            return { kind: 'not', arg, span: combineSpans(start, arg.span) };
+            const arg = this.parseNotExpr();
+            return { e: 'not', arg, span: combineSpans(start, arg.span) };
         }
-        return this.parsePredicatePrimary();
+        return this.parseCmpExpr();
     }
 
-    private parsePredicatePrimary(): PredicateExpr {
+    private parseCmpExpr(): Expr {
+        const left = this.parseAddExpr();
+        if (this.checkKind('operator') && (CMP_OPERATORS as readonly string[]).includes(this.peek().text)) {
+            const op = this.advance().text as CmpOperator;
+            const right = this.parseAddExpr();
+            return { e: 'cmp', op, left, right, span: combineSpans(left.span, right.span) };
+        }
+        if (this.matchKeyword('LIKE')) {
+            const pattern = this.parseAddExpr();
+            const like: Extract<Expr, { e: 'like' }> = { e: 'like', left, pattern, span: combineSpans(left.span, pattern.span) };
+            // ESCAPE is contextual (not reserved): only meaningful right after a LIKE pattern.
+            if (this.checkKind('identifier') && !this.peek().quoted && this.peek().upper === 'ESCAPE') {
+                this.advance();
+                const tok = this.peek();
+                if (tok.kind === 'string') {
+                    this.advance();
+                    like.escape = tok.value as string;
+                    like.span = combineSpans(left.span, tok.span);
+                } else {
+                    this.diagnostics.add('PARSE_EXPECTED_TOKEN', 'ESCAPE expects a string literal', tok.span);
+                }
+            }
+            return like;
+        }
+        return left;
+    }
+
+    private parseAddExpr(): Expr {
+        let left = this.parseMulExpr();
+        while (this.checkOperator('+') || this.checkOperator('-')) {
+            const op = this.advance().text as '+' | '-';
+            const right = this.parseMulExpr();
+            left = { e: 'arith', op, left, right, span: combineSpans(left.span, right.span) };
+        }
+        return left;
+    }
+
+    private parseMulExpr(): Expr {
+        let left = this.parseUnaryExpr();
+        while (this.matchOperator('*')) {
+            const right = this.parseUnaryExpr();
+            left = { e: 'arith', op: '*', left, right, span: combineSpans(left.span, right.span) };
+        }
+        return left;
+    }
+
+    private parseUnaryExpr(): Expr {
+        if (this.matchOperator('-')) {
+            const start = this.previous().span;
+            const arg = this.parseUnaryExpr();
+            return { e: 'neg', arg, span: combineSpans(start, arg.span) };
+        }
+        return this.parsePrimaryExpr();
+    }
+
+    private parsePrimaryExpr(): Expr {
         if (this.matchPunctuation('(')) {
             const start = this.previous().span;
-            const expr = this.parsePredicate();
+            const inner = this.parseExpr();
             const end = this.expectPunctuation(')').span;
-            return { ...expr, span: combineSpans(start, end) };
+            return { e: 'paren', inner, span: combineSpans(start, end) };
         }
-        if (this.matchKeyword('TRUE')) return { kind: 'true', span: this.previous().span };
-        if (this.matchKeyword('FALSE')) return { kind: 'false', span: this.previous().span };
         if (this.matchKeyword('EXISTS')) {
-            const start = this.previous().span;
-            const table = this.expectIdentifierToken('EXISTS table');
-            let alias: string | undefined;
-            if (this.matchKeyword('AS')) {
-                alias = this.expectIdentifierToken('EXISTS alias').text;
-            }
-            let where: PredicateExpr | undefined;
-            let end = alias !== undefined ? this.previous().span : table.span;
-            if (this.matchKeyword('WHERE')) {
-                where = this.parsePredicate();
-                end = where.span;
-            }
-            if (where === undefined) {
-                this.diagnostics.add('PARSE_EXPECTED_TOKEN', 'EXISTS requires a WHERE clause', table.span);
-                where = { kind: 'false', span: table.span };
-            }
-            return { kind: 'exists', table: table.text, alias, where, span: combineSpans(start, end) };
+            const pred = this.parseExistsRest(this.previous().span);
+            return { e: 'pred', pred, span: pred.span };
         }
-
-        const left = this.parseOperand();
-        if (this.matchKeyword('LIKE')) {
-            const pattern = this.parseValue();
-            return { kind: 'like', left, pattern, span: combineSpans(left.span, pattern.span) };
+        const tok = this.peek();
+        if (tok.kind === 'identifier' && !tok.quoted && this.peekNext().text === '(' && tok.upper === 'LENGTH') {
+            this.advance();
+            this.expectPunctuation('(');
+            const arg = this.parseExpr();
+            const end = this.expectPunctuation(')').span;
+            return { e: 'length', arg, span: combineSpans(tok.span, end) };
         }
-        if (this.checkKind('operator') && ['=', '!=', '<', '<=', '>', '>='].includes(this.peek().text)) {
-            const op = this.advance().text as '=' | '!=' | '<' | '<=' | '>' | '>=';
-            const right = this.parseOperand();
-            return { kind: 'comparison', op, left, right, span: combineSpans(left.span, right.span) };
+        if (tok.kind === 'identifier' && this.peekNext().text !== '(') {
+            this.advance();
+            return { e: 'operand', operand: this.columnRef(tok), span: tok.span };
         }
-
-        this.diagnostics.add('PARSE_EXPECTED_TOKEN', 'Expected predicate comparison', left.span);
-        return { kind: 'true', span: left.span };
+        const value = this.parseValue();
+        return { e: 'operand', operand: value, span: value.span };
     }
 
-    private parseOperand(): OperandExpr {
-        if (this.checkKind('identifier')) {
-            const tok = this.advance();
-            const dot = tok.text.lastIndexOf('.');
-            if (dot >= 0) {
-                return {
-                    kind: 'column',
-                    table: tok.text.substring(0, dot),
-                    name: tok.text.substring(dot + 1),
-                    span: tok.span,
-                };
-            }
-            return { kind: 'column', name: tok.text, span: tok.span };
+    private parseExistsRest(start: TextSpan): PredicateExpr {
+        const table = this.expectIdentifierToken('EXISTS table');
+        let alias: string | undefined;
+        if (this.matchKeyword('AS')) {
+            alias = this.expectIdentifierToken('EXISTS alias').text;
         }
-        return this.parseValue();
+        let where: PredicateExpr | undefined;
+        let end = alias !== undefined ? this.previous().span : table.span;
+        // WHERE takes the rest of the expression: an EXISTS inside AND / OR
+        // must be parenthesized to end its WHERE early.
+        if (this.matchKeyword('WHERE')) {
+            where = this.parsePredicate();
+            end = where.span;
+        }
+        if (where === undefined) {
+            this.diagnostics.add('PARSE_EXPECTED_TOKEN', 'EXISTS requires a WHERE clause', table.span);
+            where = { kind: 'false', span: table.span };
+        }
+        return { kind: 'exists', table: table.text, alias, where, span: combineSpans(start, end) };
+    }
+
+    private columnRef(tok: Token): OperandExpr {
+        const dot = tok.text.lastIndexOf('.');
+        if (dot >= 0) {
+            return { kind: 'column', table: tok.text.substring(0, dot), name: tok.text.substring(dot + 1), span: tok.span };
+        }
+        return { kind: 'column', name: tok.text, span: tok.span };
+    }
+
+    private toPredicate(expr: Expr): PredicateExpr {
+        switch (expr.e) {
+            case 'paren':
+                return { ...this.toPredicate(expr.inner), span: expr.span };
+            case 'or':
+            case 'and':
+                return { kind: expr.e, args: expr.args.map((a) => this.toPredicate(a)), span: expr.span };
+            case 'not':
+                return { kind: 'not', arg: this.toPredicate(expr.arg), span: expr.span };
+            case 'cmp':
+                return { kind: 'comparison', op: expr.op, left: this.toOperand(expr.left), right: this.toOperand(expr.right), span: expr.span };
+            case 'like': {
+                const like: Extract<PredicateExpr, { kind: 'like' }> = {
+                    kind: 'like', left: this.toOperand(expr.left), pattern: this.toOperand(expr.pattern), span: expr.span,
+                };
+                if (expr.escape !== undefined) like.escape = expr.escape;
+                return like;
+            }
+            case 'pred':
+                return expr.pred;
+            case 'operand':
+                if (expr.operand.kind === 'literal' && expr.operand.value === true) return { kind: 'true', span: expr.span };
+                if (expr.operand.kind === 'literal' && expr.operand.value === false) return { kind: 'false', span: expr.span };
+                break;
+        }
+        this.diagnostics.add('PARSE_EXPECTED_TOKEN', 'Expected a condition, got a value', expr.span);
+        return { kind: 'true', span: expr.span };
+    }
+
+    private toOperand(expr: Expr): OperandExpr {
+        switch (expr.e) {
+            case 'paren':
+                return { ...this.toOperand(expr.inner), span: expr.span };
+            case 'arith':
+                return { kind: 'arith', op: expr.op, left: this.toOperand(expr.left), right: this.toOperand(expr.right), span: expr.span };
+            case 'length':
+                return { kind: 'length', arg: this.toOperand(expr.arg), span: expr.span };
+            case 'neg': {
+                const arg = this.toOperand(expr.arg);
+                if (arg.kind === 'literal' && typeof arg.value === 'number') {
+                    return { kind: 'literal', value: negate(arg.value), span: expr.span };
+                }
+                this.diagnostics.add('PARSE_EXPECTED_TOKEN', 'Unary minus applies only to numeric literals (write 0 - x)', expr.span);
+                return arg;
+            }
+            case 'operand':
+                return expr.operand;
+        }
+        this.diagnostics.add('PARSE_EXPECTED_TOKEN', 'Expected a value, got a condition', expr.span);
+        return { kind: 'literal', value: null, span: expr.span };
     }
 
     private parseValue(): ValueExpr {
         const tok = this.peek();
         if (tok.kind === 'identifier' && this.peekNext().text === '(') {
             return this.parseValueCall();
+        }
+        if (tok.kind === 'operator' && tok.text === '-' && this.peekNext().kind === 'number') {
+            this.advance();
+            const num = this.advance();
+            return { kind: 'literal', value: negate(num.value as number), span: combineSpans(tok.span, num.span) };
+        }
+        if (tok.kind === 'keyword' && tok.upper === 'JSON' && this.peekNext().kind === 'string') {
+            return this.parseJsonText();
         }
         if (tok.kind === 'string' || tok.kind === 'number' ||
             (tok.kind === 'keyword' && ['TRUE', 'FALSE', 'NULL'].includes(tok.upper))) {
@@ -968,12 +1132,38 @@ class Parser {
             if (tok.text === open) depth += 1;
             if (tok.text === close) depth -= 1;
         } while (!this.isEof() && depth > 0);
+        const span = combineSpans(start.span, end);
+        let value: unknown;
         try {
-            return { kind: 'literal', value: JSON.parse(raw) as json.Literal | null, span: combineSpans(start.span, end) };
+            value = JSON.parse(raw);
         } catch {
-            this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', 'Invalid JSON literal', combineSpans(start.span, end));
-            return { kind: 'literal', value: null, span: combineSpans(start.span, end) };
+            this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Invalid JSON literal (write values with strings or objects as JSON '...')`, span);
+            return { kind: 'literal', value: null, span };
         }
+        return this.jsonLiteral(value, span);
+    }
+
+    // JSON '<json text>': the text is an ordinary string, so any JSON value can be written.
+    private parseJsonText(): ValueExpr {
+        const keyword = this.advance();
+        const text = this.advance();
+        const span = combineSpans(keyword.span, text.span);
+        let value: unknown;
+        try {
+            value = JSON.parse(text.value as string);
+        } catch (e) {
+            this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Invalid JSON in JSON literal: ${e instanceof Error ? e.message : String(e)}`, text.span);
+            return { kind: 'literal', value: null, span };
+        }
+        return this.jsonLiteral(value, span);
+    }
+
+    private jsonLiteral(value: unknown, span: TextSpan): ValueExpr {
+        if (!json.isLiteral(value)) {
+            this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', 'JSON values cannot contain null or non-finite numbers (write NULL for a missing value)', span);
+            return { kind: 'literal', value: null, span };
+        }
+        return { kind: 'literal', value, span };
     }
 
     private parseAuthor(): AuthorExpr {
@@ -1081,7 +1271,7 @@ class Parser {
     }
 
     private columnTypeFromToken(tok: Token): ColumnTypeName {
-        const type = tok.upper.toLowerCase();
+        const type = tok.quoted ? '' : tok.upper.toLowerCase();
         if (['string', 'integer', 'float', 'boolean', 'json', 'bigint', 'decimal', 'bytes', 'identity'].includes(type)) return type as ColumnTypeName;
         this.diagnostics.add('PARSE_EXPECTED_TOKEN', `Expected column type, got '${tok.text}'`, tok.span);
         return 'string';
@@ -1090,7 +1280,8 @@ class Parser {
     // Parse a column type name plus its optional parenthesized parameters:
     //   STRING(n) / BYTES(n)  -> constraints.maxLength = n
     //   DECIMAL(p, s)         -> constraints.precision = p, constraints.scale = s
-    // (SQL-standard order: precision then scale; both required.)
+    //   DECIMAL(*, s)         -> constraints.scale = s (no precision limit)
+    // (SQL-standard order: precision then scale; both positions required.)
     private parseColumnType(): { type: ColumnTypeName; constraints?: ColumnConstraintsExpr; span: TextSpan } {
         const typeTok = this.advance();
         const type = this.columnTypeFromToken(typeTok);
@@ -1105,11 +1296,11 @@ class Parser {
             }
         } else if (type === 'decimal') {
             this.expectPunctuation('(');
-            const precision = this.expectInteger('decimal precision');
+            const precision = this.matchOperator('*') ? undefined : this.expectInteger('decimal precision');
             this.expectPunctuation(',');
             const scale = this.expectInteger('decimal scale');
             end = this.expectPunctuation(')').span;
-            constraints = { precision, scale };
+            constraints = precision !== undefined ? { precision, scale } : { scale };
         }
 
         return constraints !== undefined
@@ -1234,6 +1425,10 @@ class Parser {
             return true;
         }
         return false;
+    }
+
+    private checkOperator(text: string): boolean {
+        return this.checkKind('operator') && this.peek().text === text;
     }
 
     private checkKeyword(keyword: string): boolean {

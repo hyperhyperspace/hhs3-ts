@@ -60,6 +60,7 @@ export function createBindContext(session: RdbSession): LangBindContext {
         resolveDefaultView: async () => session.defaultView,
         resolveVariable: (name) => session.resolveVariable(name),
         resolvePublicKey: (labelOrPrefix) => session.resolvePublicKey(labelOrPrefix),
+        hashSuite: () => session.workspace.replica.getHashSuite(),
         resolveLogTarget: (ref) => session.workspace.roots.resolveLogTarget(ref, ctx),
         currentAuthor: () => session.currentAuthor(),
         resolveAuthor: (ref) => session.resolveAuthor(ref),

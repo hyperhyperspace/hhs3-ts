@@ -12,6 +12,7 @@ import {
 import { bind, BoundStatement, PSEUDO_COLUMN_UUID } from "../src/bind/bind.js";
 import { execute } from "../src/exec/execute.js";
 import { parseStatement } from "../src/syntax/parser.js";
+import { splitStatements } from "../src/syntax/scanner.js";
 import { renderCreateSchema, renderCreateTableGroup, renderRowOp, renderSchemaUpdate } from "../src/reverse/render.js";
 import { dumpDatabase, dumpGroup, dumpSchema } from "../src/reverse/dump.js";
 import type { RenderAliasContext, RenderVersionScope } from "../src/reverse/aliases.js";
@@ -424,7 +425,11 @@ export const restPhaseTests = {
                 assertTrue(!schemaDump.includes('#unknown'), 'schema dump does not use unknown schema ref');
                 assertTrue(schemaDump.includes('-- shop\n'), 'schema dump includes schema name comment');
                 assertTrue(schemaDump.includes(`ALTER SCHEMA #${schema.getId()} AS (`), 'schema dump uses schema hash ref');
-                assertTrue(schemaDump.includes('ADD COLUMN products.note string NULL'), 'schema dump includes alter migration');
+                assertTrue(schemaDump.includes('ADD COLUMN products."note" string NULL'), 'schema dump includes alter migration');
+                const noted = await execute(await parseBind("ALTER SCHEMA shop AS (ADD COLUMN products.memo string NULL) NOTE 'v3: it''s a memo';", lang));
+                assertTrue(noted.ok && noted.value.kind === 'alter-schema', 'alter with NOTE succeeds');
+                assertTrue((await dumpSchema(schema)).includes(") NOTE 'v3: it''s a memo'"),
+                    'the executed NOTE is stored on the update and dumped');
                 const schemaDumpLines = schemaDump.split('\n');
                 assertTrue(schemaDumpLines.some((line) =>
                     line.includes(` BY #${authorKeyId}`) && line.includes(' AT {#')),
@@ -663,7 +668,7 @@ export const restPhaseTests = {
                     assertTrue(!line.includes(' AT {#'), `schema dump membership omits AT: ${line}`);
                 }
                 const alterStmt = schemaDump.split('\n\n').find((s) =>
-                    s.includes('ALTER SCHEMA #') && s.includes('ADD COLUMN products.note string NULL'));
+                    s.includes('ALTER SCHEMA #') && s.includes('ADD COLUMN products."note" string NULL'));
                 assertTrue(alterStmt !== undefined && alterStmt.includes(' AT {#'), 'schema dump alter keeps causal AT');
             },
         },
@@ -844,6 +849,71 @@ export const restPhaseTests = {
                 await expectBindReject(
                     "UPDATE fin_prod.ledger SET memo = 'toolongmemo' WHERE rowId = '#deadbeef';",
                     'over-length string on update', "column 'memo' (string): string length 11 exceeds maxLength 8");
+            },
+        },
+        {
+            name: '[REST13] JSON literals: insert/update json objects, dumped row ops re-parse and bind to the same values',
+            invoke: async () => {
+                const { ctx, lang } = await createEnv();
+
+                const schemaPlan = await execute(await parseBind(`
+                    CREATE SCHEMA docs CREATORS ($admin) AS (
+                      TABLE notes (
+                        slug string PUB READONLY,
+                        body json DEFAULT JSON '{"tags":[],"v":0}'
+                      ) ALLOW all IF true
+                    );
+                `, lang));
+                assertTrue(schemaPlan.ok && schemaPlan.value.kind === 'create-plan', 'json schema create plan succeeds');
+                if (!schemaPlan.ok || schemaPlan.value.kind !== 'create-plan') return;
+                const schema = await ctx.createObject(schemaPlan.value.plan.payload) as RSchemaImpl;
+                lang.registerSchema('docs', schema);
+
+                const groupPlan = await execute(await parseBind('CREATE TABLEGROUP docs_prod USING SCHEMA docs;', lang));
+                assertTrue(groupPlan.ok && groupPlan.value.kind === 'create-plan', 'json group create plan succeeds');
+                if (!groupPlan.ok || groupPlan.value.kind !== 'create-plan') return;
+                const group = await ctx.createObject(groupPlan.value.plan.payload) as RTableGroupImpl;
+                lang.registerGroup('docs_prod', group);
+
+                const inserted: json.Literal = { tags: ["it's", 'a"b', 'back\\slash', 'line\nbreak\ttab'], seq: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] };
+                const updated: json.Literal = [{ k: 'v' }, 'x', -2.5, true];
+
+                const insert = await execute(await parseBind(
+                    `INSERT INTO docs_prod.notes (slug, body) VALUES ('n1', JSON '${json.toStringCanonical(inserted).replace(/'/g, "''")}');`, lang));
+                assertTrue(insert.ok && insert.value.kind === 'insert', 'json object insert succeeds');
+                if (!insert.ok || insert.value.kind !== 'insert') return;
+
+                const readBody = async () => {
+                    const select = await execute(await parseBind("SELECT body FROM docs_prod.notes WHERE slug = 'n1';", lang));
+                    if (!select.ok || select.value.kind !== 'select' || select.value.rows.length !== 1) return undefined;
+                    return select.value.rows[0].values['body'];
+                };
+                const canon = (value: json.Literal | undefined) => value === undefined ? '<missing>' : json.toStringCanonical(value);
+                assertEquals(canon(await readBody()), canon(inserted), 'inserted json object reads back exactly');
+
+                const update = await execute(await parseBind(
+                    `UPDATE docs_prod.notes SET body = JSON '${json.toStringCanonical(updated)}' WHERE rowId = '${insert.value.rowId}';`, lang));
+                assertTrue(update.ok && update.value.kind === 'update', 'json array update succeeds');
+                assertEquals(canon(await readBody()), canon(updated), 'updated json array reads back exactly');
+
+                const dump = await dumpGroup(group, { render: { profile: 'full' } });
+                const statements = splitStatements(dump);
+                const rowOps = statements.filter((s) => /^\s*(INSERT|UPDATE) /.test(s) && s.includes('body'));
+                assertEquals(rowOps.length, 2, 'dump holds the insert and update row ops');
+                assertTrue(rowOps.every((s) => s.includes("body") && s.includes("JSON '")), 'dumped json values use JSON literals');
+
+                const expected = [inserted, updated];
+                for (let i = 0; i < rowOps.length; i++) {
+                    const replay = rowOps[i]
+                        .replace(/^(\s*(?:INSERT INTO|UPDATE)) notes /, '$1 docs_prod.notes ')
+                        .replace(/ BY #\S+/, '')
+                        .replace(/ AT \{[^}]*\}/, '');
+                    const bound = await parseBind(replay, lang);
+                    assertTrue(bound.kind === 'insert' || bound.kind === 'update', `dumped row op ${i} binds as a row op`);
+                    if (bound.kind === 'insert' || bound.kind === 'update') {
+                        assertEquals(canon(bound.values['body']), canon(expected[i]), `dumped row op ${i} carries the original json value`);
+                    }
+                }
             },
         },
     ],

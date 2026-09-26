@@ -195,7 +195,7 @@ function applyRule(tables: Map<string, TableDef>, rule: MigrationRule): boolean 
                 }
             }
             // refuse if THIS table's own restrictions still reference the column
-            // as a subject-row field ($row.<col>, in cmp/str operands or as an
+            // as a subject-row field ($row.<col>, in cmp/like operands or as an
             // exists where-value)
             for (const restriction of def.restrictions ?? []) {
                 if (collectRowFieldRefs(restriction.rule).has(rule.column)) return false;

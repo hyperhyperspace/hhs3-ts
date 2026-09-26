@@ -902,14 +902,14 @@ export const rtablePermTests = {
             }
         },
         {
-            name: '[PERM10] Tier 1: an insert gated by cmp/str over the subject row rejects when the predicate fails',
+            name: '[PERM10] Tier 1: an insert gated by cmp/like over the subject row rejects when the predicate fails',
             invoke: async () => {
                 const ctx = newCtx();
                 const admin = await makeIdentity();
 
-                // docs insert allowed only for low-priority rows whose body has
+                // docs insert allowed only for low-priority rows whose name has
                 // the 'ok-' prefix: an `and` of a cmp over a readonly integer
-                // column and a str over the body.
+                // column and a like over the name.
                 const tables: TableDef[] = [
                     { name: 'docs', columns: {
                         body: { type: 'string' },                  // mutable, not referenced
@@ -918,7 +918,7 @@ export const rtablePermTests = {
                       },
                       restrictions: [{ on: 'insert', rule: { p: 'and', args: [
                           { p: 'cmp', cmp: 'lt', left: { col: 'level' }, right: { lit: 3 } },
-                          { p: 'str', str: 'prefix', value: { col: 'name' }, sub: { lit: 'ok-' } },
+                          { p: 'like', value: { col: 'name' }, pattern: { lit: 'ok-%' } },
                       ] } }] },
                 ];
                 const schemaInit = await RSchemaImpl.create({
@@ -939,15 +939,15 @@ export const rtablePermTests = {
                 // No author needed (the rule names no identity).
                 await docs.insert('d-ok', { body: 'hello', name: 'ok-1', level: 2 });
                 await expectThrow(() => docs.insert('d-badname', { body: 'hello', name: 'nope', level: 2 }),
-                    'an insert failing the str prefix rejects');
+                    'an insert failing the like prefix rejects');
                 await expectThrow(() => docs.insert('d-highlevel', { body: 'hello', name: 'ok-2', level: 9 }),
                     'an insert failing the cmp on the readonly level rejects');
 
                 const view = await tableView(group, 'docs');
                 assertTrue(await view.hasRow(deriveRowId('d-ok')),
-                    'an insert satisfying both cmp and str survives');
+                    'an insert satisfying both cmp and like survives');
                 assertFalse(await view.hasRow(deriveRowId('d-badname')),
-                    'an insert failing the str prefix never appends');
+                    'an insert failing the like prefix never appends');
                 assertFalse(await view.hasRow(deriveRowId('d-highlevel')),
                     'an insert failing the cmp on the readonly level never appends');
             }

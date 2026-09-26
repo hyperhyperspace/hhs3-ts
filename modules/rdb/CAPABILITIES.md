@@ -114,7 +114,7 @@ expressible by the positive existence predicates above. Beyond that parity,
 Rdb restrictions can now also reference the **subject row's own readonly
 fields**, which RCap has no equivalent for:
 
-- **`cmp` / `str` atoms** evaluate operand expressions over `$row.<col>`
+- **`cmp` / `like` atoms** evaluate operand expressions over `$row.<col>`
   (readonly columns of the row being written), literals, exact arithmetic
   (`add` / `sub` / `mul` on `integer` / `bigint` / `decimal`, operands sharing a
   type family) and `len` — gating an op on its own immutable shape. Ordering

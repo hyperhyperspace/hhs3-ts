@@ -7,7 +7,7 @@
 // in the engine; a non-pub filter is correct but scans.
 //
 // RowFilter is a SEPARATE type from the restriction Predicate. It shares only
-// the pure value-expression core (operand / cmp / str) via ../rschema/expr.ts;
+// the pure value-expression core (operand / cmp / like) via ../rschema/expr.ts;
 // it must never be accepted where a Predicate is expected (schema restrictions,
 // canDeploy, voiding). Validation here is USER-FACING — it throws descriptive
 // errors on mistakes (unknown columns, malformed filters, type-incoherent
@@ -15,9 +15,9 @@
 // writes.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
-import type { ColumnType, CmpOp, Operand, StrOp } from "../rschema/payload.js";
-import { CMP_OPS, STR_OPS, ARITH_FNS } from "../rschema/payload.js";
-import { evalOperand, compareOperands, cmpTypesOk, strTypesOk, resolveCmpType } from "../rschema/expr.js";
+import type { ColumnType, CmpOp, Operand } from "../rschema/payload.js";
+import { CMP_OPS, ARITH_FNS } from "../rschema/payload.js";
+import { evalOperand, compareOperands, cmpTypesOk, likeTypesOk, likeMatch, isValidLikePattern, resolveCmpType } from "../rschema/expr.js";
 import { compareNumericStr } from "../rschema/canonical.js";
 import { MAX_EXPR_DEPTH, MAX_EXPR_ARGS } from "../rschema/validate.js";
 
@@ -28,13 +28,13 @@ import type { Row, RowValues } from "./interfaces.js";
 export type TypeOf = (column: string) => ColumnType | undefined;
 
 // Two-valued logic: an operand that does not resolve (missing column value)
-// makes its cmp/str atom false; `not` negates normally (no SQL three-valued
+// makes its cmp/like atom false; `not` negates normally (no SQL three-valued
 // NULL). The implicit `rowAuthor` system column can be queried like a string
 // column.
 export type RowFilter =
     | { p: 'true' }
     | { p: 'cmp'; cmp: CmpOp; left: Operand; right: Operand }
-    | { p: 'str'; str: StrOp; value: Operand; sub: Operand }
+    | { p: 'like'; value: Operand; pattern: Operand }
     | { p: 'not'; arg: RowFilter }         // query-only (forbidden in restrictions)
     | { p: 'and'; args: RowFilter[] }
     | { p: 'or'; args: RowFilter[] };
@@ -69,13 +69,11 @@ export function evalRowFilter(filter: RowFilter, row: Row, typeOf?: TypeOf): boo
             const type = typeOf !== undefined ? resolveCmpType(filter.left, filter.right, typeOf) : undefined;
             return compareOperands(filter.cmp, l, r, type);
         }
-        case 'str': {
+        case 'like': {
             const v = evalOperand(filter.value, lookup);
-            const s = evalOperand(filter.sub, lookup);
-            if (typeof v !== 'string' || typeof s !== 'string') return false;
-            if (filter.str === 'prefix') return v.startsWith(s);
-            if (filter.str === 'suffix') return v.endsWith(s);
-            return v.includes(s);
+            const pattern = evalOperand(filter.pattern, lookup);
+            if (typeof v !== 'string' || typeof pattern !== 'string') return false;
+            return likeMatch(v, pattern);
         }
         case 'not':
             return !evalRowFilter(filter.arg, row, typeOf);
@@ -204,12 +202,15 @@ function validateRowFilter(filter: RowFilter, columns: ColumnTypes, depth: numbe
             }
             return;
         }
-        case 'str': {
-            if (!STR_OPS.includes(filter.str)) throw new Error(`unknown string operator '${String(filter.str)}'`);
+        case 'like': {
             validateOperand(filter.value, columns, depth + 1);
-            validateOperand(filter.sub, columns, depth + 1);
-            if (!strTypesOk(filter.value, filter.sub, typeOf)) {
-                throw new Error("non-string operand in string-match query filter");
+            validateOperand(filter.pattern, columns, depth + 1);
+            if (!likeTypesOk(filter.value, filter.pattern, typeOf)) {
+                throw new Error("non-string operand in LIKE query filter");
+            }
+            const pattern = filter.pattern;
+            if ('lit' in pattern && typeof pattern.lit === 'string' && !isValidLikePattern(pattern.lit)) {
+                throw new Error("LIKE pattern ends in an unescaped '\\'");
             }
             return;
         }

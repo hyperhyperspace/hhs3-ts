@@ -12,11 +12,11 @@ import {
     ColumnDef, ColumnConstraints, ColumnType, FKs, IdProvider, IdTerm, MigrationRule, Operand, Predicate, PredicateContext,
     Restriction, TableDef,
     MAX_FKS, MAX_NAME_LENGTH, MAX_QUALIFIED_NAME_LENGTH, MAX_RESTRICTIONS,
-    ID_TERMS, CMP_OPS, STR_OPS, CmpOp, StrOp,
+    ID_TERMS, CMP_OPS, CmpOp,
 } from "./payload.js";
 
 import { splitTableRef, parseRowFieldTerm } from "./payload.js";
-import { cmpTypesOk, strTypesOk } from "./expr.js";
+import { cmpTypesOk, likeTypesOk, isValidLikePattern } from "./expr.js";
 import {
     isCanonicalBigint, isCanonicalDecimal, isCanonicalBase64, base64ByteLen,
     normalizeBigint, normalizeDecimal, intInRange, bigintInRange, decInRange, compareNumericStr,
@@ -67,7 +67,7 @@ export function columnValueMatchesType(value: json.Literal, type: ColumnType): b
         case 'integer': return typeof value === 'number' && Number.isSafeInteger(value);
         case 'float': return typeof value === 'number' && Number.isFinite(value);
         case 'boolean': return typeof value === 'boolean';
-        case 'json': return value !== undefined && value !== null;
+        case 'json': return json.isLiteral(value);
         case 'bigint': return typeof value === 'string' && isCanonicalBigint(value);
         case 'decimal': return typeof value === 'string';
         case 'bytes': return typeof value === 'string' && isCanonicalBase64(value);
@@ -119,6 +119,7 @@ export function columnValueValidReason(value: json.Literal, def: ColumnDef): Val
             return undefined;
         case 'json':
             if (value === undefined || value === null) return `expected a JSON value, got ${carrierName(value)}`;
+            if (!json.isLiteral(value)) return 'JSON values cannot contain null';
             return undefined;
         case 'bigint':
             if (typeof value !== 'string') return `expected a bigint string, got ${carrierName(value)}`;
@@ -166,7 +167,8 @@ function isValidTerm(value: json.Literal, context: PredicateContext): boolean {
 // $row.* is row-context only. Non-$ values are plain literals (checked here as
 // "not reserved", i.e. accepted).
 function isValidWhereValue(value: json.Literal, context: PredicateContext): boolean {
-    if (typeof value !== 'string' || !value.startsWith('$')) return true;
+    if (typeof value !== 'string') return json.isLiteral(value);
+    if (!value.startsWith('$')) return true;
     if (ID_TERMS.includes(value as IdTerm)) return isValidTerm(value, context);
     if (parseRowFieldTerm(value) !== undefined) return context === 'row';
     return false;   // any other $-string is reserved and not a known term
@@ -182,7 +184,11 @@ function validateOperand(op: json.Literal, context: PredicateContext, depth: num
     const keys = Object.keys(e);
 
     if ('lit' in e) {
-        return keys.length === 1;
+        if (keys.length !== 1) return false;
+        // $-strings are reserved for terms, as in exists where-values
+        const lit = e['lit'];
+        if (typeof lit !== 'string') return json.isLiteral(lit);
+        return !lit.startsWith('$') || isValidTerm(lit, context);
     }
     if ('col' in e) {
         if (context !== 'row') return false;   // no subject row
@@ -238,17 +244,19 @@ export function validatePredicate(pred: json.Literal, context: PredicateContext 
             return validateOperand(e['left'], context, depth + 1)
                 && validateOperand(e['right'], context, depth + 1);
         }
-        case 'str': {
-            if (keys.length !== 4) return false;
-            if (!STR_OPS.includes(e['str'] as StrOp)) return false;
-            return validateOperand(e['value'], context, depth + 1)
-                && validateOperand(e['sub'], context, depth + 1);
+        case 'like': {
+            if (keys.length !== 3) return false;
+            if (!validateOperand(e['value'], context, depth + 1)) return false;
+            if (!validateOperand(e['pattern'], context, depth + 1)) return false;
+            const pattern = e['pattern'] as { [key: string]: json.Literal };
+            return !('lit' in pattern) || typeof pattern['lit'] !== 'string' || isValidLikePattern(pattern['lit']);
         }
         case 'and':
         case 'or': {
             if (keys.length !== 2 || !Array.isArray(e['args'])) return false;
             const args = e['args'] as json.Literal[];
-            if (args.length === 0 || args.length > MAX_EXPR_ARGS) return false;
+            // a one-member group means the same as its member: not canonical
+            if (args.length < 2 || args.length > MAX_EXPR_ARGS) return false;
             return args.every((a) => validatePredicate(a, context, depth + 1));
         }
         default:
@@ -258,7 +266,7 @@ export function validatePredicate(pred: json.Literal, context: PredicateContext 
 
 type ExistsAtom = Extract<Predicate, { p: 'exists' }>;
 type CmpAtom = Extract<Predicate, { p: 'cmp' }>;
-type StrAtom = Extract<Predicate, { p: 'str' }>;
+type LikeAtom = Extract<Predicate, { p: 'like' }>;
 
 export function collectExistsAtoms(pred: Predicate, out: ExistsAtom[] = []): ExistsAtom[] {
     if (pred.p === 'exists') out.push(pred);
@@ -268,10 +276,10 @@ export function collectExistsAtoms(pred: Predicate, out: ExistsAtom[] = []): Exi
     return out;
 }
 
-export function collectCmpStrAtoms(pred: Predicate, out: (CmpAtom | StrAtom)[] = []): (CmpAtom | StrAtom)[] {
-    if (pred.p === 'cmp' || pred.p === 'str') out.push(pred);
+export function collectCmpLikeAtoms(pred: Predicate, out: (CmpAtom | LikeAtom)[] = []): (CmpAtom | LikeAtom)[] {
+    if (pred.p === 'cmp' || pred.p === 'like') out.push(pred);
     if (pred.p === 'and' || pred.p === 'or') {
-        for (const arg of pred.args) collectCmpStrAtoms(arg, out);
+        for (const arg of pred.args) collectCmpLikeAtoms(arg, out);
     }
     return out;
 }
@@ -282,16 +290,16 @@ function collectOperandCols(op: Operand, out: Set<string>): void {
 }
 
 // Every subject-row column referenced by the predicate: via `{col}` operands in
-// cmp/str atoms and via `$row.<col>` exists where-values.
+// cmp/like atoms and via `$row.<col>` exists where-values.
 export function collectRowFieldRefs(pred: Predicate, out: Set<string> = new Set()): Set<string> {
     switch (pred.p) {
         case 'cmp':
             collectOperandCols(pred.left, out);
             collectOperandCols(pred.right, out);
             break;
-        case 'str':
+        case 'like':
             collectOperandCols(pred.value, out);
-            collectOperandCols(pred.sub, out);
+            collectOperandCols(pred.pattern, out);
             break;
         case 'exists':
             for (const value of Object.values(pred.where ?? {})) {
@@ -316,7 +324,7 @@ function columnTypeOf(columns: { [c: string]: ColumnDef }): (column: string) => 
 
 // Tier 1+2 column-level checks for one restriction rule declared on `def`:
 //   - every $row.<col> reference names an existing READONLY column of `def`;
-//   - cmp/str operand types are coherent over `def`'s columns;
+//   - cmp/like operand types are coherent over `def`'s columns;
 //   - an exists where-value $row.<col> matches the (local) target field's type
 //     (identity also matches string; the target field's pub-ness is enforced
 //     separately by the exists check).
@@ -334,13 +342,13 @@ export function checkPredicateColumns(
     }
 
     const typeOf = columnTypeOf(def.columns);
-    for (const atom of collectCmpStrAtoms(rule)) {
+    for (const atom of collectCmpLikeAtoms(rule)) {
         if (atom.p === 'cmp') {
             if (!cmpTypesOk(atom.cmp, atom.left, atom.right, typeOf)) {
                 return `cmp operand types are incompatible in table '${def.name}'`;
             }
-        } else if (!strTypesOk(atom.value, atom.sub, typeOf)) {
-            return `str operand types are incompatible in table '${def.name}'`;
+        } else if (!likeTypesOk(atom.value, atom.pattern, typeOf)) {
+            return `like operand types are incompatible in table '${def.name}'`;
         }
     }
 
@@ -406,7 +414,14 @@ function compareBound(def: ColumnDef, a: string, b: string): number {
     return compareNumericStr(a, b, def.type === 'decimal' ? 'decimal' : 'bigint');
 }
 
+// Omitting a flag already means false, so an explicit false is a second
+// spelling of the same column def and is rejected.
+const COLUMN_FLAGS = ['nullable', 'pub', 'readonly'] as const;
+
 export function validateColumnDef(def: ColumnDef): ValidateReason {
+    for (const flag of COLUMN_FLAGS) {
+        if (def[flag] === false) return `flag '${flag}' must be omitted rather than set to false`;
+    }
     const c = def.constraints;
     if (c !== undefined) {
         const allowed = ALLOWED_CONSTRAINTS[def.type];
@@ -459,9 +474,17 @@ export function validateFKs(fks: FKs, columns?: { [column: string]: ColumnDef })
     return undefined;
 }
 
+// At most one restriction per op tag, and 'all' is exclusive: every op has at
+// most one governing rule, so a rule set has a single canonical form.
 export function validateRestrictions(restrictions: Restriction[]): ValidateReason {
+    const seen = new Set<string>();
     for (const [index, restriction] of restrictions.entries()) {
         if (!validatePredicate(restriction.rule)) return `invalid restriction predicate at index ${index}`;
+        if (seen.has(restriction.on)) return `duplicate ALLOW ${restriction.on} rule`;
+        seen.add(restriction.on);
+    }
+    if (seen.has('all') && seen.size > 1) {
+        return 'ALLOW all cannot be combined with operation-specific ALLOW rules';
     }
     return undefined;
 }

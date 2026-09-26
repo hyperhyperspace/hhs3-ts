@@ -1,6 +1,7 @@
 import { testing } from '@hyper-hyper-space/hhs3_util';
 import { checkFormat, Type, Format, FormatOptions } from '../format.js';
 import { Literal } from '../literal.js';
+import { isLiteral, toStringCanonical, toStringNormalized } from '../normalize.js';
 
 async function testStrictRejectsUnknownKeys() {
     const format: Format = {
@@ -170,7 +171,48 @@ const formatTests = {
     ]
 };
 
-const allSuites = [formatTests];
+async function testCanonicalKeepsArrayOrder() {
+    const arr: Literal = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+    const text = toStringCanonical(arr);
+    testing.assertEquals(text, '[0,1,2,3,4,5,6,7,8,9,10,11]', 'arrays serialize in index order');
+    testing.assertEquals(JSON.stringify(JSON.parse(text)), JSON.stringify(arr), '12-element array round-trips');
+    testing.assertTrue(toStringNormalized(arr) !== text, 'hash input keeps its historical order');
+}
+
+async function testCanonicalEscapesStrings() {
+    const value: Literal = { 'k"\n': ['line\nbreak\ttab', 'back\\slash "q"', '\u0001', 'Ünï ✓'], a: -0, b: 1.5e-7, c: false };
+    const text = toStringCanonical(value);
+    testing.assertTrue(text.startsWith('{"a":0,"b":1.5e-7,"c":false,'), `object keys sorted, -0 as 0 (got ${text})`);
+    testing.assertEquals(toStringNormalized(JSON.parse(text)), toStringNormalized({ ...value, a: 0 }), 'control characters survive JSON.parse');
+}
+
+async function testCanonicalRejectsNonLiterals() {
+    const throws = (v: unknown) => { try { toStringCanonical(v as Literal); return false; } catch { return true; } };
+    testing.assertTrue(throws(null), 'top-level null throws');
+    testing.assertTrue(throws([1, null]), 'nested null throws');
+    testing.assertTrue(throws({ a: Number.NaN }), 'NaN throws');
+}
+
+async function testIsLiteral() {
+    testing.assertTrue(isLiteral({ a: [1, 'x', true, { b: [] }] }), 'nested literal');
+    testing.assertFalse(isLiteral(null), 'null');
+    testing.assertFalse(isLiteral([1, null]), 'nested null in array');
+    testing.assertFalse(isLiteral({ a: { b: null } }), 'nested null in object');
+    testing.assertFalse(isLiteral([Number.POSITIVE_INFINITY]), 'infinity');
+    testing.assertFalse(isLiteral(undefined), 'undefined');
+}
+
+const canonicalTests = {
+    title: '[CANONICAL] toStringCanonical and isLiteral',
+    tests: [
+        { name: '[CANONICAL_00] arrays keep index order', invoke: testCanonicalKeepsArrayOrder },
+        { name: '[CANONICAL_01] strings fully escaped, keys sorted', invoke: testCanonicalEscapesStrings },
+        { name: '[CANONICAL_02] rejects null and non-finite numbers', invoke: testCanonicalRejectsNonLiterals },
+        { name: '[CANONICAL_03] isLiteral rejects null at any depth', invoke: testIsLiteral },
+    ]
+};
+
+const allSuites = [formatTests, canonicalTests];
 
 async function main() {
     const filters = process.argv.slice(2);

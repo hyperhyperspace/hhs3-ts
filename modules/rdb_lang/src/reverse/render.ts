@@ -2,15 +2,28 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import {
     AddGroupPayload, AddSchemaPayload, BundlePayload, ColumnDef, CreateRDbPayload, CreateRSchemaPayload,
-    CreateTableGroupPayload, InsertRowPayload, MigrationRule,
+    CreateTableGroupPayload, InsertRowPayload, MigrationRule, Predicate,
     RowEnvelopePayload, RowOpPayload, SchemaUpdatePayload, TableDef, UpdateRowPayload,
     formatPredicate,
 } from "@hyper-hyper-space/hhs3_rdb";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 
+import { KEYWORDS } from "../syntax/tokens.js";
 import type { RenderAliasContext, RenderVersionScope } from "./aliases.js";
 
 export type DumpRenderProfile = 'full' | 'schema';
+
+// Renders a name, possibly '.' / ':' qualified, double-quoting each part that
+// spells a keyword so it lexes back as an identifier.
+export function renderIdent(name: string): string {
+    return name.split(/([.:])/)
+        .map((part) => (part !== '.' && part !== ':' && KEYWORDS.has(part.toUpperCase()) ? `"${part}"` : part))
+        .join('');
+}
+
+function renderPredicate(pred: Predicate, gatedTable?: string): string {
+    return formatPredicate(pred, { gatedTable, quoteIdent: renderIdent });
+}
 
 export type RenderOptions = {
     profile?: DumpRenderProfile;
@@ -58,8 +71,8 @@ function renderObjectRef(
         return scope === 'schema' ? aliases.schema(id, hint) : aliases.group(id, hint);
     }
     if (isFullProfile(options)) return `#${id}`;
-    if (scope === 'schema') return options?.resolveSchemaName?.(id) ?? `#${id}`;
-    return options?.resolveGroupName?.(id) ?? hint ?? `#${id}`;
+    const name = scope === 'schema' ? options?.resolveSchemaName?.(id) : options?.resolveGroupName?.(id) ?? hint;
+    return name !== undefined ? renderIdent(name) : `#${id}`;
 }
 
 function renderGroupTarget(options?: RenderOptions): string {
@@ -72,13 +85,13 @@ export function renderCreateDatabase(payload: CreateRDbPayload, options?: Render
     const seed = isFullProfile(options) && payload.seed !== undefined && payload.seed.length > 0
         ? ` SEED ${sqlString(payload.seed)}`
         : '';
-    return `CREATE DATABASE ${payload.name ?? payload.seed}${seed}${creators};`;
+    return `CREATE DATABASE ${payload.name !== undefined ? renderIdent(payload.name) : payload.seed}${seed}${creators}${renderHashAlgorithm(payload.hashAlgorithm)};`;
 }
 
 export function renderCreateSchema(payload: CreateRSchemaPayload, options?: RenderOptions): string {
     const creators = renderCreators(payload.creators, options);
     const tables = payload.tables.map(renderTableDef).join(',\n  ');
-    return `CREATE SCHEMA ${payload.name}${creators} AS (\n  ${tables}\n);`;
+    return `CREATE SCHEMA ${renderIdent(payload.name)}${creators}${renderHashAlgorithm(payload.hashAlgorithm)} AS (\n  ${tables}\n);`;
 }
 
 export function renderCreateTableGroup(payload: CreateTableGroupPayload, options?: RenderOptions): string {
@@ -95,20 +108,21 @@ export function renderCreateTableGroup(payload: CreateTableGroupPayload, options
         options,
     );
     const parts = [
-        `${schemaComment}CREATE TABLEGROUP ${payload.name}${seed} USING SCHEMA ${schemaRef} AT ${renderVersionSet(payload.schemaVersion, schemaVersionScope(options), options)}`,
+        `${schemaComment}CREATE TABLEGROUP ${renderIdent(payload.name)}${seed} USING SCHEMA ${schemaRef} AT ${renderVersionSet(payload.schemaVersion, schemaVersionScope(options), options)}`,
     ];
+    if (payload.hashAlgorithm !== undefined) parts.push(renderHashAlgorithm(payload.hashAlgorithm).trimStart());
     for (const [name, id] of Object.entries(payload.bindings ?? {})) {
         if (isFullProfile(options)) {
-            parts.push(`BIND ${name} => #${id}`);
+            parts.push(`BIND ${renderIdent(name)} => #${id}`);
         } else {
             const groupName = options?.resolveGroupName?.(id) ?? name;
-            parts.push(`BIND ${name} => ${groupName}`);
+            parts.push(`BIND ${renderIdent(name)} => ${renderIdent(groupName)}`);
         }
     }
-    if (payload.idProvider !== undefined) parts.push(`USING IDENTITIES ${payload.idProvider}`);
-    if (payload.canDeploy !== undefined) parts.push(`ALLOW UPDATE SCHEMA IF ${formatPredicate(payload.canDeploy)}`);
+    if (payload.idProvider !== undefined) parts.push(`USING IDENTITIES ${renderIdent(payload.idProvider)}`);
+    if (payload.canDeploy !== undefined) parts.push(`ALLOW UPDATE SCHEMA IF ${renderPredicate(payload.canDeploy)}`);
     for (const [binding, pred] of Object.entries(payload.canObserve ?? {})) {
-        parts.push(`ALLOW UPDATE REF ${binding} IF ${formatPredicate(pred)}`);
+        parts.push(`ALLOW UPDATE REF ${renderIdent(binding)} IF ${renderPredicate(pred)}`);
     }
     if (payload.initialRows !== undefined) {
         const rows: string[] = [];
@@ -129,7 +143,7 @@ export function renderAddSchema(payload: AddSchemaPayload, options?: RenderOptio
         options?.resolveSchemaName?.(payload.schemaId),
         options,
     );
-    const db = options?.databaseName ?? '<database>';
+    const db = options?.databaseName !== undefined ? renderIdent(options.databaseName) : '<database>';
     return `ADD SCHEMA ${target} TO ${db}${renderNote(payload.note)}${renderBy(payload.author, options)}${isFullProfile(options) ? renderAt(options) : ''};`;
 }
 
@@ -140,7 +154,7 @@ export function renderAddGroup(payload: AddGroupPayload, options?: RenderOptions
         options?.resolveGroupName?.(payload.groupId),
         options,
     );
-    const db = options?.databaseName ?? '<database>';
+    const db = options?.databaseName !== undefined ? renderIdent(options.databaseName) : '<database>';
     return `ADD TABLEGROUP ${target} TO ${db}${renderNote(payload.note)}${renderBy(payload.author, options)}${isFullProfile(options) ? renderAt(options) : ''};`;
 }
 
@@ -153,15 +167,15 @@ export function renderSchemaUpdate(payload: SchemaUpdatePayload, options?: Rende
         : (useAliases(options) && isFullProfile(options)
             ? renderObjectRef('schema', schemaRef as B64Hash, options?.schemaName, options)
             : `#${schemaRef}`);
-    return `${comment}ALTER SCHEMA ${schemaTarget} AS (\n  ${rules}\n)${renderBy(payload.author, options)}${renderAt(options)};`;
+    return `${comment}ALTER SCHEMA ${schemaTarget} AS (\n  ${rules}\n)${renderNote(payload.note)}${renderBy(payload.author, options)}${renderAt(options)};`;
 }
 
 export function renderRowOp(payload: RowOpPayload, table?: string, options?: RenderOptions): string {
-    const target = table ?? '<table>';
+    const target = table !== undefined ? renderIdent(table) : '<table>';
     if (payload.action === 'insert') {
         const insert = payload as InsertRowPayload;
-        const cols = Object.keys(insert.values);
-        const vals = cols.map((c) => renderLiteral(insert.values[c]));
+        const cols = Object.keys(insert.values).map(renderIdent);
+        const vals = Object.values(insert.values).map(renderLiteral);
         if (isFullProfile(options) && insert.uuid !== undefined) {
             return `INSERT INTO ${target} (uuid, ${cols.join(', ')}) VALUES (${sqlString(insert.uuid)}, ${vals.join(', ')})${renderBy(insert.author, options)}${renderAt(options)};`;
         }
@@ -169,7 +183,7 @@ export function renderRowOp(payload: RowOpPayload, table?: string, options?: Ren
     }
     if (payload.action === 'update') {
         const update = payload as UpdateRowPayload;
-        const values = Object.entries(update.values).map(([k, v]) => `${k} = ${renderLiteral(v)}`).join(', ');
+        const values = Object.entries(update.values).map(([k, v]) => `${renderIdent(k)} = ${renderLiteral(v)}`).join(', ');
         return `UPDATE ${target} SET ${values} WHERE rowId = #${update.rowId}${renderBy(update.author, options)}${renderAt(options)};`;
     }
     return `DELETE FROM ${target} WHERE rowId = #${payload.rowId}${renderBy(payload.author, options)}${renderAt(options)};`;
@@ -267,12 +281,12 @@ function renderTableDef(table: TableDef): string {
     if (table.idProvider !== undefined) {
         const provider = table.idProvider.keyIdColumn === 'keyId' && table.idProvider.publicKeyColumn === 'publicKey'
             ? 'IDENTITY PROVIDER'
-            : `IDENTITY PROVIDER (${table.idProvider.keyIdColumn}, ${table.idProvider.publicKeyColumn})`;
+            : `IDENTITY PROVIDER (${renderIdent(table.idProvider.keyIdColumn)}, ${renderIdent(table.idProvider.publicKeyColumn)})`;
         structural.push(provider);
     }
 
     const allows = (table.restrictions ?? [])
-        .map((r) => `ALLOW ${r.on} IF ${formatPredicate(r.rule, { gatedTable: table.name })}`);
+        .map((r) => `ALLOW ${r.on} IF ${renderPredicate(r.rule, table.name)}`);
 
     let suffix = '';
     if (structural.length > 0) {
@@ -282,16 +296,16 @@ function renderTableDef(table: TableDef): string {
         suffix += allows.map((allow) => `\n    ${allow}`).join('');
     }
 
-    return `TABLE ${table.name} (${cols})${suffix}`;
+    return `TABLE ${renderIdent(table.name)} (${cols})${suffix}`;
 }
 
 function renderColumnDef(name: string, def: ColumnDef, fk?: string): string {
-    const parts = [name, renderColumnType(def)];
+    const parts = [renderIdent(name), renderColumnType(def)];
     if (def.nullable) parts.push('NULL');
     if (def.default !== undefined) parts.push(`DEFAULT ${renderLiteral(def.default)}`);
     if (def.pub) parts.push('PUB');
     if (def.readonly) parts.push('READONLY');
-    if (fk !== undefined) parts.push(`REFERENCES ${fk}`);
+    if (fk !== undefined) parts.push(`REFERENCES ${renderIdent(fk)}`);
     const c = def.constraints;
     if (c?.min !== undefined) parts.push(`MIN ${sqlString(c.min)}`);
     if (c?.max !== undefined) parts.push(`MAX ${sqlString(c.max)}`);
@@ -299,7 +313,8 @@ function renderColumnDef(name: string, def: ColumnDef, fk?: string): string {
 }
 
 // Render the column type with its parenthesized params: string(n) / bytes(n)
-// carry maxLength; decimal(p, s) carries precision + scale (SQL-standard order).
+// carry maxLength; decimal(p, s) carries precision + scale (SQL-standard order),
+// with `*` for an absent precision.
 function renderColumnType(def: ColumnDef): string {
     const c = def.constraints;
     switch (def.type) {
@@ -308,7 +323,7 @@ function renderColumnType(def: ColumnDef): string {
         case 'bytes':
             return c?.maxLength !== undefined ? `bytes(${c.maxLength})` : 'bytes';
         case 'decimal':
-            return `decimal(${c?.precision ?? c?.scale ?? 0}, ${c?.scale ?? 0})`;
+            return `decimal(${c?.precision ?? '*'}, ${c?.scale ?? 0})`;
         case 'identity':
             return 'identity';
         default:
@@ -321,17 +336,17 @@ function renderMigrationRule(rule: MigrationRule): string {
         case 'add-table':
             return `ADD TABLE ${renderTableDef(rule.def).replace(/^TABLE /, '')}`;
         case 'drop-table':
-            return `DROP TABLE ${rule.table}`;
+            return `DROP TABLE ${renderIdent(rule.table)}`;
         case 'add-column':
-            return `ADD COLUMN ${rule.table}.${renderColumnDef(rule.column, rule.def)}`;
+            return `ADD COLUMN ${renderIdent(rule.table)}.${renderColumnDef(rule.column, rule.def)}`;
         case 'drop-column':
-            return `DROP COLUMN ${rule.table}.${rule.column}`;
+            return `DROP COLUMN ${renderIdent(rule.table)}.${renderIdent(rule.column)}`;
         case 'set-concurrent-deletes':
-            return `SET CONCURRENT DELETES ${rule.table} ${String(rule.value)}`;
+            return `SET CONCURRENT DELETES ${renderIdent(rule.table)} ${String(rule.value)}`;
         case 'set-fks':
-            return `SET FKS ${rule.table} (${Object.entries(rule.fks).map(([c, r]) => `${c} REFERENCES ${r}`).join(', ')})`;
+            return `SET FKS ${renderIdent(rule.table)} (${Object.entries(rule.fks).map(([c, r]) => `${renderIdent(c)} REFERENCES ${renderIdent(r)}`).join(', ')})`;
         case 'set-restrictions':
-            return `SET ALLOW RULES ${rule.table} (\n    ${rule.restrictions.map((r) => `ALLOW ${r.on} IF ${formatPredicate(r.rule, { gatedTable: rule.table })}`).join(',\n    ')}\n  )`;
+            return `SET ALLOW RULES ${renderIdent(rule.table)} (\n    ${rule.restrictions.map((r) => `ALLOW ${r.on} IF ${renderPredicate(r.rule, rule.table)}`).join(',\n    ')}\n  )`;
     }
 }
 
@@ -340,28 +355,30 @@ function renderInitialRow(table: string, row: InsertRowPayload, options?: Render
     if (isFullProfile(options) && row.uuid !== undefined) {
         parts.unshift(`uuid=${sqlString(row.uuid)}`);
     }
-    return `${table} (${parts.join(', ')})`;
+    return `${renderIdent(table)} (${parts.join(', ')})`;
 }
 
 function renderRowValue(column: string, value: json.Literal, options?: RenderOptions): string {
+    const col = renderIdent(column);
     if (!useAliases(options) || typeof value !== 'string') {
-        return `${column}=${renderLiteral(value)}`;
+        return `${col}=${renderLiteral(value)}`;
     }
     const aliases = options!.aliases!;
     if (column === 'publicKey' && aliases.lookupPublicKeyAlias !== undefined) {
         const name = aliases.lookupPublicKeyAlias(value);
-        if (name !== undefined) return `${column}=publicKey($${name})`;
+        if (name !== undefined) return `${col}=publicKey($${name})`;
     }
     if (aliases.lookupKeyAlias !== undefined) {
         const name = aliases.lookupKeyAlias(value as B64Hash);
-        if (name !== undefined) return `${column}=$${name}`;
+        if (name !== undefined) return `${col}=$${name}`;
     }
-    return `${column}=${renderLiteral(value)}`;
+    return `${col}=${renderLiteral(value)}`;
 }
 
 function renderLiteral(value: json.Literal): string {
     if (typeof value === 'string') return sqlString(value);
-    return json.toStringNormalized(value);
+    if (typeof value === 'object') return `JSON ${sqlString(json.toStringCanonical(value))}`;
+    return json.toStringCanonical(value);
 }
 
 function sqlString(value: string): string {
@@ -370,6 +387,10 @@ function sqlString(value: string): string {
 
 function renderNote(note?: string): string {
     return note === undefined ? '' : ` NOTE ${sqlString(note)}`;
+}
+
+function renderHashAlgorithm(hashAlgorithm?: string): string {
+    return hashAlgorithm === undefined ? '' : ` HASH ALGORITHM ${sqlString(hashAlgorithm)}`;
 }
 
 function renderAt(options?: RenderOptions): string {
@@ -382,10 +403,13 @@ function renderBy(author?: string, options?: RenderOptions): string {
     return ` BY #${author}`;
 }
 
-function renderCreators(creators: { keyId: string }[], options?: RenderOptions): string {
+// The full profile spells out each creator's public key, so replay needs no
+// keystore; the schema profile references the key id.
+function renderCreators(creators: { keyId: string; publicKey: string }[], options?: RenderOptions): string {
     if (creators.length === 0) return '';
     const names = creators.map((c) => {
         if (useAliases(options)) return `$${options!.aliases!.key(c.keyId as B64Hash)}`;
+        if (isFullProfile(options)) return `publicKey(${sqlString(c.publicKey)})`;
         return sqlString(c.keyId);
     });
     return ` CREATORS (${names.join(', ')})`;

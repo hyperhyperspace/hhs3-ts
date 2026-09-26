@@ -48,6 +48,15 @@ export const scannerTests = {
             },
         },
         {
+            name: '[SCAN05b] double-quoted identifiers hide ; and -- like strings do',
+            invoke: async () => {
+                assertEquals(scanStatement('SELECT "a;b" FROM t.x').kind, 'no-terminator', '; inside a quoted identifier');
+                assertEquals(scanStatement('SELECT "a--b" FROM t.x;').kind, 'complete', '-- inside a quoted identifier');
+                assertEquals(scanStatement('SELECT "a""b').kind, 'incomplete-string', 'unclosed quoted identifier');
+                assertEquals(splitStatements('SELECT "a;b" FROM t.x; LOG shop;').length, 2, 'split ignores ; inside quotes');
+            },
+        },
+        {
             name: '[SCAN06] unclosed block comment is incomplete-comment',
             invoke: async () => {
                 assertEquals(scanStatement('SELECT * FROM t /* started').kind, 'incomplete-comment');

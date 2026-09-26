@@ -188,7 +188,7 @@ export type WhereValue = json.Literal | IdTerm | RowFieldTerm;
 
 export type PredicateContext = 'row' | 'object';
 
-// Operand of a value expression (cmp / str atoms). `col` resolves to the
+// Operand of a value expression (cmp / like atoms). `col` resolves to the
 // subject row's readonly column value ($row.<col>); arithmetic (add/sub/mul)
 // operates on integer, bigint, or decimal operands of the same type family,
 // `len` takes a string and yields an integer.
@@ -201,17 +201,16 @@ export type Operand =
 export const CMP_OPS = ['eq', 'ne', 'lt', 'le', 'gt', 'ge'] as const;
 export type CmpOp = typeof CMP_OPS[number];
 
-export const STR_OPS = ['prefix', 'suffix', 'contains'] as const;
-export type StrOp = typeof STR_OPS[number];
-
 export const ARITH_FNS = ['add', 'sub', 'mul'] as const;
 
+// `like` is SQL LIKE over strings (see likeMatch in expr.ts): `%` any run,
+// `_` one code point, `\` escapes the next code point, case-sensitive.
 export type Predicate =
     | { p: 'true' }
     | { p: 'false' }
     | { p: 'exists'; table: string; where: { [field: string]: WhereValue } }
     | { p: 'cmp'; cmp: CmpOp; left: Operand; right: Operand }
-    | { p: 'str'; str: StrOp; value: Operand; sub: Operand }
+    | { p: 'like'; value: Operand; pattern: Operand }
     | { p: 'and'; args: Predicate[] }
     | { p: 'or'; args: Predicate[] };
 

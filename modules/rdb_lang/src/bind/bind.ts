@@ -149,6 +149,7 @@ export type BoundAlterSchema = {
     ast: AlterSchemaStatement;
     schema: ResolvedSchemaRef;
     rules: MigrationRule[];
+    note?: string;
     author: OwnIdentity;
     at: Version;
 };
@@ -408,7 +409,9 @@ async function bindAlterSchema(ast: AlterSchemaStatement, context: LangBindConte
     const at = await context.resolveVersion(ast.at, { kind: 'schema', id: schema.id, schema: schema.schema });
     const view = await schema.schema.getView(at, at);
     const columnsOf = buildAlterColumnsOf(view, ast.rules);
-    return { kind: 'alter-schema', ast, schema, rules: compileMigrationRules(ast.rules, columnsOf), author, at };
+    const bound: BoundAlterSchema = { kind: 'alter-schema', ast, schema, rules: compileMigrationRules(ast.rules, columnsOf), author, at };
+    if (ast.note !== undefined) bound.note = ast.note;
+    return bound;
 }
 
 async function bindUpdateSchema(ast: UpdateSchemaStatement, context: LangBindContext): Promise<BoundUpdateSchema> {

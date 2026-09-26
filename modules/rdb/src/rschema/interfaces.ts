@@ -46,8 +46,9 @@ export interface RSchemaView extends View {
     getTable(name: string): TableDef | undefined;
 
     // Per-slot accessors with defaults applied (what validators call).
-    // getRestriction and-combines all declared restrictions matching the op
-    // (its own tag or 'all'), falling back to defaultRestrictionRule.
+    // getRestriction returns the single declared restriction matching the op
+    // (its own tag or 'all'; validation allows at most one), falling back to
+    // defaultRestrictionRule.
     getConcurrentDeletes(table: string): boolean;
     getFKs(table: string): FKs;
     getRestriction(table: string, op: 'insert' | 'update' | 'delete'): Predicate;

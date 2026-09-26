@@ -13,6 +13,9 @@ Schema `ALLOW` predicates and group gates (`ALLOW UPDATE SCHEMA IF`, `ALLOW UPDA
 - `$author` names the operation author. The old `$row.column` surface syntax is removed; correlate to the gated row with `gatedTable.column` instead (lowered to `$row.column` in the IR).
 - Self-referential `EXISTS` (same table as the gated table) requires `EXISTS table AS alias WHERE alias.column = ...`.
 
+## Quoted identifiers
+
+A name that spells a keyword (`identity`, `table`, `note`, ...) is written in double quotes: `"identity"`, and `""` inside the quotes stands for one `"`. Each part of a qualified name is quoted on its own: `endpoints."identity"`, `users."identity".keyId`. Quoted names are always names, so `"length"(x)` is not the `length` function and `"string"` is not a type. The reverse renderer quotes exactly the name parts that collide with keywords.
 
 
 ## Public Flow
@@ -68,6 +71,8 @@ The base types are `string`, `integer`, `float`, `boolean`, `json`, `bigint`, `d
 - `decimal(p, s)` sets `precision` = `p` and `scale` = `s` (SQL-standard order; both required).
 - `MIN` / `MAX` set inclusive bounds and apply only to `integer` / `bigint` / `decimal`. `bigint` and `decimal` bounds and values are written as quoted strings so they stay exact (a bare number literal would lose precision); the binder canonically encodes them. A `decimal` value with more fractional digits than the column scale, or any out-of-range / non-canonical value, is **rejected, never rounded**. Constraints that do not apply to a type (e.g. `MIN` on a `string`) are rejected.
 
+A `json` value is written `JSON '<json text>'`, where the JSON text is an ordinary quoted string (double a `'` inside it): `DEFAULT JSON '{"tags": ["x", "it''s"]}'`. Top-level strings, numbers and booleans can also be written as plain literals (`'abc'`, `3`, `true`), and an array without strings as brackets (`[1, 2.5, true]`). `null` is not allowed anywhere inside a JSON value; write `NULL` for a missing value. The reverse renderer writes arrays and objects as `JSON '...'`.
+
 `identity` stores a key hash and takes no parameters. Insert its value as `$name` (an unlocked identity) or `#keyIdPrefix`, the same forms `BY` accepts. Compare with `=` / `!=` (including against a `string` key-hash column); ordering and LIKE are not defined.
 
 DDL and refs:
@@ -119,7 +124,51 @@ LOG shop_prod LIMIT 20;  -- table/vertical: truncated reverse-render op preview;
 EXPLAIN LOG shop_prod LIMIT 20;  -- adds reason column for Cancelled group/table ops
 ```
 
+## Expressions
 
+Conditions (`WHERE`, `ALLOW ... IF`, `CAN DEPLOY IF`, `CAN OBSERVE IF`) and the values inside them share one grammar, loosest-binding first:
+
+```ebnf
+condition  = or ;
+or         = and { "OR" and } ;
+and        = not { "AND" not } ;
+not        = "NOT" not | compare ;
+compare    = sum [ cmp_op sum | "LIKE" sum [ "ESCAPE" string ] ] ;
+cmp_op     = "=" | "!=" | "<" | "<=" | ">" | ">=" ;
+sum        = product { ( "+" | "-" ) product } ;
+product    = unary { "*" unary } ;
+unary      = "-" unary | primary ;
+primary    = "(" condition ")"
+           | "EXISTS" table [ "AS" alias ] "WHERE" condition
+           | "length" "(" sum ")"
+           | column | literal | variable | hash | "publicKey" "(" value ")" | json ;
+column     = [ qualifier "." ] name ;
+literal    = string | number | "TRUE" | "FALSE" | "NULL" ;
+json       = "JSON" string | "[" ... "]" ;
+```
+
+- A condition must be a comparison, `LIKE`, `EXISTS`, `TRUE`/`FALSE`, or a `NOT`/`AND`/`OR` of conditions; a bare value (`WHERE name`) is an error, and so is a condition used as a value (`a = (b > 1)`).
+- `+`, `-` and `*` are left-associative; `a - b - c` means `(a - b) - c`. `length(x)` is the string length in UTF-16 code units, like JavaScript's `.length`. In payloads they become the `add`, `sub`, `mul` and `len` operand functions.
+- Unary minus applies only to numeric literals (`-1`, `-(2)`, `-1.5e-3`); for anything else write `0 - x`. Numbers are otherwise unsigned, with an optional fraction and exponent.
+- `EXISTS ... WHERE` takes the rest of the condition, so an `EXISTS` inside `AND` / `OR` needs parentheses: `(EXISTS t WHERE t.a = $author) OR b = 1`.
+- An unparenthesized chain like `A AND B AND C` is one group; parenthesized groups keep their nesting, so `(A AND B) AND C` compiles to a group inside a group.
+- `ESCAPE` and `length` are contextual, not reserved: they are ordinary names outside these positions.
+- In allow rules a quoted string may not start with `$`: payload strings starting with `$` are terms (`$author`, `$row.<col>`), so write `$author`, not `'$author'`. Queries have no terms, so `WHERE tag = '$x'` is a plain string comparison.
+
+### LIKE
+
+`value LIKE pattern [ESCAPE 'c']` is SQL `LIKE`, in both `SELECT ... WHERE` and allow rules:
+
+- `%` matches any run of characters (including none) and `_` matches exactly one character (one Unicode code point).
+- `\` makes the next character literal: `'100\%'` matches only `100%`, and `'a\\b'` matches `a\b`.
+- Matching is case-sensitive and covers the whole value, so `name LIKE 'Widget'` is an exact match.
+- The pattern may be a string literal or a column (`name LIKE t.namePattern`). A literal pattern ending in a lone `\` is rejected.
+- `ESCAPE 'c'` (literal patterns only) picks a different escape character, and `ESCAPE ''` disables escaping. The compiler rewrites the pattern to the `\` form, so `'100!%' ESCAPE '!'` stores the pattern `100\%`.
+
+```sql
+SELECT sku FROM shop_prod.products WHERE sku LIKE 'A-___';          -- 'A-' plus exactly three characters
+SELECT sku FROM shop_prod.products WHERE name LIKE '%50!%%' ESCAPE '!';  -- contains '50%'
+```
 
 ## Foreign Keys
 

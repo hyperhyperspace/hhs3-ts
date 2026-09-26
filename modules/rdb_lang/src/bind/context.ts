@@ -1,4 +1,4 @@
-import type { B64Hash, KeyId, OwnIdentity, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
+import type { B64Hash, HashSuite, KeyId, OwnIdentity, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
 import type { json } from "@hyper-hyper-space/hhs3_json";
 import type { RObject, ScopedDag, Version } from "@hyper-hyper-space/hhs3_mvt";
 import type { RDb, RSchema, RTable, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
@@ -68,6 +68,9 @@ export interface LangBindContext {
     resolveVariable(name: string): Promise<LangValue>;
     // Resolve a keystore label, key-id prefix, or full key id to a creator record.
     resolvePublicKey?(labelOrPrefix: string): Promise<{ keyId: KeyId; publicKey: PublicKey }>;
+    // The replica's hash suite, used to derive key ids from literal public
+    // keys (`CREATORS (publicKey('<base64>'))`). SHA-256 when absent.
+    hashSuite?(): HashSuite;
     resolveLogTarget(ref: NameOrHashRef): Promise<ResolvedLogTarget>;
     currentAuthor(): Promise<OwnIdentity | undefined>;
     // Resolve an explicit `BY $name` / `BY #prefix` author to an unlocked

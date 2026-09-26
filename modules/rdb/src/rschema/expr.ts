@@ -1,4 +1,4 @@
-// Shared value-expression primitives for the operand / cmp / str grammar.
+// Shared value-expression primitives for the operand / cmp / like grammar.
 //
 // These are grammar-agnostic and pure: they operate over a column lookup
 // callback, so the SAME core serves two callers with different front-ends:
@@ -112,9 +112,13 @@ export function operandType(op: Operand, typeOf: (column: string) => ColumnType 
     if (op.fn === 'len') {
         return operandType(op.args[0], typeOf, 'string') === 'string' ? 'integer' : undefined;
     }
-    // add / sub / mul: both args must resolve to the same numeric family.
-    const a = operandType(op.args[0], typeOf, hint);
-    const b = operandType(op.args[1], typeOf, hint ?? a);
+    // add / sub / mul: both args must resolve to the same numeric family. A
+    // 'string' hint is uninformative here (arithmetic never yields a string),
+    // so bare string literals are disambiguated by the sibling argument.
+    const h = hint === 'string' ? undefined : hint;
+    const b0 = operandType(op.args[1], typeOf, h);
+    const a = operandType(op.args[0], typeOf, h ?? b0);
+    const b = operandType(op.args[1], typeOf, h ?? a);
     const at = a ?? b;
     const bt = b ?? a;
     if (at === undefined || at !== bt) return undefined;
@@ -147,8 +151,70 @@ export function cmpTypesOk(cmp: CmpOp, left: Operand, right: Operand, typeOf: (c
     return t !== undefined && ['integer', 'float', 'string', 'bigint', 'decimal'].includes(t);
 }
 
-// Type coherence of a str atom: both operands resolve to strings.
-export function strTypesOk(value: Operand, sub: Operand, typeOf: (column: string) => ColumnType | undefined): boolean {
+// Type coherence of a like atom: value and pattern both resolve to strings.
+export function likeTypesOk(value: Operand, pattern: Operand, typeOf: (column: string) => ColumnType | undefined): boolean {
     return operandType(value, typeOf, 'string') === 'string'
-        && operandType(sub, typeOf, 'string') === 'string';
+        && operandType(pattern, typeOf, 'string') === 'string';
+}
+
+// LIKE patterns: `%` matches any run of code points (including none), `_`
+// exactly one code point, and `\` makes the next code point literal. Matching
+// is case-sensitive, with no other escape or collation rules.
+const LIKE_ANY = 0;
+const LIKE_ONE = 1;
+type LikeToken = typeof LIKE_ANY | typeof LIKE_ONE | string;
+
+// undefined when the pattern ends in a lone `\`.
+function tokenizeLikePattern(pattern: string): LikeToken[] | undefined {
+    const cps = Array.from(pattern);
+    const tokens: LikeToken[] = [];
+    for (let k = 0; k < cps.length; k++) {
+        const c = cps[k];
+        if (c === '\\') {
+            if (k + 1 === cps.length) return undefined;
+            tokens.push(cps[++k]);
+        } else if (c === '%') {
+            tokens.push(LIKE_ANY);
+        } else if (c === '_') {
+            tokens.push(LIKE_ONE);
+        } else {
+            tokens.push(c);
+        }
+    }
+    return tokens;
+}
+
+export function isValidLikePattern(pattern: string): boolean {
+    return tokenizeLikePattern(pattern) !== undefined;
+}
+
+// Whether `value` matches the LIKE `pattern`. A malformed pattern matches
+// nothing. Backtracks only to the most recent `%`, so it runs in
+// O(len(value) * len(pattern)) regardless of the pattern shape.
+export function likeMatch(value: string, pattern: string): boolean {
+    const tokens = tokenizeLikePattern(pattern);
+    if (tokens === undefined) return false;
+    const v = Array.from(value);
+
+    let i = 0;
+    let j = 0;
+    let anyAt = -1;     // token index of the last `%` seen
+    let anyFrom = 0;    // value index that `%` is currently extended to
+    while (i < v.length) {
+        const t = tokens[j];
+        if (j < tokens.length && t !== LIKE_ANY && (t === LIKE_ONE || t === v[i])) {
+            i++;
+            j++;
+        } else if (j < tokens.length && t === LIKE_ANY) {
+            anyAt = j++;
+            anyFrom = i;
+        } else if (anyAt >= 0) {
+            j = anyAt + 1;
+            i = ++anyFrom;
+        } else {
+            return false;
+        }
+    }
+    while (j < tokens.length && tokens[j] === LIKE_ANY) j++;
+    return j === tokens.length;
 }

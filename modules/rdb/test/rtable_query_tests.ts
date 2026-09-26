@@ -10,6 +10,7 @@ import type { TableDef } from "../src/rschema/payload.js";
 import type { Row } from "../src/rtable/interfaces.js";
 import type { ColumnTypes, RowFilter, RowQuery } from "../src/rtable/query.js";
 import { evalRowFilter, orderRows, projectRow, validateRowQuery } from "../src/rtable/query.js";
+import { likeMatch, isValidLikePattern } from "../src/rschema/expr.js";
 
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
@@ -118,7 +119,7 @@ export const rtableQueryTests = {
     title: '[QRY] RTableView single-table query',
     tests: [
         {
-            name: '[QRY01] evalRowFilter: cmp / str / and / or / not, two-valued on missing',
+            name: '[QRY01] evalRowFilter: cmp / like / and / or / not, two-valued on missing',
             invoke: async () => {
                 const r = row('r', { kind: 'apple', qty: 3, price: 1.5 });
 
@@ -132,9 +133,14 @@ export const rtableQueryTests = {
                 assertTrue(evalRowFilter({ p: 'cmp', cmp: 'eq', left: { fn: 'add', args: [{ col: 'qty' }, { lit: 1 }] }, right: { lit: 4 } }, r), 'add');
                 assertTrue(evalRowFilter({ p: 'cmp', cmp: 'eq', left: { fn: 'len', args: [{ col: 'kind' }] }, right: { lit: 5 } }, r), 'len');
 
-                assertTrue(evalRowFilter({ p: 'str', str: 'prefix', value: { col: 'kind' }, sub: { lit: 'app' } }, r), 'prefix');
-                assertTrue(evalRowFilter({ p: 'str', str: 'suffix', value: { col: 'kind' }, sub: { lit: 'ple' } }, r), 'suffix');
-                assertTrue(evalRowFilter({ p: 'str', str: 'contains', value: { col: 'kind' }, sub: { lit: 'ppl' } }, r), 'contains');
+                assertTrue(evalRowFilter({ p: 'like', value: { col: 'kind' }, pattern: { lit: 'app%' } }, r), 'like prefix');
+                assertTrue(evalRowFilter({ p: 'like', value: { col: 'kind' }, pattern: { lit: '%ple' } }, r), 'like suffix');
+                assertTrue(evalRowFilter({ p: 'like', value: { col: 'kind' }, pattern: { lit: '%ppl%' } }, r), 'like contains');
+                assertTrue(evalRowFilter({ p: 'like', value: { col: 'kind' }, pattern: { lit: 'a__le' } }, r), 'like single-char wildcards');
+                assertFalse(evalRowFilter({ p: 'like', value: { col: 'kind' }, pattern: { lit: 'App%' } }, r), 'like is case-sensitive');
+                assertFalse(evalRowFilter({ p: 'like', value: { col: 'kind' }, pattern: { lit: 'app' } }, r), 'like without wildcards is a whole-value match');
+                assertTrue(evalRowFilter({ p: 'like', value: { col: 'kind' }, pattern: { col: 'kind' } }, r), 'like over a column pattern');
+                assertFalse(evalRowFilter({ p: 'like', value: { col: 'qty' }, pattern: { lit: '%' } }, r), 'like over a non-string value is false');
 
                 assertTrue(evalRowFilter({ p: 'and', args: [
                     { p: 'cmp', cmp: 'eq', left: { col: 'kind' }, right: { lit: 'apple' } },
@@ -170,6 +176,53 @@ export const rtableQueryTests = {
             }
         },
         {
+            name: '[QRY01b] likeMatch: %, _, escapes, code points, empty inputs',
+            invoke: async () => {
+                const cases: Array<[string, string, boolean]> = [
+                    ['', '', true],
+                    ['', '%', true],
+                    ['', '_', false],
+                    ['a', '', false],
+                    ['abc', 'abc', true],
+                    ['abc', 'ab', false],
+                    ['abc', 'a%', true],
+                    ['abc', '%c', true],
+                    ['abc', '%b%', true],
+                    ['abc', '%%%', true],
+                    ['abc', 'a%b%c', true],
+                    ['abc', 'a%c%', true],
+                    ['abc', 'a%d', false],
+                    ['abc', '___', true],
+                    ['abc', '__', false],
+                    ['abc', '_b_', true],
+                    ['aXbXc', 'a%X%c', true],
+                    ['mississippi', '%iss%ppi', true],
+                    ['mississippi', '%iss%sip', false],
+                    ['ABC', 'abc', false],
+                    ['50%', '50\\%', true],
+                    ['500', '50\\%', false],
+                    ['a_b', 'a\\_b', true],
+                    ['axb', 'a\\_b', false],
+                    ['a\\b', 'a\\\\b', true],
+                    ['ab', 'a\\b', true],
+                    ['ab', 'ab\\', false],
+                    ['ñandú', '_and_', true],
+                    ['😀x', '_x', true],
+                    ['😀x', '__x', false],
+                    ['x😀y', 'x%y', true],
+                ];
+                for (const [value, pattern, expected] of cases) {
+                    assertEquals(likeMatch(value, pattern), expected, `'${value}' LIKE '${pattern}'`);
+                }
+                assertFalse(isValidLikePattern('ab\\'), 'a trailing lone escape is malformed');
+                assertTrue(isValidLikePattern('ab\\\\'), 'an escaped escape is well-formed');
+
+                // backtracking is bounded: a pathological pattern stays fast
+                const long = 'a'.repeat(2000);
+                assertFalse(likeMatch(long, '%a%a%a%a%a%b'), 'pathological pattern does not match');
+            }
+        },
+        {
             name: '[QRY02] validateRowQuery throws on user mistakes',
             invoke: async () => {
                 // valid queries do not throw
@@ -180,7 +233,9 @@ export const rtableQueryTests = {
                 expectThrow(() => validateRowQuery({ select: ['nope'] }, ITEM_COLUMNS), 'unknown column in select');
                 expectThrow(() => validateRowQuery({ orderBy: [{ column: 'nope' }] }, ITEM_COLUMNS), 'unknown column in orderBy');
                 expectThrow(() => validateRowQuery({ where: { p: 'cmp', cmp: 'eq', left: { col: 'kind' }, right: { lit: 3 } } }, ITEM_COLUMNS), 'type-incoherent cmp (string vs int)');
-                expectThrow(() => validateRowQuery({ where: { p: 'str', str: 'prefix', value: { col: 'qty' }, sub: { lit: 'x' } } }, ITEM_COLUMNS), 'non-string str operand');
+                expectThrow(() => validateRowQuery({ where: { p: 'like', value: { col: 'qty' }, pattern: { lit: 'x%' } } }, ITEM_COLUMNS), 'non-string like operand');
+                expectThrow(() => validateRowQuery({ where: { p: 'like', value: { col: 'kind' }, pattern: { lit: 'x\\' } } }, ITEM_COLUMNS), 'like pattern ending in a lone escape');
+                validateRowQuery({ where: { p: 'like', value: { col: 'kind' }, pattern: { col: 'kind' } } }, ITEM_COLUMNS);
                 expectThrow(() => validateRowQuery({ limit: -1 }, ITEM_COLUMNS), 'negative limit');
                 expectThrow(() => validateRowQuery({ limit: 1.5 }, ITEM_COLUMNS), 'non-integer limit');
                 expectThrow(() => validateRowQuery({ offset: -2 }, ITEM_COLUMNS), 'negative offset');
@@ -230,8 +285,8 @@ export const rtableQueryTests = {
                 const pushdown = await view.query({ where: { p: 'cmp', cmp: 'eq', left: { col: 'kind' }, right: { lit: 'fruit' } } });
                 assertEquals(uuids(pushdown), 'i1,i3', 'pushdown returns the two fruit rows');
 
-                // scan-equivalent (str prefix on `kind` does not push down): same rows
-                const scan = await view.query({ where: { p: 'str', str: 'prefix', value: { col: 'kind' }, sub: { lit: 'fruit' } } });
+                // scan-equivalent (LIKE on `kind` does not push down): same rows
+                const scan = await view.query({ where: { p: 'like', value: { col: 'kind' }, pattern: { lit: 'fruit%' } } });
                 assertEquals(uuids(scan), uuids(pushdown), 'scan path matches pushdown path');
 
                 // filter on a NON-pub column (forces residual scan over resolved rows)
@@ -349,6 +404,9 @@ export const rtableQueryTests = {
                 assertTrue(evalRowFilter({ p: 'cmp', cmp: 'eq',
                     left: { fn: 'add', args: [{ col: 'seq' }, { lit: '1' }] }, right: { lit: '10' } }, nine, typeOf),
                     'bigint add: 9 + 1 == 10');
+                assertTrue(evalRowFilter({ p: 'cmp', cmp: 'gt',
+                    left: { fn: 'add', args: [{ col: 'seq' }, { lit: '1' }] }, right: { lit: '9' } }, nine, typeOf),
+                    'bigint arithmetic vs a bare literal orders numerically: 9 + 1 > 9');
 
                 // numeric ordering (not lexical) via orderRows with types
                 const rows = [

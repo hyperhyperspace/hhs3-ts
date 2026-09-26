@@ -34,6 +34,7 @@ This monorepo is organized as a collection of modules. This is of course WIP.
 **Causal/Relational database**
 
 - [modules/rdb](modules/rdb) Causal/Relational database engine MVTs: RSchema, RTableGroup, RTable, and RDb
+- [modules/rpack](modules/rpack) Packaged RDb history for shipping with an app and updating an older replica (stub)
 - [modules/rdb_lang](modules/rdb_lang) C-SQL: SQL-like language to parse, bind, compile, execute, and reverse-render RDb operations
 - [modules/rdb_runtime](modules/rdb_runtime) Browser-safe runtime: workspace, session, and C-SQL execution
 - [modules/rdb_repl](modules/rdb_repl) Portable presentation and command tooling for RDb

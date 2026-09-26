@@ -97,13 +97,8 @@ export class RSchemaViewImpl implements RSchemaView {
 
     getRestriction(table: string, op: 'insert' | 'update' | 'delete'): Predicate {
         const def = this.requireTable(table);
-        const matching = (def.restrictions ?? [])
-            .filter((r) => r.on === op || r.on === 'all')
-            .map((r) => r.rule);
-
-        if (matching.length === 0) return defaultRestrictionRule(op);
-        if (matching.length === 1) return matching[0];
-        return { p: 'and', args: matching };
+        const matching = (def.restrictions ?? []).find((r) => r.on === op || r.on === 'all');
+        return matching?.rule ?? defaultRestrictionRule(op);
     }
 
     getPubColumns(table: string): string[] {

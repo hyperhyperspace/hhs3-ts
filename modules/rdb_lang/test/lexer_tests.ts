@@ -28,5 +28,35 @@ export const lexerTests = {
                 assertTrue(identifiers.includes('profiles.keyId'), 'qualified gated column token');
             },
         },
+        {
+            name: '[LEX03] tokenizes arithmetic operators, unsigned numbers with exponents, and -- comments',
+            invoke: async () => {
+                const result = lex('a+1*b-2.5e-3 >= -1E+2 -- trailing\n<=');
+                assertTrue(result.ok, 'lexing should succeed');
+                if (!result.ok) return;
+                const tokens = result.value.filter((t) => t.text !== '');
+                assertEquals(tokens.map((t) => t.text).join('|'), 'a|+|1|*|b|-|2.5e-3|>=|-|1E+2|<=', 'token text sequence');
+                const numbers = tokens.filter((t) => t.kind === 'number').map((t) => t.value);
+                assertEquals(JSON.stringify(numbers), JSON.stringify([1, 0.0025, 100]), 'number values are unsigned');
+            },
+        },
+        {
+            name: '[LEX04] double-quoted identifier parts escape keywords',
+            invoke: async () => {
+                const result = lex('"identity" users."identity"."table" "a""b" "NOT" NOT');
+                assertTrue(result.ok, 'lexing should succeed');
+                if (!result.ok) return;
+                const tokens = result.value.filter((t) => t.kind !== 'eof');
+                assertEquals(tokens.map((t) => `${t.kind}:${t.text}`).join('|'),
+                    'identifier:identity|identifier:users.identity.table|identifier:a"b|identifier:NOT|keyword:NOT',
+                    'quoted parts lex to unquoted identifier text');
+                assertTrue(tokens.slice(0, 4).every((t) => t.quoted === true), 'quoted tokens are flagged');
+                assertTrue(tokens[4].quoted === undefined, 'bare keyword is not flagged');
+
+                for (const bad of ['"unterminated', '""', '"a.b"', '"s:t"']) {
+                    assertTrue(!lex(bad).ok, `${bad} should not lex`);
+                }
+            },
+        },
     ],
 };

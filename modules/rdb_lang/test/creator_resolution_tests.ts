@@ -142,5 +142,26 @@ export const creatorResolutionTests = {
                 assertEquals(plan.payload.creators![0].publicKey, serializePublicKeyToBase64(admin.publicKey), 'creator publicKey');
             },
         },
+        {
+            name: "[CREATORS07] CREATORS (publicKey('<base64>')) binds without a keystore",
+            invoke: async () => {
+                const ctx = createMockRContext();
+                const admin = await createIdentity(SIGNING_ED25519, hashSuite);
+                const lang = createTestBindContext(ctx, {});
+                delete (lang as { resolvePublicKey?: unknown }).resolvePublicKey;
+                const b64 = serializePublicKeyToBase64(admin.publicKey);
+
+                const bound = await bindCreateSchema(`CREATE SCHEMA s CREATORS (publicKey('${b64}')) AS (${schemaBody});`, lang);
+                const plan = await compileCreate(bound);
+                if (plan.kind !== 'create-schema') throw new Error('expected create-schema');
+                assertEquals(plan.payload.creators[0].keyId, admin.keyId, 'keyId derived from the public key');
+                assertEquals(plan.payload.creators[0].publicKey, b64, 'public key kept verbatim');
+
+                const parsed = parseStatement(`CREATE SCHEMA s CREATORS (publicKey('not a key')) AS (${schemaBody});`);
+                if (!parsed.ok) throw new Error('parse should succeed');
+                const bad = await bind(parsed.value, lang);
+                assertTrue(!bad.ok && bad.diagnostics[0].message.includes('not a valid public key'), 'an invalid key is a bind error');
+            },
+        },
     ],
 };

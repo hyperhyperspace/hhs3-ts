@@ -24,7 +24,7 @@ import type { KeyId, B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { RSchemaView } from "../rschema/interfaces.js";
 import type { ColumnType, Predicate, PredicateContext, WhereValue, Operand } from "../rschema/payload.js";
 import { splitTableRef, parseRowFieldTerm } from "../rschema/payload.js";
-import { evalOperand, compareOperands, resolveCmpType } from "../rschema/expr.js";
+import { evalOperand, compareOperands, resolveCmpType, likeMatch } from "../rschema/expr.js";
 import type { RTableView, RowValues } from "../rtable/interfaces.js";
 import type { RowOpPayload } from "../rtable/payload.js";
 
@@ -118,15 +118,11 @@ export async function evaluatePredicate(pred: Predicate, env: PredicateEnv): Pro
             return compareOperands(pred.cmp, l, r, type);
         }
 
-        case 'str': {
+        case 'like': {
             const v = evalPredicateOperand(pred.value, env);
-            const s = evalPredicateOperand(pred.sub, env);
-            if (typeof v !== 'string' || typeof s !== 'string') return false;
-            switch (pred.str) {
-                case 'prefix': return v.startsWith(s);
-                case 'suffix': return v.endsWith(s);
-                case 'contains': return v.includes(s);
-            }
+            const pattern = evalPredicateOperand(pred.pattern, env);
+            if (typeof v !== 'string' || typeof pattern !== 'string') return false;
+            return likeMatch(v, pattern);
         }
 
         case 'and': {

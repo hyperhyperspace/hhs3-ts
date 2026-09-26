@@ -1,0 +1,23 @@
+{
+  "name": "@hyper-hyper-space/hhs3_rpack",
+  "version": "0.1.0",
+  "description": "Packaged RDb history for shipping with an app and updating an older replica",
+  "type": "module",
+  "source": "src/index.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "test": "TS_NODE_PROJECT=./tsconfig.test.json node --import ../../register.mjs ./test/run_tests.ts",
+    "debug": "TS_NODE_PROJECT=./tsconfig.test.json node --inspect-brk --import ../../register.mjs ./test/run_tests.ts",
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist test-build"
+  },
+  "author": "Santiago Bazerque",
+  "license": "MIT",
+  "devDependencies": {
+    "@hyper-hyper-space/hhs3_util": "^0.1.0",
+    "@types/node": "^22.2.0",
+    "ts-node": "^10.9.2",
+    "typescript": "6.0.3"
+  }
+}

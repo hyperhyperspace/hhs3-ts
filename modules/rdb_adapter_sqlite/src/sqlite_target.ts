@@ -107,7 +107,7 @@ function sqliteType(type: ColumnType): string {
 // bound as-is.
 function toParam(value: json.Literal, type: ColumnType): number | string {
     if (type === 'boolean') return value ? 1 : 0;
-    if (type === 'json') return json.toStringNormalized(value);
+    if (type === 'json') return json.toStringCanonical(value);
     return value as number | string;
 }
 
@@ -117,7 +117,7 @@ function defaultFragment(def: ColumnDef): string {
     const value = def.default;
     if (def.type === 'boolean') return ' DEFAULT ' + (value ? '1' : '0');
     if (def.type === 'integer' || def.type === 'float') return ' DEFAULT ' + String(value);
-    if (def.type === 'json') return ' DEFAULT ' + quoteText(json.toStringNormalized(value));
+    if (def.type === 'json') return ' DEFAULT ' + quoteText(json.toStringCanonical(value));
     // string / bigint / decimal / bytes: canonical string carriers.
     return ' DEFAULT ' + quoteText(String(value));
 }
@@ -437,7 +437,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
             .run(
                 event.origin, event.direction, event.groupId, event.opHash,
-                event.op === undefined ? null : json.toStringNormalized(event.op),
+                event.op === undefined ? null : json.toStringCanonical(event.op),
                 event.kind, event.table ?? null, event.rowId ?? null,
                 event.localId ?? null, event.author ?? null,
                 event.reason === undefined ? null : JSON.stringify(event.reason));

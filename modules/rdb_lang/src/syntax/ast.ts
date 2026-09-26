@@ -118,6 +118,7 @@ export type CreateSchemaStatement = {
     name: string;
     creators: ValueExpr[];
     tables: TableDecl[];
+    hashAlgorithm?: string;
     span: TextSpan;
 };
 
@@ -126,6 +127,7 @@ export type CreateDatabaseStatement = {
     name: string;
     seed?: string;
     creators: ValueExpr[];
+    hashAlgorithm?: string;
     span: TextSpan;
 };
 
@@ -148,6 +150,7 @@ export type CreateTableGroupStatement = {
     // per-binding observation gate: `ALLOW UPDATE REF <binding> IF <predicate>`.
     canObserve: { binding: string; predicate: PredicateExpr; span: TextSpan }[];
     initialRows: InitialRow[];
+    hashAlgorithm?: string;
     span: TextSpan;
 };
 
@@ -222,6 +225,7 @@ export type AlterSchemaStatement = {
     kind: 'alter-schema';
     schema: NameOrHashRef;
     rules: MigrationRuleExpr[];
+    note?: string;
     author?: AuthorExpr;
     at?: VersionExpr;
     span: TextSpan;
@@ -275,12 +279,16 @@ export type PredicateExpr =
     | { kind: 'true'; span: TextSpan }
     | { kind: 'false'; span: TextSpan }
     | { kind: 'comparison'; op: '=' | '!=' | '<' | '<=' | '>' | '>='; left: OperandExpr; right: OperandExpr; span: TextSpan }
-    | { kind: 'like'; left: OperandExpr; pattern: ValueExpr; span: TextSpan }
+    | { kind: 'like'; left: OperandExpr; pattern: OperandExpr; escape?: string; span: TextSpan }
     | { kind: 'exists'; table: string; alias?: string; where: PredicateExpr; span: TextSpan }
     | { kind: 'not'; arg: PredicateExpr; span: TextSpan }
     | { kind: 'and'; args: PredicateExpr[]; span: TextSpan }
     | { kind: 'or'; args: PredicateExpr[]; span: TextSpan };
 
+// Unary minus never reaches the AST: the parser folds it into numeric
+// literals and rejects it on anything else.
 export type OperandExpr =
     | { kind: 'column'; table?: string; name: string; span: TextSpan }
+    | { kind: 'arith'; op: '+' | '-' | '*'; left: OperandExpr; right: OperandExpr; span: TextSpan }
+    | { kind: 'length'; arg: OperandExpr; span: TextSpan }
     | ValueExpr;

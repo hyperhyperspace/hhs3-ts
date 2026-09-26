@@ -119,7 +119,7 @@ export function sqliteHarness(): TargetHarness {
 
 function toParam(value: json.Literal, type: ColumnType): number | string {
     if (type === 'boolean') return value ? 1 : 0;
-    if (type === 'json') return json.toStringNormalized(value);
+    if (type === 'json') return json.toStringCanonical(value);
     return value as number | string;
 }
 
@@ -884,6 +884,46 @@ export const sqliteSpecificTests = {
                 assertEquals(window.length, 3, 'after+before window size');
                 assertEquals(window[0].id, 2, 'window after 1');
                 assertEquals(window[2].id, 4, 'window before 5');
+                db.close();
+            },
+        },
+        {
+            name: '[ADPTS-SQL16] json columns, json DEFAULTs and op events store JSON text that reads back unchanged',
+            invoke: async () => {
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db, { captureChanges: true });
+                const gid = 'g';
+                const long = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+                const doc = { tags: ['line\nbreak', "it's", 'tab\there'], seq: long };
+                const op = { action: 'insert', values: { body: doc } };
+                await target.apply(gid, [{
+                    kind: 'create-table', table: 'docs', syncTable: 'docs_sync', primaryKey: 'id',
+                    columns: [
+                        { name: 'body', def: { type: 'json' } },
+                        { name: 'extra', def: { type: 'json', default: long } },
+                    ],
+                }], [{ kind: 'upsert-row', table: 'docs', rowId: 'r1', values: { body: doc, extra: long } }], new Set(['v1']), [{
+                    origin: 'concurrency', direction: 'void', groupId: gid as B64Hash, opHash: 'H1', kind: 'insert', op,
+                }]);
+                const same = (a: unknown, b: unknown) =>
+                    json.toStringNormalized(a as json.Literal) === json.toStringNormalized(b as json.Literal);
+
+                const stored = db.prepare('SELECT id, body, extra FROM docs').get() as { id: number; body: string; extra: string };
+                assertTrue(same(JSON.parse(stored.body), doc), `projected json reads back unchanged (${stored.body})`);
+                assertEquals(JSON.stringify(JSON.parse(stored.extra)), JSON.stringify(long), 'a 12-element array keeps its order');
+                const dflt = tableInfo(db, 'docs').find((c) => c.name === 'extra')!.dflt_value!;
+                assertEquals(JSON.stringify(JSON.parse(dflt.slice(1, -1).replace(/''/g, "'"))), JSON.stringify(long),
+                    `json DEFAULT keeps array order (${dflt})`);
+
+                const events = await target.drainOpEvents({});
+                assertTrue(same(events[0]!.event.op, op), 'a stored op event with control characters reads back unchanged');
+
+                const edited = { note: 'multi\nline', seq: [...long].reverse() };
+                db.prepare('UPDATE docs SET body = ? WHERE id = ?').run(json.toStringCanonical(edited), stored.id);
+                const batch = await target.drainChanges();
+                const change = batch.changes.find((c) => c.kind === 'update');
+                assertTrue(change !== undefined && change.kind === 'update' && same(change.values['body'], edited),
+                    'a captured local json edit drains unchanged');
                 db.close();
             },
         },

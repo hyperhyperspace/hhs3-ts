@@ -35,7 +35,7 @@ async function executeRuntime(bound: BoundExecutableStatement): Promise<LangExec
         }
         case 'alter-schema': {
             if (bound.schema.schema === undefined) throw new Error('ALTER SCHEMA target is not loaded');
-            const entryHash = await bound.schema.schema.updateSchema(bound.rules, bound.author, undefined, bound.at);
+            const entryHash = await bound.schema.schema.updateSchema(bound.rules, bound.author, bound.note, bound.at);
             return { kind: 'alter-schema', entryHash, schema: bound.schema.id, rules: bound.rules.length };
         }
         case 'update-schema': {

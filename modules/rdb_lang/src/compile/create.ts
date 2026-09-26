@@ -32,6 +32,7 @@ async function compileCreateDatabase(bound: BoundCreateDatabase): Promise<Create
         seed: bound.seed,
         name: bound.ast.name,
         ...(bound.creators.length > 0 ? { creators: bound.creators } : {}),
+        ...(bound.ast.hashAlgorithm !== undefined ? { hashAlgorithm: bound.ast.hashAlgorithm } : {}),
     });
     return { kind: 'create-database', name: bound.ast.name, payload };
 }
@@ -45,6 +46,7 @@ async function compileCreateSchema(bound: BoundCreateSchema): Promise<CreatePlan
             gated: { name: table.name, columns: columnSetFromTableDecl(table) },
             columnsOf,
         })),
+        ...(bound.ast.hashAlgorithm !== undefined ? { hashAlgorithm: bound.ast.hashAlgorithm } : {}),
     });
     return { kind: 'create-schema', name: bound.ast.name, payload };
 }
@@ -84,6 +86,7 @@ async function compileCreateTableGroup(bound: BoundCreateTableGroup): Promise<Cr
         ...(bound.ast.canDeploy !== undefined ? { canDeploy: lowerRestrictionPredicate(bound.ast.canDeploy, gateScope) } : {}),
         ...(bound.ast.canObserve.length > 0 ? { canObserve } : {}),
         ...(Object.keys(initialRows).length > 0 ? { initialRows } : {}),
+        ...(bound.ast.hashAlgorithm !== undefined ? { hashAlgorithm: bound.ast.hashAlgorithm } : {}),
     });
 
     return { kind: 'create-tablegroup', name: bound.ast.name, payload };

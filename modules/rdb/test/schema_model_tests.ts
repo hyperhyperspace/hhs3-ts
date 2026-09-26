@@ -199,6 +199,12 @@ async function testColumnValueReasons() {
         `over-length bytes names the byte count: ${tooManyBytes}`);
 
     // the boolean wrapper stays consistent with the reason function
+    // json values are Literals: null is rejected at any depth (it cannot be hashed)
+    assertTrue(columnValueValidReason({ a: [1, 'x', { b: true }] }, { type: 'json' }) === undefined, 'nested json value is valid');
+    const nestedNull = columnValueValidReason([1, null] as unknown as json.Literal, { type: 'json' });
+    assertTrue(nestedNull === 'JSON values cannot contain null', `nested null in json is rejected: ${nestedNull}`);
+    assertFalse(columnValueMatchesType({ a: null } as unknown as json.Literal, 'json'), 'coarse check rejects nested null too');
+
     assertTrue(columnValueValid('abc', cappedStr) === (columnValueValidReason('abc', cappedStr) === undefined),
         'columnValueValid agrees with columnValueValidReason (valid)');
     assertFalse(columnValueValid('abcd', cappedStr), 'columnValueValid agrees with columnValueValidReason (invalid)');
@@ -235,6 +241,12 @@ async function testTableDefFormatAndValidation() {
     } };
     assertTrue(json.checkFormat(tableDefFormat, withModifiers) && validateTableDef(withModifiers) === undefined,
         'pub/readonly modifiers in any combination should pass format and validate');
+
+    for (const flag of ['nullable', 'pub', 'readonly'] as const) {
+        const explicitFalse: TableDef = { name: 'orders', columns: { x: { type: 'string', [flag]: false } } };
+        assertTrue(validateTableDef(explicitFalse)?.includes(`flag '${flag}' must be omitted`) ?? false,
+            `an explicit ${flag}: false should not validate (omitting it means false)`);
+    }
 }
 
 async function testRestrictionDefaults() {
@@ -246,6 +258,41 @@ async function testRestrictionDefaults() {
     assertTrue(json.toStringNormalized(updateDefault) === json.toStringNormalized({ p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: '$author' } })
         && json.toStringNormalized(deleteDefault) === json.toStringNormalized({ p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: '$author' } }),
         'update/delete should default to insert-author-only (anonymous rows immutable)');
+}
+
+async function testOneRestrictionPerOp() {
+    const author: Predicate = { p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: '$author' } };
+
+    assertTrue(validateRestrictions([
+        { on: 'insert', rule: { p: 'true' } },
+        { on: 'update', rule: author },
+        { on: 'delete', rule: author },
+    ]) === undefined, 'one rule per specific op should validate');
+    assertTrue(validateRestrictions([{ on: 'all', rule: { p: 'true' } }]) === undefined,
+        'a lone all rule should validate');
+    assertTrue(validateRestrictions([]) === undefined, 'no rules should validate (defaults apply)');
+
+    assertTrue(validateRestrictions([
+        { on: 'insert', rule: { p: 'true' } },
+        { on: 'insert', rule: author },
+    ]) === 'duplicate ALLOW insert rule', 'duplicate op rules should not validate');
+    assertTrue(validateRestrictions([
+        { on: 'all', rule: { p: 'true' } },
+        { on: 'all', rule: author },
+    ]) === 'duplicate ALLOW all rule', 'duplicate all rules should not validate');
+    assertTrue(validateRestrictions([
+        { on: 'all', rule: { p: 'true' } },
+        { on: 'delete', rule: author },
+    ]) === 'ALLOW all cannot be combined with operation-specific ALLOW rules',
+        'all mixed with a specific op should not validate');
+
+    const mixed = docsTable([{ on: 'update', rule: author }, { on: 'all', rule: { p: 'true' } }]);
+    assertTrue(validateSchemaTables([mixed])?.includes('ALLOW all cannot be combined') ?? false,
+        'schema-level validation should reject mixed rules');
+    assertTrue(validateMigrationRule({
+        rule: 'set-restrictions', table: 'docs',
+        restrictions: [{ on: 'update', rule: author }, { on: 'update', rule: { p: 'true' } }],
+    })?.includes('duplicate ALLOW update rule') ?? false, 'set-restrictions should reject duplicate rules');
 }
 
 async function testFKs() {
@@ -299,22 +346,28 @@ async function testPredicates() {
     assertTrue(validatePredicate(authorOrAdmin), 'author-or-admin disjunction should validate');
 
     assertFalse(validatePredicate({ p: 'and', args: [] }), 'empty conjunction should not validate');
+    assertFalse(validatePredicate({ p: 'and', args: [{ p: 'true' }] }), 'one-member conjunction should not validate');
+    assertFalse(validatePredicate({ p: 'or', args: [{ p: 'true' }] }), 'one-member disjunction should not validate');
 
     let deep: json.Literal = { p: 'true' };
     for (let i = 0; i <= MAX_EXPR_DEPTH + 1; i++) {
-        deep = { p: 'and', args: [deep] };
+        deep = { p: 'and', args: [deep, { p: 'true' }] };
     }
     assertFalse(validatePredicate(deep), 'predicate beyond max depth should not validate');
 
-    // cmp / str atoms + operands (Tier 1)
+    // cmp / like atoms + operands (Tier 1)
     assertTrue(validatePredicate({ p: 'cmp', cmp: 'eq', left: { col: 'a' }, right: { lit: 1 } }),
         'cmp over a $row column and a literal should validate');
     assertTrue(validatePredicate({ p: 'cmp', cmp: 'ge', left: { col: 'a' }, right: { fn: 'add', args: [{ col: 'b' }, { lit: 1 }] } }),
         'cmp with a nested arithmetic operand should validate');
     assertTrue(validatePredicate({ p: 'cmp', cmp: 'lt', left: { fn: 'len', args: [{ col: 'name' }] }, right: { lit: 8 } }),
         'cmp over len() should validate');
-    assertTrue(validatePredicate({ p: 'str', str: 'prefix', value: { col: 'path' }, sub: { lit: '/x' } }),
-        'str prefix should validate');
+    assertTrue(validatePredicate({ p: 'like', value: { col: 'path' }, pattern: { lit: '/x%' } }),
+        'like over a literal pattern should validate');
+    assertTrue(validatePredicate({ p: 'like', value: { col: 'path' }, pattern: { col: 'prefix' } }),
+        'like over a column pattern should validate');
+    assertTrue(validatePredicate({ p: 'like', value: { col: 'path' }, pattern: { lit: '100\\%' } }),
+        'like with an escaped wildcard should validate');
 
     assertFalse(validatePredicate({ p: 'cmp', cmp: 'eq', left: { col: 'a' } }),
         'cmp missing an operand should not validate');
@@ -324,8 +377,22 @@ async function testPredicates() {
         'extra keys on a cmp atom should not validate');
     assertFalse(validatePredicate({ p: 'cmp', cmp: 'eq', left: { col: '2bad' }, right: { lit: 1 } }),
         'cmp over an invalid column name should not validate');
-    assertFalse(validatePredicate({ p: 'str', str: 'matches', value: { col: 'a' }, sub: { lit: 'x' } }),
-        'unknown str operator should not validate');
+    assertFalse(validatePredicate({ p: 'like', value: { col: 'a' }, pattern: { lit: 'x\\' } }),
+        'like pattern ending in a lone escape should not validate');
+    assertFalse(validatePredicate({ p: 'like', value: { col: 'a' }, pattern: { lit: 'x' }, escape: '!' }),
+        'extra keys on a like atom should not validate');
+    assertFalse(validatePredicate({ p: 'like', value: { col: 'a' } }),
+        'like missing its pattern should not validate');
+    assertTrue(validatePredicate({ p: 'cmp', cmp: 'eq', left: { col: 'a' }, right: { lit: '$author' } }),
+        'the $author term as an operand should validate');
+    assertFalse(validatePredicate({ p: 'cmp', cmp: 'eq', left: { col: 'a' }, right: { lit: '$other' } }),
+        'a reserved $-string operand literal that is not a term should not validate');
+    assertFalse(validatePredicate({ p: 'like', value: { col: 'a' }, pattern: { lit: '$row.a' } }),
+        'a $row term is not an operand literal');
+    assertFalse(validatePredicate({ p: 'cmp', cmp: 'eq', left: { col: 'a' }, right: { lit: [1, null] as unknown as json.Literal } }),
+        'an operand literal containing null should not validate');
+    assertFalse(validatePredicate({ p: 'exists', table: 'caps', where: { tags: { a: null } as unknown as json.Literal } }),
+        'an exists where-value containing null should not validate');
     assertFalse(validatePredicate({ p: 'cmp', cmp: 'eq', left: { fn: 'div', args: [{ col: 'a' }, { lit: 1 }] }, right: { lit: 1 } }),
         'unknown arithmetic fn should not validate');
     assertFalse(validatePredicate({ p: 'cmp', cmp: 'eq', left: { fn: 'add', args: [{ col: 'a' }] }, right: { lit: 1 } }),
@@ -412,7 +479,7 @@ async function testSchemaTables() {
     assertTrue(validateSchemaTables([nestedBadAtom, capsTable()]) !== undefined,
         'a non-pub where nested under and/or should not validate');
 
-    // Tier 1: cmp/str over the declaring table's own columns ($row.<col>),
+    // Tier 1: cmp/like over the declaring table's own columns ($row.<col>),
     // which must be readonly and type-coherent.
     const itemsWith = (rule: Predicate): TableDef => ({
         name: 'items',
@@ -434,6 +501,27 @@ async function testSchemaTables() {
         'cmp comparing an integer column to a string literal should not validate (type mismatch)');
     assertTrue(validateSchemaTables([itemsWith({ p: 'cmp', cmp: 'eq', left: { fn: 'add', args: [{ col: 'resource' }, { lit: 1 }] }, right: { lit: 2 } })]) !== undefined,
         'arithmetic over a string column should not validate');
+    const amountWith = (rule: Predicate): TableDef => ({
+        name: 'orders',
+        columns: { amount: { type: 'decimal', readonly: true, constraints: { scale: 2 } } },
+        restrictions: [{ on: 'insert', rule }],
+    });
+    assertTrue(validateSchemaTables([amountWith({ p: 'cmp', cmp: 'ge',
+        left: { fn: 'mul', args: [{ fn: 'add', args: [{ col: 'amount' }, { lit: '1.50' }] }, { lit: '2.00' }] },
+        right: { lit: '0.00' } })]) === undefined,
+        'decimal arithmetic compared to a bare string literal should validate');
+    assertTrue(validateSchemaTables([amountWith({ p: 'cmp', cmp: 'lt',
+        left: { fn: 'sub', args: [{ lit: '1.50' }, { col: 'amount' }] }, right: { lit: '0.00' } })]) === undefined,
+        'a string literal on the left of decimal arithmetic takes the column type');
+    assertTrue(validateSchemaTables([amountWith({ p: 'cmp', cmp: 'lt',
+        left: { fn: 'add', args: [{ lit: '1.50' }, { lit: '2.00' }] }, right: { col: 'amount' } })]) === undefined,
+        'arithmetic over bare string literals takes the type of the other cmp side');
+    assertTrue(validateSchemaTables([itemsWith({ p: 'like', value: { col: 'resource' }, pattern: { lit: 'doc/%' } })]) === undefined,
+        'like over a readonly string column should validate');
+    assertTrue(validateSchemaTables([itemsWith({ p: 'like', value: { col: 'priority' }, pattern: { lit: '1%' } })])?.includes('like operand types') ?? false,
+        'like over an integer column should not validate');
+    assertTrue(validateSchemaTables([itemsWith({ p: 'like', value: { col: 'status' }, pattern: { lit: '%' } })]) !== undefined,
+        'like over a mutable (non-readonly) column should not validate');
 
     // identity: eq/ne against $author and against a string key-hash column;
     // ordering is not defined.
@@ -584,6 +672,7 @@ export const schemaModelTests = {
         { name: '[MODEL02c] Column value rejection reasons', invoke: testColumnValueReasons },
         { name: '[MODEL03] Table def format and validation', invoke: testTableDefFormatAndValidation },
         { name: '[MODEL04] Restriction defaults', invoke: testRestrictionDefaults },
+        { name: '[MODEL04b] One restriction per op', invoke: testOneRestrictionPerOp },
         { name: '[MODEL05] FKs', invoke: testFKs },
         { name: '[MODEL06] Predicates', invoke: testPredicates },
         { name: '[MODEL07] Predicate contexts', invoke: testPredicateContexts },

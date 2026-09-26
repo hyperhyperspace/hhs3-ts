@@ -17,6 +17,9 @@ export type Token = {
     upper: string;
     span: TextSpan;
     value?: string | number | boolean | null;
+    // Set on identifiers written with a "quoted" part; `text` is unquoted.
+    // Contextual keywords (LENGTH, ESCAPE, type names) never match these.
+    quoted?: true;
 };
 
 export const KEYWORDS = new Set([
