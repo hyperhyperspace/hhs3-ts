@@ -13,6 +13,7 @@ import { creatorResolutionTests } from "./creator_resolution_tests.js";
 import { usersPermissionScriptTests } from "./users_permission_script_tests.js";
 import { referenceTests } from "./reference_tests.js";
 import { roundTripTests } from "./roundtrip_tests.js";
+import { catalogLangTests } from "./catalog_lang_tests.js";
 
 async function main() {
     const allTests = new Map<string, Array<{ name: string, invoke: () => Promise<void> }>>();
@@ -31,6 +32,7 @@ async function main() {
     allTests.set(usersPermissionScriptTests.title, usersPermissionScriptTests.tests);
     allTests.set(referenceTests.title, referenceTests.tests);
     allTests.set(roundTripTests.title, roundTripTests.tests);
+    allTests.set(catalogLangTests.title, catalogLangTests.tests);
 
     console.log('Running tests for Hyper Hyper Space v3 C-SQL (rdb_lang) module' + (filters.length > 0 ? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');
 

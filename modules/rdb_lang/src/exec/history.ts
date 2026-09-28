@@ -2,8 +2,8 @@ import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { Entry } from "@hyper-hyper-space/hhs3_dag";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
-import type { CreateRDbPayload } from "@hyper-hyper-space/hhs3_rdb";
-import { formatOpVoidDetail, isVoidCheckable, isVoidCheckableTableOp } from "@hyper-hyper-space/hhs3_rdb";
+import type { CreateRDbPayload, RDbImpl } from "@hyper-hyper-space/hhs3_rdb";
+import { formatOpVoidDetail, isVoidCheckable, isVoidCheckableTableOp, versionKey } from "@hyper-hyper-space/hhs3_rdb";
 import type { ResolvedLogTarget } from "../bind/context.js";
 import type { BoundLog } from "../bind/bind.js";
 import type { LogLangResult, LogRenderContext, LogRow } from "./result.js";
@@ -35,11 +35,13 @@ export async function executeLog(bound: BoundLog): Promise<LogLangResult> {
         rows.push(row);
     }
 
+    const renderContext = await buildLogRenderContext(bound.target);
+    if (bound.deployLabels !== undefined) renderContext.deployLabels = bound.deployLabels;
     return {
         kind: 'log',
         target: targetName(bound),
         explain: bound.explain,
-        renderContext: await buildLogRenderContext(bound.target),
+        renderContext,
         rows,
     };
 }
@@ -50,12 +52,15 @@ async function buildLogRenderContext(target: ResolvedLogTarget): Promise<LogRend
             const group = target.object;
             const groupId = group.getId();
             const groupName = group.getName();
-            return {
+            const context: LogRenderContext = {
                 schemaRef: group.getSchemaRef(),
                 groupRef: groupId,
                 groupName,
                 versionScope: { objectId: groupId, objectName: groupName },
             };
+            const schemaName = await schemaNameOf(group);
+            if (schemaName !== undefined) context.schemaName = schemaName;
+            return context;
         }
         case 'schema': {
             const schema = target.object;
@@ -73,9 +78,21 @@ async function buildLogRenderContext(target: ResolvedLogTarget): Promise<LogRend
             const databaseName = genesis === undefined
                 ? 'database'
                 : databaseNameFromPayload(genesis.payload);
+            const catalog = await db.getCatalog();
             return {
                 databaseName,
+                catalogRef: db.getCatalogRef(),
+                ...(catalog !== undefined ? { catalogName: catalog.getName() } : {}),
                 versionScope: { objectId: dbId, objectName: databaseName },
+            };
+        }
+        case 'catalog': {
+            const catalog = target.object;
+            const catalogName = catalog.getName();
+            return {
+                catalogRef: catalog.getId(),
+                catalogName,
+                versionScope: { objectId: catalog.getId(), objectName: catalogName },
             };
         }
         case 'table': {
@@ -88,6 +105,37 @@ async function buildLogRenderContext(target: ResolvedLogTarget): Promise<LogRend
             };
         }
     }
+}
+
+async function schemaNameOf(group: object): Promise<string | undefined> {
+    const withSchema = group as { getSchemaObject?: () => Promise<{ getName(): string }> };
+    if (withSchema.getSchemaObject === undefined) return undefined;
+    try {
+        return (await withSchema.getSchemaObject()).getName();
+    } catch {
+        return undefined;
+    }
+}
+
+// Labels for a member group's deploys: each version a deployed release pins
+// for the group -> "<catalog> <semver>". Hosts pass them to LOG through
+// LangBindContext.resolveDeployLabels.
+export async function deployLabelsFor(db: RDbImpl, groupId: B64Hash): Promise<{ [versionKey: string]: string }> {
+    const labels: { [versionKey: string]: string } = {};
+    const resolution = await db.resolve();
+    const member = resolution.membership?.byId.get(groupId);
+    const catalog = await db.getCatalog();
+    if (member === undefined || catalog === undefined) return labels;
+    const index = await catalog.getIndex();
+    for (const release of resolution.history) {
+        if (!index.hasEntry(release)) continue;
+        const state = index.releaseState(release);
+        const group = state.groups.get(member.catalogGroupHash);
+        if (group === undefined) continue;
+        const key = versionKey(group.version);
+        if (labels[key] === undefined) labels[key] = `${catalog.getName()} ${state.version}`;
+    }
+    return labels;
 }
 
 function databaseNameFromPayload(payload: json.Literal): string {

@@ -75,11 +75,15 @@ export function payloadName(payload: Payload): string | undefined {
     return typeof name === 'string' ? name : undefined;
 }
 
+// Dependencies first: catalogs pin schemas, groups pin schemas and bound
+// groups, gates mirror their groups' schemas.
 function priority(type: string): number {
     if (type === 'hhs/rschema_v1') return 0;
-    if (type === 'hhs/rtable_group_v1') return 1;
-    if (type === 'hhs/rdb_v1') return 2;
-    return 3;
+    if (type === 'hhs/rcatalog_v1') return 1;
+    if (type === 'hhs/rtable_group_v1') return 2;
+    if (type === 'hhs/rdeploy_gate_v1') return 3;
+    if (type === 'hhs/rdb_v1') return 4;
+    return 5;
 }
 
 function isDependencyError(e: unknown): boolean {

@@ -10,6 +10,7 @@ export type DumpAliasHints = {
     schemaNames?: Map<B64Hash, string>;
     groupNames?: Map<B64Hash, string>;
     dbNames?: Map<B64Hash, string>;
+    catalogNames?: Map<B64Hash, string>;
 };
 
 export class DumpAliasContext implements RenderAliasContext {
@@ -18,7 +19,7 @@ export class DumpAliasContext implements RenderAliasContext {
     private readonly usedNames = new Map<AliasScope, Set<string>>();
     private readonly pending: string[] = [];
     private readonly versionCounters = new Map<B64Hash, number>();
-    private counters = { key: 0, schema: 0, group: 0, db: 0 };
+    private counters = { key: 0, schema: 0, group: 0, db: 0, catalog: 0 };
 
     constructor(private readonly hints: DumpAliasHints) {}
 
@@ -26,6 +27,7 @@ export class DumpAliasContext implements RenderAliasContext {
     schema(id: B64Hash, hint?: string): string { return this.ensure('schema', id, hint ?? this.hints.schemaNames?.get(id) ?? this.next('schema')); }
     group(id: B64Hash, hint?: string): string { return this.ensure('group', id, hint ?? this.hints.groupNames?.get(id) ?? this.next('group')); }
     db(id: B64Hash, hint?: string): string { return this.ensure('db', id, hint ?? this.hints.dbNames?.get(id) ?? this.next('db')); }
+    catalog(id: B64Hash, hint?: string): string { return this.ensure('catalog', id, hint ?? this.hints.catalogNames?.get(id) ?? this.next('catalog')); }
 
     version(hash: B64Hash, scope: RenderVersionScope): string {
         const existing = this.hashToName.get(`version:${hash}`);
@@ -90,6 +92,7 @@ export class DumpAliasContext implements RenderAliasContext {
 export function createDumpAliasContext(session: ReplSession): DumpAliasContext {
     const hints: DumpAliasHints = {
         keyLabels: new Map(), keyPublicKeys: new Map(), schemaNames: new Map(), groupNames: new Map(), dbNames: new Map(),
+        catalogNames: new Map(),
     };
     for (const key of session.keyVault?.list() ?? []) {
         hints.keyLabels!.set(key.keyId, key.label);
@@ -100,6 +103,7 @@ export function createDumpAliasContext(session: ReplSession): DumpAliasContext {
         if (root.kind === 'schema') hints.schemaNames!.set(root.id, root.name);
         if (root.kind === 'group') hints.groupNames!.set(root.id, root.name);
         if (root.kind === 'database') hints.dbNames!.set(root.id, root.name);
+        if (root.kind === 'catalog') hints.catalogNames!.set(root.id, root.name);
     }
     return new DumpAliasContext(hints);
 }

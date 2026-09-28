@@ -1,6 +1,6 @@
 import "./styles.css";
 
-import editorSchemaSql from "../../rdb/examples/editor_web.sql?raw";
+import editorSchemaSql from "../../rdb/examples/editor.sql?raw";
 import { mountRepl } from "./app.js";
 import { DirectReplClient } from "./direct_client.js";
 import type { ReplInteractions } from "./protocol.js";
@@ -37,7 +37,10 @@ CREATE SCHEMA shop CREATORS ($me) AS (
     name string
   )
 );
-CREATE TABLEGROUP shop_prod USING SCHEMA shop;
+CREATE CATALOG shop_catalog VERSION '1.0.0' AS (
+  TABLEGROUP shop_prod USING SCHEMA shop
+);
+CREATE DATABASE shop_db USING CATALOG shop_catalog;
 INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');
 SELECT sku, name FROM shop_prod.products;
 `, interactions);
@@ -62,14 +65,13 @@ CREATE SCHEMA web_auth CREATORS ($me) AS (
   ) ALLOW insert IF EXISTS caps AS c
       WHERE c.label = 'manager' AND c.grantee = $author
 );
-CREATE TABLEGROUP web_auth_g USING SCHEMA web_auth
-  WITH ROWS (
-    caps (
-      uuid='61169c8a-4106-43a1-8d37-39373c07da7a',
-      label='manager',
-      grantee=$me
+CREATE CATALOG web_auth_catalog VERSION '1.0.0' PARAMS (:manager identity) AS (
+  TABLEGROUP web_auth_g USING SCHEMA web_auth
+    WITH ROWS (
+      caps (label='manager', grantee=:manager)
     )
-  );
+);
+CREATE DATABASE web_auth_db USING CATALOG web_auth_catalog WITH PARAMS (:manager = $me);
 `, interactions), 'create gated table');
         assertSuccess(await activeClient.execute('\\author nobody', interactions), 'clear author');
 

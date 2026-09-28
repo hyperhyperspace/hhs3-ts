@@ -1,7 +1,7 @@
 import type { B64Hash, HashSuite, KeyId, OwnIdentity, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
 import type { json } from "@hyper-hyper-space/hhs3_json";
 import type { RObject, ScopedDag, Version } from "@hyper-hyper-space/hhs3_mvt";
-import type { RDb, RSchema, RTable, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
+import type { RCatalogImpl, RDbImpl, RSchema, RTable, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 
 import type { HashRef, NameOrHashRef, TableRef, VersionExpr } from "../syntax/ast.js";
 
@@ -30,7 +30,8 @@ export type LangValue =
 
 export type ResolvedSchemaRef = { id: B64Hash; schema?: RSchema };
 export type ResolvedGroupRef = { id: B64Hash; group?: RTableGroup };
-export type ResolvedDatabaseRef = { id: B64Hash; db?: RDb };
+export type ResolvedDatabaseRef = { id: B64Hash; db?: RDbImpl };
+export type ResolvedCatalogRef = { id: B64Hash; catalog?: RCatalogImpl };
 export type ResolvedTableRef = {
     groupId: B64Hash;
     group: RTableGroup;
@@ -43,17 +44,22 @@ export type LoggableObject = RObject & {
 };
 
 export type ResolvedLogTarget =
-    | { kind: 'database'; id: B64Hash; object: RDb & LoggableObject }
+    | { kind: 'database'; id: B64Hash; object: RDbImpl & LoggableObject }
+    | { kind: 'catalog'; id: B64Hash; object: RCatalogImpl & LoggableObject }
     | { kind: 'schema'; id: B64Hash; object: RSchema & LoggableObject }
     | { kind: 'group'; id: B64Hash; object: RTableGroup & LoggableObject }
     | { kind: 'table'; id: B64Hash; object: RTable & LoggableObject; groupId: B64Hash; group: RTableGroup & LoggableObject; tableName: string };
 
 export interface LangBindContext {
     resolveSchema(ref: NameOrHashRef): Promise<ResolvedSchemaRef>;
+    // A group name is `group` or `db.group` (NameRef parts); a bare name
+    // resolves within the default database when one is set.
     resolveGroup(ref: NameOrHashRef): Promise<ResolvedGroupRef>;
     resolveDatabase(ref: NameOrHashRef): Promise<ResolvedDatabaseRef>;
+    resolveCatalog(ref: NameOrHashRef): Promise<ResolvedCatalogRef>;
     resolveTable(ref: TableRef): Promise<ResolvedTableRef>;
     resolveDefaultGroup?(): Promise<NameOrHashRef | undefined>;
+    resolveDefaultDatabase?(): Promise<ResolvedDatabaseRef | undefined>;
     resolveHash(ref: HashRef, scope: HashScope): Promise<B64Hash>;
     resolveRowId?(ref: HashRef, table: ResolvedTableRef, at: Version, from?: Version): Promise<B64Hash>;
     resolveFkRowId?(
@@ -72,6 +78,10 @@ export interface LangBindContext {
     // keys (`CREATORS (publicKey('<base64>'))`). SHA-256 when absent.
     hashSuite?(): HashSuite;
     resolveLogTarget(ref: NameOrHashRef): Promise<ResolvedLogTarget>;
+    // For a group's LOG: version key (sorted hashes, comma-joined) -> a label
+    // for the deployed release that pins it (e.g. "editor 1.1.0"), from the
+    // database the group belongs to. Rendering only; never normative.
+    resolveDeployLabels?(groupId: B64Hash): Promise<{ [versionKey: string]: string } | undefined>;
     currentAuthor(): Promise<OwnIdentity | undefined>;
     // Resolve an explicit `BY $name` / `BY #prefix` author to an unlocked
     // identity able to sign. Throws if the identity is unknown or still locked.

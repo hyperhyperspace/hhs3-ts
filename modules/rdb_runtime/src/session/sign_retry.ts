@@ -1,7 +1,5 @@
 import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import type {
-    AddMemberStatement,
-    AlterSchemaStatement,
     AstStatement,
     BoundStatement,
     LangBindContext,
@@ -20,10 +18,10 @@ import {
     isBindAuthorRetryStatement,
     labelForKeyId,
     resolveAuthorForBoundFailure,
-    resolveAuthorsForAddMember,
-    resolveAuthorsForAlterSchema,
+    resolveAuthorsForBindStatement,
     type AuthRetryBound,
     type AuthorResolution,
+    type BindAuthorRetryStatement,
 } from "./authz_suggest.js";
 import type { AuthInteractionContext } from "./prompts.js";
 
@@ -53,14 +51,14 @@ function formatOpKind(kind: AuthRetryBound['kind']): string {
         case 'update': return 'Update';
         case 'delete': return 'Delete';
         case 'update-ref': return 'Update ref';
-        case 'update-schema': return 'Update schema';
     }
 }
 
-function formatBindOpKind(stmt: AlterSchemaStatement | AddMemberStatement): string {
+function formatBindOpKind(stmt: BindAuthorRetryStatement): string {
     switch (stmt.kind) {
         case 'alter-schema': return 'Alter schema';
-        case 'add-member': return stmt.member === 'schema' ? 'Add schema' : 'Add tablegroup';
+        case 'alter-catalog': return 'Alter catalog';
+        case 'update-catalog': return 'Update catalog';
     }
 }
 
@@ -139,9 +137,7 @@ export async function tryBindAuthorRetry(
 
     let resolution: AuthorResolution;
     try {
-        resolution = statement.kind === 'alter-schema'
-            ? await resolveAuthorsForAlterSchema(session, statement, context)
-            : await resolveAuthorsForAddMember(session, statement, context);
+        resolution = await resolveAuthorsForBindStatement(session, statement, context);
     } catch {
         return undefined;
     }
@@ -155,26 +151,7 @@ export async function tryBindAuthorRetry(
     const identity = await identityForSignRetry(session, resolution, auth);
     if (identity === undefined) return undefined;
 
-    const bindStatement = statementForBindRetry(statement, resolution, session);
-    const rebound = await bind(bindStatement, bindContextWithAuthor(context, identity));
+    const rebound = await bind(statement, bindContextWithAuthor(context, identity));
     if (!rebound.ok) return undefined;
     return rebound.value;
-}
-
-function statementForBindRetry(
-    statement: AlterSchemaStatement | AddMemberStatement,
-    resolution: AuthorResolution,
-    session: RdbSession,
-): AstStatement {
-    if (statement.kind !== 'add-member') return statement;
-
-    const label = resolution.identity !== undefined
-        ? session.keyVault?.list().find((key) => key.keyId === resolution.identity!.keyId)?.label
-        : resolution.locked?.label;
-    if (label === undefined) return statement;
-
-    return {
-        ...statement,
-        author: { kind: 'variable', name: label, span: statement.span },
-    };
 }

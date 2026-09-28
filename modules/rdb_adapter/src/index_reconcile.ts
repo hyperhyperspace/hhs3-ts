@@ -109,7 +109,7 @@ async function reconcileOnce(
         if (!projected.has(r.groupId)) drops.push({ kind: 'drop-index', table: r.table, name: r.name });
     }
 
-    // Membership is advisory: a declared group may simply not have arrived yet.
+    // A declared group may not be a member yet, or may not have arrived.
     for (const decl of spec.indexes) {
         if (!memberNames.has(decl.group)) {
             pending.push({ name: decl.name, group: decl.group, table: decl.table, missing: [`group '${decl.group}'`] });

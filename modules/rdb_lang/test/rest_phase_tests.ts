@@ -1,25 +1,21 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
-import { B64Hash, createBasicCrypto, createIdentity, HASH_SHA256, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
+import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
-
-import { createMockRContext } from "../../rdb/test/mock_rcontext.js";
 import {
-    CreateTableGroupPayload, RDbImpl, rDbFactory, RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory,
+    CatalogReleasePayload, RDbImpl, RSchemaImpl, RTableGroupImpl,
     SchemaUpdatePayload, deriveRowId,
 } from "@hyper-hyper-space/hhs3_rdb";
 
-import { bind, BoundStatement, PSEUDO_COLUMN_UUID } from "../src/bind/bind.js";
+import { bind, BoundStatement } from "../src/bind/bind.js";
 import { execute } from "../src/exec/execute.js";
 import { parseStatement } from "../src/syntax/parser.js";
 import { splitStatements } from "../src/syntax/scanner.js";
-import { renderCreateSchema, renderCreateTableGroup, renderRowOp, renderSchemaUpdate } from "../src/reverse/render.js";
+import { renderAlterCatalog, renderCreateCatalog, renderCreateSchema, renderRowOp, renderSchemaUpdate } from "../src/reverse/render.js";
 import { dumpDatabase, dumpGroup, dumpSchema } from "../src/reverse/dump.js";
 import type { RenderAliasContext, RenderVersionScope } from "../src/reverse/aliases.js";
-import { createTestBindContext, TestBindContext } from "./mock_bind_context.js";
-
-const crypto = createBasicCrypto();
-const hashSuite = crypto.hash(HASH_SHA256);
+import type { TestBindContext } from "./mock_bind_context.js";
+import { createLangEnv, LangEnv, newIdentity } from "./lang_env.js";
 
 async function parseBind(sql: string, context: TestBindContext): Promise<BoundStatement> {
     const parsed = parseStatement(sql);
@@ -31,68 +27,55 @@ async function parseBind(sql: string, context: TestBindContext): Promise<BoundSt
     return bound.value;
 }
 
+// A `shop` schema and a `users` schema released as the `users` and
+// `shop_prod` groups of `shop_catalog`, deployed as the database `app`.
 async function createEnv() {
-    const ctx = createMockRContext({ selfValidate: true });
-    ctx.getRegistry().register(RDbImpl.typeId, rDbFactory);
-    ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
-    ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
-
-    const admin = await createIdentity(SIGNING_ED25519, hashSuite);
-    const lang = createTestBindContext(ctx, { admin, me: admin });
-
-    const usersSchemaInit = await RSchemaImpl.create({
-        name: 'test:users_schema',
-        creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
-        tables: [{
-            name: 'caps',
-            columns: { label: { type: 'string', pub: true } },
-            restrictions: [{ on: 'all', rule: { p: 'true' } }],
-        }],
-    });
-    const usersSchema = await ctx.createObject(usersSchemaInit) as RSchemaImpl;
-    const usersGroupInit = await RTableGroupImpl.create({
-        name: 'users',
-        seed: 'users-group',
-        schemaRef: usersSchema.getId(),
-        schemaVersion: await (await usersSchema.getScopedDag()).getFrontier(),
-    });
-    const usersGroup = await ctx.createObject(usersGroupInit) as RTableGroupImpl;
-    lang.registerSchema('users_schema', usersSchema);
-    lang.registerGroup('users', usersGroup);
-
-    const schemaBound = await parseBind(`
+    const admin = await newIdentity();
+    const env = await createLangEnv({ vars: { admin, me: admin } });
+    await env.run(`
+        CREATE SCHEMA test:users_schema CREATORS ($admin) AS (
+          TABLE caps (label string PUB) ALLOW all IF true
+        );
         CREATE SCHEMA shop CREATORS ($admin) AS (
           TABLE products (
             sku string PUB READONLY,
             name string
           ) ALLOW all IF true
         );
-    `, lang);
-    const schemaPlan = await execute(schemaBound);
-    if (!schemaPlan.ok || schemaPlan.value.kind !== 'create-plan') throw new Error('schema create failed');
-    const schema = await ctx.createObject(schemaPlan.value.plan.payload) as RSchemaImpl;
-    lang.registerSchema('shop', schema);
-
-    const groupBound = await parseBind(`CREATE TABLEGROUP shop_prod USING SCHEMA shop BIND users => #${usersGroup.getId()};`, lang);
-    const groupPlan = await execute(groupBound);
-    if (!groupPlan.ok || groupPlan.value.kind !== 'create-plan') throw new Error('group create failed');
-    const group = await ctx.createObject(groupPlan.value.plan.payload) as RTableGroupImpl;
-    lang.registerGroup('shop_prod', group);
-
-    return { ctx, lang, schema, group, admin, usersGroup };
+        CREATE CATALOG shop_catalog VERSION '1.0.0' AS (
+          TABLEGROUP users USING SCHEMA test:users_schema,
+          TABLEGROUP shop_prod USING SCHEMA shop BIND users => users
+        );
+        CREATE DATABASE app SEED 'app-seed' USING CATALOG shop_catalog;
+    `);
+    return {
+        env,
+        ctx: env.ctx,
+        lang: env.lang,
+        admin,
+        schema: await env.schema('shop'),
+        catalog: await env.catalog('shop_catalog'),
+        db: await env.database('app'),
+        group: await env.group('shop_prod'),
+        usersGroup: await env.group('users'),
+    };
 }
 
-type MockCtx = ReturnType<typeof createMockRContext>;
+// Releases `body` as `version` and deploys it into `db`.
+async function releaseAndDeploy(env: LangEnv, version: string, body: string, db = 'app', by = ''): Promise<void> {
+    await env.run(`ALTER CATALOG shop_catalog VERSION '${version}' AS (${body}) ${by};`);
+    await env.run(`UPDATE CATALOG shop_catalog TO '${version}' ON ${db} ${by};`);
+}
 
-function dumpLoaders(ctx: MockCtx) {
+function dumpLoaders(env: LangEnv) {
     return {
         loadSchema: async (id: B64Hash) => {
-            const object = await ctx.getObject(id);
+            const object = await env.ctx.getObject(id);
             if (object === undefined) throw new Error(`Schema '${id}' not found`);
             return object as RSchemaImpl;
         },
         loadGroup: async (id: B64Hash) => {
-            const object = await ctx.getObject(id);
+            const object = await env.ctx.getObject(id);
             if (object === undefined) throw new Error(`Group '${id}' not found`);
             return object as RTableGroupImpl;
         },
@@ -123,8 +106,12 @@ class TestAliasContext implements RenderAliasContext {
         return this.ensure('group', id, hint ?? 'group');
     }
 
-    db(_id: B64Hash, hint?: string): string {
-        return hint ?? 'db';
+    db(id: B64Hash, hint?: string): string {
+        return this.ensure('db', id, hint ?? 'db');
+    }
+
+    catalog(id: B64Hash, hint?: string): string {
+        return this.ensure('catalog', id, hint ?? 'catalog');
     }
 
     version(hash: B64Hash, scope: RenderVersionScope): string {
@@ -191,91 +178,79 @@ export const restPhaseTests = {
     title: '[RDB_LANG:REST] Remaining plan phases',
     tests: [
         {
-            name: '[REST01] CREATE DATABASE returns a valid create plan',
+            name: '[REST01] CREATE DATABASE returns a create plan whose afterCreate creates the member groups',
             invoke: async () => {
-                const { ctx, lang } = await createEnv();
-                const bound = await parseBind('CREATE DATABASE app;', lang);
-                const result = await execute(bound);
+                const { ctx, lang, catalog } = await createEnv();
+                const result = await execute(await parseBind('CREATE DATABASE app2 USING CATALOG shop_catalog;', lang));
                 assertTrue(result.ok && result.value.kind === 'create-plan', 'database create returns a plan');
-                if (!result.ok || result.value.kind !== 'create-plan') return;
-                const db = await ctx.createObject(result.value.plan.payload) as RDbImpl;
-                lang.registerDatabase('app', db);
-                assertTrue(db.getId().length > 0, 'created db has id');
+                if (!result.ok || result.value.kind !== 'create-plan' || result.value.plan.kind !== 'create-database') return;
+                const plan = result.value.plan;
+                assertEquals(plan.payload.catalog, catalog.getId(), 'the payload names the catalog');
+                assertEquals(plan.payload.release, catalog.getId(), 'LATEST selects the only release, the genesis');
+                const db = await ctx.createObject(plan.payload) as RDbImpl;
+                assertEquals((await db.getMemberGroups()).length, 2, 'the membership is computed before any group exists');
+                const update = await plan.afterCreate(db);
+                assertEquals(update.created.length, 2, 'afterCreate creates both groups');
+                assertEquals(update.commit, undefined, 'the create release is already recorded by the create');
+                for (const id of await db.getMemberGroups()) assertTrue(await ctx.getObject(id) !== undefined, `member ${id} exists`);
             },
         },
         {
-            name: '[REST01b] ADD SCHEMA / ADD TABLEGROUP register members and dump round-trips',
+            name: '[REST01b] a release adding a group deploys a new member, and the database dump replays',
             invoke: async () => {
-                const { ctx, lang, schema, group } = await createEnv();
-                const dbPlan = await execute(await parseBind('CREATE DATABASE app;', lang));
-                if (!dbPlan.ok || dbPlan.value.kind !== 'create-plan') throw new Error('database create failed');
-                const db = await ctx.createObject(dbPlan.value.plan.payload) as RDbImpl;
-                lang.registerDatabase('app', db);
+                const { env, db, admin } = await createEnv();
+                await env.run(`CREATE SCHEMA notes CREATORS ($admin) AS (TABLE notes (text string) ALLOW all IF true);`);
+                await releaseAndDeploy(env, '1.1.0', 'ADD TABLEGROUP notes USING SCHEMA notes BIND shop => shop_prod');
+                const names = await db.getMemberGroupNames();
+                assertEquals([...names.keys()].sort().join(','), 'notes,shop_prod,users', 'the new group is a member');
+                await env.run("INSERT INTO notes.notes (text) VALUES ('hi');");
 
-                const addSchema = await execute(await parseBind('ADD SCHEMA shop TO app NOTE \'shop schema\';', lang));
-                assertTrue(addSchema.ok && addSchema.value.kind === 'add-member', 'ADD SCHEMA returns add-member');
-                const addGroup = await execute(await parseBind('ADD TABLEGROUP shop_prod TO app;', lang));
-                assertTrue(addGroup.ok && addGroup.value.kind === 'add-member', 'ADD TABLEGROUP returns add-member');
+                const dump = await dumpDatabase(db, dumpLoaders(env));
+                assertTrue(dump.includes('CREATE CATALOG shop_catalog'), 'dump includes CREATE CATALOG');
+                assertTrue(dump.includes("ALTER CATALOG #") && dump.includes('ADD TABLEGROUP notes'), 'dump includes the release');
+                assertTrue(dump.indexOf('CREATE CATALOG') < dump.indexOf('CREATE DATABASE app'), 'the catalog comes first');
+                assertTrue(dump.includes('UPDATE CATALOG #') && dump.includes(`ON #${db.getId()}`), 'dump includes the deploy');
+                assertTrue(dump.indexOf('UPDATE CATALOG') < dump.indexOf('INSERT INTO notes.notes'),
+                    'ops on the new group follow the deploy that creates it');
 
-                const memberSchemas = await db.getMemberSchemas();
-                const memberGroups = await db.getMemberGroups();
-                assertTrue(memberSchemas.includes(schema.getId()), 'schema is a member');
-                assertTrue(memberGroups.includes(group.getId()), 'group is a member');
-
-                const dump = await dumpDatabase(db, dumpLoaders(ctx));
-                assertTrue(dump.includes('CREATE DATABASE app'), 'dump includes CREATE DATABASE');
-                assertTrue(dump.includes('CREATE SCHEMA shop'), 'dump includes CREATE SCHEMA');
-                assertTrue(dump.indexOf('ADD SCHEMA') < dump.indexOf('CREATE TABLEGROUP'), 'ADD SCHEMA before CREATE TABLEGROUP');
-                assertTrue(dump.includes(`ADD SCHEMA #${schema.getId()} TO app`) && dump.includes(`NOTE 'shop schema'`), 'ADD SCHEMA round-trips');
-                assertTrue(dump.includes(`ADD TABLEGROUP #${group.getId()} TO app`), 'ADD TABLEGROUP round-trips');
-                assertTrue(!dump.includes('TO <database>'), 'no database placeholder');
+                const replay = await createLangEnv({ vars: { admin, me: admin } });
+                await replay.run(dump);
+                const replayed = await replay.database('app');
+                assertEquals(replayed.getId(), db.getId(), 'the replayed database has the same id');
+                assertEquals(JSON.stringify([...(await replayed.getMemberGroupNames()).entries()].sort()),
+                    JSON.stringify([...names.entries()].sort()), 'the replayed members have the same ids');
+                const frontier = async (e: LangEnv) => [...await (await (await e.group('app.notes')).getScopedDag()).getFrontier()].sort().join();
+                assertEquals(await frontier(replay), await frontier(env), 'the new group replays to the same DAG');
             },
         },
         {
-            name: '[REST01c] gated database requires BY on ADD and dump round-trips CREATORS/BY',
+            name: '[REST01c] a database with creators requires BY on UPDATE CATALOG; the dump carries CREATORS and BY',
             invoke: async () => {
-                const { ctx, lang, schema, group, admin } = await createEnv();
-                const dbPlan = await execute(await parseBind('CREATE DATABASE gated CREATORS ($admin);', lang));
-                if (!dbPlan.ok || dbPlan.value.kind !== 'create-plan') throw new Error('database create failed');
-                const db = await ctx.createObject(dbPlan.value.plan.payload) as RDbImpl;
-                lang.registerDatabase('gated', db);
+                const { env, admin } = await createEnv();
+                await env.run('CREATE DATABASE gated USING CATALOG shop_catalog CREATORS ($admin) BY $admin;');
+                await env.run("ALTER SCHEMA shop AS (ADD COLUMN products.price integer DEFAULT 0);");
+                await env.run("ALTER CATALOG shop_catalog VERSION '1.1.0' AS (UPDATE SCHEMA shop TO LATEST ON shop_prod);");
 
-                const unsignedParsed = parseStatement('ADD SCHEMA shop TO gated;');
-                assertTrue(unsignedParsed.ok, 'parse unsigned ADD');
-                if (!unsignedParsed.ok) return;
-                const unsigned = await bind(unsignedParsed.value, lang);
-                assertTrue(!unsigned.ok, 'unsigned ADD must fail bind when database declares creators');
+                const unsigned = await env.fail("UPDATE CATALOG shop_catalog TO '1.1.0' ON gated BY NOBODY;");
+                assertTrue(unsigned.includes('requires an author'), unsigned);
+                const [deployed] = await env.run("UPDATE CATALOG shop_catalog TO '1.1.0' ON gated BY $admin;");
+                assertTrue(deployed.kind === 'update-catalog' && deployed.update.deployed.length === 1, 'the signed deploy succeeds');
 
-                const addSchema = await execute(await parseBind("ADD SCHEMA shop TO gated BY $admin NOTE 'shop schema';", lang));
-                assertTrue(addSchema.ok && addSchema.value.kind === 'add-member', 'signed ADD SCHEMA succeeds');
-                const addGroup = await execute(await parseBind('ADD TABLEGROUP shop_prod TO gated BY $admin;', lang));
-                assertTrue(addGroup.ok && addGroup.value.kind === 'add-member', 'signed ADD TABLEGROUP succeeds');
-
-                assertTrue((await db.getMemberSchemas()).includes(schema.getId()), 'schema is a member');
-                assertTrue((await db.getMemberGroups()).includes(group.getId()), 'group is a member');
-
-                const dump = await dumpDatabase(db, dumpLoaders(ctx));
-                assertTrue(dump.includes('CREATORS ('), 'dump includes CREATORS');
-                assertTrue(dump.includes(admin.keyId), 'dump includes creator keyId');
-                assertTrue(dump.includes(`ADD SCHEMA #${schema.getId()} TO gated`) && dump.includes(`NOTE 'shop schema'`) && dump.includes(`BY #${admin.keyId}`), 'ADD SCHEMA BY round-trips');
-                assertTrue(dump.includes(`ADD TABLEGROUP #${group.getId()} TO gated`) && dump.includes(`BY #${admin.keyId}`), 'ADD TABLEGROUP BY round-trips');
+                const gated = await env.database('gated');
+                const dump = await dumpDatabase(gated, dumpLoaders(env));
+                assertTrue(dump.includes(`CREATORS (publicKey('${serializePublicKeyToBase64(admin.publicKey)}'))`), 'dump includes CREATORS');
+                const updateLine = dump.split('\n').find((l) => l.startsWith('UPDATE CATALOG'));
+                assertTrue(updateLine !== undefined && updateLine.includes(`BY #${admin.keyId}`), `the deploy keeps its author: ${updateLine}`);
             },
         },
         {
-            name: '[REST02] ALTER, UPDATE SCHEMA, UPDATE REF, UPDATE, DELETE and BUNDLE execute',
+            name: '[REST02] ALTER SCHEMA, a released deploy, UPDATE REF, UPDATE, DELETE and BUNDLE execute',
             invoke: async () => {
-                const { lang, group } = await createEnv();
+                const { env, lang, group } = await createEnv();
 
                 const insert = await execute(await parseBind("INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');", lang));
                 assertTrue(insert.ok && insert.value.kind === 'insert', 'insert succeeds');
                 if (!insert.ok || insert.value.kind !== 'insert') return;
-
-                lang.resolveRowId = async (ref, table, at, from) => {
-                    const ids = await (await table.table.getView(at, from ?? at)).liveRowIds();
-                    const matches = ids.filter((id: B64Hash) => id.startsWith(ref.prefix));
-                    if (matches.length !== 1) throw new Error(`rowId prefix did not resolve uniquely: ${ref.prefix}`);
-                    return matches[0];
-                };
 
                 const update = await execute(await parseBind(`UPDATE shop_prod.products SET name = 'Widget 2' WHERE rowId = #${insert.value.rowId.slice(0, 8)};`, lang));
                 assertTrue(update.ok && update.value.kind === 'update', 'update succeeds');
@@ -292,13 +267,13 @@ export const restPhaseTests = {
                 const allowAlter = await execute(await parseBind("ALTER SCHEMA shop AS (SET ALLOW RULES products (ALLOW all IF true));", lang));
                 assertTrue(allowAlter.ok && allowAlter.value.kind === 'alter-schema', 'allow rules alter succeeds');
 
-                const deploy = await execute(await parseBind('UPDATE SCHEMA shop TO LATEST ON shop_prod;', lang));
-                assertTrue(deploy.ok && deploy.value.kind === 'update-schema', 'update schema succeeds');
+                await releaseAndDeploy(env, '1.1.0', 'UPDATE SCHEMA shop TO LATEST ON shop_prod');
 
                 const select = await execute(await parseBind("SELECT sku, price FROM shop_prod.products WHERE sku = 'A';", lang));
                 assertTrue(select.ok && select.value.kind === 'select', 'select after deploy succeeds');
                 if (select.ok && select.value.kind === 'select') assertEquals(select.value.rows[0].values['price'], 0, 'deployed default visible');
 
+                await env.run("INSERT INTO users.caps (label) VALUES ('x');");
                 const updateRef = await execute(await parseBind('UPDATE REF users TO LATEST ON shop_prod;', lang));
                 assertTrue(updateRef.ok && updateRef.value.kind === 'update-ref', 'update ref succeeds');
 
@@ -312,17 +287,14 @@ export const restPhaseTests = {
         {
             name: '[REST02b] SELECT * returns schema columns without materializing absent nullable values',
             invoke: async () => {
-                const { lang } = await createEnv();
+                const { env, lang } = await createEnv();
 
                 const insert = await execute(await parseBind("INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');", lang));
                 assertTrue(insert.ok && insert.value.kind === 'insert', 'insert succeeds');
                 if (!insert.ok || insert.value.kind !== 'insert') return;
 
-                const alter = await execute(await parseBind('ALTER SCHEMA shop AS (ADD COLUMN products.tag string NULL);', lang));
-                assertTrue(alter.ok && alter.value.kind === 'alter-schema', 'alter succeeds');
-
-                const deploy = await execute(await parseBind('UPDATE SCHEMA shop TO LATEST ON shop_prod;', lang));
-                assertTrue(deploy.ok && deploy.value.kind === 'update-schema', 'deploy succeeds');
+                await env.run('ALTER SCHEMA shop AS (ADD COLUMN products.tag string NULL);');
+                await releaseAndDeploy(env, '1.1.0', 'UPDATE SCHEMA shop TO LATEST ON shop_prod');
 
                 const select = await execute(await parseBind("SELECT * FROM shop_prod.products WHERE sku = 'A';", lang));
                 assertTrue(select.ok && select.value.kind === 'select', 'select succeeds');
@@ -383,12 +355,14 @@ export const restPhaseTests = {
                 const explicit = await parseBind("SELECT sku FROM shop_prod.products;", lang);
                 assertEquals(explicit.kind, 'select', 'explicit qualified SELECT binds');
                 if (explicit.kind === 'select') assertEquals(explicit.table.groupId, group.getId(), 'explicit group wins over default group');
+                const qualified = await parseBind("SELECT sku FROM app.shop_prod.products;", lang);
+                if (qualified.kind === 'select') assertEquals(qualified.table.groupId, group.getId(), 'db.group.table resolves the same group');
             },
         },
         {
             name: '[REST05] reverse rendering and dump produce C-SQL output',
             invoke: async () => {
-                const { schema, group, lang } = await createEnv();
+                const { schema, group, lang, catalog, usersGroup } = await createEnv();
                 const renderedSchema = renderCreateSchema(schema.createOp);
                 const renderedParsed = parseStatement(renderedSchema);
                 assertTrue(renderedParsed.ok, 'rendered schema parses');
@@ -434,30 +408,29 @@ export const restPhaseTests = {
                 assertTrue(schemaDumpLines.some((line) =>
                     line.includes(` BY #${authorKeyId}`) && line.includes(' AT {#')),
                     'dumped alter includes BY author and causal AT');
-                const renderedGroup = renderCreateTableGroup({
-                    action: 'create',
-                    type: RTableGroupImpl.typeId,
-                    name: 'shop_prod',
-                    seed: 'shop_prod',
-                    schemaRef: 'schema',
-                    schemaVersion: json.toSet(['schemaVersion']),
-                    idProvider: 'users.identities',
-                    canDeploy: { p: 'true' },
-                } as CreateTableGroupPayload);
-                assertTrue(renderedGroup.includes('USING IDENTITIES users.identities'), 'rendered tablegroup uses USING IDENTITIES syntax');
-                assertTrue(renderedGroup.includes('ALLOW UPDATE SCHEMA IF true'), 'rendered tablegroup uses ALLOW UPDATE SCHEMA IF syntax');
-                assertTrue(parseStatement(renderedGroup).ok, 'rendered tablegroup parses');
-                const renderedCorrelated = renderCreateTableGroup({
-                    action: 'create',
-                    type: RTableGroupImpl.typeId,
-                    name: 'shop_prod',
-                    seed: 'shop_prod',
-                    schemaRef: 'schema',
-                    schemaVersion: json.toSet(['schemaVersion']),
-                    canDeploy: { p: 'exists', table: 'grants', where: { resource: '$row.resource', grantee: '$author' } },
-                } as CreateTableGroupPayload);
-                assertTrue(renderedCorrelated.includes('EXISTS grants WHERE grants.resource = resource AND grants.grantee = $author'),
-                    'rendered correlated predicate uses qualified exists columns');
+
+                const renderedCatalog = renderCreateCatalog(catalog.createOp);
+                assertTrue(renderedCatalog.includes(`TABLEGROUP shop_prod USING SCHEMA #${schema.getId()} AT {#`), 'catalog groups pin their schema by hash');
+                assertTrue(renderedCatalog.includes('BIND users => users'), 'bindings render by definition name');
+                assertTrue(parseStatement(renderedCatalog).ok, 'rendered catalog parses');
+
+                const release = {
+                    action: 'release',
+                    version: '1.1.0',
+                    add: [{
+                        name: 'extra', seedSource: 'rdb', schemaRef: schema.getId(), schemaVersion: json.toSet([schema.getId()]),
+                        idProvider: 'users.identities',
+                        canDeploy: { p: 'exists', table: 'grants', where: { resource: '$row.resource', grantee: '$author' } },
+                    }],
+                    author: authorKeyId,
+                    signature: 'sig',
+                } as unknown as CatalogReleasePayload;
+                const renderedRelease = renderAlterCatalog(release, { catalogRef: catalog.getId(), catalogName: catalog.getName(), at: json.toSet([catalog.getId()]) });
+                assertTrue(renderedRelease.includes('USING IDENTITIES users.identities'), 'rendered release uses USING IDENTITIES syntax');
+                assertTrue(renderedRelease.includes('ALLOW DEPLOY IF EXISTS grants WHERE grants.resource = resource AND grants.grantee = $author'),
+                    'rendered correlated deploy predicate uses qualified exists columns');
+                assertTrue(renderedRelease.endsWith(`AT {#${catalog.getId()}};`), 'a release renders its insertion point by hash');
+                assertTrue(parseStatement(renderedRelease).ok, 'rendered release parses');
                 assertTrue(renderRowOp({ action: 'update', rowId: 'row', values: { name: 'x' } }, 'shop_prod.products').startsWith('UPDATE'), 'row op renders');
 
                 const insert = await execute(await parseBind("INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');", lang));
@@ -471,7 +444,8 @@ export const restPhaseTests = {
                 assertTrue(del.ok && del.value.kind === 'delete', 'delete for dump succeeds');
 
                 const dump = await dumpGroup(group);
-                assertTrue(dump.indexOf('CREATE TABLEGROUP') >= 0, 'group dump includes create statement');
+                assertTrue(dump.startsWith('-- TABLEGROUP shop_prod USING SCHEMA'), 'a group genesis renders as a comment');
+                assertTrue(!(await dumpGroup(usersGroup)).includes('CREATE TABLEGROUP'), 'no CREATE TABLEGROUP statement is rendered');
                 const dumpLines = dump.split('\n');
                 const hasLine = (needle: string) => dumpLines.some((line) =>
                     line.includes(needle) && line.includes(' BY #') && line.includes(' AT {#'));
@@ -484,17 +458,15 @@ export const restPhaseTests = {
             },
         },
         {
-            name: '[REST06] scripted Users-compatible group uses publicKey()',
+            name: '[REST06] catalog rows take identity literals and params; publicKey() serializes; aliasMode renders $names',
             invoke: async () => {
-                const ctx = createMockRContext({ selfValidate: true });
-                ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
-                ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
-
-                const admin = await createIdentity(SIGNING_ED25519, hashSuite);
-                const lang = createTestBindContext(ctx, { admin });
-
-                const schemaPlan = await execute(await parseBind(`
-                    CREATE SCHEMA users_schema CREATORS ($admin) AS (
+                // The rows name $admin, who is not a catalog creator (the
+                // CREATORS clause would register the key alias first).
+                const admin = await newIdentity();
+                const dev = await newIdentity();
+                const env = await createLangEnv({ vars: { admin, dev, me: dev } });
+                await env.run(`
+                    CREATE SCHEMA users_schema CREATORS ($dev) AS (
                       TABLE identities (
                         keyId string PUB READONLY,
                         publicKey string PUB READONLY,
@@ -507,17 +479,13 @@ export const restPhaseTests = {
                         ALLOW insert IF EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
                         ALLOW delete IF grantee = $author OR EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
                     );
-                `, lang));
-                assertTrue(schemaPlan.ok && schemaPlan.value.kind === 'create-plan', 'users schema create plan succeeds');
-                if (!schemaPlan.ok || schemaPlan.value.kind !== 'create-plan') return;
-                const schema = await ctx.createObject(schemaPlan.value.plan.payload) as RSchemaImpl;
-                lang.registerSchema('users_schema', schema);
-
+                `);
+                const schema = await env.schema('users_schema');
                 const renderedSchema = renderCreateSchema(schema.createOp);
-                assertTrue(parseStatement(renderedSchema).ok, 'rendered users schema parses');
                 const renderedParsed = parseStatement(renderedSchema);
+                assertTrue(renderedParsed.ok, 'rendered users schema parses');
                 if (renderedParsed.ok) {
-                    const renderedBound = await bind(renderedParsed.value, lang);
+                    const renderedBound = await bind(renderedParsed.value, env.lang);
                     assertTrue(renderedBound.ok, 'rendered users schema binds with keystore creator lookup');
                 }
                 assertTrue(renderedSchema.includes(`TABLE identities (\n    keyId string PUB READONLY,\n    publicKey string PUB READONLY,\n    name string NULL PUB\n  ) IDENTITY PROVIDER\n    ALLOW insert IF true`),
@@ -528,57 +496,60 @@ export const restPhaseTests = {
                 assertTrue(renderedSchema.includes('grantee = $author'), 'rendered schema uses unquoted $author');
                 assertTrue(!renderedSchema.includes("grantee = '$author'"), 'rendered schema does not quote $author');
 
-                const groupPlan = await execute(await parseBind(`
-                    CREATE TABLEGROUP users
-                      USING SCHEMA users_schema
-                      USING IDENTITIES identities
-                      WITH ROWS (
-                        identities (keyId = $admin, publicKey = publicKey($admin), name = 'Admin'),
-                        caps (label = 'manager', grantee = $admin)
-                      );
-                `, lang));
-                assertTrue(groupPlan.ok && groupPlan.value.kind === 'create-plan', 'users group create plan succeeds');
-                if (!groupPlan.ok || groupPlan.value.kind !== 'create-plan') return;
+                await env.run(`
+                    CREATE CATALOG users_catalog VERSION '1.0.0' PARAMS (:owner identity) AS (
+                      TABLEGROUP users USING SCHEMA users_schema
+                        USING IDENTITIES identities
+                        WITH ROWS (
+                          identities (keyId = $admin, publicKey = publicKey($admin), name = 'Admin'),
+                          caps (label = 'manager', grantee = $admin),
+                          caps (label = 'owner', grantee = :owner)
+                        )
+                    );
+                    CREATE DATABASE users_db USING CATALOG users_catalog WITH PARAMS (:owner = $admin);
+                `);
+                const catalog = await env.catalog('users_catalog');
+                const def = catalog.createOp.add![0];
+                assertEquals(def.initialRows?.['identities']?.[0].values['keyId'], admin.keyId, 'an identity literal resolves to its key id');
+                assertEquals(def.initialRows?.['identities']?.[0].values['publicKey'], serializePublicKeyToBase64(admin.publicKey),
+                    'publicKey() serializes the public key');
+                assertEquals(JSON.stringify(def.initialRows?.['caps']?.[1].params), JSON.stringify({ grantee: { param: 'owner' } }),
+                    'a :param stays a template slot in the catalog');
 
-                const payload = groupPlan.value.plan.payload as CreateTableGroupPayload;
-                assertEquals(payload.idProvider, 'identities', 'group selects local identity provider');
-                const identities = payload.initialRows?.['identities'] as Array<{ values: { [key: string]: unknown } }> | undefined;
-                assertEquals(identities?.[0].values['keyId'], admin.keyId, 'plain identity value resolves to keyId');
-                assertEquals(identities?.[0].values['publicKey'], serializePublicKeyToBase64(admin.publicKey), 'publicKey() serializes public key');
+                const group = await env.group('users');
+                assertEquals(group.getIdProvider(), 'identities', 'the group selects the local identity provider');
+                const caps = await (await group.getTable('caps')).getView();
+                assertEquals((await caps.findRowIds({ label: 'owner', grantee: admin.keyId })).length, 1,
+                    'the param is filled from WITH PARAMS at instantiation');
 
                 const aliases = new TestAliasContext(
                     new Map([[admin.keyId, 'admin']]),
                     new Map([[admin.keyId, serializePublicKeyToBase64(admin.publicKey)]]),
                 );
                 aliases.key(admin.keyId);
-                const aliasedGroup = renderCreateTableGroup(payload, { aliasMode: true, aliases });
-                assertTrue(aliasedGroup.includes('keyId=$admin'), 'aliased WITH ROWS uses $admin for keyId');
-                assertTrue(aliasedGroup.includes('publicKey=publicKey($admin)'), 'aliased WITH ROWS uses publicKey($admin)');
-                assertTrue(aliasedGroup.includes('grantee=$admin'), 'aliased WITH ROWS uses $admin for grantee');
-                const withRows = aliasedGroup.slice(aliasedGroup.indexOf('WITH ROWS'));
+                const aliased = renderCreateCatalog(catalog.createOp, { aliasMode: true, aliases });
+                assertTrue(aliased.includes('keyId=$admin'), 'aliased WITH ROWS uses $admin for keyId');
+                assertTrue(aliased.includes('publicKey=publicKey($admin)'), 'aliased WITH ROWS uses publicKey($admin)');
+                assertTrue(aliased.includes('grantee=$admin'), 'aliased WITH ROWS uses $admin for grantee');
+                assertTrue(aliased.includes('grantee=:owner'), 'a param renders as :owner');
+                const withRows = aliased.slice(aliased.indexOf('WITH ROWS'));
                 assertTrue(!withRows.includes(admin.keyId), 'aliased WITH ROWS omits raw keyId literals');
 
-                const unregisteredAliases = new TestAliasContext(
+                const unregistered = new TestAliasContext(
                     new Map([[admin.keyId, 'admin']]),
                     new Map([[admin.keyId, serializePublicKeyToBase64(admin.publicKey)]]),
                 );
-                const literalGroup = renderCreateTableGroup(payload, { aliasMode: true, aliases: unregisteredAliases });
-                assertTrue(literalGroup.includes(`keyId='${admin.keyId}'`), 'unregistered alias keeps keyId literal');
-                assertTrue(literalGroup.includes(`publicKey='${serializePublicKeyToBase64(admin.publicKey)}'`),
+                const literal = renderCreateCatalog(catalog.createOp, { aliasMode: true, aliases: unregistered });
+                assertTrue(literal.includes(`keyId='${admin.keyId}'`), 'unregistered alias keeps keyId literal');
+                assertTrue(literal.includes(`publicKey='${serializePublicKeyToBase64(admin.publicKey)}'`),
                     'unregistered alias keeps publicKey literal');
-
-                const group = await ctx.createObject(payload) as RTableGroupImpl;
-                lang.registerGroup('users', group);
-                assertTrue(group.getId().length > 0, 'scripted users group creates');
             },
         },
         {
-            name: '[REST07] publicKey() rejects bare key ids',
+            name: '[REST07] publicKey() rejects bare key ids; params are only allowed in catalog rows',
             invoke: async () => {
-                const ctx = createMockRContext({ selfValidate: true });
-                ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
-                const admin = await createIdentity(SIGNING_ED25519, hashSuite);
-                const lang = createTestBindContext(ctx, { bare: { kind: 'key-id', keyId: admin.keyId } });
+                const admin = await newIdentity();
+                const env = await createLangEnv({ vars: { admin, me: admin, bare: { kind: 'key-id', keyId: admin.keyId } } });
 
                 const schemaInit = await RSchemaImpl.create({
                     name: 'test:bare_schema',
@@ -592,32 +563,33 @@ export const restPhaseTests = {
                         idProvider: { keyIdColumn: 'keyId', publicKeyColumn: 'publicKey' },
                     }],
                 });
-                const schema = await ctx.createObject(schemaInit) as RSchemaImpl;
-                lang.registerSchema('bare_schema', schema);
+                env.lang.registerSchema('bare_schema', await env.ctx.createObject(schemaInit) as RSchemaImpl);
 
-                const parsed = parseStatement(`
-                    CREATE TABLEGROUP bad_users
-                      USING SCHEMA bare_schema
-                      WITH ROWS (
-                        identities (keyId = $bare, publicKey = publicKey($bare))
-                      );
-                `);
-                assertTrue(parsed.ok, 'parse should succeed');
-                if (!parsed.ok) return;
-                const bound = await bind(parsed.value, lang);
-                assertTrue(!bound.ok, 'publicKey() on bare key id should fail binding');
-                if (!bound.ok) assertTrue(bound.diagnostics[0].message.includes('publicKey() requires'), 'diagnostic mentions publicKey requirement');
+                const bare = await env.fail(`CREATE CATALOG c VERSION '1.0.0' AS (
+                    TABLEGROUP bad_users USING SCHEMA bare_schema
+                      WITH ROWS (identities (keyId = $bare, publicKey = publicKey($bare)))
+                );`);
+                assertTrue(bare.includes('publicKey() requires'), bare);
+
+                const undeclared = await env.fail(`CREATE CATALOG c VERSION '1.0.0' AS (
+                    TABLEGROUP users USING SCHEMA bare_schema WITH ROWS (identities (keyId = :who))
+                );`);
+                assertTrue(undeclared.includes("param ':who' is not declared"), undeclared);
+
+                const outside = await env.fail("INSERT INTO nowhere.identities (keyId) VALUES (:who);");
+                assertTrue(outside.includes('only allowed in WITH ROWS') || outside.includes('Unknown group'), outside);
             },
         },
         {
             name: '[REST08] SEED and uuid pseudo-column bind deterministically',
             invoke: async () => {
-                const { ctx, lang, admin } = await createEnv();
-                const dbPlan = await execute(await parseBind("CREATE DATABASE app SEED 'db-seed-fixed';", lang));
-                if (!dbPlan.ok || dbPlan.value.kind !== 'create-plan') throw new Error('database create failed');
-                const db1 = await ctx.createObject(dbPlan.value.plan.payload) as RDbImpl;
-                const db2 = await ctx.createObject(dbPlan.value.plan.payload) as RDbImpl;
-                assertEquals(db1.getId(), db2.getId(), 'same SEED yields same database id');
+                const { lang, admin } = await createEnv();
+                const plan = async () => {
+                    const result = await execute(await parseBind("CREATE DATABASE app2 SEED 'db-seed-fixed' USING CATALOG shop_catalog;", lang));
+                    if (!result.ok || result.value.kind !== 'create-plan') throw new Error('database create failed');
+                    return json.toStringNormalized(result.value.plan.payload as unknown as json.Literal);
+                };
+                assertEquals(await plan(), await plan(), 'same SEED yields the same database payload');
 
                 const insert = await execute(await parseBind(
                     "INSERT INTO shop_prod.products (uuid, sku, name) VALUES ('row-uuid-1', 'A', 'Widget');",
@@ -631,71 +603,48 @@ export const restPhaseTests = {
         {
             name: '[REST09] dumpDatabase full and schema profiles',
             invoke: async () => {
-                const { ctx, lang, schema, group, usersGroup } = await createEnv();
-                const dbPlan = await execute(await parseBind("CREATE DATABASE app SEED 'dump-test-db';", lang));
-                if (!dbPlan.ok || dbPlan.value.kind !== 'create-plan') throw new Error('database create failed');
-                const db = await ctx.createObject(dbPlan.value.plan.payload) as RDbImpl;
-                lang.registerDatabase('app', db);
-
-                await execute(await parseBind('ADD SCHEMA shop TO app;', lang));
-                await execute(await parseBind('ADD TABLEGROUP users TO app;', lang));
-                await execute(await parseBind('ADD TABLEGROUP shop_prod TO app;', lang));
+                const { env, db, lang } = await createEnv();
                 await execute(await parseBind("INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');", lang));
                 await execute(await parseBind('ALTER SCHEMA shop AS (ADD COLUMN products.note string NULL);', lang));
 
-                const loaders = dumpLoaders(ctx);
+                const loaders = dumpLoaders(env);
                 const fullDump = await dumpDatabase(db, { ...loaders, mode: 'full' });
-                assertTrue(fullDump.includes("SEED 'dump-test-db'"), 'full dump includes database SEED');
-                assertTrue(fullDump.indexOf('ADD SCHEMA') < fullDump.indexOf('CREATE TABLEGROUP'), 'ADD SCHEMA before groups');
-                assertTrue(fullDump.indexOf('CREATE TABLEGROUP users') < fullDump.indexOf('CREATE TABLEGROUP shop_prod'), 'users before shop_prod');
-                assertTrue(fullDump.includes(`ADD TABLEGROUP #${usersGroup.getId()} TO app`), 'full ADD TABLEGROUP by hash');
-                assertTrue(fullDump.includes(`BIND users => #${usersGroup.getId()}`), 'full BIND by hash');
-                assertTrue(fullDump.includes('INSERT INTO products'), 'full dump includes row ops');
-                for (const line of fullDump.split('\n')) {
-                    if (!line.startsWith('ADD SCHEMA ') && !line.startsWith('ADD TABLEGROUP ')) continue;
-                    assertTrue(line.includes(' AT {#'), `full dump membership includes AT: ${line}`);
-                }
+                assertTrue(fullDump.includes("SEED 'app-seed'"), 'full dump includes database SEED');
+                assertTrue(fullDump.indexOf('CREATE SCHEMA shop') < fullDump.indexOf('CREATE CATALOG'), 'schemas before the catalog');
+                assertTrue(fullDump.indexOf('TABLEGROUP users') < fullDump.indexOf('TABLEGROUP shop_prod'), 'users before shop_prod');
+                assertTrue(fullDump.includes('BIND users => users'), 'full BIND by definition name');
+                assertTrue(fullDump.indexOf('CREATE DATABASE app') < fullDump.indexOf('USE DATABASE'), 'USE DATABASE follows CREATE DATABASE');
+                assertTrue(fullDump.includes('INSERT INTO shop_prod.products'), 'full dump includes row ops qualified by member name');
 
                 const schemaDump = await dumpDatabase(db, { ...loaders, mode: 'schema' });
-                assertTrue(!schemaDump.includes("SEED 'dump-test-db'"), 'schema dump omits database SEED');
-                assertTrue(schemaDump.includes('ADD SCHEMA shop TO app'), 'schema dump ADD SCHEMA by name');
-                assertTrue(schemaDump.includes('ADD TABLEGROUP shop_prod TO app'), 'schema dump ADD TABLEGROUP by name');
-                assertTrue(schemaDump.includes('BIND users => users'), 'schema dump BIND by name');
-                assertTrue(!schemaDump.includes('INSERT INTO products'), 'schema dump omits row ops');
+                assertTrue(!schemaDump.includes("SEED 'app-seed'"), 'schema dump omits database SEED');
+                assertTrue(schemaDump.includes('CREATE DATABASE app USING CATALOG shop_catalog'), 'schema dump names the catalog');
+                assertTrue(schemaDump.includes('TABLEGROUP shop_prod USING SCHEMA shop'), 'schema dump names the schema');
+                assertTrue(!schemaDump.includes('INSERT INTO'), 'schema dump omits row ops');
                 assertTrue(schemaDump.includes('CREATE SCHEMA shop'), 'schema dump includes schema DDL');
-                for (const line of schemaDump.split('\n')) {
-                    if (!line.startsWith('ADD SCHEMA ') && !line.startsWith('ADD TABLEGROUP ')) continue;
-                    assertTrue(!line.includes(' AT {#'), `schema dump membership omits AT: ${line}`);
-                }
                 const alterStmt = schemaDump.split('\n\n').find((s) =>
                     s.includes('ALTER SCHEMA #') && s.includes('ADD COLUMN products."note" string NULL'));
                 assertTrue(alterStmt !== undefined && alterStmt.includes(' AT {#'), 'schema dump alter keeps causal AT');
             },
         },
         {
-            name: '[REST10] full dumpGroup renders group-scoped ops with #groupId',
+            name: '[REST10] full dumpGroup renders group-scoped ops with #groupId; deploys are comments',
             invoke: async () => {
-                const { lang, group, schema, usersGroup } = await createEnv();
+                const { env, lang, group, usersGroup } = await createEnv();
 
                 const insert = await execute(await parseBind("INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');", lang));
                 assertTrue(insert.ok && insert.value.kind === 'insert', 'insert succeeds');
                 if (!insert.ok || insert.value.kind !== 'insert') return;
-
-                lang.resolveRowId = async (ref, table, at, from) => {
-                    const ids = await (await table.table.getView(at, from ?? at)).liveRowIds();
-                    const matches = ids.filter((id: B64Hash) => id.startsWith(ref.prefix));
-                    if (matches.length !== 1) throw new Error(`rowId prefix did not resolve uniquely: ${ref.prefix}`);
-                    return matches[0];
-                };
 
                 const bundle = await execute(await parseBind(`BUNDLE ON shop_prod (
                     UPDATE products SET name = 'Widget 3' WHERE rowId = #${insert.value.rowId.slice(0, 10)};
                 );`, lang));
                 assertTrue(bundle.ok && bundle.value.kind === 'bundle', 'bundle succeeds');
 
-                const deploy = await execute(await parseBind('UPDATE SCHEMA shop TO LATEST ON shop_prod;', lang));
-                assertTrue(deploy.ok && deploy.value.kind === 'update-schema', 'update schema succeeds');
+                await env.run('ALTER SCHEMA shop AS (ADD COLUMN products.note string NULL);');
+                await releaseAndDeploy(env, '1.1.0', 'UPDATE SCHEMA shop TO LATEST ON shop_prod');
 
+                await env.run("INSERT INTO users.caps (label) VALUES ('x');");
                 const updateRef = await execute(await parseBind('UPDATE REF users TO LATEST ON shop_prod;', lang));
                 assertTrue(updateRef.ok && updateRef.value.kind === 'update-ref', 'update ref succeeds');
 
@@ -703,15 +652,13 @@ export const restPhaseTests = {
                 const groupTarget = `#${group.getId()}`;
                 assertTrue(!dump.includes('<group>'), 'full dump does not emit <group> placeholder');
                 assertTrue(dump.includes(`BUNDLE ON ${groupTarget}`), 'dumped bundle uses group id');
-                assertTrue(
-                    dump.includes(`UPDATE SCHEMA #${schema.getId()} TO`) && dump.includes(` ON ${groupTarget}`),
-                    'dumped UPDATE SCHEMA uses group id',
-                );
+                assertTrue(dump.includes('-- deploy shop TO {#'), 'the deploy renders as a comment');
+                assertTrue(!dump.includes('UPDATE SCHEMA'), 'no group-level UPDATE SCHEMA statement');
                 assertTrue(dump.includes('UPDATE REF #') && dump.includes(` ON ${groupTarget}`), 'dumped UPDATE REF uses group id');
 
                 for (const statement of dump.split('\n\n')) {
                     const line = statement.split('\n')[0] ?? '';
-                    if (!line.startsWith('BUNDLE ON ') && !line.startsWith('UPDATE REF ') && !line.startsWith('UPDATE SCHEMA ')) continue;
+                    if (!line.startsWith('BUNDLE ON ') && !line.startsWith('UPDATE REF ')) continue;
                     const parsed = parseStatement(statement);
                     assertTrue(parsed.ok, `dumped group-scoped statement parses: ${line}`);
                 }
@@ -720,28 +667,20 @@ export const restPhaseTests = {
                 await parseBind(`BUNDLE ON #${group.getId()} (
                     UPDATE products SET name = 'Widget 4' WHERE rowId = #${rowPrefix};
                 );`, lang);
-                await parseBind(`UPDATE SCHEMA #${schema.getId()} TO LATEST ON #${group.getId()};`, lang);
                 await parseBind(`UPDATE REF #${usersGroup.getId()} TO LATEST ON #${group.getId()};`, lang);
             },
         },
         {
-            name: '[REST11] aliasMode dump uses aliases not raw hashes',
+            name: '[REST11] aliasMode dump uses aliases not raw hashes, and replays',
             invoke: async () => {
-                const { ctx, lang, schema, group, admin, usersGroup } = await createEnv();
-                const dbPlan = await execute(await parseBind("CREATE DATABASE app SEED 'alias-dump-db';", lang));
-                if (!dbPlan.ok || dbPlan.value.kind !== 'create-plan') throw new Error('database create failed');
-                const db = await ctx.createObject(dbPlan.value.plan.payload) as RDbImpl;
-                lang.registerDatabase('app', db);
-
-                await execute(await parseBind('ADD SCHEMA shop TO app BY $admin;', lang));
-                await execute(await parseBind('ADD TABLEGROUP shop_prod TO app BY $admin;', lang));
-                await execute(await parseBind("INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget') BY $admin;", lang));
-                await execute(await parseBind('ALTER SCHEMA shop AS (ADD COLUMN products.note string NULL) BY $admin;', lang));
+                const { env, db, admin, schema, group, usersGroup, catalog } = await createEnv();
+                await env.run("INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget') BY $admin;");
+                await env.run('ALTER SCHEMA shop AS (ADD COLUMN products.note string NULL) BY $admin;');
+                await releaseAndDeploy(env, '1.1.0', 'UPDATE SCHEMA shop TO LATEST ON shop_prod', 'app', 'BY $admin');
 
                 const aliases = new TestAliasContext(new Map([[admin.keyId, 'admin']]));
-                const loaders = dumpLoaders(ctx);
                 const dump = await dumpDatabase(db, {
-                    ...loaders,
+                    ...dumpLoaders(env),
                     mode: 'full',
                     render: {
                         aliasMode: true,
@@ -761,17 +700,18 @@ export const restPhaseTests = {
                 assertTrue(!dump.includes(`BY #${admin.keyId}`), 'dump omits raw BY key hash');
                 assertTrue(dump.includes(' AT {') && dump.includes('_ver'), 'dump uses version alias names in AT');
                 assertTrue(!/ AT \{#[A-Za-z0-9+/=]+/.test(dump), 'dump AT clauses omit raw version hashes');
-                assertTrue(dump.includes(`BIND users => #${usersGroup.getId()}`), 'BIND RHS still uses hash');
-                assertTrue(dump.includes('ADD SCHEMA shop TO app'), 'ADD SCHEMA uses schema alias name');
-                assertTrue(dump.includes('ADD TABLEGROUP shop_prod TO app'), 'ADD TABLEGROUP uses group alias name');
+                assertTrue(dump.includes('BIND users => users'), 'BIND names the catalog definition');
+                assertTrue(dump.includes(`\\alias catalog shop_catalog #${catalog.getId()}`), 'the catalog is aliased');
+                assertTrue(dump.includes('USING CATALOG shop_catalog AT {shop_catalog_ver'), 'the release selection uses a version alias');
+                assertTrue(dump.includes('USING SCHEMA shop AT {shop_ver'), 'catalog pins use the schema alias');
             },
         },
         {
             name: '[REST12] precise column types: render round-trip, canonical value fidelity, bind-time reject',
             invoke: async () => {
-                const { ctx, lang } = await createEnv();
+                const { env, lang } = await createEnv();
 
-                const schemaPlan = await execute(await parseBind(`
+                await env.run(`
                     CREATE SCHEMA finance CREATORS ($admin) AS (
                       TABLE ledger (
                         seq bigint PUB READONLY,
@@ -780,11 +720,8 @@ export const restPhaseTests = {
                         qty integer MIN 0 MAX 100
                       ) ALLOW all IF true
                     );
-                `, lang));
-                assertTrue(schemaPlan.ok && schemaPlan.value.kind === 'create-plan', 'precise schema create plan succeeds');
-                if (!schemaPlan.ok || schemaPlan.value.kind !== 'create-plan') return;
-                const schema = await ctx.createObject(schemaPlan.value.plan.payload) as RSchemaImpl;
-                lang.registerSchema('finance', schema);
+                `);
+                const schema = await env.schema('finance');
 
                 // reverse render preserves type parameters and MIN/MAX modifiers, and re-parses
                 const rendered = renderCreateSchema(schema.createOp);
@@ -795,11 +732,10 @@ export const restPhaseTests = {
                     'rendered keeps MIN/MAX modifiers');
                 assertTrue(parseStatement(rendered).ok, 'rendered precise schema re-parses');
 
-                const groupPlan = await execute(await parseBind('CREATE TABLEGROUP fin_prod USING SCHEMA finance;', lang));
-                assertTrue(groupPlan.ok && groupPlan.value.kind === 'create-plan', 'finance group create plan succeeds');
-                if (!groupPlan.ok || groupPlan.value.kind !== 'create-plan') return;
-                const group = await ctx.createObject(groupPlan.value.plan.payload) as RTableGroupImpl;
-                lang.registerGroup('fin_prod', group);
+                await env.run(`
+                    CREATE CATALOG fin VERSION '1.0.0' AS (TABLEGROUP fin_prod USING SCHEMA finance);
+                    CREATE DATABASE fin_db USING CATALOG fin;
+                `);
 
                 // canonical string carriers survive a full insert -> select round-trip exactly
                 const insert = await execute(await parseBind(
@@ -854,26 +790,19 @@ export const restPhaseTests = {
         {
             name: '[REST13] JSON literals: insert/update json objects, dumped row ops re-parse and bind to the same values',
             invoke: async () => {
-                const { ctx, lang } = await createEnv();
+                const { env, lang } = await createEnv();
 
-                const schemaPlan = await execute(await parseBind(`
+                await env.run(`
                     CREATE SCHEMA docs CREATORS ($admin) AS (
                       TABLE notes (
                         slug string PUB READONLY,
                         body json DEFAULT JSON '{"tags":[],"v":0}'
                       ) ALLOW all IF true
                     );
-                `, lang));
-                assertTrue(schemaPlan.ok && schemaPlan.value.kind === 'create-plan', 'json schema create plan succeeds');
-                if (!schemaPlan.ok || schemaPlan.value.kind !== 'create-plan') return;
-                const schema = await ctx.createObject(schemaPlan.value.plan.payload) as RSchemaImpl;
-                lang.registerSchema('docs', schema);
-
-                const groupPlan = await execute(await parseBind('CREATE TABLEGROUP docs_prod USING SCHEMA docs;', lang));
-                assertTrue(groupPlan.ok && groupPlan.value.kind === 'create-plan', 'json group create plan succeeds');
-                if (!groupPlan.ok || groupPlan.value.kind !== 'create-plan') return;
-                const group = await ctx.createObject(groupPlan.value.plan.payload) as RTableGroupImpl;
-                lang.registerGroup('docs_prod', group);
+                    CREATE CATALOG docs_catalog VERSION '1.0.0' AS (TABLEGROUP docs_prod USING SCHEMA docs);
+                    CREATE DATABASE docs_db USING CATALOG docs_catalog;
+                `);
+                const group = await env.group('docs_prod');
 
                 const inserted: json.Literal = { tags: ["it's", 'a"b', 'back\\slash', 'line\nbreak\ttab'], seq: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] };
                 const updated: json.Literal = [{ k: 'v' }, 'x', -2.5, true];
@@ -897,7 +826,9 @@ export const restPhaseTests = {
                 assertEquals(canon(await readBody()), canon(updated), 'updated json array reads back exactly');
 
                 const dump = await dumpGroup(group, { render: { profile: 'full' } });
-                const statements = splitStatements(dump);
+                // The group genesis is a comment line, which the splitter keeps
+                // at the head of the statement that follows it.
+                const statements = splitStatements(dump).map((s) => s.replace(/^(\s*--[^\n]*\n)+/, ''));
                 const rowOps = statements.filter((s) => /^\s*(INSERT|UPDATE) /.test(s) && s.includes('body'));
                 assertEquals(rowOps.length, 2, 'dump holds the insert and update row ops');
                 assertTrue(rowOps.every((s) => s.includes("body") && s.includes("JSON '")), 'dumped json values use JSON literals');

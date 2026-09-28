@@ -1,6 +1,6 @@
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { RSchemaDelta, RTableGroup, RTableGroupDelta, RTableGroupDeltaStrategy } from "@hyper-hyper-space/hhs3_rdb";
-import { resolveVersionRef, type RootResolveContext } from "@hyper-hyper-space/hhs3_rdb_runtime";
+import { resolveVersionRef, rootCtx, type RootResolveContext } from "@hyper-hyper-space/hhs3_rdb_runtime";
 import type { ReplSession } from "../session.js";
 import { formatDelta } from "../format/delta.js";
 import type { GroupDeltaPayload, SchemaDeltaPayload } from "./payload.js";
@@ -16,7 +16,7 @@ export async function runDeltaCommand(session: ReplSession, args: string[]): Pro
     if (kind === 'schema' && strategyText !== undefined) {
         throw new Error('Delta strategy applies to groups only (bounded|full)');
     }
-    const ctx: RootResolveContext = { aliases: session.aliases };
+    const ctx: RootResolveContext = rootCtx(session);
     if (kind === 'schema') {
         const resolved = await session.workspace.roots.resolveSchema(ref(name), ctx);
         if (resolved.schema === undefined) throw new Error('Schema is not loaded');

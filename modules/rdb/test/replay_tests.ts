@@ -237,8 +237,10 @@ export const replayTests = {
                 const schemaVersion = await frontierOf(schema);
                 const at = await frontierOf(app);
 
-                const explicit = await signPayload(
-                    createRefAdvancePayload(schema.getId(), schemaVersion) as unknown as json.LiteralMap, alice, at, []);
+                const explicit = await signPayload({
+                    ...(createRefAdvancePayload(schema.getId(), schemaVersion) as unknown as json.LiteralMap),
+                    gate: json.toSet(await app.computeGateHashes(schemaVersion)),
+                }, alice, at, []);
                 assertTrue((await app.validatePayload(explicit, at)).valid,
                     'a deploy signed with an explicit empty scope validates at its own position');
 

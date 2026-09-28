@@ -4,13 +4,13 @@ Reactive **supervisor** that keeps a replica-wide relational projection of an [R
 
 ## What it does
 
-An `RDb` already names a set of member table groups, so it is the natural unit of projection. `RdbProjection.open(rdb, ctx, target, { writer })` resolves the members into **one shared target** and:
+An `RDb`'s member table groups are computed from the catalog releases deployed into it, so it is the natural unit of projection. `RdbProjection.open(rdb, ctx, target, { writer })` resolves the members the replica holds into **one shared target** and:
 
-- **materializes** every member with group-qualified table names (`<group>_<table>`, so tables from different groups never collide);
+- **materializes** every member with group-qualified table names (`<group>_<table>`, where `<group>` is the member name from `rdb.getMemberGroupNames()`: an identifier, unique within the database, so tables from different groups never collide);
 - **resolves cross-group FKs to serial ids** when the referenced group is co-projected (otherwise a `row_hash` passthrough);
 - **ingests local edits in commit order**, advancing co-projected cross-group refs on demand so an observer's cross-group FKs and `exists` reads validate against sibling groups ingested in the same pass; `fkBundling` (a per-member option, default on) bundles consecutive FK-linked inserts atomically;
 - **interns authors and identity keys** into a shared `rdb_keys` table as `author_key_id` / `<col>_key_id` (`registerKey` / `keyHashForId` / `publicKeyForId` on the projection);
-- **stays in sync reactively** — a debounced, coalesced `syncDatabase` fires on three triggers: each member group's `subscribe` (the rdb side advanced), the target's optional `ChangeSignalSource` (local edits are waiting), and the `RDb`'s own `subscribe` (membership changed). An explicit `sync()` and a `nudge()` fallback are also provided.
+- **stays in sync reactively** — a debounced, coalesced `syncDatabase` fires on three triggers: each member group's `subscribe` (the rdb side advanced), the target's optional `ChangeSignalSource` (local edits are waiting), and the `RDb`'s own `subscribe` (a release was deployed, possibly adding members). An explicit `sync()` and a `nudge()` fallback are also provided.
 - **exposes the op-event log** as inspect (`opEvents({ afterId, beforeId, limit, order })`) plus live subscribe (`subscribeOpEvents` / `onOpEvents`). Subscribe does not replay history.
 - **maintains projection-local indexes** declared in an index spec, installed with `reconcileIndexes` (below).
 
@@ -20,7 +20,7 @@ An `RDb` already names a set of member table groups, so it is the natural unit o
 
 - Each declaration names its rdb group (`group.getName()`) and is built on that group's group-qualified table (`<group>_<table>`), so the same index name can be used in two groups without colliding.
 - A cross-group foreign key column resolves to its `<col>_id` companion when the referenced group is co-projected, and to `<col>_row_hash` otherwise.
-- A declaration for a group that is not (yet) a member of the `RDb` is reported in `report.pending`. When the group joins, its initial projection builds it from the installed spec; no second reconcile is needed.
+- A declaration for a group that is not (yet) a member of the `RDb` is reported in `report.pending`. When the group joins (a deployed release adds it), its initial projection builds it from the installed spec; no second reconcile is needed.
 - `open()` takes no spec. Call `reconcileIndexes` right after `open()` as part of the app's update; it holds the database lock, so it never interleaves with a sync cycle. After that, every sync keeps the indexes current across remote schema changes.
 
 ```typescript
@@ -37,7 +37,7 @@ Known limits (detailed in [rdb_adapter](../rdb_adapter#known-limits)):
 
 ## Layout
 
-- `scope.ts` — resolve members → `GroupProjection`s (group-qualified names + a cross-group resolver).
+- `scope.ts` — resolve members → `GroupProjection`s (member-name-qualified tables + a cross-group resolver).
 - `projection.ts` — `RdbProjection` lifecycle: `open` / `sync` / `nudge` / `status` / `reconcileIndexes` / `stop` (waits for in-flight sync, then `target.close()` if the target implements it).
 
 ## Test

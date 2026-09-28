@@ -20,6 +20,8 @@ import { Replica, MemDagBackend } from "@hyper-hyper-space/hhs3_replica";
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
 import { RTableGroupImpl, rTableGroupFactory } from "../src/rtable_group/group.js";
 import { RDbImpl, rDbFactory } from "../src/rdb/rdb.js";
+import { RCatalogImpl, rCatalogFactory } from "../src/rcatalog/rcatalog.js";
+import { RDeployGateImpl, rDeployGateFactory } from "../src/rdeploy_gate/rdeploy_gate.js";
 import type { TableDef } from "../src/rschema/payload.js";
 
 export const crypto = createBasicCrypto();
@@ -43,7 +45,9 @@ export async function waitUntil(predicate: () => Promise<boolean>, intervalMs = 
 
 export function registerRdbTypes(replica: Replica): void {
     replica.registerType(RSchemaImpl.typeId, rSchemaFactory);
+    replica.registerType(RCatalogImpl.typeId, rCatalogFactory);
     replica.registerType(RTableGroupImpl.typeId, rTableGroupFactory);
+    replica.registerType(RDeployGateImpl.typeId, rDeployGateFactory);
     replica.registerType(RDbImpl.typeId, rDbFactory);
 }
 

@@ -1,14 +1,20 @@
 import { assertTrue, assertFalse, assertEquals } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
-import { version, Version } from "@hyper-hyper-space/hhs3_mvt";
+import { json } from "@hyper-hyper-space/hhs3_json";
+import {
+    version, Version, RContext, createRefAdvancePayload, signPayload, serializePublicKeyToBase64,
+    formatValidationFailure, ValidationRejectedError,
+} from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
 import { RTableGroupImpl, rTableGroupFactory } from "../src/rtable_group/group.js";
 import { deriveRowId } from "../src/rtable/hash.js";
-import type { TableDef } from "../src/rschema/payload.js";
+import type { TableDef, Predicate, SchemaCreator } from "../src/rschema/payload.js";
 import type { RTableView } from "../src/rtable/interfaces.js";
+import { computeMirrorHashes, deployGateId } from "../src/rdeploy_gate/mirror.js";
+import { usersSchemaTables, IDENTITIES_TABLE, identityRow } from "../src/users/users.js";
 
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
@@ -66,6 +72,60 @@ async function schemaFrontier(schema: RSchemaImpl): Promise<Version> {
 // [ENF] helper, which reads at (at, at): barrier revision needs from != at.
 async function viewAt(group: RTableGroupImpl, name: string, at: Version, from: Version): Promise<RTableView> {
     return (await group.getView(at, from)).getTableView(name);
+}
+
+function keyOf(identity: OwnIdentity): SchemaCreator {
+    return { keyId: identity.keyId, publicKey: serializePublicKeyToBase64(identity.publicKey) };
+}
+
+function authorIs(...identities: OwnIdentity[]): Predicate {
+    const terms: Predicate[] = identities.map((i) => ({ p: 'cmp', cmp: 'eq', left: { lit: '$author' }, right: { lit: i.keyId } }));
+    return terms.length === 1 ? terms[0] : { p: 'or', args: terms };
+}
+
+// A group over `tables` with an explicit deploy authority configuration.
+async function createAuthEnv(tables: TableDef[], group: {
+    canDeploy?: Predicate;
+    deployKeys?: SchemaCreator[];
+    idProvider?: string;
+    initialRows?: { [t: string]: json.Literal[] };
+}, admin: OwnIdentity, ctx: RContext = newCtx()) {
+    const schema = (await ctx.createObject(await RSchemaImpl.create({
+        name: 'deploy:auth_schema',
+        creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
+        tables,
+    }))) as RSchemaImpl;
+    const pinned = await schemaFrontier(schema);
+    const init = await RTableGroupImpl.create({
+        name: 'deploy-auth-group', seed: 'deploy-auth-group',
+        schemaRef: schema.getId(), schemaVersion: pinned,
+        ...group,
+    });
+    return { ctx, schema, init, pinned };
+}
+
+function newCtx(): RContext {
+    const ctx = createMockRContext({ selfValidate: true });
+    ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
+    ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
+    return ctx;
+}
+
+async function failureOf(fn: () => Promise<unknown>): Promise<string | undefined> {
+    try {
+        await fn();
+        return undefined;
+    } catch (e) {
+        return e instanceof ValidationRejectedError ? formatValidationFailure(e.why) : (e as Error).message;
+    }
+}
+
+// A deploy payload built by hand (gate hashes included), signed by `signer`.
+async function signedDeploy(group: RTableGroupImpl, schema: RSchemaImpl, v: Version, signer: OwnIdentity, at: Version) {
+    return signPayload({
+        ...(createRefAdvancePayload(schema.getId(), v) as unknown as json.LiteralMap),
+        gate: json.toSet(await group.computeGateHashes(v)),
+    }, signer, at);
 }
 
 export const rtableDeployTests = {
@@ -323,6 +383,128 @@ export const rtableDeployTests = {
                 const merged = await groupFrontier(group);
                 assertTrue(await (await viewAt(group, 'lines', merged, merged)).hasRow(lineId),
                     'a row that honored the new FK at the deploy stays live afterwards');
+            }
+        },
+        {
+            name: '[DEPLOY09] a deploy carries its gate hashes, depends on them, and a wrong gate is rejected',
+            invoke: async () => {
+                const { ctx, group, schema, admin } = await createEnv([open('items', { name: { type: 'string' } })]);
+                await schema.updateSchema([{ rule: 'add-column', table: 'items', column: 'size', def: { type: 'integer', nullable: true } }], admin);
+                const v2 = await schemaFrontier(schema);
+
+                assertEquals(group.getDeployGateId(), deployGateId(group.getId(), schema.getId()), 'the gate id derives from the group and schema');
+                assertTrue(await ctx.getObject(group.getDeployGateId()) === undefined, 'no gate exists on this replica');
+
+                const expected = await computeMirrorHashes(await schema.getScopedDag(), group.getDeployGateId(), v2);
+                const at = await groupFrontier(group);
+                const h = await group.deploy(v2, undefined, at);
+                const stored = (await (await group.getScopedDag()).loadEntry(h))!.payload as json.LiteralMap;
+                assertEquals([...json.fromSet(stored['gate'] as json.Set)].sort().join(','), expected.join(','),
+                    'the deploy carries the mirrors of its version');
+                assertTrue((await group.getView()).getSchemaView().getTable('items')!.columns['size'] !== undefined,
+                    'a local deploy applies without any gate');
+
+                const deps = group.extractForeignDeps(stored, at)!;
+                assertEquals(deps.length, 2, 'a deploy depends on its schema and its gate');
+                assertEquals(deps[0].objectId, schema.getId(), 'the schema dep comes first');
+                assertEquals(deps[1].objectId, group.getDeployGateId(), 'the gate dep names the gate');
+                assertEquals(deps[1].requiredHashes.sort().join(','), expected.join(','), 'the gate dep requires the mirrors');
+
+                const wrong = { ...stored, gate: json.toSet([group.getDeployGateId()]) };
+                assertFalse((await group.validatePayload(wrong, at)).valid, 'a gate that does not mirror the version is rejected');
+                const missing = { ...stored };
+                delete missing['gate'];
+                assertFalse((await group.validatePayload(missing, at)).valid, 'a deploy without gate hashes is rejected');
+                assertTrue((await group.validatePayload(stored, at)).valid, 'the original deploy validates at its position');
+            }
+        },
+        {
+            name: '[DEPLOY10] embedded deploy keys verify deploy signatures without a provider',
+            invoke: async () => {
+                const admin = await makeIdentity();
+                const stranger = await makeIdentity();
+                const { ctx, schema, init } = await createAuthEnv([open('items', { name: { type: 'string' } })],
+                    { canDeploy: authorIs(admin), deployKeys: [keyOf(admin)] }, admin);
+                const group = (await ctx.createObject(init)) as RTableGroupImpl;
+
+                await schema.updateSchema([{ rule: 'add-column', table: 'items', column: 'x', def: { type: 'string', nullable: true } }], admin);
+                const v2 = await schemaFrontier(schema);
+                const at = await groupFrontier(group);
+
+                const byStranger = await failureOf(() => group.deploy(v2, stranger, at));
+                assertTrue(byStranger?.includes('could not be verified') ?? false, `an unlisted key is rejected at the signature, got: ${byStranger}`);
+
+                const forged = { ...(await signedDeploy(group, schema, v2, stranger, at)), author: admin.keyId };
+                assertFalse((await group.validatePayload(forged, at)).valid, "a stranger's signature claiming the admin is rejected");
+
+                const tampered = { ...(await signedDeploy(group, schema, v2, admin, at)), note: 'added after signing' };
+                const tamperedResult = await group.validatePayload(tampered, at);
+                assertFalse(tamperedResult.valid, 'a tampered deploy is rejected');
+                assertTrue(!tamperedResult.valid && formatValidationFailure(tamperedResult.why).includes('could not be verified'),
+                    'the tampered deploy fails its signature');
+
+                await group.deploy(v2, admin, at);
+                assertTrue((await group.getView()).getSchemaView().getTable('items')!.columns['x'] !== undefined,
+                    'the listed admin deploys');
+            }
+        },
+        {
+            name: '[DEPLOY11] deploy keys resolve through the provider, then the embedded keys',
+            invoke: async () => {
+                const viaProvider = await makeIdentity();
+                const viaKeys = await makeIdentity();
+                const neither = await makeIdentity();
+                const { ctx, schema, init } = await createAuthEnv(
+                    [...usersSchemaTables(), open('items', { name: { type: 'string' } })],
+                    {
+                        idProvider: IDENTITIES_TABLE,
+                        canDeploy: authorIs(viaProvider, viaKeys, neither),
+                        deployKeys: [keyOf(viaKeys)],
+                        initialRows: { [IDENTITIES_TABLE]: [identityRow('provider-key', viaProvider)] },
+                    }, viaProvider);
+                const group = (await ctx.createObject(init)) as RTableGroupImpl;
+
+                await schema.updateSchema([{ rule: 'add-column', table: 'items', column: 'a', def: { type: 'string', nullable: true } }], viaProvider);
+                const v2 = await schemaFrontier(schema);
+                await group.deploy(v2, viaProvider);
+
+                await schema.updateSchema([{ rule: 'add-column', table: 'items', column: 'b', def: { type: 'string', nullable: true } }], viaProvider);
+                const v3 = await schemaFrontier(schema);
+                await group.deploy(v3, viaKeys);
+
+                await schema.updateSchema([{ rule: 'add-column', table: 'items', column: 'c', def: { type: 'string', nullable: true } }], viaProvider);
+                const v4 = await schemaFrontier(schema);
+                const byNeither = await failureOf(() => group.deploy(v4, neither));
+                assertTrue(byNeither?.includes('could not be verified') ?? false,
+                    `a key in neither source is rejected even when canDeploy names it, got: ${byNeither}`);
+
+                const columns = (await group.getView()).getSchemaView().getTable('items')!.columns;
+                assertTrue(columns['a'] !== undefined && columns['b'] !== undefined && columns['c'] === undefined,
+                    'the provider key and the embedded key both deployed');
+            }
+        },
+        {
+            name: '[DEPLOY12] a canDeploy over $author needs a key source at create',
+            invoke: async () => {
+                const admin = await makeIdentity();
+                const tables = [open('items', { name: { type: 'string' } })];
+
+                const bare = await createAuthEnv(tables, { canDeploy: authorIs(admin) }, admin);
+                const bareFailure = await failureOf(() => bare.ctx.createObject(bare.init));
+                assertTrue(bareFailure?.includes('requires an idProvider or deployKeys') ?? false,
+                    `a $author predicate without a key source is rejected, got: ${bareFailure}`);
+
+                const frozen = await createAuthEnv(tables, { canDeploy: { p: 'false' } }, admin);
+                assertTrue(await failureOf(() => frozen.ctx.createObject(frozen.init)) === undefined,
+                    'a predicate that does not read $author needs no key source');
+
+                const badKey = await createAuthEnv(tables, {
+                    canDeploy: authorIs(admin),
+                    deployKeys: [{ keyId: 'not-the-key-id', publicKey: keyOf(admin).publicKey }],
+                }, admin);
+                const badKeyFailure = await failureOf(() => badKey.ctx.createObject(badKey.init));
+                assertTrue(badKeyFailure?.includes('does not match its public key') ?? false,
+                    `deploy keys must be self-certifying, got: ${badKeyFailure}`);
             }
         },
     ],

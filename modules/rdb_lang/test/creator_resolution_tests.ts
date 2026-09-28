@@ -8,6 +8,7 @@ import { bind } from "../src/bind/bind.js";
 import { compileCreate } from "../src/compile/create.js";
 import { parseStatement } from "../src/syntax/parser.js";
 import { createTestBindContext } from "./mock_bind_context.js";
+import { createLangEnv } from "./lang_env.js";
 
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
@@ -131,15 +132,35 @@ export const creatorResolutionTests = {
         {
             name: '[CREATORS06] CREATE DATABASE CREATORS ($admin) binds with identity variable',
             invoke: async () => {
-                const ctx = createMockRContext();
                 const admin = await createIdentity(SIGNING_ED25519, hashSuite);
-                const lang = createTestBindContext(ctx, { admin, me: admin });
-                const bound = await bindCreateDatabase('CREATE DATABASE app CREATORS ($admin);', lang);
+                const env = await createLangEnv({ vars: { admin, me: admin } });
+                await env.run(`CREATE SCHEMA s CREATORS ($admin) AS (${schemaBody});
+                    CREATE CATALOG c VERSION '1.0.0' AS (TABLEGROUP g USING SCHEMA s);`);
+                const bound = await bindCreateDatabase('CREATE DATABASE app USING CATALOG c CREATORS ($admin);', env.lang);
                 const plan = await compileCreate(bound);
                 assertEquals(plan.kind, 'create-database', 'create plan kind');
                 if (plan.kind !== 'create-database') return;
                 assertEquals(plan.payload.creators![0].keyId, admin.keyId, 'creator keyId');
                 assertEquals(plan.payload.creators![0].publicKey, serializePublicKeyToBase64(admin.publicKey), 'creator publicKey');
+                assertEquals(plan.payload.catalog, (await env.catalog('c')).getId(), 'the database names its catalog');
+            },
+        },
+        {
+            name: '[CREATORS08] CREATE CATALOG defaults CREATORS to its author, who must be one of them',
+            invoke: async () => {
+                const dev = await createIdentity(SIGNING_ED25519, hashSuite);
+                const other = await createIdentity(SIGNING_ED25519, hashSuite);
+                const env = await createLangEnv({ vars: { dev, other, me: dev } });
+                await env.run(`CREATE SCHEMA s CREATORS ($dev) AS (${schemaBody});
+                    CREATE CATALOG c VERSION '1.0.0' AS (TABLEGROUP g USING SCHEMA s);`);
+                assertEquals(JSON.stringify((await env.catalog('c')).getCreators().map((c) => c.keyId)), JSON.stringify([dev.keyId]),
+                    'the author is the default creator');
+
+                const b64 = serializePublicKeyToBase64(other.publicKey);
+                const message = await env.fail(`CREATE CATALOG c2 CREATORS (publicKey('${b64}')) VERSION '1.0.0' AS (TABLEGROUP g USING SCHEMA s) BY $dev;`);
+                assertTrue(message.includes('must be one of its CREATORS'), message);
+                const unsigned = await env.fail(`CREATE CATALOG c3 VERSION '1.0.0' AS (TABLEGROUP g USING SCHEMA s) BY NOBODY;`);
+                assertTrue(unsigned.includes('requires an author'), unsigned);
             },
         },
         {

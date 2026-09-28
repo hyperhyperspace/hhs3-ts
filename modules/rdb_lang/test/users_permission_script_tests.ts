@@ -2,59 +2,40 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
-import { createBasicCrypto, createIdentity, HASH_SHA256, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
-import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
-import { version, Version } from "@hyper-hyper-space/hhs3_mvt";
-import type { RContext, RObject } from "@hyper-hyper-space/hhs3_mvt";
-import {
-    RDbImpl, rDbFactory, RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory,
-} from "@hyper-hyper-space/hhs3_rdb";
+import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
+import type { RObject, Version } from "@hyper-hyper-space/hhs3_mvt";
+import type { RTableGroupImpl } from "@hyper-hyper-space/hhs3_rdb";
 
-import { createMockRContext } from "../../rdb/test/mock_rcontext.js";
-import { bind } from "../src/bind/bind.js";
-import type { LangExecutionResult, LangValue, VersionScope } from "../src/index.js";
-import { execute } from "../src/exec/execute.js";
-import { parseScript } from "../src/syntax/parser.js";
-import type { VersionExpr } from "../src/syntax/ast.js";
-import { createTestBindContext, TestBindContext } from "./mock_bind_context.js";
+import type { LangExecutionResult } from "../src/index.js";
+import { createLangEnv, LangEnv, newIdentity } from "./lang_env.js";
 
-const crypto = createBasicCrypto();
-const hashSuite = crypto.hash(HASH_SHA256);
 const SCRIPT_DIR = resolve("test/scripts/users_permissions");
 
-type Vars = { [name: string]: LangValue };
-
-type ScriptEnv = {
-    ctx: RContext;
-    lang: TestBindContext;
-    vars: Vars;
+type ScriptEnv = LangEnv & {
     admin: OwnIdentity;
     alice: OwnIdentity;
 };
 
 async function createEnv(): Promise<ScriptEnv> {
-    const ctx = createMockRContext({ selfValidate: true });
-    ctx.getRegistry().register(RDbImpl.typeId, rDbFactory);
-    ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
-    ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
-
-    const admin = await createIdentity(SIGNING_ED25519, hashSuite);
-    const alice = await createIdentity(SIGNING_ED25519, hashSuite);
-    const vars: Vars = {
-        admin,
-        alice,
-        aliceKey: { kind: 'key-id', keyId: alice.keyId },
-        me: admin,
-    };
-    const lang = createTestBindContext(ctx, vars);
-    lang.resolveVersion = async (expr, scope) => resolveVersionExpr(expr, scope);
-    return { ctx, lang, vars, admin, alice };
+    const admin = await newIdentity();
+    const alice = await newIdentity();
+    const env = await createLangEnv({
+        vars: {
+            admin,
+            alice,
+            aliceKey: { kind: 'key-id', keyId: alice.keyId },
+            me: admin,
+        },
+    });
+    return { ...env, admin, alice };
 }
 
+// The schemas, then the app catalog and the database deployed from it.
 async function setupUsersAndDocs(env: ScriptEnv): Promise<void> {
     env.vars['me'] = env.admin;
     await runScriptFile('create_users.sql', env);
     await runScriptFile('create_docs.sql', env);
+    await runScriptFile('create_app.sql', env);
 }
 
 async function setupAliceWriter(env: ScriptEnv): Promise<void> {
@@ -64,75 +45,19 @@ async function setupAliceWriter(env: ScriptEnv): Promise<void> {
 }
 
 async function runScriptFile(name: string, env: ScriptEnv): Promise<LangExecutionResult[]> {
-    const sql = await readFile(resolve(SCRIPT_DIR, name), 'utf8');
-    return runScriptText(sql, env, name);
+    return env.run(await readFile(resolve(SCRIPT_DIR, name), 'utf8'));
 }
 
-async function runScriptText(sql: string, env: ScriptEnv, label: string): Promise<LangExecutionResult[]> {
-    const parsed = parseScript(sql);
-    assertTrue(parsed.ok, `parse should succeed for ${label}`);
-    if (!parsed.ok) throw new Error(parsed.diagnostics.map((d) => d.message).join('\n'));
-
-    const results: LangExecutionResult[] = [];
-    for (const statement of parsed.value.statements) {
-        const bound = await bind(statement, env.lang);
-        assertTrue(bound.ok, `bind should succeed for ${label}`);
-        if (!bound.ok) throw new Error(bound.diagnostics.map((d) => d.message).join('\n'));
-
-        const executed = await execute(bound.value);
-        assertTrue(executed.ok, `execute should succeed for ${label}`);
-        if (!executed.ok) throw new Error(executed.diagnostics.map((d) => d.message).join('\n'));
-
-        const result = executed.value;
-        if (result.kind === 'create-plan') {
-            const object = await env.ctx.createObject(result.plan.payload);
-            if (result.plan.kind === 'create-database') env.lang.registerDatabase(result.plan.name, object as RDbImpl);
-            if (result.plan.kind === 'create-schema') env.lang.registerSchema(result.plan.name, object as RSchemaImpl);
-            if (result.plan.kind === 'create-tablegroup') env.lang.registerGroup(result.plan.name, object as RTableGroupImpl);
-        }
-        results.push(result);
-    }
-    return results;
+async function runScriptText(sql: string, env: ScriptEnv, _label: string): Promise<LangExecutionResult[]> {
+    return env.run(sql);
 }
 
 async function expectScriptFailure(nameOrSql: string, env: ScriptEnv, isFile: boolean): Promise<void> {
-    let failed = false;
-    try {
-        if (isFile) await runScriptFile(nameOrSql, env);
-        else await runScriptText(nameOrSql, env, 'expected failure');
-    } catch (_e) {
-        failed = true;
-    }
-    assertTrue(failed, `${nameOrSql} should fail`);
-}
-
-async function resolveVersionExpr(expr: VersionExpr | undefined, scope: VersionScope): Promise<Version> {
-    if (expr?.kind === 'set') {
-        return version(...expr.members.map((m) => m.kind === 'hash' ? m.prefix : m.text));
-    }
-    if (expr?.kind === 'hash') return version(expr.hash.prefix);
-    return frontierForScope(scope);
-}
-
-async function frontierForScope(scope: VersionScope): Promise<Version> {
-    const object = scope.kind === 'schema'
-        ? scope.schema
-        : scope.kind === 'group'
-            ? scope.group
-            : scope.kind === 'table'
-                ? scope.table
-                : scope.object;
-    if (object === undefined) return version();
-    return (await object.getScopedDag()).getFrontier();
+    await env.fail(isFile ? await readFile(resolve(SCRIPT_DIR, nameOrSql), 'utf8') : nameOrSql);
 }
 
 async function group(env: ScriptEnv, name: string): Promise<RTableGroupImpl> {
-    const resolved = await env.lang.resolveGroup({ kind: 'name', text: name, parts: [name], span: zeroSpan() });
-    return resolved.group as RTableGroupImpl;
-}
-
-function zeroSpan() {
-    return { start: 0, end: 0, line: 1, column: 1 };
+    return env.group(name);
 }
 
 async function frontier(object: RObject & { getScopedDag(): Promise<{ getFrontier(): Promise<Version> }> }): Promise<Version> {
@@ -155,6 +80,7 @@ export const usersPermissionScriptTests = {
                 const docs = await group(env, 'docs_group');
                 assertEquals(users.getIdProvider(), 'identities', 'users group uses local identities');
                 assertEquals(docs.getIdProvider(), 'users.identities', 'docs group uses bound identities');
+                assertEquals(docs.getBindings()['users'], users.getId(), 'the docs binding is the same database\'s users group');
             },
         },
         {
@@ -178,7 +104,7 @@ export const usersPermissionScriptTests = {
             },
         },
         {
-            name: '[USERS_SCRIPT03] schema deploy works on scripted app group',
+            name: '[USERS_SCRIPT03] a released schema change deploys to the scripted app group',
             invoke: async () => {
                 const env = await createEnv();
                 await setupUsersAndDocs(env);
@@ -283,24 +209,37 @@ export const usersPermissionScriptTests = {
                 const env = await createEnv();
                 env.vars['me'] = env.admin;
                 await runScriptFile('create_users.sql', env);
+                await runScriptFile('create_docs.sql', env);
 
                 // a docs group whose `users` observation is gated on a manager
-                // cap (evaluated in the users frame: `caps` is local there)
+                // cap (evaluated in the users frame: `caps` is local there),
+                // next to an ungated one
                 await runScriptText(`
                     CREATE SCHEMA docs_gated_schema CREATORS ($admin) AS (
                       TABLE docs ( body string )
                     );
-                    CREATE TABLEGROUP docs_gated
-                      USING SCHEMA docs_gated_schema
-                      BIND users => users
-                      USING IDENTITIES users.identities
-                      ALLOW UPDATE REF users IF EXISTS caps WHERE label = 'manager' AND grantee = $author;
+                    CREATE CATALOG gated VERSION '1.0.0' AS (
+                      TABLEGROUP users USING SCHEMA users_schema
+                        USING IDENTITIES identities
+                        WITH ROWS (
+                          identities (keyId = $admin, publicKey = publicKey($admin), name = 'Admin'),
+                          caps (label = 'manager', grantee = $admin)
+                        ),
+                      TABLEGROUP docs_gated USING SCHEMA docs_gated_schema
+                        BIND users => users
+                        USING IDENTITIES users.identities
+                        ALLOW UPDATE REF users IF EXISTS caps WHERE label = 'manager' AND grantee = $author,
+                      TABLEGROUP docs_group USING SCHEMA docs_schema
+                        BIND users => users
+                        USING IDENTITIES users.identities
+                    );
+                    CREATE DATABASE gated_db USING CATALOG gated;
                 `, env, 'create gated docs group');
 
                 const gated = await group(env, 'docs_gated');
                 const canObserve = gated.getCanObserve();
                 assertTrue(canObserve !== undefined && canObserve['users'] !== undefined,
-                    'ALLOW UPDATE REF clause compiles into the create payload');
+                    'ALLOW UPDATE REF clause compiles into the instantiated create payload');
 
                 // an explicitly unauthored observation of a gated binding is rejected
                 await expectScriptFailure('UPDATE REF users TO LATEST ON docs_gated BY NOBODY;', env, false);
@@ -311,7 +250,6 @@ export const usersPermissionScriptTests = {
                 assertEquals(results[0].kind, 'update-ref', 'a manager-authored observe of a gated binding executes');
 
                 // BY NOBODY on an UNGATED binding stays allowed (explicit unauthored)
-                await runScriptFile('create_docs.sql', env);
                 const ungated = await runScriptText(
                     'UPDATE REF users TO LATEST ON docs_group BY NOBODY;', env, 'unauthored observe of ungated binding');
                 assertEquals(ungated[0].kind, 'update-ref', 'an ungated binding still observes unauthored');

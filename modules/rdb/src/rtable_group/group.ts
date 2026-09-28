@@ -31,12 +31,18 @@
 //
 //   ref-advance (canonical mvt payload, checked non-strictly)
 //     Advances the group's observed version of a referenced object:
-//       - the RSchema ref: THE SCHEMA DEPLOY MOMENT, as a barrier. When the
+//       - the RSchema ref: THE SCHEMA DEPLOY MOMENT, as a barrier. It carries
+//         `gate`, the RDeployGate mirror hashes of its target version: a
+//         synced deploy depends on them (extractForeignDeps), so a replica
+//         applies it only once its local gate admits the version, while
+//         validation recomputes them from the schema DAG and never reads the
+//         gate. A local deploy never waits on the gate. When the
 //         group declares `canDeploy`, that predicate is derived from the
 //         group's create payload (mandatory) and the op carries
 //         author/signature as extra fields; the deploy signature is verified
-//         at validation (against the group's own provider) and the predicate
-//         is then evaluated against the verified author.
+//         at validation (against the group's own provider, then its embedded
+//         deployKeys) and the predicate is then evaluated against the
+//         verified author.
 //       - a bound foreign group ref: cross-group FK / exists observation,
 //         a barrier advance (see observe). The
 //         dependent resolves `group.table` targets through the foreign group
@@ -53,6 +59,7 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, HASH_SHA256 } from "@hyper-hyper-space/hhs3_crypto";
 import type { OwnIdentity, KeyId, PublicKey, HashSuite } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, position } from "@hyper-hyper-space/hhs3_dag";
+import type { MetaProps } from "@hyper-hyper-space/hhs3_dag";
 
 import {
     Payload, RObjectFactory, RContext, LoadObjectOptions, NestingParent,
@@ -69,8 +76,9 @@ import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 import { signPayload as signPayloadHelper } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchema, RSchemaView } from "../rschema/interfaces.js";
-import type { Predicate } from "../rschema/payload.js";
+import type { Predicate, SchemaCreator } from "../rschema/payload.js";
 import { splitTableRef } from "../rschema/payload.js";
+import { computeMirrorHashes, deployGateId } from "../rdeploy_gate/mirror.js";
 import { RTableImpl } from "../rtable/rtable.js";
 import { deriveTableId } from "../rtable/hash.js";
 import type { RowOpPayload } from "../rtable/payload.js";
@@ -78,7 +86,7 @@ import type { RTableView } from "../rtable/interfaces.js";
 import { RTableViewImpl } from "../rtable/view.js";
 
 import type { RTableGroup as RTableGroupContract, RTableGroupView as RTableGroupViewContract, BundleWrite } from "./interfaces.js";
-import { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload, RTABLE_GROUP_TYPE_ID } from "./payload.js";
+import { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload, RTABLE_GROUP_TYPE_ID, deployGateSetFormat } from "./payload.js";
 import { TableScope, deriveCreateMeta, deriveEnvelopeMeta, deriveBundleMeta } from "./scopes.js";
 import { VoidClosure, freshVoidClosure, VOID_MAX_INFLIGHT } from "./void_closure.js";
 import { validateTableGroupPayload } from "./validate_ops.js";
@@ -164,6 +172,7 @@ export class RTableGroupImpl implements RTableGroupContract {
         canDeploy?: Predicate;
         canObserve?: { [binding: string]: Predicate };
         idProvider?: string;
+        deployKeys?: SchemaCreator[];
         hashAlgorithm?: string;
     }): Promise<CreateTableGroupPayload> => {
 
@@ -181,6 +190,7 @@ export class RTableGroupImpl implements RTableGroupContract {
         if (options.canDeploy !== undefined) createPayload.canDeploy = options.canDeploy;
         if (options.canObserve !== undefined) createPayload.canObserve = options.canObserve;
         if (options.idProvider !== undefined) createPayload.idProvider = options.idProvider;
+        if (options.deployKeys !== undefined && options.deployKeys.length > 0) createPayload.deployKeys = options.deployKeys;
         if (options.hashAlgorithm !== undefined) createPayload.hashAlgorithm = options.hashAlgorithm;
 
         return createPayload;
@@ -256,6 +266,11 @@ export class RTableGroupImpl implements RTableGroupContract {
 
     private deltaStrategy: RTableGroupDeltaStrategy = 'bounded';
 
+    // The gate id and the schema entry -> mirror hash memo: both are fixed by
+    // the group id and its (append-only) schema DAG.
+    private _deployGateId: B64Hash | undefined;
+    private readonly mirrorMemo: Map<B64Hash, B64Hash> = new Map();
+
     constructor(createOpId: B64Hash, createOp: CreateTableGroupPayload, ctx: RContext, backendLabel: string = 'default') {
         this.createOpId = createOpId;
         this.createOp = createOp;
@@ -314,6 +329,24 @@ export class RTableGroupImpl implements RTableGroupContract {
 
     getIdProvider(): string | undefined {
         return this.createOp.idProvider;
+    }
+
+    getDeployKeys(): SchemaCreator[] {
+        return [...(this.createOp.deployKeys ?? [])];
+    }
+
+    // The id of this group's RDeployGate, derived from the group id and its
+    // schema ref (the same on every replica).
+    getDeployGateId(): B64Hash {
+        if (this._deployGateId === undefined) {
+            this._deployGateId = deployGateId(this.createOpId, this.getSchemaRef());
+        }
+        return this._deployGateId;
+    }
+
+    async computeGateHashes(schemaVersion: Version): Promise<B64Hash[]> {
+        const schema = await this.getSchemaObject();
+        return computeMirrorHashes(await schema.getScopedDag(), this.getDeployGateId(), schemaVersion, this.mirrorMemo);
     }
 
     getHashSuite(): HashSuite {
@@ -566,6 +599,21 @@ export class RTableGroupImpl implements RTableGroupContract {
     // deploy signature is verified at validation (the group's own provider) and
     // the group's canDeploy predicate is evaluated against the verified author.
     async deploy(refVersion: Version, author?: OwnIdentity, at?: Version): Promise<B64Hash> {
+        const prepared = await this.prepareDeploy(refVersion, author, at);
+
+        if (this.selfValidate()) {
+            const result = await this.validatePayload(prepared.payload, prepared.at);
+            if (!result.valid) {
+                throw new ValidationRejectedError(formatValidationFailure(result.why), result.why);
+            }
+        }
+
+        return (await this.getScopedDag()).append(prepared.payload, prepared.meta, prepared.at);
+    }
+
+    // The signed deploy payload at `at` (defaults to the frontier), without
+    // appending it: the catalog planner validates it in a dry run first.
+    async prepareDeploy(refVersion: Version, author?: OwnIdentity, at?: Version): Promise<{ payload: json.LiteralMap; meta: MetaProps; at: Version }> {
         const scopedDag = await this.getScopedDag();
         at = at ?? await scopedDag.getFrontier();
 
@@ -573,19 +621,16 @@ export class RTableGroupImpl implements RTableGroupContract {
             throw new Error("deploy must be authored when the group declares canDeploy");
         }
 
-        const { payload: base, meta } = prepareRefAdvance(this.getSchemaRef(), refVersion);
+        const { payload: refAdvance, meta } = prepareRefAdvance(this.getSchemaRef(), refVersion);
+        const base: json.LiteralMap = {
+            ...(refAdvance as unknown as json.LiteralMap),
+            gate: json.toSet(await this.computeGateHashes(refVersion)),
+        };
         const payload = author !== undefined
-            ? await signPayloadHelper(base as unknown as json.LiteralMap, author, at)
-            : base as unknown as json.LiteralMap;
+            ? await signPayloadHelper(base, author, at)
+            : base;
 
-        if (this.selfValidate()) {
-            const result = await this.validatePayload(payload, at);
-            if (!result.valid) {
-                throw new ValidationRejectedError(formatValidationFailure(result.why), result.why);
-            }
-        }
-
-        return scopedDag.append(payload, meta, at);
+        return { payload, meta, at };
     }
 
     // Observe a bound foreign group at `refVersion`: a BARRIER ref-advance of
@@ -956,10 +1001,19 @@ export class RTableGroupImpl implements RTableGroupContract {
     extractForeignDeps(payload: Payload, _at: Version): ForeignDep[] | undefined {
         if (isRefAdvancePayload(payload)) {
             const refPayload = payload as unknown as RefAdvancePayload;
-            return [{
+            const deps: ForeignDep[] = [{
                 objectId: refPayload.refId,
                 requiredHashes: [...extractRefVersion(refPayload)],
             }];
+            // A schema deploy also waits for this replica's gate to admit its
+            // version. The hashes come from the payload; validation checks
+            // they mirror the version. A malformed gate adds no dep (and
+            // fails validation).
+            const gate = (payload as json.LiteralMap)['gate'];
+            if (refPayload.refId === this.getSchemaRef() && gate !== undefined && json.checkFormat(deployGateSetFormat, gate)) {
+                deps.push({ objectId: this.getDeployGateId(), requiredHashes: [...json.fromSet(gate as json.Set)] });
+            }
+            return deps;
         }
 
         // 'create' is never seen here: validatePayload rejects a create on an

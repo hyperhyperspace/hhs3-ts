@@ -307,36 +307,35 @@ async function testGroupRefAdvance() {
 // RDb payloads
 
 async function testRDbPayloads() {
-    assertTrue(validateRDbPayloadFormat({ action: 'create', type: RDB_TYPE_ID, seed: 'seed-1', name: 'mydb' }),
-        'well-formed rdb create should validate');
+    const create = { action: 'create', type: RDB_TYPE_ID, seed: 'seed-1', name: 'mydb', catalog: 'catalogId', release: 'releaseId' };
+    assertTrue(validateRDbPayloadFormat(create), 'well-formed rdb create should validate');
     assertTrue(validateRDbPayloadFormat({
-        action: 'create', type: RDB_TYPE_ID, seed: 'seed-1', name: 'mydb',
+        ...create,
         creators: [{ keyId: 'alice', publicKey: 'pem...' }],
-    }),
-        'rdb create with creators should validate');
-    assertFalse(validateRDbPayloadFormat({ action: 'create', seed: 'seed-1', name: 'mydb' }),
+        params: { admin: { identity: { keyId: 'alice', publicKey: 'pem...' } }, limit: { value: 3 } },
+    }), 'rdb create with creators and params should validate');
+    assertFalse(validateRDbPayloadFormat({ action: 'create', seed: 'seed-1', catalog: 'c', release: 'r' }),
         'rdb create without type should not validate');
+    assertFalse(validateRDbPayloadFormat({ action: 'create', type: RDB_TYPE_ID, seed: 'seed-1' }),
+        'rdb create without a catalog should not validate');
+    assertFalse(validateRDbPayloadFormat({ ...create, params: { 'not a name': { value: 1 } } }),
+        'a param name must be an identifier');
+    assertFalse(validateRDbPayloadFormat({ ...create, params: { admin: { keyId: 'alice' } } } as json.Literal),
+        'a param value is an identity or a literal');
 
-    assertTrue(validateRDbPayloadFormat({ action: 'add-schema', schemaId: 'schemaObjectId', note: 'the shop schema' }),
-        'well-formed add-schema should validate');
-    assertTrue(validateRDbPayloadFormat({
-        action: 'add-schema', schemaId: 'schemaObjectId', author: 'alice', signature: 'sig',
-    }),
-        'add-schema with author/signature should validate');
-    assertTrue(validateRDbPayloadFormat({ action: 'add-schema', schemaId: 'schemaObjectId' }),
-        'add-schema without note should validate');
-    assertTrue(validateRDbPayloadFormat({ action: 'add-schema', schemaId: 'schemaObjectId', note: '2 free-form! text' }),
-        'note is free-form: any bounded string validates (it is never resolved)');
-    assertFalse(validateRDbPayloadFormat({ action: 'add-schema', schemaId: 'schemaObjectId', note: 7 } as json.Literal),
-        'add-schema with a non-string note should not validate');
+    const update = { action: 'update-catalog', catalog: 'catalogId', release: 'releaseId' };
+    assertTrue(validateRDbPayloadFormat(update), 'well-formed update-catalog should validate');
+    assertTrue(validateRDbPayloadFormat({ ...update, note: 'free-form! text', author: 'alice', signature: 'sig' }),
+        'update-catalog with note and signature should validate');
+    assertFalse(validateRDbPayloadFormat({ action: 'update-catalog', catalog: 'catalogId' } as json.Literal),
+        'update-catalog without a release should not validate');
+    assertFalse(validateRDbPayloadFormat({ ...update, note: 7 } as json.Literal),
+        'update-catalog with a non-string note should not validate');
 
-    assertTrue(validateRDbPayloadFormat({ action: 'add-group', groupId: 'groupObjectId', note: 'main deployment' }),
-        'well-formed add-group should validate');
-    assertFalse(validateRDbPayloadFormat({ action: 'add-group' } as json.Literal),
-        'add-group without groupId should not validate');
-
-    assertFalse(validateRDbPayloadFormat({ action: 'register-schema', name: 'shop', schemaId: 'x' }),
-        'dropped catalog actions should not validate');
+    assertFalse(validateRDbPayloadFormat({ action: 'add-schema', schemaId: 'schemaObjectId' }),
+        'removed membership actions should not validate');
+    assertFalse(validateRDbPayloadFormat({ action: 'add-group', groupId: 'groupObjectId' }),
+        'removed membership actions should not validate');
     assertFalse(validateRDbPayloadFormat({ action: 'nope' }), 'unknown action should not validate');
 }
 

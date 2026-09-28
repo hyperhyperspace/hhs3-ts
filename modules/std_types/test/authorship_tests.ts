@@ -145,23 +145,23 @@ export const authorshipTests = {
             }
         },
         {
-            name: '[AUTH09] Empty insertion point is rejected',
+            name: '[AUTH09] A genesis signature is bound to the empty position',
             invoke: async () => {
                 const alice = await makeIdentity();
-                const payload = { action: 'test', data: 'hello' } as json.LiteralMap;
+                const payload = { action: 'create', data: 'hello' } as json.LiteralMap;
                 const lookup = makeKeyLookup([alice]);
 
-                let threw = false;
-                try {
-                    await signPayload(payload, alice, version());
-                } catch {
-                    threw = true;
-                }
-                assertTrue(threw, 'signing at an empty position should throw');
+                const genesis = await signPayload(payload, alice, version());
+                assertTrue(await verifyPayloadSignature(genesis, version(), lookup),
+                    'a genesis signature should verify at the empty position');
+                assertFalse(await verifyPayloadSignature(genesis, AT, lookup),
+                    'a genesis signature should not verify at a non-empty position');
+                assertFalse(await verifyPayloadSignature(genesis, version('entry-a'), lookup),
+                    'a genesis signature should not verify at a single-entry position');
 
                 const signed = await signPayload(payload, alice, AT);
                 assertFalse(await verifyPayloadSignature(signed, version(), lookup),
-                    'verifying at an empty position should fail');
+                    'a positioned signature should not verify at the empty position');
             }
         },
         {

@@ -11,11 +11,3 @@ CREATE SCHEMA users_schema CREATORS ($admin) AS (
     ALLOW insert IF EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
     ALLOW delete IF grantee = $author OR EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
 );
-
-CREATE TABLEGROUP users
-  USING SCHEMA users_schema
-  USING IDENTITIES identities
-  WITH ROWS (
-    identities (keyId = $admin, publicKey = publicKey($admin), name = 'Admin'),
-    caps (label = 'manager', grantee = $admin)
-  );

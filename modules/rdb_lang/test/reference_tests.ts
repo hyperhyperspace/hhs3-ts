@@ -6,11 +6,12 @@ import { isLangCommonHelpQuery, LANG_COMMON_REF } from "../src/reference/common.
 
 const ALL_KINDS: AstStatement['kind'][] = [
     'create-database',
+    'use-database',
     'create-schema',
-    'create-tablegroup',
-    'add-member',
+    'create-catalog',
+    'alter-catalog',
+    'update-catalog',
     'alter-schema',
-    'update-schema',
     'update-ref',
     'insert',
     'update',
@@ -40,11 +41,17 @@ export const referenceTests = {
             },
         },
         {
-            name: '[REF03] ADD SCHEMA and ADD TABLEGROUP are distinct entries',
+            name: '[REF03] the catalog statements replace membership and group-level deploys',
             invoke: async () => {
                 const commands = LANG_COMMAND_REFS.map((ref) => ref.command);
-                assertTrue(commands.includes('ADD SCHEMA'), 'ADD SCHEMA present');
-                assertTrue(commands.includes('ADD TABLEGROUP'), 'ADD TABLEGROUP present');
+                for (const command of ['CREATE CATALOG', 'ALTER CATALOG', 'UPDATE CATALOG', 'USE DATABASE']) {
+                    assertTrue(commands.includes(command), `${command} present`);
+                }
+                for (const command of ['ADD SCHEMA', 'ADD TABLEGROUP', 'CREATE TABLEGROUP', 'UPDATE SCHEMA']) {
+                    assertTrue(!commands.includes(command), `${command} removed`);
+                }
+                const catalog = LANG_COMMAND_REFS.find((ref) => ref.command === 'CREATE CATALOG')!;
+                assertTrue(catalog.syntax.includes('ALLOW DEPLOY IF'), 'catalog groups gate deploys with ALLOW DEPLOY IF');
                 const pairs = LANG_COMMAND_REFS.map((ref) => `${ref.command}:${ref.kind}`);
                 assertEquals(new Set(pairs).size, pairs.length, 'no duplicate command entries');
             },

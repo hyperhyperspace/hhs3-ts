@@ -45,7 +45,6 @@ export function extractRefUpdateTrigger(bound: BoundStatement): RefUpdateTrigger
         case 'delete':
             return { sourceGroupId: bound.table.groupId, author: bound.author };
         case 'bundle':
-        case 'update-schema':
             return { sourceGroupId: bound.group.id, author: bound.author };
         default:
             return undefined;

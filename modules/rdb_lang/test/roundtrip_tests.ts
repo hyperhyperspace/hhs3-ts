@@ -1,10 +1,10 @@
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { createBasicCrypto, createIdentity, HASH_SHA256, SIGNING_ED25519, type OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { version } from "@hyper-hyper-space/hhs3_mvt";
+import { serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 import {
-    RDbImpl, RSchemaImpl, RTableGroupImpl, normalizeDecimal, usersSchemaTables, validateRSchemaPayloadFormat,
-    type CmpOp, type ColumnDef, type ColumnType, type MigrationRule, type Operand, type OpTag, type Predicate,
+    RCatalogImpl, RDbImpl, RSchemaImpl, catalogGroupHash, normalizeDecimal, usersSchemaTables, validateRSchemaPayloadFormat,
+    type CatalogGroupDef, type CmpOp, type ColumnDef, type ColumnType, type MigrationRule, type Operand, type OpTag, type Predicate,
     type SchemaUpdatePayload, type TableDef,
 } from "@hyper-hyper-space/hhs3_rdb";
 
@@ -13,20 +13,20 @@ import { createMockRContext } from "../../rdb/test/mock_rcontext.js";
 import { bind } from "../src/bind/bind.js";
 import { compileCreate } from "../src/compile/create.js";
 import { compileMigrationRules } from "../src/compile/ddl.js";
-import { lowerRestrictionPredicate } from "../src/compile/query.js";
 import { columnSetFromTableDef, type ColumnsOf } from "../src/compile/rule_scope.js";
-import { renderOp } from "../src/reverse/render.js";
+import { renderOp, type RenderOptions } from "../src/reverse/render.js";
 import { parseStatement } from "../src/syntax/parser.js";
 import type { AstStatement } from "../src/syntax/ast.js";
-import { createTestBindContext } from "./mock_bind_context.js";
+import { createTestBindContext, type TestBindContext } from "./mock_bind_context.js";
+import { createLangEnv } from "./lang_env.js";
 
 // Lossless rendering: for every valid payload p, compile(parse(render(p))) == p.
 // Text is replayed with no keystore, as a full-profile dump must be.
 
 const hashSuite = createBasicCrypto().hash(HASH_SHA256);
 
-function keystorelessContext() {
-    const lang = createTestBindContext(createMockRContext(), {});
+function keystorelessContext(context?: TestBindContext) {
+    const lang = context ?? createTestBindContext(createMockRContext(), {});
     delete (lang as { resolvePublicKey?: unknown }).resolvePublicKey;
     return lang;
 }
@@ -37,11 +37,11 @@ function parseOrThrow(text: string): AstStatement {
     return parsed.value;
 }
 
-async function recompileCreate(text: string): Promise<json.Literal> {
-    const bound = await bind(parseOrThrow(text), keystorelessContext());
+async function recompileCreate(text: string, context?: TestBindContext): Promise<json.Literal> {
+    const bound = await bind(parseOrThrow(text), keystorelessContext(context));
     if (!bound.ok) throw new Error(`bind failed: ${bound.diagnostics.map((d) => d.message).join('; ')}`);
     const kind = bound.value.kind;
-    if (kind !== 'create-database' && kind !== 'create-schema' && kind !== 'create-tablegroup') {
+    if (kind !== 'create-database' && kind !== 'create-schema' && kind !== 'create-catalog') {
         throw new Error(`expected a CREATE statement, got ${kind}`);
     }
     return (await compileCreate(bound.value)).payload as unknown as json.Literal;
@@ -55,11 +55,11 @@ function sameOrExplain(what: string, text: string, original: unknown, back: unkn
     }
 }
 
-async function assertCreateRoundTrip(payload: unknown, what: string): Promise<string> {
-    const text = renderOp(payload as json.Literal);
+async function assertCreateRoundTrip(payload: unknown, what: string, context?: TestBindContext, options?: RenderOptions): Promise<string> {
+    const text = renderOp(payload as json.Literal, options);
     let back: json.Literal;
     try {
-        back = await recompileCreate(text);
+        back = await recompileCreate(text, context);
     } catch (e) {
         throw new Error(`${what}: ${e instanceof Error ? e.message : String(e)}\n--- rendered ---\n${text}`);
     }
@@ -368,12 +368,29 @@ export const roundTripTests = {
             },
         },
         {
-            name: '[RT04] CREATE DATABASE round-trips (keyword name, seed, public-key creators, hash algorithm)',
+            name: '[RT04] CREATE DATABASE round-trips (keyword name, seed, public-key creators, params, hash algorithm)',
             invoke: async () => {
                 const admin = await newIdentity();
-                const payload = await RDbImpl.create({ seed: "seed 'x'", name: 'order', creators: [admin], hashAlgorithm: 'sha256' });
-                const text = await assertCreateRoundTrip(payload, 'database');
-                assertTrue(text.startsWith('CREATE DATABASE "order"'), 'keyword database name is quoted');
+                const env = await createLangEnv({ vars: { admin, me: admin } });
+                await env.run(`
+                    CREATE SCHEMA s CREATORS ($admin) AS (TABLE t (who identity, n integer) ALLOW all IF true);
+                    CREATE CATALOG c VERSION '1.0.0' PARAMS (:owner identity, :limit integer) AS (
+                      TABLEGROUP g USING SCHEMA s WITH ROWS (t (who = :owner, n = :limit))
+                    );
+                `);
+                const catalog = await env.catalog('c');
+                const payload = await RDbImpl.create({
+                    seed: "seed 'x'", name: 'order', creators: [admin], hashAlgorithm: 'sha256',
+                    catalog: catalog.getId(), release: catalog.getId(),
+                    params: {
+                        owner: { identity: { keyId: admin.keyId, publicKey: serializePublicKeyToBase64(admin.publicKey) } },
+                        limit: { value: 7 },
+                    },
+                });
+                const text = await assertCreateRoundTrip(payload, 'database', env.lang);
+                assertTrue(text.startsWith(`CREATE DATABASE "order" USING CATALOG #${catalog.getId()} AT {#${catalog.getId()}}`),
+                    'keyword database name is quoted; catalog and release render by hash');
+                assertTrue(text.includes('WITH PARAMS (:limit = 7, :owner = publicKey('), 'params render sorted, identities as public keys');
             },
         },
         {
@@ -408,34 +425,55 @@ export const roundTripTests = {
             },
         },
         {
-            name: '[RT06] CREATE TABLEGROUP gates, identity provider and hash algorithm round-trip',
+            name: '[RT06] CREATE CATALOG round-trips (gates, identity provider, bindings, param rows, keyword names, seed)',
             invoke: async () => {
-                const tables = kitchenSinkTables();
+                const dev = await newIdentity();
+                const env = await createLangEnv({ vars: { dev, me: dev } });
+                await env.run(`
+                    CREATE SCHEMA users_schema CREATORS ($dev) AS (
+                      TABLE identities (keyId string PUB READONLY, publicKey string PUB READONLY) IDENTITY PROVIDER ALLOW insert IF true,
+                      TABLE caps (label string PUB READONLY, grantee identity PUB READONLY) ALLOW all IF true
+                    );
+                    CREATE SCHEMA app_schema CREATORS ($dev) AS (
+                      TABLE items (keyId identity PUB READONLY, flag boolean PUB READONLY, memo string NULL) ALLOW all IF true
+                    );
+                `);
+                const users = await env.schema('users_schema');
+                const app = await env.schema('app_schema');
+                const usersDef: CatalogGroupDef = {
+                    name: 'users', seedSource: 'rdb', schemaRef: users.getId(), schemaVersion: json.toSet([users.getId()]),
+                    idProvider: 'identities',
+                    initialRows: {
+                        identities: [{ values: {}, params: { keyId: { param: 'owner' }, publicKey: { param: 'owner', fn: 'publicKey' } } }],
+                        caps: [{ values: { label: "it's" }, params: { grantee: { param: 'owner' } } }],
+                    },
+                };
                 const canDeploy: Predicate = {
                     p: 'or',
                     args: [
-                        { p: 'exists', table: 'table', where: { identity: '$author', flag: true } },
+                        { p: 'exists', table: 'items', where: { keyId: '$author', flag: true } },
                         { p: 'exists', table: 'users.caps', where: { label: "it's", grantee: '$author' } },
                     ],
                 };
                 const canObserve: { [binding: string]: Predicate } = {
-                    users: { p: 'and', args: [{ p: 'and', args: [{ p: 'exists', table: 'items', where: { keyId: '$author' } }, { p: 'true' }] }, { p: 'false' }] },
+                    users: { p: 'and', args: [{ p: 'and', args: [{ p: 'exists', table: 'caps', where: { grantee: '$author' } }, { p: 'true' }] }, { p: 'false' }] },
                 };
-                const payload = await RTableGroupImpl.create({
-                    name: 'identity', seed: 'seed', schemaRef: 'SCHEMAREF', schemaVersion: version('VERSIONA'),
-                    bindings: { users: 'GROUPREF' }, idProvider: 'users.identities', canDeploy, canObserve, hashAlgorithm: 'sha256',
+                const identityDef: CatalogGroupDef = {
+                    name: 'identity', seedSource: 'rdb', schemaRef: app.getId(), schemaVersion: json.toSet([app.getId()]),
+                    bindings: { users: catalogGroupHash(usersDef) }, idProvider: 'users.identities', canDeploy, canObserve,
+                };
+                const payload = await RCatalogImpl.create({
+                    name: 'order', creators: [dev], author: dev, version: '1.0.0', note: "first -- it's",
+                    add: [usersDef, identityDef], params: [{ name: 'owner', type: 'identity' }], seed: 'catalog seed',
                 });
-                const text = renderOp(payload as unknown as json.Literal);
-                const ast = parseOrThrow(text);
-                if (ast.kind !== 'create-tablegroup') throw new Error(`expected create-tablegroup, got ${ast.kind}`);
-                assertEquals(ast.name, 'identity', 'keyword group name');
-                assertEquals(ast.hashAlgorithm, 'sha256', 'HASH ALGORITHM round-trips');
-                assertEquals(ast.idProvider, 'users.identities', 'identity provider');
-                const scope = { columnsOf: columnsOfDefs(tables) };
-                if (ast.canDeploy === undefined) throw new Error('missing canDeploy');
-                sameOrExplain('canDeploy', text, canDeploy, lowerRestrictionPredicate(ast.canDeploy, scope));
-                assertEquals(ast.canObserve.length, 1, 'one observe gate');
-                sameOrExplain('canObserve', text, canObserve.users, lowerRestrictionPredicate(ast.canObserve[0].predicate, scope));
+                const text = await assertCreateRoundTrip(payload, 'catalog', env.lang, {
+                    resolveSchemaName: (id) => (id === users.getId() ? 'users_schema' : id === app.getId() ? 'app_schema' : undefined),
+                });
+                assertTrue(text.startsWith('CREATE CATALOG "order"'), 'keyword catalog name is quoted');
+                assertTrue(text.includes('TABLEGROUP "identity" USING SCHEMA'), 'keyword group name is quoted');
+                assertTrue(text.includes('BIND users => users'), 'the binding names the definition');
+                assertTrue(text.includes('ALLOW DEPLOY IF'), 'the deploy gate renders');
+                assertTrue(text.includes('publicKey=publicKey(:owner)'), 'param rows render as :param slots');
             },
         },
     ],

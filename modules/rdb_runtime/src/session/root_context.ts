@@ -4,7 +4,9 @@ import type { RdbSession } from "./session.js";
 import type { RootResolveContext } from "../workspace/root_index.js";
 
 export function rootCtx(session: RdbSession): RootResolveContext {
-    return { aliases: session.aliases };
+    return session.currentDatabase === undefined
+        ? { aliases: session.aliases }
+        : { aliases: session.aliases, currentDatabase: session.currentDatabase };
 }
 
 export function nameOrHashRef(text: string): NameOrHashRef {

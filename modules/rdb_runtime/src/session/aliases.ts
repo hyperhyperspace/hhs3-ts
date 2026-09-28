@@ -3,7 +3,7 @@ import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { KeyVault } from "../keys/key_vault.js";
 import type { RdbWorkspace } from "../workspace/workspace.js";
 
-export type AliasScope = 'key' | 'schema' | 'group' | 'db' | 'version';
+export type AliasScope = 'key' | 'schema' | 'catalog' | 'group' | 'db' | 'version';
 
 export type AliasEntry = {
     scope: AliasScope;
@@ -11,7 +11,7 @@ export type AliasEntry = {
     hash: B64Hash;
 };
 
-const ALL_SCOPES: AliasScope[] = ['db', 'schema', 'group', 'key', 'version'];
+const ALL_SCOPES: AliasScope[] = ['db', 'catalog', 'schema', 'group', 'key', 'version'];
 
 const SCOPE_KEYWORDS = new Set<string>(ALL_SCOPES);
 

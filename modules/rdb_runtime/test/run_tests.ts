@@ -41,9 +41,13 @@ const tests = [
                 await session.createKey('alice', 'correct');
                 session.selectAuthor('alice');
                 const result = await runtime.execute(setupScript());
-                assertEquals(result.results.length, 4, 'four statements');
+                assertEquals(result.results.length, 5, 'five statements');
                 assertEquals(session.workspace.roots.list('schema').length, 1, 'schema indexed');
-                assertEquals(session.workspace.roots.list('group').length, 1, 'group indexed');
+                assertEquals(session.workspace.roots.list('catalog').length, 1, 'catalog indexed');
+                assertEquals(session.workspace.roots.list('database').length, 1, 'database indexed');
+                assertEquals(session.workspace.roots.list('group').length, 1, 'group created by the database');
+                assertEquals(session.workspace.roots.list('other').length, 0, 'the deploy gate is not a root');
+                assertEquals(result.results[2]?.deploy?.created.length, 1, 'CREATE DATABASE reports the created group');
             } finally {
                 await runtime.close();
             }
@@ -88,7 +92,10 @@ const tests = [
             const runtime2 = await RdbRuntime.open({ backend, hashSuite, crypto, keyVault });
             try {
                 assertEquals(runtime2.session.workspace.roots.list('schema').length, 1, 'schema rehydrated');
+                assertEquals(runtime2.session.workspace.roots.list('catalog').length, 1, 'catalog rehydrated');
+                assertEquals(runtime2.session.workspace.roots.list('database').length, 1, 'database rehydrated');
                 assertEquals(runtime2.session.workspace.roots.list('group').length, 1, 'group rehydrated');
+                assertEquals(runtime2.session.workspace.roots.list('other').length, 0, 'the deploy gate stays hidden');
                 const selected = await runtime2.execute("SELECT sku, name FROM shop_prod.products;");
                 assertEquals(selected.results[0]?.result.kind, 'select', 'select result');
             } finally {
@@ -105,6 +112,7 @@ const tests = [
                 runtime.session.selectAuthor('alice');
                 await runtime.execute(setupScript());
                 const group = runtime.session.workspace.roots.list('group')[0]!;
+                runtime.session.setCurrentGroup(group.id);
                 const dag = await group.object!.getScopedDag();
                 const hashes: string[] = [];
                 for await (const entry of dag.loadAllEntries()) hashes.push(entry.hash);
@@ -228,6 +236,80 @@ const tests = [
         },
     },
     {
+        name: '[RDB_RT11] group names resolve within a database: db.group, the current database, or a unique match',
+        invoke: async () => {
+            const runtime = await RdbRuntime.openMemory({ keyVault: new FakeKeyVault() });
+            try {
+                await runtime.session.createKey('alice', 'correct');
+                runtime.session.selectAuthor('alice');
+                await runtime.execute(`
+CREATE SCHEMA shop CREATORS ($me) AS (TABLE products (sku string) ALLOW all IF true);
+CREATE SCHEMA misc CREATORS ($me) AS (TABLE notes (text string) ALLOW all IF true);
+CREATE CATALOG shop_catalog VERSION '1.0.0' AS (TABLEGROUP shop_prod USING SCHEMA shop);
+CREATE CATALOG misc_catalog VERSION '1.0.0' AS (TABLEGROUP notes USING SCHEMA misc);
+CREATE DATABASE east USING CATALOG shop_catalog;
+CREATE DATABASE west USING CATALOG shop_catalog;
+CREATE DATABASE other USING CATALOG misc_catalog;
+`);
+                assertEquals(runtime.session.workspace.roots.list('group').length, 3, 'one group per database');
+
+                // CREATE DATABASE made 'other' current: shop_prod is elsewhere.
+                await expectRunError(runtime, "INSERT INTO shop_prod.products (sku) VALUES ('x');",
+                    'use east.shop_prod or west.shop_prod', 'the error suggests the qualified names');
+
+                await runtime.execute("INSERT INTO east.shop_prod.products (sku) VALUES ('e1');");
+                await runtime.execute("USE DATABASE west; INSERT INTO shop_prod.products (sku) VALUES ('w1');");
+                const east = await runtime.execute('SELECT sku FROM east.shop_prod.products;');
+                const west = await runtime.execute('SELECT sku FROM shop_prod.products;');
+                const skus = (r: typeof east) => r.results[0]!.result.kind === 'select'
+                    ? r.results[0]!.result.rows.map((row) => row.values['sku']) : [];
+                assertEquals(JSON.stringify(skus(east)), JSON.stringify(['e1']), 'east has its own row');
+                assertEquals(JSON.stringify(skus(west)), JSON.stringify(['w1']), 'the current database is west');
+
+                const fresh = new RdbSession({ workspace: runtime.workspace, keyVault: runtime.session.keyVault });
+                await expectError(() => executeText(fresh, 'SELECT sku FROM shop_prod.products;'),
+                    'Ambiguous group', 'without a current database, two matches are ambiguous');
+                const unique = await executeText(fresh, 'SELECT text FROM notes.notes;');
+                assertEquals(unique.results[0]?.result.kind, 'select', 'a unique name resolves across databases');
+            } finally {
+                await runtime.close();
+            }
+        },
+    },
+    {
+        name: '[RDB_RT12] UPDATE CATALOG deploys a release; the group LOG labels the deploy',
+        invoke: async () => {
+            const runtime = await RdbRuntime.openMemory({ keyVault: new FakeKeyVault() });
+            try {
+                await runtime.session.createKey('alice', 'correct');
+                runtime.session.selectAuthor('alice');
+                await runtime.execute(setupScript());
+                await runtime.execute(`
+ALTER SCHEMA shop AS (ADD COLUMN products.price integer DEFAULT 0);
+ALTER CATALOG shop_catalog VERSION '1.1.0' AS (UPDATE SCHEMA shop TO LATEST ON shop_prod);
+`);
+                const deployed = await runtime.execute("UPDATE CATALOG shop_catalog TO '1.1.0' ON shop_db;");
+                const result = deployed.results[0]!.result;
+                assertTrue(result.kind === 'update-catalog' && result.update.deployed.length === 1, 'one group deployed');
+                assertTrue(result.kind === 'update-catalog' && result.update.commit !== undefined, 'the release is recorded');
+
+                await runtime.execute("INSERT INTO shop_prod.products (sku, name, price) VALUES ('B', 'Gadget', 3);");
+                const log = await runtime.execute('LOG shop_prod;');
+                const logResult = log.results[0]!.result;
+                assertTrue(logResult.kind === 'log', 'log result');
+                if (logResult.kind !== 'log') return;
+                assertEquals(logResult.renderContext.deployLabels !== undefined
+                    && Object.values(logResult.renderContext.deployLabels).includes('shop_catalog 1.1.0'), true,
+                'the deploy is labeled with the release that pins it');
+
+                await expectRunError(runtime, "UPDATE CATALOG shop_catalog TO '9.9.9' ON shop_db;",
+                    "no release '9.9.9'", 'an unknown release is rejected');
+            } finally {
+                await runtime.close();
+            }
+        },
+    },
+    {
         name: '[RDB_RT10] MemoryKeyVault resolves exact labels before unambiguous prefixes',
         invoke: async () => {
             const vault = new MemoryKeyVault();
@@ -316,7 +398,10 @@ CREATE SCHEMA shop CREATORS ($me) AS (
     name string
   )
 );
-CREATE TABLEGROUP shop_prod USING SCHEMA shop;
+CREATE CATALOG shop_catalog VERSION '1.0.0' AS (
+  TABLEGROUP shop_prod USING SCHEMA shop
+);
+CREATE DATABASE shop_db USING CATALOG shop_catalog;
 INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');
 SELECT sku, name FROM shop_prod.products;
 `;
@@ -327,15 +412,22 @@ function crossGroupSetupScript(): string {
 CREATE SCHEMA users_schema CREATORS ($me) AS (
   TABLE identities (name string) ALLOW all IF true
 );
-CREATE TABLEGROUP users USING SCHEMA users_schema;
 CREATE SCHEMA shop CREATORS ($me) AS (
   TABLE orders (
     customer string REFERENCES users.identities,
     label string
   ) ALLOW all IF true
 );
-CREATE TABLEGROUP shop_prod USING SCHEMA shop BIND users => users;
+CREATE CATALOG shop_catalog VERSION '1.0.0' AS (
+  TABLEGROUP users USING SCHEMA users_schema,
+  TABLEGROUP shop_prod USING SCHEMA shop BIND users => users
+);
+CREATE DATABASE shop_db USING CATALOG shop_catalog;
 `;
+}
+
+async function expectRunError(runtime: RdbRuntime, sql: string, message: string, description: string): Promise<void> {
+    await expectError(() => runtime.execute(sql), message, description);
 }
 
 async function main() {

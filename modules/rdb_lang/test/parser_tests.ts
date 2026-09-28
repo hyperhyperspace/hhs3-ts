@@ -5,6 +5,20 @@ import { lowerRestrictionPredicate, lowerRowFilter } from "../src/compile/query.
 import { columnSetFromTableDecl, columnsOfFromTableDecls } from "../src/compile/rule_scope.js";
 import { parseStatement } from "../src/syntax/parser.js";
 import { createTestBindContext } from "./mock_bind_context.js";
+import type { CatalogGroupExpr } from "../src/syntax/ast.js";
+
+// The single group of `CREATE CATALOG c VERSION '1.0.0' AS (<body>)`.
+function catalogGroup(body: string): CatalogGroupExpr {
+    const result = parseStatement(`CREATE CATALOG c VERSION '1.0.0' AS (${body});`);
+    if (!result.ok) throw new Error(`parse should succeed: ${result.diagnostics.map((d) => d.message).join('; ')}`);
+    if (result.value.kind !== 'create-catalog' || result.value.groups.length !== 1) throw new Error('expected one catalog group');
+    return result.value.groups[0];
+}
+
+function parseMessages(sql: string): string[] {
+    const result = parseStatement(sql);
+    return result.ok ? [] : result.diagnostics.map((d) => d.message);
+}
 
 export const parserTests = {
     title: '[RDB_LANG:PARSE] Parser',
@@ -182,69 +196,65 @@ export const parserTests = {
             },
         },
         {
-            name: '[PARSE10] parses ALLOW UPDATE SCHEMA IF predicates',
+            name: '[PARSE10] parses ALLOW DEPLOY IF predicates on catalog groups',
             invoke: async () => {
-                const result = parseStatement(`
-                    CREATE TABLEGROUP shop_prod USING SCHEMA shop
-                      ALLOW UPDATE SCHEMA IF EXISTS users.caps WHERE label = 'deployer' AND grantee = $author;
+                const group = catalogGroup(`
+                    TABLEGROUP shop_prod USING SCHEMA shop
+                      ALLOW DEPLOY IF EXISTS users.caps WHERE label = 'deployer' AND grantee = $author
                 `);
-                assertTrue(result.ok, 'parse should succeed');
-                if (!result.ok || result.value.kind !== 'create-tablegroup') return;
-                assertTrue(result.value.canDeploy !== undefined, 'canDeploy predicate is present');
+                assertTrue(group.canDeploy !== undefined, 'canDeploy predicate is present');
             },
         },
         {
             name: '[PARSE10b] parses ALLOW UPDATE REF gate predicates',
             invoke: async () => {
-                const result = parseStatement(`
-                    CREATE TABLEGROUP docs_gated USING SCHEMA shop
+                const group = catalogGroup(`
+                    TABLEGROUP docs_gated USING SCHEMA shop
                       BIND users => users
-                      ALLOW UPDATE REF users IF EXISTS users.caps WHERE label = 'manager' AND grantee = $author;
+                      ALLOW UPDATE REF users IF EXISTS users.caps WHERE label = 'manager' AND grantee = $author
                 `);
-                assertTrue(result.ok, 'parse should succeed');
-                if (!result.ok || result.value.kind !== 'create-tablegroup') return;
-                assertEquals(result.value.canObserve.length, 1, 'one canObserve gate');
-                assertEquals(result.value.canObserve[0].binding, 'users', 'gate binds users');
+                assertEquals(group.canObserve.length, 1, 'one canObserve gate');
+                assertEquals(group.canObserve[0].binding, 'users', 'gate binds users');
             },
         },
         {
             name: '[PARSE10c] rejects deprecated CAN DEPLOY SCHEMA syntax',
             invoke: async () => {
-                const result = parseStatement(`
-                    CREATE TABLEGROUP shop_prod USING SCHEMA shop
-                      CAN DEPLOY SCHEMA IF true;
-                `);
+                const result = parseStatement(`CREATE CATALOG c VERSION '1.0.0' AS (
+                    TABLEGROUP shop_prod USING SCHEMA shop
+                      CAN DEPLOY SCHEMA IF true
+                );`);
                 assertTrue(!result.ok, 'CAN DEPLOY SCHEMA should fail');
                 if (!result.ok) {
-                    assertTrue(result.diagnostics.some((d) => d.message.includes('Unexpected CREATE TABLEGROUP clause')),
+                    assertTrue(result.diagnostics.some((d) => d.message.includes('Unexpected TABLEGROUP clause')),
                         'diagnostic mentions unexpected clause');
                 }
             },
         },
         {
-            name: '[PARSE10d] rejects row ALLOW rules on CREATE TABLEGROUP',
+            name: '[PARSE10d] rejects row ALLOW rules on catalog groups',
             invoke: async () => {
-                const result = parseStatement(`
-                    CREATE TABLEGROUP shop_prod USING SCHEMA shop
-                      ALLOW insert IF true;
-                `);
-                assertTrue(!result.ok, 'ALLOW insert on tablegroup should fail');
+                const result = parseStatement(`CREATE CATALOG c VERSION '1.0.0' AS (
+                    TABLEGROUP shop_prod USING SCHEMA shop
+                      ALLOW insert IF true
+                );`);
+                assertTrue(!result.ok, 'ALLOW insert on a catalog group should fail');
                 if (!result.ok) {
-                    assertTrue(result.diagnostics.some((d) => d.message.includes('Expected ALLOW UPDATE SCHEMA or ALLOW UPDATE REF')),
+                    assertTrue(result.diagnostics.some((d) => d.message.includes('Expected ALLOW DEPLOY IF or ALLOW UPDATE REF')),
                         'diagnostic mentions expected tablegroup allow forms');
                 }
             },
         },
         {
-            name: '[PARSE10e] rejects deprecated ALLOW DEPLOY SCHEMA syntax',
+            name: '[PARSE10e] rejects ALLOW UPDATE SCHEMA IF, replaced by ALLOW DEPLOY IF',
             invoke: async () => {
-                const result = parseStatement(`
-                    CREATE TABLEGROUP shop_prod USING SCHEMA shop
-                      ALLOW DEPLOY SCHEMA IF true;
-                `);
-                assertTrue(!result.ok, 'ALLOW DEPLOY SCHEMA should fail');
+                const result = parseStatement(`CREATE CATALOG c VERSION '1.0.0' AS (
+                    TABLEGROUP shop_prod USING SCHEMA shop
+                      ALLOW UPDATE SCHEMA IF true
+                );`);
+                assertTrue(!result.ok, 'ALLOW UPDATE SCHEMA should fail');
                 if (!result.ok) {
-                    assertTrue(result.diagnostics.some((d) => d.message.includes('Expected ALLOW UPDATE SCHEMA or ALLOW UPDATE REF')),
+                    assertTrue(result.diagnostics.some((d) => d.message.includes('Expected ALLOW DEPLOY IF or ALLOW UPDATE REF')),
                         'diagnostic mentions expected tablegroup allow forms');
                 }
             },
@@ -320,19 +330,17 @@ export const parserTests = {
         {
             name: '[PARSE15] parses USING IDENTITIES tablegroup provider selection',
             invoke: async () => {
-                const local = parseStatement('CREATE TABLEGROUP users USING SCHEMA users_schema USING IDENTITIES identities;');
-                assertTrue(local.ok, 'local provider should parse');
-                if (local.ok && local.value.kind === 'create-tablegroup') assertEquals(local.value.idProvider, 'identities', 'local provider');
+                const local = catalogGroup('TABLEGROUP users USING SCHEMA users_schema USING IDENTITIES identities');
+                assertEquals(local.idProvider, 'identities', 'local provider');
 
-                const foreign = parseStatement('CREATE TABLEGROUP app USING SCHEMA app_schema BIND users => users USING IDENTITIES users.identities;');
-                assertTrue(foreign.ok, 'foreign provider should parse');
-                if (foreign.ok && foreign.value.kind === 'create-tablegroup') assertEquals(foreign.value.idProvider, 'users.identities', 'foreign provider');
+                const foreign = catalogGroup('TABLEGROUP app USING SCHEMA app_schema BIND users => users USING IDENTITIES users.identities');
+                assertEquals(foreign.idProvider, 'users.identities', 'foreign provider');
             },
         },
         {
             name: '[PARSE16] rejects old tablegroup IDENTITY PROVIDER syntax',
             invoke: async () => {
-                const result = parseStatement('CREATE TABLEGROUP app USING SCHEMA app_schema IDENTITY PROVIDER users.identities;');
+                const result = parseStatement("CREATE CATALOG c VERSION '1.0.0' AS (TABLEGROUP app USING SCHEMA app_schema IDENTITY PROVIDER users.identities);");
                 assertTrue(!result.ok, 'old tablegroup provider syntax should fail');
             },
         },
@@ -369,9 +377,9 @@ export const parserTests = {
                 assertTrue(anon.ok, 'DELETE BY NOBODY should parse');
                 if (anon.ok && anon.value.kind === 'delete') assertEquals(anon.value.author?.kind, 'nobody', 'delete author is nobody');
 
-                const deploy = parseStatement('UPDATE SCHEMA s TO LATEST ON g BY $deployer;');
-                assertTrue(deploy.ok, 'UPDATE SCHEMA BY should parse');
-                if (deploy.ok && deploy.value.kind === 'update-schema') assertEquals(deploy.value.author?.kind, 'variable', 'update schema author ref');
+                const deploy = parseStatement("UPDATE CATALOG c TO '1.1.0' ON db BY $deployer;");
+                assertTrue(deploy.ok, 'UPDATE CATALOG BY should parse');
+                if (deploy.ok && deploy.value.kind === 'update-catalog') assertEquals(deploy.value.author?.kind, 'variable', 'update catalog author ref');
 
                 const alter = parseStatement('ALTER SCHEMA s AS (DROP TABLE t) BY $admin;');
                 assertTrue(alter.ok, 'ALTER BY should parse');
@@ -395,13 +403,15 @@ export const parserTests = {
             },
         },
         {
-            name: '[PARSE20] parses UPDATE SCHEMA with trailing causal AT',
+            name: '[PARSE20] parses ALTER CATALOG with BY and a trailing insertion-point AT',
             invoke: async () => {
-                const result = parseStatement('UPDATE SCHEMA shop TO LATEST ON g BY $admin AT {#cut};');
-                assertTrue(result.ok, 'UPDATE SCHEMA with BY and trailing AT should parse');
-                if (!result.ok || result.value.kind !== 'update-schema') return;
+                const result = parseStatement("ALTER CATALOG c VERSION '1.1.0' AS (UPDATE SCHEMA shop TO LATEST ON g) BY $admin AT {#cut};");
+                assertTrue(result.ok, 'ALTER CATALOG with BY and trailing AT should parse');
+                if (!result.ok || result.value.kind !== 'alter-catalog') return;
                 assertEquals(result.value.author?.kind, 'variable', 'author present');
                 assertEquals(result.value.at?.kind, 'set', 'causal AT present');
+                const change = result.value.changes[0];
+                assertTrue(change?.kind === 'update-schema' && change.version.kind === 'latest', 'the body AT is the version, not the insertion point');
             },
         },
         {
@@ -546,16 +556,11 @@ export const parserTests = {
         {
             name: '[PARSE27] rejects top-level column references in group gates',
             invoke: async () => {
-                const result = parseStatement(`
-                    CREATE TABLEGROUP g USING SCHEMA s
-                      ALLOW UPDATE SCHEMA IF keyId = $author;
-                `);
-                assertTrue(result.ok, 'parse should succeed');
-                if (!result.ok || result.value.kind !== 'create-tablegroup') return;
+                const group = catalogGroup('TABLEGROUP g USING SCHEMA s ALLOW DEPLOY IF keyId = $author');
                 const scope = { columnsOf: () => undefined };
                 let threw = false;
                 try {
-                    lowerRestrictionPredicate(result.value.canDeploy!, scope);
+                    lowerRestrictionPredicate(group.canDeploy!, scope);
                 } catch (e) {
                     threw = e instanceof Error && e.message.includes('not allowed');
                 }
@@ -573,15 +578,15 @@ export const parserTests = {
             },
         },
         {
-            name: '[PARSE29] parses SEED on CREATE DATABASE and CREATE TABLEGROUP',
+            name: '[PARSE29] parses SEED on CREATE DATABASE and CREATE CATALOG',
             invoke: async () => {
-                const db = parseStatement("CREATE DATABASE app SEED 'db-seed';");
+                const db = parseStatement("CREATE DATABASE app USING CATALOG c SEED 'db-seed';");
                 assertTrue(db.ok && db.value.kind === 'create-database', 'database parse');
                 if (db.ok && db.value.kind === 'create-database') assertEquals(db.value.seed, 'db-seed', 'database seed');
 
-                const group = parseStatement("CREATE TABLEGROUP g SEED 'g-seed' USING SCHEMA shop;");
-                assertTrue(group.ok && group.value.kind === 'create-tablegroup', 'tablegroup parse');
-                if (group.ok && group.value.kind === 'create-tablegroup') assertEquals(group.value.seed, 'g-seed', 'group seed');
+                const catalog = parseStatement("CREATE CATALOG c VERSION '1.0.0' SEED 'c-seed' AS (TABLEGROUP g USING SCHEMA shop);");
+                assertTrue(catalog.ok && catalog.value.kind === 'create-catalog', 'catalog parse');
+                if (catalog.ok && catalog.value.kind === 'create-catalog') assertEquals(catalog.value.seed, 'c-seed', 'catalog seed');
             },
         },
         {
@@ -865,6 +870,149 @@ export const parserTests = {
                 assertTrue(errorOf(`JSON '[1, null]'`).includes('cannot contain null'), 'nested null');
                 assertTrue(errorOf('[1, null]').includes('cannot contain null'), 'nested null in the bracket form');
                 assertTrue(errorOf('["x"]').includes(`JSON '...'`), 'the bracket form points strings at JSON literals');
+            },
+        },
+        {
+            name: '[PARSE40] parses CREATE CATALOG: creators, version, params, groups, comma bindings, param rows',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE CATALOG editor CREATORS ($dev) VERSION '1.0.0'
+                      PARAMS (:admin identity, :limit integer)
+                    AS (
+                      TABLEGROUP user USING SCHEMA hhs:user AT LATEST
+                        USING IDENTITIES identities
+                        WITH ROWS (identities (keyId = :admin, publicKey = publicKey(:admin), name = 'Admin'),
+                                   caps (label = 'manager', grantee = :admin)),
+                      TABLEGROUP doc USING SCHEMA hhs:doc AT LATEST
+                        BIND user => user, other => #abc USING IDENTITIES user.identities
+                        ALLOW UPDATE REF user IF EXISTS caps WHERE caps.grantee = $author
+                        ALLOW DEPLOY IF EXISTS user.caps WHERE caps.grantee = $author
+                    ) NOTE 'initial' BY $dev;
+                `);
+                assertTrue(result.ok, `parse should succeed: ${JSON.stringify(result.ok ? '' : result.diagnostics.map((d) => d.message))}`);
+                if (!result.ok || result.value.kind !== 'create-catalog') return;
+                const stmt = result.value;
+                assertEquals(stmt.name, 'editor', 'catalog name');
+                assertEquals(stmt.version, '1.0.0', 'release version');
+                assertEquals(stmt.params.map((p) => `${p.name}:${p.type}`).join(','), 'admin:identity,limit:integer', 'param decls');
+                assertEquals(stmt.groups.map((g) => g.name).join(','), 'user,doc', 'two groups');
+                assertEquals(stmt.note, 'initial', 'note');
+                assertEquals(stmt.author?.kind, 'variable', 'author');
+                const [user, doc] = stmt.groups;
+                const row = user.initialRows[0];
+                assertEquals(row.values[0].value.kind, 'param', ':admin is a param');
+                const pk = row.values[1].value;
+                assertTrue(pk.kind === 'call' && pk.args[0].kind === 'param', 'publicKey(:admin) takes a param');
+                assertEquals(doc.bindings.map((b) => `${b.name}=>${b.group.kind}`).join(','), 'user=>name,other=>hash',
+                    'a comma continues the BIND list when another alias => follows');
+                assertEquals(doc.idProvider, 'user.identities', 'the clause after the bindings still parses');
+                assertTrue(doc.canDeploy !== undefined && doc.canObserve.length === 1, 'deploy and observe gates');
+            },
+        },
+        {
+            name: '[PARSE41] parses ALTER CATALOG; its trailing AT takes hashes or LATEST, never a version string',
+            invoke: async () => {
+                const result = parseStatement(`
+                    ALTER CATALOG editor VERSION '1.1.0'
+                      PARAMS (:support identity)
+                    AS (
+                      UPDATE SCHEMA hhs:doc TO LATEST ON doc,
+                      ADD TABLEGROUP comments USING SCHEMA hhs:comments AT LATEST
+                        BIND doc => doc, user => user USING IDENTITIES user.identities
+                    ) NOTE 'comments' BY $dev AT {#h1, #h2};
+                `);
+                assertTrue(result.ok, `parse should succeed: ${JSON.stringify(result.ok ? '' : result.diagnostics.map((d) => d.message))}`);
+                if (!result.ok || result.value.kind !== 'alter-catalog') return;
+                assertEquals(result.value.changes.map((c) => c.kind).join(','), 'update-schema,add-group', 'body items');
+                assertTrue(result.value.at?.kind === 'set' && result.value.at.members.length === 2, 'the insertion point is a hash set');
+                assertEquals(result.value.params[0]?.name, 'support', 'new param');
+
+                const latest = parseStatement("ALTER CATALOG editor VERSION '1.2.0' AT LATEST;");
+                assertTrue(latest.ok && latest.value.kind === 'alter-catalog' && latest.value.at?.kind === 'latest'
+                    && latest.value.changes.length === 0, 'AT LATEST, and a release with no body');
+
+                const semver = parseMessages("ALTER CATALOG editor VERSION '1.2.0' AS (UPDATE SCHEMA s TO LATEST ON g) AT '1.1.0';");
+                assertTrue(semver.some((m) => m.includes('not a version string')), `a semver insertion point is a parse error: ${semver}`);
+                assertTrue(parseMessages("ALTER CATALOG editor AS (UPDATE SCHEMA s TO LATEST ON g);").some((m) => m.includes('requires VERSION')),
+                    'a release needs a version');
+            },
+        },
+        {
+            name: '[PARSE42] parses CREATE DATABASE USING CATALOG with a release selection, creators, params and BY',
+            invoke: async () => {
+                const result = parseStatement(`
+                    CREATE DATABASE editor_prod USING CATALOG editor AT '1.0.0'
+                      CREATORS ($santi) WITH PARAMS (:admin = $santi, :limit = 10) BY $santi;
+                `);
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok || result.value.kind !== 'create-database') return;
+                assertEquals(result.value.release?.kind, 'semver', 'semver selection');
+                assertEquals(result.value.params.map((p) => p.name).join(','), 'admin,limit', 'params');
+                assertEquals(result.value.creators.length, 1, 'creators');
+                assertEquals(result.value.author?.kind, 'variable', 'author');
+
+                const byHash = parseStatement('CREATE DATABASE d USING CATALOG #cat AT {#rel};');
+                assertTrue(byHash.ok && byHash.value.kind === 'create-database' && byHash.value.release?.kind === 'version'
+                    && byHash.value.catalog.kind === 'hash', 'hash catalog and release');
+                const noRelease = parseStatement('CREATE DATABASE d USING CATALOG editor;');
+                assertTrue(noRelease.ok && noRelease.value.kind === 'create-database' && noRelease.value.release === undefined,
+                    'the release defaults to the latest one');
+                assertTrue(parseMessages('CREATE DATABASE d CREATORS ($a);').some((m) => m.includes('requires USING CATALOG')),
+                    'a database needs a catalog');
+            },
+        },
+        {
+            name: '[PARSE43] parses UPDATE CATALOG ... ON and USE DATABASE',
+            invoke: async () => {
+                const result = parseStatement("UPDATE CATALOG editor TO '1.1.0' ON editor_prod WITH PARAMS (:support = $bob) NOTE 'go' BY $santi;");
+                assertTrue(result.ok, 'parse should succeed');
+                if (!result.ok || result.value.kind !== 'update-catalog') return;
+                assertTrue(result.value.release.kind === 'semver' && result.value.release.version === '1.1.0', 'release selection');
+                assertEquals(result.value.params[0]?.name, 'support', 'params');
+                assertEquals(result.value.note, 'go', 'note');
+                assertTrue(result.value.database.kind === 'name' && result.value.database.text === 'editor_prod', 'target database');
+
+                const latest = parseStatement('UPDATE CATALOG editor TO LATEST ON #db;');
+                assertTrue(latest.ok && latest.value.kind === 'update-catalog' && latest.value.release.kind === 'version', 'LATEST');
+
+                const use = parseStatement('USE DATABASE editor_prod;');
+                assertTrue(use.ok && use.value.kind === 'use-database', 'USE DATABASE');
+            },
+        },
+        {
+            name: '[PARSE44] removed statements point at their catalog replacements',
+            invoke: async () => {
+                const expect = (sql: string, part: string) => {
+                    const messages = parseMessages(sql);
+                    assertTrue(messages.some((m) => m.includes(part)), `${sql}: expected '${part}', got ${JSON.stringify(messages)}`);
+                };
+                expect('CREATE TABLEGROUP g USING SCHEMA s;', 'CREATE TABLEGROUP was removed');
+                expect('ADD SCHEMA s TO db;', 'ADD SCHEMA and ADD TABLEGROUP were removed');
+                expect('ADD TABLEGROUP g TO db;', 'ADD SCHEMA and ADD TABLEGROUP were removed');
+                expect('UPDATE SCHEMA s TO LATEST ON g;', 'UPDATE CATALOG ... ON database');
+                const next = parseStatement("UPDATE shop.products SET name = 'x' WHERE rowId = 'r';");
+                assertTrue(next.ok, 'a table named after a statement keyword still updates');
+            },
+        },
+        {
+            name: '[PARSE45] three-part names and :param tokens',
+            invoke: async () => {
+                const insert = parseStatement("INSERT INTO prod.shop.products (sku) VALUES ('A');");
+                assertTrue(insert.ok && insert.value.kind === 'insert', 'db.group.table parses');
+                if (insert.ok && insert.value.kind === 'insert') {
+                    const ref = insert.value.table;
+                    assertTrue(ref.database?.kind === 'name' && ref.database.text === 'prod', 'database part');
+                    assertTrue(ref.group?.kind === 'name' && ref.group.text === 'shop', 'group part');
+                    assertEquals(ref.table, 'products', 'table part');
+                }
+                const observe = parseStatement('UPDATE REF users TO LATEST ON prod.docs;');
+                assertTrue(observe.ok && observe.value.kind === 'update-ref' && observe.value.group.kind === 'name'
+                    && observe.value.group.parts.join('/') === 'prod/docs', 'db.group target');
+                assertTrue(parseMessages('SELECT * FROM a.b.c.d;').some((m) => m.includes('[db.]group.table')), 'four parts are rejected');
+
+                const params = parseStatement("CREATE CATALOG c VERSION '1.0.0' PARAMS (:who identity) AS (TABLEGROUP g USING SCHEMA s WITH ROWS (t (x = :who)));");
+                assertTrue(params.ok, ':param lexes in WITH ROWS and PARAMS');
+                assertTrue(!parseStatement('SELECT * FROM t WHERE x = : y;').ok, 'a bare colon is still unexpected');
             },
         },
     ],

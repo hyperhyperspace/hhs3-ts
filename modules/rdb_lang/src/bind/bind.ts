@@ -1,36 +1,41 @@
 import type { B64Hash, KeyId, OwnIdentity, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
 import type { json } from "@hyper-hyper-space/hhs3_json";
-import type { Version } from "@hyper-hyper-space/hhs3_mvt";
-import { deriveRowId } from "@hyper-hyper-space/hhs3_rdb";
-import type { ColumnDef, InsertRowPayload, MigrationRule, RowOpPayload, RowQuery } from "@hyper-hyper-space/hhs3_rdb";
+import { serializePublicKeyToBase64, type Version } from "@hyper-hyper-space/hhs3_mvt";
+import { compareSemver, deriveRowId, isValidSemver, paramTypeFits } from "@hyper-hyper-space/hhs3_rdb";
+import type {
+    CatalogGroupDef, CatalogParamDecl, CatalogReleaseSpec, ColumnDef, InsertRowPayload, MigrationRule, ParamValue,
+    RCatalogImpl, RDbImpl, RowOpPayload, RowQuery,
+} from "@hyper-hyper-space/hhs3_rdb";
 
 import { DiagnosticBag, err, ok, Result } from "../diagnostics.js";
 import type {
-    AddMemberStatement, AlterSchemaStatement, AstStatement, AuthorExpr, BundleStatement, BundleWriteStatement,
-    CreateDatabaseStatement, CreateSchemaStatement, CreateTableGroupStatement,
-    DeleteStatement, InsertStatement, LogStatement,
-    NameOrHashRef, SelectStatement, SetViewStatement, TableRef, UpdateRefStatement, UpdateSchemaStatement, UpdateStatement,
-    ValueExpr,
+    AlterCatalogStatement, AlterSchemaStatement, AstStatement, AuthorExpr, BundleStatement, BundleWriteStatement,
+    CreateCatalogStatement, CreateDatabaseStatement, CreateSchemaStatement,
+    DeleteStatement, InsertStatement, LogStatement, NameOrHashRef, ParamAssignment, ReleaseSelector,
+    SelectStatement, SetViewStatement, TableRef, UpdateCatalogStatement, UpdateRefStatement, UpdateStatement,
+    UseDatabaseStatement, ValueExpr,
 } from "../syntax/ast.js";
 import { compileMigrationRules } from "../compile/ddl.js";
 import { buildAlterColumnsOf } from "../compile/rule_scope.js";
 import { lowerSelectQuery } from "../compile/query.js";
+import { CatalogDefScope, compileCatalogGroup, compileParamDecls, compileReleaseChanges } from "../compile/catalog.js";
 import type {
     LangBindContext, LangValue, ResolvedDatabaseRef, ResolvedGroupRef, ResolvedLogTarget, ResolvedSchemaRef,
     ResolvedTableRef, VersionScope,
 } from "./context.js";
-import { asIdentity, asJsonLiteral, asKeyId, canonicalEncodeRowValues, resolveCreator, resolveValue } from "./values.js";
+import { asJsonLiteral, canonicalEncodeRowValues, canonicalEncodeValue, resolveCreator, resolveValue } from "./values.js";
 
-/** Reserved INSERT / WITH ROWS pseudo-column; not a schema column. */
+/** Reserved INSERT pseudo-column; not a schema column. */
 export const PSEUDO_COLUMN_UUID = 'uuid';
 
 export type BoundStatement =
     | BoundCreateDatabase
     | BoundCreateSchema
-    | BoundCreateTableGroup
-    | BoundAddMember
+    | BoundCreateCatalog
+    | BoundAlterCatalog
+    | BoundUpdateCatalog
+    | BoundUseDatabase
     | BoundAlterSchema
-    | BoundUpdateSchema
     | BoundUpdateRef
     | BoundInsert
     | BoundUpdate
@@ -40,11 +45,12 @@ export type BoundStatement =
     | BoundSelect
     | BoundLog;
 
-export type BoundCreateStatement = BoundCreateDatabase | BoundCreateSchema | BoundCreateTableGroup;
+export type BoundCreateStatement = BoundCreateDatabase | BoundCreateSchema | BoundCreateCatalog;
 export type BoundExecutableStatement =
-    | BoundAddMember
+    | BoundAlterCatalog
+    | BoundUpdateCatalog
+    | BoundUseDatabase
     | BoundAlterSchema
-    | BoundUpdateSchema
     | BoundUpdateRef
     | BoundInsert
     | BoundUpdate
@@ -53,12 +59,20 @@ export type BoundExecutableStatement =
     | BoundSetView
     | BoundSelect
     | BoundLog;
+
+export type LoadedCatalogRef = { id: B64Hash; catalog: RCatalogImpl };
+export type LoadedDatabaseRef = { id: B64Hash; db: RDbImpl };
 
 export type BoundCreateDatabase = {
     kind: 'create-database';
     ast: CreateDatabaseStatement;
     seed: string;
     creators: { keyId: KeyId; publicKey: PublicKey }[];
+    catalog: LoadedCatalogRef;
+    release: B64Hash;
+    params: { [name: string]: ParamValue };
+    // Signs the deploys that bring members from their pins to the release.
+    author?: OwnIdentity;
 };
 
 export type BoundCreateSchema = {
@@ -67,31 +81,39 @@ export type BoundCreateSchema = {
     creators: { keyId: KeyId; publicKey: PublicKey }[];
 };
 
-export type BoundCreateTableGroup = {
-    kind: 'create-tablegroup';
-    ast: CreateTableGroupStatement;
-    seed: string;
-    schema: ResolvedSchemaRef;
-    schemaVersion: Version;
-    bindings: { [name: string]: B64Hash };
-    initialRows: BoundInitialRow[];
+export type BoundCreateCatalog = {
+    kind: 'create-catalog';
+    ast: CreateCatalogStatement;
+    creators: { keyId: KeyId; publicKey: PublicKey }[];
+    author: OwnIdentity;
+    add: CatalogGroupDef[];
+    params: CatalogParamDecl[];
 };
 
-export type BoundInitialRow = {
-    table: string;
-    uuid: string;
-    values: { [column: string]: json.Literal };
+export type BoundAlterCatalog = {
+    kind: 'alter-catalog';
+    ast: AlterCatalogStatement;
+    catalog: LoadedCatalogRef;
+    spec: CatalogReleaseSpec;
+    author: OwnIdentity;
+    at: Version;
 };
 
-export type BoundAddMember = {
-    kind: 'add-member';
-    ast: AddMemberStatement;
-    member: 'schema' | 'tablegroup';
-    database: ResolvedDatabaseRef;
-    memberId: B64Hash;
+export type BoundUpdateCatalog = {
+    kind: 'update-catalog';
+    ast: UpdateCatalogStatement;
+    catalog: LoadedCatalogRef;
+    database: LoadedDatabaseRef;
+    release: B64Hash;
+    params: { [name: string]: ParamValue };
     note?: string;
     author?: OwnIdentity;
-    at: Version;
+};
+
+export type BoundUseDatabase = {
+    kind: 'use-database';
+    ast: UseDatabaseStatement;
+    database: ResolvedDatabaseRef;
 };
 
 export type BoundInsert = {
@@ -154,15 +176,6 @@ export type BoundAlterSchema = {
     at: Version;
 };
 
-export type BoundUpdateSchema = {
-    kind: 'update-schema';
-    ast: UpdateSchemaStatement;
-    group: ResolvedGroupRef;
-    version: Version;
-    author?: OwnIdentity;
-    at: Version;
-};
-
 export type BoundUpdateRef = {
     kind: 'update-ref';
     ast: UpdateRefStatement;
@@ -189,6 +202,7 @@ export type BoundLog = {
     at: Version;
     from: Version;
     explain: boolean;
+    deployLabels?: { [versionKey: string]: string };
 };
 
 export async function bind(statement: AstStatement, context: LangBindContext): Promise<Result<BoundStatement>> {
@@ -199,14 +213,16 @@ export async function bind(statement: AstStatement, context: LangBindContext): P
                 return ok(await bindCreateDatabase(statement, context));
             case 'create-schema':
                 return ok(await bindCreateSchema(statement, context));
-            case 'create-tablegroup':
-                return ok(await bindCreateTableGroup(statement, context));
-            case 'add-member':
-                return ok(await bindAddMember(statement, context));
+            case 'create-catalog':
+                return ok(await bindCreateCatalog(statement, context));
+            case 'alter-catalog':
+                return ok(await bindAlterCatalog(statement, context));
+            case 'update-catalog':
+                return ok(await bindUpdateCatalog(statement, context));
+            case 'use-database':
+                return ok({ kind: 'use-database', ast: statement, database: await context.resolveDatabase(statement.database) });
             case 'alter-schema':
                 return ok(await bindAlterSchema(statement, context));
-            case 'update-schema':
-                return ok(await bindUpdateSchema(statement, context));
             case 'update-ref':
                 return ok(await bindUpdateRef(statement, context));
             case 'insert':
@@ -235,7 +251,173 @@ async function bindCreateDatabase(ast: CreateDatabaseStatement, context: LangBin
     for (const expr of ast.creators) {
         creators.push(await resolveCreator(expr, context));
     }
-    return { kind: 'create-database', ast, seed: ast.seed ?? context.createSeed('rdb', ast.name), creators };
+    const catalog = await loadCatalog(ast.catalog, context);
+    const release = await selectRelease(ast.release, catalog, context);
+    const decls = (await catalog.catalog.getIndex()).releaseState(release).params;
+    const params = await bindParamAssignments(ast.params, decls, new Set(), context);
+    const author = await resolveEffectiveAuthor(ast.author, context);
+    const bound: BoundCreateDatabase = {
+        kind: 'create-database', ast, seed: ast.seed ?? context.createSeed('rdb', ast.name), creators, catalog, release, params,
+    };
+    if (author !== undefined) bound.author = author;
+    return bound;
+}
+
+async function bindCreateCatalog(ast: CreateCatalogStatement, context: LangBindContext): Promise<BoundCreateCatalog> {
+    const author = await resolveEffectiveAuthor(ast.author, context);
+    if (author === undefined) throw new Error('CREATE CATALOG requires an author identity: every catalog entry is signed');
+    const creators: { keyId: KeyId; publicKey: PublicKey }[] = [];
+    for (const expr of ast.creators) creators.push(await resolveCreator(expr, context));
+    if (creators.length === 0) creators.push({ keyId: author.keyId, publicKey: author.publicKey });
+    if (!creators.some((c) => c.keyId === author.keyId)) {
+        throw new Error('the CREATE CATALOG author must be one of its CREATORS');
+    }
+    if (!isValidSemver(ast.version)) throw new Error(`VERSION '${ast.version}' is not a semver (major.minor.patch)`);
+
+    const params = compileParamDecls(ast.params);
+    const paramMap = new Map(params.map((p) => [p.name, p]));
+    const scope = new CatalogDefScope();
+    const add: CatalogGroupDef[] = [];
+    for (const group of ast.groups) {
+        const def = await compileCatalogGroup(group, context, scope, paramMap);
+        if (add.some((d) => d.name === def.name)) throw new Error(`TABLEGROUP ${def.name} is defined twice`);
+        scope.add(def);
+        add.push(def);
+    }
+    return { kind: 'create-catalog', ast, creators, author, add, params };
+}
+
+async function bindAlterCatalog(ast: AlterCatalogStatement, context: LangBindContext): Promise<BoundAlterCatalog> {
+    const catalog = await loadCatalog(ast.catalog, context);
+    const author = await resolveEffectiveAuthor(ast.author, context);
+    if (author === undefined) throw new Error('ALTER CATALOG requires an author identity: every catalog entry is signed');
+    if (!catalog.catalog.isCreator(author.keyId)) throw new Error('the ALTER CATALOG author must be one of the catalog creators');
+    if (!isValidSemver(ast.version)) throw new Error(`VERSION '${ast.version}' is not a semver (major.minor.patch)`);
+
+    const at = await context.resolveVersion(ast.at ?? { kind: 'latest', span: ast.span }, {
+        kind: 'object', id: catalog.id, object: catalog.catalog,
+    });
+    const index = await catalog.catalog.getIndex();
+    const parents = index.parentsOf(at);
+    if (parents.length === 0) throw new Error('ALTER CATALOG ... AT must be at or above the catalog genesis');
+    for (const parent of parents) {
+        const parentVersion = index.releaseState(parent).version;
+        if (compareSemver(ast.version, parentVersion) <= 0) {
+            throw new Error(`VERSION '${ast.version}' must be greater than the parent release '${parentVersion}' (#${parent.slice(0, 8)})`);
+        }
+    }
+    const fold = index.foldParents(parents);
+
+    const params = compileParamDecls(ast.params);
+    const paramMap = new Map(fold.params);
+    for (const decl of params) {
+        if (paramMap.has(decl.name)) throw new Error(`param ':${decl.name}' is already declared by an earlier release`);
+        paramMap.set(decl.name, decl);
+    }
+    const { changes, add } = await compileReleaseChanges(ast.changes, fold, context, paramMap);
+
+    const spec: CatalogReleaseSpec = { version: ast.version };
+    if (Object.keys(changes).length > 0) spec.changes = changes;
+    if (add.length > 0) spec.add = add;
+    if (params.length > 0) spec.params = params;
+    if (ast.note !== undefined) spec.note = ast.note;
+    return { kind: 'alter-catalog', ast, catalog, spec, author, at };
+}
+
+async function bindUpdateCatalog(ast: UpdateCatalogStatement, context: LangBindContext): Promise<BoundUpdateCatalog> {
+    const catalog = await loadCatalog(ast.catalog, context);
+    const resolved = await context.resolveDatabase(ast.database);
+    if (resolved.db === undefined) throw new Error(`database '${resolved.id}' is not loaded`);
+    const database: LoadedDatabaseRef = { id: resolved.id, db: resolved.db };
+    if (database.db.getCatalogRef() !== catalog.id) {
+        throw new Error(`database '${database.db.getName() ?? database.id}' uses catalog '${database.db.getCatalogRef()}', not '${catalog.id}'`);
+    }
+    const release = await selectRelease(ast.release, catalog, context);
+    const author = await resolveEffectiveAuthor(ast.author, context);
+    if (database.db.getCreators().length > 0 && author === undefined) {
+        throw new Error('UPDATE CATALOG requires an author when the database declares creators');
+    }
+    const decls = (await catalog.catalog.getIndex()).releaseState(release).params;
+    const existing = new Set(Object.keys(await database.db.getParams()));
+    const params = await bindParamAssignments(ast.params, decls, existing, context);
+    const bound: BoundUpdateCatalog = { kind: 'update-catalog', ast, catalog, database, release, params };
+    if (ast.note !== undefined) bound.note = ast.note;
+    if (author !== undefined) bound.author = author;
+    return bound;
+}
+
+async function loadCatalog(ref: NameOrHashRef, context: LangBindContext): Promise<LoadedCatalogRef> {
+    const resolved = await context.resolveCatalog(ref);
+    if (resolved.catalog === undefined) throw new Error(`catalog '${resolved.id}' is not loaded`);
+    return { id: resolved.id, catalog: resolved.catalog };
+}
+
+// A semver or LATEST must match exactly one release; hashes name a release.
+async function selectRelease(
+    selector: ReleaseSelector | undefined,
+    catalog: LoadedCatalogRef,
+    context: LangBindContext,
+): Promise<B64Hash> {
+    const index = await catalog.catalog.getIndex();
+    const frontier = await (await catalog.catalog.getScopedDag()).getFrontier();
+    const describe = (hashes: B64Hash[]) => hashes
+        .map((h) => `'${index.releaseState(h).version}' (#${h.slice(0, 8)})`).join(', ');
+
+    if (selector === undefined || (selector.kind === 'version' && selector.version.kind === 'latest')) {
+        const maximal = index.maximalReleasesAt(frontier);
+        if (maximal.length !== 1) {
+            throw new Error(`the catalog has ${maximal.length} latest releases: ${describe(maximal)}; select one by hash`);
+        }
+        return maximal[0];
+    }
+    if (selector.kind === 'semver') {
+        const matches = index.findReleasesByVersion(selector.version, frontier);
+        if (matches.length === 0) throw new Error(`the catalog has no release '${selector.version}'`);
+        if (matches.length > 1) {
+            throw new Error(`release '${selector.version}' is ambiguous: ${matches.map((h) => `#${h.slice(0, 8)}`).join(', ')}; select one by hash`);
+        }
+        return matches[0];
+    }
+    const version = await context.resolveVersion(selector.version, { kind: 'object', id: catalog.id, object: catalog.catalog });
+    if (version.size !== 1) throw new Error('a release selection names exactly one release');
+    const hash = [...version][0];
+    if (!index.isRelease(hash)) throw new Error(`'#${hash.slice(0, 8)}' is not a release of the catalog`);
+    return hash;
+}
+
+// Params supplied at deploy time: each must be declared by the release, not
+// already set on the database, and of its declared type; together with the
+// existing ones they must cover every declaration.
+async function bindParamAssignments(
+    assignments: ParamAssignment[],
+    decls: Map<string, CatalogParamDecl>,
+    existing: Set<string>,
+    context: LangBindContext,
+): Promise<{ [name: string]: ParamValue }> {
+    const out: { [name: string]: ParamValue } = {};
+    for (const assignment of assignments) {
+        const decl = decls.get(assignment.name);
+        if (decl === undefined) throw new Error(`param ':${assignment.name}' is not declared by the release`);
+        if (existing.has(assignment.name)) throw new Error(`param ':${assignment.name}' is already set on the database`);
+        if (out[assignment.name] !== undefined) throw new Error(`param ':${assignment.name}' is set twice`);
+        out[assignment.name] = await bindParamValue(assignment.value, decl, context);
+    }
+    const missing = [...decls.keys()].filter((name) => !existing.has(name) && out[name] === undefined).sort();
+    if (missing.length > 0) {
+        throw new Error(`the release needs ${missing.map((n) => `:${n}`).join(', ')}; add WITH PARAMS (${missing.map((n) => `:${n} = ...`).join(', ')})`);
+    }
+    return out;
+}
+
+async function bindParamValue(expr: ValueExpr, decl: CatalogParamDecl, context: LangBindContext): Promise<ParamValue> {
+    if (decl.type === 'identity') {
+        const creator = await resolveCreator(expr, context);
+        return { identity: { keyId: creator.keyId, publicKey: serializePublicKeyToBase64(creator.publicKey) } };
+    }
+    const literal = asJsonLiteral(await resolveValue(expr, context));
+    const value: ParamValue = { value: canonicalEncodeValue(literal, { type: decl.type } as ColumnDef) };
+    if (!paramTypeFits(decl, value)) throw new Error(`param ':${decl.name}' needs a ${decl.type} value`);
+    return value;
 }
 
 async function bindCreateSchema(ast: CreateSchemaStatement, context: LangBindContext): Promise<BoundCreateSchema> {
@@ -251,52 +433,6 @@ async function bindCreateSchema(ast: CreateSchemaStatement, context: LangBindCon
         creators.push(await resolveCreator(expr, context));
     }
     return { kind: 'create-schema', ast, creators };
-}
-
-async function bindCreateTableGroup(ast: CreateTableGroupStatement, context: LangBindContext): Promise<BoundCreateTableGroup> {
-    const schema = await context.resolveSchema(ast.schema);
-    const schemaVersion = await context.resolveVersion(ast.schemaVersion, { kind: 'schema', id: schema.id, schema: schema.schema });
-    const bindings: { [name: string]: B64Hash } = {};
-    for (const binding of ast.bindings) {
-        bindings[binding.name] = (await context.resolveGroup(binding.group)).id;
-    }
-    const initialRows: BoundInitialRow[] = [];
-    const schemaView = schema.schema !== undefined
-        ? await schema.schema.getView(schemaVersion, schemaVersion)
-        : undefined;
-    for (const row of ast.initialRows) {
-        const { uuid, values } = await bindInitialRowValues(row.values, context);
-        const columns = schemaView?.getTable(row.table)?.columns ?? {};
-        initialRows.push({ table: row.table, uuid, values: canonicalEncodeRowValues(values, columns) });
-    }
-    return {
-        kind: 'create-tablegroup',
-        ast,
-        seed: ast.seed ?? context.createSeed('group', ast.name),
-        schema,
-        schemaVersion,
-        bindings,
-        initialRows,
-    };
-}
-
-async function bindAddMember(ast: AddMemberStatement, context: LangBindContext): Promise<BoundAddMember> {
-    const database = await context.resolveDatabase(ast.database);
-    const memberId = ast.member === 'schema'
-        ? (await context.resolveSchema(ast.target)).id
-        : (await context.resolveGroup(ast.target)).id;
-    const at = await context.resolveVersion(ast.at, { kind: 'object', id: database.id, object: database.db });
-    if (database.db !== undefined && database.db.getCreators().length > 0 && ast.author === undefined) {
-        throw new Error(`ADD ${ast.member === 'schema' ? 'SCHEMA' : 'TABLEGROUP'} requires BY when the database declares creators`);
-    }
-    const author = await resolveEffectiveAuthor(ast.author, context);
-    if (database.db !== undefined && database.db.getCreators().length > 0 && author === undefined) {
-        throw new Error(`ADD ${ast.member === 'schema' ? 'SCHEMA' : 'TABLEGROUP'} requires an author when the database declares creators`);
-    }
-    const bound: BoundAddMember = { kind: 'add-member', ast, member: ast.member, database, memberId, at };
-    if (ast.note !== undefined) bound.note = ast.note;
-    if (author !== undefined) bound.author = author;
-    return bound;
 }
 
 // Resolve the effective author of an authored statement: an explicit `BY`
@@ -414,18 +550,6 @@ async function bindAlterSchema(ast: AlterSchemaStatement, context: LangBindConte
     return bound;
 }
 
-async function bindUpdateSchema(ast: UpdateSchemaStatement, context: LangBindContext): Promise<BoundUpdateSchema> {
-    const group = await context.resolveGroup(ast.group);
-    if (group.group === undefined) throw new Error('UPDATE SCHEMA target group is not loaded');
-    const schema = await context.resolveSchema(ast.schema);
-    const version = await context.resolveVersion(ast.version, { kind: 'schema', id: schema.id, schema: schema.schema });
-    const author = await resolveEffectiveAuthor(ast.author, context);
-    const at = await context.resolveVersion(ast.at, { kind: 'group', id: group.id, group: group.group });
-    const bound: BoundUpdateSchema = { kind: 'update-schema', ast, group, version, at };
-    if (author !== undefined) bound.author = author;
-    return bound;
-}
-
 async function bindUpdateRef(ast: UpdateRefStatement, context: LangBindContext): Promise<BoundUpdateRef> {
     const group = await context.resolveGroup(ast.group);
     if (group.group === undefined) throw new Error('UPDATE REF target group is not loaded');
@@ -483,6 +607,7 @@ async function bindSelect(ast: SelectStatement, context: LangBindContext): Promi
 
 async function resolveTableRef(ref: TableRef, context: LangBindContext): Promise<ResolvedTableRef> {
     if (ref.group !== undefined) return context.resolveTable(ref);
+    // A bare table name resolves in the current group.
     const group = await context.resolveDefaultGroup?.();
     if (group === undefined) {
         throw new Error(`Table '${ref.table}' requires a group qualifier; use group.table or set a current group`);
@@ -499,6 +624,7 @@ function versionScopeForLogTarget(target: ResolvedLogTarget): VersionScope {
         case 'schema':
             return { kind: 'schema', id: target.id, schema: target.object };
         case 'database':
+        case 'catalog':
             return { kind: 'object', id: target.id, object: target.object };
     }
 }
@@ -519,7 +645,12 @@ async function bindLog(ast: LogStatement, context: LangBindContext): Promise<Bou
     const from = ast.at === undefined && defaultView?.from !== undefined
         ? defaultView.from
         : await context.resolveVersion(ast.from ?? ast.at, fromScope);
-    return { kind: 'log', ast, target, at, from, explain: ast.explain === true };
+    const bound: BoundLog = { kind: 'log', ast, target, at, from, explain: ast.explain === true };
+    if (target.kind === 'group' && context.resolveDeployLabels !== undefined) {
+        const labels = await context.resolveDeployLabels(target.id);
+        if (labels !== undefined) bound.deployLabels = labels;
+    }
+    return bound;
 }
 
 async function bindInsertColumns(
@@ -559,24 +690,6 @@ async function bindInsertColumns(
         }
     }
     return { uuid: uuid ?? context.createUuid(), values: canonicalEncodeRowValues(values, columnDefs) };
-}
-
-async function bindInitialRowValues(
-    pairs: { column: string; value: ValueExpr }[],
-    context: LangBindContext,
-): Promise<{ uuid: string; values: { [column: string]: json.Literal } }> {
-    let uuid: string | undefined;
-    const values: { [column: string]: json.Literal } = {};
-    for (const pair of pairs) {
-        if (pair.column === PSEUDO_COLUMN_UUID) {
-            const lit = asJsonLiteral(await resolveValue(pair.value, context));
-            if (typeof lit !== 'string') throw new Error('uuid pseudo-column requires a string value');
-            uuid = lit;
-            continue;
-        }
-        values[pair.column] = asJsonLiteral(await resolveValue(pair.value, context));
-    }
-    return { uuid: uuid ?? context.createUuid(), values };
 }
 
 // The declared column defs of a group table at a version, for canonical value

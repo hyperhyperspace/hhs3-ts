@@ -1,15 +1,11 @@
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { createBasicCrypto, createIdentity, HASH_SHA256, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 
-import { createMockRContext } from "../../rdb/test/mock_rcontext.js";
-import {
-    RDbImpl, rDbFactory, RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory,
-} from "@hyper-hyper-space/hhs3_rdb";
-
 import { bind } from "../src/bind/bind.js";
 import { execute } from "../src/exec/execute.js";
 import { parseStatement } from "../src/syntax/parser.js";
-import { createTestBindContext, TestBindContext } from "./mock_bind_context.js";
+import type { TestBindContext } from "./mock_bind_context.js";
+import { createLangEnv } from "./lang_env.js";
 
 const crypto = createBasicCrypto();
 
@@ -35,73 +31,39 @@ async function expectBindFailure(sql: string, context: TestBindContext, messageI
 }
 
 async function createLocalFkEnv() {
-    const ctx = createMockRContext({ selfValidate: true });
-    ctx.getRegistry().register(RDbImpl.typeId, rDbFactory);
-    ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
-    ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
-
     const admin = await createIdentity(SIGNING_ED25519, crypto.hash(HASH_SHA256));
-    const lang = createTestBindContext(ctx, { admin, me: admin });
-
-    const schemaPlan = await execute(await parseBind(`
+    const env = await createLangEnv({ vars: { admin, me: admin } });
+    await env.run(`
         CREATE SCHEMA local_fk CREATORS ($admin) AS (
           TABLE orders (id string PUB) ALLOW all IF true,
           TABLE lines (orderRef string REFERENCES orders, qty integer) ALLOW all IF true
         );
-    `, lang));
-    if (!schemaPlan.ok || schemaPlan.value.kind !== 'create-plan') throw new Error('schema create failed');
-    const schema = await ctx.createObject(schemaPlan.value.plan.payload) as RSchemaImpl;
-    lang.registerSchema('local_fk', schema);
-
-    const groupPlan = await execute(await parseBind('CREATE TABLEGROUP local_fk_group USING SCHEMA local_fk;', lang));
-    if (!groupPlan.ok || groupPlan.value.kind !== 'create-plan') throw new Error('group create failed');
-    const group = await ctx.createObject(groupPlan.value.plan.payload) as RTableGroupImpl;
-    lang.registerGroup('local_fk_group', group);
-
-    return { ctx, lang, group };
+        CREATE CATALOG local_fk_catalog VERSION '1.0.0' AS (TABLEGROUP local_fk_group USING SCHEMA local_fk);
+        CREATE DATABASE local_fk_db USING CATALOG local_fk_catalog;
+    `);
+    return { ctx: env.ctx, lang: env.lang, group: await env.group('local_fk_group') };
 }
 
 async function createCrossGroupFkEnv() {
-    const ctx = createMockRContext({ selfValidate: true });
-    ctx.getRegistry().register(RDbImpl.typeId, rDbFactory);
-    ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
-    ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
-
     const admin = await createIdentity(SIGNING_ED25519, crypto.hash(HASH_SHA256));
-    const lang = createTestBindContext(ctx, { admin, me: admin });
-
-    const usersSchemaPlan = await execute(await parseBind(`
+    const env = await createLangEnv({ vars: { admin, me: admin } });
+    await env.run(`
         CREATE SCHEMA users_schema CREATORS ($admin) AS (
           TABLE identities (name string) ALLOW all IF true
         );
-    `, lang));
-    if (!usersSchemaPlan.ok || usersSchemaPlan.value.kind !== 'create-plan') throw new Error('users schema create failed');
-    const usersSchema = await ctx.createObject(usersSchemaPlan.value.plan.payload) as RSchemaImpl;
-    lang.registerSchema('users_schema', usersSchema);
-
-    const usersGroupPlan = await execute(await parseBind('CREATE TABLEGROUP users USING SCHEMA users_schema;', lang));
-    if (!usersGroupPlan.ok || usersGroupPlan.value.kind !== 'create-plan') throw new Error('users group create failed');
-    const usersGroup = await ctx.createObject(usersGroupPlan.value.plan.payload) as RTableGroupImpl;
-    lang.registerGroup('users', usersGroup);
-
-    const appSchemaPlan = await execute(await parseBind(`
         CREATE SCHEMA app_schema CREATORS ($admin) AS (
           TABLE profiles (
             ownerId string REFERENCES users.identities,
             label string
           ) ALLOW all IF true
         );
-    `, lang));
-    if (!appSchemaPlan.ok || appSchemaPlan.value.kind !== 'create-plan') throw new Error('app schema create failed');
-    const appSchema = await ctx.createObject(appSchemaPlan.value.plan.payload) as RSchemaImpl;
-    lang.registerSchema('app_schema', appSchema);
-
-    const appGroupPlan = await execute(await parseBind('CREATE TABLEGROUP app USING SCHEMA app_schema BIND users => users;', lang));
-    if (!appGroupPlan.ok || appGroupPlan.value.kind !== 'create-plan') throw new Error('app group create failed');
-    const appGroup = await ctx.createObject(appGroupPlan.value.plan.payload) as RTableGroupImpl;
-    lang.registerGroup('app', appGroup);
-
-    return { ctx, lang, usersGroup, appGroup };
+        CREATE CATALOG app_catalog VERSION '1.0.0' AS (
+          TABLEGROUP users USING SCHEMA users_schema,
+          TABLEGROUP app USING SCHEMA app_schema BIND users => users
+        );
+        CREATE DATABASE app_db USING CATALOG app_catalog;
+    `);
+    return { ctx: env.ctx, lang: env.lang, usersGroup: await env.group('users'), appGroup: await env.group('app') };
 }
 
 export const fkHashValuesTests = {

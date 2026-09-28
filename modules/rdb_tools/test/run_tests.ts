@@ -132,7 +132,8 @@ const tests = [
                 const create = await runMetaCommand(session, '\\help commands CREATE');
                 assertTrue(create.output?.includes('CREATE DATABASE') === true, 'CREATE DATABASE in filtered help');
                 assertTrue(create.output?.includes('CREATE SCHEMA') === true, 'CREATE SCHEMA in filtered help');
-                assertTrue(create.output?.includes('CREATE TABLEGROUP') === true, 'CREATE TABLEGROUP in filtered help');
+                assertTrue(create.output?.includes('CREATE CATALOG') === true, 'CREATE CATALOG in filtered help');
+                assertTrue(create.output?.includes('CREATE TABLEGROUP') !== true, 'CREATE TABLEGROUP is gone');
                 assertTrue(create.output?.startsWith('COMMON') !== true, 'filtered help omits COMMON block');
                 assertTrue(create.output?.includes('--- common ---') !== true, 'filtered help omits common section');
 
@@ -166,15 +167,15 @@ const tests = [
                 const setup = await runScript(session, databaseSetupScript());
                 assertEquals(setup.exitCode, 0, setup.output);
                 const full = await runMetaCommand(session, '\\dump database app;');
-                assertTrue(full.output?.includes('CREATE DATABASE app') === true, 'full dump header');
-                assertTrue(full.output?.includes('ADD SCHEMA') === true, 'full dump membership');
-                assertTrue(full.output?.includes('INSERT INTO products') === true, 'full dump row ops');
+                assertTrue(full.output?.includes('CREATE CATALOG shop_catalog') === true, 'full dump starts with the catalog');
+                assertTrue(full.output?.includes('CREATE DATABASE app USING CATALOG') === true, 'full dump header');
+                assertTrue(full.output?.includes('USE DATABASE') === true, 'full dump selects its database');
+                assertTrue(full.output?.includes('INSERT INTO shop_prod.products') === true, 'full dump row ops');
 
                 const schema = await runMetaCommand(session, '\\dump database app schema;');
-                assertTrue(schema.output?.includes('CREATE DATABASE app') === true, 'schema dump header');
-                assertTrue(schema.output?.includes('ADD SCHEMA shop TO app') === true, 'schema dump named ADD SCHEMA');
-                assertTrue(schema.output?.includes('ADD TABLEGROUP shop_prod TO app') === true, 'schema dump named ADD TABLEGROUP');
-                assertTrue(schema.output?.includes('INSERT INTO products') !== true, 'schema dump omits row ops');
+                assertTrue(schema.output?.includes('CREATE DATABASE app USING CATALOG shop_catalog') === true, 'schema dump header');
+                assertTrue(schema.output?.includes('TABLEGROUP shop_prod USING SCHEMA shop') === true, 'schema dump names the catalog group');
+                assertTrue(schema.output?.includes('INSERT INTO') !== true, 'schema dump omits row ops');
             });
         },
     },
@@ -204,7 +205,7 @@ const tests = [
                 assertTrue(current.output?.includes('INSERT INTO products') === true, 'current group insert op');
 
                 const genesis = await runMetaCommand(session, `\\dump op shop_prod #${groupPrefix}`);
-                assertTrue(genesis.output?.includes('CREATE TABLEGROUP shop_prod') === true, 'genesis create op');
+                assertTrue(genesis.output?.includes('-- TABLEGROUP shop_prod') === true, 'the genesis renders as a comment');
 
                 let badHashFailed = false;
                 try {
@@ -274,7 +275,9 @@ const tests = [
 
                 const alter = await runCommand(session, 'ALTER SCHEMA shop AS (ADD COLUMN products.tag string NULL);');
                 assertEquals(alter.exitCode, 0, alter.output);
-                const deploy = await runCommand(session, 'UPDATE SCHEMA shop TO LATEST ON shop_prod;');
+                const release = await runCommand(session, "ALTER CATALOG shop_catalog VERSION '1.1.0' AS (UPDATE SCHEMA shop TO LATEST ON shop_prod);");
+                assertEquals(release.exitCode, 0, release.output);
+                const deploy = await runCommand(session, "UPDATE CATALOG shop_catalog TO '1.1.0' ON shop_db;");
                 assertEquals(deploy.exitCode, 0, deploy.output);
 
                 const selected = await runCommand(session, 'SELECT * FROM shop_prod.products;');
@@ -374,9 +377,10 @@ const tests = [
                 const result = await runScript(session, setupScript());
                 assertEquals(result.exitCode, 0, result.output);
 
+                await runMetaCommand(session, '\\use group shop_prod');
                 const selected = await runCommand(session, "SELECT sku, name FROM products;");
                 assertEquals(selected.exitCode, 0, selected.output);
-                assertTrue(selected.output.includes('Widget'), 'script-created current group selects bare table');
+                assertTrue(selected.output.includes('Widget'), 'the current group selects a bare table');
 
                 const newSession = new WorkspaceSession({ workspace: session.workspace, keystore: session.keystore });
                 const missingGroup = await runCommand(newSession, "SELECT sku, name FROM products;");
@@ -398,12 +402,12 @@ const tests = [
             await withSession(async (session) => {
                 const result = await runScript(session, setupScript());
                 assertEquals(result.exitCode, 0, result.output);
-                assertEquals(promptForSession(session), 'rdb:shop_prod:alice> ', 'prompt uses friendly names');
+                assertEquals(promptForSession(session), 'rdb:shop_db:alice> ', 'prompt shows the current database');
 
                 const group = session.workspace.roots.list('group')[0];
                 await runMetaCommand(session, `\\alias group prod #${group.id.slice(0, 10)}`);
                 await runMetaCommand(session, '\\use group prod');
-                assertEquals(promptForSession(session), 'rdb:shop_prod:alice> ', 'prompt uses canonical group name via alias');
+                assertEquals(promptForSession(session), 'rdb:shop_db.shop_prod:alice> ', 'prompt uses canonical db.group names via alias');
             });
         },
     },
@@ -629,6 +633,7 @@ const tests = [
                 const cutHash = opHashes[opHashes.length - 1];
                 await runMetaCommand(session, `\\alias version cut #${cutHash.slice(0, 10)}`);
 
+                await runMetaCommand(session, '\\use group shop_prod');
                 const view = await runCommand(session, 'SET VIEW AT {cut};');
                 assertEquals(view.exitCode, 0, view.output);
 
@@ -705,7 +710,7 @@ const tests = [
                 assertTrue(dumpText.includes('\\alias version '), 'dump defines version aliases');
                 assertTrue(dumpText.includes('BY $alice'), 'dump uses aliased BY author');
                 assertTrue(dumpText.includes('_ver'), 'dump uses version alias names');
-                assertTrue(dumpText.includes('INSERT INTO products'), 'dump includes row ops');
+                assertTrue(dumpText.includes('INSERT INTO shop_prod.products'), 'dump includes row ops, qualified by member name');
                 await workspace1.close();
 
                 const workspace2 = await Workspace.open({ path: join(dir, 'replay.db') });
@@ -1409,20 +1414,21 @@ const tests = [
         },
     },
     {
-        name: '[RDB_TOOLS46] bind-author retry succeeds for ADD TABLEGROUP',
+        name: '[RDB_TOOLS46] bind-author retry succeeds for UPDATE CATALOG',
         invoke: async () => {
             await withSession(async (session) => {
-                const setup = await runScript(session, addMemberBindRetrySetupScript());
+                const setup = await runScript(session, updateCatalogBindRetrySetupScript());
                 assertEquals(setup.exitCode, 0, setup.output);
 
                 await runMetaCommand(session, '\\author nobody');
-                const added = await runCommandInteractive(
+                const deployed = await runCommandInteractive(
                     session,
-                    'ADD TABLEGROUP shop_prod TO app;',
+                    "UPDATE CATALOG shop_catalog TO '1.1.0' ON app;",
                     ['Y'],
                 );
-                assertEquals(added.exitCode, 0, added.output);
-                assertTrue(!added.output.includes('BIND_UNKNOWN_NAME'), added.output);
+                assertEquals(deployed.exitCode, 0, deployed.output);
+                assertTrue(!deployed.output.includes('BIND_UNKNOWN_NAME'), deployed.output);
+                assertTrue(deployed.output.includes('deployed shop_prod'), deployed.output);
             });
         },
     },
@@ -1709,7 +1715,8 @@ CREATE SCHEMA voidtest CREATORS ($me) AS (
     name string
   ) ALLOW insert IF EXISTS caps WHERE label = 'grant'
 );
-CREATE TABLEGROUP void_g USING SCHEMA voidtest;
+CREATE CATALOG void_catalog VERSION '1.0.0' AS ( TABLEGROUP void_g USING SCHEMA voidtest );
+CREATE DATABASE void_db USING CATALOG void_catalog;
 INSERT INTO void_g.caps (uuid, label) VALUES ('c-1', 'grant');
 `;
 }
@@ -1724,7 +1731,8 @@ CREATE SCHEMA shop CREATORS ($me) AS (
     name string
   )
 );
-CREATE TABLEGROUP shop_prod USING SCHEMA shop;
+CREATE CATALOG shop_catalog VERSION '1.0.0' AS ( TABLEGROUP shop_prod USING SCHEMA shop );
+CREATE DATABASE shop_db USING CATALOG shop_catalog;
 INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');
 SELECT sku, name FROM shop_prod.products;
 LOG shop_prod LIMIT 5;
@@ -1738,14 +1746,17 @@ function crossGroupSetupScript(): string {
 CREATE SCHEMA users_schema CREATORS ($me) AS (
   TABLE identities (name string) ALLOW all IF true
 );
-CREATE TABLEGROUP users USING SCHEMA users_schema;
 CREATE SCHEMA shop CREATORS ($me) AS (
   TABLE orders (
     customer string REFERENCES users.identities,
     label string
   ) ALLOW all IF true
 );
-CREATE TABLEGROUP shop_prod USING SCHEMA shop BIND users => users;
+CREATE CATALOG shop_catalog VERSION '1.0.0' AS (
+  TABLEGROUP users USING SCHEMA users_schema,
+  TABLEGROUP shop_prod USING SCHEMA shop BIND users => users
+);
+CREATE DATABASE shop_db USING CATALOG shop_catalog;
 `;
 }
 
@@ -1760,10 +1771,13 @@ CREATE SCHEMA users_schema CREATORS ($me) AS (
     grantee string PUB
   ) ALLOW insert IF EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
 );
-CREATE TABLEGROUP user USING SCHEMA users_schema
-  WITH ROWS (
-    caps (uuid='61169c8a-4106-43a1-8d37-39373c07da7a', label='manager', grantee=$me)
-  );
+CREATE CATALOG user_catalog VERSION '1.0.0' AS (
+  TABLEGROUP user USING SCHEMA users_schema
+    WITH ROWS (
+      caps (label='manager', grantee=$me)
+    )
+);
+CREATE DATABASE user_db USING CATALOG user_catalog;
 \\key create bob correct
 `;
 }
@@ -1776,17 +1790,20 @@ CREATE SCHEMA users_schema CREATORS ($me) AS (
   TABLE identities (name string) ALLOW all IF true,
   TABLE caps (label string PUB, grantee string PUB) ALLOW all IF true
 );
-CREATE TABLEGROUP users USING SCHEMA users_schema;
-INSERT INTO users.caps (label, grantee) VALUES ('manager', $me);
 CREATE SCHEMA doc_schema CREATORS ($me) AS (
   TABLE notes (
     body string NULL REFERENCES users.identities,
     label string
   ) ALLOW all IF true
 );
-CREATE TABLEGROUP doc USING SCHEMA doc_schema
-  BIND users => users
-  ALLOW UPDATE REF users IF EXISTS caps WHERE label = 'manager' AND grantee = $author;
+CREATE CATALOG doc_catalog VERSION '1.0.0' AS (
+  TABLEGROUP users USING SCHEMA users_schema,
+  TABLEGROUP doc USING SCHEMA doc_schema
+    BIND users => users
+    ALLOW UPDATE REF users IF EXISTS caps WHERE label = 'manager' AND grantee = $author
+);
+CREATE DATABASE doc_db USING CATALOG doc_catalog;
+INSERT INTO users.caps (label, grantee) VALUES ('manager', $me);
 `;
 }
 
@@ -1798,18 +1815,21 @@ CREATE SCHEMA users_schema CREATORS ($me) AS (
   TABLE identities (name string) ALLOW all IF true,
   TABLE caps (label string PUB, grantee string PUB) ALLOW all IF true
 );
-CREATE TABLEGROUP users USING SCHEMA users_schema;
-\\key create bob correct
-INSERT INTO users.caps (label, grantee) VALUES ('manager', $bob);
 CREATE SCHEMA doc_schema CREATORS ($me) AS (
   TABLE notes (
     body string NULL REFERENCES users.identities,
     label string
   ) ALLOW all IF true
 );
-CREATE TABLEGROUP doc USING SCHEMA doc_schema
-  BIND users => users
-  ALLOW UPDATE REF users IF EXISTS caps WHERE label = 'manager' AND grantee = $author;
+CREATE CATALOG doc_catalog VERSION '1.0.0' AS (
+  TABLEGROUP users USING SCHEMA users_schema,
+  TABLEGROUP doc USING SCHEMA doc_schema
+    BIND users => users
+    ALLOW UPDATE REF users IF EXISTS caps WHERE label = 'manager' AND grantee = $author
+);
+CREATE DATABASE doc_db USING CATALOG doc_catalog;
+\\key create bob correct
+INSERT INTO users.caps (label, grantee) VALUES ('manager', $bob);
 `;
 }
 
@@ -1823,24 +1843,26 @@ CREATE SCHEMA user CREATORS ($me) AS (
     grantee identity PUB
   )
 );
-CREATE TABLEGROUP user USING SCHEMA user;
+CREATE CATALOG user_catalog VERSION '1.0.0' AS ( TABLEGROUP user USING SCHEMA user );
+CREATE DATABASE user_db USING CATALOG user_catalog;
 INSERT INTO user.caps (label, grantee) VALUES ('manager', $me);
 `;
 }
 
-function addMemberBindRetrySetupScript(): string {
+function updateCatalogBindRetrySetupScript(): string {
     return `
 \\key create alice correct
 \\author alice
-CREATE DATABASE app CREATORS ($me);
 CREATE SCHEMA shop CREATORS ($me) AS (
   TABLE products (
     sku string PUB READONLY,
     name string
   )
 );
-CREATE TABLEGROUP shop_prod USING SCHEMA shop;
-ADD SCHEMA shop TO app BY $alice;
+CREATE CATALOG shop_catalog VERSION '1.0.0' AS ( TABLEGROUP shop_prod USING SCHEMA shop );
+CREATE DATABASE app USING CATALOG shop_catalog CREATORS ($me) BY $alice;
+ALTER SCHEMA shop AS (ADD COLUMN products.tag string NULL);
+ALTER CATALOG shop_catalog VERSION '1.1.0' AS ( UPDATE SCHEMA shop TO LATEST ON shop_prod ) BY $alice;
 `;
 }
 
@@ -1848,27 +1870,25 @@ function editorProjectionSetupScript(): string {
     return `
 \\key create alice correct
 \\author alice
-CREATE DATABASE app CREATORS ($me);
 CREATE SCHEMA users_schema CREATORS ($me) AS (
   TABLE caps (
     label string PUB,
     grantee string PUB
   ) ALLOW all IF true
 );
-CREATE TABLEGROUP user USING SCHEMA users_schema
-  WITH ROWS (
-    caps (uuid='61169c8a-4106-43a1-8d37-39373c07da7a', label='manager', grantee=$me)
-  );
 CREATE SCHEMA doc_schema CREATORS ($me) AS (
   TABLE pages (
     title string
   ) ALLOW insert IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author
 );
-CREATE TABLEGROUP doc USING SCHEMA doc_schema BIND user => user;
-ADD SCHEMA users_schema TO app BY $alice;
-ADD SCHEMA doc_schema TO app BY $alice;
-ADD TABLEGROUP user TO app BY $alice;
-ADD TABLEGROUP doc TO app BY $alice;
+CREATE CATALOG editor VERSION '1.0.0' PARAMS (:manager identity) AS (
+  TABLEGROUP user USING SCHEMA users_schema
+    WITH ROWS (
+      caps (label='manager', grantee=:manager)
+    ),
+  TABLEGROUP doc USING SCHEMA doc_schema BIND user => user
+);
+CREATE DATABASE app USING CATALOG editor CREATORS ($me) WITH PARAMS (:manager = $me) BY $alice;
 `;
 }
 
@@ -1876,16 +1896,14 @@ function databaseSetupScript(): string {
     return `
 \\key create alice correct
 \\author alice
-CREATE DATABASE app;
 CREATE SCHEMA shop CREATORS ($me) AS (
   TABLE products (
     sku string PUB READONLY,
     name string
   )
 );
-CREATE TABLEGROUP shop_prod USING SCHEMA shop;
-ADD SCHEMA shop TO app;
-ADD TABLEGROUP shop_prod TO app;
+CREATE CATALOG shop_catalog VERSION '1.0.0' AS ( TABLEGROUP shop_prod USING SCHEMA shop );
+CREATE DATABASE app USING CATALOG shop_catalog;
 INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');
 `;
 }

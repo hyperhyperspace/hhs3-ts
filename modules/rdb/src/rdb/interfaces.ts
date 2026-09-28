@@ -1,31 +1,55 @@
 // Public RDb interfaces.
 //
-// RDb is the deployment sync root: an advisory, monotonic registry of member
-// RSchemas and RTableGroups. startSync subscribes to the RDb DAG and reconciles
-// a fan-out of sync sessions for members and their transitive references;
-// later membership ops keep that set updated until stopSync.
+// RDb is the sync root of a database deployed from a catalog: its DAG records
+// the deployed catalog releases and their params, and its member groups are
+// computed from them. startSync subscribes to the RDb DAG and reconciles a
+// fan-out of sync sessions for the catalog, its schemas and the member groups;
+// the adoption policy admits deployed releases into the members' local gates.
 
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { OwnIdentity, KeyId } from "@hyper-hyper-space/hhs3_crypto";
 import type { RObject, SyncableObject, Version } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RDbRuntimeConfig } from "./rdb.js";
-import type { SchemaCreator } from "./payload.js";
+import type { ParamValue, SchemaCreator } from "./payload.js";
+import type { RDbResolution } from "./resolve.js";
+import type { CreateTableGroupPayload } from "../rtable_group/payload.js";
+import type { RCatalog } from "../rcatalog/interfaces.js";
 
 export interface RDb extends RObject, SyncableObject {
-    // Membership writers (monotonic; optional free-form note, never resolved).
-    // When the RDb declares creators, author is required and the op is signed.
-    addSchema(schemaId: B64Hash, note?: string, author?: OwnIdentity, at?: Version): Promise<B64Hash>;
-    addGroup(groupId: B64Hash, note?: string, author?: OwnIdentity, at?: Version): Promise<B64Hash>;
-
     // Create-time deployment authority (empty when unsigned / open mode).
     getCreators(): SchemaCreator[];
     isCreator(keyId: KeyId): boolean;
 
-    // Membership resolution (add-only union by id).
-    getMemberSchemas(): Promise<B64Hash[]>;
-    getMemberGroups(): Promise<B64Hash[]>;
+    getName(): string | undefined;
+    getCatalogRef(): B64Hash;
+    getCatalog(): Promise<RCatalog | undefined>;
 
-    // Tune mesh / backend label / fetch timeout used by the sync fan-out.
+    // Deploys a later release of the catalog (forward only), with the params
+    // it first needs. When the RDb declares creators, author is required.
+    updateCatalog(release: B64Hash, params?: { [name: string]: ParamValue }, author?: OwnIdentity, note?: string, at?: Version): Promise<B64Hash>;
+
+    resolve(at?: Version): Promise<RDbResolution>;
+    getDeployedReleases(at?: Version): Promise<B64Hash[]>;
+    getDeployHistory(at?: Version): Promise<B64Hash[]>;
+    getParams(at?: Version): Promise<{ [name: string]: ParamValue }>;
+
+    // Computed membership.
+    getMemberGroupNames(at?: Version): Promise<Map<string, B64Hash>>;
+    getMemberGroupPayloads(at?: Version): Promise<Map<B64Hash, CreateTableGroupPayload>>;
+    getMemberGroups(): Promise<B64Hash[]>;
+    getMemberSchemas(): Promise<B64Hash[]>;
+
+    // Creates the computed member groups (and their gates) that are absent
+    // and whose genesis deps are present. Returns the created group ids.
+    materializeMembers(): Promise<B64Hash[]>;
+
+    // Adoption.
+    getAdoptionRange(): Promise<string>;
+    setAdoptionRange(range: string): Promise<void>;
+    getAdoptedReleases(): Promise<B64Hash[]>;
+    adopt(): Promise<void>;
+
+    // Tune mesh / backend label / fetch timeout / adoption range.
     setRuntimeConfig(config: RDbRuntimeConfig): void;
 }

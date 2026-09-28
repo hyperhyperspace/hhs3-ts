@@ -26,6 +26,8 @@ A table group is the unit of atomicity, snapshot, observation, and composition. 
 
 A group pins one schema version. The schema is a separate object; the group observes it at a fixed version, advanced forward only (a deploy). Pinning at the group is the only path from group to schema: every table is interpreted under the same version, and tables cannot drift onto different schema versions through different references.
 
+Groups are not created one by one. A database is deployed from a **catalog**, and its groups are computed from the catalog's releases (see [Databases, catalogs and releases](#databases-catalogs-and-releases)).
+
 ## Foreign references
 
 A group depends on another — a cross-group foreign key, a shared capability table — by observing it at a chosen version and advancing that observation forward. The dependency is recorded as data, never implicit. This is MVT's [State-Observation-as-Data](../mvt#composability-soad-architecture) pattern: the observed group is unaware of its observers, the dependency graph stays acyclic, and data is the integration surface between applications.
@@ -58,10 +60,15 @@ CREATE SCHEMA shop AS (
   ) ALLOW insert IF EXISTS users.caps WHERE label = 'writer' AND grantee = $author
 );
 
-CREATE TABLEGROUP shop_prod USING SCHEMA shop AT {#schemaVersion}
-  BIND users => users
-  USING IDENTITIES users.identities
-  ALLOW UPDATE SCHEMA IF EXISTS users.caps WHERE label = 'deployer' AND grantee = $author;
+CREATE CATALOG store VERSION '1.0.0' AS (
+  TABLEGROUP users USING SCHEMA users_schema USING IDENTITIES identities,
+  TABLEGROUP shop_prod USING SCHEMA shop AT LATEST
+    BIND users => users
+    USING IDENTITIES users.identities
+    ALLOW DEPLOY IF EXISTS users.caps WHERE label = 'deployer' AND grantee = $author
+) BY $dev;
+
+CREATE DATABASE store_prod USING CATALOG store AT '1.0.0' CREATORS ($admin) BY $admin;
 
 INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget') BY $alice;
 SELECT sku, name FROM shop_prod.products WHERE name LIKE 'Wid%' ORDER BY sku LIMIT 10;
@@ -77,14 +84,36 @@ LOG shop_prod LIMIT 20;
 
 ## Building blocks
 
-Rdb is four content-addressed MVT types. C-SQL and the adapter are the intended interfaces; the types are the vocabulary the rest of the docs use.
+Rdb is six content-addressed MVT types. C-SQL and the adapter are the intended interfaces; the types are the vocabulary the rest of the docs use.
 
 - **RSchema** — the specification for one table group: tables, columns, foreign keys, restrictions, and migration rules. A standalone object with its own history; it evolves independently and is reusable by many groups. Spec authority belongs to its signed creators.
+- **RCatalog** — a developer-signed DAG of semver releases describing a database's table groups: which schema each group uses at which version, its bindings, gates, identity provider and genesis rows (with deploy-time `:params`). See [Databases, catalogs and releases](#databases-catalogs-and-releases).
 - **RTableGroup** — the unit of atomicity, snapshot, observation, and composition. Pins a schema version, binds and observes foreign groups, and is where deploys and cross-group references happen.
 - **RTable** — a member table on a scoped projection of its group's history. Rows are write-once identities with permanent deletes; both row liveness and per-field column values are pinned to the structural table/column incarnation active at write time (per-field last-writer-wins within that incarnation), so a drop+re-add resets the table or column. See [Schema evolution and incarnations](#schema-evolution-and-incarnations).
-- **RDb** — the deployment sync root: records member schemas and groups and ensures they and their transitive references are present and syncing in the replica.
+- **RDb** — the deployment sync root: records which catalog releases were deployed and with which params, computes its member groups from them, and keeps the catalog, its schemas and the members present and syncing in the replica.
+- **RDeployGate** — a replica-local record of the schema versions one group has adopted. Never synced; see [Adoption and RDeployGate](#adoption-and-rdeploygate).
 
-All four are `RObject`s, so a consumer can observe advances through `subscribe` and pull deltas in response — the mechanism [rdb_projection](../rdb_projection) uses to stay in sync without polling. See [mvt Reactivity](../mvt#reactivity).
+All of them are `RObject`s, so a consumer can observe advances through `subscribe` and pull deltas in response — the mechanism [rdb_projection](../rdb_projection) uses to stay in sync without polling. See [mvt Reactivity](../mvt#reactivity).
+
+## Databases, catalogs and releases
+
+A database's structure is published by its developer as a catalog, deployed by an admin into an RDb, and adopted by each client. The three steps have three verbs:
+
+- **Release** (developer, `CREATE CATALOG` / `ALTER CATALOG`). Every catalog entry is signed by one of the catalog's creators; the genesis is the first release. A release is a diff against its parents (the maximal releases below its position): the group definitions it adds, and the versions it sets for existing groups. A merge of several parents must set every group they disagree on. Its semver must exceed every parent's. A release that introduces schemas is preceded by a signed, dependency-free `declare` entry naming them, so a replica discovers the new schemas from validated catalog state and fetches them before the release that pins them validates.
+- **Deploy** (admin, `CREATE DATABASE ... USING CATALOG`, `UPDATE CATALOG ... ON db`). The RDb records the deployed release and the params it first needs (forward only; signed by a database creator when the RDb declares creators). The catalog planner then creates any new member groups and deploys the new schema versions to existing ones, bound groups first (advancing their dependents' refs), and records the release last, as the commit point.
+- **Adopt** (client, automatic). Each replica admits deployed releases into its members' local deploy gates, within the database's adoption range (`^<major>` of the create release by default: patches and minors flow, a new major waits until the app widens the range). A group deploy synced from a peer waits until its version is adopted.
+
+Membership is computed, never stored: every replica derives the same group ids from the deployed releases, the params and the database id, so group creates are never served by peers. Two concurrently deployed definitions with the same name are told apart deterministically (the smaller definition hash keeps the name, the other gets a `_<hex8>` suffix).
+
+Schemas don't belong to the RDb: it reaches them only through its catalog's group definitions. `catalogStatus(rdb)` reports how a replica's database stands against its catalog: the released, deployed, adopted and held releases, and for each member its target version, current version and adopted version.
+
+### Deploy authority
+
+Who may deploy a schema version to a group is its `canDeploy` predicate (`ALLOW DEPLOY IF` in the catalog). Without one, a group of a database with creators accepts deploys by those creators only: `canDeploy` defaults to an `$author` predicate over them, and their keys are embedded in the group (`deployKeys`) so deploy signatures verify with or without an identity provider. A deploy's author key resolves through the group's identity provider first, then `deployKeys`; a `canDeploy` that references `$author` needs one of the two.
+
+### Adoption and RDeployGate
+
+Each group has a replica-local RDeployGate, derived from `{group, schema}`, that mirrors the part of the schema DAG this replica has adopted (each mirror entry tagged with its schema entry's hash). A group deploy carries the precomputed gate hashes of its target version; they are the deploy's sync dependencies on the gate, and validation recomputes them from the schema DAG rather than trusting them. So a synced deploy is applied only once the adoption policy admits the version into the local gate, while local deploys never wait. The gate never enters a group's view: it gates when a deploy arrives, not what the group means.
 
 ## Schema evolution and incarnations
 
@@ -136,7 +165,7 @@ npm test
 
 ## Example: revoking an insert gate
 
-[`examples/editor.sql`](./examples/editor.sql) defines a `user` group containing capabilities and a `doc` group that observes it. Page inserts require a live `writer` capability:
+[`examples/editor.sql`](./examples/editor.sql) releases an `editor` catalog with a `user` group containing capabilities and a `doc` group that observes it, and deploys it as the `app` database. Page inserts require a live `writer` capability:
 
 ```sql
 TABLE pages (
@@ -150,7 +179,7 @@ TABLE pages (
 Register `$santi` with the identity provider:
 
 ```text
-rdb:-:-> insert into user.identities (keyId, publicKey, name) values ($santi, publicKey($santi), 'Santi');
+rdb:app:-> insert into user.identities (keyId, publicKey, name) values ($santi, publicKey($santi), 'Santi');
 inserted osPHT/Qq (niR/TD+S)
 updated ref on doc to #0XQOqMlp
 ```
@@ -158,7 +187,7 @@ updated ref on doc to #0XQOqMlp
 The identity is now available to the signing rules:
 
 ```text
-rdb:-:-> select * from user.identities;
+rdb:app:-> select * from user.identities;
 rowId    | keyId  | publicKey       | name
 ---------+--------+-----------------+------
 LzJMa+ww | $admin | AAAAB2VkMjU1MTm | Admin
@@ -168,7 +197,7 @@ osPHT/Qq | $santi | AAAAB2VkMjU1MTn | Santi
 Without a `writer` capability, the insert gate rejects `$santi`:
 
 ```text
-rdb:-:-> insert into doc.pages (title, deleted) values ('No dice', false) by $santi;
+rdb:app:-> insert into doc.pages (title, deleted) values ('No dice', false) by $santi;
 <input>:1:1: error VALIDATION_REJECTED: row envelope rejected
 (object A0bzGQCM55iFHvguG0VHNRB73xtHcJ8o0Xl98n3lTJc=):
 pages insert on row 'oITlMHy/egymP9j7nhQhCVRNR+u20bvMIvQ9K8T5I/o=' does not satisfy
@@ -178,7 +207,7 @@ ALLOW insert IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.
 Grant `$santi` the `writer` capability:
 
 ```text
-rdb:-:-> insert into user.caps (grantee, label) values ($santi, 'writer') by $admin;
+rdb:app:-> insert into user.caps (grantee, label) values ($santi, 'writer') by $admin;
 inserted PNOfPL/+ (atbLbavD)
 updated ref on doc to #FN7PWhKt
 ```
@@ -186,7 +215,7 @@ updated ref on doc to #FN7PWhKt
 The capability table now contains the grant:
 
 ```text
-rdb:-:-> select * from user.caps;
+rdb:app:-> select * from user.caps;
 rowId    | rowAuthor | label   | grantee
 ---------+-----------+---------+--------
 PNOfPL/+ | $admin    | writer  | $santi
@@ -196,16 +225,16 @@ lbz7VOYL |           | manager | $admin
 The gate now permits `$santi` to insert two pages:
 
 ```text
-rdb:-:-> insert into doc.pages (title, deleted) values ('hi', false) by $santi;
+rdb:app:-> insert into doc.pages (title, deleted) values ('hi', false) by $santi;
 inserted NNXMJ00Z (0XQ3qXkC)
-rdb:-:-> insert into doc.pages (title, deleted) values ('bye', false) by $santi;
+rdb:app:-> insert into doc.pages (title, deleted) values ('bye', false) by $santi;
 inserted WqSuhMmR (HhtcgvFn)
 ```
 
 Both rows are live:
 
 ```text
-rdb:-:-> select * from doc.pages;
+rdb:app:-> select * from doc.pages;
 rowId    | rowAuthor | title | deleted
 ---------+-----------+-------+--------
 NNXMJ00Z | $santi    | hi    | false
@@ -215,10 +244,10 @@ WqSuhMmR | $santi    | bye   | false
 The logs provide the versions used below. The user history contains the identity and capability inserts:
 
 ```text
-rdb:-:-> log user;
+rdb:app:-> log user;
 hash      | prev      | op                                | status
 ----------+-----------+-----------------------------------+-------
-#p0N+nsa8 | -         | CREATE TABLEGROUP user SEED 'c... |
+#p0N+nsa8 | -         | -- TABLEGROUP user USING SCHEM... |
 #niR/TD+S | #p0N+nsa8 | INSERT INTO identities (uuid, ... | OK
 #atbLbavD | #niR/TD+S | INSERT INTO caps (uuid, grante... | OK
 ```
@@ -226,10 +255,10 @@ hash      | prev      | op                                | status
 The document history identifies `#0XQ3qXkC` as the version after the first page insert and before the second:
 
 ```text
-rdb:-:-> log doc;
+rdb:app:-> log doc;
 hash      | prev      | op                                | status
 ----------+-----------+-----------------------------------+-------
-#A0bzGQCM | -         | CREATE TABLEGROUP doc SEED 'Fc... |
+#A0bzGQCM | -         | -- TABLEGROUP doc USING SCHEMA... |
 #0XQOqMlp | #A0bzGQCM | UPDATE REF #p0N+nsa85uTC7o93fh... | OK
 #FN7PWhKt | #0XQOqMlp | UPDATE REF #p0N+nsa85uTC7o93fh... | OK
 #0XQ3qXkC | #FN7PWhKt | INSERT INTO pages (uuid, title... | OK
@@ -239,7 +268,7 @@ hash      | prev      | op                                | status
 Delete the capability:
 
 ```text
-rdb:-:-> delete from user.caps where rowId = #PNO;
+rdb:app:-> delete from user.caps where rowId = #PNO;
 Delete needs $admin. Sign and retry? [Y/n] y
 deleted PNOfPL/+ (AkpW2DhH)
 updated ref on doc to #OBXGt1O5
@@ -248,7 +277,7 @@ updated ref on doc to #OBXGt1O5
 The `writer` row is gone:
 
 ```text
-rdb:-:-> select * from user.caps;
+rdb:app:-> select * from user.caps;
 rowId    | rowAuthor | label   | grantee
 ---------+-----------+---------+--------
 lbz7VOYL |           | manager | $admin
@@ -257,10 +286,10 @@ lbz7VOYL |           | manager | $admin
 The document log now ends at `#OBXGt1O5`, whose reference observes the revocation:
 
 ```text
-rdb:-:-> log doc;
+rdb:app:-> log doc;
 hash      | prev      | op                                | status
 ----------+-----------+-----------------------------------+-------
-#A0bzGQCM | -         | CREATE TABLEGROUP doc SEED 'Fc... |
+#A0bzGQCM | -         | -- TABLEGROUP doc USING SCHEMA... |
 #0XQOqMlp | #A0bzGQCM | UPDATE REF #p0N+nsa85uTC7o93fh... | OK
 #FN7PWhKt | #0XQOqMlp | UPDATE REF #p0N+nsa85uTC7o93fh... | OK
 #0XQ3qXkC | #FN7PWhKt | INSERT INTO pages (uuid, title... | OK
@@ -271,7 +300,7 @@ hash      | prev      | op                                | status
 Advancing the reference at the current tip does not rewrite the earlier application views:
 
 ```text
-rdb:-:-> select * from doc.pages;
+rdb:app:-> select * from doc.pages;
 rowId    | rowAuthor | title | deleted
 ---------+-----------+-------+--------
 NNXMJ00Z | $santi    | hi    | false
@@ -281,14 +310,14 @@ WqSuhMmR | $santi    | bye   | false
 Use the logged `#0XQ3` prefix to place the latest `user` reference immediately after the first insert, concurrent with the second:
 
 ```text
-rdb:-:-> update ref user to latest on doc at #0XQ3 by $admin;
+rdb:app:-> update ref user to latest on doc at #0XQ3 by $admin;
 updated ref user on A0bzGQCM (R1tDyESK)
 ```
 
 The second insert now sees the revoked capability from its frontier. Its insert gate is false, so reconciliation cancels the operation and removes its row:
 
 ```text
-rdb:-:-> select * from doc.pages;
+rdb:app:-> select * from doc.pages;
 rowId    | rowAuthor | title | deleted
 ---------+-----------+-------+--------
 NNXMJ00Z | $santi    | hi    | false
@@ -297,10 +326,10 @@ NNXMJ00Z | $santi    | hi    | false
 The log records the cancelled operation. The first insert precedes the concurrent reference update and remains live:
 
 ```text
-rdb:-:-> log doc;
+rdb:app:-> log doc;
 hash      | prev      | op                                | status
 ----------+-----------+-----------------------------------+----------
-#A0bzGQCM | -         | CREATE TABLEGROUP doc SEED 'Fc... |
+#A0bzGQCM | -         | -- TABLEGROUP doc USING SCHEMA... |
 #0XQOqMlp | #A0bzGQCM | UPDATE REF #p0N+nsa85uTC7o93fh... | OK
 #FN7PWhKt | #0XQOqMlp | UPDATE REF #p0N+nsa85uTC7o93fh... | OK
 #0XQ3qXkC | #FN7PWhKt | INSERT INTO pages (uuid, title... | OK

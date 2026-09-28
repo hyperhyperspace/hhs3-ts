@@ -1,6 +1,6 @@
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 
-export type RenderAliasScope = 'key' | 'schema' | 'group' | 'db' | 'version';
+export type RenderAliasScope = 'key' | 'schema' | 'catalog' | 'group' | 'db' | 'version';
 
 export type RenderVersionScope = {
     objectId: B64Hash;
@@ -13,6 +13,7 @@ export interface RenderAliasContext {
     schema(id: B64Hash, hint?: string): string;
     group(id: B64Hash, hint?: string): string;
     db(id: B64Hash, hint?: string): string;
+    catalog?(id: B64Hash, hint?: string): string;
     /** Lazy: only allocates a name the first time this hash is referenced */
     version(hash: B64Hash, scope: RenderVersionScope): string;
     /** `\alias` lines not yet emitted for the upcoming statement */

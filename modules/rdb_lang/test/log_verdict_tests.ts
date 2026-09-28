@@ -1,62 +1,60 @@
 import { assertEquals, assertFalse, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
-import { createBasicCrypto, createIdentity, HASH_SHA256, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
-import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { version } from "@hyper-hyper-space/hhs3_mvt";
-import type { VersionScope } from "../src/bind/context.js";
-import type { VersionExpr } from "../src/syntax/ast.js";
+import { deriveRowId } from "@hyper-hyper-space/hhs3_rdb";
 
-import { createMockRContext } from "../../rdb/test/mock_rcontext.js";
-import { deriveRowId, RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory } from "@hyper-hyper-space/hhs3_rdb";
-
-import { bind, BoundStatement } from "../src/bind/bind.js";
-import { execute } from "../src/exec/execute.js";
+import { bind } from "../src/bind/bind.js";
+import { deployLabelsFor } from "../src/exec/history.js";
+import { renderLogOpLine } from "../src/reverse/log_line.js";
 import { parseStatement } from "../src/syntax/parser.js";
-import { createTestBindContext } from "./mock_bind_context.js";
-
-const crypto = createBasicCrypto();
-const hashSuite = crypto.hash(HASH_SHA256);
-
-async function collectEntryHashes(group: RTableGroupImpl): Promise<B64Hash[]> {
-    const hashes: B64Hash[] = [];
-    for await (const entry of (await group.getScopedDag()).loadAllEntries()) hashes.push(entry.hash);
-    return hashes;
-}
-
-function resolveHashPrefix(prefix: string, hashes: B64Hash[]): B64Hash {
-    const matches = hashes.filter((h) => h.startsWith(prefix));
-    if (matches.length === 1) return matches[0];
-    if (matches.length === 0) throw new Error(`Unknown hash prefix '#${prefix}'`);
-    throw new Error(`Ambiguous hash prefix '#${prefix}'`);
-}
-
-function installEntryHashVersionResolver(
-    lang: ReturnType<typeof createTestBindContext>,
-    entryHashes: B64Hash[],
-): void {
-    const base = lang.resolveVersion.bind(lang);
-    lang.resolveVersion = async (expr: VersionExpr | undefined, scope: VersionScope) => {
-        if (expr?.kind === 'set') {
-            return version(...expr.members.map((m) => m.kind === 'hash'
-                ? resolveHashPrefix(m.prefix, entryHashes)
-                : (() => { throw new Error(`Unknown version alias '${m.text}'`); })()));
-        }
-        if (expr?.kind === 'hash') return version(resolveHashPrefix(expr.hash.prefix, entryHashes));
-        return base(expr, scope);
-    };
-}
-
-async function parseBind(sql: string, context: ReturnType<typeof createTestBindContext>): Promise<BoundStatement> {
-    const parsed = parseStatement(sql);
-    assertTrue(parsed.ok, `parse should succeed: ${sql}`);
-    if (!parsed.ok) throw new Error(parsed.diagnostics[0].message);
-    const bound = await bind(parsed.value, context);
-    assertTrue(bound.ok, `bind should succeed: ${sql}`);
-    if (!bound.ok) throw new Error(bound.diagnostics[0].message);
-    return bound.value;
-}
+import type { LogLangResult } from "../src/exec/result.js";
+import { createLangEnv, LangEnv, newIdentity } from "./lang_env.js";
 
 function isObject(value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+// A shop database whose `items` inserts are gated on a `grant` cap; a
+// concurrent revoke voids an insert made at the same base.
+async function voidedInsertEnv(): Promise<LangEnv> {
+    const admin = await newIdentity();
+    const env = await createLangEnv({ vars: { admin, me: admin } });
+    await env.run(`
+        CREATE SCHEMA shop CREATORS ($admin) AS (
+          TABLE caps (
+            label string PUB
+          ) ALLOW all IF true,
+          TABLE items (
+            name string
+          ) ALLOW insert IF EXISTS caps WHERE label = 'grant'
+        );
+        CREATE CATALOG shop_catalog VERSION '1.0.0' AS (TABLEGROUP shop_prod USING SCHEMA shop);
+        CREATE DATABASE shop_db USING CATALOG shop_catalog;
+    `);
+    const group = await env.group('shop_prod');
+    const caps = await group.getTable('caps');
+    const items = await group.getTable('items');
+    await caps.insert('c-1', { label: 'grant' });
+    const base = await (await group.getScopedDag()).getFrontier();
+    await caps.delete(deriveRowId('c-1'), undefined, base);
+    await items.insert('i-1', { name: 'thing' }, undefined, base);
+    return env;
+}
+
+async function runLog(env: LangEnv, sql: string): Promise<LogLangResult> {
+    const [result] = await env.run(sql);
+    if (result.kind !== 'log') throw new Error(`expected a log result, got ${result.kind}`);
+    return result;
+}
+
+function itemsInsert(log: LogLangResult) {
+    return log.rows.find((r) => {
+        if (!isObject(r.payload) || r.payload['action'] !== 'row' || r.payload['table'] !== 'items') return false;
+        const op = r.payload['op'];
+        return isObject(op) && op['action'] === 'insert';
+    });
+}
+
+function opLines(log: LogLangResult): string[] {
+    return log.rows.map((row) => renderLogOpLine(row.payload, row.prev, log.renderContext));
 }
 
 export const logVerdictTests = {
@@ -75,15 +73,11 @@ export const logVerdictTests = {
         {
             name: '[LOG02] LOG FROM without AT fails bind',
             invoke: async () => {
-                const ctx = createMockRContext({ selfValidate: true });
-                ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
-                ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
-                const lang = createTestBindContext(ctx);
-
+                const env = await createLangEnv();
                 const parsed = parseStatement('LOG shop_prod FROM LATEST;');
                 assertTrue(parsed.ok, 'parse should succeed');
                 if (!parsed.ok) return;
-                const bound = await bind(parsed.value, lang);
+                const bound = await bind(parsed.value, env.lang);
                 assertFalse(bound.ok, 'bind should fail');
                 if (bound.ok) return;
                 assertTrue(
@@ -95,58 +89,14 @@ export const logVerdictTests = {
         {
             name: '[LOG03] group log annotates void verdict on row ops',
             invoke: async () => {
-                const ctx = createMockRContext({ selfValidate: true });
-                ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
-                ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
+                const env = await voidedInsertEnv();
+                const log = await runLog(env, 'LOG shop_prod LIMIT 20;');
 
-                const admin = await createIdentity(SIGNING_ED25519, hashSuite);
-                const lang = createTestBindContext(ctx, { admin, me: admin });
-
-                const schemaBound = await parseBind(`
-                    CREATE SCHEMA shop CREATORS ($admin) AS (
-                      TABLE caps (
-                        label string PUB
-                      ) ALLOW all IF true,
-                      TABLE items (
-                        name string
-                      ) ALLOW insert IF EXISTS caps WHERE label = 'grant'
-                    );
-                `, lang);
-                const schemaPlan = await execute(schemaBound);
-                assertTrue(schemaPlan.ok && schemaPlan.value.kind === 'create-plan', 'schema create');
-                if (!schemaPlan.ok || schemaPlan.value.kind !== 'create-plan') return;
-                const schema = await ctx.createObject(schemaPlan.value.plan.payload) as RSchemaImpl;
-                lang.registerSchema('shop', schema);
-
-                const groupBound = await parseBind('CREATE TABLEGROUP shop_prod USING SCHEMA shop;', lang);
-                const groupPlan = await execute(groupBound);
-                assertTrue(groupPlan.ok && groupPlan.value.kind === 'create-plan', 'group create');
-                if (!groupPlan.ok || groupPlan.value.kind !== 'create-plan') return;
-                const group = await ctx.createObject(groupPlan.value.plan.payload) as RTableGroupImpl;
-                lang.registerGroup('shop_prod', group);
-
-                const caps = await group.getTable('caps');
-                const items = await group.getTable('items');
-                const capId = deriveRowId('c-1');
-                await caps.insert('c-1', { label: 'grant' });
-                const base = await (await group.getScopedDag()).getFrontier();
-                await caps.delete(capId, undefined, base);
-                await items.insert('i-1', { name: 'thing' }, undefined, base);
-
-                const logBound = await parseBind('LOG shop_prod LIMIT 20;', lang);
-                const log = await execute(logBound);
-                assertTrue(log.ok && log.value.kind === 'log', 'log executes');
-                if (!log.ok || log.value.kind !== 'log') return;
-
-                const createRow = log.value.rows.find((r) => isObject(r.payload) && r.payload['action'] === 'create');
+                const createRow = log.rows.find((r) => isObject(r.payload) && r.payload['action'] === 'create');
                 assertTrue(createRow !== undefined, 'log includes create entry');
                 assertEquals(createRow?.void, undefined, 'create entry has no verdict');
 
-                const insertRow = log.value.rows.find((r) => {
-                    if (!isObject(r.payload) || r.payload['action'] !== 'row' || r.payload['table'] !== 'items') return false;
-                    const op = r.payload['op'];
-                    return isObject(op) && op['action'] === 'insert';
-                });
+                const insertRow = itemsInsert(log);
                 assertTrue(insertRow !== undefined, 'log includes insert entry');
                 assertEquals(insertRow?.void, true, 'concurrent revoke voids insert');
             },
@@ -154,50 +104,10 @@ export const logVerdictTests = {
         {
             name: '[LOG03b] table log annotates void verdict on row ops',
             invoke: async () => {
-                const ctx = createMockRContext({ selfValidate: true });
-                ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
-                ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
+                const env = await voidedInsertEnv();
+                const log = await runLog(env, 'LOG shop_prod.items LIMIT 20;');
 
-                const admin = await createIdentity(SIGNING_ED25519, hashSuite);
-                const lang = createTestBindContext(ctx, { admin, me: admin });
-
-                const schemaBound = await parseBind(`
-                    CREATE SCHEMA shop CREATORS ($admin) AS (
-                      TABLE caps (
-                        label string PUB
-                      ) ALLOW all IF true,
-                      TABLE items (
-                        name string
-                      ) ALLOW insert IF EXISTS caps WHERE label = 'grant'
-                    );
-                `, lang);
-                const schemaPlan = await execute(schemaBound);
-                assertTrue(schemaPlan.ok && schemaPlan.value.kind === 'create-plan', 'schema create');
-                if (!schemaPlan.ok || schemaPlan.value.kind !== 'create-plan') return;
-                const schema = await ctx.createObject(schemaPlan.value.plan.payload) as RSchemaImpl;
-                lang.registerSchema('shop', schema);
-
-                const groupBound = await parseBind('CREATE TABLEGROUP shop_prod USING SCHEMA shop;', lang);
-                const groupPlan = await execute(groupBound);
-                assertTrue(groupPlan.ok && groupPlan.value.kind === 'create-plan', 'group create');
-                if (!groupPlan.ok || groupPlan.value.kind !== 'create-plan') return;
-                const group = await ctx.createObject(groupPlan.value.plan.payload) as RTableGroupImpl;
-                lang.registerGroup('shop_prod', group);
-
-                const caps = await group.getTable('caps');
-                const items = await group.getTable('items');
-                const capId = deriveRowId('c-1');
-                await caps.insert('c-1', { label: 'grant' });
-                const base = await (await group.getScopedDag()).getFrontier();
-                await caps.delete(capId, undefined, base);
-                await items.insert('i-1', { name: 'thing' }, undefined, base);
-
-                const logBound = await parseBind('LOG shop_prod.items LIMIT 20;', lang);
-                const log = await execute(logBound);
-                assertTrue(log.ok && log.value.kind === 'log', 'table log executes');
-                if (!log.ok || log.value.kind !== 'log') return;
-
-                const insertRow = log.value.rows.find((r) => {
+                const insertRow = log.rows.find((r) => {
                     if (!isObject(r.payload) || r.payload['action'] !== 'insert') return false;
                     return isObject(r.payload['values']) && r.payload['values']['name'] === 'thing';
                 });
@@ -217,55 +127,11 @@ export const logVerdictTests = {
         {
             name: '[LOG05] EXPLAIN LOG annotates void reason on cancelled ops',
             invoke: async () => {
-                const ctx = createMockRContext({ selfValidate: true });
-                ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
-                ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
+                const env = await voidedInsertEnv();
+                const log = await runLog(env, 'EXPLAIN LOG shop_prod LIMIT 20;');
+                assertTrue(log.explain, 'explain flag on result');
 
-                const admin = await createIdentity(SIGNING_ED25519, hashSuite);
-                const lang = createTestBindContext(ctx, { admin, me: admin });
-
-                const schemaBound = await parseBind(`
-                    CREATE SCHEMA shop CREATORS ($admin) AS (
-                      TABLE caps (
-                        label string PUB
-                      ) ALLOW all IF true,
-                      TABLE items (
-                        name string
-                      ) ALLOW insert IF EXISTS caps WHERE label = 'grant'
-                    );
-                `, lang);
-                const schemaPlan = await execute(schemaBound);
-                assertTrue(schemaPlan.ok && schemaPlan.value.kind === 'create-plan', 'schema create');
-                if (!schemaPlan.ok || schemaPlan.value.kind !== 'create-plan') return;
-                const schema = await ctx.createObject(schemaPlan.value.plan.payload) as RSchemaImpl;
-                lang.registerSchema('shop', schema);
-
-                const groupBound = await parseBind('CREATE TABLEGROUP shop_prod USING SCHEMA shop;', lang);
-                const groupPlan = await execute(groupBound);
-                assertTrue(groupPlan.ok && groupPlan.value.kind === 'create-plan', 'group create');
-                if (!groupPlan.ok || groupPlan.value.kind !== 'create-plan') return;
-                const group = await ctx.createObject(groupPlan.value.plan.payload) as RTableGroupImpl;
-                lang.registerGroup('shop_prod', group);
-
-                const caps = await group.getTable('caps');
-                const items = await group.getTable('items');
-                const capId = deriveRowId('c-1');
-                await caps.insert('c-1', { label: 'grant' });
-                const base = await (await group.getScopedDag()).getFrontier();
-                await caps.delete(capId, undefined, base);
-                await items.insert('i-1', { name: 'thing' }, undefined, base);
-
-                const logBound = await parseBind('EXPLAIN LOG shop_prod LIMIT 20;', lang);
-                const log = await execute(logBound);
-                assertTrue(log.ok && log.value.kind === 'log', 'explain log executes');
-                if (!log.ok || log.value.kind !== 'log') return;
-                assertTrue(log.value.explain, 'explain flag on result');
-
-                const insertRow = log.value.rows.find((r) => {
-                    if (!isObject(r.payload) || r.payload['action'] !== 'row' || r.payload['table'] !== 'items') return false;
-                    const op = r.payload['op'];
-                    return isObject(op) && op['action'] === 'insert';
-                });
+                const insertRow = itemsInsert(log);
                 assertTrue(insertRow !== undefined, 'log includes insert entry');
                 assertEquals(insertRow?.void, true, 'concurrent revoke voids insert');
                 assertTrue(
@@ -277,14 +143,9 @@ export const logVerdictTests = {
         {
             name: '[LOG06] EXPLAIN LOG void verdicts stay consistent across concurrent-looking row ops',
             invoke: async () => {
-                const ctx = createMockRContext({ selfValidate: true });
-                ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
-                ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
-
-                const admin = await createIdentity(SIGNING_ED25519, hashSuite);
-                const lang = createTestBindContext(ctx, { admin, me: admin });
-
-                const schemaBound = await parseBind(`
+                const admin = await newIdentity();
+                const env = await createLangEnv({ vars: { admin, me: admin } });
+                await env.run(`
                     CREATE SCHEMA users_schema CREATORS ($admin) AS (
                       TABLE identities (
                         keyId string PUB READONLY,
@@ -299,67 +160,37 @@ export const logVerdictTests = {
                         ALLOW insert IF EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
                         ALLOW delete IF grantee = $author OR EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
                     );
-                `, lang);
-                const schemaPlan = await execute(schemaBound);
-                assertTrue(schemaPlan.ok && schemaPlan.value.kind === 'create-plan', 'schema create');
-                if (!schemaPlan.ok || schemaPlan.value.kind !== 'create-plan') return;
-                const schema = await ctx.createObject(schemaPlan.value.plan.payload) as RSchemaImpl;
-                lang.registerSchema('users_schema', schema);
+                    CREATE CATALOG users_catalog VERSION '1.0.0' AS (
+                      TABLEGROUP users USING SCHEMA users_schema
+                        USING IDENTITIES identities
+                        WITH ROWS (
+                          identities (keyId = $admin, publicKey = publicKey($admin), name = 'Admin'),
+                          caps (label = 'manager', grantee = $admin)
+                        )
+                    );
+                    CREATE DATABASE users_db USING CATALOG users_catalog CREATORS ($admin);
+                `);
 
-                const groupBound = await parseBind(`
-                    CREATE TABLEGROUP users
-                      USING SCHEMA users_schema
-                      USING IDENTITIES identities
-                      WITH ROWS (
-                        identities (keyId = $admin, publicKey = publicKey($admin), name = 'Admin'),
-                        caps (label = 'manager', grantee = $admin)
-                      );
-                `, lang);
-                const groupPlan = await execute(groupBound);
-                assertTrue(groupPlan.ok && groupPlan.value.kind === 'create-plan', 'group create');
-                if (!groupPlan.ok || groupPlan.value.kind !== 'create-plan') return;
-                const group = await ctx.createObject(groupPlan.value.plan.payload) as RTableGroupImpl;
-                lang.registerGroup('users', group);
+                const [pickaxerInsert] = await env.run("INSERT INTO users.caps (label, grantee) VALUES ('pickaxer', $admin) BY $admin;");
+                if (pickaxerInsert.kind !== 'insert') throw new Error('pickaxer cap insert');
 
-                const pickaxerInsert = await execute(await parseBind(
-                    "INSERT INTO users.caps (label, grantee) VALUES ('pickaxer', $admin) BY $admin;",
-                    lang,
-                ));
-                assertTrue(pickaxerInsert.ok && pickaxerInsert.value.kind === 'insert', 'pickaxer cap insert');
-                if (!pickaxerInsert.ok || pickaxerInsert.value.kind !== 'insert') return;
+                await env.run(`
+                    ALTER SCHEMA users_schema AS (ADD COLUMN caps.reason string NULL);
+                    ALTER CATALOG users_catalog VERSION '1.1.0' AS (UPDATE SCHEMA users_schema TO LATEST ON users);
+                `);
+                const [deploy] = await env.run("UPDATE CATALOG users_catalog TO '1.1.0' ON users_db BY $admin;");
+                assertTrue(deploy.kind === 'update-catalog' && deploy.update.deployed.length === 1, 'the reason column is deployed');
 
-                const alter = await execute(await parseBind(
-                    'ALTER SCHEMA users_schema AS (ADD COLUMN caps.reason string NULL);',
-                    lang,
-                ));
-                assertTrue(alter.ok && alter.value.kind === 'alter-schema', 'alter add reason');
-
-                const deploy = await execute(await parseBind(
-                    'UPDATE SCHEMA users_schema TO LATEST ON users;',
-                    lang,
-                ));
-                assertTrue(deploy.ok && deploy.value.kind === 'update-schema', 'deploy reason column');
-
-                const reasonUpdate = await execute(await parseBind(
-                    `UPDATE users.caps SET reason = 'assigned' WHERE rowId = #${pickaxerInsert.value.rowId.slice(0, 8)} BY $admin;`,
-                    lang,
-                ));
-                assertTrue(reasonUpdate.ok && reasonUpdate.value.kind === 'update', 'reason update');
-                if (!reasonUpdate.ok || reasonUpdate.value.kind !== 'update') return;
-                const updateEntryHash = reasonUpdate.value.entryHash;
-
-                installEntryHashVersionResolver(lang, await collectEntryHashes(group));
+                const [reasonUpdate] = await env.run(
+                    `UPDATE users.caps SET reason = 'assigned' WHERE rowId = #${pickaxerInsert.rowId.slice(0, 8)} BY $admin;`);
+                if (reasonUpdate.kind !== 'update') throw new Error('reason update');
+                const updateEntryHash = reasonUpdate.entryHash;
 
                 const horizon = updateEntryHash.slice(0, 8);
-                const log = await execute(await parseBind(
-                    `EXPLAIN LOG users AT {#${horizon}} FROM {#${horizon}} LIMIT 50;`,
-                    lang,
-                ));
-                assertTrue(log.ok && log.value.kind === 'log', 'explain log executes');
-                if (!log.ok || log.value.kind !== 'log') return;
-                assertTrue(log.value.explain, 'explain flag on result');
+                const log = await runLog(env, `EXPLAIN LOG users AT {#${horizon}} FROM {#${horizon}} LIMIT 50;`);
+                assertTrue(log.explain, 'explain flag on result');
 
-                const pickaxerRow = log.value.rows.find((r) => {
+                const pickaxerRow = log.rows.find((r) => {
                     if (!isObject(r.payload) || r.payload['action'] !== 'row' || r.payload['table'] !== 'caps') return false;
                     const op = r.payload['op'];
                     return isObject(op) && op['action'] === 'insert'
@@ -368,18 +199,50 @@ export const logVerdictTests = {
                 assertTrue(pickaxerRow !== undefined, 'log includes pickaxer insert');
                 assertEquals(pickaxerRow?.void, false, 'pickaxer insert is not void at update horizon');
 
-                const updateRow = log.value.rows.find((r) => r.hash === updateEntryHash);
+                const updateRow = log.rows.find((r) => r.hash === updateEntryHash);
                 assertTrue(updateRow !== undefined, 'log includes reason update');
                 assertEquals(updateRow?.void, false, 'reason update is not void at update horizon');
 
-                for (const row of log.value.rows) {
+                for (const row of log.rows) {
                     if (row.void === true) {
-                        assertTrue(
-                            row.reason !== undefined && row.reason.length > 0,
-                            'voided row has non-empty reason',
-                        );
+                        assertTrue(row.reason !== undefined && row.reason.length > 0, 'voided row has non-empty reason');
                     }
                 }
+            },
+        },
+        {
+            name: '[LOG07] deploys, declares and group genesis render as comments; catalogs and databases as statements',
+            invoke: async () => {
+                const dev = await newIdentity();
+                const env = await createLangEnv({ vars: { dev, me: dev } });
+                await env.run(`
+                    CREATE SCHEMA shop CREATORS ($dev) AS (TABLE products (sku string) ALLOW all IF true);
+                    CREATE SCHEMA notes CREATORS ($dev) AS (TABLE notes (text string) ALLOW all IF true);
+                    CREATE CATALOG shop_catalog VERSION '1.0.0' AS (TABLEGROUP shop_prod USING SCHEMA shop);
+                    CREATE DATABASE shop_db USING CATALOG shop_catalog;
+                    ALTER SCHEMA shop AS (ADD COLUMN products.price integer DEFAULT 0);
+                    ALTER CATALOG shop_catalog VERSION '1.1.0' AS (
+                      UPDATE SCHEMA shop TO LATEST ON shop_prod,
+                      ADD TABLEGROUP notes USING SCHEMA notes
+                    );
+                    UPDATE CATALOG shop_catalog TO LATEST ON shop_db;
+                `);
+                const db = await env.database('shop_db');
+                env.lang.resolveDeployLabels = (groupId) => deployLabelsFor(db, groupId);
+
+                const group = opLines(await runLog(env, 'LOG shop_prod;'));
+                assertTrue(group[0]!.startsWith('-- TABLEGROUP shop_prod USING SCHEMA'), `group genesis: ${group[0]}`);
+                assertTrue(group.some((l) => l.startsWith('-- deploy shop TO {') && l.endsWith('(shop_catalog 1.1.0)')),
+                    `the deploy names its release: ${group.join(' | ')}`);
+
+                const catalog = opLines(await runLog(env, 'LOG shop_catalog;'));
+                assertTrue(catalog[0]!.startsWith('CREATE CATALOG shop_catalog'), catalog[0]!);
+                assertTrue(catalog.some((l) => l.startsWith('-- declare schemas {')), 'the implied declare is a comment');
+                assertTrue(catalog.some((l) => l.startsWith("ALTER CATALOG #") && l.includes("VERSION '1.1.0'")), 'the release is an ALTER CATALOG');
+
+                const database = opLines(await runLog(env, 'LOG shop_db;'));
+                assertTrue(database[0]!.startsWith('CREATE DATABASE shop_db USING CATALOG'), database[0]!);
+                assertTrue(database[1]!.startsWith('UPDATE CATALOG') && database[1]!.includes('ON shop_db'), database[1]!);
             },
         },
     ],

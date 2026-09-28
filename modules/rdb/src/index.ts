@@ -33,16 +33,36 @@ export * from "./rtable_group/interfaces.js";
 export * from "./rtable_group/group.js";
 export { evaluatePredicate, evaluateRowOpRestriction } from "./rtable_group/predicates.js";
 
+// RCatalog: the developer-signed catalog of table groups (semver releases)
+export * from "./rcatalog/payload.js";
+export * from "./rcatalog/semver.js";
+export * from "./rcatalog/validate.js";
+export * from "./rcatalog/validate_ops.js";
+export * from "./rcatalog/resolve.js";
+export * from "./rcatalog/interfaces.js";
+export * from "./rcatalog/rcatalog.js";
+
+// RDeployGate: the replica-local record of the schema versions a group adopted
+export * from "./rdeploy_gate/payload.js";
+export * from "./rdeploy_gate/mirror.js";
+export * from "./rdeploy_gate/interfaces.js";
+export * from "./rdeploy_gate/rdeploy_gate.js";
+
 // Users: a standard identities-provider + capabilities RTableGroup
 export * from "./users/users.js";
 export * from "./users/peer_authorizer.js";
 export * from "./users/endpoints.js";
 export * from "./users/peer_directory.js";
 
-// RDb: the sync root / orchestrator (advisory; never validity-bearing)
+// RDb: the sync root / orchestrator of a database deployed from a catalog
+// (computed membership; never validity-bearing for its groups)
 export * from "./rdb/payload.js";
 export * from "./rdb/validate.js";
 export * from "./rdb/validate_ops.js";
 export * from "./rdb/resolve.js";
+export * from "./rdb/instantiate.js";
+export * from "./rdb/adoption.js";
+export * from "./rdb/conformance.js";
+export * from "./rdb/catalog_update.js";
 export * from "./rdb/interfaces.js";
 export * from "./rdb/rdb.js";

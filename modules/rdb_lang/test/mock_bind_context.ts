@@ -2,75 +2,167 @@ import { B64Hash, createBasicCrypto, HASH_SHA256, KeyId, OwnIdentity, PublicKey 
 import { version } from "@hyper-hyper-space/hhs3_mvt";
 import type { RContext, Version } from "@hyper-hyper-space/hhs3_mvt";
 import type { RObject } from "@hyper-hyper-space/hhs3_mvt";
-import type { RDb, RSchema, RTableGroup, RTableView } from "@hyper-hyper-space/hhs3_rdb";
+import type { RCatalogImpl, RDbImpl, RSchema, RTableGroup, RTableView } from "@hyper-hyper-space/hhs3_rdb";
 import { splitTableRef } from "@hyper-hyper-space/hhs3_rdb";
 
 import type {
-    HashScope, LangBindContext, LangValue, ResolvedDatabaseRef, ResolvedGroupRef, ResolvedLogTarget,
+    HashScope, LangBindContext, LangValue, ResolvedCatalogRef, ResolvedDatabaseRef, ResolvedGroupRef, ResolvedLogTarget,
     ResolvedSchemaRef, ResolvedTableRef, VersionScope,
 } from "../src/bind/context.js";
 import type { HashRef, NameOrHashRef, TableRef, VersionExpr } from "../src/syntax/ast.js";
 
-type ScopedObject = RObject & { getScopedDag(): Promise<{ getFrontier(): Promise<Version> }> };
+type ScopedObject = RObject & { getScopedDag(): Promise<{ getFrontier(): Promise<Version>; loadAllEntries(): AsyncIterable<{ hash: B64Hash }> }> };
 
 export type TestBindContext = LangBindContext & {
     registerSchema(name: string, schema: RSchema & ScopedObject): void;
     registerGroup(name: string, group: RTableGroup & ScopedObject): void;
-    registerDatabase(name: string, db: RDb & ScopedObject): void;
+    registerDatabase(name: string, db: RDbImpl & ScopedObject): void;
+    registerCatalog(name: string, catalog: RCatalogImpl & ScopedObject): void;
+    setCurrentDatabase(id: B64Hash | undefined): void;
+    setCurrentGroup(id: B64Hash | undefined): void;
 };
 
-export function createTestBindContext(_ctx: RContext, vars: { [name: string]: LangValue } = {}): TestBindContext {
+// Group names resolve like the runtime's: `db.group` exactly; a bare name in
+// the current database when one is set, else uniquely across databases.
+// Groups registered by name directly (tests that build groups by hand) are
+// looked up first.
+export function createTestBindContext(ctx: RContext, vars: { [name: string]: LangValue } = {}): TestBindContext {
     const crypto = createBasicCrypto();
     const hashSuite = crypto.hash(HASH_SHA256);
     const schemas = new Map<string, RSchema & ScopedObject>();
     const groups = new Map<string, RTableGroup & ScopedObject>();
-    const dbs = new Map<string, RDb & ScopedObject>();
+    const dbs = new Map<string, RDbImpl & ScopedObject>();
+    const catalogs = new Map<string, RCatalogImpl & ScopedObject>();
+    let currentDatabase: B64Hash | undefined;
+    let currentGroup: B64Hash | undefined;
     let nextUuid = 1;
 
-    const ids = () => [
+    const rootIds = () => [
         ...[...schemas.values()].map((s) => s.getId()),
         ...[...groups.values()].map((g) => g.getId()),
         ...[...dbs.values()].map((d) => d.getId()),
+        ...[...catalogs.values()].map((c) => c.getId()),
     ];
 
-    const refText = (ref: NameOrHashRef) => ref.kind === 'name' ? ref.text : resolveHashPrefix(ref.prefix, ids());
+    const findByIdOrName = <T extends RObject>(map: Map<string, T>, ref: NameOrHashRef, what: string): T => {
+        if (ref.kind === 'hash') {
+            const matches = [...map.values()].filter((o) => o.getId().startsWith(ref.prefix));
+            if (matches.length === 1) return matches[0];
+            throw new Error(matches.length === 0 ? `Unknown ${what} '#${ref.prefix}'` : `Ambiguous ${what} '#${ref.prefix}'`);
+        }
+        const found = map.get(ref.text) ?? [...map.values()].find((o) => o.getId() === ref.text);
+        if (found === undefined) throw new Error(`Unknown ${what} '${ref.text}'`);
+        return found;
+    };
+
+    const loadGroup = async (id: B64Hash): Promise<RTableGroup & ScopedObject> => {
+        const obj = await ctx.getObject(id);
+        if (obj === undefined) throw new Error(`Group '${id}' is not loaded`);
+        return obj as unknown as RTableGroup & ScopedObject;
+    };
+
+    const groupInDb = async (db: RDbImpl, name: string): Promise<B64Hash | undefined> =>
+        (await db.getMemberGroupNames()).get(name);
+
+    const resolveGroupRef = async (ref: NameOrHashRef): Promise<ResolvedGroupRef> => {
+        if (ref.kind === 'hash') {
+            const candidates = new Set(rootIds());
+            for (const db of dbs.values()) for (const id of await db.getMemberGroups()) candidates.add(id);
+            const matches = [...candidates].filter((id) => id.startsWith(ref.prefix));
+            if (matches.length !== 1) throw new Error(matches.length === 0 ? `Unknown group '#${ref.prefix}'` : `Ambiguous group '#${ref.prefix}'`);
+            return { id: matches[0], group: await loadGroup(matches[0]) };
+        }
+        if (ref.parts.length === 2) {
+            const db = findByIdOrName(dbs, { kind: 'name', text: ref.parts[0], parts: [ref.parts[0]], span: ref.span }, 'database');
+            const id = await groupInDb(db, ref.parts[1]);
+            if (id === undefined) throw new Error(`Database '${ref.parts[0]}' has no group '${ref.parts[1]}'`);
+            return { id, group: await loadGroup(id) };
+        }
+        const registered = groups.get(ref.text) ?? [...groups.values()].find((g) => g.getId() === ref.text);
+        if (registered !== undefined) return { id: registered.getId(), group: registered };
+        if ((await ctx.getObject(ref.text)) !== undefined) return { id: ref.text, group: await loadGroup(ref.text) };
+
+        if (currentDatabase !== undefined) {
+            const db = [...dbs.values()].find((d) => d.getId() === currentDatabase)!;
+            const id = await groupInDb(db, ref.text);
+            if (id === undefined) throw new Error(`Unknown group '${ref.text}' in the current database`);
+            return { id, group: await loadGroup(id) };
+        }
+        const matches: B64Hash[] = [];
+        for (const db of dbs.values()) {
+            const id = await groupInDb(db, ref.text);
+            if (id !== undefined) matches.push(id);
+        }
+        if (matches.length === 1) return { id: matches[0], group: await loadGroup(matches[0]) };
+        throw new Error(matches.length === 0 ? `Unknown group '${ref.text}'` : `Ambiguous group '${ref.text}'`);
+    };
+
+    const scopeObject = (scope: VersionScope): ScopedObject | undefined => {
+        if (scope.kind === 'schema') return scope.schema as ScopedObject | undefined;
+        if (scope.kind === 'group') return scope.group as ScopedObject | undefined;
+        if (scope.kind === 'table') return scope.table as ScopedObject | undefined;
+        return scope.object as ScopedObject | undefined;
+    };
+
+    const entryHashes = async (object: ScopedObject | undefined): Promise<B64Hash[]> => {
+        if (object === undefined) return rootIds();
+        const hashes: B64Hash[] = [];
+        for await (const entry of (await object.getScopedDag()).loadAllEntries()) hashes.push(entry.hash);
+        return hashes;
+    };
 
     const bindContext: TestBindContext = {
         registerSchema(name, schema) { schemas.set(name, schema); },
         registerGroup(name, group) { groups.set(name, group); },
         registerDatabase(name, db) { dbs.set(name, db); },
+        registerCatalog(name, catalog) { catalogs.set(name, catalog); },
+        setCurrentDatabase(id) { currentDatabase = id; },
+        setCurrentGroup(id) { currentGroup = id; },
 
         async resolveSchema(ref: NameOrHashRef): Promise<ResolvedSchemaRef> {
-            const name = refText(ref);
-            const schema = schemas.get(name) ?? [...schemas.values()].find((s) => s.getId() === name);
-            if (schema === undefined) throw new Error(`Unknown schema '${name}'`);
+            const schema = findByIdOrName(schemas, ref, 'schema');
             return { id: schema.getId(), schema };
         },
 
-        async resolveGroup(ref: NameOrHashRef): Promise<ResolvedGroupRef> {
-            const name = refText(ref);
-            const group = groups.get(name) ?? [...groups.values()].find((g) => g.getId() === name);
-            if (group === undefined) throw new Error(`Unknown group '${name}'`);
-            return { id: group.getId(), group };
-        },
+        resolveGroup: resolveGroupRef,
 
         async resolveDatabase(ref: NameOrHashRef): Promise<ResolvedDatabaseRef> {
-            const name = refText(ref);
-            const db = dbs.get(name) ?? [...dbs.values()].find((d) => d.getId() === name);
-            if (db === undefined) throw new Error(`Unknown database '${name}'`);
+            const db = findByIdOrName(dbs, ref, 'database');
             return { id: db.getId(), db };
+        },
+
+        async resolveCatalog(ref: NameOrHashRef): Promise<ResolvedCatalogRef> {
+            const catalog = findByIdOrName(catalogs, ref, 'catalog');
+            return { id: catalog.getId(), catalog };
+        },
+
+        async resolveDefaultDatabase(): Promise<ResolvedDatabaseRef | undefined> {
+            if (currentDatabase === undefined) return undefined;
+            const db = [...dbs.values()].find((d) => d.getId() === currentDatabase);
+            return db === undefined ? undefined : { id: db.getId(), db };
+        },
+
+        async resolveDefaultGroup(): Promise<NameOrHashRef | undefined> {
+            if (currentGroup === undefined) return undefined;
+            return { kind: 'name', text: currentGroup, parts: [currentGroup], span: { start: 0, end: 0, line: 1, column: 1 } };
         },
 
         async resolveTable(ref: TableRef): Promise<ResolvedTableRef> {
             if (ref.group === undefined) throw new Error(`Table '${ref.table}' requires a group qualifier`);
-            const group = (await this.resolveGroup(ref.group)).group;
-            if (group === undefined) throw new Error(`Group '${ref.group.kind === 'name' ? ref.group.text : ref.group.prefix}' is not loaded`);
+            const groupRef: NameOrHashRef = ref.database !== undefined && ref.database.kind === 'name' && ref.group.kind === 'name'
+                ? { kind: 'name', text: `${ref.database.text}.${ref.group.text}`, parts: [ref.database.text, ref.group.text], span: ref.span }
+                : ref.group;
+            const resolved = await resolveGroupRef(groupRef);
+            const group = resolved.group!;
             const table = await group.getTable(ref.table);
             return { groupId: group.getId(), group, tableName: ref.table, table };
         },
 
-        async resolveHash(ref: HashRef, _scope: HashScope): Promise<B64Hash> {
-            return resolveHashPrefix(ref.prefix, ids());
+        async resolveHash(ref: HashRef, scope: HashScope): Promise<B64Hash> {
+            const candidates = scope.kind === 'object'
+                ? await entryHashes(await ctx.getObject(scope.objectId) as ScopedObject | undefined)
+                : rootIds();
+            return resolveHashPrefix(ref.prefix, candidates);
         },
 
         async resolveRowId(ref, table, at, from) {
@@ -106,13 +198,14 @@ export function createTestBindContext(_ctx: RContext, vars: { [name: string]: La
         },
 
         async resolveVersion(expr: VersionExpr | undefined, scope: VersionScope): Promise<Version> {
+            const obj = scopeObject(scope);
             if (expr?.kind === 'set') {
+                const candidates = await entryHashes(obj);
                 return version(...expr.members.map((m) => m.kind === 'hash'
-                    ? resolveHashPrefix(m.prefix, ids())
+                    ? resolveHashPrefix(m.prefix, candidates)
                     : (() => { throw new Error(`Unknown version alias '${m.text}'`); })()));
             }
-            if (expr?.kind === 'hash') return version(resolveHashPrefix(expr.hash.prefix, ids()));
-            const obj = objectForVersion(scope);
+            if (expr?.kind === 'hash') return version(resolveHashPrefix(expr.hash.prefix, await entryHashes(obj)));
             return obj === undefined ? version() : await (await obj.getScopedDag()).getFrontier();
         },
 
@@ -150,28 +243,31 @@ export function createTestBindContext(_ctx: RContext, vars: { [name: string]: La
         },
 
         async resolveLogTarget(ref: NameOrHashRef): Promise<ResolvedLogTarget> {
-            const name = refText(ref);
-            if (name.includes('.')) {
-                const parts = name.split('.');
-                const group = groups.get(parts[0]);
-                if (group === undefined) throw new Error(`Unknown group '${parts[0]}'`);
-                const table = await group.getTable(parts[1]);
-                return {
-                    kind: 'table',
-                    id: table.getId(),
-                    object: table as any,
-                    groupId: group.getId(),
-                    group,
-                    tableName: parts[1],
-                };
+            if (ref.kind === 'name' && ref.parts.length === 2) {
+                const readings: ResolvedLogTarget[] = [];
+                try {
+                    const group = (await resolveGroupRef({ kind: 'name', text: ref.parts[0], parts: [ref.parts[0]], span: ref.span })).group!;
+                    const table = await group.getTable(ref.parts[1]);
+                    readings.push({ kind: 'table', id: table.getId(), object: table as any, groupId: group.getId(), group: group as any, tableName: ref.parts[1] });
+                } catch { /* not group.table */ }
+                try {
+                    const resolved = await resolveGroupRef(ref);
+                    readings.push({ kind: 'group', id: resolved.id, object: resolved.group as any });
+                } catch { /* not db.group */ }
+                if (readings.length === 1) return readings[0];
+                throw new Error(readings.length === 0 ? `Unknown LOG target '${ref.text}'` : `Ambiguous LOG target '${ref.text}'`);
             }
-            const schema = schemas.get(name) ?? [...schemas.values()].find((s) => s.getId() === name);
-            if (schema !== undefined) return { kind: 'schema', id: schema.getId(), object: schema };
-            const group = groups.get(name) ?? [...groups.values()].find((g) => g.getId() === name);
-            if (group !== undefined) return { kind: 'group', id: group.getId(), object: group };
-            const db = dbs.get(name) ?? [...dbs.values()].find((d) => d.getId() === name);
-            if (db !== undefined) return { kind: 'database', id: db.getId(), object: db };
-            throw new Error(`Unknown LOG target '${name}'`);
+            const tryFind = <T extends RObject>(map: Map<string, T>): T | undefined => {
+                try { return findByIdOrName(map, ref, 'object'); } catch { return undefined; }
+            };
+            const schema = tryFind(schemas);
+            if (schema !== undefined) return { kind: 'schema', id: schema.getId(), object: schema as any };
+            const catalog = tryFind(catalogs);
+            if (catalog !== undefined) return { kind: 'catalog', id: catalog.getId(), object: catalog as any };
+            const db = tryFind(dbs);
+            if (db !== undefined) return { kind: 'database', id: db.getId(), object: db as any };
+            const group = await resolveGroupRef(ref);
+            return { kind: 'group', id: group.id, object: group.group as any };
         },
 
         async currentAuthor(): Promise<OwnIdentity | undefined> {
@@ -180,10 +276,16 @@ export function createTestBindContext(_ctx: RContext, vars: { [name: string]: La
         },
 
         async resolveAuthor(ref): Promise<OwnIdentity> {
-            const key = ref.kind === 'variable' ? ref.name : ref.prefix;
-            const v = vars[key];
-            if (typeof v === 'object' && v !== null && 'secretKey' in v) return v as OwnIdentity;
-            throw new Error(`Unknown or locked identity '${key}'`);
+            const isIdentity = (v: LangValue | undefined): v is OwnIdentity =>
+                typeof v === 'object' && v !== null && 'secretKey' in v;
+            if (ref.kind === 'variable') {
+                const v = vars[ref.name];
+                if (isIdentity(v)) return v;
+                throw new Error(`Unknown or locked identity '${ref.name}'`);
+            }
+            const matches = [...new Set(Object.values(vars).filter(isIdentity))].filter((v) => v.keyId.startsWith(ref.prefix));
+            if (matches.length === 1) return matches[0];
+            throw new Error(`Unknown or locked identity '#${ref.prefix}'`);
         },
 
         createUuid(): string {
@@ -209,15 +311,8 @@ function creatorRecordFrom(value: LangValue): { keyId: KeyId; publicKey: PublicK
     return { keyId: value.keyId, publicKey: value.publicKey as PublicKey };
 }
 
-function objectForVersion(scope: VersionScope): ScopedObject | undefined {
-    if (scope.kind === 'schema') return scope.schema as ScopedObject | undefined;
-    if (scope.kind === 'group') return scope.group as ScopedObject | undefined;
-    if (scope.kind === 'table') return scope.table as ScopedObject | undefined;
-    return scope.object as ScopedObject | undefined;
-}
-
 function resolveHashPrefix(prefix: string, hashes: B64Hash[]): B64Hash {
-    const matches = hashes.filter((h) => h.startsWith(prefix));
+    const matches = [...new Set(hashes)].filter((h) => h.startsWith(prefix));
     if (matches.length === 1) return matches[0];
     if (matches.length === 0) throw new Error(`Unknown hash prefix '#${prefix}'`);
     throw new Error(`Ambiguous hash prefix '#${prefix}'`);

@@ -1,9 +1,10 @@
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { Version, version } from "@hyper-hyper-space/hhs3_mvt";
-import type { RTableGroup, RTableView } from "@hyper-hyper-space/hhs3_rdb";
+import type { CatalogUpdateResult, RDbImpl, RTableGroup, RTableView } from "@hyper-hyper-space/hhs3_rdb";
 import { splitTableRef } from "@hyper-hyper-space/hhs3_rdb";
 import {
     bind,
+    deployLabelsFor,
     execute,
     LangBindContext,
     LangDiagnostic,
@@ -30,6 +31,8 @@ import type { AuthInteractionContext } from "./prompts.js";
 export type StatementRunResult = {
     result: LangExecutionResult;
     refUpdates?: RefUpdateOutcome[];
+    // CREATE DATABASE: the groups created (and deployed) for its release.
+    deploy?: CatalogUpdateResult;
 };
 
 export type ScriptRunResult = {
@@ -39,12 +42,13 @@ export type ScriptRunResult = {
 export type ExecuteTextOptions = AuthInteractionContext;
 
 export function createBindContext(session: RdbSession): LangBindContext {
-    const ctx = rootCtx(session);
+    const roots = session.workspace.roots;
     return {
-        resolveSchema: (ref) => session.workspace.roots.resolveSchema(ref, ctx),
-        resolveGroup: (ref) => session.workspace.roots.resolveGroup(ref, ctx),
-        resolveDatabase: (ref) => session.workspace.roots.resolveDatabase(ref, ctx),
-        resolveTable: (ref) => session.workspace.roots.resolveTable(ref, ctx),
+        resolveSchema: (ref) => roots.resolveSchema(ref, rootCtx(session)),
+        resolveGroup: (ref) => roots.resolveGroup(ref, rootCtx(session)),
+        resolveDatabase: (ref) => roots.resolveDatabase(ref, rootCtx(session)),
+        resolveCatalog: (ref) => roots.resolveCatalog(ref, rootCtx(session)),
+        resolveTable: (ref) => roots.resolveTable(ref, rootCtx(session)),
         resolveDefaultGroup: async () => session.currentGroup === undefined
             ? undefined
             : {
@@ -53,6 +57,16 @@ export function createBindContext(session: RdbSession): LangBindContext {
                 parts: [session.currentGroup],
                 span: { start: 0, end: session.currentGroup.length, line: 1, column: 1 },
             },
+        resolveDefaultDatabase: async () => {
+            if (session.currentDatabase === undefined) return undefined;
+            const root = roots.get(session.currentDatabase);
+            return { id: session.currentDatabase, db: root?.object as RDbImpl | undefined };
+        },
+        resolveDeployLabels: async (groupId) => {
+            const member = await roots.memberName(groupId);
+            if (member?.database.object === undefined) return undefined;
+            return deployLabelsFor(member.database.object as RDbImpl, groupId);
+        },
         resolveHash: (ref, scope) => session.workspace.roots.resolveHash(ref, scope),
         resolveRowId: (ref, table, at, from) => resolveRowIdPrefix(ref.prefix, table, at, from),
         resolveFkRowId: (prefix, sourceTable, column, at, from) => resolveFkRowId(prefix, sourceTable, column, at, from),
@@ -61,7 +75,7 @@ export function createBindContext(session: RdbSession): LangBindContext {
         resolveVariable: (name) => session.resolveVariable(name),
         resolvePublicKey: (labelOrPrefix) => session.resolvePublicKey(labelOrPrefix),
         hashSuite: () => session.workspace.replica.getHashSuite(),
-        resolveLogTarget: (ref) => session.workspace.roots.resolveLogTarget(ref, ctx),
+        resolveLogTarget: (ref) => roots.resolveLogTarget(ref, rootCtx(session)),
         currentAuthor: () => session.currentAuthor(),
         resolveAuthor: (ref) => session.resolveAuthor(ref),
         createUuid: () => session.createUuid(),
@@ -107,10 +121,15 @@ export async function executeText(
             result = executed.value;
         }
 
+        const item: StatementRunResult = { result };
         if (result.kind === 'create-plan') {
             const object = await session.workspace.createRoot(result.plan);
-            if (result.plan.kind === 'create-database') session.setCurrentDatabase(object.getId());
-            if (result.plan.kind === 'create-tablegroup') session.setCurrentGroup(object.getId());
+            if (result.plan.kind === 'create-database') {
+                item.deploy = await result.plan.afterCreate(object);
+                await useDatabase(session, object.getId());
+            }
+        } else if (result.kind === 'use-database') {
+            await useDatabase(session, result.database);
         } else if (result.kind === 'set-view') {
             session.setDefaultView({
                 at: await resolveVersionExpr(session, result.at, { kind: 'group', id: session.currentGroup ?? '', group: undefined }),
@@ -120,7 +139,6 @@ export async function executeText(
             });
         }
 
-        const item: StatementRunResult = { result };
         const trigger = extractRefUpdateTrigger(effectiveBound);
         if (session.refAutoUpdate !== 'off' && trigger !== undefined) {
             item.refUpdates = await propagateRefUpdates(session, trigger.sourceGroupId, trigger.author, options);
@@ -130,6 +148,15 @@ export async function executeText(
     }
 
     return { results };
+}
+
+// Makes `id` the current database; a current group of another database is
+// cleared.
+export async function useDatabase(session: RdbSession, id: B64Hash): Promise<void> {
+    session.setCurrentDatabase(id);
+    if (session.currentGroup === undefined) return;
+    const db = session.workspace.roots.get(id)?.object as RDbImpl | undefined;
+    if (db !== undefined && !(await db.getMemberGroups()).includes(session.currentGroup)) session.clearCurrentGroup();
 }
 
 export class LanguageError extends Error {

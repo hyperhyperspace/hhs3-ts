@@ -17,6 +17,9 @@ export async function resolveValue(expr: ValueExpr, context: LangBindContext): P
         if (expr.field !== undefined) throw new Error('$row.<column> is only supported in allow rule predicates');
         return context.resolveVariable(expr.name);
     }
+    if (expr.kind === 'param') {
+        throw new Error(`:${expr.name} is a catalog param; params are only allowed in WITH ROWS values of catalog table groups`);
+    }
     if (expr.kind === 'call') {
         if (expr.name === 'publicKey') {
             if (expr.args.length !== 1) throw new Error('publicKey() expects exactly one argument');

@@ -52,6 +52,8 @@ export type SigningScope = json.Literal[];
 // The signed message binds the payload to its insertion point: `at` must be
 // exactly the prevEntryHashes of the entry that will carry the payload, so a
 // signed op cannot be replayed at another position or into another object.
+// An empty `at` is a genesis signature: it only verifies for an entry with no
+// predecessors, whose hash is the object id of that exact payload.
 // `scope` binds it to its place inside that object's DAG; it is omitted when
 // empty, so root-level signatures are identical to unscoped ones.
 function signedMessage(payload: json.LiteralMap, at: Version, scope: SigningScope): Uint8Array {
@@ -90,10 +92,6 @@ export async function signPayload<T extends json.LiteralMap>(
     at: Version,
     scope: SigningScope = [],
 ): Promise<T & AuthoredFields> {
-    if (at.size === 0) {
-        throw new Error('Signed payloads require a non-empty insertion point');
-    }
-
     const suite = getSigningSuite(author.publicKey.suite);
     if (suite === undefined) {
         throw new Error(`Signing suite '${author.publicKey.suite}' not registered`);
@@ -113,7 +111,7 @@ export async function verifyPayloadSignature(
     keyLookup: KeyLookup,
     scope: SigningScope = [],
 ): Promise<boolean> {
-    if (!isAuthoredPayload(payload) || at.size === 0) {
+    if (!isAuthoredPayload(payload)) {
         return false;
     }
 

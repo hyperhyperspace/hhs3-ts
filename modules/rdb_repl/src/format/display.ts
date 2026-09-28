@@ -96,8 +96,17 @@ export function collectTruncatableFromResult(result: LangExecutionResult): strin
             );
         case 'log':
             return result.rows.flatMap((row) => [row.fullHash, ...row.prev]);
-        case 'add-member':
-            return [result.memberId, result.database, result.entryHash];
+        case 'alter-catalog':
+            return [result.catalog, result.release, ...(result.declare === undefined ? [] : [result.declare])];
+        case 'update-catalog':
+            return [
+                result.catalog, result.database, result.release,
+                ...(result.update.commit === undefined ? [] : [result.update.commit]),
+                ...result.update.created,
+                ...result.update.deployed.flatMap((d) => [d.groupId, d.entry]),
+            ];
+        case 'use-database':
+            return [result.database];
         case 'insert':
         case 'update':
         case 'delete':
@@ -106,8 +115,6 @@ export function collectTruncatableFromResult(result: LangExecutionResult): strin
             return [result.entryHash];
         case 'alter-schema':
             return [result.schema, result.entryHash];
-        case 'update-schema':
-            return [result.group, result.entryHash];
         case 'update-ref':
             return [result.ref, result.group, result.entryHash];
         default:

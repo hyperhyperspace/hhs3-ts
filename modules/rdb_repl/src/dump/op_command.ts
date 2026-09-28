@@ -1,6 +1,7 @@
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 import { dumpGroupEntry, type LoggableObject } from "@hyper-hyper-space/hhs3_rdb_lang";
+import { rootCtx } from "@hyper-hyper-space/hhs3_rdb_runtime";
 import type { ReplSession } from "../session.js";
 import { createDumpRenderOptions } from "./alias_context.js";
 
@@ -33,7 +34,7 @@ async function findEntry(session: ReplSession, prefix: string): Promise<Resolved
     const matches: Resolved[] = [];
     const seen = new Set<B64Hash>();
     for (const name of ordered) {
-        const resolved = await session.workspace.roots.resolveGroup(ref(name), { aliases: session.aliases });
+        const resolved = await session.workspace.roots.resolveGroup(ref(name), rootCtx(session));
         if (resolved.group === undefined || seen.has(resolved.id)) continue;
         const group = resolved.group as GroupObject;
         const entries: B64Hash[] = [];
@@ -52,7 +53,7 @@ async function findEntry(session: ReplSession, prefix: string): Promise<Resolved
 }
 
 async function resolveEntry(session: ReplSession, groupName: string, hashRef: string): Promise<Resolved> {
-    const resolved = await session.workspace.roots.resolveGroup(ref(groupName), { aliases: session.aliases });
+    const resolved = await session.workspace.roots.resolveGroup(ref(groupName), rootCtx(session));
     if (resolved.group === undefined) throw new Error('Group is not loaded');
     return {
         group: resolved.group as GroupObject,

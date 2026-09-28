@@ -2,12 +2,13 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 
 import { combineSpans, DiagnosticBag, err, ok, Result, TextSpan } from "../diagnostics.js";
 import {
-    AddMemberStatement, AllowOp, AllowRuleExpr, AlterSchemaStatement, AstScript, AstStatement, AuthorExpr, BundleStatement, BundleWriteStatement,
-    ColumnDecl, ColumnConstraintsExpr, ColumnTypeName, CreateDatabaseStatement, CreateSchemaStatement,
-    CreateTableGroupStatement, DeleteStatement, HashRef, InitialRow,
-    InsertStatement, LogStatement, MigrationRuleExpr, NameOrHashRef, NameRef, OperandExpr,
-    PredicateExpr, SelectStatement, SetViewStatement, TableDecl, TableOption, TableRef, UpdateRefStatement,
-    UpdateSchemaStatement, UpdateStatement, ValueExpr, VersionExpr, VersionMember,
+    AllowOp, AllowRuleExpr, AlterCatalogStatement, AlterSchemaStatement, AstScript, AstStatement, AuthorExpr,
+    BundleStatement, BundleWriteStatement, CatalogChangeExpr, CatalogGroupExpr, CatalogParamDeclExpr,
+    ColumnDecl, ColumnConstraintsExpr, ColumnTypeName, CreateCatalogStatement, CreateDatabaseStatement, CreateSchemaStatement,
+    DeleteStatement, HashRef, InitialRow,
+    InsertStatement, LogStatement, MigrationRuleExpr, NameOrHashRef, NameRef, OperandExpr, ParamAssignment,
+    PredicateExpr, ReleaseSelector, SelectStatement, SetViewStatement, TableDecl, TableOption, TableRef,
+    UpdateCatalogStatement, UpdateRefStatement, UpdateStatement, ValueExpr, VersionExpr, VersionMember,
 } from "./ast.js";
 import { lex } from "./lexer.js";
 import { Token } from "./tokens.js";
@@ -66,24 +67,36 @@ class Parser {
             const createTok = this.previous();
             if (this.matchKeyword('DATABASE')) return this.parseCreateDatabase(createTok.span);
             if (this.matchKeyword('SCHEMA')) return this.parseCreateSchema(createTok.span);
-            if (this.matchKeyword('TABLEGROUP')) return this.parseCreateTableGroup(createTok.span);
-            this.expected('DATABASE, SCHEMA or TABLEGROUP');
+            if (this.matchKeyword('CATALOG')) return this.parseCreateCatalog(createTok.span);
+            if (this.checkKeyword('TABLEGROUP')) {
+                return this.removedStatement('CREATE TABLEGROUP was removed: define table groups in a catalog (CREATE CATALOG ... AS (TABLEGROUP ...)) and deploy it with CREATE DATABASE ... USING CATALOG');
+            }
+            this.expected('DATABASE, SCHEMA or CATALOG');
             return undefined;
         }
 
-        if (this.matchKeyword('ADD')) {
-            const start = this.previous().span;
-            if (this.matchKeyword('SCHEMA')) return this.parseAddMember(start, 'schema');
-            if (this.matchKeyword('TABLEGROUP')) return this.parseAddMember(start, 'tablegroup');
-            this.expected('SCHEMA or TABLEGROUP');
-            return undefined;
+        if (this.checkKeyword('ADD')) {
+            return this.removedStatement('ADD SCHEMA and ADD TABLEGROUP were removed: a database gets its table groups from its catalog');
         }
-        if (this.matchKeyword('ALTER')) return this.parseAlterSchema(this.previous().span);
+        if (this.matchKeyword('ALTER')) {
+            const start = this.previous().span;
+            if (this.matchKeyword('CATALOG')) return this.parseAlterCatalog(start);
+            return this.parseAlterSchema(start);
+        }
         if (this.matchKeyword('UPDATE')) {
             const start = this.previous().span;
             if (this.matchKeyword('REF')) return this.parseUpdateRef(start);
-            if (this.matchKeyword('SCHEMA')) return this.parseUpdateSchema(start);
+            if (this.matchKeyword('CATALOG')) return this.parseUpdateCatalog(start);
+            if (this.checkKeyword('SCHEMA')) {
+                return this.removedStatement('UPDATE SCHEMA ... ON group was removed: set the version in an ALTER CATALOG release and deploy it with UPDATE CATALOG ... ON database');
+            }
             return this.parseUpdate(start);
+        }
+        if (this.matchKeyword('USE')) {
+            const start = this.previous().span;
+            this.expectKeyword('DATABASE');
+            const database = this.parseNameOrHash();
+            return { kind: 'use-database', database, span: combineSpans(start, database.span) };
         }
         if (this.matchKeyword('DELETE')) return this.parseDelete(this.previous().span);
         if (this.matchKeyword('BUNDLE')) return this.parseBundle(this.previous().span);
@@ -117,30 +130,302 @@ class Parser {
         return this.diagnostics;
     }
 
+    private removedStatement(message: string): undefined {
+        this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', message, this.peek().span);
+        this.synchronizeStatement();
+        return undefined;
+    }
+
     private parseCreateDatabase(start: TextSpan): CreateDatabaseStatement {
         const nameTok = this.expectIdentifierToken('database name');
         let end = nameTok.span;
         let seed: string | undefined;
-        if (this.matchKeyword('SEED')) {
-            const seedTok = this.expectKind('string', 'SEED value');
-            seed = seedTok.value as string;
-            end = seedTok.span;
+        let catalog: NameOrHashRef | undefined;
+        let release: ReleaseSelector | undefined;
+        let creators: ValueExpr[] = [];
+        let params: ParamAssignment[] = [];
+        let hashAlgorithm: string | undefined;
+        let author: AuthorExpr | undefined;
+        while (!this.isEof() && !this.checkPunctuation(';')) {
+            const hashTok = this.matchHashAlgorithm();
+            if (hashTok !== undefined) {
+                hashAlgorithm = hashTok.value as string;
+                end = hashTok.span;
+            } else if (this.matchKeyword('SEED')) {
+                const seedTok = this.expectKind('string', 'SEED value');
+                seed = seedTok.value as string;
+                end = seedTok.span;
+            } else if (this.matchKeyword('USING')) {
+                this.expectKeyword('CATALOG');
+                catalog = this.parseNameOrHash();
+                end = catalog.span;
+                if (this.matchKeyword('AT')) {
+                    release = this.parseReleaseSelector();
+                    end = release.span;
+                }
+            } else if (this.matchKeyword('CREATORS')) {
+                const parsed = this.parseCreatorList();
+                creators = parsed.creators;
+                end = parsed.end;
+            } else if (this.matchKeyword('WITH')) {
+                this.expectKeyword('PARAMS');
+                const parsed = this.parseParamAssignments();
+                params = parsed.params;
+                end = parsed.end;
+            } else if (this.matchKeyword('BY')) {
+                author = this.parseAuthor();
+                end = author.span;
+            } else {
+                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected CREATE DATABASE clause '${this.peek().text}'`, this.peek().span);
+                this.advance();
+            }
         }
+        if (catalog === undefined) {
+            this.diagnostics.add('PARSE_EXPECTED_TOKEN', 'CREATE DATABASE requires USING CATALOG catalogRef', combineSpans(start, end));
+            catalog = this.nameRef(nameTok.text, nameTok.span);
+        }
+        const stmt: CreateDatabaseStatement = {
+            kind: 'create-database', name: nameTok.text, catalog, creators, params, span: combineSpans(start, end),
+        };
+        if (seed !== undefined) stmt.seed = seed;
+        if (release !== undefined) stmt.release = release;
+        if (hashAlgorithm !== undefined) stmt.hashAlgorithm = hashAlgorithm;
+        if (author !== undefined) stmt.author = author;
+        return stmt;
+    }
+
+    private parseCreatorList(): { creators: ValueExpr[]; end: TextSpan } {
         const creators: ValueExpr[] = [];
-        if (this.matchKeyword('CREATORS')) {
+        this.expectPunctuation('(');
+        if (!this.checkPunctuation(')')) {
+            do {
+                creators.push(this.parseValue());
+            } while (this.matchPunctuation(','));
+        }
+        return { creators, end: this.expectPunctuation(')').span };
+    }
+
+    // A semver string, or LATEST / #hash / {version set}.
+    private parseReleaseSelector(): ReleaseSelector {
+        if (this.checkKind('string')) {
+            const tok = this.advance();
+            return { kind: 'semver', version: tok.value as string, span: tok.span };
+        }
+        const version = this.parseVersion();
+        return { kind: 'version', version, span: version.span };
+    }
+
+    // `(:name = value, ...)`
+    private parseParamAssignments(): { params: ParamAssignment[]; end: TextSpan } {
+        const params: ParamAssignment[] = [];
+        this.expectPunctuation('(');
+        while (!this.checkPunctuation(')') && !this.isEof()) {
+            const tok = this.expectKind('param', ':param name');
+            this.expectOperator('=');
+            const value = this.parseValue();
+            params.push({ name: tok.text.substring(1), value, span: combineSpans(tok.span, value.span) });
+            if (!this.matchPunctuation(',')) break;
+        }
+        return { params, end: this.expectPunctuation(')').span };
+    }
+
+    // `(:name type, ...)`
+    private parseParamDecls(): { params: CatalogParamDeclExpr[]; end: TextSpan } {
+        const params: CatalogParamDeclExpr[] = [];
+        this.expectPunctuation('(');
+        while (!this.checkPunctuation(')') && !this.isEof()) {
+            const tok = this.expectKind('param', ':param name');
+            const typeTok = this.advance();
+            const type = this.columnTypeFromToken(typeTok);
+            params.push({ name: tok.text.substring(1), type, span: combineSpans(tok.span, typeTok.span) });
+            if (!this.matchPunctuation(',')) break;
+        }
+        return { params, end: this.expectPunctuation(')').span };
+    }
+
+    private parseCreateCatalog(start: TextSpan): CreateCatalogStatement {
+        const name = this.expectIdentifierText('catalog name');
+        let seed: string | undefined;
+        let creators: ValueExpr[] = [];
+        let version: string | undefined;
+        let params: CatalogParamDeclExpr[] = [];
+        let hashAlgorithm: string | undefined;
+        while (!this.isEof() && !this.checkPunctuation(';') && !this.checkKeyword('AS')) {
+            const hashTok = this.matchHashAlgorithm();
+            if (hashTok !== undefined) {
+                hashAlgorithm = hashTok.value as string;
+            } else if (this.matchKeyword('SEED')) {
+                seed = this.expectKind('string', 'SEED value').value as string;
+            } else if (this.matchKeyword('CREATORS')) {
+                creators = this.parseCreatorList().creators;
+            } else if (this.matchKeyword('VERSION')) {
+                version = this.expectKind('string', "VERSION '<semver>'").value as string;
+            } else if (this.matchKeyword('PARAMS')) {
+                params = this.parseParamDecls().params;
+            } else {
+                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected CREATE CATALOG clause '${this.peek().text}'`, this.peek().span);
+                this.advance();
+            }
+        }
+        this.expectKeyword('AS');
+        this.expectPunctuation('(');
+        const groups: CatalogGroupExpr[] = [];
+        while (!this.checkPunctuation(')') && !this.isEof()) {
+            const groupStart = this.expectKeyword('TABLEGROUP').span;
+            groups.push(this.parseCatalogGroup(groupStart));
+            if (!this.matchPunctuation(',')) break;
+        }
+        let end = this.expectPunctuation(')').span;
+        let note: string | undefined;
+        let author: AuthorExpr | undefined;
+        while (!this.isEof() && !this.checkPunctuation(';')) {
+            if (this.matchKeyword('NOTE')) {
+                const tok = this.expectKind('string', 'NOTE text');
+                note = tok.value as string;
+                end = tok.span;
+            } else if (this.matchKeyword('BY')) {
+                author = this.parseAuthor();
+                end = author.span;
+            } else if (this.checkKeyword('AT')) {
+                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', 'CREATE CATALOG has no insertion point: the genesis is the first release', this.peek().span);
+                this.advance();
+            } else {
+                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected CREATE CATALOG clause '${this.peek().text}'`, this.peek().span);
+                this.advance();
+            }
+        }
+        if (version === undefined) {
+            this.diagnostics.add('PARSE_EXPECTED_TOKEN', "CREATE CATALOG requires VERSION '<semver>'", combineSpans(start, end));
+            version = '';
+        }
+        const stmt: CreateCatalogStatement = { kind: 'create-catalog', name, creators, version, params, groups, span: combineSpans(start, end) };
+        if (seed !== undefined) stmt.seed = seed;
+        if (hashAlgorithm !== undefined) stmt.hashAlgorithm = hashAlgorithm;
+        if (note !== undefined) stmt.note = note;
+        if (author !== undefined) stmt.author = author;
+        return stmt;
+    }
+
+    private parseAlterCatalog(start: TextSpan): AlterCatalogStatement {
+        const catalog = this.parseNameOrHash();
+        let version: string | undefined;
+        let params: CatalogParamDeclExpr[] = [];
+        let end = catalog.span;
+        while (!this.isEof() && !this.checkPunctuation(';') && !this.checkKeyword('AS')
+            && !this.checkKeyword('NOTE') && !this.checkKeyword('BY') && !this.checkKeyword('AT')) {
+            if (this.matchKeyword('VERSION')) {
+                const tok = this.expectKind('string', "VERSION '<semver>'");
+                version = tok.value as string;
+                end = tok.span;
+            } else if (this.matchKeyword('PARAMS')) {
+                const parsed = this.parseParamDecls();
+                params = parsed.params;
+                end = parsed.end;
+            } else {
+                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected ALTER CATALOG clause '${this.peek().text}'`, this.peek().span);
+                this.advance();
+            }
+        }
+        const changes: CatalogChangeExpr[] = [];
+        if (this.matchKeyword('AS')) {
             this.expectPunctuation('(');
-            if (!this.checkPunctuation(')')) {
-                do {
-                    creators.push(this.parseValue());
-                } while (this.matchPunctuation(','));
+            while (!this.checkPunctuation(')') && !this.isEof()) {
+                const change = this.parseCatalogChange();
+                if (change !== undefined) changes.push(change);
+                if (!this.matchPunctuation(',')) break;
             }
             end = this.expectPunctuation(')').span;
         }
-        const hashAlgorithm = this.matchHashAlgorithm();
-        if (hashAlgorithm !== undefined) end = hashAlgorithm.span;
-        const stmt: CreateDatabaseStatement = { kind: 'create-database', name: nameTok.text, creators, span: combineSpans(start, end) };
-        if (seed !== undefined) stmt.seed = seed;
-        if (hashAlgorithm !== undefined) stmt.hashAlgorithm = hashAlgorithm.value as string;
+        let note: string | undefined;
+        let author: AuthorExpr | undefined;
+        let at: VersionExpr | undefined;
+        while (!this.isEof() && !this.checkPunctuation(';')) {
+            if (this.matchKeyword('NOTE')) {
+                const tok = this.expectKind('string', 'NOTE text');
+                note = tok.value as string;
+                end = tok.span;
+            } else if (this.matchKeyword('BY')) {
+                author = this.parseAuthor();
+                end = author.span;
+            } else if (this.matchKeyword('AT')) {
+                if (this.checkKind('string')) {
+                    this.diagnostics.add('PARSE_EXPECTED_TOKEN',
+                        'ALTER CATALOG ... AT takes release hashes ({#hash, ...}) or LATEST, not a version string',
+                        this.peek().span);
+                    this.advance();
+                } else {
+                    at = this.parseVersion();
+                    end = at.span;
+                }
+            } else {
+                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected ALTER CATALOG clause '${this.peek().text}'`, this.peek().span);
+                this.advance();
+            }
+        }
+        if (version === undefined) {
+            this.diagnostics.add('PARSE_EXPECTED_TOKEN', "ALTER CATALOG requires VERSION '<semver>'", combineSpans(start, end));
+            version = '';
+        }
+        const stmt: AlterCatalogStatement = { kind: 'alter-catalog', catalog, version, params, changes, span: combineSpans(start, end) };
+        if (note !== undefined) stmt.note = note;
+        if (author !== undefined) stmt.author = author;
+        if (at !== undefined) stmt.at = at;
+        return stmt;
+    }
+
+    private parseCatalogChange(): CatalogChangeExpr | undefined {
+        const start = this.peek().span;
+        if (this.matchKeyword('ADD')) {
+            this.expectKeyword('TABLEGROUP');
+            const group = this.parseCatalogGroup(start);
+            return { kind: 'add-group', group, span: group.span };
+        }
+        if (this.matchKeyword('UPDATE')) {
+            this.expectKeyword('SCHEMA');
+            const schema = this.parseNameOrHash();
+            this.expectKeyword('TO');
+            const version = this.parseVersion();
+            this.expectKeyword('ON');
+            const group = this.parseNameOrHash();
+            return { kind: 'update-schema', schema, version, group, span: combineSpans(start, group.span) };
+        }
+        this.diagnostics.add('PARSE_UNEXPECTED_TOKEN',
+            `Expected ADD TABLEGROUP or UPDATE SCHEMA in ALTER CATALOG, got '${this.peek().text}'`, this.peek().span);
+        this.advance();
+        return undefined;
+    }
+
+    private parseUpdateCatalog(start: TextSpan): UpdateCatalogStatement {
+        const catalog = this.parseNameOrHash();
+        this.expectKeyword('TO');
+        const release = this.parseReleaseSelector();
+        this.expectKeyword('ON');
+        const database = this.parseNameOrHash();
+        let end = database.span;
+        let params: ParamAssignment[] = [];
+        let note: string | undefined;
+        let author: AuthorExpr | undefined;
+        while (!this.isEof() && !this.checkPunctuation(';')) {
+            if (this.matchKeyword('WITH')) {
+                this.expectKeyword('PARAMS');
+                const parsed = this.parseParamAssignments();
+                params = parsed.params;
+                end = parsed.end;
+            } else if (this.matchKeyword('NOTE')) {
+                const tok = this.expectKind('string', 'NOTE text');
+                note = tok.value as string;
+                end = tok.span;
+            } else if (this.matchKeyword('BY')) {
+                author = this.parseAuthor();
+                end = author.span;
+            } else {
+                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected UPDATE CATALOG clause '${this.peek().text}'`, this.peek().span);
+                this.advance();
+            }
+        }
+        const stmt: UpdateCatalogStatement = { kind: 'update-catalog', catalog, release, database, params, span: combineSpans(start, end) };
+        if (note !== undefined) stmt.note = note;
+        if (author !== undefined) stmt.author = author;
         return stmt;
     }
 
@@ -289,40 +574,36 @@ class Parser {
         return undefined;
     }
 
-    private parseCreateTableGroup(start: TextSpan): CreateTableGroupStatement {
+    // `name USING SCHEMA ref [clauses]`, ending at the `,` or `)` that closes
+    // the catalog body item.
+    private parseCatalogGroup(start: TextSpan): CatalogGroupExpr {
         const name = this.expectIdentifierText('tablegroup name');
-        let seed: string | undefined;
-        if (this.matchKeyword('SEED')) {
-            const seedTok = this.expectKind('string', 'SEED value');
-            seed = seedTok.value as string;
-        }
         this.expectKeyword('USING');
         this.expectKeyword('SCHEMA');
         const schema = this.parseNameOrHash();
         let schemaVersion: VersionExpr | undefined;
-        const bindings: CreateTableGroupStatement['bindings'] = [];
+        const bindings: CatalogGroupExpr['bindings'] = [];
         let idProvider: string | undefined;
         let canDeploy: PredicateExpr | undefined;
-        const canObserve: CreateTableGroupStatement['canObserve'] = [];
+        const canObserve: CatalogGroupExpr['canObserve'] = [];
         const initialRows: InitialRow[] = [];
-        let hashAlgorithm: string | undefined;
         let end = schema.span;
 
-        while (!this.isEof() && !this.checkPunctuation(';') && !this.checkPunctuation(')')) {
-            const hashTok = this.matchHashAlgorithm();
-            if (hashTok !== undefined) {
-                hashAlgorithm = hashTok.value as string;
-                end = hashTok.span;
-            } else if (this.matchKeyword('AT')) {
+        while (!this.isEof() && !this.checkPunctuation(';') && !this.checkPunctuation(')') && !this.checkPunctuation(',')) {
+            if (this.matchKeyword('AT')) {
                 schemaVersion = this.parseVersion();
                 end = schemaVersion.span;
             } else if (this.matchKeyword('BIND')) {
-                const bindStart = this.previous().span;
-                const bindName = this.expectIdentifierText('binding name');
-                this.expectOperator('=>');
-                const group = this.parseNameOrHash();
-                bindings.push({ name: bindName, group, span: combineSpans(bindStart, group.span) });
-                end = group.span;
+                for (;;) {
+                    const bindStart = this.peek().span;
+                    const bindName = this.expectIdentifierText('binding name');
+                    this.expectOperator('=>');
+                    const group = this.parseNameOrHash();
+                    bindings.push({ name: bindName, group, span: combineSpans(bindStart, group.span) });
+                    end = group.span;
+                    if (!this.continuesBindList()) break;
+                    this.advance();
+                }
             } else if (this.matchKeyword('USING')) {
                 const identities = this.expectIdentifierLike('IDENTITIES');
                 if (identities.upper !== 'IDENTITIES') {
@@ -333,26 +614,19 @@ class Parser {
                 end = provider.span;
             } else if (this.matchKeyword('ALLOW')) {
                 const allowStart = this.previous().span;
-                if (this.matchKeyword('UPDATE')) {
-                    if (this.matchKeyword('REF')) {
-                        const binding = this.expectIdentifierText('binding name');
-                        this.expectKeyword('IF');
-                        const predicate = this.parsePredicate();
-                        canObserve.push({ binding, predicate, span: combineSpans(allowStart, predicate.span) });
-                        end = predicate.span;
-                    } else if (this.matchKeyword('SCHEMA')) {
-                        this.expectKeyword('IF');
-                        canDeploy = this.parsePredicate();
-                        end = canDeploy.span;
-                    } else {
-                        this.diagnostics.add('PARSE_EXPECTED_TOKEN',
-                            'Expected ALLOW UPDATE SCHEMA or ALLOW UPDATE REF on CREATE TABLEGROUP',
-                            this.previous().span);
-                        this.advance();
-                    }
+                if (this.matchKeyword('DEPLOY')) {
+                    this.expectKeyword('IF');
+                    canDeploy = this.parsePredicate();
+                    end = canDeploy.span;
+                } else if (this.matchKeyword('UPDATE') && this.matchKeyword('REF')) {
+                    const binding = this.expectIdentifierText('binding name');
+                    this.expectKeyword('IF');
+                    const predicate = this.parsePredicate();
+                    canObserve.push({ binding, predicate, span: combineSpans(allowStart, predicate.span) });
+                    end = predicate.span;
                 } else {
                     this.diagnostics.add('PARSE_EXPECTED_TOKEN',
-                        'Expected ALLOW UPDATE SCHEMA or ALLOW UPDATE REF on CREATE TABLEGROUP',
+                        'Expected ALLOW DEPLOY IF or ALLOW UPDATE REF binding IF on a catalog table group',
                         this.previous().span);
                     this.advance();
                 }
@@ -367,18 +641,16 @@ class Parser {
                 }
                 end = this.expectPunctuation(')').span;
             } else {
-                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected CREATE TABLEGROUP clause '${this.peek().text}'`, this.peek().span);
+                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected TABLEGROUP clause '${this.peek().text}'`, this.peek().span);
                 this.advance();
             }
         }
 
-        const stmt: CreateTableGroupStatement = { kind: 'create-tablegroup', name, schema, bindings, canObserve, initialRows, span: combineSpans(start, end) };
-        if (seed !== undefined) stmt.seed = seed;
-        if (schemaVersion !== undefined) stmt.schemaVersion = schemaVersion;
-        if (idProvider !== undefined) stmt.idProvider = idProvider;
-        if (canDeploy !== undefined) stmt.canDeploy = canDeploy;
-        if (hashAlgorithm !== undefined) stmt.hashAlgorithm = hashAlgorithm;
-        return stmt;
+        const group: CatalogGroupExpr = { name, schema, bindings, canObserve, initialRows, span: combineSpans(start, end) };
+        if (schemaVersion !== undefined) group.schemaVersion = schemaVersion;
+        if (idProvider !== undefined) group.idProvider = idProvider;
+        if (canDeploy !== undefined) group.canDeploy = canDeploy;
+        return group;
     }
 
     private parseInitialRow(): InitialRow {
@@ -393,37 +665,6 @@ class Parser {
         }
         const end = this.expectPunctuation(')').span;
         return { table: startTok.text, values, span: combineSpans(startTok.span, end) };
-    }
-
-    private parseAddMember(start: TextSpan, member: 'schema' | 'tablegroup'): AddMemberStatement {
-        const target = this.parseNameOrHash();
-        this.expectKeyword('TO');
-        const database = this.parseNameOrHash();
-        let end = database.span;
-        let note: string | undefined;
-        let at: VersionExpr | undefined;
-        let author: AuthorExpr | undefined;
-        while (!this.isEof() && !this.checkPunctuation(';')) {
-            if (this.matchKeyword('NOTE')) {
-                const tok = this.expectKind('string', 'NOTE text');
-                note = tok.value as string;
-                end = tok.span;
-            } else if (this.matchKeyword('AT')) {
-                at = this.parseVersion();
-                end = at.span;
-            } else if (this.matchKeyword('BY')) {
-                author = this.parseAuthor();
-                end = author.span;
-            } else {
-                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected ADD clause '${this.peek().text}'`, this.peek().span);
-                this.advance();
-            }
-        }
-        const stmt: AddMemberStatement = { kind: 'add-member', member, target, database, span: combineSpans(start, end) };
-        if (note !== undefined) stmt.note = note;
-        if (at !== undefined) stmt.at = at;
-        if (author !== undefined) stmt.author = author;
-        return stmt;
     }
 
     private parseAlterSchema(start: TextSpan): AlterSchemaStatement {
@@ -549,33 +790,6 @@ class Parser {
         }
         this.validateAllowRules(options.filter((opt): opt is { kind: 'allow-rule' } & AllowRuleExpr => opt.kind === 'allow-rule'));
         return { name, columns, options, span: combineSpans(start, end) };
-    }
-
-    private parseUpdateSchema(start: TextSpan): UpdateSchemaStatement {
-        const schema = this.parseNameOrHash();
-        this.expectKeyword('TO');
-        const version = this.parseVersion();
-        this.expectKeyword('ON');
-        const group = this.parseNameOrHash();
-        let end = group.span;
-        let at: VersionExpr | undefined;
-        let author: AuthorExpr | undefined;
-        while (!this.isEof() && !this.checkPunctuation(';')) {
-            if (this.matchKeyword('AT')) {
-                at = this.parseVersion();
-                end = at.span;
-            } else if (this.matchKeyword('BY')) {
-                author = this.parseAuthor();
-                end = author.span;
-            } else {
-                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected UPDATE SCHEMA clause '${this.peek().text}'`, this.peek().span);
-                this.advance();
-            }
-        }
-        const stmt: UpdateSchemaStatement = { kind: 'update-schema', schema, version, group, span: combineSpans(start, end) };
-        if (author !== undefined) stmt.author = author;
-        if (at !== undefined) stmt.at = at;
-        return stmt;
     }
 
     private parseUpdateRef(start: TextSpan): UpdateRefStatement {
@@ -1091,6 +1305,10 @@ class Parser {
             const hashTok = this.advance();
             return { kind: 'hash', prefix: hashTok.text.substring(1), span: hashTok.span };
         }
+        if (this.checkKind('param')) {
+            const paramTok = this.advance();
+            return { kind: 'param', name: paramTok.text.substring(1), span: paramTok.span };
+        }
         if (this.checkPunctuation('[') || this.checkPunctuation('{')) {
             return this.parseJsonValue();
         }
@@ -1237,12 +1455,18 @@ class Parser {
         if (parts.length === 1) {
             return { table: tok.text, span: tok.span };
         }
-        if (parts.length !== 2) {
-            this.diagnostics.add('PARSE_EXPECTED_TOKEN', 'Expected table reference in the form group.table', tok.span);
+        if (parts.length === 3) {
+            return {
+                database: this.nameRef(parts[0], tok.span),
+                group: this.nameRef(parts[1], tok.span),
+                table: parts[2],
+                span: tok.span,
+            };
         }
-        const groupText = parts.length >= 2 ? parts.slice(0, parts.length - 1).join('.') : tok.text;
-        const table = parts.length >= 2 ? parts[parts.length - 1] : tok.text;
-        return { group: this.nameRef(groupText, tok.span), table, span: tok.span };
+        if (parts.length !== 2) {
+            this.diagnostics.add('PARSE_EXPECTED_TOKEN', 'Expected table reference in the form [db.]group.table', tok.span);
+        }
+        return { group: this.nameRef(parts[0], tok.span), table: parts[parts.length - 1], span: tok.span };
     }
 
     private parseNameOrHash(): NameOrHashRef {
@@ -1452,7 +1676,19 @@ class Parser {
     }
 
     private peekNext(): Token {
-        return this.tokens[this.pos + 1] ?? this.tokens[this.tokens.length - 1];
+        return this.peekAt(1);
+    }
+
+    private peekAt(offset: number): Token {
+        return this.tokens[this.pos + offset] ?? this.tokens[this.tokens.length - 1];
+    }
+
+    // In `BIND a => x, b => y`, a comma continues the list only when another
+    // `alias =>` follows it; otherwise it ends the catalog body item.
+    private continuesBindList(): boolean {
+        return this.checkPunctuation(',')
+            && this.peekAt(1).kind === 'identifier'
+            && this.peekAt(2).kind === 'operator' && this.peekAt(2).text === '=>';
     }
 
     private previous(): Token {

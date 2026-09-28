@@ -1,4 +1,4 @@
-import { deriveRowId } from "@hyper-hyper-space/hhs3_rdb";
+import { deployCatalogRelease, deriveRowId } from "@hyper-hyper-space/hhs3_rdb";
 import { formatValidationFailure, ValidationRejectedError } from "@hyper-hyper-space/hhs3_mvt";
 
 import { DiagnosticBag, err, ok, Result } from "../diagnostics.js";
@@ -10,7 +10,7 @@ import type { LangExecutionResult, SelectLangResult } from "./result.js";
 export async function execute(bound: BoundStatement): Promise<Result<LangExecutionResult>> {
     const diagnostics = new DiagnosticBag();
     try {
-        if (bound.kind === 'create-database' || bound.kind === 'create-schema' || bound.kind === 'create-tablegroup') {
+        if (bound.kind === 'create-database' || bound.kind === 'create-schema' || bound.kind === 'create-catalog') {
             return ok({ kind: 'create-plan', plan: await compileCreate(bound) });
         }
         return ok(await executeRuntime(bound));
@@ -26,22 +26,31 @@ export async function execute(bound: BoundStatement): Promise<Result<LangExecuti
 
 async function executeRuntime(bound: BoundExecutableStatement): Promise<LangExecutionResult> {
     switch (bound.kind) {
-        case 'add-member': {
-            if (bound.database.db === undefined) throw new Error('ADD target database is not loaded');
-            const entryHash = bound.member === 'schema'
-                ? await bound.database.db.addSchema(bound.memberId, bound.note, bound.author, bound.at)
-                : await bound.database.db.addGroup(bound.memberId, bound.note, bound.author, bound.at);
-            return { kind: 'add-member', member: bound.member, entryHash, database: bound.database.id, memberId: bound.memberId };
+        case 'alter-catalog': {
+            const published = await bound.catalog.catalog.publishRelease(bound.spec, bound.author, bound.at);
+            return {
+                kind: 'alter-catalog',
+                catalog: bound.catalog.id,
+                version: bound.spec.version,
+                release: published.release,
+                ...(published.declare !== undefined ? { declare: published.declare } : {}),
+            };
         }
+        case 'update-catalog': {
+            const update = await deployCatalogRelease(bound.database.db, {
+                release: bound.release,
+                params: bound.params,
+                ...(bound.note !== undefined ? { note: bound.note } : {}),
+                ...(bound.author !== undefined ? { author: bound.author } : {}),
+            });
+            return { kind: 'update-catalog', catalog: bound.catalog.id, database: bound.database.id, release: bound.release, update };
+        }
+        case 'use-database':
+            return { kind: 'use-database', database: bound.database.id };
         case 'alter-schema': {
             if (bound.schema.schema === undefined) throw new Error('ALTER SCHEMA target is not loaded');
             const entryHash = await bound.schema.schema.updateSchema(bound.rules, bound.author, bound.note, bound.at);
             return { kind: 'alter-schema', entryHash, schema: bound.schema.id, rules: bound.rules.length };
-        }
-        case 'update-schema': {
-            if (bound.group.group === undefined) throw new Error('UPDATE SCHEMA target group is not loaded');
-            const entryHash = await bound.group.group.deploy(bound.version, bound.author, bound.at);
-            return { kind: 'update-schema', entryHash, group: bound.group.id };
         }
         case 'update-ref': {
             if (bound.group.group === undefined) throw new Error('UPDATE REF target group is not loaded');

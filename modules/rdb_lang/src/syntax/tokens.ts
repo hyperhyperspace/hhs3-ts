@@ -4,6 +4,7 @@ export type TokenKind =
     | 'identifier'
     | 'keyword'
     | 'variable'
+    | 'param'
     | 'hash'
     | 'string'
     | 'number'
@@ -38,6 +39,7 @@ export const KEYWORDS = new Set([
     'BUNDLE',
     'BY',
     'BYTES',
+    'CATALOG',
     'COLUMN',
     'CONCURRENT',
     'CREATE',
@@ -47,6 +49,7 @@ export const KEYWORDS = new Set([
     'DEFAULT',
     'DELETE',
     'DELETES',
+    'DEPLOY',
     'DESC',
     'DROP',
     'EXISTS',
@@ -77,6 +80,7 @@ export const KEYWORDS = new Set([
     'ON',
     'OR',
     'ORDER',
+    'PARAMS',
     'PROVIDER',
     'PUB',
     'READONLY',
@@ -94,8 +98,10 @@ export const KEYWORDS = new Set([
     'TO',
     'TRUE',
     'UPDATE',
+    'USE',
     'USING',
     'VALUES',
+    'VERSION',
     'VIEW',
     'WHERE',
     'WITH',

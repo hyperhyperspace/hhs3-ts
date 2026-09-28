@@ -29,8 +29,20 @@ export function formatTableResult(result: LangExecutionResult, session: ReplSess
     const ctx = createDisplayContext(session, collectTruncatableFromResult(result));
     switch (result.kind) {
         case 'create-plan': return `create ${result.plan.kind} ${result.plan.name}`;
-        case 'add-member':
-            return `added ${result.member} ${ctx.formatString(result.memberId, { role: 'hash' })} to ${ctx.formatString(result.database, { role: 'hash' })} (${ctx.formatString(result.entryHash, { role: 'hash' })})`;
+        case 'alter-catalog': {
+            const declared = result.declare === undefined ? '' : `, after declare ${ctx.formatString(result.declare, { role: 'hash' })}`;
+            return `released ${result.version} (${ctx.formatString(result.release, { role: 'hash' })}${declared})`;
+        }
+        case 'update-catalog': {
+            const update = result.update;
+            const committed = update.commit === undefined
+                ? 'already deployed; caught up'
+                : `committed ${ctx.formatString(update.commit, { role: 'hash' })}`;
+            return `deployed release ${ctx.formatString(result.release, { role: 'hash' })}: `
+                + `${update.created.length} groups created, ${update.deployed.length} deployed, ${committed}`;
+        }
+        case 'use-database':
+            return `using database ${session.workspace.roots.get(result.database)?.name ?? ctx.formatString(result.database, { role: 'hash' })}`;
         case 'select': {
             const records = result.rows.map((row) => selectRowToRecord(row, result.columns));
             const columns = result.columns === undefined ? undefined : [
@@ -53,7 +65,6 @@ export function formatTableResult(result: LangExecutionResult, session: ReplSess
         case 'delete': return `deleted ${ctx.formatString(result.rowId, { role: 'hash' })} (${ctx.formatString(result.entryHash, { role: 'hash' })})`;
         case 'bundle': return `bundle ${ctx.formatString(result.entryHash, { role: 'hash' })} (${result.writes} writes)`;
         case 'alter-schema': return `altered schema ${ctx.formatString(result.schema, { role: 'hash' })} (${result.rules} rules, ${ctx.formatString(result.entryHash, { role: 'hash' })})`;
-        case 'update-schema': return `updated schema on ${ctx.formatString(result.group, { role: 'hash' })} (${ctx.formatString(result.entryHash, { role: 'hash' })})`;
         case 'update-ref': return `updated ref ${ctx.formatString(result.ref, { role: 'hash' })} on ${ctx.formatString(result.group, { role: 'hash' })} (${ctx.formatString(result.entryHash, { role: 'hash' })})`;
     }
 }

@@ -2,7 +2,7 @@ import { assertTrue, assertFalse, assertEquals } from "@hyper-hyper-space/hhs3_u
 import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { formatValidationFailure, ValidationRejectedError, version, Version } from "@hyper-hyper-space/hhs3_mvt";
+import { formatValidationFailure, ValidationRejectedError, version, Version, serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
@@ -20,6 +20,7 @@ async function makeIdentity(): Promise<OwnIdentity> {
 
 async function createEnv(tables: TableDef[], opts?: {
     canDeploy?: Predicate;
+    deployKeys?: OwnIdentity[];
     initialRows?: { [t: string]: json.Literal[] };
     admin?: OwnIdentity;
     selfValidate?: boolean;
@@ -43,6 +44,9 @@ async function createEnv(tables: TableDef[], opts?: {
         schemaRef: schema.getId(),
         schemaVersion: pinned,
         ...(opts?.canDeploy !== undefined ? { canDeploy: opts.canDeploy } : {}),
+        ...(opts?.deployKeys !== undefined ? {
+            deployKeys: opts.deployKeys.map((k) => ({ keyId: k.keyId, publicKey: serializePublicKeyToBase64(k.publicKey) })),
+        } : {}),
         ...(opts?.initialRows !== undefined ? { initialRows: opts.initialRows } : {}),
     });
     const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
@@ -476,13 +480,17 @@ export const rtableEnforceTests = {
             name: '[ENF13] canDeploy predicate evaluated on deploy: passing and failing authors',
             invoke: async () => {
                 // canDeploy: exists admins where grantee = $author
+                // both keys are embedded, so both signatures verify and the
+                // predicate alone decides
                 const admins = open('admins', { label: { type: 'string', pub: true }, grantee: { type: 'string', pub: true } });
                 const admin = await makeIdentity();
+                const stranger = await makeIdentity();
                 const { group, schema } = await createEnv(
                     [admins, open('orders', { customer: { type: 'string' } })],
                     {
                         admin,
                         canDeploy: { p: 'exists', table: 'admins', where: { grantee: '$author' } },
+                        deployKeys: [admin, stranger],
                         initialRows: {
                             admins: [{ action: 'insert', rowId: deriveRowId('seed-admin'), uuid: 'seed-admin', values: { label: 'root', grantee: admin.keyId } }],
                         },
@@ -492,7 +500,6 @@ export const rtableEnforceTests = {
                 await schema.updateSchema([{ rule: 'add-table', def: open('notes', { body: { type: 'string' } }) }], admin);
                 const v2 = await (await schema.getScopedDag()).getFrontier();
 
-                const stranger = await makeIdentity();
                 let strangerFailed = false;
                 let strangerMessage = '';
                 try {

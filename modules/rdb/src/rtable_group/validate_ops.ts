@@ -4,7 +4,8 @@
 //   create       - format + the pinned RSchema resolves (a MISSING schema
 //                  object or binding target is an infrastructure error:
 //                  throw, never `false`) + every initial row validates as an
-//                  insert against the pinned schema.
+//                  insert against the pinned schema + deployKeys are
+//                  self-certifying + a canDeploy over $author has a key source.
 //   row          - format + table exists in the effective schema at `at` +
 //                  the op conforms to it + identity rules: rowIds are
 //                  write-once (an insert is valid only if NO insert or
@@ -13,10 +14,12 @@
 //                  deletes need a view-live row at `(at, at)` (`hasRow`) + the row restriction passes at the
 //                  parent frontier `(at, at)`.
 //   ref-advance  - EITHER the schema deploy (refId is the group's schema ref:
-//                  monotonic against the schema DAG, at or above the pinned
-//                  version; when authored, the signature is verified at
-//                  validation and canDeploy is evaluated in 'object' context
-//                  against the verified author; PLUS the one-time add-fk
+//                  its `gate` hashes are exactly the RDeployGate mirrors of the
+//                  target version; monotonic against the schema DAG, at or
+//                  above the pinned version; when authored and the group has a
+//                  key source (idProvider, then deployKeys), the signature is
+//                  verified at validation and canDeploy is evaluated in
+//                  'object' context against the verified author; PLUS the one-time add-fk
 //                  prerequisite — a deploy whose newly-added/retargeted FK
 //                  would strand an existing live row at `at` is hard-rejected,
 //                  since FK reach is at-use and would otherwise leave the old
@@ -47,21 +50,21 @@ import {
 } from "@hyper-hyper-space/hhs3_mvt";
 import {
     isRefAdvancePayload, extractRefVersion, validateRefAdvanceMonotonicity, refVersionAtOrAbove,
-    extractAuthor, verifyPayloadSignature,
+    extractAuthor, verifyPayloadSignature, deserializePublicKeyFromBase64, computeKeyId,
 } from "@hyper-hyper-space/hhs3_mvt";
 import type { RefAdvancePayload, SigningScope } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchema, RSchemaView } from "../rschema/interfaces.js";
-import type { Predicate } from "../rschema/payload.js";
+import type { Predicate, SchemaCreator } from "../rschema/payload.js";
 import { splitTableRef } from "../rschema/payload.js";
 import { formatPredicate, formatRestrictionFailureReason } from "../rschema/format_predicate.js";
-import { collectExistsAtoms } from "../rschema/validate.js";
+import { collectExistsAtoms, predicateReferencesAuthor } from "../rschema/validate.js";
 import { isValidTableRef } from "../rschema/validate.js";
 import type { RTable, RTableView } from "../rtable/interfaces.js";
 import type { InsertRowPayload, RowOpPayload } from "../rtable/payload.js";
 import { validateInsertAgainstSchema, validateRowOpAgainstSchema, validateProviderInsertIntegrity } from "../rtable/validate_ops.js";
 
-import { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload, tableSigningContext } from "./payload.js";
+import { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload, tableSigningContext, deployGateSetFormat } from "./payload.js";
 import { validateTableGroupPayloadFormat } from "./validate.js";
 import { evaluatePredicate, evaluateRowOpRestriction } from "./predicates.js";
 import { rowTag } from "./scopes.js";
@@ -81,6 +84,11 @@ export type GroupOpHost = {
     evaluateObserveGate(refId: B64Hash, author: KeyId | undefined, refAt: Version, refFrom: Version): Promise<boolean>;
     getBindings(): { [name: string]: B64Hash };
     getIdProvider(): string | undefined;
+    // The embedded deploy signature keys (empty when the group declares none).
+    getDeployKeys(): SchemaCreator[];
+    // The RDeployGate mirror hashes of a schema version (sorted), computed
+    // from the schema DAG alone.
+    computeGateHashes(schemaVersion: Version): Promise<B64Hash[]>;
     getHashSuite(): HashSuite;
     getScopedDag(): Promise<ScopedDag>;
     getSchemaObject(): Promise<RSchema>;
@@ -203,6 +211,28 @@ async function validateCreate(create: CreateTableGroupPayload, ctx: RContext): P
         }
     }
 
+    // deploy keys are self-certifying, like schema creators
+    const seenKeys = new Set<KeyId>();
+    for (const key of create.deployKeys ?? []) {
+        if (seenKeys.has(key.keyId)) return validationFailure(`duplicate deploy key '${key.keyId}'`);
+        seenKeys.add(key.keyId);
+        try {
+            const pk = deserializePublicKeyFromBase64(key.publicKey);
+            if (computeKeyId(pk, hashSuite) !== key.keyId) {
+                return validationFailure(`deploy key '${key.keyId}' does not match its public key`);
+            }
+        } catch {
+            return validationFailure(`deploy key '${key.keyId}' public key is invalid`);
+        }
+    }
+
+    // a canDeploy that reads $author is only sound when the author is
+    // signature-verified: it needs a key source
+    if (create.canDeploy !== undefined && predicateReferencesAuthor(create.canDeploy)
+        && create.idProvider === undefined && (create.deployKeys ?? []).length === 0) {
+        return validationFailure("a canDeploy predicate over $author requires an idProvider or deployKeys");
+    }
+
     // idProvider selection: a LOCAL provider must exist in the pinned schema and
     // be flagged idProvider; a qualified 'group.table' provider is
     // name-resolvability only (its group must be bound — the foreign table being
@@ -225,7 +255,7 @@ async function validateCreate(create: CreateTableGroupPayload, ctx: RContext): P
 
 // The distinct group-names of all qualified (group.table) FK and exists
 // targets in the effective schema.
-function qualifiedTargetGroups(schemaView: RSchemaView): Set<string> {
+export function qualifiedTargetGroups(schemaView: RSchemaView): Set<string> {
     const groups = new Set<string>();
 
     for (const table of schemaView.getTableNames()) {
@@ -529,17 +559,46 @@ function bindingNameFor(group: GroupOpHost, refId: B64Hash): string {
     return refId;
 }
 
+// A deploy author's key: through the group's provider first, then the embedded
+// deployKeys. A missing bound provider object throws (the sync layer defers).
+async function resolveDeployKey(group: GroupOpHost, keyId: KeyId, at: Version): Promise<PublicKey | undefined> {
+    if (group.getIdProvider() !== undefined) {
+        const pk = await group.resolveAuthorKey(keyId, at);
+        if (pk !== undefined) return pk;
+    }
+    const key = group.getDeployKeys().find((k) => k.keyId === keyId);
+    if (key === undefined) return undefined;
+    try {
+        return deserializePublicKeyFromBase64(key.publicKey);
+    } catch {
+        return undefined;
+    }
+}
+
 async function validateDeploy(payload: RefAdvancePayload, group: GroupOpHost, at: Version): Promise<ValidationResult> {
     const p = payload as unknown as json.LiteralMap;
     const author = extractAuthor(p);
+    const newRefVersion = extractRefVersion(payload);
+
+    // The gate hashes must be exactly the mirrors of the target version,
+    // recomputed from the schema DAG. This never reads the gate, so validity is
+    // the same on every replica whatever each one has adopted.
+    const gate = p['gate'];
+    if (gate === undefined || !json.checkFormat(deployGateSetFormat, gate)) {
+        return validationFailure("schema deploy must carry the gate hashes of its version");
+    }
+    const expected = await group.computeGateHashes(newRefVersion);
+    if ([...json.fromSet(gate as json.Set)].sort().join(',') !== expected.join(',')) {
+        return validationFailure("schema deploy gate hashes do not mirror its version");
+    }
 
     // AUTHENTICATION at validation: when the deploy is authored and the group
-    // configures a provider (its OWN provider — the deploying group's scope),
-    // the signature must verify against the resolved key, else HARD REJECT. A
+    // has a key source (its OWN provider, or its embedded deployKeys), the
+    // signature must verify against the resolved key, else HARD REJECT. A
     // missing bound provider object throws (defer). canDeploy then evaluates
     // $author against the VERIFIED author.
-    if (author !== undefined && group.getIdProvider() !== undefined) {
-        if (!await verifyPayloadSignature(p, at, (keyId) => group.resolveAuthorKey(keyId, at))) {
+    if (author !== undefined && (group.getIdProvider() !== undefined || group.getDeployKeys().length > 0)) {
+        if (!await verifyPayloadSignature(p, at, (keyId) => resolveDeployKey(group, keyId, at))) {
             return validationFailure(`deploy signature from author '${author}' could not be verified`);
         }
     }
@@ -558,7 +617,6 @@ async function validateDeploy(payload: RefAdvancePayload, group: GroupOpHost, at
         if (!ok) return validationFailure(`canDeploy predicate rejected schema deploy: ${formatPredicate(canDeploy)}`);
     }
 
-    const newRefVersion = extractRefVersion(payload);
     const schema = await group.getSchemaObject();
     const schemaCausalDag = await schema.getCausalDag();
 

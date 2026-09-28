@@ -6,10 +6,12 @@ export function promptForSession(session: ReplSession, continuation = false): st
     return `rdb:${groupDisplayName(session)}:${keyDisplayName(session)}> `;
 }
 
+// `db.group`, `db` or `-`.
 function groupDisplayName(session: ReplSession): string {
-    if (session.currentGroup === undefined) return '-';
-    return session.workspace.roots.get(session.currentGroup)?.name
-        ?? formatDisplayString(session, session.currentGroup, { role: 'hash' });
+    const name = (id: string) => session.workspace.roots.get(id)?.name ?? formatDisplayString(session, id, { role: 'hash' });
+    const db = session.currentDatabase === undefined ? undefined : name(session.currentDatabase);
+    if (session.currentGroup === undefined) return db ?? '-';
+    return db === undefined ? name(session.currentGroup) : `${db}.${name(session.currentGroup)}`;
 }
 
 function keyDisplayName(session: ReplSession): string {

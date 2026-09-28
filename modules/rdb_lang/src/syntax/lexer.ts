@@ -136,6 +136,13 @@ export function lex(source: string): Result<Token[]> {
             continue;
         }
 
+        if (ch === ':' && i + 1 < source.length && isIdentStart(source[i + 1])) {
+            i += 1;
+            while (i < source.length && isIdentPart(source[i])) i += 1;
+            push('param', source.substring(start, i), start, i);
+            continue;
+        }
+
         if (ch === '#') {
             i += 1;
             if (i >= source.length || !isHashPart(source[i])) {

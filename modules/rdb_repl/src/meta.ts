@@ -1,7 +1,9 @@
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { RObject } from "@hyper-hyper-space/hhs3_mvt";
-import type { ColumnConstraints, RSchema, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
+import type { ColumnConstraints, RDbImpl, RSchema, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
+import { catalogStatus } from "@hyper-hyper-space/hhs3_rdb";
 import {
+    dumpCatalog,
     dumpDatabase,
     dumpGroup,
     dumpSchema,
@@ -12,7 +14,7 @@ import {
     type LangCommandRef,
     type RenderOptions,
 } from "@hyper-hyper-space/hhs3_rdb_lang";
-import type { RefAutoUpdateMode } from "@hyper-hyper-space/hhs3_rdb_runtime";
+import { rootCtx, useDatabase, type RefAutoUpdateMode } from "@hyper-hyper-space/hhs3_rdb_runtime";
 import { formatAliasListing, formatAliasResult, isAliasScope, resolveAliasTarget, type AliasScope } from "./aliases.js";
 import { runDeltaCommand } from "./delta/command.js";
 import { runProjectCommand } from "./projection/command.js";
@@ -42,8 +44,11 @@ export async function runMetaCommand(session: ReplSession, line: string): Promis
         case 'q':
         case 'quit': return { handled: true, quit: true };
         case 'dbs': return { handled: true, output: roots(session, 'database') };
+        case 'catalogs': return { handled: true, output: roots(session, 'catalog') };
         case 'schemas': return { handled: true, output: roots(session, 'schema') };
-        case 'groups': return { handled: true, output: roots(session, 'group') };
+        case 'groups': return { handled: true, output: await listGroups(session) };
+        case 'catalog': return { handled: true, output: await catalogCommand(session, args[0]) };
+        case 'adopt': return { handled: true, output: await adoptCommand(session, args) };
         case 'dt': return { handled: true, output: await listTables(session, args[0]) };
         case 'd': return { handled: true, output: await describeTable(session, args[0]) };
         case 'keys': return { handled: true, output: await listKeys(session) };
@@ -124,25 +129,86 @@ export async function fulfillPassphraseNeed(
     return `unlocked ${formatDisplayString(session, identity.keyId, { role: 'hash' })}`;
 }
 
-function roots(session: ReplSession, kind: 'database' | 'schema' | 'group'): string {
+function roots(session: ReplSession, kind: 'database' | 'catalog' | 'schema'): string {
     return formatSessionRows(session, session.workspace.roots.list(kind).map((root) => ({
         name: root.name ?? '', id: root.id, type: root.type,
     })), undefined, { structuralColumns: new Set(['id']) });
 }
 
+// Groups by database: `db.group` is the name to use outside USE DATABASE.
+async function listGroups(session: ReplSession): Promise<string> {
+    const rows: Record<string, unknown>[] = [];
+    for (const db of session.workspace.roots.list('database')) {
+        if (db.object === undefined) continue;
+        for (const [name, id] of await (db.object as RDbImpl).getMemberGroupNames()) {
+            rows.push({ database: db.name ?? '', name, id, current: session.currentDatabase === db.id });
+        }
+    }
+    return formatSessionRows(session, rows, undefined, { structuralColumns: new Set(['id']) });
+}
+
+async function loadDatabase(session: ReplSession, name?: string): Promise<RDbImpl> {
+    const target = name ?? (session.currentDatabase === undefined ? undefined : `#${session.currentDatabase}`);
+    if (target === undefined) throw new Error('No current database; name one or USE DATABASE');
+    const root = await session.workspace.roots.resolveDatabase(ref(target), rootCtx(session));
+    if (root.db === undefined) throw new Error('Database is not loaded');
+    return root.db;
+}
+
+// \catalog [db]: how the database stands against its catalog on this replica.
+async function catalogCommand(session: ReplSession, name?: string): Promise<string> {
+    const db = await loadDatabase(session, name);
+    const status = await catalogStatus(db);
+    const hashes = [
+        status.catalog,
+        ...[...status.released, ...status.history].map((r) => r.hash),
+        ...status.members.flatMap((m) => [m.groupId, ...m.target, ...(m.current ?? []), ...(m.adopted ?? [])]),
+    ];
+    const ctx = createDisplayContext(session, hashes);
+    const h = (hash: string) => ctx.formatString(hash, { role: 'hash', hashPrefix: true });
+    const list = (releases: { hash: string; version: string }[]) =>
+        releases.length === 0 ? '(none)' : releases.map((r) => `${r.version} ${h(r.hash)}`).join(', ');
+    const set = (hashes: string[] | undefined) => hashes === undefined ? '' : `{${hashes.map(h).join(', ')}}`;
+    const catalogName = session.workspace.roots.get(status.catalog)?.name ?? h(status.catalog);
+    const lines = [
+        `catalog  ${catalogName}`,
+        `released ${list(status.released)}`,
+        `deployed ${list(status.deployed)}`,
+        `adopted  ${list(status.adopted)} (range ${status.adoptionRange})`,
+        `held     ${list(status.held)}`,
+    ];
+    if (status.unresolved !== undefined) lines.push(`unresolved: ${JSON.stringify(status.unresolved)}`);
+    if (status.members.length > 0) {
+        lines.push(formatRows(status.members.map((m) => ({
+            group: m.name, state: m.state, target: set(m.target), current: set(m.current), adopted: set(m.adopted),
+        }))));
+    }
+    return lines.join('\n');
+}
+
+// \adopt <range> [db]: widen (or set) the database's adoption range.
+async function adoptCommand(session: ReplSession, args: string[]): Promise<string> {
+    const [range, name] = args;
+    if (range === undefined) throw new Error('Usage: \\adopt <range> [db]   (e.g. ^2, ^1.4, *)');
+    const db = await loadDatabase(session, name);
+    await db.setAdoptionRange(range);
+    const held = (await catalogStatus(db)).held.length;
+    return `adoption range ${range}${held > 0 ? ` (${held} deployed releases still held)` : ''}`;
+}
+
 async function listTables(session: ReplSession, name?: string): Promise<string> {
-    const group = await session.workspace.roots.resolveGroup(ref(name ?? session.currentGroup ?? ''), { aliases: session.aliases });
+    const group = await session.workspace.roots.resolveGroup(ref(name ?? session.currentGroup ?? ''), rootCtx(session));
     if (group.group === undefined) throw new Error('Group is not loaded');
     return formatRows((await group.group.getView()).getSchemaView().getTableNames().map((table) => ({ table })));
 }
 
 async function describeTable(session: ReplSession, tableRef?: string): Promise<string> {
-    if (tableRef === undefined) throw new Error('Usage: \\d group.table');
+    if (tableRef === undefined) throw new Error('Usage: \\d [db.]group.table');
     const parts = tableRef.split('.');
-    const groupName = parts.length > 1 ? parts[0] : session.currentGroup;
-    const tableName = parts.length > 1 ? parts.slice(1).join('.') : parts[0];
-    if (groupName === undefined) throw new Error('No current group; use \\d group.table');
-    const group = await session.workspace.roots.resolveGroup(ref(groupName), { aliases: session.aliases });
+    const groupName = parts.length > 1 ? parts.slice(0, -1).join('.') : session.currentGroup;
+    const tableName = parts[parts.length - 1]!;
+    if (groupName === undefined) throw new Error('No current group; use \\d [db.]group.table');
+    const group = await session.workspace.roots.resolveGroup(ref(groupName), rootCtx(session));
     if (group.group === undefined) throw new Error('Group is not loaded');
     const table = (await group.group.getView()).getSchemaView().getTable(tableName);
     if (table === undefined) throw new Error(`Unknown table '${tableName}'`);
@@ -214,20 +280,22 @@ function labelFor(session: ReplSession, keyId: string): string {
 async function useCommand(session: ReplSession, args: string[]): Promise<string> {
     const [kind, name] = args;
     if (kind === 'database') {
-        const root = await session.workspace.roots.resolveDatabase(ref(name), { aliases: session.aliases });
-        session.setCurrentDatabase(root.id);
-        return `using database ${formatDisplayString(session, root.id, { role: 'hash' })}`;
+        const root = await session.workspace.roots.resolveDatabase(ref(name), rootCtx(session));
+        await useDatabase(session, root.id);
+        return `using database ${root.db?.getName() ?? formatDisplayString(session, root.id, { role: 'hash' })}`;
     }
     if (kind === 'group') {
-        const root = await session.workspace.roots.resolveGroup(ref(name), { aliases: session.aliases });
+        const root = await session.workspace.roots.resolveGroup(ref(name), rootCtx(session));
+        const member = await session.workspace.roots.memberName(root.id);
+        if (member !== undefined && member.database.id !== session.currentDatabase) await useDatabase(session, member.database.id);
         session.setCurrentGroup(root.id);
-        return `using group ${formatDisplayString(session, root.id, { role: 'hash' })}`;
+        return `using group ${member === undefined ? formatDisplayString(session, root.id, { role: 'hash' }) : `${member.database.name ?? ''}.${member.name}`}`;
     }
-    throw new Error('Usage: \\use database <name> | \\use group <name>');
+    throw new Error('Usage: \\use database <name> | \\use group <[db.]name>');
 }
 
 async function frontier(session: ReplSession, name?: string): Promise<string> {
-    const root = await session.workspace.roots.resolveGroup(ref(name ?? session.currentGroup ?? ''), { aliases: session.aliases });
+    const root = await session.workspace.roots.resolveGroup(ref(name ?? session.currentGroup ?? ''), rootCtx(session));
     if (root.group === undefined) throw new Error('Group is not loaded');
     const hashes = [...await (await root.group.getScopedDag()).getFrontier()];
     const ctx = createDisplayContext(session, hashes);
@@ -299,19 +367,27 @@ async function dump(session: ReplSession, args: string[]): Promise<string> {
     const render = (extra?: RenderOptions) => createDumpRenderOptions(session, extra);
     if (kind === 'op') return runDumpOpCommand(session, args.slice(1));
     if (kind === 'schema') {
-        const root = await session.workspace.roots.resolveSchema(ref(name), { aliases: session.aliases });
+        const root = await session.workspace.roots.resolveSchema(ref(name), rootCtx(session));
         if (root.schema === undefined) throw new Error('Schema is not loaded');
         return dumpSchema(root.schema as Parameters<typeof dumpSchema>[0], { render: render() });
     }
+    if (kind === 'catalog') {
+        const root = await session.workspace.roots.resolveCatalog(ref(name), rootCtx(session));
+        if (root.catalog === undefined) throw new Error('Catalog is not loaded');
+        return dumpCatalog(root.catalog as Parameters<typeof dumpCatalog>[0], {
+            loadSchema: async (id) => await loadRoot(session, id) as RSchema & Parameters<typeof dumpSchema>[0],
+            render: render(),
+        });
+    }
     if (kind === 'group') {
-        const root = await session.workspace.roots.resolveGroup(ref(name), { aliases: session.aliases });
+        const root = await session.workspace.roots.resolveGroup(ref(name), rootCtx(session));
         if (root.group === undefined) throw new Error('Group is not loaded');
         return dumpGroup(root.group as Parameters<typeof dumpGroup>[0], { render: render() });
     }
     if (kind === 'database') {
         if (name === undefined) throw new Error('Usage: \\dump database <name> [full|schema]');
         const mode = args[2] === 'schema' ? 'schema' : 'full';
-        const root = await session.workspace.roots.resolveDatabase(ref(name), { aliases: session.aliases });
+        const root = await session.workspace.roots.resolveDatabase(ref(name), rootCtx(session));
         if (root.db === undefined) throw new Error('Database is not loaded');
         return dumpDatabase(root.db as Parameters<typeof dumpDatabase>[0], {
             mode,
@@ -320,7 +396,7 @@ async function dump(session: ReplSession, args: string[]): Promise<string> {
             render: render({ profile: mode }),
         });
     }
-    throw new Error('Usage: \\dump schema|group|database <name> [full|schema] | \\dump op [group] #hash');
+    throw new Error('Usage: \\dump schema|catalog|group|database <name> [full|schema] | \\dump op [group] #hash');
 }
 
 async function loadRoot(session: ReplSession, id: B64Hash): Promise<RObject> {
@@ -348,11 +424,12 @@ function ref(text = '') {
 
 function help(args: string[]): string {
     if (args[0] !== 'commands' && args[0] !== 'command') return [
-        '\\dbs, \\schemas, \\groups, \\dt [group], \\d group.table',
+        '\\dbs, \\catalogs, \\schemas, \\groups, \\dt [[db.]group], \\d [db.]group.table',
+        '\\catalog [db]  (released / deployed / adopted / held releases and member states), \\adopt <range> [db]  (e.g. ^2)',
         '\\key create <label> [passphrase], \\key unlock <label|#prefix> [passphrase], \\keys, \\whoami',
         '\\author [<label|#prefix> [passphrase]|nobody]',
-        '\\use database <name>, \\use group <name>, \\view, \\frontier [group]',
-        '\\alias [scope] <name> <#prefix>, \\aliases [scope], \\unalias <scope> <name>, \\output table|json|vertical, \\hash-width auto|full|<N>, \\hash-labels on|off, \\ref-auto-update auto|self|off, \\dump schema|group|database <name> [full|schema], \\dump op [group] #hash',
+        '\\use database <name>, \\use group <[db.]name>, \\view, \\frontier [[db.]group]',
+        '\\alias [scope] <name> <#prefix>, \\aliases [scope], \\unalias <scope> <name>, \\output table|json|vertical, \\hash-width auto|full|<N>, \\hash-labels on|off, \\ref-auto-update auto|self|off, \\dump schema|catalog|group|database <name> [full|schema], \\dump op [group] #hash',
         '\\delta schema|group <name> <start> <end> [bounded|full]',
         '\\project start <db> as <local-id> to <path>',
         '\\project status [<db>], \\project stop <id>, \\project update <id>, \\project events <id> [after <n>] [before <n>] [limit <m>] [order asc|desc]',

@@ -53,15 +53,19 @@ C-SQL statements terminate with `;` (multi-line and paste supported). Backslash 
 ```
 \help                         list meta-commands
 \help commands [filter]       C-SQL reference
-\dbs \schemas \groups         list roots
-\dt [group] \d group.table    list / describe tables
-\use database|group <name>    set current root
+\dbs \catalogs \schemas       list roots
+\groups                       list groups by database (db.group)
+\dt [[db.]group] \d [db.]group.table    list / describe tables
+\use database <name>          set the current database (bare group names resolve in it)
+\use group <[db.]name>        set the current group (bare table names resolve in it)
+\catalog [db]                 released / deployed / adopted / held releases, member states
+\adopt <range> [db]           widen the adoption range (e.g. ^2)
 \view \frontier [group]       show view / group frontier
 \key create|unlock ...        \keys \whoami \author   key + identity mgmt
 \alias \aliases \unalias      name #hash prefixes
 \output table|json|vertical   \hash-width \hash-labels   display
 \ref-auto-update auto|self|off   auto UPDATE REF for bound observers (auto in REPL, off in scripts)
-\dump schema|group|database <name> [full|schema]
+\dump schema|catalog|group|database <name> [full|schema]
 \dump op [group] #hash        reverse-render one group op
 \delta schema|group <name> <start> <end>
 \project start <db> as <id> to <path>
@@ -76,6 +80,8 @@ C-SQL statements terminate with `;` (multi-line and paste supported). Backslash 
 \quit
 ```
 
+A database is created from a catalog release (`CREATE DATABASE ... USING CATALOG`), which creates its table groups and makes it the current database; the prompt shows `rdb:<db>[.<group>]:<author>>`. Group names are per database: `db.group` always resolves, a bare `group` resolves in the current database, and without one only when a single database has it. `UPDATE CATALOG ... ON db` deploys a later release and reports the groups it created and deployed. `\catalog` shows how the database stands against its catalog on this replica, and `\adopt ^N` lets a held major release flow.
+
 After a mutating write on a table group, `\ref-auto-update auto` (the REPL default) finds every loaded group that binds the written group and issues `UPDATE REF` recursively, so cross-group FK targets stay current without manual ref-advances. Each automatic ref-update prints a line like `updated ref on shop_prod to #abc…` (suppressed in `--json` output mode).
 
 Ref-auto-update has three modes:
@@ -84,7 +90,7 @@ Ref-auto-update has three modes:
 - **self** — preferred authors only (same order); prompt to unlock those identities if gated and locked; skip with a message listing tested identities if none satisfy the gate (no keystore scan).
 - **off** — no automatic ref updates.
 
-For gated `ALLOW UPDATE REF` bindings, validation failures on auth-related rules may include a `hint: BY $label` line suggesting a keystore identity that would satisfy the gate. In the interactive REPL, when a statement omits an explicit `BY` clause and a keystore identity would satisfy the auth rule, the tool may prompt to sign and retry instead of showing the validation error first; explicit `BY` (including `NOBODY` or a failing key) shows the error and hint only. The same sign-and-retry flow applies at bind time for `ALTER SCHEMA` and `ADD SCHEMA` / `ADD TABLEGROUP` when an author is required and `BY` is omitted. Override with `RDB_REF_AUTO_UPDATE=auto|self|off` (`on` is accepted as `auto`).
+For gated `ALLOW UPDATE REF` bindings, validation failures on auth-related rules may include a `hint: BY $label` line suggesting a keystore identity that would satisfy the gate. In the interactive REPL, when a statement omits an explicit `BY` clause and a keystore identity would satisfy the auth rule, the tool may prompt to sign and retry instead of showing the validation error first; explicit `BY` (including `NOBODY` or a failing key) shows the error and hint only. The same sign-and-retry flow applies at bind time for `ALTER SCHEMA`, `ALTER CATALOG` (a catalog creator) and `UPDATE CATALOG` (a database creator) when an author is required and `BY` is omitted. Override with `RDB_REF_AUTO_UPDATE=auto|self|off` (`on` is accepted as `auto`).
 
 `EXPLAIN LOG` adds a `reason` column for Cancelled group/table ops (void restriction, FK, observe-gate, etc.).
 

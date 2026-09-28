@@ -8,7 +8,7 @@
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import type { NestingParent, RObject, Version, View } from "@hyper-hyper-space/hhs3_mvt";
 
-import type { Predicate } from "../rschema/payload.js";
+import type { Predicate, SchemaCreator } from "../rschema/payload.js";
 import type { RSchemaView } from "../rschema/interfaces.js";
 import type { RTable, RTableView } from "../rtable/interfaces.js";
 import type { RowOpPayload } from "../rtable/payload.js";
@@ -37,6 +37,10 @@ export interface RTableGroup extends RObject, NestingParent {
     // The selected identity provider (local table name or 'group.table'), or
     // undefined if the group performs no authentication.
     getIdProvider(): string | undefined;
+    // Embedded deploy signature keys (a key source beside the idProvider).
+    getDeployKeys(): SchemaCreator[];
+    // The id of this group's replica-local RDeployGate.
+    getDeployGateId(): B64Hash;
 
     // Member access: loads the nested RTable. The table must exist in the
     // effective schema at the group frontier; throws otherwise.

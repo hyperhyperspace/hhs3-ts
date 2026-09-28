@@ -1,49 +1,43 @@
-// RDb: the sync root and orchestrator for a deployed database. Its DAG records
-// deployment membership (advisory, monotonic, add-only); its runtime role is
-// to ensure member objects and their transitive references (RSchemas, bound
-// foreign groups) are present and syncing in the replica — this is where the
-// loosely-specified startSync / stopSync of RObject earn their keep.
+// RDb: the sync root and orchestrator for a database deployed from a catalog.
+// Its DAG records which catalog releases the admin deployed and with which
+// params; its member groups are computed from those releases by the normative
+// instantiation (instantiate.ts). Its runtime role is to keep the catalog, the
+// referenced schemas and the member groups present and syncing, and to adopt
+// deployed releases into the members' local gates.
 //
 // ACTIONS (see payload.ts for formats):
 //
 //   create
-//     Genesis of the sync root. Carries: seed, optional name, optional
-//     creators (keyId + publicKey; deployment authority when non-empty),
-//     hash algorithm.
+//     Genesis of the sync root: seed, optional name and creators (deployment
+//     authority when non-empty), the catalog, the genesis release, its params,
+//     hash algorithm. Validated without the catalog.
 //
-//   add-schema
-//     Records an RSchema as part of the deployment (monotonic, no removal in
-//     v1; optional free-form `note`). When creators are declared, requires
-//     author + signature from a creator.
-//
-//   add-group
-//     Records a deployed RTableGroup as part of the deployment (monotonic;
-//     optional free-form `note`). When creators are declared, requires
-//     author + signature from a creator.
+//   update-catalog
+//     Deploys a later release of the same catalog (forward only) with the
+//     params it first needs. Depends on the catalog at that release. When
+//     creators are declared, requires author + signature from a creator.
 //
 // Invariants:
-//   - RDb state is ADVISORY: nothing's validity ever depends on it; groups are
-//     fully valid and verifiable without their RDb. extractForeignDeps returns
-//     undefined for this reason (membership never gates op validation).
-//   - Membership is keyed by schema / group id. The optional `note` is a
-//     free-form comment: never resolved, never a key. Name resolution for
-//     qualified FK / exists / idProvider targets does NOT go through the RDb —
-//     each RTableGroup fixes its own `bindings` (name -> group id) at creation.
-//   - A member or referenced object missing from the replica triggers a mesh
-//     fetch (ctx.fetchObject); if that is unavailable or fails, it is an
-//     infrastructure error (throw), never an MVT data condition.
+//   - No group's validity ever depends on its RDb: groups never observe it.
+//   - Membership is computed, never stored: every replica derives the same
+//     group ids from the deployed releases, the params and the creators.
+//     Membership is computed ∪ assigned; assigned is empty in v1.
+//   - A deployed release is adopted by this replica only within its adoption
+//     range (adoption.ts); synced deploys to versions not adopted wait.
 //
 // startSync subscribes to this RDb's DAG (register, then read) and reconciles
-// the sync fan-out. Reconcile is two-step and repeatable:
-//   Step 1 (closure): BFS the transitive closure — members, each group's own
-//     RSchema and bound foreign groups — fetching any object not yet present
-//     with an explicit backend label. Backend labels are fixed at create /
-//     fetch time and only memoized thereafter, so the whole closure must be
-//     present before sessions open (foreign-dep lookup uses getObject, which
-//     needs the closure already in the replica map).
-//   Step 2 (sessions): open one swarm + sync session per DAG not yet in the
-//     session map (including the RDb's own DAG) and activate it.
-// Membership is add-only in v1, so reconcile only opens missing sessions.
+// the sync fan-out, repeatably:
+//   - the catalog comes through the creation-deps path (its genesis pins
+//     schemas): fetch its create payload, sync those schemas, then create it;
+//   - every schema the catalog references (genesis pins plus declares) is
+//     fetched and synced, so a declared schema arrives before the release
+//     that needs it validates;
+//   - absent member groups are created from their locally computed payloads
+//     once their genesis deps are present (peers never serve group creates),
+//     together with their replica-local RDeployGate, which gets no session;
+//   - each present object gets one swarm + sync session, and its growth
+//     triggers a rescan (onDepChange);
+//   - the adoption policy runs after every pass.
 // stopSync unsubscribes, invalidates in-flight work via an epoch, and tears
 // sessions down. An in-flight start that loses to stopSync throws.
 
@@ -65,10 +59,18 @@ import { createSyncSession } from "@hyper-hyper-space/hhs3_sync";
 import type { SyncSession, SyncTarget } from "@hyper-hyper-space/hhs3_sync";
 
 import type { RDb as RDbContract } from "./interfaces.js";
-import { CreateRDbPayload, AddSchemaPayload, AddGroupPayload, RDB_TYPE_ID, SchemaCreator } from "./payload.js";
+import { CreateRDbPayload, UpdateCatalogPayload, ParamValue, RDB_TYPE_ID, SchemaCreator } from "./payload.js";
 import { validateRDbPayload } from "./validate_ops.js";
-import { resolveMembers } from "./resolve.js";
+import { RDbOps, RDbResolution, collectOps, resolveRDb } from "./resolve.js";
+import { adoptedReleases, runAdoptionPolicy } from "./adoption.js";
+import type { Membership } from "./instantiate.js";
 import { RTableGroupImpl, RTABLE_GROUP_TYPE_ID } from "../rtable_group/group.js";
+import type { CreateTableGroupPayload } from "../rtable_group/payload.js";
+import { RCatalogImpl, RCATALOG_TYPE_ID } from "../rcatalog/rcatalog.js";
+import type { CatalogIndex } from "../rcatalog/resolve.js";
+import { versionKey } from "../rcatalog/resolve.js";
+import { isValidSemverRange, majorRange } from "../rcatalog/semver.js";
+import { ensureDeployGate } from "../rdeploy_gate/rdeploy_gate.js";
 
 export { RDB_TYPE_ID } from "./payload.js";
 
@@ -78,6 +80,9 @@ export type RDbRuntimeConfig = {
     fetchTimeoutMs?: number;
     authorizer?: PeerAuthorizer;
     report?: IssueReporter;
+    // The adoption range (a semver range, e.g. '^1' or '*'); defaults to the
+    // major version of the release the RDb was created at.
+    adoptionRange?: string;
 };
 
 class SyncAbortedError extends Error {
@@ -127,6 +132,9 @@ export class RDbImpl implements RDbContract, SyncableObject {
         seed: string;
         name?: string;
         creators?: { keyId: KeyId; publicKey: PublicKey }[];
+        catalog: B64Hash;
+        release: B64Hash;
+        params?: { [name: string]: ParamValue };
         hashAlgorithm?: string;
     }): Promise<CreateRDbPayload> => {
 
@@ -134,6 +142,8 @@ export class RDbImpl implements RDbContract, SyncableObject {
             action: 'create',
             type: RDB_TYPE_ID,
             seed: options.seed,
+            catalog: options.catalog,
+            release: options.release,
         };
         if (options.name !== undefined) createPayload.name = options.name;
         if (options.creators !== undefined && options.creators.length > 0) {
@@ -142,6 +152,7 @@ export class RDbImpl implements RDbContract, SyncableObject {
                 publicKey: serializePublicKeyToBase64(c.publicKey),
             }));
         }
+        if (options.params !== undefined && Object.keys(options.params).length > 0) createPayload.params = options.params;
         if (options.hashAlgorithm !== undefined) createPayload.hashAlgorithm = options.hashAlgorithm;
 
         return createPayload;
@@ -167,21 +178,21 @@ export class RDbImpl implements RDbContract, SyncableObject {
     private rescanRequested = false;
     private reconcileIdleWaiters: Array<() => void> = [];
 
-    // A create payload fetched (hash-verified) but not yet materialized because
-    // its genesis deps (e.g. a pinned, possibly post-genesis schema version, or a
-    // bound foreign group) are not yet locally satisfiable. Retried on each
-    // reconcile pass; materialized once every dep object is present and every
-    // pinned requiredHash is on that dep's DAG.
+    // A create payload (fetched and hash-verified, or computed locally for a
+    // member group) not yet materialized because its genesis deps (a pinned,
+    // possibly post-genesis schema version, a bound group) are not yet locally
+    // satisfiable. Retried on each reconcile pass.
     private pendingCreates: Map<B64Hash, { payload: Payload; deps: ForeignDep[] }> = new Map();
 
     // Creates that were genuinely invalid once their deps were satisfied. Dropped
     // and reported once; never retried within a run.
     private invalidCreates: Set<B64Hash> = new Set();
 
-    // Objects whose own DAG growth may unblock a pending create (a schema
-    // advancing to a pinned version). Subscribed when their session opens,
-    // unsubscribed on teardown.
+    // Objects whose own DAG growth may unblock a pending create or change the
+    // membership (the catalog). Subscribed when their session opens.
     private watchedObjects: Map<B64Hash, RObject> = new Map();
+
+    private resolutionCache: { key: string; resolution: RDbResolution } | undefined;
 
     constructor(createOpId: B64Hash, createOp: CreateRDbPayload, ctx: RContext, backendLabel: string = 'default') {
         this.createOpId = createOpId;
@@ -195,7 +206,10 @@ export class RDbImpl implements RDbContract, SyncableObject {
     getBackendLabel(): string { return this.backendLabel; }
 
     seed(): string { return this.createOp.seed; }
+    getName(): string | undefined { return this.createOp.name; }
     hashAlgorithm(): string | undefined { return this.createOp.hashAlgorithm; }
+    getCatalogRef(): B64Hash { return this.createOp.catalog; }
+    getCreateRelease(): B64Hash { return this.createOp.release; }
 
     getCreators(): SchemaCreator[] {
         return [...(this.createOp.creators ?? [])];
@@ -215,77 +229,203 @@ export class RDbImpl implements RDbContract, SyncableObject {
         return this.ctx.getConfig().selfValidate || false;
     }
 
-    // --- Membership writers ---
+    // --- Catalog access ---
 
-    async addSchema(schemaId: B64Hash, note?: string, author?: OwnIdentity, at?: Version): Promise<B64Hash> {
-        const base: Omit<AddSchemaPayload, 'author' | 'signature'> = { action: 'add-schema', schemaId };
-        if (note !== undefined) base.note = note;
-        return this.applyMembership(base, author, at);
+    async getCatalog(): Promise<RCatalogImpl | undefined> {
+        const obj = await this.ctx.getObject(this.getCatalogRef());
+        if (obj === undefined || obj.getType() !== RCATALOG_TYPE_ID) return undefined;
+        return obj as RCatalogImpl;
     }
 
-    async addGroup(groupId: B64Hash, note?: string, author?: OwnIdentity, at?: Version): Promise<B64Hash> {
-        const base: Omit<AddGroupPayload, 'author' | 'signature'> = { action: 'add-group', groupId };
-        if (note !== undefined) base.note = note;
-        return this.applyMembership(base, author, at);
+    async getCatalogIndex(): Promise<CatalogIndex | undefined> {
+        return (await this.getCatalog())?.getIndex();
     }
 
-    private async applyMembership(
-        base: Omit<AddSchemaPayload, 'author' | 'signature'> | Omit<AddGroupPayload, 'author' | 'signature'>,
-        author?: OwnIdentity,
-        at?: Version,
+    // --- Writer ---
+
+    async updateCatalog(
+        release: B64Hash, params?: { [name: string]: ParamValue }, author?: OwnIdentity, note?: string, at?: Version,
     ): Promise<B64Hash> {
-        const scopedDag = await this.getScopedDag();
-        at = at ?? await scopedDag.getFrontier();
-
-        let payload: Payload;
-        if (this.getCreators().length > 0) {
-            if (author === undefined) {
-                throw new Error(`RDb membership op '${(base as json.LiteralMap)['action']}' requires an author when the database declares creators`);
-            }
-            payload = await signPayloadHelper(base as unknown as json.LiteralMap, author, at);
-        } else {
-            payload = base as Payload;
-        }
+        const prepared = await this.prepareUpdateCatalog(release, params, author, note, at);
 
         if (this.selfValidate()) {
-            const result = await this.validatePayload(payload, at);
+            const result = await this.validatePayload(prepared.payload, prepared.at);
             if (!result.valid) {
                 throw new ValidationRejectedError(formatValidationFailure(result.why), result.why);
             }
         }
-        return this.applyPayload(payload, at);
+        return this.applyPayload(prepared.payload, prepared.at);
     }
 
-    // --- Membership resolution ---
-
-    async getMemberSchemas(): Promise<B64Hash[]> {
-        return (await this.resolveAt()).schemaIds;
-    }
-
-    async getMemberGroups(): Promise<B64Hash[]> {
-        return (await this.resolveAt()).groupIds;
-    }
-
-    private async resolveAt(at?: Version): Promise<{ schemaIds: B64Hash[]; groupIds: B64Hash[] }> {
+    // The (signed, when creators are declared) update-catalog payload at `at`
+    // (defaults to the frontier), without appending it.
+    async prepareUpdateCatalog(
+        release: B64Hash, params?: { [name: string]: ParamValue }, author?: OwnIdentity, note?: string, at?: Version,
+    ): Promise<{ payload: json.LiteralMap; at: Version }> {
         const scopedDag = await this.getScopedDag();
         at = at ?? await scopedDag.getFrontier();
 
+        const base: json.LiteralMap = { action: 'update-catalog', catalog: this.getCatalogRef(), release };
+        if (params !== undefined && Object.keys(params).length > 0) base['params'] = params as unknown as json.Literal;
+        if (note !== undefined) base['note'] = note;
+
+        if (this.getCreators().length === 0) return { payload: base, at };
+        if (author === undefined) {
+            throw new Error("update-catalog requires an author when the database declares creators");
+        }
+        return { payload: await signPayloadHelper(base, author, at), at };
+    }
+
+    // --- Resolution ---
+
+    async opsAt(at?: Version): Promise<RDbOps> {
+        const scopedDag = await this.getScopedDag();
+        at = at ?? await scopedDag.getFrontier();
         const entries: Entry[] = [];
         for await (const entry of scopedDag.loadAllEntries()) entries.push(entry);
+        return collectOps(entries, at);
+    }
 
-        return resolveMembers(entries, at);
+    async resolve(at?: Version): Promise<RDbResolution> {
+        const scopedDag = await this.getScopedDag();
+        const frontier = await scopedDag.getFrontier();
+        at = at ?? frontier;
+
+        const catalog = await this.getCatalog();
+        const catalogKey = catalog === undefined ? '-' : versionKey(await (await catalog.getScopedDag()).getFrontier());
+        const key = `${versionKey(at)}|${catalogKey}`;
+        if (this.resolutionCache !== undefined && this.resolutionCache.key === key) return this.resolutionCache.resolution;
+
+        const resolution = resolveRDb({
+            rdbId: this.createOpId,
+            ops: await this.opsAt(at),
+            catalog: catalog === undefined ? undefined : await catalog.getIndex(),
+        });
+        this.resolutionCache = { key, resolution };
+        return resolution;
+    }
+
+    // The resolution as if `release` were deployed now with `params` (the
+    // catalog planner's view of the outcome).
+    async resolvePlanned(release: B64Hash, params?: { [name: string]: ParamValue }): Promise<RDbResolution> {
+        const ops = await this.opsAt();
+        const planned: UpdateCatalogPayload = { action: 'update-catalog', catalog: this.getCatalogRef(), release };
+        if (params !== undefined && Object.keys(params).length > 0) planned.params = params;
+        return resolveRDb({
+            rdbId: this.createOpId,
+            ops: { ...ops, updates: [...ops.updates, { hash: '~planned', payload: planned }] },
+            catalog: await this.getCatalogIndex(),
+        });
+    }
+
+    async getDeployedReleases(at?: Version): Promise<B64Hash[]> {
+        return (await this.resolve(at)).deployed ?? [];
+    }
+
+    async getDeployHistory(at?: Version): Promise<B64Hash[]> {
+        return (await this.resolve(at)).history;
+    }
+
+    async getParams(at?: Version): Promise<{ [name: string]: ParamValue }> {
+        return (await this.resolve(at)).params;
+    }
+
+    async getMembership(at?: Version): Promise<Membership | undefined> {
+        return (await this.resolve(at)).membership;
+    }
+
+    async getMemberGroupNames(at?: Version): Promise<Map<string, B64Hash>> {
+        return new Map((await this.getMembership(at))?.names ?? []);
+    }
+
+    async getMemberGroupPayloads(at?: Version): Promise<Map<B64Hash, CreateTableGroupPayload>> {
+        const out = new Map<B64Hash, CreateTableGroupPayload>();
+        const membership = await this.getMembership(at);
+        for (const hash of membership?.order ?? []) {
+            const member = membership!.byHash.get(hash)!;
+            out.set(member.id, member.payload);
+        }
+        return out;
+    }
+
+    async getMemberGroups(): Promise<B64Hash[]> {
+        const membership = await this.getMembership();
+        return (membership?.order ?? []).map((hash) => membership!.byHash.get(hash)!.id);
+    }
+
+    async getMemberSchemas(): Promise<B64Hash[]> {
+        const membership = await this.getMembership();
+        const schemas: B64Hash[] = [];
+        for (const hash of membership?.order ?? []) {
+            const schema = membership!.byHash.get(hash)!.def.schemaRef;
+            if (!schemas.includes(schema)) schemas.push(schema);
+        }
+        return schemas;
+    }
+
+    private async creationDepsSatisfied(deps: ForeignDep[]): Promise<boolean> {
+        for (const dep of deps) {
+            const depObj = await this.ctx.getObject(dep.objectId);
+            if (depObj === undefined) return false;
+            const scoped = await depObj.getScopedDag();
+            for (const requiredHash of dep.requiredHashes) {
+                if (await scoped.loadEntry(requiredHash) === undefined) return false;
+            }
+        }
+        return true;
+    }
+
+    async materializeMembers(): Promise<B64Hash[]> {
+        const membership = await this.getMembership();
+        if (membership === undefined) return [];
+
+        const backendLabel = this.runtimeConfig.backendLabel ?? this.backendLabel;
+        const created: B64Hash[] = [];
+        for (const hash of membership.order) {
+            const member = membership.byHash.get(hash)!;
+            if (await this.ctx.getObject(member.id) === undefined) {
+                const deps = await this.creationDepsFor(member.payload);
+                if (!await this.creationDepsSatisfied(deps)) continue;
+                await this.ctx.createObject(member.payload, backendLabel);
+                created.push(member.id);
+            }
+            await ensureDeployGate(this.ctx, member.id, member.def.schemaRef, backendLabel);
+        }
+        return created;
+    }
+
+    // --- Adoption ---
+
+    async getAdoptionRange(): Promise<string> {
+        if (this.runtimeConfig.adoptionRange !== undefined) return this.runtimeConfig.adoptionRange;
+        const state = (await this.resolve()).releases?.get(this.getCreateRelease());
+        return state === undefined ? '*' : majorRange(state.version);
+    }
+
+    async setAdoptionRange(range: string): Promise<void> {
+        if (!isValidSemverRange(range)) throw new Error(`invalid adoption range '${range}'`);
+        this.runtimeConfig = { ...this.runtimeConfig, adoptionRange: range };
+        await this.adopt();
+    }
+
+    async getAdoptedReleases(): Promise<B64Hash[]> {
+        return adoptedReleases(await this.resolve(), await this.getAdoptionRange());
+    }
+
+    async adopt(): Promise<void> {
+        await runAdoptionPolicy(this);
     }
 
     // --- RObject interface ---
 
     async validatePayload(payload: Payload, at: Version): Promise<ValidationResult> {
         if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
-            return validationFailure("RDb membership payload must be an object", { objectHash: this.createOpId });
+            return validationFailure("RDb payload must be an object", { objectHash: this.createOpId });
         }
         const action = (payload as json.LiteralMap)['action'];
         // genesis-only action; never a valid post-creation op
-        if (action !== 'add-schema' && action !== 'add-group') {
-            return validationFailure(`action '${String(action)}' is not an RDb membership op`, { objectHash: this.createOpId });
+        if (action !== 'update-catalog') {
+            return validationFailure(`action '${String(action)}' is not an RDb op`, { objectHash: this.createOpId });
         }
         return validateRDbPayload(payload, { mode: 'op', rdb: this, at });
     }
@@ -299,22 +439,33 @@ export class RDbImpl implements RDbContract, SyncableObject {
         const scopedDag = await this.getScopedDag();
         at = at ?? await scopedDag.getFrontier();
         from = from ?? await scopedDag.getFrontier();
-        const members = await this.resolveAt(at);
-        return new RDbView(this, at, from, [...members.schemaIds, ...members.groupIds]);
+        const resolution = await this.resolve(at);
+        const members = resolution.membership;
+        const schemas = new Set<B64Hash>();
+        const groups: B64Hash[] = [];
+        for (const hash of members?.order ?? []) {
+            const member = members!.byHash.get(hash)!;
+            schemas.add(member.def.schemaRef);
+            groups.push(member.id);
+        }
+        return new RDbView(this, at, from, this.getCatalogRef(), resolution.deployed ?? [], [...schemas, ...groups]);
     }
 
-    // RDb membership is advisory: validity never depends on member presence, so
-    // it declares no foreign deps (fetch is a runtime startSync concern).
-    extractForeignDeps(_payload: Payload, _at: Version): ForeignDep[] | undefined {
-        return undefined;
+    // An update-catalog depends on the catalog at the deployed release. The
+    // create has no deps (it is validated without the catalog).
+    extractForeignDeps(payload: Payload, _at: Version): ForeignDep[] | undefined {
+        if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined;
+        if ((payload as json.LiteralMap)['action'] !== 'update-catalog') return undefined;
+        const update = payload as unknown as UpdateCatalogPayload;
+        return [{ objectId: update.catalog, requiredHashes: [update.release] }];
     }
 
     async computeDelta(_start: Version, _end: Version): Promise<Delta> {
-        throw new Error("RDb is advisory; no delta in v1");
+        throw new Error("RDb has no delta in v1");
     }
 
     createDeltaAccumulator(_start: Version, _end: Version): DeltaAccumulator {
-        throw new Error("RDb is advisory; no delta in v1");
+        throw new Error("RDb has no delta in v1");
     }
 
     private _subscription: ScopedDagSubscription | undefined;
@@ -420,8 +571,8 @@ export class RDbImpl implements RDbContract, SyncableObject {
         void this.requestReconcile(false);
     };
 
-    // A watched object's DAG grew (e.g. a schema reached a pinned version):
-    // a pending create may now be materializable.
+    // A watched object's DAG grew (a schema reached a pinned version, the
+    // catalog gained a release or a declare): rescan.
     private readonly onDepChange = (_version: Version): void => {
         if (this.syncIntent !== 'running') return;
         void this.requestReconcile(false);
@@ -431,6 +582,7 @@ export class RDbImpl implements RDbContract, SyncableObject {
         await this.stopSync();
         this._scopedDag = undefined;
         this._causalDag = undefined;
+        this.resolutionCache = undefined;
     }
 
     private readonly onMembershipChange = (_version: Version): void => {
@@ -513,25 +665,28 @@ export class RDbImpl implements RDbContract, SyncableObject {
         }
     }
 
-    // One incremental reconcile pass. BFS the closure (members + each present
-    // group's schema and bound foreign groups). For every id:
-    //   - present  -> open its session immediately (so a schema syncs while the
-    //                 group that pins it is still pending) and fan out;
-    //   - absent   -> fetch its create payload (once), register it as pending,
-    //                 enqueue its genesis deps so they fetch / session / advance,
-    //                 and materialize it as soon as those deps are satisfiable.
-    // Materialized objects are fanned out from too. Objects that stay pending are
-    // retried on the next pass, woken by dep-growth (onDepChange) or a new object
-    // appearing (onNewObject). The genesis dep graph is acyclic by hash
-    // construction, so this terminates once the mesh delivers.
+    // One incremental reconcile pass. BFS from [rdb, catalog]: the catalog fans
+    // out to the schemas it references and (once resolvable) the member
+    // groups; each present group fans out to its schema and bound groups. For
+    // every id:
+    //   - present  -> open its session (so a schema syncs while the object that
+    //                 pins it is still pending) and fan out;
+    //   - absent   -> a computed member is created from its local payload, any
+    //                 other object has its create payload fetched (once); it is
+    //                 held pending until its genesis deps are satisfiable, and
+    //                 its deps are enqueued so they fetch / session / advance.
+    // Objects that stay pending are retried on the next pass, woken by
+    // dep-growth (onDepChange) or a new object appearing (onNewObject). The
+    // genesis dep graph is acyclic by hash construction, so this terminates
+    // once the mesh delivers. The adoption policy runs after the pass.
     private async runReconcilePass(epoch: number): Promise<void> {
-        const members = await this.resolveAt();
-        if (!this.isCurrent(epoch)) throw new SyncAbortedError();
-
         const mesh = this.ctx.getMesh(this.runtimeConfig.meshLabel ?? 'default') as Mesh;
 
         const visited = new Set<B64Hash>();
-        const queue: B64Hash[] = [this.createOpId, ...members.schemaIds, ...members.groupIds];
+        const catalogId = this.getCatalogRef();
+        const queue: B64Hash[] = [this.createOpId, catalogId];
+        let membership = (await this.resolve()).membership;
+        if (!this.isCurrent(epoch)) throw new SyncAbortedError();
 
         while (queue.length > 0) {
             const id = queue.shift()!;
@@ -550,12 +705,18 @@ export class RDbImpl implements RDbContract, SyncableObject {
             if (!this.isCurrent(epoch)) throw new SyncAbortedError();
 
             if (obj === undefined) {
-                // Prefer the deps-aware path (fetch the create payload, hold it
-                // pending until its genesis deps are satisfiable). Contexts that
-                // only expose fetchObject fall back to direct materialization.
-                obj = this.ctx.fetchCreatePayload !== undefined
-                    ? await this.tryMaterialize(id, epoch)
-                    : await this.fetchAndMaterializeDirect(id);
+                const member = membership?.byId.get(id);
+                if (member !== undefined) {
+                    obj = await this.tryMaterialize(id, epoch, member.payload as unknown as Payload);
+                } else {
+                    // Prefer the deps-aware path (fetch the create payload, hold
+                    // it pending until its genesis deps are satisfiable).
+                    // Contexts that only expose fetchObject fall back to direct
+                    // materialization.
+                    obj = this.ctx.fetchCreatePayload !== undefined
+                        ? await this.tryMaterialize(id, epoch)
+                        : await this.fetchAndMaterializeDirect(id);
+                }
                 if (!this.isCurrent(epoch)) throw new SyncAbortedError();
             }
 
@@ -571,22 +732,48 @@ export class RDbImpl implements RDbContract, SyncableObject {
 
             await this.ensureSession(id, mesh, epoch);
 
-            if (obj.getType() === RTABLE_GROUP_TYPE_ID) {
+            if (id === catalogId && obj.getType() === RCATALOG_TYPE_ID) {
+                const catalog = obj as RCatalogImpl;
+                const frontier = await (await catalog.getScopedDag()).getFrontier();
+                for (const schema of [...(await catalog.getIndex()).referencedSchemasAt(frontier)].sort()) queue.push(schema);
+                membership = (await this.resolve()).membership;
+                if (!this.isCurrent(epoch)) throw new SyncAbortedError();
+                for (const hash of membership?.order ?? []) queue.push(membership!.byHash.get(hash)!.id);
+            } else if (obj.getType() === RTABLE_GROUP_TYPE_ID) {
                 const group = obj as RTableGroupImpl;
                 queue.push(group.getSchemaRef());
                 for (const boundId of Object.values(group.getBindings())) queue.push(boundId);
+                if (membership?.byId.has(id) === true) {
+                    await ensureDeployGate(this.ctx, id, group.getSchemaRef(), this.runtimeConfig.backendLabel ?? this.backendLabel);
+                }
             }
+        }
+
+        if (!this.isCurrent(epoch)) throw new SyncAbortedError();
+        try {
+            await this.adopt();
+        } catch (err) {
+            // transient (e.g. a schema still syncing): a later pass retries
+            this.runtimeConfig.report?.({
+                source: 'rdb',
+                kind: 'adoption-deferred',
+                severity: 'low',
+                dagId: this.createOpId,
+                message: `adoption deferred: ${(err as Error).message}`,
+            });
         }
     }
 
-    // Fetch (once) and try to materialize a not-yet-present object. Returns the
-    // object if it was (or already is) materialized, otherwise undefined (still
-    // pending or dropped as invalid). Throws SyncAbortedError on epoch change and
-    // rethrows a fetch failure so the reconcile loop can back off / retry.
-    private async tryMaterialize(id: B64Hash, epoch: number): Promise<RObject | undefined> {
+    // Try to materialize a not-yet-present object: a computed member from its
+    // local payload, anything else from its fetched (once) create payload.
+    // Returns the object if it was (or already is) materialized, otherwise
+    // undefined (still pending or dropped as invalid). Throws SyncAbortedError
+    // on epoch change and rethrows a fetch failure so the reconcile loop can
+    // back off / retry.
+    private async tryMaterialize(id: B64Hash, epoch: number, localPayload?: Payload): Promise<RObject | undefined> {
         let pending = this.pendingCreates.get(id);
         if (pending === undefined) {
-            const payload = await this.fetchCreatePayloadFor(id);
+            const payload = localPayload ?? await this.fetchCreatePayloadFor(id);
             if (!this.isCurrent(epoch)) throw new SyncAbortedError();
             const deps = await this.creationDepsFor(payload);
             if (!this.isCurrent(epoch)) throw new SyncAbortedError();
@@ -594,17 +781,9 @@ export class RDbImpl implements RDbContract, SyncableObject {
             this.pendingCreates.set(id, pending);
         }
 
-        // Deps satisfiable? Every dep object present AND every pinned requiredHash
-        // resolvable on that dep's own DAG.
-        for (const dep of pending.deps) {
-            const depObj = await this.ctx.getObject(dep.objectId);
-            if (!this.isCurrent(epoch)) throw new SyncAbortedError();
-            if (depObj === undefined) return undefined;
-            const scoped = await depObj.getScopedDag();
-            for (const requiredHash of dep.requiredHashes) {
-                if (await scoped.loadEntry(requiredHash) === undefined) return undefined;
-            }
-        }
+        const satisfied = await this.creationDepsSatisfied(pending.deps);
+        if (!this.isCurrent(epoch)) throw new SyncAbortedError();
+        if (!satisfied) return undefined;
 
         try {
             const backendLabel = this.runtimeConfig.backendLabel ?? this.backendLabel;
@@ -628,7 +807,7 @@ export class RDbImpl implements RDbContract, SyncableObject {
 
     // Legacy path for contexts that expose fetchObject but not fetchCreatePayload
     // (they cannot inspect a create's deps without materializing it). Fetches and
-    // materializes in one step, as reconcile did before deps-aware materialization.
+    // materializes in one step.
     private async fetchAndMaterializeDirect(id: B64Hash): Promise<RObject> {
         if (this.ctx.fetchObject === undefined) {
             throw new Error(`Object '${id}' is not present in the replica and the context cannot fetch it`);
@@ -746,13 +925,15 @@ export class RDbImpl implements RDbContract, SyncableObject {
     }
 }
 
-// Minimal advisory membership view: members are the references; RDb pins no
-// reference versions.
+// The RDb view: its references are the catalog, the member schemas and the
+// member groups. The catalog resolves to the deployed releases.
 class RDbView implements View {
     constructor(
         private obj: RDbImpl,
         private at: Version,
         private from: Version,
+        private catalog: B64Hash,
+        private deployed: B64Hash[],
         private members: B64Hash[],
     ) {}
 
@@ -760,9 +941,9 @@ class RDbView implements View {
     getVersion(): Version { return this.at; }
     getFromVersion(): Version { return this.from; }
 
-    async getReferences(): Promise<B64Hash[]> { return [...this.members]; }
+    async getReferences(): Promise<B64Hash[]> { return [this.catalog, ...this.members]; }
 
-    async resolveRefVersion(_refId: B64Hash): Promise<Version> {
-        return version();   // RDb does not pin observed versions
+    async resolveRefVersion(refId: B64Hash): Promise<Version> {
+        return refId === this.catalog ? version(...this.deployed) : version();
     }
 }

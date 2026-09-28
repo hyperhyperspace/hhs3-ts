@@ -8,7 +8,7 @@ import {
 } from "@hyper-hyper-space/hhs3_rdb";
 import type { RowOpPayload } from "@hyper-hyper-space/hhs3_rdb";
 import type {
-    AddMemberStatement,
+    AlterCatalogStatement,
     AlterSchemaStatement,
     AstStatement,
     AuthorExpr,
@@ -17,9 +17,9 @@ import type {
     BoundStatement,
     BoundUpdate,
     BoundUpdateRef,
-    BoundUpdateSchema,
     LangBindContext,
     LangDiagnostic,
+    UpdateCatalogStatement,
 } from "@hyper-hyper-space/hhs3_rdb_lang";
 
 import type { KeyRecord } from "../keys/key_vault.js";
@@ -29,8 +29,9 @@ export type AuthRetryBound =
     | BoundInsert
     | BoundUpdate
     | BoundDelete
-    | BoundUpdateRef
-    | BoundUpdateSchema;
+    | BoundUpdateRef;
+
+export type BindAuthorRetryStatement = AlterSchemaStatement | AlterCatalogStatement | UpdateCatalogStatement;
 
 export type AuthorCandidate = {
     keyId: KeyId;
@@ -59,10 +60,8 @@ const AUTH_FAILURE_PATTERNS = [
 
 const BIND_AUTHOR_REQUIRED_MESSAGES = new Set([
     'ALTER SCHEMA requires an author identity',
-    'ADD SCHEMA requires BY when the database declares creators',
-    'ADD TABLEGROUP requires BY when the database declares creators',
-    'ADD SCHEMA requires an author when the database declares creators',
-    'ADD TABLEGROUP requires an author when the database declares creators',
+    'ALTER CATALOG requires an author identity: every catalog entry is signed',
+    'UPDATE CATALOG requires an author when the database declares creators',
 ]);
 
 export function isBindAuthorRequiredFailure(diagnostics: LangDiagnostic[]): boolean {
@@ -75,8 +74,8 @@ export function hasExplicitByAst(stmt: { author?: AuthorExpr }): boolean {
     return stmt.author !== undefined;
 }
 
-export function isBindAuthorRetryStatement(stmt: AstStatement): stmt is AlterSchemaStatement | AddMemberStatement {
-    return stmt.kind === 'alter-schema' || stmt.kind === 'add-member';
+export function isBindAuthorRetryStatement(stmt: AstStatement): stmt is BindAuthorRetryStatement {
+    return stmt.kind === 'alter-schema' || stmt.kind === 'alter-catalog' || stmt.kind === 'update-catalog';
 }
 
 export function labelForKeyId(session: RdbSession, keyId: KeyId): string {
@@ -181,21 +180,6 @@ export async function evaluateObserveGateKey(
     return observer.evaluateObserveGate(foreignGroupId, keyId, refAt, refFrom);
 }
 
-export async function evaluateCanDeployKey(
-    group: RTableGroupImpl,
-    at: Version,
-    keyId: KeyId,
-): Promise<boolean> {
-    const canDeploy = group.getCanDeploy();
-    if (canDeploy === undefined) return true;
-    return evaluatePredicate(canDeploy, {
-        getTableView: async (table) => group.makeTable(table).getView(at, at),
-        getForeignTableView: (groupName, table) => group.resolveForeignTableView(groupName, table, at, at),
-        author: keyId,
-        context: 'object',
-    });
-}
-
 function rowOpFromBound(bound: BoundInsert | BoundUpdate | BoundDelete, keyId: KeyId): RowOpPayload {
     switch (bound.kind) {
         case 'insert':
@@ -263,7 +247,6 @@ export function isAuthRetryBound(bound: BoundStatement): bound is AuthRetryBound
         case 'update':
         case 'delete':
         case 'update-ref':
-        case 'update-schema':
             return true;
         default:
             return false;
@@ -291,11 +274,6 @@ async function gateTestForBound(bound: AuthRetryBound): Promise<(keyId: KeyId) =
             if (foreignId === undefined) throw new Error(`Unknown bound group '${bound.ref}'`);
             const at = bound.at;
             return (keyId) => evaluateObserveGateKey(group, foreignId, at, at, keyId);
-        }
-        case 'update-schema': {
-            const group = bound.group.group as RTableGroupImpl | undefined;
-            if (group === undefined) throw new Error('UPDATE SCHEMA target group is not loaded');
-            return (keyId) => evaluateCanDeployKey(group, bound.at, keyId);
         }
     }
 }
@@ -345,12 +323,6 @@ export async function suggestAuthorsForFailure(
             );
             break;
         }
-        case 'update-schema': {
-            const group = bound.group.group as RTableGroupImpl | undefined;
-            if (group === undefined) break;
-            candidates = await scanKeystore(session, (keyId) => evaluateCanDeployKey(group, bound.at, keyId));
-            break;
-        }
         default:
             break;
     }
@@ -374,9 +346,25 @@ export async function resolveAuthorsForAlterSchema(
     );
 }
 
-export async function resolveAuthorsForAddMember(
+// Catalog entries are signed by one of the catalog creators.
+export async function resolveAuthorsForAlterCatalog(
     session: RdbSession,
-    stmt: AddMemberStatement,
+    stmt: AlterCatalogStatement,
+    context: LangBindContext,
+): Promise<AuthorResolution> {
+    const catalog = await context.resolveCatalog(stmt.catalog);
+    if (catalog.catalog === undefined) return { candidates: [] };
+    return resolveAuthorForGate(
+        session,
+        (keyId) => Promise.resolve(catalog.catalog!.isCreator(keyId)),
+        [await session.currentAuthor()],
+    );
+}
+
+// A database with creators only accepts deploys signed by one of them.
+export async function resolveAuthorsForUpdateCatalog(
+    session: RdbSession,
+    stmt: UpdateCatalogStatement,
     context: LangBindContext,
 ): Promise<AuthorResolution> {
     const database = await context.resolveDatabase(stmt.database);
@@ -388,18 +376,18 @@ export async function resolveAuthorsForAddMember(
     );
 }
 
-async function resolveAuthorsForBindStatement(
+export async function resolveAuthorsForBindStatement(
     session: RdbSession,
-    stmt: AstStatement,
+    stmt: BindAuthorRetryStatement,
     context: LangBindContext,
-): Promise<AuthorResolution | undefined> {
+): Promise<AuthorResolution> {
     switch (stmt.kind) {
         case 'alter-schema':
             return resolveAuthorsForAlterSchema(session, stmt, context);
-        case 'add-member':
-            return resolveAuthorsForAddMember(session, stmt, context);
-        default:
-            return undefined;
+        case 'alter-catalog':
+            return resolveAuthorsForAlterCatalog(session, stmt, context);
+        case 'update-catalog':
+            return resolveAuthorsForUpdateCatalog(session, stmt, context);
     }
 }
 
@@ -410,9 +398,9 @@ export async function suggestAuthorsForBindFailure(
     context: LangBindContext,
 ): Promise<string | undefined> {
     if (!isBindAuthorRequiredFailure(diagnostics)) return undefined;
+    if (!isBindAuthorRetryStatement(stmt)) return undefined;
     try {
         const resolution = await resolveAuthorsForBindStatement(session, stmt, context);
-        if (resolution === undefined) return undefined;
         return formatAuthorHint(resolution.candidates);
     } catch {
         return undefined;

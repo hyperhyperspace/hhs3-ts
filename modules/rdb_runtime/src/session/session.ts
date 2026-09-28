@@ -88,6 +88,10 @@ export class RdbSession {
         this.currentGroup = id;
     }
 
+    clearCurrentGroup(): void {
+        this.currentGroup = undefined;
+    }
+
     setDefaultView(view: SessionView): void {
         this.defaultView = view;
     }

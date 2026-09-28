@@ -10,9 +10,11 @@ import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test
 import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import type { Version, RContext } from "@hyper-hyper-space/hhs3_mvt";
-import type { TableDef } from "@hyper-hyper-space/hhs3_rdb";
+import { json } from "@hyper-hyper-space/hhs3_json";
+import type { CatalogGroupDef, TableDef } from "@hyper-hyper-space/hhs3_rdb";
 import {
     RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory, RDbImpl, rDbFactory, deriveRowId,
+    RCatalogImpl, rCatalogFactory, RDeployGateImpl, rDeployGateFactory, catalogGroupHash, deployCatalogRelease,
 } from "@hyper-hyper-space/hhs3_rdb";
 import { MemoryTarget, type OpEvent, type BidirectionalTarget, type CapturedBatch, type IngestSettle, type SyncMapping, type StoredOpEvent, type SchemaAction, type RowAction, type OpEventQuery } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
@@ -31,6 +33,8 @@ function newCtx(): RContext {
     ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
     ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
     ctx.getRegistry().register(RDbImpl.typeId, rDbFactory);
+    ctx.getRegistry().register(RCatalogImpl.typeId, rCatalogFactory);
+    ctx.getRegistry().register(RDeployGateImpl.typeId, rDeployGateFactory);
     return ctx;
 }
 
@@ -38,24 +42,59 @@ function open(name: string, columns: TableDef['columns'], extra?: Partial<TableD
     return { name, columns, restrictions: [{ on: 'all', rule: { p: 'true' } }], ...extra };
 }
 
-async function makeSchemaGroup(ctx: RContext, name: string, tables: TableDef[], bindings?: { [k: string]: B64Hash }) {
-    const admin = await makeIdentity();
-    const schemaInit = await RSchemaImpl.create({
-        name: `${name}:schema`, creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }], tables,
-    });
-    const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
-    const pinned = await (await schema.getScopedDag()).getFrontier();
-    const groupInit = await RTableGroupImpl.create({
-        name, seed: `${name}-seed`, schemaRef: schema.getId(), schemaVersion: pinned,
-        ...(bindings !== undefined ? { bindings } : {}),
-    });
-    const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
-    return { schema, group, admin };
+type GroupSpec = { name: string; tables: TableDef[]; bindings?: { [alias: string]: string } };
+type Member = { schema: RSchemaImpl; group: RTableGroupImpl; admin: OwnIdentity };
+
+// A schema per group and a catalog group definition pinned at its genesis;
+// bindings name earlier groups of the same list.
+async function defineGroups(ctx: RContext, dev: OwnIdentity, specs: GroupSpec[], known = new Map<string, B64Hash>()) {
+    const creators = [{ keyId: dev.keyId, publicKey: dev.publicKey }];
+    const defs: CatalogGroupDef[] = [];
+    const schemas = new Map<string, RSchemaImpl>();
+    for (const spec of specs) {
+        const schema = (await ctx.createObject(await RSchemaImpl.create({ name: `${spec.name}:schema`, creators, tables: spec.tables }))) as RSchemaImpl;
+        const def: CatalogGroupDef = {
+            name: spec.name,
+            seedSource: 'rdb',
+            schemaRef: schema.getId(),
+            schemaVersion: json.toSet([...await (await schema.getScopedDag()).getFrontier()]),
+        };
+        if (spec.bindings !== undefined) {
+            def.bindings = Object.fromEntries(Object.entries(spec.bindings).map(([alias, target]) => [alias, known.get(target)!]));
+        }
+        known.set(spec.name, catalogGroupHash(def));
+        defs.push(def);
+        schemas.set(spec.name, schema);
+    }
+    return { defs, schemas, known };
 }
 
-async function makeRDb(ctx: RContext, seed: string): Promise<RDbImpl> {
-    const init = await RDbImpl.create({ seed });
-    return (await ctx.createObject(init)) as RDbImpl;
+// A catalog releasing `specs` and a database deployed from it (the planner
+// creates the member groups).
+async function makeDatabase(ctx: RContext, seed: string, specs: GroupSpec[]) {
+    const dev = await makeIdentity();
+    const { defs, schemas, known } = await defineGroups(ctx, dev, specs);
+    const catalog = (await ctx.createObject(await RCatalogImpl.create({
+        name: `${seed.replace(/[^A-Za-z0-9_]/g, '_')}_catalog`, creators: [{ keyId: dev.keyId, publicKey: dev.publicKey }], author: dev, version: '1.0.0', add: defs,
+    }))) as RCatalogImpl;
+    const rdb = (await ctx.createObject(await RDbImpl.create({ seed, catalog: catalog.getId(), release: catalog.getId() }))) as RDbImpl;
+    await deployCatalogRelease(rdb, { release: catalog.getId() });
+    const names = await rdb.getMemberGroupNames();
+    const members: { [name: string]: Member } = {};
+    for (const spec of specs) {
+        members[spec.name] = { schema: schemas.get(spec.name)!, group: (await ctx.getObject(names.get(spec.name)!)) as RTableGroupImpl, admin: dev };
+    }
+    return { rdb, catalog, dev, known, members };
+}
+
+// Releases more groups in the catalog and deploys the release into the RDb.
+async function addGroups(ctx: RContext, db: Awaited<ReturnType<typeof makeDatabase>>, version: string, specs: GroupSpec[]) {
+    const { defs } = await defineGroups(ctx, db.dev, specs, db.known);
+    const published = await db.catalog.publishRelease({ version, add: defs }, db.dev);
+    await deployCatalogRelease(db.rdb, { release: published.release });
+    const names = await db.rdb.getMemberGroupNames();
+    return Object.fromEntries(await Promise.all(specs.map(async (spec) =>
+        [spec.name, (await ctx.getObject(names.get(spec.name)!)) as RTableGroupImpl] as const)));
 }
 
 async function frontier(group: RTableGroupImpl): Promise<Version> {
@@ -65,15 +104,15 @@ async function frontier(group: RTableGroupImpl): Promise<Version> {
 // Build a catalog group (products) and an orders group whose `item` column is a
 // cross-group FK into catalog.products, both registered on one RDb.
 async function makeCatalogAndOrders(ctx: RContext) {
-    const catalog = await makeSchemaGroup(ctx, 'catalog', [open('products', { title: { type: 'string' } })]);
-    const orders = await makeSchemaGroup(ctx, 'orders',
-        [open('orders', { item: { type: 'string', nullable: true } }, { fks: { item: 'catalog.products' } })],
-        { catalog: catalog.group.getId() });
-
-    const rdb = await makeRDb(ctx, 'shop');
-    await rdb.addGroup(catalog.group.getId());
-    await rdb.addGroup(orders.group.getId());
-    return { catalog, orders, rdb };
+    const db = await makeDatabase(ctx, 'shop', [
+        { name: 'catalog', tables: [open('products', { title: { type: 'string' } })] },
+        {
+            name: 'orders',
+            tables: [open('orders', { item: { type: 'string', nullable: true } }, { fks: { item: 'catalog.products' } })],
+            bindings: { catalog: 'catalog' },
+        },
+    ]);
+    return { catalog: db.members['catalog']!, orders: db.members['orders']!, rdb: db.rdb };
 }
 
 async function poll(fn: () => boolean, timeoutMs = 2000): Promise<void> {
@@ -130,13 +169,14 @@ class DelayCloseTarget implements BidirectionalTarget {
 // A single-group RDb whose `comments` table carries a local FK into `posts`, so
 // a dangling-FK local insert produces a deterministic ingestion failure.
 async function makeForum(ctx: RContext) {
-    const forum = await makeSchemaGroup(ctx, 'forum', [
-        open('posts', { title: { type: 'string' } }),
-        open('comments', { body: { type: 'string' }, post: { type: 'string', nullable: true } }, { fks: { post: 'posts' } }),
-    ]);
-    const rdb = await makeRDb(ctx, 'forum-db');
-    await rdb.addGroup(forum.group.getId());
-    return { forum, rdb };
+    const db = await makeDatabase(ctx, 'forum-db', [{
+        name: 'forum',
+        tables: [
+            open('posts', { title: { type: 'string' } }),
+            open('comments', { body: { type: 'string' }, post: { type: 'string', nullable: true } }, { fks: { post: 'posts' } }),
+        ],
+    }]);
+    return { forum: db.members['forum']!, rdb: db.rdb, db };
 }
 
 // A single-group RDb reproducing a p2p concurrency void: an `items` insert is
@@ -144,14 +184,15 @@ async function makeForum(ctx: RContext) {
 // parent) leaves the insert accepted at write time but voided at the merged
 // head. Mirrors the rdb-level OPDELTA01 barrier, but driven through projection.
 async function makeConcurrency(ctx: RContext) {
-    const g = await makeSchemaGroup(ctx, 'perm', [
-        open('caps', { label: { type: 'string', pub: true } }, { concurrentDeletes: true }),
-        open('items', { name: { type: 'string' } },
-            { restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'caps', where: { label: 'grant' } } }] }),
-    ]);
-    const rdb = await makeRDb(ctx, 'perm-db');
-    await rdb.addGroup(g.group.getId());
-    return { g, rdb };
+    const db = await makeDatabase(ctx, 'perm-db', [{
+        name: 'perm',
+        tables: [
+            open('caps', { label: { type: 'string', pub: true } }, { concurrentDeletes: true }),
+            open('items', { name: { type: 'string' } },
+                { restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'caps', where: { label: 'grant' } } }] }),
+        ],
+    }]);
+    return { g: db.members['perm']!, rdb: db.rdb };
 }
 
 export const projectionTests = {
@@ -566,7 +607,7 @@ export const projectionTests = {
             name: '[RDBPROJ13] a declaration for a group not in the database is pending, then built when the group joins',
             invoke: async () => {
                 const ctx = newCtx();
-                const { rdb } = await makeForum(ctx);
+                const { rdb, db } = await makeForum(ctx);
                 const target = new MemoryTarget();
                 const projection = await RdbProjection.open(rdb, ctx, target, { debounceMs: 10 });
                 try {
@@ -583,8 +624,7 @@ export const projectionTests = {
                     assertEquals((await target.getIndexState()).materialized.map((m) => m.table).join(','), 'forum_posts',
                         'only the present group is indexed');
 
-                    const late = await makeSchemaGroup(ctx, 'late', [open('notes', { body: { type: 'string' } })]);
-                    await rdb.addGroup(late.group.getId());
+                    await addGroups(ctx, db, '1.1.0', [{ name: 'late', tables: [open('notes', { body: { type: 'string' } })] }]);
                     let tables: string[] = [];
                     await poll(() => {
                         void target.getIndexState().then((s) => { tables = s.materialized.map((m) => m.table).sort(); });

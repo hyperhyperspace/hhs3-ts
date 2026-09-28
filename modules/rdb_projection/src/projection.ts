@@ -334,7 +334,9 @@ export class RdbProjection {
     // monotonic in v1, so groups are only ever added).
     private async reconfigure(): Promise<void> {
         const groups = await resolveMemberGroups(this.rdb, this.ctx);
+        const names = new Map([...(await this.rdb.getMemberGroupNames()).entries()].map(([name, id]) => [id, name]));
         this.members = await buildScope(groups, {
+            names,
             writer: this.options.writer,
             configOverride: this.options.configOverride,
         });

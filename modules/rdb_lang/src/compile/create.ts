@@ -1,40 +1,73 @@
-import type { json } from "@hyper-hyper-space/hhs3_json";
+import type { RObject } from "@hyper-hyper-space/hhs3_mvt";
 import {
-    ColumnConstraints, ColumnDef, CreateRDbPayload, CreateRSchemaPayload, CreateTableGroupPayload, FKs,
-    InsertRowPayload, Predicate, RDbImpl, RSchemaImpl, RTableGroupImpl, Restriction, TableDef,
-    deriveRowId, normalizeBigint, normalizeDecimal,
+    CatalogUpdateResult, ColumnConstraints, ColumnDef, CreateRCatalogPayload, CreateRDbPayload, CreateRSchemaPayload, FKs,
+    RCatalogImpl, RDbImpl, RSchemaImpl, Restriction, TableDef,
+    deployCatalogRelease, normalizeBigint, normalizeDecimal,
 } from "@hyper-hyper-space/hhs3_rdb";
 
 import type { ColumnDecl, ColumnTypeName, TableDecl, ValueExpr } from "../syntax/ast.js";
 import { canonicalEncodeValue } from "../bind/values.js";
-import type { BoundCreateDatabase, BoundCreateSchema, BoundCreateStatement, BoundCreateTableGroup } from "../bind/bind.js";
+import type { BoundCreateCatalog, BoundCreateDatabase, BoundCreateSchema, BoundCreateStatement } from "../bind/bind.js";
 import {
     columnSetFromTableDecl,
     columnsOfFromTableDecls,
-    columnsOfFromSchemaView,
     type RuleScope,
 } from "./rule_scope.js";
 import { lowerRestrictionPredicate } from "./query.js";
 
+// The host creates the root object from `payload`, then runs `afterCreate`
+// on it when present.
 export type CreatePlan =
-    | { kind: 'create-database'; name: string; payload: CreateRDbPayload }
+    | {
+        kind: 'create-database';
+        name: string;
+        payload: CreateRDbPayload;
+        // Creates the member groups and their gates, and deploys members
+        // whose release version is above their pin.
+        afterCreate: (object: RObject) => Promise<CatalogUpdateResult>;
+    }
     | { kind: 'create-schema'; name: string; payload: CreateRSchemaPayload }
-    | { kind: 'create-tablegroup'; name: string; payload: CreateTableGroupPayload };
+    | { kind: 'create-catalog'; name: string; payload: CreateRCatalogPayload };
 
 export async function compileCreate(bound: BoundCreateStatement): Promise<CreatePlan> {
     if (bound.kind === 'create-database') return compileCreateDatabase(bound);
     if (bound.kind === 'create-schema') return compileCreateSchema(bound);
-    return compileCreateTableGroup(bound);
+    return compileCreateCatalog(bound);
 }
 
 async function compileCreateDatabase(bound: BoundCreateDatabase): Promise<CreatePlan> {
     const payload = await RDbImpl.create({
         seed: bound.seed,
         name: bound.ast.name,
+        catalog: bound.catalog.id,
+        release: bound.release,
+        ...(Object.keys(bound.params).length > 0 ? { params: bound.params } : {}),
         ...(bound.creators.length > 0 ? { creators: bound.creators } : {}),
         ...(bound.ast.hashAlgorithm !== undefined ? { hashAlgorithm: bound.ast.hashAlgorithm } : {}),
     });
-    return { kind: 'create-database', name: bound.ast.name, payload };
+    const release = bound.release;
+    const author = bound.author;
+    return {
+        kind: 'create-database',
+        name: bound.ast.name,
+        payload,
+        afterCreate: (object) => deployCatalogRelease(object as RDbImpl, { release, ...(author !== undefined ? { author } : {}) }),
+    };
+}
+
+async function compileCreateCatalog(bound: BoundCreateCatalog): Promise<CreatePlan> {
+    const payload = await RCatalogImpl.create({
+        name: bound.ast.name,
+        creators: bound.creators,
+        author: bound.author,
+        version: bound.ast.version,
+        ...(bound.add.length > 0 ? { add: bound.add } : {}),
+        ...(bound.params.length > 0 ? { params: bound.params } : {}),
+        ...(bound.ast.note !== undefined ? { note: bound.ast.note } : {}),
+        ...(bound.ast.seed !== undefined ? { seed: bound.ast.seed } : {}),
+        ...(bound.ast.hashAlgorithm !== undefined ? { hashAlgorithm: bound.ast.hashAlgorithm } : {}),
+    });
+    return { kind: 'create-catalog', name: bound.ast.name, payload };
 }
 
 async function compileCreateSchema(bound: BoundCreateSchema): Promise<CreatePlan> {
@@ -49,47 +82,6 @@ async function compileCreateSchema(bound: BoundCreateSchema): Promise<CreatePlan
         ...(bound.ast.hashAlgorithm !== undefined ? { hashAlgorithm: bound.ast.hashAlgorithm } : {}),
     });
     return { kind: 'create-schema', name: bound.ast.name, payload };
-}
-
-async function compileCreateTableGroup(bound: BoundCreateTableGroup): Promise<CreatePlan> {
-    const initialRows: { [table: string]: json.Literal[] } = {};
-    for (const row of bound.initialRows) {
-        const payload: InsertRowPayload = {
-            action: 'insert',
-            rowId: deriveRowId(row.uuid),
-            uuid: row.uuid,
-            values: row.values,
-        };
-        if (initialRows[row.table] === undefined) initialRows[row.table] = [];
-        initialRows[row.table].push(payload as unknown as json.Literal);
-    }
-
-    let columnsOf = columnsOfFromTableDecls([]);
-    if (bound.schema.schema !== undefined) {
-        const view = await bound.schema.schema.getView(bound.schemaVersion, bound.schemaVersion);
-        columnsOf = columnsOfFromSchemaView(view);
-    }
-    const gateScope: RuleScope = { columnsOf };
-
-    const canObserve: { [binding: string]: Predicate } = {};
-    for (const clause of bound.ast.canObserve) {
-        canObserve[clause.binding] = lowerRestrictionPredicate(clause.predicate, gateScope);
-    }
-
-    const payload = await RTableGroupImpl.create({
-        name: bound.ast.name,
-        seed: bound.seed,
-        schemaRef: bound.schema.id,
-        schemaVersion: bound.schemaVersion,
-        ...(Object.keys(bound.bindings).length > 0 ? { bindings: bound.bindings } : {}),
-        ...(bound.ast.idProvider !== undefined ? { idProvider: bound.ast.idProvider } : {}),
-        ...(bound.ast.canDeploy !== undefined ? { canDeploy: lowerRestrictionPredicate(bound.ast.canDeploy, gateScope) } : {}),
-        ...(bound.ast.canObserve.length > 0 ? { canObserve } : {}),
-        ...(Object.keys(initialRows).length > 0 ? { initialRows } : {}),
-        ...(bound.ast.hashAlgorithm !== undefined ? { hashAlgorithm: bound.ast.hashAlgorithm } : {}),
-    });
-
-    return { kind: 'create-tablegroup', name: bound.ast.name, payload };
 }
 
 export function compileTable(table: TableDecl, scope?: RuleScope): TableDef {

@@ -1,16 +1,17 @@
-import { assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
-import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
+import { assertTrue, assertEquals } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
+import { json } from "@hyper-hyper-space/hhs3_json";
 import type { RContext, RObject } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
-import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
-import { RTableGroupImpl, rTableGroupFactory } from "../src/rtable_group/group.js";
-import { RDbImpl, rDbFactory } from "../src/rdb/rdb.js";
-import type { TableDef } from "../src/rschema/payload.js";
-
-const crypto = createBasicCrypto();
-const hashSuite = crypto.hash(HASH_SHA256);
+import {
+    registerCatalogTypes, makeIdentity, openTable, buildCatalog, buildDatabase, materializeCatalog,
+    catalogDatabase, rootIdOf, BuiltCatalog, FixtureSpec,
+} from "./catalog_fixture.js";
+import { RSchemaImpl } from "../src/rschema/rschema.js";
+import type { CatalogGroupDef } from "../src/rcatalog/payload.js";
+import { RDbImpl } from "../src/rdb/rdb.js";
+import { deployGateId } from "../src/rdeploy_gate/mirror.js";
 
 // A swarm stub that records its lifecycle (mirrors replica test stubs).
 type StubSwarm = {
@@ -61,58 +62,28 @@ function createStubMesh() {
     return mesh;
 }
 
-async function makeIdentity(): Promise<OwnIdentity> {
-    return createIdentity(SIGNING_ED25519, hashSuite);
-}
-
-function open(name: string, columns: TableDef['columns']): TableDef {
-    return { name, columns, restrictions: [{ on: 'all', rule: { p: 'true' } }] };
-}
-
 function newCtx(opts?: {
     mesh?: any;
     fetchObject?: RContext['fetchObject'];
 }): RContext {
     const ctx = createMockRContext({ selfValidate: true }, { mesh: opts?.mesh, fetchObject: opts?.fetchObject });
-    ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
-    ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
-    ctx.getRegistry().register(RDbImpl.typeId, rDbFactory);
+    registerCatalogTypes(ctx);
     return ctx;
 }
 
-// Create a schema + group pair. The group references its own schema and may
-// bind foreign groups.
-async function makeSchemaGroup(ctx: RContext, seed: string, opts?: {
-    bindings?: { [name: string]: B64Hash };
-}): Promise<{ schema: RSchemaImpl; group: RTableGroupImpl }> {
-    const creator = await makeIdentity();
-    const schemaInit = await RSchemaImpl.create({
-        name: `${seed.replace(/[^a-zA-Z0-9_]+/g, '_')}:schema`,
-        creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
-        tables: [open('t', { name: { type: 'string' } })],
-    });
-    const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
-    const pinned = await (await schema.getScopedDag()).getFrontier();
-
-    const groupInit = await RTableGroupImpl.create({
-        name: seed,
-        seed: seed + '-group',
-        schemaRef: schema.getId(),
-        schemaVersion: pinned,
-        ...(opts?.bindings !== undefined ? { bindings: opts.bindings } : {}),
-    });
-    const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
-    return { schema, group };
+// One group over one open table.
+function oneGroup(dev: OwnIdentity, name: string): FixtureSpec {
+    return { dev, name, groups: [{ name: 'main', tables: [openTable('t', { name: { type: 'string' } })] }] };
 }
 
-async function makeRDb(ctx: RContext, seed: string, creators?: OwnIdentity[]): Promise<RDbImpl> {
-    const init = await RDbImpl.create({
-        seed,
-        ...(creators !== undefined && creators.length > 0
-            ? { creators: creators.map((c) => ({ keyId: c.keyId, publicKey: c.publicKey })) }
-            : {}),
-    });
-    return (await ctx.createObject(init)) as RDbImpl;
+// Group `a` binds group `b`.
+function boundGroups(dev: OwnIdentity, name: string): FixtureSpec {
+    return {
+        dev, name, groups: [
+            { name: 'b', tables: [openTable('t', { name: { type: 'string' } })] },
+            { name: 'a', tables: [openTable('u', { name: { type: 'string' } })], bindings: { b: 'b' } },
+        ],
+    };
 }
 
 async function expectThrow(fn: () => Promise<unknown>, why: string): Promise<void> {
@@ -123,6 +94,10 @@ async function expectThrow(fn: () => Promise<unknown>, why: string): Promise<voi
 
 function liveSwarms(mesh: ReturnType<typeof createStubMesh>): StubSwarm[] {
     return mesh.swarms.filter((s) => s.activated && !s.destroyed);
+}
+
+function liveTopics(mesh: ReturnType<typeof createStubMesh>): Set<B64Hash> {
+    return new Set(liveSwarms(mesh).map((s) => s.topic));
 }
 
 async function waitUntil(pred: () => boolean | Promise<boolean>, why: string, timeoutMs = 2000): Promise<void> {
@@ -140,148 +115,128 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
     return { promise, resolve };
 }
 
+// A schema of its own for a group added by a later release.
+async function extraSchema(ctx: RContext, dev: OwnIdentity, name: string): Promise<RSchemaImpl> {
+    return (await ctx.createObject(await RSchemaImpl.create({
+        name, creators: [{ keyId: dev.keyId, publicKey: dev.publicKey }], tables: [openTable('x', { v: { type: 'string' } })],
+    }))) as RSchemaImpl;
+}
+
+function defFor(name: string, schema: RSchemaImpl): CatalogGroupDef {
+    return { name, seedSource: 'rdb', schemaRef: schema.getId(), schemaVersion: json.toSet([schema.getId()]) };
+}
+
+// Catalog + RDb whose members are NOT materialized (a joining replica).
+async function unmaterialized(ctx: RContext, built: BuiltCatalog, seed: string) {
+    const db = await buildDatabase(built, { seed });
+    const rdb = (await ctx.createObject(db.rdbPayload)) as RDbImpl;
+    return { db, rdb };
+}
+
 export const rdbSyncTests = {
     title: '[RDB] RDb sync root + startSync fan-out',
     tests: [
         {
-            name: '[RDB01] create + addSchema/addGroup reflect the add-only membership union',
+            name: '[RDB01] membership is computed from the deployed releases',
             invoke: async () => {
                 const ctx = newCtx();
-                const rdb = await makeRDb(ctx, 'rdb01');
-                const { schema, group } = await makeSchemaGroup(ctx, 'rdb01');
+                const dev = await makeIdentity();
+                const { rdb, catalog, builtDb, schemas } = await catalogDatabase(ctx, oneGroup(dev, 'rdb01'), { seed: 'rdb01' });
 
-                assertTrue((await rdb.getMemberSchemas()).length === 0, 'no schemas before add');
-                assertTrue((await rdb.getMemberGroups()).length === 0, 'no groups before add');
+                assertEquals((await rdb.getMemberGroups()).join(','), builtDb.groupIds.get('main')!, 'one computed member group');
+                assertEquals((await rdb.getMemberSchemas()).join(','), schemas.get('main')!.getId(), 'its schema is a member schema');
 
-                await rdb.addSchema(schema.getId(), 'primary schema');
-                await rdb.addGroup(group.getId());
-                // idempotent re-add (monotonic union keyed by id)
-                await rdb.addSchema(schema.getId());
-
-                const schemas = await rdb.getMemberSchemas();
-                const groups = await rdb.getMemberGroups();
-
-                assertTrue(schemas.length === 1 && schemas[0] === schema.getId(), 'one member schema (de-duplicated)');
-                assertTrue(groups.length === 1 && groups[0] === group.getId(), 'one member group');
+                const extra = await extraSchema(ctx, dev, 'rdb01:extra');
+                const { release } = await catalog.publishRelease({ version: '1.1.0', add: [defFor('extra', extra)] }, dev);
+                assertEquals((await rdb.getMemberGroups()).length, 1, 'a release does not change membership until deployed');
+                await rdb.updateCatalog(release);
+                assertEquals((await rdb.getMemberGroups()).length, 2, 'deploying the release adds its group');
             },
         },
         {
-            name: '[RDB02] startSync opens one session per transitive DAG; stopSync tears them down',
+            name: '[RDB02] startSync opens one session per synced DAG, none for gates; stopSync tears them down',
             invoke: async () => {
                 const mesh = createStubMesh();
                 const ctx = newCtx({ mesh });
-                const rdb = await makeRDb(ctx, 'rdb02');
-                const { schema, group } = await makeSchemaGroup(ctx, 'rdb02');
-
-                await rdb.addSchema(schema.getId());
-                await rdb.addGroup(group.getId());
+                const dev = await makeIdentity();
+                const { rdb, catalog, groups, schemas } = await catalogDatabase(ctx, oneGroup(dev, 'rdb02'), { seed: 'rdb02' });
+                const group = groups.get('main')!;
 
                 await rdb.startSync();
 
-                // closure: RDb + schema + group (group's schemaRef === schema)
                 const topics = new Set(mesh.swarms.map((s) => s.topic));
-                assertTrue(topics.size === 3, `expected 3 sync sessions, got ${topics.size}`);
-                assertTrue(topics.has(rdb.getId()), 'RDb DAG synced');
-                assertTrue(topics.has(schema.getId()), 'schema DAG synced');
-                assertTrue(topics.has(group.getId()), 'group DAG synced');
+                assertEquals(topics.size, 4, 'RDb + catalog + schema + group');
+                assertTrue(topics.has(rdb.getId()) && topics.has(catalog.getId()), 'RDb and catalog synced');
+                assertTrue(topics.has(schemas.get('main')!.getId()) && topics.has(group.getId()), 'schema and group synced');
+                assertTrue(!topics.has(deployGateId(group.getId(), group.getSchemaRef())), 'the gate gets no session');
+                assertTrue(await ctx.getObject(group.getDeployGateId()) !== undefined, 'the gate exists');
                 assertTrue(mesh.swarms.every((s) => s.activated), 'all swarms activated');
 
-                // idempotent
                 await rdb.startSync();
-                assertTrue(mesh.swarms.length === 3, 'startSync is idempotent (no new swarms)');
+                assertEquals(mesh.swarms.length, 4, 'startSync is idempotent (no new swarms)');
 
                 await rdb.stopSync();
                 assertTrue(mesh.swarms.every((s) => s.destroyed), 'all swarms destroyed on stopSync');
             },
         },
         {
-            name: '[RDB03] startSync throws when a member is absent and the context cannot fetch',
-            invoke: async () => {
-                const mesh = createStubMesh();
-                const ctx = newCtx({ mesh });   // mock ctx has no fetchObject
-                const rdb = await makeRDb(ctx, 'rdb03');
-
-                // a real-looking id that was never created in this replica
-                const absentInit = await RSchemaImpl.create({
-                    name: 'rdb03:absent',
-                    creators: [],
-                    tables: [open('t', { name: { type: 'string' } })],
-                });
-                const absentId = await rSchemaFactory.computeRootObjectId(absentInit, ctx);
-
-                await rdb.addSchema(absentId);
-
-                await expectThrow(() => rdb.startSync(), 'startSync must throw for an unfetchable absent member');
-                assertTrue(ctx.fetchObject === undefined, 'mock context exposes no fetchObject');
-                assertTrue(liveSwarms(mesh).length === 0, 'failed startSync leaves no live swarms');
-            },
-        },
-        {
-            name: '[RDB04] startSync fans out transitively to bound foreign groups and their schemas',
+            name: '[RDB03] startSync throws when the catalog is absent and the context cannot fetch',
             invoke: async () => {
                 const mesh = createStubMesh();
                 const ctx = newCtx({ mesh });
-                const rdb = await makeRDb(ctx, 'rdb04');
+                const dev = await makeIdentity();
+                const built = await buildCatalog(oneGroup(dev, 'rdb03'));
+                const { rdb } = await unmaterialized(ctx, built, 'rdb03');
 
-                // GroupB (own SchemaB) must exist before GroupA binds it
-                const b = await makeSchemaGroup(ctx, 'rdb04-b');
-                const a = await makeSchemaGroup(ctx, 'rdb04-a', { bindings: { b: b.group.getId() } });
-
-                // only GroupA is an explicit member
-                await rdb.addGroup(a.group.getId());
+                await expectThrow(() => rdb.startSync(), 'startSync must throw for an unfetchable absent catalog');
+                assertTrue(ctx.fetchObject === undefined, 'mock context exposes no fetchObject');
+                assertEquals(liveSwarms(mesh).length, 0, 'failed startSync leaves no live swarms');
+            },
+        },
+        {
+            name: '[RDB04] startSync fans out to bound member groups and their schemas',
+            invoke: async () => {
+                const mesh = createStubMesh();
+                const ctx = newCtx({ mesh });
+                const dev = await makeIdentity();
+                const { rdb, groups, schemas } = await catalogDatabase(ctx, boundGroups(dev, 'rdb04'), { seed: 'rdb04' });
 
                 await rdb.startSync();
 
                 const topics = new Set(mesh.swarms.map((s) => s.topic));
-                // closure: RDb + GroupA + SchemaA + GroupB + SchemaB
-                assertTrue(topics.has(a.group.getId()), 'GroupA synced');
-                assertTrue(topics.has(a.schema.getId()), 'SchemaA synced (group schema)');
-                assertTrue(topics.has(b.group.getId()), 'GroupB synced (bound foreign group)');
-                assertTrue(topics.has(b.schema.getId()), 'SchemaB synced (foreign group schema)');
-                assertTrue(topics.size === 5, `expected 5 sessions (RDb + A/SchemaA + B/SchemaB), got ${topics.size}`);
+                for (const name of ['a', 'b']) {
+                    assertTrue(topics.has(groups.get(name)!.getId()), `group ${name} synced`);
+                    assertTrue(topics.has(schemas.get(name)!.getId()), `schema ${name} synced`);
+                }
+                assertEquals(topics.size, 6, 'RDb + catalog + two schemas + two groups');
+                await rdb.stopSync();
             },
         },
         {
-            name: '[RDB05] creators gate membership ops: unsigned rejected, creator signed accepted, outsider rejected',
+            name: '[RDB05] creators gate update-catalog: unsigned rejected, outsider rejected, creator accepted',
             invoke: async () => {
                 const ctx = newCtx();
+                const dev = await makeIdentity();
                 const admin = await makeIdentity();
                 const outsider = await makeIdentity();
-                const rdb = await makeRDb(ctx, 'rdb05', [admin]);
-                const { schema, group } = await makeSchemaGroup(ctx, 'rdb05');
+                const { rdb, catalog } = await catalogDatabase(ctx, oneGroup(dev, 'rdb05'), { seed: 'rdb05', creators: [admin], author: admin });
+                const release = await catalog.release({ version: '1.1.0' }, dev);
 
-                await expectThrow(
-                    () => rdb.addSchema(schema.getId()),
-                    'unsigned add-schema must be rejected when creators are declared',
-                );
-                await expectThrow(
-                    () => rdb.addSchema(schema.getId(), undefined, outsider),
-                    'non-creator add-schema must be rejected',
-                );
-
-                await rdb.addSchema(schema.getId(), undefined, admin);
-                assertTrue((await rdb.getMemberSchemas()).includes(schema.getId()), 'creator-signed add-schema accepted');
-
-                await expectThrow(
-                    () => rdb.addGroup(group.getId()),
-                    'unsigned add-group must be rejected when creators are declared',
-                );
-                await rdb.addGroup(group.getId(), undefined, admin);
-                assertTrue((await rdb.getMemberGroups()).includes(group.getId()), 'creator-signed add-group accepted');
+                await expectThrow(() => rdb.updateCatalog(release), 'unsigned update-catalog must be rejected when creators are declared');
+                await expectThrow(() => rdb.updateCatalog(release, undefined, outsider), 'non-creator update-catalog must be rejected');
+                await rdb.updateCatalog(release, undefined, admin);
+                assertEquals((await rdb.getDeployedReleases()).join(','), release, 'creator-signed update-catalog accepted');
             },
         },
         {
-            name: '[RDB06] no creators keeps unsigned membership ops valid',
+            name: '[RDB06] no creators keeps unsigned update-catalog valid',
             invoke: async () => {
                 const ctx = newCtx();
-                const rdb = await makeRDb(ctx, 'rdb06');
-                const { schema, group } = await makeSchemaGroup(ctx, 'rdb06');
-
-                await rdb.addSchema(schema.getId());
-                await rdb.addGroup(group.getId());
-
-                assertTrue((await rdb.getMemberSchemas()).includes(schema.getId()), 'unsigned add-schema accepted');
-                assertTrue((await rdb.getMemberGroups()).includes(group.getId()), 'unsigned add-group accepted');
+                const dev = await makeIdentity();
+                const { rdb, catalog } = await catalogDatabase(ctx, oneGroup(dev, 'rdb06'), { seed: 'rdb06' });
+                const release = await catalog.release({ version: '1.1.0' }, dev);
+                await rdb.updateCatalog(release);
+                assertEquals((await rdb.getDeployedReleases()).join(','), release, 'unsigned update-catalog accepted');
             },
         },
         {
@@ -289,32 +244,27 @@ export const rdbSyncTests = {
             invoke: async () => {
                 const mesh = createStubMesh();
                 const ctx = newCtx({ mesh });
-                const rdb = await makeRDb(ctx, 'rdb07');
-                const { schema, group } = await makeSchemaGroup(ctx, 'rdb07');
-                await rdb.addSchema(schema.getId());
-                await rdb.addGroup(group.getId());
+                const dev = await makeIdentity();
+                const { rdb } = await catalogDatabase(ctx, oneGroup(dev, 'rdb07'), { seed: 'rdb07' });
 
                 const authorizer = { authorize: async () => true };
                 rdb.setRuntimeConfig({ authorizer });
                 await rdb.startSync();
 
-                assertTrue(mesh.createOpts.length === 3, 'one createSwarm per DAG');
+                assertEquals(mesh.createOpts.length, 4, 'one createSwarm per synced DAG');
                 assertTrue(
                     mesh.createOpts.every((opts) => (opts as { authorizer?: unknown }).authorizer === authorizer),
                     'authorizer forwarded to every swarm',
                 );
+                await rdb.stopSync();
             },
         },
         {
-            name: '[RDB08] startSync fetches an absent member via ctx.fetchObject',
+            name: '[RDB08] startSync fetches an absent catalog, then creates the members from local payloads',
             invoke: async () => {
                 const mesh = createStubMesh();
-                const creator = await makeIdentity();
-                const schemaInit = await RSchemaImpl.create({
-                    name: 'rdb08:schema',
-                    creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
-                    tables: [open('t', { name: { type: 'string' } })],
-                });
+                const dev = await makeIdentity();
+                const built = await buildCatalog(oneGroup(dev, 'rdb08'));
 
                 const fetched: B64Hash[] = [];
                 let ctx!: RContext;
@@ -322,53 +272,43 @@ export const rdbSyncTests = {
                     mesh,
                     fetchObject: async (id) => {
                         fetched.push(id);
-                        return ctx.createObject(schemaInit);
+                        return ctx.createObject(built.catalogPayload);
                     },
                 });
-
-                const schemaId = await rSchemaFactory.computeRootObjectId(schemaInit, ctx);
-                const rdb = await makeRDb(ctx, 'rdb08');
-                await rdb.addSchema(schemaId);
-
-                assertTrue((await ctx.getObject(schemaId)) === undefined, 'schema is absent before startSync');
+                for (const payload of built.schemaPayloads.values()) await ctx.createObject(payload);
+                const { rdb, db } = await unmaterialized(ctx, built, 'rdb08');
+                const groupId = db.groupIds.get('main')!;
+                assertTrue((await ctx.getObject(groupId)) === undefined, 'the member group is absent before startSync');
 
                 await rdb.startSync();
 
-                assertTrue(fetched.length === 1 && fetched[0] === schemaId, 'fetchObject called once for the absent schema');
-                assertTrue((await ctx.getObject(schemaId)) !== undefined, 'schema present after fetch');
-
-                const topics = new Set(mesh.swarms.map((s) => s.topic));
-                assertTrue(topics.has(rdb.getId()), 'RDb DAG synced');
-                assertTrue(topics.has(schemaId), 'fetched schema DAG synced');
-                assertTrue(topics.size === 2, `expected 2 sessions (RDb + schema), got ${topics.size}`);
+                assertEquals(fetched.join(','), built.catalogId, 'fetchObject called once, for the catalog');
+                assertTrue((await ctx.getObject(groupId)) !== undefined, 'the member group was created locally');
+                const topics = liveTopics(mesh);
+                assertTrue(topics.has(built.catalogId) && topics.has(groupId), 'catalog and group DAGs synced');
+                assertEquals(topics.size, 4, 'RDb + catalog + schema + group');
+                await rdb.stopSync();
             },
         },
         {
-            name: '[RDB09] addGroup after startSync opens a new swarm without stop/start',
+            name: '[RDB09] deploying a release after startSync opens its new sessions without stop/start',
             invoke: async () => {
                 const mesh = createStubMesh();
                 const ctx = newCtx({ mesh });
-                const rdb = await makeRDb(ctx, 'rdb09');
-                const first = await makeSchemaGroup(ctx, 'rdb09-a');
-                const second = await makeSchemaGroup(ctx, 'rdb09-b');
-
-                await rdb.addSchema(first.schema.getId());
-                await rdb.addGroup(first.group.getId());
+                const dev = await makeIdentity();
+                const { rdb, catalog } = await catalogDatabase(ctx, oneGroup(dev, 'rdb09'), { seed: 'rdb09' });
                 await rdb.startSync();
-                assertTrue(mesh.swarms.length === 3, 'initial closure is RDb + schema + group');
+                assertEquals(mesh.swarms.length, 4, 'initial closure is RDb + catalog + schema + group');
 
-                await rdb.addSchema(second.schema.getId());
-                await rdb.addGroup(second.group.getId());
+                const extra = await extraSchema(ctx, dev, 'rdb09:extra');
+                const { release } = await catalog.publishRelease({ version: '1.1.0', add: [defFor('extra', extra)] }, dev);
+                await rdb.updateCatalog(release);
 
-                await waitUntil(
-                    () => mesh.swarms.some((s) => s.topic === second.group.getId() && s.activated && !s.destroyed),
-                    'second group swarm should open after addGroup',
-                );
-                const topics = new Set(liveSwarms(mesh).map((s) => s.topic));
-                assertTrue(topics.has(second.schema.getId()), 'second schema DAG synced');
-                assertTrue(topics.has(second.group.getId()), 'second group DAG synced');
-                assertTrue(topics.size === 5, `expected 5 live sessions, got ${topics.size}`);
-
+                const extraId = (await rdb.getMemberGroupNames()).get('extra')!;
+                await waitUntil(() => liveTopics(mesh).has(extraId), 'the new group swarm should open after the deploy');
+                const topics = liveTopics(mesh);
+                assertTrue(topics.has(extra.getId()), 'the new schema DAG synced');
+                assertEquals(topics.size, 6, 'two more live sessions');
                 await rdb.stopSync();
             },
         },
@@ -377,17 +317,13 @@ export const rdbSyncTests = {
             invoke: async () => {
                 const mesh = createStubMesh();
                 const ctx = newCtx({ mesh });
-                const rdb = await makeRDb(ctx, 'rdb10');
-                const { schema, group } = await makeSchemaGroup(ctx, 'rdb10');
-                await rdb.addSchema(schema.getId());
-                await rdb.addGroup(group.getId());
+                const dev = await makeIdentity();
+                const { rdb } = await catalogDatabase(ctx, oneGroup(dev, 'rdb10'), { seed: 'rdb10' });
 
                 await Promise.all([rdb.startSync(), rdb.startSync()]);
 
-                const topics = new Set(liveSwarms(mesh).map((s) => s.topic));
-                assertTrue(topics.size === 3, `expected 3 live sessions, got ${topics.size}`);
-                assertTrue(mesh.swarms.length === 3, 'concurrent startSync must not double-create swarms');
-
+                assertEquals(liveTopics(mesh).size, 4, 'four live sessions');
+                assertEquals(mesh.swarms.length, 4, 'concurrent startSync must not double-create swarms');
                 await rdb.stopSync();
             },
         },
@@ -395,18 +331,12 @@ export const rdbSyncTests = {
             name: '[RDB11] stopSync during fetchObject does not resurrect sessions',
             invoke: async () => {
                 const mesh = createStubMesh();
-                const creator = await makeIdentity();
-                const schemaInit = await RSchemaImpl.create({
-                    name: 'rdb11:schema',
-                    creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
-                    tables: [open('t', { name: { type: 'string' } })],
-                });
+                const dev = await makeIdentity();
+                const built = await buildCatalog(oneGroup(dev, 'rdb11'));
 
                 let releaseFetch!: (obj: RObject) => void;
                 const fetchStarted = deferred<void>();
-                const fetchGate = new Promise<RObject>((resolve) => {
-                    releaseFetch = resolve;
-                });
+                const fetchGate = new Promise<RObject>((resolve) => { releaseFetch = resolve; });
 
                 let ctx!: RContext;
                 ctx = newCtx({
@@ -416,22 +346,20 @@ export const rdbSyncTests = {
                         return fetchGate;
                     },
                 });
-
-                const schemaId = await rSchemaFactory.computeRootObjectId(schemaInit, ctx);
-                const rdb = await makeRDb(ctx, 'rdb11');
-                await rdb.addSchema(schemaId);
+                for (const payload of built.schemaPayloads.values()) await ctx.createObject(payload);
+                const { rdb } = await unmaterialized(ctx, built, 'rdb11');
 
                 const started = rdb.startSync();
                 await fetchStarted.promise;
                 await rdb.stopSync();
-                releaseFetch(await ctx.createObject(schemaInit));
+                releaseFetch(await ctx.createObject(built.catalogPayload));
 
                 await expectThrow(() => started, 'startSync must abort when stopSync wins');
-                assertTrue(liveSwarms(mesh).length === 0, 'no live swarms after stop during fetch');
+                assertEquals(liveSwarms(mesh).length, 0, 'no live swarms after stop during fetch');
 
                 await rdb.startSync();
-                const topics = new Set(liveSwarms(mesh).map((s) => s.topic));
-                assertTrue(topics.has(rdb.getId()) && topics.has(schemaId), 'a later startSync opens sessions');
+                const topics = liveTopics(mesh);
+                assertTrue(topics.has(rdb.getId()) && topics.has(built.catalogId), 'a later startSync opens sessions');
                 await rdb.stopSync();
             },
         },
@@ -440,38 +368,33 @@ export const rdbSyncTests = {
             invoke: async () => {
                 const mesh = createStubMesh();
                 const ctx = newCtx({ mesh });
-                const rdb = await makeRDb(ctx, 'rdb12');
-                const { schema, group } = await makeSchemaGroup(ctx, 'rdb12');
-                await rdb.addSchema(schema.getId());
-                await rdb.addGroup(group.getId());
+                const dev = await makeIdentity();
+                const { rdb } = await catalogDatabase(ctx, oneGroup(dev, 'rdb12'), { seed: 'rdb12' });
 
                 const started = rdb.startSync();
                 await rdb.stopSync();
                 await expectThrow(() => started, 'in-flight startSync must reject when stopSync wins');
-                assertTrue(liveSwarms(mesh).length === 0, 'stopSync leaves no live swarms');
+                assertEquals(liveSwarms(mesh).length, 0, 'stopSync leaves no live swarms');
 
                 await rdb.startSync();
-                const topics = new Set(liveSwarms(mesh).map((s) => s.topic));
-                assertTrue(topics.size === 3, 'startSync after abort opens the full closure');
+                assertEquals(liveTopics(mesh).size, 4, 'startSync after abort opens the full closure');
                 await rdb.stopSync();
             },
         },
         {
-            name: '[RDB13] addSchema during in-flight start is included in the start promise',
+            name: '[RDB13] a deploy during an in-flight start is included in the start promise',
             invoke: async () => {
                 const mesh = createStubMesh();
-                const creator = await makeIdentity();
-                const schemaAInit = await RSchemaImpl.create({
-                    name: 'rdb13_schema_a',
-                    creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
-                    tables: [open('t', { name: { type: 'string' } })],
+                const dev = await makeIdentity();
+                const absentInit = await RSchemaImpl.create({
+                    name: 'rdb13:absent', creators: [{ keyId: dev.keyId, publicKey: dev.publicKey }],
+                    tables: [openTable('t', { name: { type: 'string' } })],
                 });
+                const absentId = rootIdOf(absentInit);
 
                 let releaseFetch!: (obj: RObject) => void;
                 const fetchStarted = deferred<void>();
-                const fetchGate = new Promise<RObject>((resolve) => {
-                    releaseFetch = resolve;
-                });
+                const fetchGate = new Promise<RObject>((resolve) => { releaseFetch = resolve; });
 
                 let ctx!: RContext;
                 ctx = newCtx({
@@ -481,21 +404,21 @@ export const rdbSyncTests = {
                         return fetchGate;
                     },
                 });
-
-                const schemaAId = await rSchemaFactory.computeRootObjectId(schemaAInit, ctx);
-                const rdb = await makeRDb(ctx, 'rdb13');
-                const extra = await makeSchemaGroup(ctx, 'rdb13-extra');
-                await rdb.addSchema(schemaAId);
+                const { rdb, catalog } = await catalogDatabase(ctx, oneGroup(dev, 'rdb13'), { seed: 'rdb13' });
+                await catalog.declare([absentId], dev);
 
                 const started = rdb.startSync();
                 await fetchStarted.promise;
-                await rdb.addSchema(extra.schema.getId());
-                releaseFetch(await ctx.createObject(schemaAInit));
+
+                const extra = await extraSchema(ctx, dev, 'rdb13:extra');
+                const { release } = await catalog.publishRelease({ version: '1.1.0', add: [defFor('extra', extra)] }, dev);
+                await rdb.updateCatalog(release);
+                releaseFetch(await ctx.createObject(absentInit));
                 await started;
 
-                const topics = new Set(liveSwarms(mesh).map((s) => s.topic));
-                assertTrue(topics.has(schemaAId), 'fetched schema is synced');
-                assertTrue(topics.has(extra.schema.getId()), 'schema added during start is synced');
+                const extraId = (await rdb.getMemberGroupNames()).get('extra')!;
+                await waitUntil(() => liveTopics(mesh).has(extraId), 'the group deployed during start is synced');
+                assertTrue(liveTopics(mesh).has(absentId), 'the declared schema was fetched and synced');
                 await rdb.stopSync();
             },
         },
@@ -503,27 +426,21 @@ export const rdbSyncTests = {
             name: '[RDB14] failed startSync then retry actually opens sessions',
             invoke: async () => {
                 const mesh = createStubMesh();
-                const creator = await makeIdentity();
-                const schemaInit = await RSchemaImpl.create({
-                    name: 'rdb14:schema',
-                    creators: [{ keyId: creator.keyId, publicKey: creator.publicKey }],
-                    tables: [open('t', { name: { type: 'string' } })],
-                });
-
                 const ctx = newCtx({ mesh });
-                const schemaId = await rSchemaFactory.computeRootObjectId(schemaInit, ctx);
-                const rdb = await makeRDb(ctx, 'rdb14');
-                await rdb.addSchema(schemaId);
+                const dev = await makeIdentity();
+                const built = await buildCatalog(oneGroup(dev, 'rdb14'));
+                const { rdb, db } = await unmaterialized(ctx, built, 'rdb14');
 
-                await expectThrow(() => rdb.startSync(), 'first startSync fails while the schema is absent');
-                assertTrue(liveSwarms(mesh).length === 0, 'failed start leaves no live swarms');
+                await expectThrow(() => rdb.startSync(), 'first startSync fails while the catalog is absent');
+                assertEquals(liveSwarms(mesh).length, 0, 'failed start leaves no live swarms');
 
-                await ctx.createObject(schemaInit);
+                await materializeCatalog(ctx, built);
                 await rdb.startSync();
 
-                const topics = new Set(liveSwarms(mesh).map((s) => s.topic));
-                assertTrue(topics.has(rdb.getId()) && topics.has(schemaId), 'retry startSync opens sessions');
-                assertTrue(topics.size === 2, `expected 2 live sessions, got ${topics.size}`);
+                const topics = liveTopics(mesh);
+                assertTrue(topics.has(rdb.getId()) && topics.has(built.catalogId), 'retry startSync opens sessions');
+                assertTrue(topics.has(db.groupIds.get('main')!), 'the member group is created and synced');
+                assertEquals(topics.size, 4, 'RDb + catalog + schema + group');
                 await rdb.stopSync();
             },
         },

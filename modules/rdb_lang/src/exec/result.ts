@@ -1,6 +1,6 @@
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { json } from "@hyper-hyper-space/hhs3_json";
-import type { Row, RowQuery } from "@hyper-hyper-space/hhs3_rdb";
+import type { CatalogUpdateResult, Row, RowQuery } from "@hyper-hyper-space/hhs3_rdb";
 
 import type { CreatePlan } from "../compile/create.js";
 import type { RenderVersionScope } from "../reverse/aliases.js";
@@ -41,12 +41,28 @@ export type SetViewLangResult = {
     from?: VersionExpr;
 };
 
-export type AddMemberLangResult = {
-    kind: 'add-member';
-    member: 'schema' | 'tablegroup';
-    entryHash: B64Hash;
+export type AlterCatalogLangResult = {
+    kind: 'alter-catalog';
+    catalog: B64Hash;
+    version: string;
+    release: B64Hash;
+    // Present when the release introduced schemas: the implied declare entry.
+    declare?: B64Hash;
+};
+
+// A catalog release deployed into a database (UPDATE CATALOG, and the
+// planner run after CREATE DATABASE).
+export type UpdateCatalogLangResult = {
+    kind: 'update-catalog';
+    catalog: B64Hash;
     database: B64Hash;
-    memberId: B64Hash;
+    release: B64Hash;
+    update: CatalogUpdateResult;
+};
+
+export type UseDatabaseLangResult = {
+    kind: 'use-database';
+    database: B64Hash;
 };
 
 export type AlterSchemaLangResult = {
@@ -54,12 +70,6 @@ export type AlterSchemaLangResult = {
     entryHash: B64Hash;
     schema: string;
     rules: number;
-};
-
-export type UpdateSchemaLangResult = {
-    kind: 'update-schema';
-    entryHash: B64Hash;
-    group: string;
 };
 
 export type UpdateRefLangResult = {
@@ -97,6 +107,9 @@ export type LogRenderContext = {
     groupName?: string;
     tableName?: string;
     databaseName?: string;
+    catalogRef?: B64Hash;
+    catalogName?: string;
+    deployLabels?: { [versionKey: string]: string };
     versionScope?: RenderVersionScope;
 };
 
@@ -115,9 +128,10 @@ export type CreatePlanResult = {
 
 export type LangExecutionResult =
     | CreatePlanResult
-    | AddMemberLangResult
+    | AlterCatalogLangResult
+    | UpdateCatalogLangResult
+    | UseDatabaseLangResult
     | AlterSchemaLangResult
-    | UpdateSchemaLangResult
     | UpdateRefLangResult
     | InsertLangResult
     | UpdateLangResult

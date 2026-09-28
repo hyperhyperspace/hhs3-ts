@@ -264,6 +264,31 @@ export function validatePredicate(pred: json.Literal, context: PredicateContext 
     }
 }
 
+function operandReferencesAuthor(op: Operand): boolean {
+    if ('lit' in op) return op.lit === '$author';
+    if ('fn' in op) return op.args.some(operandReferencesAuthor);
+    return false;
+}
+
+// Whether a predicate reads `$author`, through a `{lit: '$author'}` operand or
+// a `'$author'` exists where-value. Such a predicate is only sound when the
+// author is signature-verified, so it needs a key source.
+export function predicateReferencesAuthor(pred: Predicate): boolean {
+    switch (pred.p) {
+        case 'cmp':
+            return operandReferencesAuthor(pred.left) || operandReferencesAuthor(pred.right);
+        case 'like':
+            return operandReferencesAuthor(pred.value) || operandReferencesAuthor(pred.pattern);
+        case 'exists':
+            return Object.values(pred.where ?? {}).some((value) => value === '$author');
+        case 'and':
+        case 'or':
+            return pred.args.some(predicateReferencesAuthor);
+        default:
+            return false;
+    }
+}
+
 type ExistsAtom = Extract<Predicate, { p: 'exists' }>;
 type CmpAtom = Extract<Predicate, { p: 'cmp' }>;
 type LikeAtom = Extract<Predicate, { p: 'like' }>;

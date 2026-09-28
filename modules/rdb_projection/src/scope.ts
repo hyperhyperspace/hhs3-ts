@@ -14,9 +14,10 @@
 //     but only when that group is CO-PROJECTED (a member the replica holds);
 //     a ref into a non-projected group falls back to a row_hash passthrough.
 //
-// RDb membership is advisory, so a member the replica hasn't fetched yet is
-// simply skipped and folded in later (the supervisor rebuilds the scope on a
-// membership change).
+// An RDb's members are computed from its deployed catalog releases; a member
+// the replica hasn't fetched yet is simply skipped and folded in later (the
+// supervisor rebuilds the scope on a membership change). Member names are
+// identifiers, unique within the RDb, so their prefixes never collide.
 
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import type { RContext } from "@hyper-hyper-space/hhs3_mvt";
@@ -29,6 +30,10 @@ import type { AdapterConfig, CrossGroupResolver, GroupProjection } from "@hyper-
 export type GroupConfigOverride = (info: { groupId: B64Hash; groupName: string; tableNames: string[] }) => AdapterConfig;
 
 export type ScopeOptions = {
+    // Each group's member name in its RDb (RDb.getMemberGroupNames(), with the
+    // tie-break applied); the table prefix. Groups absent here use their own
+    // name.
+    names?: Map<B64Hash, string>;
     // Default writer applied to every member that lacks one (enables ingestion).
     writer?: OwnIdentity;
     // Default FK-consecutive bundling applied to every member that does not set
@@ -44,7 +49,7 @@ function sanitizePrefix(name: string): string {
 }
 
 // Resolve the RTableGroup objects the replica currently holds for an RDb's
-// member groups. Members not yet present are skipped (advisory membership).
+// member groups. Members not yet present are skipped.
 export async function resolveMemberGroups(rdb: RDb, ctx: RContext): Promise<RTableGroup[]> {
     const ids = await rdb.getMemberGroups();
     const groups: RTableGroup[] = [];
@@ -64,7 +69,7 @@ export async function buildScope(groups: RTableGroup[], options: ScopeOptions = 
     const tableList = new Map<B64Hash, string[]>();
     for (const group of groups) {
         const id = group.getId();
-        const prefix = sanitizePrefix(group.getName());
+        const prefix = sanitizePrefix(options.names?.get(id) ?? group.getName());
         const clash = usedPrefixes.get(prefix);
         if (clash !== undefined && clash !== id) {
             throw new Error(

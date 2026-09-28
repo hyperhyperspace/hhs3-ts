@@ -1,4 +1,7 @@
-CREATE DATABASE app CREATORS ($admin);
+-- The editor app: two schemas, a catalog that releases them as table groups,
+-- and a database deployed from the catalog. $admin plays both roles here: the
+-- developer who signs the schemas and the catalog, and the admin who deploys
+-- the database.
 
 CREATE SCHEMA hhs:user CREATORS ($admin) AS (
   
@@ -43,24 +46,26 @@ CREATE SCHEMA hhs:doc CREATORS ($admin) AS (
   ) ALLOW all IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author,
 );
 
-ADD SCHEMA hhs:user TO app BY $admin;
+-- The first release. :admin is supplied by whoever deploys the catalog, and
+-- becomes the first manager.
+CREATE CATALOG editor CREATORS ($admin) VERSION '1.0.0'
+  PARAMS (:admin identity)
+AS (
+  TABLEGROUP user USING SCHEMA hhs:user AT LATEST
+    USING IDENTITIES identities
+    WITH ROWS (
+      identities (keyId = :admin, publicKey = publicKey(:admin), name = 'Admin'),
+      caps (label = 'manager', grantee = :admin)
+    ),
+  TABLEGROUP doc USING SCHEMA hhs:doc AT LATEST
+    BIND user => user
+    USING IDENTITIES user.identities
+    ALLOW UPDATE REF user IF EXISTS caps WHERE caps.grantee = $author
+) NOTE 'initial release' BY $admin;
 
-ADD SCHEMA hhs:doc TO app BY $admin;
-
--- hhs:user
-CREATE TABLEGROUP user USING SCHEMA hhs:user AT LATEST
-  USING IDENTITIES identities
-  WITH ROWS (
-  identities (keyId=$admin, publicKey=publicKey($admin), name='Admin'),
-  caps (label='manager', grantee=$admin)
-);
-
--- hhs:doc
-CREATE TABLEGROUP doc USING SCHEMA hhs:doc AT LATEST
-  BIND user => user
-  USING IDENTITIES user.identities
-  ALLOW UPDATE REF user IF EXISTS caps WHERE caps.grantee = $author;
-
-ADD TABLEGROUP user TO app BY $admin;
-
-ADD TABLEGROUP doc TO app BY $admin;
+-- Deploying the release creates the database's user and doc groups. Later
+-- releases (ALTER CATALOG) reach it with UPDATE CATALOG editor TO ... ON app.
+CREATE DATABASE app USING CATALOG editor AT '1.0.0'
+  CREATORS ($admin)
+  WITH PARAMS (:admin = $admin)
+  BY $admin;

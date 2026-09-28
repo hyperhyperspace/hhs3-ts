@@ -20,14 +20,15 @@ import { B64Hash, KeyId } from "@hyper-hyper-space/hhs3_crypto";
 import { createPayloadTypeFormat } from "@hyper-hyper-space/hhs3_mvt";
 
 import {
-    Predicate,
+    Predicate, SchemaCreator, schemaCreatorFormat,
     MAX_NAME_LENGTH, MAX_QUALIFIED_NAME_LENGTH, MAX_TABLES,
     MAX_SEED_LENGTH, MAX_HASH_ALGORITHM_LENGTH,
-    MAX_HASH_LENGTH, MAX_KEY_ID_LENGTH, MAX_SIGNATURE_LENGTH,
+    MAX_HASH_LENGTH, MAX_KEY_ID_LENGTH, MAX_SIGNATURE_LENGTH, MAX_CREATORS,
 } from "../rschema/payload.js";
 export const MAX_INITIAL_ROWS_PER_TABLE = 1024;
 export const MAX_BINDINGS = 256;
 export const MAX_BUNDLE_OPS = 1024;
+export const MAX_GATE_WIDTH = 256;
 
 // Create a table group:
 
@@ -69,6 +70,14 @@ export const MAX_BUNDLE_OPS = 1024;
 // create — its group-name must be in `bindings`; the foreign table being a
 // provider is a runtime concern). Fixed v1 like bindings / canDeploy. A group
 // with no idProvider performs no authentication (claimed authors are trusted).
+//
+// `deployKeys` is an embedded, self-certifying key list used only to verify
+// deploy signatures, alongside the idProvider: a deploy's author key resolves
+// through the provider first, then through `deployKeys`. It grants nothing by
+// itself; authorization is always `canDeploy`. Instantiation fills it with the
+// RDb's creators when a catalog group declares no ALLOW DEPLOY IF. A canDeploy
+// that reads $author needs a key source (idProvider or deployKeys), so an
+// unverified author never reaches it.
 
 export const RTABLE_GROUP_TYPE_ID = 'hhs/rtable_group_v1';
 
@@ -84,6 +93,7 @@ export type CreateTableGroupPayload = {
     canDeploy?: Predicate;                         // gates schema ref-advances ('object' context; fixed v1)
     canObserve?: { [binding: string]: Predicate }; // per-binding gate on foreign-group observations ('object' context; fixed v1)
     idProvider?: string;                           // local table name or 'group.table' (fixed v1)
+    deployKeys?: SchemaCreator[];                  // deploy signature key source, beside the idProvider (fixed v1)
     hashAlgorithm?: string;
 };
 
@@ -108,8 +118,20 @@ export const createTableGroupFormat: json.Format = {
         json.Type.Something,                              // each checked with validatePredicate('object')
         MAX_BINDINGS]],
     idProvider: [json.Type.Option, [json.Type.BoundedString, MAX_QUALIFIED_NAME_LENGTH]],
+    deployKeys: [json.Type.Option, [json.Type.BoundedArray, schemaCreatorFormat, MAX_CREATORS]],
     hashAlgorithm: [json.Type.Option, [json.Type.BoundedString, MAX_HASH_ALGORITHM_LENGTH]],
 };
+
+// Schema deploy (*):
+
+// (*) The canonical mvt ref-advance of the group's schema ref, plus `gate`:
+// the RDeployGate mirror hashes of the target version (see
+// ../rdeploy_gate/mirror.ts). A synced deploy depends on those entries in this
+// replica's gate, so it is applied only once the replica adopts the version.
+// Validation recomputes the hashes from the schema DAG and never reads the gate.
+
+export const deployGateSetFormat: json.Format =
+    [json.Type.BoundedMap, [json.Type.BoundedString, MAX_HASH_LENGTH], [json.Type.Constant, ''], MAX_GATE_WIDTH];
 
 // Row envelope (*):
 

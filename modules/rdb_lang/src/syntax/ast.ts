@@ -11,10 +11,11 @@ export type AstScript = {
 export type AstStatement =
     | CreateDatabaseStatement
     | CreateSchemaStatement
-    | CreateTableGroupStatement
-    | AddMemberStatement
+    | CreateCatalogStatement
+    | AlterCatalogStatement
+    | UpdateCatalogStatement
+    | UseDatabaseStatement
     | AlterSchemaStatement
-    | UpdateSchemaStatement
     | UpdateRefStatement
     | InsertStatement
     | UpdateStatement
@@ -55,13 +56,18 @@ export type AuthorExpr =
     | { kind: 'variable'; name: string; span: TextSpan }
     | { kind: 'hash'; prefix: string; span: TextSpan };
 
+// `:name` is a deploy-time catalog param; the binder only accepts it in the
+// WITH ROWS values of a catalog group definition.
 export type ValueExpr =
     | { kind: 'literal'; value: json.Literal | null; span: TextSpan }
     | { kind: 'variable'; name: string; field?: string; span: TextSpan }
     | { kind: 'hash'; prefix: string; span: TextSpan }
+    | { kind: 'param'; name: string; span: TextSpan }
     | { kind: 'call'; name: string; args: ValueExpr[]; span: TextSpan };
 
+// `db.group.table`, `group.table` or `table`.
 export type TableRef = {
+    database?: NameOrHashRef;
     group?: NameOrHashRef;
     table: string;
     span: TextSpan;
@@ -122,12 +128,28 @@ export type CreateSchemaStatement = {
     span: TextSpan;
 };
 
+// Selects one release of a catalog: a semver string or LATEST (both must match
+// exactly one release), or a hash / single-member version set.
+export type ReleaseSelector =
+    | { kind: 'semver'; version: string; span: TextSpan }
+    | { kind: 'version'; version: VersionExpr; span: TextSpan };
+
+export type ParamAssignment = {
+    name: string;
+    value: ValueExpr;
+    span: TextSpan;
+};
+
 export type CreateDatabaseStatement = {
     kind: 'create-database';
     name: string;
     seed?: string;
+    catalog: NameOrHashRef;
+    release?: ReleaseSelector;
     creators: ValueExpr[];
+    params: ParamAssignment[];
     hashAlgorithm?: string;
+    author?: AuthorExpr;
     span: TextSpan;
 };
 
@@ -137,31 +159,77 @@ export type InitialRow = {
     span: TextSpan;
 };
 
-export type CreateTableGroupStatement = {
-    kind: 'create-tablegroup';
+export type CatalogParamDeclExpr = {
     name: string;
-    seed?: string;
+    type: ColumnTypeName;
+    span: TextSpan;
+};
+
+// A group definition inside a catalog body (`TABLEGROUP ...` in CREATE
+// CATALOG, `ADD TABLEGROUP ...` in ALTER CATALOG). Bindings and change targets
+// name other definitions of the same catalog, by name or by definition hash
+// (a merge can hold two definitions with the same name).
+export type CatalogGroupExpr = {
+    name: string;
     schema: NameOrHashRef;
     schemaVersion?: VersionExpr;
     bindings: { name: string; group: NameOrHashRef; span: TextSpan }[];
     idProvider?: string;
-    // deploy gate: `ALLOW UPDATE SCHEMA IF <predicate>`.
+    // `ALLOW DEPLOY IF <predicate>`.
     canDeploy?: PredicateExpr;
-    // per-binding observation gate: `ALLOW UPDATE REF <binding> IF <predicate>`.
+    // `ALLOW UPDATE REF <binding> IF <predicate>`.
     canObserve: { binding: string; predicate: PredicateExpr; span: TextSpan }[];
     initialRows: InitialRow[];
-    hashAlgorithm?: string;
     span: TextSpan;
 };
 
-export type AddMemberStatement = {
-    kind: 'add-member';
-    member: 'schema' | 'tablegroup';
-    target: NameOrHashRef;
-    database: NameOrHashRef;
+export type CatalogChangeExpr =
+    | { kind: 'add-group'; group: CatalogGroupExpr; span: TextSpan }
+    // Sets a group's version in the release (not a deploy).
+    | { kind: 'update-schema'; schema: NameOrHashRef; version: VersionExpr; group: NameOrHashRef; span: TextSpan };
+
+export type CreateCatalogStatement = {
+    kind: 'create-catalog';
+    name: string;
+    seed?: string;
+    creators: ValueExpr[];
+    version: string;
+    params: CatalogParamDeclExpr[];
+    groups: CatalogGroupExpr[];
+    hashAlgorithm?: string;
     note?: string;
     author?: AuthorExpr;
+    span: TextSpan;
+};
+
+export type AlterCatalogStatement = {
+    kind: 'alter-catalog';
+    catalog: NameOrHashRef;
+    version: string;
+    params: CatalogParamDeclExpr[];
+    changes: CatalogChangeExpr[];
+    note?: string;
+    author?: AuthorExpr;
+    // The insertion point: hashes or LATEST only.
     at?: VersionExpr;
+    span: TextSpan;
+};
+
+// Deploys a catalog release into a database.
+export type UpdateCatalogStatement = {
+    kind: 'update-catalog';
+    catalog: NameOrHashRef;
+    release: ReleaseSelector;
+    database: NameOrHashRef;
+    params: ParamAssignment[];
+    note?: string;
+    author?: AuthorExpr;
+    span: TextSpan;
+};
+
+export type UseDatabaseStatement = {
+    kind: 'use-database';
+    database: NameOrHashRef;
     span: TextSpan;
 };
 
@@ -226,16 +294,6 @@ export type AlterSchemaStatement = {
     schema: NameOrHashRef;
     rules: MigrationRuleExpr[];
     note?: string;
-    author?: AuthorExpr;
-    at?: VersionExpr;
-    span: TextSpan;
-};
-
-export type UpdateSchemaStatement = {
-    kind: 'update-schema';
-    schema: NameOrHashRef;
-    version: VersionExpr;
-    group: NameOrHashRef;
     author?: AuthorExpr;
     at?: VersionExpr;
     span: TextSpan;

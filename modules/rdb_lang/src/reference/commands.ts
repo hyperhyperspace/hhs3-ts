@@ -1,7 +1,7 @@
 /** C-SQL (causal SQL) command reference for \\help commands. */
 import type { AstStatement } from "../syntax/ast.js";
 
-export type LangCommandSection = 'creation' | 'schema' | 'refs' | 'data' | 'query';
+export type LangCommandSection = 'creation' | 'catalog' | 'schema' | 'refs' | 'data' | 'query';
 
 export type LangCommandRef = {
     /** Leading keywords, e.g. "CREATE DATABASE" */
@@ -17,6 +17,7 @@ export type LangCommandRef = {
 
 export const LANG_COMMAND_SECTIONS: readonly LangCommandSection[] = [
     'creation',
+    'catalog',
     'schema',
     'refs',
     'data',
@@ -28,8 +29,56 @@ export const LANG_COMMAND_REFS: readonly LangCommandRef[] = [
         command: 'CREATE DATABASE',
         section: 'creation',
         kind: 'create-database',
-        syntax: "CREATE DATABASE name [SEED '...'] [CREATORS (value, ...)] [HASH ALGORITHM '...'];",
-        description: 'Creates a database. Optional SEED and CREATORS pin identity and restrict who may add schemas and table groups.',
+        syntax: [
+            "CREATE DATABASE name USING CATALOG catalogRef [AT release] [SEED '...']",
+            '  [CREATORS (value, ...)] [WITH PARAMS (:name = value, ...)]',
+            "  [HASH ALGORITHM '...'] [BY author];",
+        ].join('\n'),
+        description: "Creates a database from a catalog release and creates its table groups. release is a version string ('1.0.0'), #hash or LATEST (the default); a version string or LATEST must match exactly one release. WITH PARAMS supplies every param the release declares ($name for an identity param). CREATORS restrict who may deploy releases into the database (UPDATE CATALOG) and, unless the catalog says otherwise (ALLOW DEPLOY IF), who may deploy schema versions to its groups. The database becomes the current one.",
+    },
+    {
+        command: 'USE DATABASE',
+        section: 'creation',
+        kind: 'use-database',
+        syntax: 'USE DATABASE databaseRef;',
+        description: 'Sets the current database: bare group names (group.table) resolve within it.',
+    },
+    {
+        command: 'CREATE CATALOG',
+        section: 'catalog',
+        kind: 'create-catalog',
+        syntax: [
+            "CREATE CATALOG name [CREATORS (value, ...)] VERSION '<semver>' [PARAMS (:name type, ...)] [SEED '...'] AS (",
+            '  TABLEGROUP name USING SCHEMA schemaRef [AT version]',
+            '    [BIND binding => groupName [, binding => groupName]*]',
+            '    [USING IDENTITIES providerRef]',
+            '    [ALLOW DEPLOY IF predicate]',
+            '    [ALLOW UPDATE REF binding IF predicate]*',
+            '    [WITH ROWS (table (col = value | :param | publicKey(:param), ...), ...)],',
+            '  ...',
+            ") [NOTE '...'] [BY author];",
+        ].join('\n'),
+        description: "Creates a catalog: a signed DAG of releases describing a database's table groups. The genesis is the first release. CREATORS (default: the author) are the only keys that may sign releases. BIND names another table group of the catalog. :param values in WITH ROWS are supplied when the release is deployed. Without ALLOW DEPLOY IF, a group's schema deploys are restricted to the database creators.",
+    },
+    {
+        command: 'ALTER CATALOG',
+        section: 'catalog',
+        kind: 'alter-catalog',
+        syntax: [
+            "ALTER CATALOG catalogRef VERSION '<semver>' [PARAMS (:name type, ...)] [AS (",
+            '  UPDATE SCHEMA schemaRef TO version ON groupName,',
+            '  ADD TABLEGROUP name USING SCHEMA schemaRef ... (as in CREATE CATALOG),',
+            '  ...',
+            ")] [NOTE '...'] [BY author] [AT {#release, ...} | AT LATEST];",
+        ].join('\n'),
+        description: "Publishes a release: the version changes and new table groups relative to its parents, the latest releases at AT (default LATEST; hashes only, since releases can share a version). With several parents the release is a merge, and must UPDATE SCHEMA every group they disagree on. The version must be greater than every parent's. Nothing changes in a database until the release is deployed with UPDATE CATALOG.",
+    },
+    {
+        command: 'UPDATE CATALOG',
+        section: 'catalog',
+        kind: 'update-catalog',
+        syntax: "UPDATE CATALOG catalogRef TO release ON databaseRef [WITH PARAMS (:name = value, ...)] [NOTE '...'] [BY author];",
+        description: "Deploys a later catalog release into a database: creates its new table groups, deploys the new schema versions (bound groups first, advancing their dependents' refs), then records the release. release is a version string, #hash or LATEST. WITH PARAMS supplies the params the release adds. Other replicas adopt the release when it is in their adoption range (see \\adopt).",
     },
     {
         command: 'CREATE SCHEMA',
@@ -44,37 +93,6 @@ export const LANG_COMMAND_REFS: readonly LangCommandRef[] = [
             ');',
         ].join('\n'),
         description: "Defines a schema: tables, columns, allow rules, and an optional identity provider. Column type is one of string[(n)], integer, float, boolean, json, bigint, decimal(p, s), bytes[(n)], identity (n = maxLength; p, s = precision, scale, with p = * for no precision limit; identity stores a key-hash string). A creator is $name, #keyIdPrefix, a key-id string, or publicKey('<base64>'). Names that collide with keywords are double-quoted: \"identity\". MIN/MAX give inclusive bounds (integer/bigint/decimal only); write bigint/decimal literals as quoted strings so they stay exact, and json values as JSON '<json text>'. Values are rejected, never rounded. Mark FK columns with REFERENCES refTable (or REFERENCES binding.table for a bound group); insert their values as #rowIdPrefix. For identity columns, insert $name or #keyIdPrefix.",
-    },
-    {
-        command: 'CREATE TABLEGROUP',
-        section: 'creation',
-        kind: 'create-tablegroup',
-        syntax: [
-            "CREATE TABLEGROUP name [SEED '...']",
-            '  USING SCHEMA schemaRef [AT version]',
-            '  [BIND binding => groupRef]*',
-            '  [USING IDENTITIES providerRef]',
-            '  [ALLOW UPDATE SCHEMA IF predicate]',
-            '  [ALLOW UPDATE REF binding IF predicate]*',
-            '  [WITH ROWS (table (col = value, ...), ...)]',
-            "  [HASH ALGORITHM '...']",
-            '  [BY author] [AT version];',
-        ].join('\n'),
-        description: 'Creates a table group from a schema, optional bindings, identity provider, deploy/ref gates, and genesis rows.',
-    },
-    {
-        command: 'ADD SCHEMA',
-        section: 'creation',
-        kind: 'add-member',
-        syntax: "ADD SCHEMA schemaRef TO databaseRef [NOTE '...'] [AT version] [BY author];",
-        description: 'Adds a schema to a database (advisory membership).',
-    },
-    {
-        command: 'ADD TABLEGROUP',
-        section: 'creation',
-        kind: 'add-member',
-        syntax: "ADD TABLEGROUP groupRef TO databaseRef [NOTE '...'] [AT version] [BY author];",
-        description: 'Adds a table group to a database (advisory membership).',
     },
     {
         command: 'ALTER SCHEMA',
@@ -97,38 +115,31 @@ export const LANG_COMMAND_REFS: readonly LangCommandRef[] = [
         description: 'Migrates a schema with add/drop table or column, FK, allow-rule, and concurrent-delete changes. SET FKS table (col REFERENCES refTable, ...) sets a table\'s foreign keys. Requires an author.',
     },
     {
-        command: 'UPDATE SCHEMA',
-        section: 'refs',
-        kind: 'update-schema',
-        syntax: 'UPDATE SCHEMA schemaRef TO version ON groupRef [AT version] [BY author];',
-        description: 'Deploys a schema version on a table group. Gated by ALLOW UPDATE SCHEMA IF when present.',
-    },
-    {
         command: 'UPDATE REF',
         section: 'refs',
         kind: 'update-ref',
-        syntax: 'UPDATE REF binding TO version ON groupRef [AT version] [BY author];',
+        syntax: 'UPDATE REF binding TO version ON [db.]group [AT version] [BY author];',
         description: 'Advances the observed version of a bound group on a table group. Gated by ALLOW UPDATE REF IF when present.',
     },
     {
         command: 'INSERT',
         section: 'data',
         kind: 'insert',
-        syntax: 'INSERT INTO [group.]table (col, ...) VALUES (value, ...) [BY author] [AT version];',
+        syntax: 'INSERT INTO [[db.]group.]table (col, ...) VALUES (value, ...) [BY author] [AT version];',
         description: 'Inserts a row into a table. Supply uuid for deterministic row identity. For REFERENCES columns, pass the FK value as a #rowIdPrefix of the target row. Write json values as JSON \'<json text>\' (no null inside).',
     },
     {
         command: 'UPDATE',
         section: 'data',
         kind: 'update',
-        syntax: 'UPDATE [group.]table SET col = value [, ...] WHERE rowId = #prefix [BY author] [AT version];',
+        syntax: 'UPDATE [[db.]group.]table SET col = value [, ...] WHERE rowId = #prefix [BY author] [AT version];',
         description: 'Updates columns on an existing row, identified by rowId hash prefix.',
     },
     {
         command: 'DELETE',
         section: 'data',
         kind: 'delete',
-        syntax: 'DELETE FROM [group.]table WHERE rowId = #prefix [BY author] [AT version];',
+        syntax: 'DELETE FROM [[db.]group.]table WHERE rowId = #prefix [BY author] [AT version];',
         description: 'Deletes a row by rowId hash prefix.',
     },
     {
@@ -136,7 +147,7 @@ export const LANG_COMMAND_REFS: readonly LangCommandRef[] = [
         section: 'data',
         kind: 'bundle',
         syntax: [
-            'BUNDLE ON groupRef (',
+            'BUNDLE ON [db.]group (',
             '  INSERT INTO table (...) VALUES (...);',
             '  UPDATE table SET ... WHERE rowId = #prefix;',
             '  DELETE FROM table WHERE rowId = #prefix;',
@@ -149,7 +160,7 @@ export const LANG_COMMAND_REFS: readonly LangCommandRef[] = [
         section: 'query',
         kind: 'select',
         syntax: [
-            'SELECT * | col [, ...] FROM [group.]table',
+            'SELECT * | col [, ...] FROM [[db.]group.]table',
             '  [WHERE predicate]',
             '  [ORDER BY col [ASC|DESC] [, ...]]',
             '  [LIMIT n] [OFFSET n]',
@@ -169,7 +180,7 @@ export const LANG_COMMAND_REFS: readonly LangCommandRef[] = [
         section: 'query',
         kind: 'log',
         syntax: '[EXPLAIN] LOG targetRef [AT version] [FROM version] [LIMIT n] [OFFSET n];',
-        description: 'Shows paginated operation history for a schema, table group, or database. Group and table logs include status (OK/Cancelled) for void-checkable ops and a truncated reverse-render op preview. EXPLAIN adds a reason column (populated for Cancelled ops only). JSON output carries raw payload rows only. Read-only.',
+        description: 'Shows paginated operation history for a schema, catalog, table group, table or database. Group and table logs include status (OK/Cancelled) for void-checkable ops and a truncated reverse-render op preview. EXPLAIN adds a reason column (populated for Cancelled ops only). JSON output carries raw payload rows only. Read-only.',
     },
 ];
 

@@ -6,7 +6,7 @@ It does not own persistence, SQLite files, workspace root-name metadata, key sto
 
 ## Allow-rule column references
 
-Schema `ALLOW` predicates and group gates (`ALLOW UPDATE SCHEMA IF`, `ALLOW UPDATE REF`) resolve column names by scope:
+Schema `ALLOW` predicates and catalog group gates (`ALLOW DEPLOY IF`, `ALLOW UPDATE REF`) resolve column names by scope:
 
 - Unqualified names are allowed when they refer to exactly one in-scope table.
 - Use `table.column` (or `group.table.column` for cross-group `EXISTS` targets) when a bare name would be ambiguous.
@@ -26,25 +26,42 @@ parseScript(sql)
   -> execute(boundStatement)
 ```
 
-Creation statements return create plans. Hosts decide when to call `RContext.createObject(plan.payload)`.
+Creation statements return create plans. Hosts decide when to call `RContext.createObject(plan.payload)`; a `create-database` plan also carries `afterCreate(object)`, which the host runs on the new RDb to create its table groups (and deploy any whose release version is above their pin). `USE DATABASE` returns a `use-database` result that the host applies, as it does `set-view`.
 
 ## Supported Statements
 
-Creation:
+Creation. A database is deployed from a catalog: the developer releases table groups in a catalog, and `CREATE DATABASE` deploys one release, creating its groups:
 
 ```sql
-CREATE DATABASE mydb;
 CREATE SCHEMA shop AS (
   TABLE products (
     sku string PUB READONLY,
     name string
   ) ALLOW insert IF EXISTS users.caps WHERE label = 'writer' AND grantee = $author
 );
-CREATE TABLEGROUP shop_prod USING SCHEMA shop AT {#schemaVersion}
-  BIND users => users
-  USING IDENTITIES users.identities
-  ALLOW UPDATE SCHEMA IF EXISTS users.caps WHERE label = 'deployer' AND grantee = $author;
+
+CREATE CATALOG store CREATORS ($dev) VERSION '1.0.0'
+  PARAMS (:admin identity)
+AS (
+  TABLEGROUP users USING SCHEMA users_schema AT LATEST
+    USING IDENTITIES identities
+    WITH ROWS (identities (keyId = :admin, publicKey = publicKey(:admin), name = 'Admin'),
+               caps (label = 'manager', grantee = :admin)),
+  TABLEGROUP shop_prod USING SCHEMA shop AT {#schemaVersion}
+    BIND users => users USING IDENTITIES users.identities
+    ALLOW UPDATE REF users IF EXISTS caps WHERE caps.grantee = $author
+    ALLOW DEPLOY IF EXISTS users.caps WHERE label = 'deployer' AND grantee = $author
+) NOTE 'initial' BY $dev;
+
+CREATE DATABASE store_prod USING CATALOG store AT '1.0.0'
+  CREATORS ($admin) WITH PARAMS (:admin = $admin) BY $admin;
 ```
+
+- `CREATORS` of a catalog (default: the author) are the only keys that may sign its entries; every entry is signed, and the genesis is the first release.
+- `BIND alias => group` names another group of the same catalog (by name, or `#hash` of its definition when a merge joined two definitions with the same name). `BIND a => x, b => y` lists several.
+- `:param` values in `WITH ROWS` are filled from `WITH PARAMS` when the release is deployed; `publicKey(:p)` takes an identity param's public key. Params are declared with `PARAMS (:name type, ...)` and may only appear in catalog rows. Literal values (`$admin`, `'Admin'`) are fixed in the catalog. Genesis rows get derived uuids, so `uuid` is not allowed there.
+- `ALLOW DEPLOY IF` gates schema deploys to the group. Without it, a database with `CREATORS` accepts deploys from those creators only. A predicate over `$author` needs `USING IDENTITIES` to verify deploy signatures.
+- `CREATE DATABASE ... AT` selects a release: a version string or `LATEST` (the default) must match exactly one release; `{#hash}` names one. `WITH PARAMS` supplies every param the release declares. `CREATORS` restrict who may deploy releases into the database. `BY` signs the deploys the planner makes for groups whose release version is above their pin. The new database becomes the current one.
 
 Column types and constraints:
 
@@ -87,20 +104,35 @@ ALTER SCHEMA shop AS (
   )
 );
 
-UPDATE SCHEMA shop TO {#schemaVersion} ON shop_prod;
 UPDATE REF users TO LATEST ON shop_prod;
 ```
 
-Deployment membership (advisory, monotonic add-only on the RDb):
+Releases and deploys. A schema change reaches a database in two steps: the developer releases it in the catalog, and the admin deploys the release:
 
 ```sql
-ADD SCHEMA shop TO mydb;
-ADD TABLEGROUP shop_prod TO mydb NOTE 'main deployment';
+ALTER CATALOG store VERSION '1.1.0'
+  PARAMS (:support identity)
+AS (
+  UPDATE SCHEMA shop TO LATEST ON shop_prod,
+  ADD TABLEGROUP comments USING SCHEMA comments_schema AT LATEST
+    BIND shop => shop_prod, users => users USING IDENTITIES users.identities
+) NOTE 'comments' BY $dev;
+
+UPDATE CATALOG store TO '1.1.0' ON store_prod WITH PARAMS (:support = $bob) BY $admin;
+USE DATABASE store_prod;
 ```
 
-A schema or tablegroup can belong to several databases; `ADD ... TO <db>` records
-the membership link by id (it never moves or copies the object). The optional
-`NOTE` is free-form bookkeeping, never resolved.
+- An `ALTER CATALOG` release is a diff against its parents: `UPDATE SCHEMA s TO v ON group` sets a group's version in the release (it is not a deploy), and `ADD TABLEGROUP` adds a group. The version must be greater than every parent's. A release that introduces schemas is preceded by an implied, signed declare entry.
+- The trailing `AT` is the insertion point, as for other authored statements, and takes release hashes (`{#h1, #h2}`) or `LATEST` only, never a version string: concurrent releases can share a version. It defaults to the catalog frontier. Several maximal releases there make the release a merge, which must `UPDATE SCHEMA` every group whose version differs across its parents.
+- `UPDATE CATALOG c TO r ON db` deploys a later release (forward only): the planner creates the release's new groups, deploys the new schema versions (bound groups first, advancing their dependents' refs), then records the release. `WITH PARAMS` supplies the params the release adds; params already set cannot change. A database with `CREATORS` requires an author from among them. Other replicas adopt the release when it is within their adoption range.
+- There is no group-level `UPDATE SCHEMA ... ON group`, `CREATE TABLEGROUP` or `ADD SCHEMA` / `ADD TABLEGROUP`: groups exist only through catalogs, and the catalog is the only deploy path.
+
+Names. Tables are `db.group.table`, `group.table` or `table` (in the current group); groups are `db.group` or `group`:
+
+- A database qualifier always resolves exactly.
+- With a current database (`USE DATABASE`, `CREATE DATABASE`), a bare group resolves only inside it; a group that exists only elsewhere is an error that names the qualified form.
+- With no current database, a bare group resolves when exactly one database has a group by that name.
+- `LOG a.b` resolves when exactly one reading (group.table or db.group) matches.
 
 DML and bundles:
 
@@ -126,7 +158,7 @@ EXPLAIN LOG shop_prod LIMIT 20;  -- adds reason column for Cancelled group/table
 
 ## Expressions
 
-Conditions (`WHERE`, `ALLOW ... IF`, `CAN DEPLOY IF`, `CAN OBSERVE IF`) and the values inside them share one grammar, loosest-binding first:
+Conditions (`WHERE`, `ALLOW ... IF`, `ALLOW DEPLOY IF`, `ALLOW UPDATE REF ... IF`) and the values inside them share one grammar, loosest-binding first:
 
 ```ebnf
 condition  = or ;
@@ -221,12 +253,12 @@ Each table or `SET ALLOW RULES` block accepts at most one expression per operati
 
 Omitted rules use RDb defaults: inserts are allowed, while updates and deletes require `rowAuthor = $author` (the row's insert author must equal the op signer). To explicitly open every operation, write `ALLOW all IF true`.
 
-### Tablegroup allow rules
+### Tablegroup gates
 
-Deploy authority and ref-update authority use parallel `ALLOW UPDATE …` gates on `CREATE TABLEGROUP`:
+Deploy authority and ref-update authority are gates on a catalog group definition (`TABLEGROUP` / `ADD TABLEGROUP`):
 
 ```sql
-ALLOW UPDATE SCHEMA IF EXISTS users.caps
+ALLOW DEPLOY IF EXISTS users.caps
   WHERE label = 'deployer'
   AND grantee = $author
 
@@ -235,11 +267,11 @@ ALLOW UPDATE REF users IF EXISTS users.caps
   AND grantee = $author
 ```
 
-`ALLOW UPDATE SCHEMA IF ...` is evaluated when advancing a schema version on the tablegroup (via `UPDATE SCHEMA`). `ALLOW UPDATE REF <binding> IF ...` gates who may advance the observed version of a bound foreign group via `UPDATE REF`. Both use object context: `$author` is available, but there is no subject row. A gated binding requires an authored `UPDATE REF ... BY ...`; ungated bindings still accept `BY NOBODY`.
+`ALLOW DEPLOY IF ...` is evaluated when a schema version is deployed to the group (by the catalog planner, for `UPDATE CATALOG`). Without it, the group of a database with creators accepts deploys from those creators only, whose keys the group embeds for verification. `ALLOW UPDATE REF <binding> IF ...` gates who may advance the observed version of a bound foreign group via `UPDATE REF`. Both use object context: `$author` is available, but there is no subject row. A gated binding requires an authored `UPDATE REF ... BY ...`; ungated bindings still accept `BY NOBODY`.
 
 ## Authorship
 
-Authored statements — `INSERT`, `UPDATE`, `DELETE`, `BUNDLE`, `UPDATE SCHEMA`, `UPDATE REF`, and `ALTER SCHEMA` — sign as an author identity. The author is chosen in this order:
+Authored statements — `INSERT`, `UPDATE`, `DELETE`, `BUNDLE`, `UPDATE REF`, `ALTER SCHEMA`, `CREATE CATALOG`, `ALTER CATALOG`, `UPDATE CATALOG` and `CREATE DATABASE` (for the deploys it makes) — sign as an author identity. The author is chosen in this order:
 
 1. an explicit trailing `BY` clause, if present;
 2. otherwise the host's default author (`currentAuthor()`), which may itself be unset.
@@ -252,7 +284,7 @@ DELETE FROM docs WHERE rowId = #ab BY NOBODY;   -- explicitly unauthored
 
 The author is `$name` (an unlocked identity, resolved by the host) or `#keyid` (by key-id prefix). The bareword `NOBODY` forces an unauthored op even when a default author is set — useful for anonymous writes. Because `NOBODY` is a keyword, an identity literally named `nobody` is still referenced as `$nobody`.
 
-`BY` sits alongside the optional `AT <version>` clause and is written before it. `$author` and `$me` in value position resolve to the statement's effective author, so `VALUES ($author)` agrees with the identity chosen by `BY`. A `BUNDLE` is a single signed op: put `BY` on the `BUNDLE`, not on its inner writes (a `BY` on an inner write is a parse error). `ALTER SCHEMA` requires an author (explicit or default); the others fall back to an unauthored op when neither is present.
+`BY` sits alongside the optional `AT <version>` clause and is written before it. `$author` and `$me` in value position resolve to the statement's effective author, so `VALUES ($author)` agrees with the identity chosen by `BY`. A `BUNDLE` is a single signed op: put `BY` on the `BUNDLE`, not on its inner writes (a `BY` on an inner write is a parse error). `ALTER SCHEMA`, `CREATE CATALOG` and `ALTER CATALOG` require an author (explicit or default), a catalog creator for the catalog statements; `UPDATE CATALOG` requires one when the database declares creators. The others fall back to an unauthored op when neither is present.
 
 ## Identity Providers
 
@@ -266,12 +298,12 @@ TABLE identities (
 ) IDENTITY PROVIDER
 ```
 
-Use `USING IDENTITIES` on a tablegroup to select a local or bound foreign provider for signature verification:
+Use `USING IDENTITIES` on a catalog tablegroup to select a local or bound foreign provider for signature verification:
 
 ```sql
-CREATE TABLEGROUP app_group USING SCHEMA app_schema
+TABLEGROUP app_group USING SCHEMA app_schema
   BIND users => users
-  USING IDENTITIES users.identities;
+  USING IDENTITIES users.identities
 ```
 
 `publicKey($admin)` returns the canonical serialized public key for an identity or public-key record. Plain `$admin` remains the key id string in row values.
@@ -293,24 +325,28 @@ CREATE SCHEMA users_schema CREATORS ($admin) AS (
     ALLOW delete IF grantee = $author OR EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
 );
 
-CREATE TABLEGROUP users
-  USING SCHEMA users_schema
-  USING IDENTITIES identities
-  WITH ROWS (
-    identities (keyId = $admin, publicKey = publicKey($admin), name = 'Admin'),
-    caps (label = 'manager', grantee = $admin)
-  );
+CREATE CATALOG users_catalog VERSION '1.0.0' PARAMS (:admin identity) AS (
+  TABLEGROUP users
+    USING SCHEMA users_schema
+    USING IDENTITIES identities
+    WITH ROWS (
+      identities (keyId = :admin, publicKey = publicKey(:admin), name = 'Admin'),
+      caps (label = 'manager', grantee = :admin)
+    )
+);
+CREATE DATABASE users_db USING CATALOG users_catalog WITH PARAMS (:admin = $admin);
 ```
-
 
 
 ## Binding Boundary
 
 `LangBindContext` supplies all host-owned behavior:
 
-- workspace name resolution for schemas, groups, tables, and log targets,
+- workspace name resolution for schemas, catalogs, databases, groups (`group` / `db.group`), tables, and log targets (`resolveCatalog`, `resolveGroup`, `resolveTable`, ...),
+- the current database for bare group names (`resolveDefaultDatabase`) and the current group for bare table names (`resolveDefaultGroup`),
+- labels for a group's deploys in LOG, from the database that has the group (`resolveDeployLabels`; `deployLabelsFor(db, groupId)` computes them),
 - hash-prefix and version resolution (`#prefix` in `AT {…}`; bare names in `AT {…}` resolve via session version aliases),
-- session scoped aliases (`key`, `schema`, `group`, `db`, `version`) via the REPL `\\alias` command; `$name` for identities only,
+- session scoped aliases (`key`, `schema`, `catalog`, `group`, `db`, `version`) via the REPL `\\alias` command; `$name` for identities only,
 - session variables such as `$me`, `$admin`, and `$author` (identity scope: alias then keystore label),
 - keystore public-key lookup for `CREATORS (#prefix)` and key-id literals (`resolvePublicKey`),
 - default author identity (`currentAuthor`),
@@ -320,12 +356,12 @@ CREATE TABLEGROUP users
 Optional deterministic identity on create/write statements:
 
 ```sql
-CREATE DATABASE app SEED 'fixed-db-seed';
-CREATE TABLEGROUP shop_prod SEED 'fixed-group-seed' USING SCHEMA shop;
+CREATE CATALOG store SEED 'fixed-catalog-seed' VERSION '1.0.0' AS (TABLEGROUP shop_prod USING SCHEMA shop);
+CREATE DATABASE app SEED 'fixed-db-seed' USING CATALOG store;
 INSERT INTO products (uuid, sku, name) VALUES ('fixed-row-uuid', 'A', 'Widget');
 ```
 
-The `uuid` identifier is a reserved pseudo-column on `INSERT` and in `WITH ROWS` (not a schema column). When omitted, the host generates fresh seeds/uuids.
+The `uuid` identifier is a reserved pseudo-column on `INSERT` (not a schema column). When omitted, the host generates fresh seeds/uuids. A database's groups are derived from the database id and their catalog definitions, and their genesis rows get derived uuids, so group ids never depend on the host.
 
 The C-SQL layer validates and applies language semantics, but it does not persist workspace metadata or manage keys.
 
@@ -333,37 +369,26 @@ The C-SQL layer validates and applies language semantics, but it does not persis
 
 Reverse helpers render known payloads and DAG histories:
 
-- `renderCreateDatabase`
-- `renderCreateSchema`
-- `renderCreateTableGroup`
-- `renderAddSchema`
-- `renderAddGroup`
-- `renderSchemaUpdate`
-- `renderRowOp`
-- `renderRefOp`
-- `renderBundle`
-- `renderOp`
-- `dumpSchema`
-- `dumpGroup`
-- `dumpDatabase`
-- `sortMemberGroupsByBindings`
+- `renderCreateSchema`, `renderSchemaUpdate`
+- `renderCreateCatalog` (the genesis), `renderAlterCatalog` (a release, rendered literally: each `changes` entry becomes `UPDATE SCHEMA s TO {#v} ON group`, each `add` definition `ADD TABLEGROUP`, and the trailing `AT` is always explicit hashes)
+- `renderCreateDatabase` (`USING CATALOG ... AT {#release} ... WITH PARAMS`), `renderUpdateCatalog`, `renderUseDatabase`
+- `renderRowOp`, `renderRefOp`, `renderBundle`, `renderOp`
+- `dumpSchema`, `dumpCatalog`, `dumpGroup`, `dumpDatabase`, `sortMemberGroupsByBindings`
 
-`dumpDatabase(db, { mode, loadSchema, loadGroup })` emits a five-section script:
+Entries with no C-SQL statement render as comment lines: a group genesis (`-- TABLEGROUP doc USING SCHEMA ... (created by its database)`), a group's schema deploy (`-- deploy hhs:doc TO {#v} (editor 1.1.0)`, labeled with the deployed release that pins the version when the host passes `deployLabels`, or noting that none does), and a catalog declare (`-- declare schemas {#s1, #s2}`).
 
-1. `CREATE DATABASE`
-2. Member schema DAGs (`getMemberSchemas()`)
-3. `ADD SCHEMA` membership ops
-4. Member tablegroup DAGs (`getMemberGroups()`, BIND topo order among members)
-5. `ADD TABLEGROUP` membership ops
+`dumpCatalog(catalog, { loadSchema })` emits the referenced schemas, then `CREATE CATALOG`, then every release as `ALTER CATALOG` in topological order. Declares are implied, so a release that sits on a declare renders the declare's insertion point, and replaying regenerates the declare. Replaying re-signs every entry, so it needs the developer's keys; signatures are deterministic, so the replayed catalog has the same entry hashes.
+
+`dumpDatabase(db, { mode, loadSchema, loadGroup })` emits the catalog dump, `CREATE DATABASE`, `USE DATABASE`, and then (full mode) the members' history in rounds. A deploy is made by the statement that deploys its release (`CREATE DATABASE` or `UPDATE CATALOG`), so group histories are split at their deploys: each round holds the ops that depend on that release's deploys and follows its `UPDATE CATALOG`. Deploys and the planner's own ref advances after a bound group's deploy are regenerated on replay and not rendered. A deploy to a version no deployed release pins cannot be replayed; it renders as a comment with a warning.
 
 Modes:
 
-- `full` **(default, clone):** includes `SEED`, `uuid` pseudo-column, and `#hash` refs for replay with stable ids. Group-scoped ops (`UPDATE REF`, `UPDATE SCHEMA`, `BUNDLE`) render `ON #groupId` / `BUNDLE ON #groupId`.
-- `schema` **(bootstrap):** omits `SEED`/`uuid`; uses names for `ADD`/`BIND`; group section is genesis + `WITH ROWS` only (no row/ref ops). Membership ops (`ADD SCHEMA`, `ADD TABLEGROUP`) omit causal `AT` because the database seed is not fixed; replay appends at the db frontier. Schema migrations and group genesis schema-version pins are unchanged.
+- `full` **(default, clone):** includes `SEED`, `uuid` pseudo-column, and `#hash` refs for replay with stable ids. Row writes and group-scoped ops render with the group's member name (`INSERT INTO shop_prod.products`, `ON shop_prod`), resolved within the dump's `USE DATABASE`; a standalone `dumpGroup` renders `ON #groupId` / `BUNDLE ON #groupId`.
+- `schema` **(bootstrap):** omits `SEED`/`uuid` and uses names for catalogs, schemas and bindings; no row or ref ops, and the deploys are the `UPDATE CATALOG` statements themselves. Schema migrations keep their causal `AT`.
 
-`aliasMode` **(opt-in via** `RenderOptions`**, enabled by** `rdb_tools` ****`\\dump`**):** emits `\alias` preamble lines (always with the full hash as target) immediately before the first statement that needs each alias, then renders readable names instead of raw hashes in `BY` (`BY $name`), `CREATORS ($name, ...)`, `AT`/`TO` version sets (`AT {schema_ver1}`), and object refs in full profile (`ADD SCHEMA shop`, `ON shop_prod`, etc.). `WITH ROWS` genesis values for registered key aliases render as `$name` / `publicKey($name)` instead of repeated literals. Version aliases are allocated lazily on first reference (`{objectName}_ver{N}` per owning DAG). Keys are always aliased for portable replay even when a keystore label exists. `BIND` RHS and `rowId` prefixes are unchanged. With `aliasMode: false` (default), output matches the legacy `#hash` form.
+`aliasMode` **(opt-in via** `RenderOptions`**, enabled by** `rdb_tools` ****`\\dump`**):** emits `\alias` preamble lines (always with the full hash as target) immediately before the first statement that needs each alias, then renders readable names instead of raw hashes in `BY` (`BY $name`), `CREATORS ($name, ...)`, `AT`/`TO` version sets (`AT {schema_ver1}`), release selections, and object refs in full profile (`USING CATALOG store`, `USE DATABASE app`, etc.). `WITH ROWS` values for registered key aliases render as `$name` / `publicKey($name)` instead of repeated literals. Version aliases are allocated lazily on first reference (`{objectName}_ver{N}` per owning DAG). Keys are always aliased for portable replay even when a keystore label exists. `rowId` prefixes are unchanged. With `aliasMode: false` (default), output uses `#hash` refs.
 
-Unknown payloads render as stable SQL comments instead of being dropped.
+Generated scripts never rely on workspace-wide name uniqueness: they select their database with `USE DATABASE` or use hashes. Unknown payloads render as stable SQL comments instead of being dropped.
 
 ## Diagnostics
 

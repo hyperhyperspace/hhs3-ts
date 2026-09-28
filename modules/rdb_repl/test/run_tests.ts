@@ -133,9 +133,8 @@ async function runProjectionNoticeTests(): Promise<void> {
         // --- Scenario A: a reactive sync throw reaches onProjectionError ---
         const setupA = await runCommand(session, `
 CREATE SCHEMA flaky_a CREATORS ($me) AS ( TABLE items (label string) ALLOW all IF true );
-CREATE TABLEGROUP flaky_a_g USING SCHEMA flaky_a;
-CREATE DATABASE flaky_a_db;
-ADD TABLEGROUP flaky_a_g TO flaky_a_db;
+CREATE CATALOG flaky_a_catalog VERSION '1.0.0' AS ( TABLEGROUP flaky_a_g USING SCHEMA flaky_a );
+CREATE DATABASE flaky_a_db USING CATALOG flaky_a_catalog;
 `);
         assertEqual(setupA.exitCode, 0, 'scenario A setup');
 
@@ -158,9 +157,8 @@ ADD TABLEGROUP flaky_a_g TO flaky_a_db;
         // --- Scenario B: a throw during the initial materialization fails start ---
         const setupB = await runCommand(session, `
 CREATE SCHEMA flaky_b CREATORS ($me) AS ( TABLE items (label string) ALLOW all IF true );
-CREATE TABLEGROUP flaky_b_g USING SCHEMA flaky_b;
-CREATE DATABASE flaky_b_db;
-ADD TABLEGROUP flaky_b_g TO flaky_b_db;
+CREATE CATALOG flaky_b_catalog VERSION '1.0.0' AS ( TABLEGROUP flaky_b_g USING SCHEMA flaky_b );
+CREATE DATABASE flaky_b_db USING CATALOG flaky_b_catalog;
 `);
         assertEqual(setupB.exitCode, 0, 'scenario B setup');
 
@@ -178,9 +176,8 @@ CREATE SCHEMA blog CREATORS ($me) AS (
   TABLE posts (title string) ALLOW all IF true,
   TABLE comments (body string, post string REFERENCES posts) ALLOW all IF true
 );
-CREATE TABLEGROUP blog_g USING SCHEMA blog;
-CREATE DATABASE blog_db;
-ADD TABLEGROUP blog_g TO blog_db;
+CREATE CATALOG blog_catalog VERSION '1.0.0' AS ( TABLEGROUP blog_g USING SCHEMA blog );
+CREATE DATABASE blog_db USING CATALOG blog_catalog;
 `);
         assertEqual(setupC.exitCode, 0, 'scenario C setup');
 
@@ -261,12 +258,16 @@ CREATE SCHEMA shop CREATORS ($me) AS (
     name string
   )
 );
-CREATE TABLEGROUP shop_prod USING SCHEMA shop;
+CREATE CATALOG shop_catalog VERSION '1.0.0' AS ( TABLEGROUP shop_prod USING SCHEMA shop );
+CREATE DATABASE shopdb USING CATALOG shop_catalog;
 INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');
 SELECT sku, name FROM shop_prod.products;
 `);
         assert(setup.exitCode === 0 && setup.output.includes('Widget'), 'portable table rendering');
-        assertEqual(promptForSession(session), 'rdb:shop_prod:alice> ', 'canonical prompt labels');
+        assert(setup.output.includes('created groups shop_prod'), 'CREATE DATABASE reports its groups');
+        assertEqual(promptForSession(session), 'rdb:shopdb:alice> ', 'canonical prompt labels');
+        await runCommand(session, '\\use group shop_prod');
+        assertEqual(promptForSession(session), 'rdb:shopdb.shop_prod:alice> ', 'prompt shows db.group');
 
         const progress: string[] = [];
         const streamed = await runCommand(session, 'SELECT sku, name FROM shop_prod.products;', undefined, {
@@ -290,14 +291,17 @@ SELECT sku, name FROM shop_prod.products;
 CREATE SCHEMA users_schema CREATORS ($me) AS (
   TABLE identities (name string) ALLOW all IF true
 );
-CREATE TABLEGROUP users USING SCHEMA users_schema;
 CREATE SCHEMA observer_schema CREATORS ($me) AS (
   TABLE orders (
     customer string REFERENCES users.identities,
     label string
   ) ALLOW all IF true
 );
-CREATE TABLEGROUP observer USING SCHEMA observer_schema BIND users => users;
+CREATE CATALOG observer_catalog VERSION '1.0.0' AS (
+  TABLEGROUP users USING SCHEMA users_schema,
+  TABLEGROUP observer USING SCHEMA observer_schema BIND users => users
+);
+CREATE DATABASE observerdb USING CATALOG observer_catalog;
 `);
         assertEqual(observerSetup.exitCode, 0, 'observer setup');
         session.setRefAutoUpdate('auto');
@@ -315,7 +319,7 @@ CREATE TABLEGROUP observer USING SCHEMA observer_schema BIND users => users;
         assert(refIndex > insertIndex, 'ref update was streamed after its triggering insert');
 
         await runCommand(session, '\\output json');
-        const selected = await runCommand(session, 'SELECT sku, name FROM shop_prod.products;');
+        const selected = await runCommand(session, 'SELECT sku, name FROM shopdb.shop_prod.products;');
         assert(selected.exitCode === 0 && selected.output.includes('"Widget"'), 'portable JSON rendering');
 
         await runCommand(session, '\\hash-width 12');
@@ -329,11 +333,13 @@ CREATE TABLEGROUP observer USING SCHEMA observer_schema BIND users => users;
         const noProj = await runCommand(session, '\\project status');
         assertEqual(noProj.output, '(no active projections)', 'projection status with none active');
 
-        const dbSetup = await runCommand(session, `
-CREATE DATABASE shopdb;
-ADD TABLEGROUP shop_prod TO shopdb;
-`);
-        assertEqual(dbSetup.exitCode, 0, 'database + membership setup');
+        const catalog = await runCommand(session, '\\catalog shopdb');
+        assert(catalog.exitCode === 0 && catalog.output.includes('deployed 1.0.0'), `\\catalog shows the deployed release (${catalog.output})`);
+        assert(catalog.output.includes('shop_prod') && catalog.output.includes('ok'), 'the member is up to date');
+        const adopt = await runCommand(session, '\\adopt ^2 shopdb');
+        assert(adopt.exitCode === 0 && adopt.output.includes('adoption range ^2'), `\\adopt sets the range (${adopt.output})`);
+        const groups = await runCommand(session, '\\groups');
+        assert(groups.output.includes('observerdb') && groups.output.includes('shopdb'), 'groups are listed by database');
 
         const missingTo = await runCommand(session, '\\project start shopdb as alice');
         assert(missingTo.exitCode === 1 && missingTo.output.includes("Expected 'to'"), 'start without to is refused');
@@ -603,9 +609,8 @@ async function runSyncFetchNonDefaultBackendTest(): Promise<void> {
 CREATE SCHEMA shop CREATORS ($me) AS (
   TABLE products (sku string PUB READONLY, name string)
 );
-CREATE TABLEGROUP shop_prod USING SCHEMA shop;
-CREATE DATABASE shopdb;
-ADD TABLEGROUP shop_prod TO shopdb;
+CREATE CATALOG shop_catalog VERSION '1.0.0' AS ( TABLEGROUP shop_prod USING SCHEMA shop );
+CREATE DATABASE shopdb USING CATALOG shop_catalog;
 `);
         assertEqual(setup.exitCode, 0, `alice shopdb (${setup.output})`);
 
