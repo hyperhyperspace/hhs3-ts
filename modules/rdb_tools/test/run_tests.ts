@@ -163,6 +163,7 @@ const tests = [
 
                 const meta = await runMetaCommand(session, '\\help');
                 assertTrue(meta.output?.includes('\\quit') === true, 'meta help includes quit');
+                assertTrue(meta.output?.includes('\\project files <id> <name> to <path>') === true, 'meta help includes project files');
                 assertTrue(meta.output?.includes('\\help commands [filter]') === true, 'meta help includes C-SQL commands hint');
             });
         },
