@@ -148,22 +148,8 @@ rpack [-C <dir>] [--keystore <path>] <command>
 
 ## Test
 
+Afte building the workspace, do
+
 ```
 npm test
 ```
-
-`[RPACK01]`–`[RPACK05]` cover the release file on the catalog in [`examples/editor.sql`](../rdb/examples/editor.sql). The producer:
-
-- `[RPACK06]` the schema diff: every rule kind, the phase order, reference cycles among new and dropped tables, effective equality, refusals, and forward and backward edits of the editor schemas, each applied with rdb's `applyMigrationRules`;
-- `[RPACK07]` the catalog diff over real releases: new groups after the groups they bind, pins, a merge of two releases that disagree, params, and every refusal;
-- `[RPACK08]` reading the source: the model, real keys (no stand-in left), forbidden clauses with positions, and `upgrade-manual.sql`;
-- `[RPACK09]` writing source: verbatim where unchanged, each edit kind, removals with their comments, a full render;
-- `[RPACK10]` end to end on an in-memory repository: 1.0.0, 1.1.0, 2.0.0 with a reset, 1.1.1 on 1.1.0, and 2.0.1 merging them; `version.json` as written, its note in the release, kept by `set base`, and an unknown field refused; `log`; the refusals of `new`, `set base` and `release`; `status` and `build` in a released folder; the same bytes on a rerun;
-- `[RPACK12]` `new` removing a catalog `VERSION` that names a parent, and keeping schema `VERSION`s;
-- `[RPACK13]` the release question: no writes nothing, and the warnings follow the count;
-- `[RPACK14]` FILES: shipped with the first release, `ADD FILES` for a new one, and the refusals for a changed, rebound or removed FILES;
-- `[RPACK15]` writing source with FILES items: kept verbatim, added, replaced, removed, and next to new groups;
-- `[RPACK16]` a read-only FILES: left out once its table is dropped, with one warning; refused while it still fits; its name kept; writable again when listed with its table back;
-- `[RPACK17]` a read-only FILES through the commands: the hint when the source still lists it, and `new` writing sources with and without it;
-- `[RPACK18]` re-releasing without dependents: the refusal without `--force`, nothing to re-release, a new note alone as a change, the file and `.released/` replaced, unreleased folders repointed, each release with its folder's note, and a re-released first release starting a new catalog;
-- `[RPACK19]` re-releasing with dependents: one that doesn't build fails it with nothing written, `--yes` is needed without a question, no writes nothing, the preview's warnings and changed folders, and yes leaving one release per version, all verified.
