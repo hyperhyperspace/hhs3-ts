@@ -1,7 +1,8 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { stdin as input } from "node:process";
 import type { Interface } from "node:readline/promises";
+import { PassThrough, Writable } from "node:stream";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -14,17 +15,19 @@ import type { ResolvedTableRef } from "@hyper-hyper-space/hhs3_rdb_lang";
 import { testing } from "@hyper-hyper-space/hhs3_util";
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 
-import { KeyStore } from "../src/keys/keystore.js";
+import { createNodeSyncMeshFactory, KeyStore } from "@hyper-hyper-space/hhs3_rhost_node";
+import { nodeFilesDirectories } from "../src/files/folders.js";
+import { nodeLocalFiles } from "../src/files/local_files.js";
 import { runMetaCommand } from "../src/repl/meta.js";
 import { promptForSession } from "../src/repl/prompt.js";
 import { runCommand } from "../src/script/run_command.js";
-import { runScript } from "../src/script/run_script.js";
-import { canPromptForKeys } from "../src/repl/prompt_tty.js";
+import { runScript, runScriptFile } from "../src/script/run_script.js";
+import { requestPassphrase } from "../src/repl/passphrase.js";
+import { canPromptForKeys, setPromptStreamsForTests } from "../src/repl/prompt_tty.js";
 import { evaluateObserveGateKey, scanKeystore } from "../src/session/authz_suggest.js";
 import { resolveRowIdPrefix } from "../src/session/adapter.js";
 import { WorkspaceSession } from "../src/session/session.js";
 import { Workspace } from "../src/workspace/workspace.js";
-import { createNodeSyncMeshFactory } from "../src/sync/node_mesh.js";
 import { RTableGroupImpl } from "@hyper-hyper-space/hhs3_rdb";
 import { formatRows, formatRowsVertical } from "../src/format/rows.js";
 import {
@@ -32,6 +35,10 @@ import {
     looksLikeSpeculativeHash,
     uniquePrefixes,
 } from "../src/format/display.js";
+import { hostTests } from "./host_tests.js";
+import { rkeysTests } from "./rkeys_tests.js";
+import { rpackTests } from "./rpack_tests.js";
+import { stageTests } from "./stage_tests.js";
 
 const tests = [
     {
@@ -350,7 +357,7 @@ const tests = [
         name: '[RDB_TOOLS07] rejected writes surface validation diagnostics',
         invoke: async () => {
             await withSession(async (session) => {
-                const result = await runScript(session, setupScript());
+                const result = await runScript(session, setupScript('ALLOW delete IF false'));
                 assertEquals(result.exitCode, 0, result.output);
 
                 const group = session.workspace.roots.list('group')[0];
@@ -363,7 +370,7 @@ const tests = [
                 const del = await runCommand(anonymousSession, `DELETE FROM shop_prod.products WHERE rowId = '${rowId}';`);
                 assertEquals(del.exitCode, 2, 'invalid delete should be a language validation error');
                 assertTrue(del.output.includes('VALIDATION_REJECTED'), 'validation diagnostic code');
-                assertTrue(del.output.includes('does not satisfy ALLOW delete IF products.rowAuthor = $author'), 'validation reason');
+                assertTrue(del.output.includes('does not satisfy ALLOW delete IF false'), `validation reason (${del.output})`);
 
                 const selected = await runCommand(session, "SELECT sku, name FROM shop_prod.products;");
                 assertTrue(selected.output.includes('Widget'), 'rejected delete should not remove the row');
@@ -601,9 +608,10 @@ const tests = [
                 const reopened = new WorkspaceSession({ workspace: session.workspace, keystore });
                 assertTrue(!reopened.isUnlocked(alice.keyId), 'alice is locked in fresh session');
 
+                // shop_prod writes are anonymous; schema changes are always signed.
                 const missing = await runCommandNonInteractive(
                     reopened,
-                    "INSERT INTO shop_prod.products (sku, name) VALUES ('B', 'Gadget') BY $alice;",
+                    'ALTER SCHEMA shop AS (ADD COLUMN products.note string NULL) BY $alice;',
                 );
                 assertEquals(missing.exitCode, 1, 'locked BY author fails non-interactively');
                 assertTrue(missing.output.includes('passphrase required'), 'non-interactive signed insert requests passphrase');
@@ -1232,7 +1240,7 @@ const tests = [
         name: '[RDB_TOOLS37] validation failure suggests keystore author',
         invoke: async () => {
             await withSession(async (session) => {
-                const setup = await runScript(session, setupScript());
+                const setup = await runScript(session, signedShopSetupScript());
                 assertEquals(setup.exitCode, 0, setup.output);
 
                 const group = session.workspace.roots.list('group')[0];
@@ -1496,6 +1504,39 @@ const tests = [
         },
     },
     {
+        name: '[RDB_TOOLS50b] a passphrase prompt that opens its own terminal keeps it raw until the passphrase is read',
+        invoke: async () => {
+            await withSession(async (session) => {
+                const terminal = fakeTerminal();
+                setPromptStreamsForTests(terminal);
+                session.setPromptForKeys(true);
+                try {
+                    for (const chunks of [['p', 'w', '\r'], ['pw\r']]) {
+                        const pending = withTimeout(
+                            requestPassphrase(session, { kind: 'statement-unlock', label: 'alice' }),
+                            2000,
+                            `passphrase read from ${JSON.stringify(chunks)}`,
+                        );
+                        await nextImmediate();
+                        terminal.input.write('\r');
+                        for (const [i, chunk] of chunks.entries()) {
+                            await nextImmediate();
+                            if (i === chunks.length - 1) {
+                                assertTrue(terminal.input.isRaw, `raw mode is on before Enter (${JSON.stringify(chunks)})`);
+                            }
+                            terminal.input.write(chunk);
+                        }
+                        assertEquals(await pending, 'pw', `passphrase from ${JSON.stringify(chunks)}`);
+                        assertTrue(!terminal.input.isRaw, 'closing the prompt restores cooked mode');
+                    }
+                    assertTrue(!terminal.written().includes('pw'), `the passphrase is not echoed (${JSON.stringify(terminal.written())})`);
+                } finally {
+                    setPromptStreamsForTests(undefined);
+                }
+            });
+        },
+    },
+    {
         name: '[RDB_TOOLS51] sync mesh factory falls back to folder discovery when the tracker is down',
         invoke: async () => {
             const dir = await mkdtemp(join(tmpdir(), 'rdb-sync-mesh-'));
@@ -1633,6 +1674,138 @@ const tests = [
             });
         },
     },
+    {
+        name: '[RDB_TOOLS53] a script file reports diagnostics at file lines; a typed command at lines of its input',
+        invoke: async () => {
+            await withSession(async (session, dbPath) => {
+                const catalog = [
+                    "CREATE CATALOG shop_catalog VERSION '1.0.0' AS (",
+                    '  TABLEGROUP shop_prod USING SCHEMA shop',
+                    "    WITH ROWS (products (sku = 'A'))",
+                    ');',
+                ];
+                const scriptPath = join(dbPath, '..', 'setup.sql');
+                await writeFile(scriptPath, [
+                    '\\key create alice correct',
+                    '\\author alice',
+                    'CREATE SCHEMA shop CREATORS ($me) AS (',
+                    '  TABLE products (sku string, name string)',
+                    ');',
+                    '',
+                    '-- the catalog',
+                    ...catalog,
+                ].join('\n'));
+                const reason = "TABLEGROUP shop_prod: products row 1 in WITH ROWS doesn't set name, which is NOT NULL with no DEFAULT: "
+                    + 'set it in the row, make name NULL, or give it a DEFAULT';
+
+                const script = await runScriptFile(session, scriptPath);
+                assertEquals(script.exitCode, 2, script.output);
+                assertTrue(script.output.split('\n').includes(`${scriptPath}:10:16: error VALIDATION_REJECTED: ${reason}`), script.output);
+
+                const typed = await runCommand(session, catalog.join('\n'));
+                assertEquals(typed.exitCode, 2, typed.output);
+                assertEquals(typed.output, `<input>:3:16: error VALIDATION_REJECTED: ${reason}`);
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS60] PUT FILE and GET ... TO round-trip a local file through a FILES member; LIST and inline GET print',
+        invoke: async () => {
+            await withSession(async (session, dbPath) => {
+                const dir = join(dbPath, '..');
+                session.localFiles = nodeLocalFiles(dir);
+                const setup = await runScript(session, `
+\\key create alice correct
+\\author alice
+CREATE SCHEMA users_schema CREATORS ($me) AS (
+  TABLE identities (keyId string PUB READONLY, publicKey string PUB READONLY) IDENTITY PROVIDER ALLOW insert IF true
+);
+CREATE CATALOG app VERSION '1.0.0' PARAMS (:admin identity) AS (
+  TABLEGROUP users USING SCHEMA users_schema USING IDENTITIES identities
+    WITH ROWS (identities (keyId = :admin, publicKey = publicKey(:admin))),
+  FILES media USING IDENTITIES users.identities ALLOW WRITE IF true
+);
+CREATE DATABASE app_db USING CATALOG app WITH PARAMS (:admin = $me);
+`);
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                const bytes = new Uint8Array(200_000).map((_, i) => (i * 31) % 251);
+                await mkdir(join(dir, 'in'), { recursive: true });
+                await writeFile(join(dir, 'in', 'photo.bin'), bytes);
+                const put = await runCommand(session, "PUT FILE 'in/photo.bin' INTO media;");
+                assertEquals(put.exitCode, 0, put.output);
+                assertTrue(put.output.includes('put media/photo.bin: uploaded 200000 bytes'), put.output);
+
+                const get = await runCommand(session, "GET 'photo.bin' FROM media TO 'out/photo.bin';");
+                assertEquals(get.exitCode, 0, get.output);
+                assertTrue(get.output.includes('wrote media/photo.bin to out/photo.bin (200000 bytes'), get.output);
+                const restored = new Uint8Array(await readFile(join(dir, 'out', 'photo.bin')));
+                assertTrue(restored.length === bytes.length && restored.every((b, i) => b === bytes[i]), 'the file round-trips byte for byte');
+
+                await runCommand(session, "PUT STRING 'hello' INTO media AT 'notes/hi.txt';");
+                const text = await runCommand(session, "GET 'notes/hi.txt' FROM media;");
+                assertEquals(text.output, 'hello', 'an inline GET prints the text');
+                const list = await runCommand(session, 'LIST FROM media;');
+                assertTrue(list.output.includes('photo.bin') && list.output.includes('notes/hi.txt') && list.output.includes('fileHash'), list.output);
+                const missing = await runCommand(session, "PUT FILE 'in/nope.bin' INTO media;");
+                assertTrue(missing.exitCode !== 0 && missing.output.includes("'in/nope.bin' is not a file"), missing.output);
+            });
+        },
+    },
+    {
+        name: '[RDB_TOOLS61] \\project files mounts a FILES member as a folder on disk; the folder stays after \\project stop',
+        invoke: async () => {
+            await withSession(async (session, dbPath) => {
+                const dir = join(dbPath, '..');
+                session.projectionTargetFactory = async ({ path }) =>
+                    new SqliteTarget(new Database(path), { captureChanges: true, dbPath: path });
+                session.filesDirectoryFactory = nodeFilesDirectories(dir);
+                try {
+                    const setup = await runScript(session, `
+\\key create alice correct
+\\author alice
+CREATE SCHEMA users_schema CREATORS ($me) AS (
+  TABLE identities (keyId string PUB READONLY, publicKey string PUB READONLY) IDENTITY PROVIDER ALLOW insert IF true
+);
+CREATE CATALOG app VERSION '1.0.0' PARAMS (:admin identity) AS (
+  TABLEGROUP users USING SCHEMA users_schema USING IDENTITIES identities
+    WITH ROWS (identities (keyId = :admin, publicKey = publicKey(:admin))),
+  FILES media USING IDENTITIES users.identities ALLOW WRITE IF true
+);
+CREATE DATABASE app_db USING CATALOG app WITH PARAMS (:admin = $me);
+`);
+                    assertEquals(setup.exitCode, 0, setup.output);
+                    const start = await runCommand(session, '\\project start app_db as alice to :memory:');
+                    assertEquals(start.exitCode, 0, start.output);
+                    const id = /started projection (\d+)/.exec(start.output)?.[1];
+                    assertTrue(id !== undefined, start.output);
+
+                    const mount = await runCommand(session, `\\project files ${id} media to media`);
+                    assertEquals(mount.exitCode, 0, mount.output);
+                    assertEquals(mount.output, 'media at media: 0 files, writable by $alice', 'the mount line');
+
+                    const put = await runCommand(session, "PUT STRING 'hello' INTO media AT 'notes/hi.txt';");
+                    assertEquals(put.exitCode, 0, put.output);
+                    const onDisk = join(dir, 'media', 'common', 'notes', 'hi.txt');
+                    for (let i = 0; i < 100 && !existsSync(onDisk); i++) {
+                        await new Promise((resolve) => setTimeout(resolve, 50));
+                    }
+                    assertTrue(existsSync(onDisk), 'the put file lands under media/common/');
+                    assertEquals(await readFile(onDisk, 'utf8'), 'hello', 'with its bytes');
+
+                    const stop = await runCommand(session, `\\project stop ${id}`);
+                    assertEquals(stop.output, `stopped projection ${id}; its folders (media) stay as they are`, 'stop names the folder');
+                    assertTrue(existsSync(onDisk), 'the folder keeps its files');
+                } finally {
+                    await stopAllProjections(session);
+                }
+            });
+        },
+    },
+    ...hostTests,
+    ...rpackTests,
+    ...rkeysTests,
+    ...stageTests,
 ];
 
 async function runCommandNonInteractive(session: WorkspaceSession, command: string) {
@@ -1688,6 +1861,48 @@ async function runCommandInteractive(
     }
 }
 
+// A terminal for the key prompts: raw mode is recorded, and the output is a TTY
+// so readline runs in terminal mode, as it does for a real user.
+function fakeTerminal() {
+    const ttyIn = new PassThrough() as PassThrough & { isTTY: boolean; isRaw: boolean; setRawMode(mode: boolean): unknown };
+    ttyIn.isTTY = true;
+    ttyIn.isRaw = false;
+    ttyIn.setRawMode = (mode: boolean) => {
+        ttyIn.isRaw = mode;
+        return ttyIn;
+    };
+    let text = '';
+    const ttyOut = new Writable({
+        write(chunk, _encoding, done) {
+            text += chunk.toString();
+            done();
+        },
+    }) as Writable & { isTTY: boolean; columns: number };
+    ttyOut.isTTY = true;
+    ttyOut.columns = 80;
+    return {
+        input: ttyIn as unknown as NodeJS.ReadStream & PassThrough,
+        output: ttyOut as unknown as NodeJS.WriteStream,
+        written: () => text,
+    };
+}
+
+function nextImmediate(): Promise<void> {
+    return new Promise((resolve) => setImmediate(resolve));
+}
+
+async function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out waiting for ${what}`)), ms);
+    });
+    try {
+        return await Promise.race([promise, timeout]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 async function withSession(fn: (session: WorkspaceSession, dbPath: string) => Promise<void>): Promise<void> {
     const dir = await mkdtemp(join(tmpdir(), 'rdb-tools-'));
     const dbPath = join(dir, 'dev.db');
@@ -1721,7 +1936,8 @@ INSERT INTO void_g.caps (uuid, label) VALUES ('c-1', 'grant');
 `;
 }
 
-function setupScript(): string {
+// shop_prod has no identity provider, so its writes are anonymous.
+function setupScript(productRules?: string): string {
     return `
 \\key create alice correct
 \\author alice
@@ -1729,13 +1945,41 @@ CREATE SCHEMA shop CREATORS ($me) AS (
   TABLE products (
     sku string PUB READONLY,
     name string
-  )
+  )${productRules === undefined ? '' : ' ' + productRules}
 );
 CREATE CATALOG shop_catalog VERSION '1.0.0' AS ( TABLEGROUP shop_prod USING SCHEMA shop );
 CREATE DATABASE shop_db USING CATALOG shop_catalog;
 INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');
 SELECT sku, name FROM shop_prod.products;
 LOG shop_prod LIMIT 5;
+`;
+}
+
+// As setupScript, but shop_prod registers alice, so her insert is signed and
+// the default delete rule is the owner's.
+function signedShopSetupScript(): string {
+    return `
+\\key create alice correct
+\\author alice
+CREATE SCHEMA shop CREATORS ($me) AS (
+  TABLE identities (
+    keyId string PUB READONLY,
+    publicKey string PUB READONLY
+  ) IDENTITY PROVIDER ALLOW insert IF true,
+  TABLE products (
+    sku string PUB READONLY,
+    name string
+  )
+);
+CREATE CATALOG shop_catalog VERSION '1.0.0' AS (
+  TABLEGROUP shop_prod USING SCHEMA shop
+    USING IDENTITIES identities
+    WITH ROWS (
+      identities (keyId = $alice, publicKey = publicKey($alice))
+    )
+);
+CREATE DATABASE shop_db USING CATALOG shop_catalog;
+INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');
 `;
 }
 
@@ -1760,12 +2004,17 @@ CREATE DATABASE shop_db USING CATALOG shop_catalog;
 `;
 }
 
+// admin and bob are both registered identities; only admin is a manager.
 function gatedCapsSetupScript(): string {
     return `
 \\key create admin correct
+\\key create bob correct
 \\author admin
 CREATE SCHEMA users_schema CREATORS ($me) AS (
-  TABLE identities (name string) ALLOW all IF true,
+  TABLE identities (
+    keyId string PUB READONLY,
+    publicKey string PUB READONLY
+  ) IDENTITY PROVIDER ALLOW insert IF true,
   TABLE caps (
     label string PUB,
     grantee string PUB
@@ -1773,15 +2022,20 @@ CREATE SCHEMA users_schema CREATORS ($me) AS (
 );
 CREATE CATALOG user_catalog VERSION '1.0.0' AS (
   TABLEGROUP user USING SCHEMA users_schema
+    USING IDENTITIES identities
     WITH ROWS (
+      identities (keyId = $admin, publicKey = publicKey($admin)),
+      identities (keyId = $bob, publicKey = publicKey($bob)),
       caps (label='manager', grantee=$me)
     )
 );
 CREATE DATABASE user_db USING CATALOG user_catalog;
-\\key create bob correct
 `;
 }
 
+// users is anonymous: its identities table is a plain one the tests write to
+// advance users. doc's UPDATE REF gate reads $author, so doc registers its
+// observers in a local provider.
 function gatedCrossGroupSetupScript(): string {
     return `
 \\key create alice correct
@@ -1791,6 +2045,10 @@ CREATE SCHEMA users_schema CREATORS ($me) AS (
   TABLE caps (label string PUB, grantee string PUB) ALLOW all IF true
 );
 CREATE SCHEMA doc_schema CREATORS ($me) AS (
+  TABLE members (
+    keyId string PUB READONLY,
+    publicKey string PUB READONLY
+  ) IDENTITY PROVIDER ALLOW insert IF true,
   TABLE notes (
     body string NULL REFERENCES users.identities,
     label string
@@ -1800,22 +2058,32 @@ CREATE CATALOG doc_catalog VERSION '1.0.0' AS (
   TABLEGROUP users USING SCHEMA users_schema,
   TABLEGROUP doc USING SCHEMA doc_schema
     BIND users => users
+    USING IDENTITIES members
     ALLOW UPDATE REF users IF EXISTS caps WHERE label = 'manager' AND grantee = $author
+    WITH ROWS (
+      members (keyId = $alice, publicKey = publicKey($alice))
+    )
 );
 CREATE DATABASE doc_db USING CATALOG doc_catalog;
 INSERT INTO users.caps (label, grantee) VALUES ('manager', $me);
 `;
 }
 
+// As gatedCrossGroupSetupScript, but bob is the manager.
 function gatedBobManagerSetupScript(): string {
     return `
 \\key create alice correct
+\\key create bob correct
 \\author alice
 CREATE SCHEMA users_schema CREATORS ($me) AS (
   TABLE identities (name string) ALLOW all IF true,
   TABLE caps (label string PUB, grantee string PUB) ALLOW all IF true
 );
 CREATE SCHEMA doc_schema CREATORS ($me) AS (
+  TABLE members (
+    keyId string PUB READONLY,
+    publicKey string PUB READONLY
+  ) IDENTITY PROVIDER ALLOW insert IF true,
   TABLE notes (
     body string NULL REFERENCES users.identities,
     label string
@@ -1825,10 +2093,14 @@ CREATE CATALOG doc_catalog VERSION '1.0.0' AS (
   TABLEGROUP users USING SCHEMA users_schema,
   TABLEGROUP doc USING SCHEMA doc_schema
     BIND users => users
+    USING IDENTITIES members
     ALLOW UPDATE REF users IF EXISTS caps WHERE label = 'manager' AND grantee = $author
+    WITH ROWS (
+      members (keyId = $alice, publicKey = publicKey($alice)),
+      members (keyId = $bob, publicKey = publicKey($bob))
+    )
 );
 CREATE DATABASE doc_db USING CATALOG doc_catalog;
-\\key create bob correct
 INSERT INTO users.caps (label, grantee) VALUES ('manager', $bob);
 `;
 }
@@ -1871,6 +2143,10 @@ function editorProjectionSetupScript(): string {
 \\key create alice correct
 \\author alice
 CREATE SCHEMA users_schema CREATORS ($me) AS (
+  TABLE identities (
+    keyId string PUB READONLY,
+    publicKey string PUB READONLY
+  ) IDENTITY PROVIDER ALLOW insert IF true,
   TABLE caps (
     label string PUB,
     grantee string PUB
@@ -1883,10 +2159,12 @@ CREATE SCHEMA doc_schema CREATORS ($me) AS (
 );
 CREATE CATALOG editor VERSION '1.0.0' PARAMS (:manager identity) AS (
   TABLEGROUP user USING SCHEMA users_schema
+    USING IDENTITIES identities
     WITH ROWS (
+      identities (keyId = :manager, publicKey = publicKey(:manager)),
       caps (label='manager', grantee=:manager)
     ),
-  TABLEGROUP doc USING SCHEMA doc_schema BIND user => user
+  TABLEGROUP doc USING SCHEMA doc_schema BIND user => user USING IDENTITIES user.identities
 );
 CREATE DATABASE app USING CATALOG editor CREATORS ($me) WITH PARAMS (:manager = $me) BY $alice;
 `;
@@ -1909,9 +2187,15 @@ INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');
 }
 
 async function main() {
-    console.log('Running tests for Hyper Hyper Space v3 rdb_tools module\n');
+    const filters = process.argv.slice(2);
+    console.log('Running tests for Hyper Hyper Space v3 rdb_tools module'
+        + (filters.length > 0 ? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');
     for (const test of tests) {
-        testing.exitIfFailed(await testing.run(test.name, test.invoke));
+        if (filters.every((filter) => test.name.includes(filter))) {
+            testing.exitIfFailed(await testing.run(test.name, test.invoke));
+        } else {
+            await testing.skip(test.name);
+        }
     }
 }
 

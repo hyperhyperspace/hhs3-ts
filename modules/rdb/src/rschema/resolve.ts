@@ -3,8 +3,12 @@
 // The RSchema DAG has no barriers, so the effective schema is a pure function
 // of the position `at`: collect the create + schema-update entries at or
 // below `at`, decompose them into slot writes, and resolve each slot by LWW
-// (the causally-maximal write wins; concurrent maxima tiebreak by entry hash;
+// (the causally-maximal write wins; among concurrent maxima the write from
+// the entry with the higher schema version wins, then the larger entry hash;
 // within one entry, the later migration rule wins; drops are tombstones).
+// Versions increase along every causal path (validated), so the version only
+// ever decides between concurrent lines of the schema: the author's numbering
+// says which line wins a slot both lines wrote.
 //
 // Slots:
 //   - (table) existence          written by add-table / drop-table (tombstone)
@@ -39,6 +43,7 @@ import {
 } from "./payload.js";
 import { CreateRSchemaPayload, SchemaUpdatePayload, SchemaCreator } from "./payload.js";
 import { IncarnationId, tableIncarnationId, columnIncarnationId } from "./incarnation.js";
+import { SemVer, compareParsedSemver, formatSemver, parseSemver } from "../semver.js";
 
 // The resolved, effective schema at a position.
 
@@ -46,6 +51,9 @@ export type SchemaState = {
     name: string;
     creators: SchemaCreator[];
     hashAlgorithm?: string;
+    // The schema versions of the entries at `at` (the position's maxima),
+    // highest first. A single-headed position has one.
+    versions: string[];
     tables: Map<string, TableDef>;
     // The live table incarnation id per existing table (see incarnation.ts).
     tableIncarnations: Map<string, IncarnationId>;
@@ -66,8 +74,11 @@ type SlotWrite = {
     entryHash: B64Hash;
     entryIdx: number;      // topological index of the entry
     ruleIndex: number;     // position within the entry's migration rules
+    version: SemVer;       // the entry's schema version
     value: SlotValue;
 };
+
+type WriteOrigin = { entryHash: B64Hash; entryIdx: number; ruleIndex: number; version: SemVer };
 
 // Slot keys. Table and column names cannot contain '/' or ':' (isValidName),
 // so these are collision-free.
@@ -118,7 +129,7 @@ function pushWrite(writes: WritesBySlot, slot: string, write: SlotWrite): void {
 
 // add-table writes the existence slot plus base writes for every subordinate
 // slot of the table (the reset). The base writes share the rule's position.
-function pushTableWrites(writes: WritesBySlot, def: TableDef, origin: { entryHash: B64Hash; entryIdx: number; ruleIndex: number }): void {
+function pushTableWrites(writes: WritesBySlot, def: TableDef, origin: WriteOrigin): void {
     pushWrite(writes, existenceSlot(def.name), { ...origin, value: { kind: 'table', def } });
     pushWrite(writes, modeSlot(def.name), { ...origin, value: { kind: 'concurrent-deletes', value: def.concurrentDeletes } });
     pushWrite(writes, fksSlot(def.name), { ...origin, value: { kind: 'fks', fks: def.fks } });
@@ -128,7 +139,7 @@ function pushTableWrites(writes: WritesBySlot, def: TableDef, origin: { entryHas
     }
 }
 
-function pushRuleWrites(writes: WritesBySlot, rule: MigrationRule, origin: { entryHash: B64Hash; entryIdx: number; ruleIndex: number }): void {
+function pushRuleWrites(writes: WritesBySlot, rule: MigrationRule, origin: WriteOrigin): void {
     switch (rule.rule) {
         case 'add-table':
             pushTableWrites(writes, rule.def, origin);
@@ -166,8 +177,8 @@ function before(c: Causality, a: SlotWrite, b: SlotWrite): boolean {
     return a.entryHash !== b.entryHash && c.ancestors[b.entryIdx].has(a.entryIdx);
 }
 
-// LWW: causal maxima first; among concurrent maxima the larger entry hash
-// wins; within one entry the later rule wins.
+// LWW: causal maxima first; among concurrent maxima the higher schema version
+// wins, then the larger entry hash; within one entry the later rule wins.
 function resolveSlot(c: Causality, writes: SlotWrite[]): SlotWrite | undefined {
     if (writes.length === 0) return undefined;
 
@@ -185,9 +196,23 @@ function resolveSlot(c: Causality, writes: SlotWrite[]): SlotWrite | undefined {
 
     let winner = maxima[0];
     for (const w of maxima) {
-        if (w.entryHash > winner.entryHash) winner = w;
+        if (outranks(w, winner)) winner = w;
     }
     return winner;
+}
+
+// Between two concurrent writes: the higher schema version, then the larger
+// entry hash.
+function outranks(a: SlotWrite, b: SlotWrite): boolean {
+    const byVersion = compareParsedSemver(a.version, b.version);
+    if (byVersion !== 0) return byVersion > 0;
+    return a.entryHash > b.entryHash;
+}
+
+function entryVersion(entry: Entry, raw: string): SemVer {
+    const parsed = parseSemver(raw);
+    if (parsed === undefined) throw new Error(`resolveSchemaState: entry '${entry.hash}' has an invalid version '${raw}'`);
+    return parsed;
 }
 
 // Collect the entries at or below `at` (by hash ancestry) from the full,
@@ -240,6 +265,7 @@ export function resolveSchemaState(entries: Entry[], at: Position): SchemaState 
 
     let create: CreateRSchemaPayload | undefined;
     const writes: WritesBySlot = new Map();
+    const headVersions: SemVer[] = [];
 
     for (const entry of included) {
         const payload = entry.payload as json.LiteralMap;
@@ -248,13 +274,17 @@ export function resolveSchemaState(entries: Entry[], at: Position): SchemaState 
         if (payload['action'] === 'create') {
             if (create !== undefined) throw new Error("resolveSchemaState: multiple create entries");
             create = payload as CreateRSchemaPayload;
+            const version = entryVersion(entry, create.version);
+            if (at.has(entry.hash)) headVersions.push(version);
             create.tables.forEach((def, i) => {
-                pushTableWrites(writes, def, { entryHash: entry.hash, entryIdx, ruleIndex: i });
+                pushTableWrites(writes, def, { entryHash: entry.hash, entryIdx, ruleIndex: i, version });
             });
         } else if (payload['action'] === 'schema-update') {
             const update = payload as SchemaUpdatePayload;
+            const version = entryVersion(entry, update.version);
+            if (at.has(entry.hash)) headVersions.push(version);
             update.migration.forEach((rule, i) => {
-                pushRuleWrites(writes, rule, { entryHash: entry.hash, entryIdx, ruleIndex: i });
+                pushRuleWrites(writes, rule, { entryHash: entry.hash, entryIdx, ruleIndex: i, version });
             });
         } else {
             throw new Error(`resolveSchemaState: unknown action '${payload['action']}'`);
@@ -380,6 +410,7 @@ export function resolveSchemaState(entries: Entry[], at: Position): SchemaState 
     const state: SchemaState = {
         name: create.name,
         creators: create.creators,
+        versions: headVersions.sort((a, b) => compareParsedSemver(b, a)).map(formatSemver),
         tables,
         tableIncarnations,
         columnIncarnations,

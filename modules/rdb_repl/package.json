@@ -21,7 +21,8 @@
     "@hyper-hyper-space/hhs3_rdb_adapter": "^0.1.0",
     "@hyper-hyper-space/hhs3_rdb_lang": "^0.1.0",
     "@hyper-hyper-space/hhs3_rdb_projection": "^0.1.0",
-    "@hyper-hyper-space/hhs3_rdb_runtime": "^0.1.0"
+    "@hyper-hyper-space/hhs3_rdb_runtime": "^0.1.0",
+    "@hyper-hyper-space/hhs3_rhost": "^0.1.0"
   },
   "devDependencies": {
     "typescript": "6.0.3"

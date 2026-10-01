@@ -1,12 +1,12 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import {
-    BundlePayload, CatalogDeclarePayload, CatalogGroupDef, CatalogParamDecl, CatalogReleasePayload, CatalogRowTemplate,
+    BundlePayload, CatalogDeclarePayload, CatalogFilesDef, CatalogGroupDef, CatalogParamDecl, CatalogReleasePayload, CatalogRowTemplate,
     ColumnDef, CreateRCatalogPayload, CreateRDbPayload, CreateRSchemaPayload,
     CreateTableGroupPayload, InsertRowPayload, MigrationRule, ParamValue, Predicate,
     RowEnvelopePayload, RowOpPayload, SchemaUpdatePayload, TableDef, UpdateCatalogPayload, UpdateRowPayload,
     RCATALOG_TYPE_ID, RDB_TYPE_ID, RSCHEMA_TYPE_ID, RTABLE_GROUP_TYPE_ID,
-    catalogGroupHash, formatPredicate, versionKey,
+    catalogGroupHash, formatPredicate, renderStringLiteral, versionKey,
 } from "@hyper-hyper-space/hhs3_rdb";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 
@@ -23,7 +23,7 @@ export function renderIdent(name: string): string {
         .join('');
 }
 
-function renderPredicate(pred: Predicate, gatedTable?: string): string {
+export function renderPredicate(pred: Predicate, gatedTable?: string): string {
     return formatPredicate(pred, { gatedTable, quoteIdent: renderIdent });
 }
 
@@ -124,7 +124,7 @@ export function renderCreateDatabase(payload: CreateRDbPayload, options?: Render
     const parts = [
         `CREATE DATABASE ${name} USING CATALOG ${renderCatalogTarget(payload.catalog, catalogOptions)} AT ${renderRelease(payload.release, catalogOptions)}`,
     ];
-    if (isFullProfile(options) && payload.seed !== undefined && payload.seed.length > 0) parts.push(`SEED ${sqlString(payload.seed)}`);
+    if (isFullProfile(options) && payload.seed !== undefined && payload.seed.length > 0) parts.push(`SEED ${renderStringLiteral(payload.seed)}`);
     const creators = renderCreators(payload.creators ?? [], options).trimStart();
     if (creators.length > 0) parts.push(creators);
     const params = renderParamAssignments(payload.params, options);
@@ -159,7 +159,7 @@ function renderParamAssignments(params: { [name: string]: ParamValue } | undefin
 function renderParamValue(value: ParamValue, options?: RenderOptions): string {
     if ('identity' in value) {
         if (useAliases(options)) return `$${options!.aliases!.key(value.identity.keyId as B64Hash)}`;
-        return `publicKey(${sqlString(value.identity.publicKey)})`;
+        return `publicKey(${renderStringLiteral(value.identity.publicKey)})`;
     }
     return renderLiteral(value.value);
 }
@@ -168,10 +168,10 @@ export function renderCreateCatalog(payload: CreateRCatalogPayload, options?: Re
     const head = [`CREATE CATALOG ${renderIdent(payload.name)}`];
     const creators = renderCreators(payload.creators, options).trimStart();
     if (creators.length > 0) head.push(creators);
-    head.push(`VERSION ${sqlString(payload.version)}`);
+    head.push(`VERSION ${renderStringLiteral(payload.version)}`);
     const params = renderParamDecls(payload.params);
     if (params.length > 0) head.push(params);
-    if (payload.seed !== undefined) head.push(`SEED ${sqlString(payload.seed)}`);
+    if (payload.seed !== undefined) head.push(`SEED ${renderStringLiteral(payload.seed)}`);
     if (payload.hashAlgorithm !== undefined) head.push(renderHashAlgorithm(payload.hashAlgorithm).trimStart());
 
     const defs = new Map<B64Hash, CatalogGroupDef>();
@@ -180,7 +180,9 @@ export function renderCreateCatalog(payload: CreateRCatalogPayload, options?: Re
         defs.set(catalogGroupHash(def), def);
         return rendered;
     });
-    return `${head.join(' ')} AS (\n  ${groups.join(',\n  ')}\n)${renderNote(payload.note)}${renderBy(payload.author, options)};`;
+    const files = (payload.files ?? []).map((def) => renderCatalogFilesDef('FILES', def, defs));
+    const items = [...groups, ...files];
+    return `${head.join(' ')} AS (\n  ${items.join(',\n  ')}\n)${renderNote(payload.note)}${renderBy(payload.author, options)};`;
 }
 
 // The release payload rendered literally: its `changes` and `add` become the
@@ -189,7 +191,7 @@ export function renderCreateCatalog(payload: CreateRCatalogPayload, options?: Re
 // declare is regenerated on replay).
 export function renderAlterCatalog(payload: CatalogReleasePayload, options?: RenderOptions): string {
     const target = options?.catalogRef !== undefined ? renderCatalogTarget(options.catalogRef, options) : '<catalog>';
-    const head = [`ALTER CATALOG ${target}`, `VERSION ${sqlString(payload.version)}`];
+    const head = [`ALTER CATALOG ${target}`, `VERSION ${renderStringLiteral(payload.version)}`];
     const params = renderParamDecls(payload.params);
     if (params.length > 0) head.push(params);
 
@@ -205,6 +207,7 @@ export function renderAlterCatalog(payload: CatalogReleasePayload, options?: Ren
         body.push(renderCatalogGroupDef('ADD TABLEGROUP', def, defs, options));
         defs.set(catalogGroupHash(def), def);
     }
+    for (const def of payload.files ?? []) body.push(renderCatalogFilesDef('ADD FILES', def, defs));
     const asBody = body.length > 0 ? ` AS (\n  ${body.join(',\n  ')}\n)` : '';
     return `${head.join(' ')}${asBody}${renderNote(payload.note)}${renderBy(payload.author, options)}${renderAt({ ...options, versionScope: catalogVersionScope(options) ?? options?.versionScope })};`;
 }
@@ -255,6 +258,22 @@ function renderCatalogGroupDef(
     return parts.join('\n    ');
 }
 
+// BIND only when the alias isn't the group's name, or the name is ambiguous
+// among `defs`; otherwise the qualifier of USING IDENTITIES names the group.
+export function renderCatalogFilesDef(
+    keyword: 'FILES' | 'ADD FILES',
+    def: CatalogFilesDef,
+    defs: Map<B64Hash, CatalogGroupDef>,
+): string {
+    const [alias, hash] = Object.entries(def.bindings)[0];
+    const ref = renderDefRef(hash, defs);
+    const parts = [`${keyword} ${renderIdent(def.name)}`];
+    if (defs.get(hash)?.name !== alias || ref.startsWith('#')) parts.push(`BIND ${renderIdent(alias)} => ${ref}`);
+    parts.push(`USING IDENTITIES ${renderIdent(def.idProvider)}`);
+    parts.push(`ALLOW WRITE IF ${renderPredicate(def.canWrite)}`);
+    return parts.join('\n    ');
+}
+
 function renderRowTemplate(table: string, template: CatalogRowTemplate, options?: RenderOptions): string {
     const parts = Object.entries(template.values).map(([k, v]) => renderRowValue(k, v, options));
     for (const [column, param] of Object.entries(template.params ?? {})) {
@@ -273,7 +292,7 @@ export function renderGroupGenesis(payload: CreateTableGroupPayload, options?: R
 export function renderCreateSchema(payload: CreateRSchemaPayload, options?: RenderOptions): string {
     const creators = renderCreators(payload.creators, options);
     const tables = payload.tables.map(renderTableDef).join(',\n  ');
-    return `CREATE SCHEMA ${renderIdent(payload.name)}${creators}${renderHashAlgorithm(payload.hashAlgorithm)} AS (\n  ${tables}\n);`;
+    return `CREATE SCHEMA ${renderIdent(payload.name)}${creators} VERSION ${renderStringLiteral(payload.version)}${renderHashAlgorithm(payload.hashAlgorithm)} AS (\n  ${tables}\n);`;
 }
 
 export function renderSchemaUpdate(payload: SchemaUpdatePayload, options?: RenderOptions): string {
@@ -285,7 +304,7 @@ export function renderSchemaUpdate(payload: SchemaUpdatePayload, options?: Rende
         : (useAliases(options) && isFullProfile(options)
             ? renderObjectRef('schema', schemaRef as B64Hash, options?.schemaName, options)
             : `#${schemaRef}`);
-    return `${comment}ALTER SCHEMA ${schemaTarget} AS (\n  ${rules}\n)${renderNote(payload.note)}${renderBy(payload.author, options)}${renderAt(options)};`;
+    return `${comment}ALTER SCHEMA ${schemaTarget} VERSION ${renderStringLiteral(payload.version)} AS (\n  ${rules}\n)${renderNote(payload.note)}${renderBy(payload.author, options)}${renderAt(options)};`;
 }
 
 export function renderRowOp(payload: RowOpPayload, table?: string, options?: RenderOptions): string {
@@ -296,7 +315,7 @@ export function renderRowOp(payload: RowOpPayload, table?: string, options?: Ren
         const cols = Object.keys(insert.values).map(renderIdent);
         const vals = Object.values(insert.values).map(renderLiteral);
         if (isFullProfile(options) && insert.uuid !== undefined) {
-            return `INSERT INTO ${target} (uuid, ${cols.join(', ')}) VALUES (${sqlString(insert.uuid)}, ${vals.join(', ')})${renderBy(insert.author, options)}${renderAt(options)};`;
+            return `INSERT INTO ${target} (uuid, ${cols.join(', ')}) VALUES (${renderStringLiteral(insert.uuid)}, ${vals.join(', ')})${renderBy(insert.author, options)}${renderAt(options)};`;
         }
         return `INSERT INTO ${target} (${cols.join(', ')}) VALUES (${vals.join(', ')})${renderBy(insert.author, options)}${renderAt(options)};`;
     }
@@ -403,12 +422,20 @@ export function renderOp(payload: json.Literal, options?: RenderOptions): string
     return `-- unknown payload ${json.toStringNormalized(payload)}`;
 }
 
-function renderTableDef(table: TableDef): string {
+export function renderTableDef(table: TableDef): string {
     const colIndent = '    ';
     const colLines = Object.entries(table.columns)
         .map(([name, def]) => `${colIndent}${renderColumnDef(name, def, table.fks?.[name])}`);
     const cols = colLines.length === 0 ? '' : `\n${colLines.join(',\n')}\n  `;
 
+    return `TABLE ${renderIdent(table.name)} (${cols})${renderTableOptions(table)}`;
+}
+
+// What follows a table's column list: its concurrent-deletes and
+// identity-provider flags, then one ALLOW line per restriction. Empty when the
+// table has none; otherwise it starts with its separator (a space or a line
+// break).
+export function renderTableOptions(table: TableDef): string {
     const structural: string[] = [];
     if (table.concurrentDeletes !== undefined) {
         structural.push(table.concurrentDeletes ? 'CONCURRENT DELETES' : 'NO CONCURRENT DELETES');
@@ -431,10 +458,10 @@ function renderTableDef(table: TableDef): string {
         suffix += allows.map((allow) => `\n    ${allow}`).join('');
     }
 
-    return `TABLE ${renderIdent(table.name)} (${cols})${suffix}`;
+    return suffix;
 }
 
-function renderColumnDef(name: string, def: ColumnDef, fk?: string): string {
+export function renderColumnDef(name: string, def: ColumnDef, fk?: string): string {
     const parts = [renderIdent(name), renderColumnType(def)];
     if (def.nullable) parts.push('NULL');
     if (def.default !== undefined) parts.push(`DEFAULT ${renderLiteral(def.default)}`);
@@ -442,8 +469,8 @@ function renderColumnDef(name: string, def: ColumnDef, fk?: string): string {
     if (def.readonly) parts.push('READONLY');
     if (fk !== undefined) parts.push(`REFERENCES ${renderIdent(fk)}`);
     const c = def.constraints;
-    if (c?.min !== undefined) parts.push(`MIN ${sqlString(c.min)}`);
-    if (c?.max !== undefined) parts.push(`MAX ${sqlString(c.max)}`);
+    if (c?.min !== undefined) parts.push(`MIN ${renderStringLiteral(c.min)}`);
+    if (c?.max !== undefined) parts.push(`MAX ${renderStringLiteral(c.max)}`);
     return parts.join(' ');
 }
 
@@ -466,7 +493,7 @@ function renderColumnType(def: ColumnDef): string {
     }
 }
 
-function renderMigrationRule(rule: MigrationRule): string {
+export function renderMigrationRule(rule: MigrationRule): string {
     switch (rule.rule) {
         case 'add-table':
             return `ADD TABLE ${renderTableDef(rule.def).replace(/^TABLE /, '')}`;
@@ -502,22 +529,18 @@ function renderRowValue(column: string, value: json.Literal, options?: RenderOpt
     return `${col}=${renderLiteral(value)}`;
 }
 
-function renderLiteral(value: json.Literal): string {
-    if (typeof value === 'string') return sqlString(value);
-    if (typeof value === 'object') return `JSON ${sqlString(json.toStringCanonical(value))}`;
+export function renderLiteral(value: json.Literal): string {
+    if (typeof value === 'string') return renderStringLiteral(value);
+    if (typeof value === 'object') return `JSON ${renderStringLiteral(json.toStringCanonical(value))}`;
     return json.toStringCanonical(value);
 }
 
-function sqlString(value: string): string {
-    return `'${value.replace(/'/g, "''")}'`;
-}
-
 function renderNote(note?: string): string {
-    return note === undefined ? '' : ` NOTE ${sqlString(note)}`;
+    return note === undefined ? '' : ` NOTE ${renderStringLiteral(note)}`;
 }
 
 function renderHashAlgorithm(hashAlgorithm?: string): string {
-    return hashAlgorithm === undefined ? '' : ` HASH ALGORITHM ${sqlString(hashAlgorithm)}`;
+    return hashAlgorithm === undefined ? '' : ` HASH ALGORITHM ${renderStringLiteral(hashAlgorithm)}`;
 }
 
 function renderAt(options?: RenderOptions): string {
@@ -536,8 +559,8 @@ function renderCreators(creators: { keyId: string; publicKey: string }[], option
     if (creators.length === 0) return '';
     const names = creators.map((c) => {
         if (useAliases(options)) return `$${options!.aliases!.key(c.keyId as B64Hash)}`;
-        if (isFullProfile(options)) return `publicKey(${sqlString(c.publicKey)})`;
-        return sqlString(c.keyId);
+        if (isFullProfile(options)) return `publicKey(${renderStringLiteral(c.publicKey)})`;
+        return renderStringLiteral(c.keyId);
     });
     return ` CREATORS (${names.join(', ')})`;
 }

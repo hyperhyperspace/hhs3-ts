@@ -2,10 +2,12 @@
 // top of the format checks in validate.ts.
 //
 //   create        - format + every creator's keyId matches its public key
-//   schema-update - format + signature by one of the creators + per-rule
-//                   applicability against the resolved schema at the entry's
-//                   parent frontier `at`. Rules within one update apply
-//                   sequentially: later rules see the effect of earlier ones.
+//   schema-update - format + signature by one of the creators + a version
+//                   above every version at `at` (so versions increase along
+//                   every causal path) + per-rule applicability against the
+//                   resolved schema at the entry's parent frontier `at`. Rules
+//                   within one update apply sequentially: later rules see the
+//                   effect of earlier ones.
 //
 // Applicability is checked at `at` only: slot conflicts across forks (e.g.
 // concurrent add-table of the same name on two branches) are NOT validity
@@ -20,11 +22,12 @@ import {
 import { verifyPayloadSignature, deserializePublicKeyFromBase64, computeKeyId } from "@hyper-hyper-space/hhs3_mvt";
 
 import { CreateRSchemaPayload, SchemaUpdatePayload, SchemaCreator } from "./payload.js";
-import { validateRSchemaPayloadFormat } from "./validate.js";
+import { validateMigrationRule, validateRSchemaPayloadFormat, type ValidateReason } from "./validate.js";
 import { TableDef, MigrationRule } from "./payload.js";
 import { collectExistsAtoms, collectRowFieldRefs, checkPredicateColumns, isValidSchemaName } from "./validate.js";
 import { splitTableRef } from "./payload.js";
 import type { RSchema, RSchemaView } from "./interfaces.js";
+import { compareSemver } from "../semver.js";
 
 export type RSchemaValidationContext =
     | { mode: 'create'; ctx: RContext }
@@ -86,6 +89,14 @@ async function validateUpdate(update: SchemaUpdatePayload, schema: RSchema, at: 
         return validationFailure(`schema-update signature from '${update.author}' could not be verified`);
     }
 
+    // The entries at `at` are the position's maxima, and versions increase
+    // along every causal path, so checking them covers the whole past.
+    for (const current of view.getVersions()) {
+        if (compareSemver(update.version, current) <= 0) {
+            return validationFailure(`schema-update version '${update.version}' is not above '${current}'`);
+        }
+    }
+
     return rulesApplicableAt(update.migration, view)
         ? validationOk()
         : validationFailure("schema-update migration is not applicable at this version");
@@ -101,18 +112,32 @@ export function rulesApplicableAt(rules: MigrationRule[], view: RSchemaView): bo
     }
 
     for (const rule of rules) {
-        if (!applyRule(tables, rule)) return false;
+        if (applyRule(tables, rule) !== undefined) return false;
     }
 
     return true;
 }
 
+export type MigrationCheck = { ok: true } | { ok: false; index: number; reason: string };
+
+// Each rule's format check, then its applicability, in order over `tables`,
+// which ends as the migrated table set (up to the first failing rule). For
+// tools that plan updates: the same checks a schema-update gets, with the
+// reason the first failing rule is refused.
+export function applyMigrationRules(tables: Map<string, TableDef>, rules: MigrationRule[]): MigrationCheck {
+    for (let index = 0; index < rules.length; index++) {
+        const reason = validateMigrationRule(rules[index]) ?? applyRule(tables, rules[index]);
+        if (reason !== undefined) return { ok: false, index, reason };
+    }
+    return { ok: true };
+}
+
 // `where` fields of local exists atoms must be pub columns of the target
 // (foreign targets are checked at group binding time, as for create).
-function checkLocalPredicateTargets(def: TableDef, tables: Map<string, TableDef>): boolean {
+function checkLocalPredicateTargets(def: TableDef, tables: Map<string, TableDef>): ValidateReason {
     for (const target of Object.values(def.fks ?? {})) {
         const [group, table] = splitTableRef(target);
-        if (group === undefined && !tables.has(table)) return false;
+        if (group === undefined && !tables.has(table)) return `table '${def.name}': FK target '${table}' does not exist`;
     }
 
     for (const restriction of def.restrictions ?? []) {
@@ -121,76 +146,91 @@ function checkLocalPredicateTargets(def: TableDef, tables: Map<string, TableDef>
             if (group !== undefined) continue;
 
             const target = tables.get(table);
-            if (target === undefined) return false;
+            if (target === undefined) return `table '${def.name}': EXISTS target '${table}' does not exist`;
 
             for (const field of Object.keys(atom.where ?? {})) {
                 const column = target.columns[field];
-                if (column === undefined || !(column.pub ?? false)) return false;
+                if (column === undefined || !(column.pub ?? false)) {
+                    return `table '${def.name}': EXISTS field '${table}.${field}' is not a pub column`;
+                }
             }
         }
-        if (checkPredicateColumns(def, restriction.rule, (t) => tables.get(t)) !== undefined) return false;
+        const reason = checkPredicateColumns(def, restriction.rule, (t) => tables.get(t));
+        if (reason !== undefined) return `table '${def.name}': ${reason}`;
     }
 
-    return true;
+    return undefined;
 }
 
-// Checks one rule against the working table set and applies it. Returns
-// false if the rule is not applicable.
-function applyRule(tables: Map<string, TableDef>, rule: MigrationRule): boolean {
+// A local FK or exists atom of another table that still names `table`.
+function referenceTo(tables: Map<string, TableDef>, table: string): string | undefined {
+    for (const [name, def] of tables) {
+        if (name === table) continue;
+        for (const [column, target] of Object.entries(def.fks ?? {})) {
+            const [group, t] = splitTableRef(target);
+            if (group === undefined && t === table) return `the FK ${name}.${column}`;
+        }
+        for (const restriction of def.restrictions ?? []) {
+            for (const atom of collectExistsAtoms(restriction.rule)) {
+                const [group, t] = splitTableRef(atom.table);
+                if (group === undefined && t === table) return `an EXISTS in ${name}'s ${restriction.on} restriction`;
+            }
+        }
+    }
+    return undefined;
+}
+
+// Checks one rule against the working table set and applies it. Returns the
+// reason the rule is not applicable, if it isn't.
+function applyRule(tables: Map<string, TableDef>, rule: MigrationRule): ValidateReason {
     switch (rule.rule) {
         case 'add-table': {
-            if (tables.has(rule.def.name)) return false;
+            if (tables.has(rule.def.name)) return `table '${rule.def.name}' already exists`;
             const withNew = new Map(tables);
             withNew.set(rule.def.name, rule.def);
-            if (!checkLocalPredicateTargets(rule.def, withNew)) return false;
+            const reason = checkLocalPredicateTargets(rule.def, withNew);
+            if (reason !== undefined) return reason;
             tables.set(rule.def.name, rule.def);
-            return true;
+            return undefined;
         }
         case 'drop-table': {
-            if (!tables.has(rule.table)) return false;
+            if (!tables.has(rule.table)) return `table '${rule.table}' does not exist`;
             // best-effort durability: refuse to drop a table still referenced
             // by another table's local FK or exists atom. This is an `at`-only
             // check (per-slot LWW merges can still produce a dangling local
             // target on another branch — a later FK write against it is then
             // voided at-use, an exists over it is false).
-            for (const [name, def] of tables) {
-                if (name === rule.table) continue;
-                for (const target of Object.values(def.fks ?? {})) {
-                    const [group, t] = splitTableRef(target);
-                    if (group === undefined && t === rule.table) return false;
-                }
-                for (const restriction of def.restrictions ?? []) {
-                    for (const atom of collectExistsAtoms(restriction.rule)) {
-                        const [group, t] = splitTableRef(atom.table);
-                        if (group === undefined && t === rule.table) return false;
-                    }
-                }
-            }
+            const reference = referenceTo(tables, rule.table);
+            if (reference !== undefined) return `table '${rule.table}' is still referenced by ${reference}`;
             tables.delete(rule.table);
-            return true;
+            return undefined;
         }
         case 'add-column': {
             const def = tables.get(rule.table);
-            if (def === undefined) return false;
-            if (def.columns[rule.column] !== undefined) return false;
+            if (def === undefined) return `table '${rule.table}' does not exist`;
+            if (def.columns[rule.column] !== undefined) return `column '${rule.table}.${rule.column}' already exists`;
             tables.set(rule.table, { ...def, columns: { ...def.columns, [rule.column]: rule.def } });
-            return true;
+            return undefined;
         }
         case 'drop-column': {
             const def = tables.get(rule.table);
-            if (def === undefined) return false;
-            if (def.columns[rule.column] === undefined) return false;
+            if (def === undefined) return `table '${rule.table}' does not exist`;
+            if (def.columns[rule.column] === undefined) return `column '${rule.table}.${rule.column}' does not exist`;
             const columns = { ...def.columns };
             delete columns[rule.column];
-            if (Object.keys(columns).length === 0) return false;   // a table needs at least one column
-            if ((def.fks ?? {})[rule.column] !== undefined) return false;   // drop the FK first (set-fks)
+            if (Object.keys(columns).length === 0) return `column '${rule.table}.${rule.column}' is the table's last column`;
+            if ((def.fks ?? {})[rule.column] !== undefined) {
+                return `column '${rule.table}.${rule.column}' still has an FK (drop it first with set-fks)`;
+            }
             // best-effort durability: refuse if any exists atom (local target
             // = this table) still references the column as a where-field
-            for (const other of tables.values()) {
+            for (const [name, other] of tables) {
                 for (const restriction of other.restrictions ?? []) {
                     for (const atom of collectExistsAtoms(restriction.rule)) {
                         const [group, t] = splitTableRef(atom.table);
-                        if (group === undefined && t === rule.table && (atom.where ?? {})[rule.column] !== undefined) return false;
+                        if (group === undefined && t === rule.table && (atom.where ?? {})[rule.column] !== undefined) {
+                            return `column '${rule.table}.${rule.column}' is still used by an EXISTS in ${name}'s ${restriction.on} restriction`;
+                        }
                     }
                 }
             }
@@ -198,35 +238,38 @@ function applyRule(tables: Map<string, TableDef>, rule: MigrationRule): boolean 
             // as a subject-row field ($row.<col>, in cmp/like operands or as an
             // exists where-value)
             for (const restriction of def.restrictions ?? []) {
-                if (collectRowFieldRefs(restriction.rule).has(rule.column)) return false;
+                if (collectRowFieldRefs(restriction.rule).has(rule.column)) {
+                    return `column '${rule.table}.${rule.column}' is still used by the table's ${restriction.on} restriction`;
+                }
             }
             tables.set(rule.table, { ...def, columns });
-            return true;
+            return undefined;
         }
         case 'set-concurrent-deletes': {
             const def = tables.get(rule.table);
-            if (def === undefined) return false;
+            if (def === undefined) return `table '${rule.table}' does not exist`;
             tables.set(rule.table, { ...def, concurrentDeletes: rule.value });
-            return true;
+            return undefined;
         }
         case 'set-fks': {
             const def = tables.get(rule.table);
-            if (def === undefined) return false;
+            if (def === undefined) return `table '${rule.table}' does not exist`;
             for (const [column, target] of Object.entries(rule.fks)) {
-                if (def.columns[column] === undefined) return false;
+                if (def.columns[column] === undefined) return `FK column '${rule.table}.${column}' does not exist`;
                 const [group, table] = splitTableRef(target);
-                if (group === undefined && !tables.has(table)) return false;
+                if (group === undefined && !tables.has(table)) return `FK target '${table}' of '${rule.table}.${column}' does not exist`;
             }
             tables.set(rule.table, { ...def, fks: rule.fks });
-            return true;
+            return undefined;
         }
         case 'set-restrictions': {
             const def = tables.get(rule.table);
-            if (def === undefined) return false;
+            if (def === undefined) return `table '${rule.table}' does not exist`;
             const updated = { ...def, restrictions: rule.restrictions };
-            if (!checkLocalPredicateTargets(updated, tables)) return false;
+            const reason = checkLocalPredicateTargets(updated, tables);
+            if (reason !== undefined) return reason;
             tables.set(rule.table, updated);
-            return true;
+            return undefined;
         }
     }
 }

@@ -333,6 +333,12 @@ export async function ingestDatabaseChanges(
         if (writer === undefined) throw new Error(`ingestDatabaseChanges: group '${groupId}' has no config.writer`);
         return writer;
     };
+    // The author of a group's ingested writes: its writer, or none when the
+    // group has no idProvider and so admits only anonymous ops.
+    const authorFor = (groupId: B64Hash): OwnIdentity | undefined => {
+        const writer = writerFor(groupId);
+        return groupById.get(groupId)!.getIdProvider() !== undefined ? writer : undefined;
+    };
 
     // Global prefetch (FK targets and insert read-back may span sibling groups).
     const prefetched = new Map<string, SyncMapping | undefined>();
@@ -350,7 +356,7 @@ export async function ingestDatabaseChanges(
         if (groupId === undefined) return undefined;
         return {
             groupId, schemaView: contexts.get(groupId)!.schemaView,
-            config: contexts.get(groupId)!.config, writerKeyId: writerFor(groupId).keyId,
+            config: contexts.get(groupId)!.config, writerKeyId: authorFor(groupId)?.keyId,
         };
     };
     const fkBundlingFor = (groupId: string): boolean => contexts.get(groupId as B64Hash)?.config.fkBundling !== false;
@@ -385,7 +391,7 @@ export async function ingestDatabaseChanges(
         const opHash = f.write !== undefined ? await syntheticOpHash(group, f.write) : f.rowId ?? `${f.targetTable}#${f.localId}`;
         const event: OpEvent = {
             origin: 'ingestion', direction: 'failure', groupId: f.groupId, opHash, kind: f.kind,
-            table: f.targetTable, localId: f.localId, author: writerFor(f.groupId).keyId,
+            table: f.targetTable, localId: f.localId, author: authorFor(f.groupId)?.keyId,
             reason: { source: 'validation', failure: f.failure },
         };
         if (f.rowId !== undefined) event.rowId = f.rowId;
@@ -414,10 +420,10 @@ export async function ingestDatabaseChanges(
     // --- submit helpers ---
     const bump = (groupId: B64Hash, n: number): void => { accepted.set(groupId, accepted.get(groupId)! + n); };
 
-    const attempt = async (group: RTableGroup, writes: BundleWrite[], writer: OwnIdentity):
+    const attempt = async (group: RTableGroup, writes: BundleWrite[], author: OwnIdentity | undefined):
         Promise<{ ok: true } | { ok: false; why: ValidationFailure }> => {
         try {
-            await group.bundle(writes, writer);
+            await group.bundle(writes, author);
             return { ok: true };
         } catch (e) {
             if (e instanceof ValidationRejectedError) return { ok: false, why: e.why };
@@ -429,9 +435,8 @@ export async function ingestDatabaseChanges(
     // per-field update fallback, else record a genuine failure.
     const submitOp = async (groupId: B64Hash, op: PlannedOp): Promise<void> => {
         const group = groupById.get(groupId)!;
-        const writer = writerFor(groupId);
         const rowId = op.write.op.rowId;
-        const res = await attempt(group, [op.write], writer);
+        const res = await attempt(group, [op.write], authorFor(groupId));
         if (res.ok) { bump(groupId, 1); return; }
 
         if (op.kind === 'insert' && isWriteOnceFor(res.why, rowId)) {
@@ -460,9 +465,8 @@ export async function ingestDatabaseChanges(
     const submitEntry = async (entry: PlannedEntry): Promise<void> => {
         const groupId = entry.groupId as B64Hash;
         const group = groupById.get(groupId)!;
-        const writer = writerFor(groupId);
         if (entry.ops.length > 1) {
-            const res = await attempt(group, entry.ops.map((o) => o.write), writer);
+            const res = await attempt(group, entry.ops.map((o) => o.write), authorFor(groupId));
             if (res.ok) { bump(groupId, entry.ops.length); return; }
             for (const op of entry.ops) await submitOp(groupId, op);   // fkBundling fallback
             return;
@@ -496,7 +500,7 @@ export async function ingestDatabaseChanges(
         if (pending === undefined || pending.size === 0) return;
         dirty.delete(observerId);
         const observer = groupById.get(observerId)!;
-        const author = writerFor(observerId);
+        const writer = writerFor(observerId);
         for (const [foreignId, version] of pending) {
             const pairKey = observerId + '\u0000' + foreignId;
             if (guard !== undefined) {
@@ -505,6 +509,7 @@ export async function ingestDatabaseChanges(
             }
             const bindingName = bindingNameFor(observerId, foreignId);
             if (bindingName === undefined) continue;
+            const author = observer.observeNeedsAuthor(bindingName) ? writer : undefined;
             const failure = await observeToVersion(observer, bindingName, foreignId, version, author);
             if (failure !== undefined) {
                 rejects.get(observerId)!.push({

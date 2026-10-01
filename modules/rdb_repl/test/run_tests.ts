@@ -32,6 +32,7 @@ import {
     type Transport,
     type TransportProvider,
 } from "@hyper-hyper-space/hhs3_mesh";
+import { MemoryDirectory } from "@hyper-hyper-space/hhs3_rdb_projection";
 import {
     ReplSession,
     formatRows,
@@ -41,10 +42,10 @@ import {
     runLanguageText,
     stopAllProjections,
     stopAllSyncs,
-    type SyncMeshFactory,
 } from "../src/index.js";
+import type { SyncMeshFactory } from "@hyper-hyper-space/hhs3_rhost";
 import { runProjectParseTests } from "./project_parse_tests.js";
-import { runSyncAuthorizerTests, runSyncParseTests } from "./sync_parse_tests.js";
+import { runSyncParseTests } from "./sync_parse_tests.js";
 
 function assert(condition: unknown, message: string): asserts condition {
     if (!condition) throw new Error(message);
@@ -371,14 +372,12 @@ CREATE DATABASE observerdb USING CATALOG observer_catalog;
         assert(reused.exitCode === 0 && reused.output.includes('started projection 2'), 'ids are never reused after stop');
 
         const idxSpec = JSON.stringify({
-            version: 1,
             indexes: [
                 { name: 'by_name', group: 'shop_prod', table: 'products', columns: ['name', 'sku'] },
                 { name: 'by_x', group: 'not_here', table: 't', columns: ['x'] },
             ],
         });
         const withOptions = JSON.stringify({
-            version: 1,
             indexes: [{ name: 'by_name', group: 'shop_prod', table: 'products', columns: ['name'], options: {} }],
         });
         const refused = await runCommand(session, `\\project indexes 2 ${withOptions}`);
@@ -394,9 +393,10 @@ CREATE DATABASE observerdb USING CATALOG observer_catalog;
         assert(again.exitCode === 0 && again.output.includes('indexes unchanged'), 'reinstalling the same spec is a no-op');
         const noReader = await runCommand(session, '\\project indexes 2 ./idx.json');
         assert(noReader.exitCode === 1 && noReader.output.includes('cannot read files'), 'file spec needs a host reader');
-        session.readTextFile = async () => JSON.stringify({ version: 1, indexes: [] });
-        const conflict = await runCommand(session, '\\project indexes 2 ./idx.json');
-        assert(conflict.exitCode === 1 && conflict.output.includes('bump the version'), 'same version, other content is refused');
+        session.readTextFile = async () => JSON.stringify({ indexes: [] });
+        const replaced = await runCommand(session, '\\project indexes 2 ./idx.json');
+        assert(replaced.exitCode === 0 && replaced.output.includes('indexes installed'), `a different spec installs (${replaced.output})`);
+        assert(replaced.output.includes('drop'), 'the previous index is dropped');
         session.readTextFile = undefined;
         const badJson = await runCommand(session, '\\project indexes 2 {"version": 1,}');
         assert(badJson.exitCode === 1 && badJson.output.includes('Invalid index spec JSON'), 'bad inline JSON is reported');
@@ -414,10 +414,107 @@ CREATE DATABASE observerdb USING CATALOG observer_catalog;
     }
 
     await runProjectionNoticeTests();
+    await runProjectFilesTests();
     await runSyncFetchNonDefaultBackendTest();
     await runSyncParseTests();
     await runProjectParseTests();
-    await runSyncAuthorizerTests();
+}
+
+// `\project files`: FILES members mounted as folders of a running projection,
+// on MemoryTarget and MemoryDirectory folders. Self-contained workspace.
+async function runProjectFilesTests(): Promise<void> {
+    const workspace = await openMemWorkspace();
+    const keyVault = new MemoryKeyVault(workspace.replica.getHashSuite());
+    const session = new ReplSession({
+        workspace,
+        keyVault,
+        projectionTargetFactory: async () => new MemoryTarget({ captureChanges: true }),
+    });
+    session.enableReplDefaults();
+    const folders = new Map<string, MemoryDirectory>();
+
+    try {
+        await runCommand(session, '\\key create alice', undefined, { requestPassphrase: async () => 'correct horse' });
+        await runCommand(session, '\\author alice');
+        const setup = await runCommand(session, `
+CREATE SCHEMA users_schema CREATORS ($me) AS (
+  TABLE identities (keyId string PUB READONLY, publicKey string PUB READONLY) IDENTITY PROVIDER ALLOW insert IF true
+);
+CREATE CATALOG app VERSION '1.0.0' PARAMS (:admin identity) AS (
+  TABLEGROUP users USING SCHEMA users_schema USING IDENTITIES identities
+    WITH ROWS (identities (keyId = :admin, publicKey = publicKey(:admin))),
+  FILES media USING IDENTITIES users.identities ALLOW WRITE IF true
+);
+CREATE DATABASE other_db USING CATALOG app WITH PARAMS (:admin = $me);
+CREATE DATABASE app_db USING CATALOG app WITH PARAMS (:admin = $me);
+`);
+        assertEqual(setup.exitCode, 0, `files setup (${setup.output})`);
+
+        const started = await runCommand(session, '\\project start app_db as alice to :memory:');
+        const id = startedProjectId(started.output);
+        const other = startedProjectId((await runCommand(session, '\\project start other_db as alice to data/other.sqlite')).output);
+
+        const noHost = await runCommand(session, `\\project files ${id} media to media`);
+        assert(noHost.exitCode === 1 && noHost.output.includes("This host can't mount folders"), `no folder factory is refused (${noHost.output})`);
+
+        session.filesDirectoryFactory = async ({ path }) => {
+            const dir = new MemoryDirectory();
+            folders.set(path, dir);
+            return dir;
+        };
+        const mounted = await runCommand(session, `\\project files ${id} media to media`);
+        assertEqual(mounted.exitCode, 0, `files mounts (${mounted.output})`);
+        assertEqual(mounted.output, 'media at media: 0 files, writable by $alice', 'the mount line');
+        const media = folders.get('media')!;
+
+        const put = await runCommand(session, "PUT STRING 'hello' INTO media AT 'a.txt';");
+        assertEqual(put.exitCode, 0, `PUT STRING (${put.output})`);
+        assert(await waitFor(() => media.paths().includes('common/a.txt')), `a put file is written to the folder (${media.paths().join(', ')})`);
+        assertEqual(await media.readText('common/a.txt'), 'hello', 'with its bytes');
+
+        await media.writeText('common/b.txt', 'from the folder');
+        let listed = '';
+        for (let i = 0; i < 200 && !listed.includes('b.txt'); i++) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            listed = (await runCommand(session, 'LIST FROM media;')).output;
+        }
+        assert(listed.includes('b.txt') && listed.includes('a.txt'), `a file written to the folder is added (${listed})`);
+
+        const again = await runCommand(session, `\\project files ${id} media to ./media/`);
+        assert(again.exitCode === 0 && again.output.startsWith('media at media: ') && again.output.endsWith('writable by $alice'),
+            `the same mount again changes nothing (${again.output})`);
+        assertEqual(folders.size, 1, 'and opens no new folder');
+        const moved = await runCommand(session, `\\project files ${id} media to elsewhere`);
+        assert(moved.exitCode === 1 && moved.output.includes("already mounted at 'media'") && moved.output.includes('stop the projection'),
+            `the same name at another path is refused (${moved.output})`);
+        const nested = await runCommand(session, `\\project files ${id} docs to media/docs`);
+        assert(nested.exitCode === 1 && nested.output.includes("overlaps 'media'"), `a path inside a mount is refused (${nested.output})`);
+        const around = await runCommand(session, `\\project files ${id} docs to data`);
+        assert(around.exitCode === 1 && around.output.includes(`the target of projection ${other}`), `a path around a projection target is refused (${around.output})`);
+        const badName = await runCommand(session, `\\project files ${id} 9lives to cats`);
+        assert(badName.exitCode === 1 && badName.output.includes('identifier'), `a bad name is refused (${badName.output})`);
+        const noSession = await runCommand(session, '\\project files 99 media to x');
+        assert(noSession.exitCode === 1 && noSession.output.includes('No projection session 99'), `an unknown session is refused (${noSession.output})`);
+        assert(!folders.has('elsewhere') && !folders.has('media/docs') && !folders.has('cats'), 'refused mounts open no folder');
+
+        const pending = await runCommand(session, `\\project files ${id} docs to docs`);
+        assertEqual(pending.output, 'docs at docs: pending, no FILES docs deployed yet', 'a FILES not deployed is pending');
+
+        const status = await runCommand(session, '\\project status');
+        assert(status.output.includes('local_only') && status.output.includes('waiting') && status.output.includes('mounted') && status.output.includes('pending'),
+            `\\project status lists the mounts (${status.output})`);
+        const otherStatus = await runCommand(session, '\\project status other_db');
+        assert(!otherStatus.output.includes('local_only'), `the mounts table follows the database filter (${otherStatus.output})`);
+
+        const stopped = await runCommand(session, `\\project stop ${id}`);
+        assertEqual(stopped.output, `stopped projection ${id}; its folders (media, docs) stay as they are`, 'stop names the folders');
+        assert(media.paths().includes('common/a.txt') && media.paths().includes('common/b.txt'), 'the folder keeps its files');
+        const plain = await runCommand(session, `\\project stop ${other}`);
+        assertEqual(plain.output, `stopped projection ${other}`, 'a session without mounts stops as before');
+    } finally {
+        await stopAllProjections(session);
+        await workspace.close();
+    }
 }
 
 function memSyncFactory(): SyncMeshFactory {

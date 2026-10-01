@@ -10,6 +10,7 @@ import { RTableGroupImpl, rTableGroupFactory } from "../src/rtable_group/group.j
 import { deriveRowId } from "../src/rtable/hash.js";
 import type { TableDef, Predicate } from "../src/rschema/payload.js";
 import type { InsertRowPayload } from "../src/rtable/payload.js";
+import { identitiesTableDef, localIdentityProvider } from "./identity_fixture.js";
 
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
@@ -47,21 +48,24 @@ function notesTable(): TableDef {
     return { name: 'notes', columns: { body: { type: 'string' } } };
 }
 
+// `authors` get a local identity provider, so their signed row ops verify.
 async function createTestEnv(groupExtras?: {
     initialRows?: { [table: string]: json.Literal[] };
     bindings?: { [name: string]: string };
     canDeploy?: Predicate;
+    authors?: OwnIdentity[];
 }) {
     const ctx = createMockRContext({ selfValidate: true });
     ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
     ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
 
     const admin = await makeIdentity();
+    const { authors, ...extras } = groupExtras ?? {};
 
     const schemaInit = await RSchemaImpl.create({
         name: 'shop',
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
-        tables: [ordersTable(), capsTable()],
+        tables: authors === undefined ? [ordersTable(), capsTable()] : [ordersTable(), capsTable(), identitiesTableDef()],
     });
     const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
 
@@ -72,7 +76,8 @@ async function createTestEnv(groupExtras?: {
         seed: 'group-test',
         schemaRef: schema.getId(),
         schemaVersion: pinned,
-        ...groupExtras,
+        ...extras,
+        ...(authors === undefined ? {} : localIdentityProvider(authors, extras.initialRows)),
     });
     const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
 
@@ -168,13 +173,13 @@ export const rtableGroupTests = {
         {
             name: '[RGROUP03] Insert and delete accepted and duplicate insert rejected',
             invoke: async () => {
-                const { group } = await createTestEnv();
+                const authored = await makeIdentity();
+                const { group } = await createTestEnv({ authors: [authored] });
                 const orders = await group.getTable('orders');
 
                 const anonId = deriveRowId('o-1');
                 await orders.insert('o-1', { customer: 'ada', total: 10 });
 
-                const authored = await makeIdentity();
                 const authoredId = deriveRowId('o-2', authored.keyId);
                 await orders.insert('o-2', { customer: 'bob', total: 20 }, authored);
 
@@ -359,35 +364,38 @@ export const rtableGroupTests = {
             }
         },
         {
-            name: '[RGROUP07] Deploy rejected when canDeploy requires authoring',
+            name: '[RGROUP07] Deploy authorship: a signed deploy needs a key source; an open canDeploy takes unsigned deploys',
             invoke: async () => {
                 const { group, schema, admin } = await createTestEnv({ canDeploy: { p: 'true' } });
 
                 await schema.updateSchema([{ rule: 'add-table', def: notesTable() }], admin);
                 const v2 = await (await schema.getScopedDag()).getFrontier();
 
-                let unauthoredFailed = false;
+                // admin created the schema, not the group: with no provider and
+                // no deployKeys, nothing can verify its signature
+                let unverifiableFailed = false;
                 try {
-                    await group.deploy(v2);
+                    await group.deploy(v2, admin);
                 } catch {
-                    unauthoredFailed = true;
+                    unverifiableFailed = true;
                 }
-                assertTrue(unauthoredFailed, 'an unauthored deploy should be rejected when canDeploy is declared');
+                assertTrue(unverifiableFailed, 'a deploy signed by a key the group cannot resolve should be rejected');
 
-                await group.deploy(v2, admin);
+                await group.deploy(v2);
                 const view = await group.getView();
-                assertTrue(view.getTableNames().includes('notes'), 'the authored deploy should land');
+                assertTrue(view.getTableNames().includes('notes'), 'an unsigned deploy passes a canDeploy that does not read $author');
             }
         },
         {
             name: '[RGROUP08] findRowIds returns live rows matching pub column values',
             invoke: async () => {
+                const alice = await makeIdentity();
                 const { group } = await createTestEnv({
                     initialRows: { caps: [initialCapRow('seed-admin', 'admin')] },
+                    authors: [alice],
                 });
                 const caps = await group.getTable('caps');
 
-                const alice = await makeIdentity();
                 const d1 = deriveRowId('d-1', alice.keyId);
                 const d2 = deriveRowId('d-2');
                 const d3 = deriveRowId('d-3');

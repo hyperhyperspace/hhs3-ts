@@ -11,6 +11,7 @@ import type { Row } from "../src/rtable/interfaces.js";
 import type { ColumnTypes, RowFilter, RowQuery } from "../src/rtable/query.js";
 import { evalRowFilter, orderRows, projectRow, validateRowQuery } from "../src/rtable/query.js";
 import { likeMatch, isValidLikePattern } from "../src/rschema/expr.js";
+import { identitiesTableDef, localIdentityProvider } from "./identity_fixture.js";
 
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
@@ -71,7 +72,8 @@ async function createLedgerGroup() {
     return { ctx, group, admin };
 }
 
-async function createItemsGroup() {
+// `authors` get a local identity provider, so their signed ops verify.
+async function createItemsGroup(authors?: OwnIdentity[]) {
     const ctx = createMockRContext({ selfValidate: true });
     ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
     ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
@@ -80,13 +82,14 @@ async function createItemsGroup() {
     const schemaInit = await RSchemaImpl.create({
         name: 'inventory',
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
-        tables: [itemsTable()],
+        tables: authors === undefined ? [itemsTable()] : [itemsTable(), identitiesTableDef()],
     });
     const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
     const pinned = await (await schema.getScopedDag()).getFrontier();
 
     const groupInit = await RTableGroupImpl.create({
         name: 'query-test', seed: 'query-test', schemaRef: schema.getId(), schemaVersion: pinned,
+        ...(authors === undefined ? {} : localIdentityProvider(authors)),
     });
     const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
 
@@ -308,9 +311,9 @@ export const rtableQueryTests = {
         {
             name: '[QRY05] engine: author system-column filters',
             invoke: async () => {
-                const { group } = await createItemsGroup();
-                const items = await group.getTable('items');
                 const alice = await makeIdentity();
+                const { group } = await createItemsGroup([alice]);
+                const items = await group.getTable('items');
 
                 await items.insert('anon1', { kind: 'fruit', qty: 1 });
                 await items.insert('authored1', { kind: 'fruit', qty: 2 }, alice);

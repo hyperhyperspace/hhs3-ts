@@ -1,9 +1,26 @@
 import type { B64Hash, HashSuite, KeyId, OwnIdentity, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
 import type { json } from "@hyper-hyper-space/hhs3_json";
 import type { RObject, ScopedDag, Version } from "@hyper-hyper-space/hhs3_mvt";
-import type { RCatalogImpl, RDbImpl, RSchema, RTable, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
+import type { FileSource, RBlobStore, RCatalogImpl, RDbImpl, RFileMap, RSchema, RTable, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 
-import type { HashRef, NameOrHashRef, TableRef, VersionExpr } from "../syntax/ast.js";
+import type { HashRef, NameOrHashRef, NameRef, TableRef, VersionExpr } from "../syntax/ast.js";
+
+// A FILES member of a database: its name there, and both objects.
+export type ResolvedFilesRef = {
+    name: string;
+    database: B64Hash;
+    store: RBlobStore;
+    map: RFileMap;
+};
+
+// The host's local files, for PUT FILE and GET ... TO. Paths are the host's
+// (Node: relative to the working directory).
+export interface LocalFileAccess {
+    // A re-readable source of a local file's bytes.
+    open(path: string): Promise<FileSource>;
+    // Replaces the file atomically, creating parent folders.
+    write(path: string, chunks: AsyncIterable<Uint8Array>): Promise<void>;
+}
 
 // The identity forms of a `BY` clause (the `NOBODY` case never reaches the
 // host: the binder maps it to an unauthored op directly).
@@ -58,6 +75,10 @@ export interface LangBindContext {
     resolveDatabase(ref: NameOrHashRef): Promise<ResolvedDatabaseRef>;
     resolveCatalog(ref: NameOrHashRef): Promise<ResolvedCatalogRef>;
     resolveTable(ref: TableRef): Promise<ResolvedTableRef>;
+    // A FILES name is `files` or `db.files`, resolved like a group name.
+    resolveFiles?(ref: NameRef): Promise<ResolvedFilesRef>;
+    // Absent: PUT FILE and GET ... TO are refused.
+    readonly localFiles?: LocalFileAccess;
     resolveDefaultGroup?(): Promise<NameOrHashRef | undefined>;
     resolveDefaultDatabase?(): Promise<ResolvedDatabaseRef | undefined>;
     resolveHash(ref: HashRef, scope: HashScope): Promise<B64Hash>;
@@ -86,6 +107,13 @@ export interface LangBindContext {
     // Resolve an explicit `BY $name` / `BY #prefix` author to an unlocked
     // identity able to sign. Throws if the identity is unknown or still locked.
     resolveAuthor(ref: AuthorRef): Promise<OwnIdentity>;
+    // The version of a CREATE CATALOG parsed without VERSION (source mode,
+    // see ParseOptions.catalogVersionOptional). Absent: such a statement is
+    // a bind error.
+    defaultCatalogVersion?(): Promise<string | undefined>;
+    // The version of a CREATE SCHEMA parsed without VERSION, while target-catalog.sql
+    // is evaluated. Absent: the schema defaults to 0.0.1.
+    defaultSchemaVersion?(): Promise<string | undefined>;
     createUuid(): string;
     createSeed(kind: 'rdb' | 'group', name?: string): string;
 }

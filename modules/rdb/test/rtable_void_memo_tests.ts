@@ -7,6 +7,7 @@ import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
 import { RTableGroupImpl, rTableGroupFactory } from "../src/rtable_group/group.js";
 import { deriveRowId } from "../src/rtable/hash.js";
 import type { TableDef } from "../src/rschema/payload.js";
+import { identitiesTableDef, localIdentityProvider } from "./identity_fixture.js";
 
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
@@ -43,7 +44,7 @@ async function createEnv() {
     const schemaInit = await RSchemaImpl.create({
         name: 'voidmemo:schema',
         creators: [{ keyId: author.keyId, publicKey: author.publicKey }],
-        tables: [pagesTable()],
+        tables: [pagesTable(), identitiesTableDef()],
     });
     const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
     const pinned = await (await schema.getScopedDag()).getFrontier();
@@ -53,6 +54,7 @@ async function createEnv() {
         seed: 'voidmemo-group',
         schemaRef: schema.getId(),
         schemaVersion: pinned,
+        ...localIdentityProvider([author]),
     });
     const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
     const pages = await group.getTable('pages');

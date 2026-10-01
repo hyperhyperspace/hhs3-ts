@@ -76,7 +76,10 @@ export type AdapterConfig = {
 
     // The identity every ingested op is authored (and signed) by. Required by
     // ingestChanges; the projected DB attributes all local edits to this single
-    // "adapter writer" (per-principal inbound authorship is out of scope).
+    // "adapter writer" (per-principal inbound authorship is out of scope). A
+    // group without an idProvider admits only anonymous ops, so its ingested
+    // writes are anonymous; ref-advances are signed only when the binding's
+    // canObserve reads $author.
     writer?: OwnIdentity;
     // Whether to bundle CONSECUTIVE same-group ops joined by an explicit FK arc
     // into ONE atomic entry (so an app's parent+child inserts become visible
@@ -438,9 +441,6 @@ export type IndexDecl = {
 };
 
 export type IndexSpec = {
-    // Monotonic: reconcile installs only a strictly newer version (an older
-    // one is skipped; the same version with different content is an error).
-    version: number;
     indexes: IndexDecl[];
     // Default policy: one single-column index per `pub` column of every
     // projected table (named `pub__<column>`), in addition to `indexes`.

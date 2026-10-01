@@ -12,7 +12,8 @@
 //     it, and resolution falls back to the union of the versions),
 //   - the definitions it adds, at their pins,
 //   - its `changes`.
-// Definitions and params accumulate over the causal past.
+// Group and FILES definitions and params accumulate over the causal past.
+// FILES definitions are immutable, so parents never disagree on them.
 //
 // Catalog DAGs are small: the index loads every entry and computes causal
 // pasts directly, with no meta indexing.
@@ -23,8 +24,8 @@ import { Entry } from "@hyper-hyper-space/hhs3_dag";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 
 import {
-    CatalogGroupDef, CatalogParamDecl, CatalogReleaseBody, CreateRCatalogPayload,
-    CatalogDeclarePayload, SchemaCreator, catalogGroupHash,
+    CatalogGroupDef, CatalogFilesDef, CatalogParamDecl, CatalogReleaseBody, CreateRCatalogPayload,
+    CatalogDeclarePayload, SchemaCreator, catalogGroupHash, catalogFilesHash,
 } from "./payload.js";
 import { compareSemver } from "./semver.js";
 
@@ -41,6 +42,8 @@ export type ReleaseState = {
     groups: Map<B64Hash, CatalogGroupState>;       // folded: catalog group hash -> version
     defs: Map<B64Hash, CatalogGroupDef>;           // every definition in the causal past, own adds included
     addedIn: Map<B64Hash, B64Hash>;                // definition hash -> release that added it
+    files: Map<B64Hash, CatalogFilesDef>;          // every FILES definition in the causal past, own adds included
+    filesAddedIn: Map<B64Hash, B64Hash>;           // FILES definition hash -> release that added it
     params: Map<string, CatalogParamDecl>;         // every param declared in the causal past
     added: B64Hash[];                              // this release's own adds, in payload order
     changed: B64Hash[];                            // this release's own changes, sorted
@@ -70,9 +73,18 @@ export type ParentFold = {
     conflicts: Map<B64Hash, CatalogGroupState[]>;
     defs: Map<B64Hash, CatalogGroupDef>;
     addedIn: Map<B64Hash, B64Hash>;
+    files: Map<B64Hash, CatalogFilesDef>;
+    filesAddedIn: Map<B64Hash, B64Hash>;
     params: Map<string, CatalogParamDecl>;
     ancestors: Set<B64Hash>;
 };
+
+export function emptyParentFold(): ParentFold {
+    return {
+        groups: new Map(), conflicts: new Map(), defs: new Map(), addedIn: new Map(),
+        files: new Map(), filesAddedIn: new Map(), params: new Map(), ancestors: new Set(),
+    };
+}
 
 export class CatalogIndex {
 
@@ -186,6 +198,8 @@ export class CatalogIndex {
         const seen = new Map<B64Hash, CatalogGroupState[]>();
         const defs = new Map<B64Hash, CatalogGroupDef>();
         const addedIn = new Map<B64Hash, B64Hash>();
+        const files = new Map<B64Hash, CatalogFilesDef>();
+        const filesAddedIn = new Map<B64Hash, B64Hash>();
         const params = new Map<string, CatalogParamDecl>();
         const ancestors = new Set<B64Hash>();
 
@@ -195,6 +209,8 @@ export class CatalogIndex {
             for (const a of state.ancestors) ancestors.add(a);
             for (const [hash, def] of state.defs) defs.set(hash, def);
             for (const [hash, release] of state.addedIn) addedIn.set(hash, release);
+            for (const [hash, def] of state.files) files.set(hash, def);
+            for (const [hash, release] of state.filesAddedIn) filesAddedIn.set(hash, release);
             for (const [name, decl] of state.params) params.set(name, decl);
             for (const [hash, group] of state.groups) {
                 const list = seen.get(hash) ?? [];
@@ -215,7 +231,7 @@ export class CatalogIndex {
             }
         }
 
-        return { groups, conflicts, defs, addedIn, params, ancestors };
+        return { groups, conflicts, defs, addedIn, files, filesAddedIn, params, ancestors };
     }
 
     // The parents of an entry at `prevs`: the maximal releases below it.
@@ -274,6 +290,14 @@ export function applyReleaseBody(
     }
     changed.sort();
 
+    const files = new Map(fold.files);
+    const filesAddedIn = new Map(fold.filesAddedIn);
+    for (const def of body.files ?? []) {
+        const filesHash = catalogFilesHash(def);
+        files.set(filesHash, def);
+        filesAddedIn.set(filesHash, hash);
+    }
+
     for (const decl of body.params ?? []) params.set(decl.name, decl);
 
     const state: ReleaseState = {
@@ -284,6 +308,8 @@ export function applyReleaseBody(
         groups,
         defs,
         addedIn,
+        files,
+        filesAddedIn,
         params,
         added,
         changed,

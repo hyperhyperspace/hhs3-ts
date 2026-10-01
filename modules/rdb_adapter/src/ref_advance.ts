@@ -54,13 +54,14 @@ export async function frontierOf(group: RTableGroup): Promise<Version> {
 // Advance one observer -> foreign binding to `version`. observe() is a
 // monotonic, canObserve-gated barrier, so re-observing an already-covered
 // version is a cheap no-op; a gate rejection (unauthorized author) surfaces as
-// a captured failure rather than throwing through the ingest walk.
+// a captured failure rather than throwing through the ingest walk. `author` is
+// undefined for an anonymous observation.
 export async function observeToVersion(
     observer: RTableGroup,
     bindingName: string,
     foreignGroupId: B64Hash,
     version: Version,
-    author: OwnIdentity,
+    author: OwnIdentity | undefined,
 ): Promise<RefAdvanceFailure | undefined> {
     try {
         await observer.observe(bindingName, version, author);

@@ -8,9 +8,10 @@ import {
 } from "@hyper-hyper-space/hhs3_rdb_runtime";
 
 import type { IssueReporter } from "@hyper-hyper-space/hhs3_mesh";
+import type { SyncMeshFactory } from "@hyper-hyper-space/hhs3_rhost";
 
-import type { ProjectionTargetFactory, ProjectSessionEntry } from "./projection/types.js";
-import type { SyncMeshFactory, SyncSessionEntry } from "./sync/types.js";
+import type { FilesDirectoryFactory, ProjectionTargetFactory, ProjectSessionEntry } from "./projection/types.js";
+import type { SyncSessionEntry } from "./sync/types.js";
 
 export type OutputMode = 'table' | 'json' | 'vertical';
 export type HashWidth = 'auto' | 'full' | number;
@@ -39,6 +40,7 @@ export type ReplSessionOptions = {
     stopOnError?: boolean;
     createUuid?: () => string;
     projectionTargetFactory?: ProjectionTargetFactory;
+    filesDirectoryFactory?: FilesDirectoryFactory;
     onProjectionError?: ProjectionErrorHandler;
     readTextFile?: TextFileReader;
     syncMeshFactory?: SyncMeshFactory;
@@ -55,6 +57,7 @@ export class ReplSession extends RdbSession {
     // Host-injected projection backend factory + the active \\project sessions,
     // keyed by a session-global incrementing id that is never reused after stop.
     projectionTargetFactory?: ProjectionTargetFactory;
+    filesDirectoryFactory?: FilesDirectoryFactory;
     onProjectionError?: ProjectionErrorHandler;
     readonly projections = new Map<number, ProjectSessionEntry>();
     nextProjectId = 1;
@@ -86,6 +89,7 @@ export class ReplSession extends RdbSession {
         this.promptForKeys = options.promptForKeys ?? false;
         this.stopOnError = options.stopOnError ?? true;
         this.projectionTargetFactory = options.projectionTargetFactory;
+        this.filesDirectoryFactory = options.filesDirectoryFactory;
         this.onProjectionError = options.onProjectionError;
         this.readTextFile = options.readTextFile;
         this.syncMeshFactory = options.syncMeshFactory;

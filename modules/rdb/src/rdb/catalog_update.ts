@@ -8,7 +8,8 @@
 //            over bindings.
 //   dry-run  validate the RDb op and each deploy of an existing group at its
 //            planned position; report which group rejects.
-//   apply    create the missing groups, deploy bound groups first and advance
+//   apply    create the missing groups and FILES objects (blob store and file
+//            map, after their group), deploy bound groups first and advance
 //            their dependents' refs to them, deploy the dependents, and append
 //            the update-catalog last: it is the commit point, so a replica
 //            never sees a deployed release whose deploys are missing.
@@ -16,6 +17,10 @@
 // A failed ref advance is reported without aborting. A failed deploy aborts
 // before the commit. The planner is idempotent: re-running it for a release
 // that is already deployed only catches up the deploys that are behind.
+//
+// The author signs a deploy or a ref advance only when the gate reads $author.
+// The other ops go out anonymous, since a group without an identity provider
+// rejects an author it cannot verify.
 //
 // Local deploys never wait on the admin's own gate; the admin's replica adopts
 // through the policy once the commit lands.
@@ -26,12 +31,13 @@ import {
     Version, formatValidationFailure, refVersionAtOrAbove,
     ValidationRejectedError,
 } from "@hyper-hyper-space/hhs3_mvt";
+import type { Payload } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchema } from "../rschema/interfaces.js";
 import type { RTableGroupImpl } from "../rtable_group/group.js";
 import { ensureDeployGate } from "../rdeploy_gate/rdeploy_gate.js";
 import { versionKey } from "../rcatalog/resolve.js";
-import type { MemberGroup } from "./instantiate.js";
+import type { MemberFiles, MemberGroup } from "./instantiate.js";
 import type { ParamValue } from "./payload.js";
 import type { RDbImpl } from "./rdb.js";
 
@@ -48,6 +54,7 @@ export type CatalogPlan = {
     commit: boolean;                  // false when the release is already deployed (catch-up only)
     order: MemberGroup[];             // every member, bottom-up over bindings
     creates: MemberGroup[];           // members absent on this replica
+    fileCreates: { id: B64Hash; payload: MemberFiles['store'] | MemberFiles['map'] }[];   // absent FILES objects
     deploys: PlannedDeploy[];         // bottom-up
     problems: string[];               // why the plan cannot be applied (empty when it can)
 };
@@ -90,7 +97,7 @@ export async function planCatalogUpdate(rdb: RDbImpl, spec: {
     const resolution = commit ? await rdb.resolvePlanned(spec.release, params) : await rdb.resolve();
     const plan: CatalogPlan = {
         rdb, release: spec.release, params, commit,
-        order: [], creates: [], deploys: [], problems: [],
+        order: [], creates: [], fileCreates: [], deploys: [], problems: [],
     };
     if (spec.note !== undefined) plan.note = spec.note;
 
@@ -136,12 +143,17 @@ export async function planCatalogUpdate(rdb: RDbImpl, spec: {
 
         plan.deploys.push({ member, target: member.target });
         try {
-            const prepared = await group.prepareDeploy(member.target, spec.author);
+            const prepared = await group.prepareDeploy(member.target, group.deployNeedsAuthor() ? spec.author : undefined);
             const result = await group.validatePayload(prepared.payload, prepared.at);
             if (!result.valid) plan.problems.push(`deploy of '${member.name}': ${formatValidationFailure(result.why)}`);
         } catch (err) {
             plan.problems.push(`deploy of '${member.name}': ${failureMessage(err)}`);
         }
+    }
+
+    for (const files of membership.files.values()) {
+        if (await ctx.getObject(files.storeId) === undefined) plan.fileCreates.push({ id: files.storeId, payload: files.store });
+        if (await ctx.getObject(files.mapId) === undefined) plan.fileCreates.push({ id: files.mapId, payload: files.map });
     }
 
     return plan;
@@ -164,6 +176,10 @@ export async function applyCatalogPlan(plan: CatalogPlan, author?: OwnIdentity):
     for (const member of plan.order) {
         await ensureDeployGate(ctx, member.id, member.def.schemaRef, backendLabel);
     }
+    for (const create of plan.fileCreates) {
+        await ctx.createObject(create.payload as unknown as Payload, backendLabel);
+        result.created.push(create.id);
+    }
 
     const deployedIds = new Set<B64Hash>();
     const targets = new Map(plan.deploys.map((d) => [d.member.id, d.target]));
@@ -176,7 +192,7 @@ export async function applyCatalogPlan(plan: CatalogPlan, author?: OwnIdentity):
             try {
                 const bound = await ctx.getObject(boundId) as RTableGroupImpl;
                 const frontier = await (await bound.getScopedDag()).getFrontier();
-                const entry = await group.observe(binding, frontier, author);
+                const entry = await group.observe(binding, frontier, group.observeNeedsAuthor(binding) ? author : undefined);
                 result.observed.push({ groupId: member.id, binding, entry });
             } catch (err) {
                 result.observeFailures.push({ groupId: member.id, binding, message: failureMessage(err) });
@@ -186,7 +202,7 @@ export async function applyCatalogPlan(plan: CatalogPlan, author?: OwnIdentity):
         const target = targets.get(member.id);
         if (target === undefined) continue;
         try {
-            const entry = await group.deploy(target, author);
+            const entry = await group.deploy(target, group.deployNeedsAuthor() ? author : undefined);
             result.deployed.push({ groupId: member.id, name: member.name, entry });
             deployedIds.add(member.id);
         } catch (err) {

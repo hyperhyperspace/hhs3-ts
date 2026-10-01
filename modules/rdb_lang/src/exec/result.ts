@@ -121,6 +121,50 @@ export type LogLangResult = {
     rows: LogRow[];
 };
 
+// PUT: the element written (the owner is set in a key section), whether its
+// bytes had to be uploaded, and the entries appended.
+export type PutFileLangResult = {
+    kind: 'put-file';
+    files: string;
+    section: 'common' | 'key';
+    owner?: string;
+    path: string;
+    fileHash: B64Hash;
+    size: number;
+    uploaded: boolean;
+    entries: B64Hash[];
+};
+
+// GET: inline content (`text` or `b64`), or where it was written (`written`).
+export type GetFileLangResult = {
+    kind: 'get-file';
+    files: string;
+    section: 'common' | 'key';
+    owner?: string;
+    path: string;
+    fileHash: B64Hash;
+    size: number;
+    text?: string;
+    b64?: string;
+    written?: string;
+};
+
+export type FileListRow = {
+    section: 'common' | 'key';
+    owner: string;            // '' in common
+    path: string;
+    size: number | null;      // null when no upload of it has arrived
+    fileHash: B64Hash;
+    complete: boolean;
+};
+
+export type ListFilesLangResult = {
+    kind: 'list-files';
+    files: string;
+    columns: (keyof FileListRow)[];
+    rows: FileListRow[];
+};
+
 export type CreatePlanResult = {
     kind: 'create-plan';
     plan: CreatePlan;
@@ -139,4 +183,7 @@ export type LangExecutionResult =
     | BundleLangResult
     | SetViewLangResult
     | SelectLangResult
-    | LogLangResult;
+    | LogLangResult
+    | PutFileLangResult
+    | GetFileLangResult
+    | ListFilesLangResult;

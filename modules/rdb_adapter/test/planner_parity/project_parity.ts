@@ -44,7 +44,7 @@ function fuzzIndexSpec(groupName: string, views: RSchemaView[]): IndexSpec {
             indexes.push({ name: `ix_${table}_pair`, group: groupName, table, columns: [cols[0]!, cols[1]!] });
         }
     }
-    const spec: IndexSpec = { version: 1, indexes, indexPub: true };
+    const spec: IndexSpec = { indexes, indexPub: true };
     const invalid = validateIndexSpec(spec);
     if (invalid !== undefined) throw new Error(`fuzz index spec is invalid: ${invalid}`);
     return spec;

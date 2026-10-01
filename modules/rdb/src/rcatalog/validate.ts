@@ -8,10 +8,11 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import { validationFailure, validationOk, ValidationResult } from "@hyper-hyper-space/hhs3_mvt";
 
 import { isValidName, isValidSchemaName, isValidTableRef, validatePredicate } from "../rschema/validate.js";
+import { filesAccessReason } from "../rfiles/access.js";
 import {
     createRCatalogFormat, catalogReleaseFormat, catalogDeclareFormat,
     CreateRCatalogPayload, CatalogReleasePayload, CatalogDeclarePayload,
-    CatalogGroupDef, CatalogReleaseBody, catalogGroupHash,
+    CatalogGroupDef, CatalogFilesDef, CatalogReleaseBody, catalogGroupHash, catalogFilesHash,
 } from "./payload.js";
 import { isValidSemver } from "./semver.js";
 
@@ -74,6 +75,14 @@ export function checkGroupDefFormat(def: CatalogGroupDef): string | undefined {
     return undefined;
 }
 
+// The same access rules the instantiated RBlobStore and RFileMap enforce, so a
+// valid definition always instantiates into valid objects.
+export function checkFilesDefFormat(def: CatalogFilesDef): string | undefined {
+    if (!isValidName(def.name)) return `invalid FILES name '${def.name}'`;
+    const reason = filesAccessReason(def);
+    return reason === undefined ? undefined : `FILES ${def.name}: ${reason}`;
+}
+
 function checkReleaseBodyFormat(body: CatalogReleaseBody): string | undefined {
     if (!isValidSemver(body.version)) return `invalid release version '${body.version}' (expected MAJOR.MINOR.PATCH)`;
 
@@ -89,6 +98,15 @@ function checkReleaseBodyFormat(body: CatalogReleaseBody): string | undefined {
     for (const [hash, change] of Object.entries(body.changes ?? {})) {
         if (addHashes.has(hash)) return `group '${hash}' is added and changed in the same release`;
         if (!isNonEmptySet(change.version)) return `change of group '${hash}' names an empty version`;
+    }
+
+    const filesHashes = new Set<string>();
+    for (const def of body.files ?? []) {
+        const reason = checkFilesDefFormat(def);
+        if (reason !== undefined) return reason;
+        const hash = catalogFilesHash(def);
+        if (filesHashes.has(hash)) return `FILES '${def.name}' is added twice`;
+        filesHashes.add(hash);
     }
 
     const paramNames = new Set<string>();

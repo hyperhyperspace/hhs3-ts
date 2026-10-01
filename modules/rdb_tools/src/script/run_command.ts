@@ -20,6 +20,7 @@ export type { CommandRun };
 
 export type CommandRunOptions = {
     rl?: Interface;
+    firstLine?: number;
 };
 
 export async function runLanguageWithUnlock(
@@ -65,5 +66,6 @@ export async function runCommand(
     return runPortableCommand(session, command, file, {
         auth: toAuthInteractionContext(session, { rl: options?.rl }),
         requestPassphrase: (need) => requestPassphrase(session, need, options?.rl),
+        ...(options?.firstLine !== undefined ? { firstLine: options.firstLine } : {}),
     });
 }

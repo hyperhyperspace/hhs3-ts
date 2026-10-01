@@ -66,6 +66,23 @@ export function formatTableResult(result: LangExecutionResult, session: ReplSess
         case 'bundle': return `bundle ${ctx.formatString(result.entryHash, { role: 'hash' })} (${result.writes} writes)`;
         case 'alter-schema': return `altered schema ${ctx.formatString(result.schema, { role: 'hash' })} (${result.rules} rules, ${ctx.formatString(result.entryHash, { role: 'hash' })})`;
         case 'update-ref': return `updated ref ${ctx.formatString(result.ref, { role: 'hash' })} on ${ctx.formatString(result.group, { role: 'hash' })} (${ctx.formatString(result.entryHash, { role: 'hash' })})`;
+        case 'put-file': {
+            const where = result.owner === undefined ? '' : ` in key ${ctx.formatString(result.owner, { role: 'hash' })}`;
+            const bytes = result.uploaded ? `uploaded ${result.size} bytes` : `${result.size} bytes already stored`;
+            return `put ${result.files}/${result.path}${where}: ${bytes} (${ctx.formatString(result.fileHash, { role: 'hash' })})`;
+        }
+        case 'get-file':
+            if (result.written !== undefined) {
+                return `wrote ${result.files}/${result.path} to ${result.written} (${result.size} bytes, ${ctx.formatString(result.fileHash, { role: 'hash' })})`;
+            }
+            return result.text ?? result.b64 ?? '';
+        case 'list-files': {
+            const records = result.rows.map((row) => ({ ...row, size: row.size ?? '' }));
+            const listCtx = createDisplayContext(session, collectTruncatableStrings(records, new Set(['fileHash', 'owner'])));
+            return mode === 'vertical'
+                ? formatRowsVertical(records, result.columns, { ctx: listCtx })
+                : formatRows(records, result.columns, { ctx: listCtx });
+        }
     }
 }
 

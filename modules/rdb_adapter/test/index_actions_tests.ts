@@ -128,8 +128,8 @@ async function indexNames(target: MemoryTarget): Promise<string[]> {
     return (await target.getIndexState()).materialized.map((m) => `${m.table}.${m.name}`).sort();
 }
 
-function spec(version: number, indexes: IndexDecl[], extra: Partial<IndexSpec> = {}): IndexSpec {
-    return { version, indexes, ...extra };
+function spec(indexes: IndexDecl[], extra: Partial<IndexSpec> = {}): IndexSpec {
+    return { indexes, ...extra };
 }
 
 function bookDecl(name: string, table: string, columns: IndexDecl['columns'], extra: Partial<IndexDecl> = {}): IndexDecl {
@@ -158,25 +158,23 @@ export const indexActionsTests = {
                     const reason = validateIndexSpec(s);
                     assertTrue(reason !== undefined && reason.includes(match), `${why}: got ${String(reason)}`);
                 };
-                ok(spec(0, []), 'empty spec at version 0');
-                ok(spec(1, [decl('by_author', 'posts', ['@author', 'title'])]), '@author pseudo-column');
-                ok(spec(1, [decl('by_title', 'posts', ['title'], { options: { anything: [1, 'x'] } })]),
+                ok(spec([]), 'empty spec');
+                ok(spec([decl('by_author', 'posts', ['@author', 'title'])]), '@author pseudo-column');
+                ok(spec([decl('by_title', 'posts', ['title'], { options: { anything: [1, 'x'] } })]),
                     'options are opaque to the core');
-                ok(spec(1, [decl('by_title', 'posts', ['title']), { ...decl('by_title', 'posts', ['title']), group: 'other' }]),
+                ok(spec([decl('by_title', 'posts', ['title']), { ...decl('by_title', 'posts', ['title']), group: 'other' }]),
                     'the same name in two groups is fine');
-                bad(spec(1.5, []), 'non-negative integer', 'fractional version');
-                bad(spec(-1, []), 'non-negative integer', 'negative version');
-                bad(spec(1, [{ ...decl('x', 'posts', ['title']), group: '' }]), 'must name its group', 'empty group');
-                bad(spec(1, [decl('bad name', 'posts', ['title'])]), 'not a valid identifier', 'bad index name');
-                bad(spec(1, [decl('pub__title', 'posts', ['title'])]), 'reserved', 'pub__ prefix is reserved');
-                bad(spec(1, [decl('x', 'posts', ['title']), decl('x', 'comments', ['body'])]), 'declared twice',
+                bad(spec([{ ...decl('x', 'posts', ['title']), group: '' }]), 'must name its group', 'empty group');
+                bad(spec([decl('bad name', 'posts', ['title'])]), 'not a valid identifier', 'bad index name');
+                bad(spec([decl('pub__title', 'posts', ['title'])]), 'reserved', 'pub__ prefix is reserved');
+                bad(spec([decl('x', 'posts', ['title']), decl('x', 'comments', ['body'])]), 'declared twice',
                     'duplicate name within one group');
-                bad(spec(1, [decl('x', 'posts', [])]), 'at least one column', 'no columns');
-                bad(spec(1, [decl('x', 'posts', ['title', 'title'])]), 'twice', 'duplicate column');
-                bad(spec(1, [decl('x', 'posts', [{ column: 'title', desc: true } as unknown as string])]),
+                bad(spec([decl('x', 'posts', [])]), 'at least one column', 'no columns');
+                bad(spec([decl('x', 'posts', ['title', 'title'])]), 'twice', 'duplicate column');
+                bad(spec([decl('x', 'posts', [{ column: 'title', desc: true } as unknown as string])]),
                     "belong in the target's options", 'object column entries are refused');
-                bad(spec(1, [decl('x', 'posts', ['@who'])]), 'not a valid identifier', 'unknown pseudo-column');
-                bad(spec(1, [decl('x', 'no such', ['title'])]), 'table', 'bad table identifier');
+                bad(spec([decl('x', 'posts', ['@who'])]), 'not a valid identifier', 'unknown pseudo-column');
+                bad(spec([decl('x', 'no such', ['title'])]), 'table', 'bad table identifier');
             },
         },
         {
@@ -231,7 +229,7 @@ export const indexActionsTests = {
         {
             name: '[IDX04] groupIndexDecls filters by group and expands indexPub into pub__<column> decls',
             invoke: async () => {
-                const s = spec(1, [decl('by_title', 'posts', ['title']), { ...decl('elsewhere', 'posts', ['title']), group: 'other' }]);
+                const s = spec([decl('by_title', 'posts', ['title']), { ...decl('elsewhere', 'posts', ['title']), group: 'other' }]);
                 assertEquals(groupIndexDecls(s, 'forum', forumView).map((d) => d.name).join(','), 'by_title',
                     'only this group\'s declarations');
                 assertEquals(groupIndexDecls(undefined, 'forum', forumView).length, 0, 'no spec, no declarations');
@@ -312,39 +310,33 @@ export const indexActionsTests = {
             },
         },
         {
-            name: '[IDX07] reconcileIndexes version gate: installed, unchanged, conflict, skipped-older, dry-run',
+            name: '[IDX07] reconcileIndexes: installed, unchanged, replaced, dry-run',
             invoke: async () => {
-                const { group, admin, members } = await createGroup();
-                await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', amount: '1.00' }, admin);
+                const { group, members } = await createGroup();
+                await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', amount: '1.00' });
                 const target = new MemoryTarget();
                 await projectGroup(group, target);
 
-                const v1 = spec(1, [bookDecl('by_memo', 'ledger', ['memo'])]);
-                const r1 = await reconcileIndexes(members, target, v1);
+                const first = spec([bookDecl('by_memo', 'ledger', ['memo'])]);
+                const r1 = await reconcileIndexes(members, target, first);
                 assertEquals(r1.status, 'installed', 'first spec installs');
                 assertEquals(kinds(r1.actions).join(','), 'ensure:ledger.by_memo', 'first spec ensures its index');
                 assertEquals((await indexNames(target)).join(','), 'ledger.by_memo', 'index record materialized');
-                assertEquals((await target.getIndexState()).spec?.version, 1, 'spec stored as installed');
+                assertEquals((await target.getIndexState()).spec?.indexes[0]?.name, 'by_memo', 'spec stored as installed');
 
-                const again = await reconcileIndexes(members, target, v1);
-                assertEquals(again.status, 'unchanged', 'same version + content is a no-op');
+                const again = await reconcileIndexes(members, target, first);
+                assertEquals(again.status, 'unchanged', 'the same spec is a no-op');
                 assertEquals(again.actions.length, 0, 'no-op carries no actions');
 
-                await expectReject(() => reconcileIndexes(members, target, spec(1, [])), 'bump the version',
-                    'same version, different content');
-                const older = await reconcileIndexes(members, target, spec(0, []));
-                assertEquals(older.status, 'skipped-older', 'older version is skipped');
-                assertEquals((await indexNames(target)).join(','), 'ledger.by_memo', 'skipped spec changes nothing');
-
-                const v2 = spec(2, [bookDecl('by_ref', 'ledger', ['ref'])]);
-                const dry = await reconcileIndexes(members, target, v2, { dryRun: true });
+                const next = spec([bookDecl('by_ref', 'ledger', ['ref'])]);
+                const dry = await reconcileIndexes(members, target, next, { dryRun: true });
                 assertEquals(dry.status, 'dry-run', 'dry run reports');
                 assertEquals(kinds(dry.actions).join(','), 'drop:ledger.by_memo,ensure:ledger.by_ref', 'dry run plans drops then ensures');
-                assertEquals((await target.getIndexState()).spec?.version, 1, 'dry run installs nothing');
+                assertEquals((await target.getIndexState()).spec?.indexes[0]?.name, 'by_memo', 'dry run installs nothing');
                 assertEquals((await indexNames(target)).join(','), 'ledger.by_memo', 'dry run changes no index');
 
-                const r2 = await reconcileIndexes(members, target, v2);
-                assertEquals(r2.status, 'installed', 'newer version installs');
+                const r2 = await reconcileIndexes(members, target, next);
+                assertEquals(r2.status, 'installed', 'a different spec installs');
                 assertEquals((await indexNames(target)).join(','), 'ledger.by_ref', 'old index dropped, new one built');
             },
         },
@@ -354,14 +346,14 @@ export const indexActionsTests = {
                 const { group, members } = await createGroup();
                 const target = new MemoryTarget();
                 await projectGroup(group, target);
-                await expectReject(() => reconcileIndexes(members, target, spec(1, [bookDecl('pub__x', 'ledger', ['memo'])])),
+                await expectReject(() => reconcileIndexes(members, target, spec([bookDecl('pub__x', 'ledger', ['memo'])])),
                     'reserved', 'structurally invalid spec is refused before touching the target');
                 await expectReject(
-                    () => reconcileIndexes(members, target, spec(1, [{ ...bookDecl('by_memo', 'ledger', ['memo']), options: {} }])),
+                    () => reconcileIndexes(members, target, spec([{ ...bookDecl('by_memo', 'ledger', ['memo']), options: {} }])),
                     'takes no index options', 'the memory target refuses any options, even {}');
                 assertEquals((await target.getIndexState()).spec, undefined, 'refused options install nothing');
 
-                const r = await reconcileIndexes(members, target, spec(1, [
+                const r = await reconcileIndexes(members, target, spec([
                     bookDecl('by_memo', 'ledger', ['memo']),
                     bookDecl('later', 'invoices', ['total']),
                     bookDecl('typo', 'ledger', ['mmeo']),
@@ -379,10 +371,10 @@ export const indexActionsTests = {
             name: '[IDX09] apply-time maintenance: drop-column drops the index first; re-adding the column rebuilds it',
             invoke: async () => {
                 const { schema, group, admin, members } = await createGroup();
-                await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', amount: '1.00', memo: 'm' }, admin);
+                await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', amount: '1.00', memo: 'm' });
                 const target = new MemoryTarget();
                 await projectGroup(group, target);
-                await reconcileIndexes(members, target, spec(1, [
+                await reconcileIndexes(members, target, spec([
                     bookDecl('by_memo', 'ledger', ['memo', 'ref']),
                     bookDecl('by_ref', 'ledger', ['ref']),
                 ]));
@@ -408,7 +400,7 @@ export const indexActionsTests = {
                 const { schema, group, admin, members } = await createGroup();
                 const target = new MemoryTarget();
                 await projectGroup(group, target);
-                await reconcileIndexes(members, target, spec(1, [
+                await reconcileIndexes(members, target, spec([
                     bookDecl('by_code', 'tags', ['code']),
                     bookDecl('by_post', 'comments', ['post']),
                 ]));
@@ -438,7 +430,7 @@ export const indexActionsTests = {
                 const target = new MemoryTarget();
 
                 // Nothing projected yet: the spec is recorded, with no actions.
-                const r = await reconcileIndexes(members, target, spec(1, [bookDecl('by_memo', 'ledger', ['memo'])], { indexPub: true }));
+                const r = await reconcileIndexes(members, target, spec([bookDecl('by_memo', 'ledger', ['memo'])], { indexPub: true }));
                 assertEquals(r.status, 'installed', 'installs on an empty target');
                 assertEquals(r.actions.length, 0, 'no group materialized -> nothing to build yet');
 

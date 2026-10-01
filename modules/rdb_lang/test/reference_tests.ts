@@ -20,15 +20,18 @@ const ALL_KINDS: AstStatement['kind'][] = [
     'set-view',
     'select',
     'log',
+    'put-file',
+    'get-file',
+    'list-files',
 ];
 
 export const referenceTests = {
     title: '[RDB_LANG:REF] Command reference',
     tests: [
         {
-            name: '[REF01] LANG_COMMAND_REFS has 15 entries',
+            name: '[REF01] LANG_COMMAND_REFS has 18 entries',
             invoke: async () => {
-                assertEquals(LANG_COMMAND_REFS.length, 15, 'entry count');
+                assertEquals(LANG_COMMAND_REFS.length, 18, 'entry count');
             },
         },
         {
@@ -63,7 +66,7 @@ export const referenceTests = {
                 assertEquals(create.length, 3, 'CREATE prefix count');
                 assertTrue(create.every((ref) => ref.command.startsWith('CREATE')), 'CREATE prefix match');
                 assertEquals(findLangCommandRefs('NOPE').length, 0, 'unknown prefix');
-                assertEquals(findLangCommandRefs().length, 15, 'no filter returns all');
+                assertEquals(findLangCommandRefs().length, 18, 'no filter returns all');
             },
         },
         {

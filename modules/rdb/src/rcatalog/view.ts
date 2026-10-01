@@ -4,7 +4,7 @@ import { B64Hash, KeyId } from "@hyper-hyper-space/hhs3_crypto";
 import { Version, version } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RCatalog, RCatalogView } from "./interfaces.js";
-import type { CatalogGroupDef, SchemaCreator } from "./payload.js";
+import type { CatalogFilesDef, CatalogGroupDef, SchemaCreator } from "./payload.js";
 import { CatalogIndex, DeclareInfo, ReleaseState } from "./resolve.js";
 
 export class RCatalogViewImpl implements RCatalogView {
@@ -71,6 +71,14 @@ export class RCatalogViewImpl implements RCatalogView {
     getGroupDef(hash: B64Hash): CatalogGroupDef | undefined {
         for (const release of this.maximal) {
             const def = this.index.releaseState(release).defs.get(hash);
+            if (def !== undefined) return def;
+        }
+        return undefined;
+    }
+
+    getFilesDef(hash: B64Hash): CatalogFilesDef | undefined {
+        for (const release of this.maximal) {
+            const def = this.index.releaseState(release).files.get(hash);
             if (def !== undefined) return def;
         }
         return undefined;

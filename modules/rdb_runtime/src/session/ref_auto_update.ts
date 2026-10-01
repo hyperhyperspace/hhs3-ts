@@ -140,8 +140,8 @@ async function observeWithResolvedAuthor(
     const refAt = targetVersion;
     const refFrom = targetVersion;
 
-    if (impl.observeGateFor(foreignGroupId) === undefined) {
-        return observer.observe(bindingName, targetVersion, triggerAuthor);
+    if (!observer.observeNeedsAuthor(foreignGroupId)) {
+        return observer.observe(bindingName, targetVersion);
     }
 
     const preferred = [triggerAuthor, await session.currentAuthor()];

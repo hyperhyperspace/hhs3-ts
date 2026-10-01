@@ -5,8 +5,10 @@ import { dirname, join } from "node:path";
 import {
     chacha20Poly1305,
     createIdentity,
+    getSigningSuite,
     HashSuite,
     KeyId,
+    keyIdFromPublicKey,
     OwnIdentity,
     random,
     SIGNING_ED25519,
@@ -29,6 +31,8 @@ type KeystoreFile = {
     version: 1;
     keys: StoredKeyRecord[];
 };
+
+const KEY_PAIR_PROBE = new TextEncoder().encode('hhs3 keystore: key pair check');
 
 // Resolve the global keystore path. The keystore is shared across all
 // workspaces and lives in the user's home directory by default. The env
@@ -83,6 +87,18 @@ export class KeyStore implements KeyVault {
         return identity;
     }
 
+    // Add a record exported from another keystore, still encrypted with its own
+    // passphrase. Importing the same key again is a no-op.
+    async importRecord(record: StoredKeyRecord): Promise<void> {
+        const existing = this.data.keys.find((key) => key.label === record.label);
+        if (existing !== undefined) {
+            if (existing.keyId === record.keyId) return;
+            throw new Error(`Key label '${record.label}' already exists`);
+        }
+        this.data.keys.push(JSON.parse(JSON.stringify(record)) as StoredKeyRecord);
+        await this.save();
+    }
+
     // Decrypt a stored key with its passphrase and return the identity. This is
     // a pure read: it does not mutate the vault or any session state.
     async unlock(labelOrPrefix: string, passphrase: string): Promise<OwnIdentity> {
@@ -90,9 +106,34 @@ export class KeyStore implements KeyVault {
         const key = deriveKey(passphrase, record.kdf);
         const ciphertext = base64ToBytes(record.aead.ciphertext);
         const nonce = base64ToBytes(record.aead.nonce);
-        const plaintext = chacha20Poly1305.decrypt(ciphertext, key, nonce, new TextEncoder().encode(record.keyId));
+        let plaintext: Uint8Array;
+        try {
+            plaintext = chacha20Poly1305.decrypt(ciphertext, key, nonce, new TextEncoder().encode(record.keyId));
+        } catch {
+            throw new Error(`Wrong passphrase for key '${record.label}'`);
+        }
         const secret = JSON.parse(new TextDecoder().decode(plaintext));
-        return decodeIdentitySecret(record.keyId, secret);
+        const identity = decodeIdentitySecret(record.keyId, secret);
+        await this.checkKeyPair(record.label, identity);
+        return identity;
+    }
+
+    // The keyId is the record's plaintext; the key pair is what was sealed.
+    // Whoever can write the file can seal any key pair under a real keyId
+    // (it is only the AEAD's associated data), so check that they agree.
+    private async checkKeyPair(label: string, identity: OwnIdentity): Promise<void> {
+        if (keyIdFromPublicKey(identity.publicKey, this.hashSuite) !== identity.keyId) {
+            throw new Error(`Key '${label}' does not match its key id`);
+        }
+        const suite = getSigningSuite(identity.publicKey.suite);
+        if (suite === undefined) throw new Error(`Key '${label}' uses an unknown signing suite '${identity.publicKey.suite}'`);
+        let verified: boolean;
+        try {
+            verified = await suite.verify(KEY_PAIR_PROBE, await suite.sign(KEY_PAIR_PROBE, identity.secretKey), identity.publicKey.key);
+        } catch {
+            verified = false;
+        }
+        if (!verified) throw new Error(`Key '${label}' holds a secret key that does not match its public key`);
     }
 
     resolvePublic(labelOrPrefix: string): { keyId: KeyId; publicKey: ReturnType<typeof decodePublicKey> } {

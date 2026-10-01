@@ -13,12 +13,14 @@
 // rows.
 
 import type { HashSuite } from "@hyper-hyper-space/hhs3_crypto";
+import type { json } from "@hyper-hyper-space/hhs3_json";
 import {
     computeKeyId, deserializePublicKeyFromBase64,
     validationFailure, validationOk, ValidationResult,
 } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchemaView } from "../rschema/interfaces.js";
+import type { IdProvider } from "../rschema/payload.js";
 import { columnValueValidReason } from "../rschema/validate.js";
 import type { InsertRowPayload, UpdateRowPayload, RowOpPayload } from "./payload.js";
 
@@ -85,9 +87,15 @@ export function validateProviderInsertIntegrity(
     if (op.action !== 'insert') return validationOk();
     const provider = view.getIdProvider(table);
     if (provider === undefined) return validationOk();
+    return validateProviderValues(op.values, provider, hashSuite);
+}
 
-    const keyIdVal = op.values[provider.keyIdColumn];
-    const pkVal = op.values[provider.publicKeyColumn];
+// The same check over a provider row's values.
+export function validateProviderValues(
+    values: { [column: string]: json.Literal }, provider: IdProvider, hashSuite: HashSuite,
+): ValidationResult {
+    const keyIdVal = values[provider.keyIdColumn];
+    const pkVal = values[provider.publicKeyColumn];
     if (typeof keyIdVal !== 'string' || typeof pkVal !== 'string') {
         return validationFailure(`provider row must carry string '${provider.keyIdColumn}' and '${provider.publicKeyColumn}' values`);
     }

@@ -938,7 +938,6 @@ export const sqliteSpecificTests = {
                 const members: GroupProjection[] = [{ group, config: {} }];
 
                 const report = await reconcileIndexes(members, target, {
-                    version: 1,
                     indexes: [
                         financeDecl('by_memo', 'ledger', ['memo'], { columns: { memo: { collate: 'NOCASE', whereNotNull: true } } }),
                         financeDecl('by_amount', 'ledger', ['amount', '@author'], { columns: { amount: { desc: true } } }),
@@ -966,7 +965,8 @@ export const sqliteSpecificTests = {
 
                 // State survives reopening the database with a fresh target.
                 const reopened = await new SqliteTarget(db).getIndexState();
-                assertEquals(reopened.spec?.version, 1, 'installed spec persisted');
+                assertEquals(reopened.spec?.indexes.map((d) => d.name).sort().join(','), 'by_amount,by_memo',
+                    'installed spec persisted');
                 assertEquals(reopened.materialized.map((m) => m.name).sort().join(','), 'by_amount,by_memo',
                     'materialized records persisted');
                 db.close();
@@ -981,7 +981,7 @@ export const sqliteSpecificTests = {
                 await projectGroup(group, target);
                 const members: GroupProjection[] = [{ group, config: {} }];
                 const attempt = (options: IndexDecl['options']) =>
-                    reconcileIndexes(members, target, { version: 1, indexes: [financeDecl('ix', 'ledger', ['memo'], options)] });
+                    reconcileIndexes(members, target, { indexes: [financeDecl('ix', 'ledger', ['memo'], options)] });
 
                 await expectThrows(() => attempt({ columns: { memo: { collate: 'FANCY' } } }), 'unknown collation', 'bad collation');
                 await expectThrows(() => attempt({ columns: { ref: { collate: 'NOCASE' } } }), 'does not list',
@@ -1015,7 +1015,6 @@ export const sqliteSpecificTests = {
                 await projectGroup(group, target);
                 const members: GroupProjection[] = [{ group, config: {} }];
                 await reconcileIndexes(members, target, {
-                    version: 1,
                     indexes: [financeDecl('by_memo', 'ledger', ['memo', 'ref']), financeDecl('by_ref', 'ledger', ['ref'])],
                 });
 
@@ -1083,7 +1082,7 @@ export const sqliteSpecificTests = {
                     kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
                     columns: [{ name: 'ref', def: { type: 'string' } }],
                 }], [], v1);
-                const spec: IndexSpec = { version: 1, indexes: [] };
+                const spec: IndexSpec = { indexes: [] };
                 const expect = { specFingerprint: undefined, checkpoints: new Map([[gid, v1]]) };
 
                 await expectThrows(() => target.installIndexSpec(spec, 'fp1', [

@@ -1,6 +1,6 @@
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { RObject } from "@hyper-hyper-space/hhs3_mvt";
-import type { RCatalogImpl, RDbImpl, RSchema, RTable, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
+import type { MemberFiles, RBlobStore, RCatalogImpl, RDbImpl, RFileMap, RSchema, RTable, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 import {
     RCATALOG_TYPE_ID, RDB_TYPE_ID, RDEPLOY_GATE_TYPE_ID, RSCHEMA_TYPE_ID, RTABLE_GROUP_TYPE_ID,
 } from "@hyper-hyper-space/hhs3_rdb";
@@ -8,8 +8,10 @@ import type {
     HashRef,
     HashScope,
     NameOrHashRef,
+    NameRef,
     ResolvedCatalogRef,
     ResolvedDatabaseRef,
+    ResolvedFilesRef,
     ResolvedGroupRef,
     ResolvedLogTarget,
     ResolvedSchemaRef,
@@ -139,6 +141,54 @@ export class RootIndex {
             if (root.object === undefined) continue;
             const id = (await (root.object as RDbImpl).getMemberGroupNames()).get(name);
             if (id !== undefined) out.push({ db: root, groupId: id });
+        }
+        return out;
+    }
+
+    // A FILES member by `db.files` or `files`, with the group rules: a bare
+    // name resolves in the current database when one is set, otherwise when
+    // exactly one database has it. Both objects must be present.
+    async resolveFiles(ref: NameRef, ctx: RootResolveContext = {}): Promise<ResolvedFilesRef> {
+        let found: { db: RootRecord; files: MemberFiles }[];
+        if (ref.parts.length === 2) {
+            const [dbName, name] = ref.parts as [string, string];
+            const db = await this.resolveDatabase({ kind: 'name', text: dbName, parts: [dbName], span: ref.span }, ctx);
+            const files = db.db === undefined ? undefined : (await db.db.getMemberFiles()).find((m) => m.name === name);
+            if (files === undefined) throw new Error(`Database '${dbName}' has no FILES '${name}'`);
+            found = [{ db: this.roots.get(db.id)!, files }];
+        } else if (ref.parts.length === 1) {
+            found = await this.filesNamed(ref.text);
+            if (ctx.currentDatabase !== undefined) {
+                const here = found.filter((f) => f.db.id === ctx.currentDatabase);
+                if (here.length === 0) {
+                    const where = this.roots.get(ctx.currentDatabase)?.name ?? ctx.currentDatabase;
+                    const elsewhere = found.map((f) => `${f.db.name ?? `#${f.db.id.slice(0, 8)}`}.${ref.text}`);
+                    throw new Error(`Unknown FILES '${ref.text}' in database '${where}'${elsewhere.length > 0 ? `; use ${elsewhere.join(' or ')}` : ''}`);
+                }
+                found = here;
+            }
+            if (found.length === 0) throw new Error(`Unknown FILES '${ref.text}'`);
+            if (found.length > 1) {
+                const candidates = found.map((f) => `${f.db.name ?? `#${f.db.id.slice(0, 8)}`}.${ref.text}`);
+                throw new Error(`Ambiguous FILES '${ref.text}': ${candidates.join(', ')} (use db.files or USE DATABASE)`);
+            }
+        } else {
+            throw new Error(`Expected files or db.files, got '${ref.text}'`);
+        }
+        const [{ db, files }] = found;
+        const rdb = db.object as RDbImpl;
+        const store = await rdb.getContext().getObject(files.storeId);
+        const map = await rdb.getContext().getObject(files.mapId);
+        if (store === undefined || map === undefined) throw new Error(`FILES '${files.name}' hasn't arrived on this replica yet`);
+        return { name: files.name, database: db.id, store: store as unknown as RBlobStore, map: map as unknown as RFileMap };
+    }
+
+    private async filesNamed(name: string): Promise<{ db: RootRecord; files: MemberFiles }[]> {
+        const out: { db: RootRecord; files: MemberFiles }[] = [];
+        for (const root of this.list('database')) {
+            if (root.object === undefined) continue;
+            const files = (await (root.object as RDbImpl).getMemberFiles()).find((m) => m.name === name);
+            if (files !== undefined) out.push({ db: root, files });
         }
         return out;
     }

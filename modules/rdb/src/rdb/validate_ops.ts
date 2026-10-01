@@ -6,8 +6,9 @@
 //                     none are: no author/signature fields); names the
 //                     create's catalog; its foreign dep {catalog, [release]}
 //                     makes the release present before validation; the target
-//                     is a release and every release deployed at `at` is
-//                     strictly in its causal past (forward only); each
+//                     is a release and no release deployed at `at` is at or
+//                     above it (never backwards; a release concurrent with a
+//                     deployed one merges with it, see resolve.ts); each
 //                     supplied param is declared by the target, not already
 //                     set at `at`, and of the declared type; afterwards every
 //                     param the target declares is set.
@@ -138,8 +139,11 @@ async function validateUpdateCatalog(update: UpdateCatalogPayload, rdb: RDbOpHos
     const ops = await rdb.opsAt(at);
     for (const deployed of deployedHistory(ops)) {
         if (!index.hasEntry(deployed)) throw new Error(`catalog release '${deployed}' is not present in the replica`);
-        if (!index.isReleaseBelow(deployed, update.release)) {
-            return validationFailure(`update-catalog must move forward: release '${deployed}' is not below the target`, { objectHash });
+        if (deployed === update.release) {
+            return validationFailure(`update-catalog must not move backwards: release '${deployed}' is already deployed`, { objectHash });
+        }
+        if (index.isReleaseBelow(update.release, deployed)) {
+            return validationFailure(`update-catalog must not move backwards: the target is below deployed release '${deployed}'`, { objectHash });
         }
     }
 

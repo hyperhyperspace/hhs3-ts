@@ -13,10 +13,10 @@
 // missing reference (unbound name or absent foreign table) makes the atom
 // false, same as an empty local result.
 //
-// Identity terms resolve from the op's author (already signature-verified at
-// validation when the group has a provider, so op.author is trusted here). The
-// subject row's insert author is exposed as the readonly system column
-// `rowAuthor`.
+// Identity terms resolve from the op's author (admission rejects any author
+// that does not verify, so op.author is trusted here; an anonymous op leaves
+// them unresolved). The subject row's insert author is exposed as the readonly
+// system column `rowAuthor`.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import type { KeyId, B64Hash } from "@hyper-hyper-space/hhs3_crypto";
@@ -146,16 +146,18 @@ export async function evaluatePredicate(pred: Predicate, env: PredicateEnv): Pro
 // decides the horizon by supplying anchored views: validation passes `(at, at)`,
 // while view-time voiding passes the op position observed from `from`. The
 // subject row's author comes from the insert op author for inserts, and from
-// the live row for updates/deletes.
+// the live row for updates/deletes. `authenticated` (the group has an
+// idProvider) selects the default rule for an op the table declares none for.
 export async function evaluateRowOpRestriction(
     op: RowOpPayload,
     table: string,
     schemaView: RSchemaView,
+    authenticated: boolean,
     getTableView: (table: string) => Promise<RTableView>,
     getForeignTableView: (group: string, table: string) => Promise<RTableView | undefined>,
 ): Promise<boolean> {
     if (!schemaView.hasTable(table)) return false;
-    const rule = schemaView.getRestriction(table, op.action);
+    const rule = schemaView.getRestriction(table, op.action, authenticated);
 
     let subjectRow: RowValues | undefined;
     if (op.action === 'insert') {
@@ -197,14 +199,15 @@ export async function explainRowOpRestriction(
     op: RowOpPayload,
     table: string,
     schemaView: RSchemaView,
+    authenticated: boolean,
     getTableView: (table: string) => Promise<RTableView>,
     getForeignTableView: (group: string, table: string) => Promise<RTableView | undefined>,
 ): Promise<RowOpRestrictionFailure | undefined> {
     if (!schemaView.hasTable(table)) {
         return { table, action: op.action, rowId: op.rowId, rule: { p: 'false' } };
     }
-    const rule = schemaView.getRestriction(table, op.action);
-    const ok = await evaluateRowOpRestriction(op, table, schemaView, getTableView, getForeignTableView);
+    const rule = schemaView.getRestriction(table, op.action, authenticated);
+    const ok = await evaluateRowOpRestriction(op, table, schemaView, authenticated, getTableView, getForeignTableView);
     return ok ? undefined : { table, action: op.action, rowId: op.rowId, rule };
 }
 

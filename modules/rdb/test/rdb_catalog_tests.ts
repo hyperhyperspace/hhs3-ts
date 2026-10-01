@@ -21,6 +21,8 @@ import { deployCatalogRelease, planCatalogUpdate, applyCatalogPlan, CatalogUpdat
 import type { RDeployGateImpl } from "../src/rdeploy_gate/rdeploy_gate.js";
 import { deriveRowId } from "../src/rtable/hash.js";
 import { deriveGenesisRowUuid, deriveGroupSeed } from "../src/rdb/instantiate.js";
+import type { RBlobStoreImpl } from "../src/rblob_store/rblob_store.js";
+import type { RFileMapImpl } from "../src/rfile_map/rfile_map.js";
 
 function newCtx(): RContext {
     const ctx = createMockRContext({ selfValidate: true });
@@ -145,20 +147,24 @@ export const rdbCatalogTests = {
             }
         },
         {
-            name: '[RDBC02] deploys move forward only; the planner catches up and is idempotent',
+            name: '[RDBC02] deploys never move backwards; a concurrent release merges; the planner catches up and is idempotent',
             invoke: async () => {
                 const ctx = newCtx();
                 const dev = await makeIdentity();
                 const admin = await makeIdentity();
-                const { rdb, groups, catalog, schemas } = await catalogDatabase(ctx, itemsSpec(dev), { seed: 'rdbc02', creators: [admin], author: admin });
+                const { rdb, groups, catalog, schemas, built } = await catalogDatabase(ctx, itemsSpec(dev), { seed: 'rdbc02', creators: [admin], author: admin });
                 const items = groups.get('items')!;
                 const itemsHash = (await rdb.getMembership())!.byId.get(items.getId())!.catalogGroupHash;
                 const schema = schemas.get('items')!;
                 const genesis = version(catalog.getId());
+                const v1 = await frontierOf(schema);
 
                 const v2 = await addColumn(schema, dev, 'a');
                 const r11 = await catalog.release({ version: '1.1.0', changes: { [itemsHash]: change(schema, v2) } }, dev, genesis);
-                const r101 = await catalog.release({ version: '1.0.1' }, dev, genesis);
+                // a maintenance release on the genesis line, concurrent with 1.1.0
+                const v101 = version(await schema.updateSchema(
+                    [{ rule: 'add-column', table: 'items', column: 'b', def: { type: 'string', nullable: true } }], dev, undefined, v1));
+                const r101 = await catalog.release({ version: '1.0.1', changes: { [itemsHash]: change(schema, v101) } }, dev, genesis);
 
                 const result = await deployCatalogRelease(rdb, { release: r11, author: admin });
                 assertTrue(result.commit !== undefined, 'the planner commits the update-catalog');
@@ -168,12 +174,26 @@ export const rdbCatalogTests = {
                 const again = await deployCatalogRelease(rdb, { release: r11, author: admin });
                 assertTrue(again.commit === undefined && again.deployed.length === 0, 're-running the planner changes nothing');
 
-                await expectFailure(() => rdb.updateCatalog(r11, undefined, admin), 'must move forward', 're-deploying a deployed release is rejected');
-                await expectFailure(() => rdb.updateCatalog(r101, undefined, admin), 'must move forward', 'deploying a concurrent release is rejected');
+                await expectFailure(() => rdb.updateCatalog(r11, undefined, admin), 'must not move backwards', 're-deploying a deployed release is rejected');
 
-                const merge = await catalog.release({ version: '1.2.0', changes: { [itemsHash]: change(schema, v2) } }, dev);
+                // 1.0.1 is concurrent with 1.1.0: deploying it merges the two
+                const sideways = await deployCatalogRelease(rdb, { release: r101, author: admin });
+                assertTrue(sideways.commit !== undefined, 'a concurrent release is deployed');
+                assertEquals((await rdb.getDeployedReleases()).length, 2, 'both releases stay deployed');
+                assertEquals(await currentSchemaVersion(items), [...v2, ...v101].sort().join(','),
+                    'the group moves to the union of its versions in the deployed releases');
+                const merged = await (await items.getSchemaObject()).getView(await items.resolveSchemaVersion(await frontierOf(items)));
+                assertTrue(merged.hasTable('items') && merged.getTable('items')!.columns['a'] !== undefined && merged.getTable('items')!.columns['b'] !== undefined,
+                    'the merged schema carries both lines');
+
+                const merge = await catalog.release({ version: '1.2.0', changes: { [itemsHash]: change(schema, new Set([...v2, ...v101])) } }, dev);
                 await rdb.updateCatalog(merge, undefined, admin);
-                assertEquals((await rdb.getDeployedReleases()).join(','), merge, 'a release above the deployed one is accepted');
+                assertEquals((await rdb.getDeployedReleases()).join(','), merge, 'a release above the deployed ones is accepted and supersedes them');
+
+                // a fresh database at the merge cannot go back to a release below it
+                const fresh = (await ctx.createObject((await buildDatabase(built, { seed: 'rdbc02-fresh' })).rdbPayload)) as RDbImpl;
+                await fresh.updateCatalog(merge);
+                await expectFailure(() => fresh.updateCatalog(r11), 'must not move backwards', 'a release below a deployed one is rejected');
             }
         },
         {
@@ -393,6 +413,96 @@ export const rdbCatalogTests = {
                 assertTrue(result.commit !== undefined, 'the release is committed');
                 assertEquals((await rdb.getDeployedReleases()).join(','), r11, 'the RDb records the release');
                 assertTrue(await ctx.getObject((await rdb.getMemberGroupNames()).get('extra')!) !== undefined, 'the new group exists');
+            }
+        },
+        {
+            name: '[RDBC10] FILES members: deploys create the blob store and file map, bound to the member group',
+            invoke: async () => {
+                const ctx = newCtx();
+                const dev = await makeIdentity();
+                const admin = await makeIdentity();
+                const canWrite = { p: 'exists', table: 'user.caps', where: { grantee: '$author' } } as const;
+                const spec: FixtureSpec = { ...usersSpec(dev), files: [{ name: 'media', group: 'user', idProvider: 'user.identities', canWrite }] };
+                const { rdb, groups, builtDb, catalog } = await catalogDatabase(ctx, spec, {
+                    seed: 'rdbc10', creators: [admin], params: { admin: identityParam(admin) }, author: admin,
+                });
+
+                const members = await rdb.getMemberFiles();
+                assertEquals(members.map((m) => m.name).join(','), 'media', 'the FILES is a member');
+                const media = members[0];
+                assertEquals(media.mapId, builtDb.files.get('media')!.mapId, 'the offline ids match the live ones');
+                assertEquals(media.groupId, groups.get('user')!.getId(), 'bound to the member group');
+                assertFalse((await rdb.getMemberGroupNames()).has('media'), 'a FILES is not a member group');
+
+                const store = (await ctx.getObject(media.storeId)) as RBlobStoreImpl;
+                const map = (await ctx.getObject(media.mapId)) as RFileMapImpl;
+                assertTrue(store !== undefined && map !== undefined, 'the deploy created both objects');
+                assertEquals(map.getBlobStoreId(), store.getId(), 'the map names the store');
+                assertEquals(store.getGroupId(), media.groupId, 'the store binds the member group');
+
+                const status = await catalogStatus(rdb);
+                assertEquals((status.files ?? []).map((f) => `${f.name}:${f.present}`).join(','), 'media:true', 'status lists the FILES');
+
+                const bytes = new TextEncoder().encode('hello');
+                const stored = await store.putFile({ size: bytes.length, read: async function* () { yield bytes; } }, admin, { lane: 0 });
+                await map.add({ section: 'common', path: 'hello.txt', fileHash: stored.fileHash }, admin);
+                assertEquals((await map.list()).map((f) => f.path).join(','), 'hello.txt', 'the manager writes a file');
+                assertFalse(await map.canWrite((await makeIdentity()).keyId), 'an unknown key cannot write');
+
+                const attachments = { name: 'attachments', bindings: { user: builtDb.membership.byId.get(media.groupId)!.catalogGroupHash }, idProvider: 'user.identities', canWrite: { p: 'true' } } as const;
+                const r11 = await catalog.release({ version: '1.1.0', files: [attachments] }, dev);
+                const result = await deployCatalogRelease(rdb, { release: r11, author: admin });
+                const added = (await rdb.getMemberFiles()).find((m) => m.name === 'attachments')!;
+                assertEquals(result.created.slice().sort().join(','), [added.storeId, added.mapId].sort().join(','),
+                    'deploying a later release creates its FILES objects');
+                assertEquals((await rdb.getMemberFiles()).map((m) => m.name).join(','), 'attachments,media', 'members are sorted by name');
+                assertEquals((await catalogStatus(rdb)).files!.length, 2, 'status lists both');
+            }
+        },
+        {
+            name: '[RDBC11] a FILES whose group drops what ALLOW WRITE IF reads becomes read-only: reads work, writes are refused, nothing throws',
+            invoke: async () => {
+                const ctx = newCtx();
+                const dev = await makeIdentity();
+                const admin = await makeIdentity();
+                const canWrite = { p: 'exists', table: 'user.caps', where: { label: 'manager', grantee: '$author' } } as const;
+                const spec: FixtureSpec = { ...usersSpec(dev), files: [{ name: 'media', group: 'user', idProvider: 'user.identities', canWrite }] };
+                const { rdb, groups, schemas, catalog } = await catalogDatabase(ctx, spec, {
+                    seed: 'rdbc11', creators: [admin], params: { admin: identityParam(admin) }, author: admin,
+                });
+                const userSchema = schemas.get('user')!;
+                const userHash = (await rdb.getMembership())!.byId.get(groups.get('user')!.getId())!.catalogGroupHash;
+                const media = (await rdb.getMemberFiles())[0];
+                const store = (await ctx.getObject(media.storeId)) as RBlobStoreImpl;
+                const map = (await ctx.getObject(media.mapId)) as RFileMapImpl;
+
+                const bytes = new TextEncoder().encode('hello');
+                const stored = await store.putFile({ size: bytes.length, read: async function* () { yield bytes; } }, admin, { lane: 0 });
+                await map.add({ section: 'common', path: 'hello.txt', fileHash: stored.fileHash }, admin);
+                assertTrue(await map.canWriteNow(admin.keyId), 'the manager can write before the change');
+
+                const readText = async () => {
+                    const parts: Uint8Array[] = [];
+                    for await (const part of store.readFile(stored.tail)) parts.push(part);
+                    return new TextDecoder().decode(Uint8Array.from(parts.flatMap((p) => [...p])));
+                };
+                const expectReadOnly = async (label: string) => {
+                    assertFalse(await map.canWriteNow(admin.keyId), `${label}: the manager can't write at the group's current version`);
+                    assertEquals((await map.list()).map((f) => f.path).join(','), 'hello.txt', `${label}: the file is still listed`);
+                    assertEquals(await readText(), 'hello', `${label}: the file still reads`);
+                    await expectFailure(() => map.add({ section: 'common', path: 'more.txt', fileHash: stored.fileHash }, admin),
+                        'is not allowed to write', `${label}: a new write is refused`);
+                };
+
+                await userSchema.updateSchema([{ rule: 'drop-column', table: 'caps', column: 'label' }], dev);
+                const r11 = await catalog.release({ version: '1.1.0', changes: { [userHash]: change(userSchema, await frontierOf(userSchema)) } }, dev);
+                await deployCatalogRelease(rdb, { release: r11, author: admin });
+                await expectReadOnly('a dropped where column');
+
+                await userSchema.updateSchema([{ rule: 'drop-table', table: 'caps' }], dev);
+                const r12 = await catalog.release({ version: '1.2.0', changes: { [userHash]: change(userSchema, await frontierOf(userSchema)) } }, dev);
+                await deployCatalogRelease(rdb, { release: r12, author: admin });
+                await expectReadOnly('a dropped table');
             }
         },
     ],

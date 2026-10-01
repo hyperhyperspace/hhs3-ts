@@ -39,9 +39,10 @@ export interface RTable extends RObject {
     // rowIds are WRITE-ONCE identities: deletes are permanent, and a deleted
     // rowId can never be re-inserted (insert a new row with a fresh uuid
     // instead). `author` is optional: an unauthored op is anonymous and passes
-    // authentication trivially, but cannot satisfy $author restrictions
-    // (when the group has a provider, an authored op's signature is verified at
-    // validation). `at` defaults to the GROUP frontier (not the table-scope
+    // authentication trivially, but cannot satisfy $author restrictions. An
+    // authored op's signature is verified at validation through the group's
+    // provider; a group with no provider rejects authored ops. `at` defaults
+    // to the GROUP frontier (not the table-scope
     // frontier): by default a write extends the group's consistent snapshot.
     insert(uuid: string, values: RowValues, author?: OwnIdentity, at?: Version): Promise<B64Hash>;
     // partial update: only the changed values; per-field LWW with entry-hash

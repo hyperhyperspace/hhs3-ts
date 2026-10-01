@@ -59,10 +59,17 @@ async function testRSchemaCreate() {
         action: 'create',
         type: RSCHEMA_TYPE_ID,
         name: 'shop',
+        version: '1.0.0',
         creators: [{ keyId: 'alice', publicKey: 'pem...' }],
         tables: [ordersTable(), linesTable()],
     };
     assertTrue(validateRSchemaPayloadFormat(create), 'well-formed schema create should validate');
+
+    const { version: _createVersion, ...unversionedCreate } = create;
+    assertFalse(validateRSchemaPayloadFormat(unversionedCreate as json.Literal),
+        'schema create without a version should not validate');
+    assertFalse(validateRSchemaPayloadFormat({ ...create, version: '1.0' }),
+        'schema create with a non-semver version should not validate');
 
     assertFalse(validateRSchemaPayloadFormat({ ...create, type: 'wrong/type' }),
         'schema create with wrong type should not validate');
@@ -95,12 +102,19 @@ async function testRSchemaCreate() {
 async function testRSchemaUpdate() {
     const update: SchemaUpdatePayload = {
         action: 'schema-update',
+        version: '1.0.1',
         migration: [{ rule: 'add-column', table: 'orders', column: 'status', def: { type: 'string', default: 'new' } }],
         note: 'add order status',
         author: 'alice',
         signature: 'sig...',
     };
     assertTrue(validateRSchemaPayloadFormat(update), 'well-formed rules-only schema update should validate');
+
+    const { version: _updateVersion, ...unversionedUpdate } = update;
+    assertFalse(validateRSchemaPayloadFormat(unversionedUpdate as json.Literal),
+        'schema update without a version should not validate');
+    assertFalse(validateRSchemaPayloadFormat({ ...update, version: 'v1.0.1' }),
+        'schema update with a non-semver version should not validate');
 
     const { author: _author, signature: _signature, ...unsigned } = update;
     assertFalse(validateRSchemaPayloadFormat(unsigned as json.Literal),

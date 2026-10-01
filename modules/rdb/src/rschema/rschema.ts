@@ -4,24 +4,26 @@
 // ACTIONS (see payload.ts for formats):
 //
 //   create
-//     Genesis of a schema. Carries: name,
-//     `creators` (keyId + publicKey pairs; spec authority — they may sign
-//     schema-updates), the initial TableDef[] (columns with types /
+//     Genesis of a schema. Carries: name, the schema's first version (strict
+//     semver), `creators` (keyId + publicKey pairs; spec authority — they may
+//     sign schema-updates), the initial TableDef[] (columns with types /
 //     nullable / default / pub, concurrentDeletes, fks: column -> table with
 //     at-use semantics, restrictions: at-use predicates tagged
 //     insert / update / delete / all), hash algorithm. No object-op gates:
 //     deploy authority is per-instance policy (RTableGroup's canDeploy).
 //
 //   schema-update
-//     Evolves the spec. Carries ONLY the migration rules — the slot writes:
-//     add/drop-table, add/drop-column, set-concurrent-deletes,
-//     set-fks, set-restrictions. No resulting defs and no result
-//     hash: the effective schema is derived by the per-slot LWW resolution
-//     and never serialized. Plus an optional note, and a REQUIRED author +
-//     signature from one of the creators. Deploying an update is a separate
-//     act: each observing RTableGroup barrier-ref-advances to the new
-//     RSchema version at its own pace; concurrent deploys resolve by union
-//     (the effective schema is the resolution at the merged version).
+//     Evolves the spec. Carries the update's version (above every version at
+//     its position, so versions increase along every causal path) and ONLY
+//     the migration rules — the slot writes: add/drop-table, add/drop-column,
+//     set-concurrent-deletes, set-fks, set-restrictions. No resulting defs
+//     and no result hash: the effective schema is derived by the per-slot
+//     LWW resolution and never serialized. Plus an optional note, and a
+//     REQUIRED author + signature from one of the creators. Deploying an
+//     update is a separate act: each observing RTableGroup barrier-ref-
+//     advances to the new RSchema version at its own pace; concurrent deploys
+//     resolve by union (the effective schema is the resolution at the merged
+//     version, where a slot both lines wrote goes to the higher version).
 //
 // The DAG has no barriers, so the effective schema is a pure function of the
 // position `at` (see resolve.ts); resolved states are cached per normalized
@@ -44,9 +46,10 @@ import {
 import { RootScopedDag, ScopedDag, CausalDag, ScopedDagSubscription } from "@hyper-hyper-space/hhs3_mvt";
 import { signPayload as signPayloadHelper, serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 
-import type { RSchema as RSchemaContract, RSchemaView as RSchemaViewContract } from "./interfaces.js";
-import { CreateRSchemaPayload, SchemaUpdatePayload, RSCHEMA_TYPE_ID } from "./payload.js";
+import type { RSchema as RSchemaContract, RSchemaView as RSchemaViewContract, SchemaUpdateOptions } from "./interfaces.js";
+import { CreateRSchemaPayload, SchemaUpdatePayload, RSCHEMA_TYPE_ID, DEFAULT_SCHEMA_VERSION } from "./payload.js";
 import { TableDef, MigrationRule } from "./payload.js";
+import { compareSemver, nextPatch } from "../semver.js";
 import { validateRSchemaPayload } from "./validate_ops.js";
 import { resolveSchemaState, positionKey, SchemaState } from "./resolve.js";
 import { RSchemaViewImpl } from "./view.js";
@@ -85,8 +88,10 @@ export const rSchemaFactory: RObjectFactory = {
 
 export class RSchemaImpl implements RSchemaContract {
 
+    // `version` is the schema's first version; defaults to DEFAULT_SCHEMA_VERSION.
     static create = async (options: {
         name: string;
+        version?: string;
         creators: { keyId: KeyId; publicKey: PublicKey }[];
         tables: TableDef[];
         hashAlgorithm?: string;
@@ -96,6 +101,7 @@ export class RSchemaImpl implements RSchemaContract {
             action: 'create',
             type: RSCHEMA_TYPE_ID,
             name: options.name,
+            version: options.version ?? DEFAULT_SCHEMA_VERSION,
             creators: options.creators.map((c) => ({
                 keyId: c.keyId,
                 publicKey: serializePublicKeyToBase64(c.publicKey),
@@ -142,16 +148,28 @@ export class RSchemaImpl implements RSchemaContract {
     }
 
     // The only writer beyond creation: build a rules-only schema-update,
-    // sign it and append it at `at` (defaults to the current frontier).
-    async updateSchema(migration: MigrationRule[], author: OwnIdentity, note?: string, at?: Version): Promise<B64Hash> {
+    // sign it and append it at `at` (defaults to the current frontier). The
+    // version defaults to the next patch above the highest version at `at`.
+    async updateSchema(migration: MigrationRule[], author: OwnIdentity, options?: SchemaUpdateOptions): Promise<B64Hash>;
+    async updateSchema(migration: MigrationRule[], author: OwnIdentity, note?: string, at?: Version): Promise<B64Hash>;
+    async updateSchema(
+        migration: MigrationRule[], author: OwnIdentity,
+        optionsOrNote?: SchemaUpdateOptions | string, positionalAt?: Version,
+    ): Promise<B64Hash> {
+        const options: SchemaUpdateOptions = typeof optionsOrNote === 'string' || optionsOrNote === undefined
+            ? { note: optionsOrNote, at: positionalAt }
+            : optionsOrNote;
+
         const scopedDag = await this.getScopedDag();
-        at = at ?? await scopedDag.getFrontier();
+        const at = options.at ?? await scopedDag.getFrontier();
+        const version = options.version ?? nextPatch(highestVersion((await this.getView(at, at)).getVersions()));
 
         const base: Omit<SchemaUpdatePayload, 'author' | 'signature'> = {
             action: 'schema-update',
+            version,
             migration,
         };
-        if (note !== undefined) base.note = note;
+        if (options.note !== undefined) base.note = options.note;
 
         const signed = await signPayloadHelper(base as unknown as json.LiteralMap, author, at);
 
@@ -260,6 +278,12 @@ export class RSchemaImpl implements RSchemaContract {
         this._causalDag = undefined;
         this.resolveCache.clear();
     }
+}
+
+// The highest of a view's versions (they come highest first, but don't rely on it).
+function highestVersion(versions: string[]): string {
+    if (versions.length === 0) throw new Error("schema position has no versions");
+    return versions.reduce((best, v) => (compareSemver(v, best) > 0 ? v : best));
 }
 
 export { RSchemaViewImpl } from "./view.js";

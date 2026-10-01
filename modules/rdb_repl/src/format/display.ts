@@ -117,6 +117,12 @@ export function collectTruncatableFromResult(result: LangExecutionResult): strin
             return [result.schema, result.entryHash];
         case 'update-ref':
             return [result.ref, result.group, result.entryHash];
+        case 'put-file':
+            return [result.fileHash, ...result.entries, ...(result.owner === undefined ? [] : [result.owner])];
+        case 'get-file':
+            return [result.fileHash, ...(result.owner === undefined ? [] : [result.owner])];
+        case 'list-files':
+            return result.rows.flatMap((row) => [row.fileHash, ...(row.owner === '' ? [] : [row.owner])]);
         default:
             return [];
     }

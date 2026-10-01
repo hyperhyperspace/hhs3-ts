@@ -7,12 +7,15 @@
   "main": "dist/src/index.js",
   "types": "dist/src/index.d.ts",
   "bin": {
-    "rdb": "./dist/bin/rdb.js"
+    "rdb": "./dist/bin/rdb.js",
+    "rpack": "./dist/bin/rpack.js",
+    "rhost": "./dist/bin/rhost.js",
+    "rkeys": "./dist/bin/rkeys.js"
   },
   "scripts": {
     "test": "node --import ../../register.mjs ./test/run_tests.ts",
     "debug": "node --inspect-brk --import ../../register.mjs ./test/run_tests.ts",
-    "build": "tsc -p tsconfig.json && chmod +x dist/bin/rdb.js",
+    "build": "tsc -p tsconfig.json && chmod +x dist/bin/rdb.js dist/bin/rpack.js dist/bin/rhost.js dist/bin/rkeys.js",
     "clean": "rm -rf dist test-build"
   },
   "author": "Santiago Bazerque",
@@ -25,10 +28,18 @@
     "@hyper-hyper-space/hhs3_json": "^0.1.0",
     "@hyper-hyper-space/hhs3_mvt": "^0.1.0",
     "@hyper-hyper-space/hhs3_rdb": "^0.1.0",
+    "@hyper-hyper-space/hhs3_rdb_adapter": "^0.1.0",
     "@hyper-hyper-space/hhs3_rdb_adapter_sqlite": "^0.1.0",
+    "@hyper-hyper-space/hhs3_rdb_files_node": "^0.1.0",
     "@hyper-hyper-space/hhs3_rdb_lang": "^0.1.0",
+    "@hyper-hyper-space/hhs3_rdb_projection": "^0.1.0",
     "@hyper-hyper-space/hhs3_rdb_repl": "^0.1.0",
     "@hyper-hyper-space/hhs3_rdb_runtime": "^0.1.0",
+    "@hyper-hyper-space/hhs3_rhost": "^0.1.0",
+    "@hyper-hyper-space/hhs3_rhost_client": "^0.1.0",
+    "@hyper-hyper-space/hhs3_rhost_client_node": "^0.1.0",
+    "@hyper-hyper-space/hhs3_rhost_node": "^0.1.0",
+    "@hyper-hyper-space/hhs3_rpack": "^0.1.0",
     "@hyper-hyper-space/hhs3_mesh": "^0.1.0",
     "@hyper-hyper-space/hhs3_mesh_folder_discovery": "^0.1.0",
     "@hyper-hyper-space/hhs3_mesh_node": "^0.1.0",

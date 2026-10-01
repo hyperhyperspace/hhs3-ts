@@ -2,22 +2,23 @@ import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { Payload, RObject } from "@hyper-hyper-space/hhs3_mvt";
 import { RDB_TYPE_ID, type RDb } from "@hyper-hyper-space/hhs3_rdb";
 import { payloadName } from "@hyper-hyper-space/hhs3_rdb_runtime";
-
-import { runLanguageText } from "../adapter.js";
-import { formatSessionRows } from "../format/display.js";
-import type { ReplSession } from "../session.js";
-import { createAllowAuthorizer } from "./authorizer.js";
 import {
     allowIsEveryone,
+    columnLookup,
+    createAllowAuthorizer,
+    fetchDatabase,
     formatAllow,
+    startDatabaseSync,
+    validateAllowSources,
+} from "@hyper-hyper-space/hhs3_rhost";
+
+import { formatSessionRows } from "../format/display.js";
+import type { ReplSession } from "../session.js";
+import {
     parseSyncCommand,
-    type AllowSource,
     type SyncFetchCommand,
     type SyncStartCommand,
 } from "./parse.js";
-import type { BuiltSyncMesh, SyncCloseable, SyncSessionEntry } from "./types.js";
-
-const MESH_CLOSEABLE_WAIT_MS = 1_000;
 
 export type SyncCommandResult = {
     output?: string;
@@ -78,9 +79,9 @@ async function start(session: ReplSession, cmd: SyncStartCommand): Promise<SyncC
         return { needsUnlock: { label: record.label } };
     }
 
-    const lookup = makeLookup(session);
+    const lookup = columnLookup(session);
     if (!allowIsEveryone(cmd.sources)) {
-        await validateAllowQueries(cmd.sources, lookup);
+        await validateAllowSources(cmd.sources, lookup);
     }
     const authorizer = createAllowAuthorizer(cmd.sources, lookup);
 
@@ -95,35 +96,25 @@ async function start(session: ReplSession, cmd: SyncStartCommand): Promise<SyncC
 
     const syncId = session.nextSyncId;
     session.nextSyncId += 1;
-    const meshLabel = `sync-${syncId}`;
-    const entry: SyncSessionEntry = {
+    const sync = await startDatabaseSync({
+        replica: session.workspace.replica,
+        db,
+        built,
+        meshLabel: `sync-${syncId}`,
+        authorizer,
+        report: session.report,
+    });
+
+    session.syncs.set(syncId, {
         id: syncId,
         dbId: id,
         dbName: name,
-        db,
-        meshLabel,
-        mesh: built.mesh,
         identityLabel: record.label,
         identityKeyId: identity.keyId,
         scope: cmd.scope,
         sources: cmd.sources,
-        listenAddresses: built.listenAddresses,
-        discoveryNotes: built.discoveryNotes,
-        closeables: built.closeables,
-    };
-
-    session.workspace.replica.attachMesh(meshLabel, built.mesh);
-    db.setRuntimeConfig({ meshLabel, authorizer, report: session.report });
-
-    try {
-        await db.startSync();
-    } catch (err) {
-        session.syncs.set(syncId, entry);
-        await teardown(session, syncId);
-        throw err;
-    }
-
-    session.syncs.set(syncId, entry);
+        sync,
+    });
     const notes = built.discoveryNotes.length === 0 ? '' : `\n${built.discoveryNotes.join('\n')}`;
     return {
         output: `started sync ${syncId} for ${name} as ${record.label} on ${cmd.scope}${notes}`,
@@ -154,39 +145,23 @@ async function fetch(session: ReplSession, cmd: SyncFetchCommand): Promise<SyncC
 
     const fetchId = session.nextFetchId;
     session.nextFetchId += 1;
-    const meshLabel = `fetch-${fetchId}`;
-    let built: BuiltSyncMesh | undefined;
-    try {
-        built = await session.syncMeshFactory({
+    const obj = await fetchDatabase({
+        replica,
+        id: cmd.rdbId,
+        meshFactory: session.syncMeshFactory,
+        request: {
             scope: cmd.scope,
             identity,
             trackerAddress: cmd.tracker,
             trackerKeyId: cmd.trackerKey,
             listenAddress: cmd.listen,
             report: session.report,
-        });
-        replica.attachMesh(meshLabel, built.mesh);
-        const obj = await replica.fetchObject(cmd.rdbId, {
-            meshLabel,
-            backendLabel: session.workspace.backendLabel,
-        });
-        if (obj.getType() !== RDB_TYPE_ID) {
-            throw new Error(
-                `Fetched object is type '${obj.getType()}', not an RDb. The RDb may already be local.`,
-            );
-        }
-        registerFetched(session, obj);
-        return { output: formatFetchOutput(session, obj, false) };
-    } catch (err) {
-        const leftover = await replica.getObject(cmd.rdbId);
-        const msg = err instanceof Error ? err.message : String(err);
-        if (leftover !== undefined && !msg.includes('may already be local')) {
-            throw new Error(`${msg} The RDb may already be local.`);
-        }
-        throw err;
-    } finally {
-        await closeTempMesh(session, meshLabel, built);
-    }
+        },
+        meshLabel: `fetch-${fetchId}`,
+        backendLabel: session.workspace.backendLabel,
+    });
+    registerFetched(session, obj);
+    return { output: formatFetchOutput(session, obj, false) };
 }
 
 async function status(session: ReplSession, database?: string): Promise<string> {
@@ -196,9 +171,9 @@ async function status(session: ReplSession, database?: string): Promise<string> 
         scope: entry.scope,
         as: entry.identityLabel,
         allow: formatAllow(entry.sources),
-        listen: entry.listenAddresses.join(', '),
-        discovery: entry.discoveryNotes.join('; '),
-        peers: countPeers(entry),
+        listen: entry.sync.listenAddresses.join(', '),
+        discovery: entry.sync.discoveryNotes.join('; '),
+        peers: entry.sync.peerCount(),
     }));
     if (database !== undefined) {
         const { id } = await resolveDatabase(session, database);
@@ -221,20 +196,11 @@ async function stop(session: ReplSession, id: number): Promise<string> {
 async function peers(session: ReplSession, id: number): Promise<string> {
     const entry = session.syncs.get(id);
     if (entry === undefined) throw new Error(`No sync session ${id}`);
-    const seen = new Set<string>();
-    const rows: Record<string, unknown>[] = [];
-    for (const swarm of entry.mesh.swarms()) {
-        for (const peer of swarm.peers()) {
-            const key = `${peer.keyId}@${peer.endpoint}`;
-            if (seen.has(key)) continue;
-            seen.add(key);
-            rows.push({
-                keyId: peer.keyId,
-                endpoint: peer.endpoint,
-                topic: swarm.topic,
-            });
-        }
-    }
+    const rows: Record<string, unknown>[] = entry.sync.peers().map((peer) => ({
+        keyId: peer.keyId,
+        endpoint: peer.endpoint,
+        topic: peer.topic,
+    }));
     if (rows.length === 0) return '(no peers)';
     return formatSessionRows(session, rows, ['keyId', 'endpoint', 'topic'], {
         structuralColumns: new Set(['keyId', 'topic']),
@@ -246,21 +212,7 @@ async function teardown(session: ReplSession, id: number): Promise<void> {
     const entry = session.syncs.get(id);
     if (entry === undefined) return;
     session.syncs.delete(id);
-    try {
-        await entry.db.stopSync();
-    } catch {
-        // already stopped
-    }
-    await closeBuiltMesh(entry.mesh, entry.closeables);
-    session.workspace.replica.detachMesh(entry.meshLabel);
-}
-
-function countPeers(entry: SyncSessionEntry): number {
-    const ids = new Set<string>();
-    for (const swarm of entry.mesh.swarms()) {
-        for (const peer of swarm.peers()) ids.add(peer.keyId);
-    }
-    return ids.size;
+    await entry.sync.stop();
 }
 
 function registerFetched(session: ReplSession, obj: RObject): void {
@@ -278,60 +230,4 @@ function formatFetchOutput(session: ReplSession, obj: RObject, alreadyLocal: boo
     const name = session.workspace.roots.get(obj.getId())?.name ?? `#${obj.getId()}`;
     const already = alreadyLocal ? 'already local; ' : '';
     return `fetched ${name} (${already}genesis only; use \\sync start to share)`;
-}
-
-async function closeTempMesh(
-    session: ReplSession,
-    meshLabel: string,
-    built: BuiltSyncMesh | undefined,
-): Promise<void> {
-    if (built !== undefined) {
-        await closeBuiltMesh(built.mesh, built.closeables);
-    }
-    session.workspace.replica.detachMesh(meshLabel);
-}
-
-async function closeBuiltMesh(
-    mesh: { close(): void },
-    closeables: SyncCloseable[],
-): Promise<void> {
-    const closing = Promise.all(closeables.map(async (closeable) => {
-        try {
-            await closeable.close();
-        } catch {
-            // best-effort
-        }
-    }));
-    await Promise.race([
-        closing,
-        new Promise<void>((resolve) => setTimeout(resolve, MESH_CLOSEABLE_WAIT_MS)),
-    ]);
-    try {
-        mesh.close();
-    } catch {
-        // best-effort
-    }
-}
-
-function makeLookup(session: ReplSession) {
-    return async (source: Extract<AllowSource, { type: 'column' }>): Promise<Iterable<unknown>> => {
-        const sql = `SELECT ${source.column} FROM ${source.group}.${source.table}`
-            + (source.where === undefined ? '' : ` WHERE ${source.where}`);
-        const run = await runLanguageText(session, sql);
-        const result = run.results[0]?.result;
-        if (result === undefined || result.kind !== 'select') {
-            throw new Error(`allow query did not return a SELECT result`);
-        }
-        return result.rows.map((row) => row.values[source.column]);
-    };
-}
-
-async function validateAllowQueries(
-    sources: AllowSource[],
-    lookup: ReturnType<typeof makeLookup>,
-): Promise<void> {
-    for (const source of sources) {
-        if (source.type !== 'column') continue;
-        await lookup(source);
-    }
 }

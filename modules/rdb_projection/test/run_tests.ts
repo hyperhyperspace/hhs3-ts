@@ -2,6 +2,7 @@ import { testing } from "@hyper-hyper-space/hhs3_util";
 
 import { projectionTests } from "./projection_tests.js";
 import { ingestionTests } from "./ingestion_tests.js";
+import { filesTests } from "./files_tests.js";
 
 async function main() {
     const allTests = new Map<string, Array<{ name: string, invoke: () => Promise<void> }>>();
@@ -9,6 +10,7 @@ async function main() {
 
     allTests.set(projectionTests.title, projectionTests.tests);
     allTests.set(ingestionTests.title, ingestionTests.tests);
+    allTests.set(filesTests.title, filesTests.tests);
 
     console.log('Running tests for Hyper Hyper Space v3 rdb_projection module'
         + (filters.length > 0 ? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');

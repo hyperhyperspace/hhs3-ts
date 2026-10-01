@@ -1,10 +1,6 @@
-export * from "./workspace/backend.js";
 export * from "./workspace/workspace.js";
 export * from "./workspace/root_index.js";
 export * from "./workspace/rehydrate.js";
-
-export * from "./keys/keystore.js";
-export * from "./keys/identity.js";
 
 export * from "./session/session.js";
 export * from "./session/adapter.js";
@@ -28,7 +24,9 @@ export * from "./format/log.js";
 export * from "./format/display.js";
 export * from "./format/diagnostics.js";
 
-export * from "./sync/node_mesh.js";
+export * from "./host/tty_prompter.js";
+export * from "./files/local_files.js";
+export * from "./files/folders.js";
 
 export {
     RdbRuntime,

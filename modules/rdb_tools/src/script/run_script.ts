@@ -25,31 +25,34 @@ export async function runScript(session: WorkspaceSession, text: string, file = 
     session.enableScriptDefaults();
     const outputs: string[] = [];
     let buffer = '';
+    let bufferLine = 1;
     const rl = createPromptInterface(session);
 
     try {
-        for (const line of text.split(/\r?\n/)) {
+        const lines = text.split(/\r?\n/);
+        for (const [index, line] of lines.entries()) {
             const trimmed = line.trim();
             if (buffer.length === 0 && (trimmed.length === 0 || trimmed.startsWith('--'))) continue;
 
             if (buffer.length === 0 && trimmed.startsWith('\\')) {
-                const result = await runCommand(session, trimmed, file, { rl });
+                const result = await runCommand(session, trimmed, file, { rl, firstLine: index + 1 });
                 if (result.output.length > 0) outputs.push(result.output);
                 if (result.exitCode !== 0 && session.stopOnError) return { exitCode: result.exitCode, output: outputs.join('\n') };
                 continue;
             }
 
+            if (buffer.length === 0) bufferLine = index + 1;
             buffer += (buffer.length === 0 ? '' : '\n') + line;
             if (scanStatement(buffer).kind !== 'complete') continue;
 
-            const result = await runCommand(session, buffer, file, { rl });
+            const result = await runCommand(session, buffer, file, { rl, firstLine: bufferLine });
             if (result.output.length > 0) outputs.push(result.output);
             buffer = '';
             if (result.exitCode !== 0 && session.stopOnError) return { exitCode: result.exitCode, output: outputs.join('\n') };
         }
 
         if (buffer.trim().length > 0) {
-            const result = await runCommand(session, buffer, file, { rl });
+            const result = await runCommand(session, buffer, file, { rl, firstLine: bufferLine });
             if (result.output.length > 0) outputs.push(result.output);
             if (result.exitCode !== 0 && session.stopOnError) return { exitCode: result.exitCode, output: outputs.join('\n') };
         }

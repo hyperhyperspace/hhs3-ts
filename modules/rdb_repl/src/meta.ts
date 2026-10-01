@@ -163,6 +163,7 @@ async function catalogCommand(session: ReplSession, name?: string): Promise<stri
         status.catalog,
         ...[...status.released, ...status.history].map((r) => r.hash),
         ...status.members.flatMap((m) => [m.groupId, ...m.target, ...(m.current ?? []), ...(m.adopted ?? [])]),
+        ...(status.files ?? []).flatMap((f) => [f.blobStoreId, f.fileMapId]),
     ];
     const ctx = createDisplayContext(session, hashes);
     const h = (hash: string) => ctx.formatString(hash, { role: 'hash', hashPrefix: true });
@@ -183,13 +184,18 @@ async function catalogCommand(session: ReplSession, name?: string): Promise<stri
             group: m.name, state: m.state, target: set(m.target), current: set(m.current), adopted: set(m.adopted),
         }))));
     }
+    if (status.files !== undefined) {
+        lines.push(formatRows(status.files.map((f) => ({
+            files: f.name, state: f.present ? 'ok' : 'missing', store: h(f.blobStoreId), map: h(f.fileMapId),
+        }))));
+    }
     return lines.join('\n');
 }
 
 // \adopt <range> [db]: widen (or set) the database's adoption range.
 async function adoptCommand(session: ReplSession, args: string[]): Promise<string> {
     const [range, name] = args;
-    if (range === undefined) throw new Error('Usage: \\adopt <range> [db]   (e.g. ^2, ^1.4, *)');
+    if (range === undefined) throw new Error('Usage: \\adopt <range> [db]   (e.g. ^2, ^1.4, <3.0.0, *)');
     const db = await loadDatabase(session, name);
     await db.setAdoptionRange(range);
     const held = (await catalogStatus(db)).held.length;
@@ -425,7 +431,7 @@ function ref(text = '') {
 function help(args: string[]): string {
     if (args[0] !== 'commands' && args[0] !== 'command') return [
         '\\dbs, \\catalogs, \\schemas, \\groups, \\dt [[db.]group], \\d [db.]group.table',
-        '\\catalog [db]  (released / deployed / adopted / held releases and member states), \\adopt <range> [db]  (e.g. ^2)',
+        '\\catalog [db]  (released / deployed / adopted / held releases and member states), \\adopt <range> [db]  (e.g. ^2, <3.0.0)',
         '\\key create <label> [passphrase], \\key unlock <label|#prefix> [passphrase], \\keys, \\whoami',
         '\\author [<label|#prefix> [passphrase]|nobody]',
         '\\use database <name>, \\use group <[db.]name>, \\view, \\frontier [[db.]group]',

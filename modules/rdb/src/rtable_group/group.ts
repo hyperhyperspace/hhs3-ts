@@ -38,8 +38,8 @@
 //         validation recomputes them from the schema DAG and never reads the
 //         gate. A local deploy never waits on the gate. When the
 //         group declares `canDeploy`, that predicate is derived from the
-//         group's create payload (mandatory) and the op carries
-//         author/signature as extra fields; the deploy signature is verified
+//         group's create payload (mandatory); an authored deploy carries
+//         author/signature as extra fields, the signature is verified
 //         at validation (against the group's own provider, then its embedded
 //         deployKeys) and the predicate is then evaluated against the
 //         verified author.
@@ -78,6 +78,7 @@ import { signPayload as signPayloadHelper } from "@hyper-hyper-space/hhs3_mvt";
 import type { RSchema, RSchemaView } from "../rschema/interfaces.js";
 import type { Predicate, SchemaCreator } from "../rschema/payload.js";
 import { splitTableRef } from "../rschema/payload.js";
+import { predicateReferencesAuthor } from "../rschema/validate.js";
 import { computeMirrorHashes, deployGateId } from "../rdeploy_gate/mirror.js";
 import { RTableImpl } from "../rtable/rtable.js";
 import { deriveTableId } from "../rtable/hash.js";
@@ -568,7 +569,7 @@ export class RTableGroupImpl implements RTableGroupContract {
     // selected identity provider, anchored at group position `at`, LIVENESS-
     // BYPASSED (a raw provider read; see RTableViewImpl.rawProviderPublicKey).
     // Signature verification calls this at the op's own (at, at) position.
-    //   - no provider configured            -> undefined (caller: no authentication)
+    //   - no provider configured            -> undefined (caller: reject authored ops)
     //   - local provider                    -> raw read of the local provider table
     //   - 'group.table' provider PRESENT but
     //     key absent / table not a provider  -> undefined (caller: fail-closed reject)
@@ -580,24 +581,30 @@ export class RTableGroupImpl implements RTableGroupContract {
         if (providerRef === undefined) return undefined;
 
         const [groupName, table] = splitTableRef(providerRef);
-        if (groupName === undefined) {
-            // liveness-bypassed provider read: rawProviderPublicKey never
-            // reaches the void guard, but the view constructor requires a
-            // closure, so mint a throwaway one.
-            return new RTableViewImpl(this.makeTable(table), at, at, freshVoidClosure()).rawProviderPublicKey(keyId);
-        }
+        if (groupName === undefined) return this.providerPublicKeyAt(table, keyId, at);
 
         const groupId = this.getBindings()[groupName];
         if (groupId === undefined) return undefined;   // unbound (create-time validated; defensive)
         const foreign = await this.loadForeignGroup(groupId, groupName);   // missing object -> throw -> defer
         const foreignAt = await this.resolveObservedForeignVersion(groupId, at, at);
-        return new RTableViewImpl(foreign.makeTable(table), foreignAt, foreignAt, freshVoidClosure()).rawProviderPublicKey(keyId);
+        return foreign.providerPublicKeyAt(table, keyId, foreignAt);
+    }
+
+    // The publicKey registered for `keyId` in this group's provider table
+    // `table` at version `at`, liveness-bypassed; undefined when the table is
+    // absent or not a provider at `at`. Shared by resolveAuthorKey and by the
+    // types that observe a group for their identities (rfiles).
+    async providerPublicKeyAt(table: string, keyId: KeyId, at: Version): Promise<PublicKey | undefined> {
+        // rawProviderPublicKey never reaches the void guard, but the view
+        // constructor requires a closure, so mint a throwaway one.
+        return new RTableViewImpl(this.makeTable(table), at, at, freshVoidClosure()).rawProviderPublicKey(keyId);
     }
 
     // Deploy: THE schema deploy moment — a barrier ref-advance of the schema
     // ref. Monotonicity (and at-or-above-pinned) validated; when authored, the
-    // deploy signature is verified at validation (the group's own provider) and
-    // the group's canDeploy predicate is evaluated against the verified author.
+    // deploy signature is verified at validation (the group's own provider,
+    // then its deployKeys) and the group's canDeploy predicate is evaluated
+    // against the verified author.
     async deploy(refVersion: Version, author?: OwnIdentity, at?: Version): Promise<B64Hash> {
         const prepared = await this.prepareDeploy(refVersion, author, at);
 
@@ -611,14 +618,25 @@ export class RTableGroupImpl implements RTableGroupContract {
         return (await this.getScopedDag()).append(prepared.payload, prepared.meta, prepared.at);
     }
 
-    // The signed deploy payload at `at` (defaults to the frontier), without
-    // appending it: the catalog planner validates it in a dry run first.
+    deployNeedsAuthor(): boolean {
+        const canDeploy = this.getCanDeploy();
+        return canDeploy !== undefined && predicateReferencesAuthor(canDeploy);
+    }
+
+    observeNeedsAuthor(group: string | B64Hash): boolean {
+        const gate = this.observeGateFor(this.resolveBoundGroupId(group));
+        return gate !== undefined && predicateReferencesAuthor(gate);
+    }
+
+    // The deploy payload at `at` (defaults to the frontier), signed when an
+    // author is given, without appending it: the catalog planner validates it
+    // in a dry run first.
     async prepareDeploy(refVersion: Version, author?: OwnIdentity, at?: Version): Promise<{ payload: json.LiteralMap; meta: MetaProps; at: Version }> {
         const scopedDag = await this.getScopedDag();
         at = at ?? await scopedDag.getFrontier();
 
-        if (this.getCanDeploy() !== undefined && author === undefined) {
-            throw new Error("deploy must be authored when the group declares canDeploy");
+        if (author === undefined && this.deployNeedsAuthor()) {
+            throw new Error("deploy must be authored when the group's canDeploy reads $author");
         }
 
         const { payload: refAdvance, meta } = prepareRefAdvance(this.getSchemaRef(), refVersion);
@@ -644,17 +662,18 @@ export class RTableGroupImpl implements RTableGroupContract {
     // revoke; the foreign-version resolver already passes (at, from), so this
     // is purely the barrier tag). `group` is a binding name or a bound group id.
     //
-    // When the observed binding declares a canObserve gate, the observation
-    // must be authored: the signature is verified and the gate evaluated at
-    // validation (and re-evaluated at-use), exactly like a gated deploy.
+    // A claimed author is verified through this group's provider. When the
+    // observed binding's canObserve gate reads $author, the observation must
+    // be authored; the gate is evaluated at validation (and re-evaluated
+    // at-use), exactly like a gated deploy.
     async observe(group: string | B64Hash, refVersion: Version, author?: OwnIdentity, at?: Version): Promise<B64Hash> {
         const scopedDag = await this.getScopedDag();
         at = at ?? await scopedDag.getFrontier();
 
         const groupId = this.resolveBoundGroupId(group);
 
-        if (this.observeGateFor(groupId) !== undefined && author === undefined) {
-            throw new Error("observe must be authored when the binding declares canObserve");
+        if (author === undefined && this.observeNeedsAuthor(groupId)) {
+            throw new Error("observe must be authored when the binding's canObserve reads $author");
         }
 
         const base = createRefAdvancePayload(groupId, refVersion);
@@ -848,9 +867,10 @@ export class RTableGroupImpl implements RTableGroupContract {
             return undefined;
         };
 
+        const authenticated = this.getIdProvider() !== undefined;
         for (const [index, { table, op }] of ops.entries()) {
             const restrictionFailure = await explainRowOpRestriction(
-                op, table, schemaView, getTableView, getForeignTableView,
+                op, table, schemaView, authenticated, getTableView, getForeignTableView,
             );
             if (restrictionFailure !== undefined) {
                 // row-not-live is an explain alias for restriction failure when

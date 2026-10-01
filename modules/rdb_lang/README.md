@@ -28,12 +28,16 @@ parseScript(sql)
 
 Creation statements return create plans. Hosts decide when to call `RContext.createObject(plan.payload)`; a `create-database` plan also carries `afterCreate(object)`, which the host runs on the new RDb to create its table groups (and deploy any whose release version is above their pin). `USE DATABASE` returns a `use-database` result that the host applies, as it does `set-view`.
 
+`parseScript(sql, { catalogVersionOptional: true })` is the source mode a release tool uses: `CREATE CATALOG` may then omit `VERSION`, and the binder takes it from `LangBindContext.defaultCatalogVersion()` (a bind error when neither gives one). The REPL never sets the option.
+
+Every AST node carries its `span` (`start` and `end` offsets, and the start's line and column). `CREATE SCHEMA` and `CREATE CATALOG` also carry `body`, from `AS` to the closing parenthesis, and a table declaration carries `body`, its parenthesized column list: the insertion points a tool needs to edit source in place. A `CREATE CATALOG` that states `VERSION` carries `versionSpan`, the clause from the keyword to the string.
+
 ## Supported Statements
 
 Creation. A database is deployed from a catalog: the developer releases table groups in a catalog, and `CREATE DATABASE` deploys one release, creating its groups:
 
 ```sql
-CREATE SCHEMA shop AS (
+CREATE SCHEMA shop VERSION '1.0.0' AS (
   TABLE products (
     sku string PUB READONLY,
     name string
@@ -57,11 +61,13 @@ CREATE DATABASE store_prod USING CATALOG store AT '1.0.0'
   CREATORS ($admin) WITH PARAMS (:admin = $admin) BY $admin;
 ```
 
+- `VERSION` on `CREATE SCHEMA` is the schema's first version (default `0.0.1`). Schemas are versioned on their own: every `ALTER SCHEMA` carries a version above the schema's version at `AT` (default: the next patch), and when two concurrent updates write the same slot, the higher version wins.
 - `CREATORS` of a catalog (default: the author) are the only keys that may sign its entries; every entry is signed, and the genesis is the first release.
 - `BIND alias => group` names another group of the same catalog (by name, or `#hash` of its definition when a merge joined two definitions with the same name). `BIND a => x, b => y` lists several.
 - `:param` values in `WITH ROWS` are filled from `WITH PARAMS` when the release is deployed; `publicKey(:p)` takes an identity param's public key. Params are declared with `PARAMS (:name type, ...)` and may only appear in catalog rows. Literal values (`$admin`, `'Admin'`) are fixed in the catalog. Genesis rows get derived uuids, so `uuid` is not allowed there.
 - `ALLOW DEPLOY IF` gates schema deploys to the group. Without it, a database with `CREATORS` accepts deploys from those creators only. A predicate over `$author` needs `USING IDENTITIES` to verify deploy signatures.
-- `CREATE DATABASE ... AT` selects a release: a version string or `LATEST` (the default) must match exactly one release; `{#hash}` names one. `WITH PARAMS` supplies every param the release declares. `CREATORS` restrict who may deploy releases into the database. `BY` signs the deploys the planner makes for groups whose release version is above their pin. The new database becomes the current one.
+- `USING IDENTITIES` names the group's identity provider, fixed for the life of the group. A `TABLEGROUP` without it is anonymous: its writes take no `BY` (see [Authorship](#authorship)), and none of its gates, nor any allow rule of its schema, may read `$author`. The catalog checks this when the group is added and on every schema version a release gives it.
+- `CREATE DATABASE ... AT` selects a release: a version string or `LATEST` (the default) must match exactly one release; `{#hash}` names one. `WITH PARAMS` supplies every param the release declares. `CREATORS` restrict who may deploy releases into the database. `BY` signs the deploys the planner makes for groups whose release version is above their pin and whose deploy gate reads `$author`. The new database becomes the current one.
 
 Column types and constraints:
 
@@ -88,14 +94,14 @@ The base types are `string`, `integer`, `float`, `boolean`, `json`, `bigint`, `d
 - `decimal(p, s)` sets `precision` = `p` and `scale` = `s` (SQL-standard order; both required).
 - `MIN` / `MAX` set inclusive bounds and apply only to `integer` / `bigint` / `decimal`. `bigint` and `decimal` bounds and values are written as quoted strings so they stay exact (a bare number literal would lose precision); the binder canonically encodes them. A `decimal` value with more fractional digits than the column scale, or any out-of-range / non-canonical value, is **rejected, never rounded**. Constraints that do not apply to a type (e.g. `MIN` on a `string`) are rejected.
 
-A `json` value is written `JSON '<json text>'`, where the JSON text is an ordinary quoted string (double a `'` inside it): `DEFAULT JSON '{"tags": ["x", "it''s"]}'`. Top-level strings, numbers and booleans can also be written as plain literals (`'abc'`, `3`, `true`), and an array without strings as brackets (`[1, 2.5, true]`). `null` is not allowed anywhere inside a JSON value; write `NULL` for a missing value. The reverse renderer writes arrays and objects as `JSON '...'`.
+A `json` value is written `JSON '<json text>'`, where the JSON text is an ordinary quoted string (double a `'` inside it, and write JSON's own backslash escapes with `\\`, so a newline inside a JSON string is `a\\nb`): `DEFAULT JSON '{"tags": ["x", "it''s"]}'`. Top-level strings, numbers and booleans can also be written as plain literals (`'abc'`, `3`, `true`), and an array without strings as brackets (`[1, 2.5, true]`). `null` is not allowed anywhere inside a JSON value; write `NULL` for a missing value. The reverse renderer writes arrays and objects as `JSON '...'`.
 
 `identity` stores a key hash and takes no parameters. Insert its value as `$name` (an unlocked identity) or `#keyIdPrefix`, the same forms `BY` accepts. Compare with `=` / `!=` (including against a `string` key-hash column); ordering and LIKE are not defined.
 
 DDL and refs:
 
 ```sql
-ALTER SCHEMA shop AS (
+ALTER SCHEMA shop VERSION '1.1.0' AS (
   ADD COLUMN products.price integer DEFAULT 0,
   SET CONCURRENT DELETES products true,
   SET ALLOW RULES products (
@@ -106,6 +112,8 @@ ALTER SCHEMA shop AS (
 
 UPDATE REF users TO LATEST ON shop_prod;
 ```
+
+`VERSION` may be left out; the update then takes the next patch above the schema's version at `AT`. Dumps always write it, so a replay reproduces the same versions.
 
 Releases and deploys. A schema change reaches a database in two steps: the developer releases it in the catalog, and the admin deploys the release:
 
@@ -124,8 +132,54 @@ USE DATABASE store_prod;
 
 - An `ALTER CATALOG` release is a diff against its parents: `UPDATE SCHEMA s TO v ON group` sets a group's version in the release (it is not a deploy), and `ADD TABLEGROUP` adds a group. The version must be greater than every parent's. A release that introduces schemas is preceded by an implied, signed declare entry.
 - The trailing `AT` is the insertion point, as for other authored statements, and takes release hashes (`{#h1, #h2}`) or `LATEST` only, never a version string: concurrent releases can share a version. It defaults to the catalog frontier. Several maximal releases there make the release a merge, which must `UPDATE SCHEMA` every group whose version differs across its parents.
-- `UPDATE CATALOG c TO r ON db` deploys a later release (forward only): the planner creates the release's new groups, deploys the new schema versions (bound groups first, advancing their dependents' refs), then records the release. `WITH PARAMS` supplies the params the release adds; params already set cannot change. A database with `CREATORS` requires an author from among them. Other replicas adopt the release when it is within their adoption range.
+- `UPDATE CATALOG c TO r ON db` deploys another release, never one at or below a release already deployed: the planner creates the release's new groups, deploys the new schema versions (bound groups first, advancing their dependents' refs), then records the release. A release concurrent with a deployed one merges with it: both stay deployed and each group moves to the union of its versions in them. `WITH PARAMS` supplies the params the release adds; params already set cannot change. A database with `CREATORS` requires an author from among them. Other replicas adopt the release when it is within their adoption range.
 - There is no group-level `UPDATE SCHEMA ... ON group`, `CREATE TABLEGROUP` or `ADD SCHEMA` / `ADD TABLEGROUP`: groups exist only through catalogs, and the catalog is the only deploy path.
+
+### Catalog FILES
+
+A `FILES` item defines a file store for every database that deploys it (an RBlobStore and an RFileMap, see [rdb](../rdb#files)), bound to one table group of the catalog:
+
+```sql
+FILES name [BIND alias => group] USING IDENTITIES alias.table ALLOW WRITE IF predicate
+```
+
+```sql
+CREATE CATALOG editor CREATORS ($admin) VERSION '1.0.0' PARAMS (:admin identity) AS (
+  TABLEGROUP user USING SCHEMA hhs:user AT LATEST USING IDENTITIES identities ...,
+  FILES media
+    USING IDENTITIES user.identities
+    ALLOW WRITE IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author
+) BY $admin;
+
+ALTER CATALOG editor VERSION '1.1.0' AS (
+  ADD FILES attachments USING IDENTITIES user.identities ALLOW WRITE IF true
+) BY $admin;
+```
+
+- Without `BIND`, the alias is the group name, taken from the qualifier of `USING IDENTITIES` and resolved like a `BIND` target. `BIND` is only needed when that name is ambiguous (`'user' names several catalog groups; use #hash`): `BIND u => #ab12cd34 USING IDENTITIES u.identities`.
+- A FILES has no tables of its own, so the identity table and every table `ALLOW WRITE IF` reads are qualified with its one alias, and must exist in the bound group's schema at its version in the release (the identity table as an `IDENTITY PROVIDER`). Each column an `EXISTS ... WHERE` filters on must exist and be `PUB` (`ALLOW WRITE IF reads user.caps.memo, which isn't PUB in caps`). `$author` is the op's author; there is no subject row. `ALLOW WRITE IF true` still needs the author's key in the identity table, since every op is signed.
+- These checks apply when the FILES is added. A later `UPDATE SCHEMA` of its group that drops a table or column it reads is accepted, and the FILES becomes read-only (see [rdb](../rdb#files)).
+- The name shares the release's namespace with its groups. A FILES definition never changes: publish a new name instead. The dump renders `BIND` only when it is needed.
+- `FILES` (at the start of a catalog item or after `ADD`) and `WRITE` (after `ALLOW` in a FILES item) are contextual keywords; `files` and `write` stay valid names.
+
+Files. `PUT`, `GET` and `LIST` read and write a database's FILES members, for inspecting them from the REPL and for scripts that pull files out:
+
+```sql
+PUT FILE 'path/to/local/file' INTO attachments [AT 'another/path'] [IN KEY | IN COMMON] [BY $admin];
+PUT STRING 'hello world\n' INTO attachments AT 'notes/hello.txt';
+PUT B64 'aGVsbG8=' INTO app.attachments AT 'bin/hello';
+
+GET 'another/path' FROM attachments [IN KEY [$alice | #prefix]] [HASH 'prefix'] [AS B64] [TO 'path/to/local/file'];
+LIST ['some/path'] FROM attachments [IN COMMON | IN KEY [$alice | #prefix]];
+```
+
+- A FILES name resolves like a group name: `files` in the current database, or `db.files`. Paths are the file map's (no `common/` or `keys/<id>/` prefix) and follow its path rules.
+- `PUT` writes to `common`, or with `IN KEY` to the author's own section. Every op is signed: the author is `BY` or the session's, never `NOBODY`, and must pass `ALLOW WRITE IF` (checked before any bytes are uploaded). `AT` defaults to the local file's name. The bytes are uploaded unless the store has them (an interrupted upload by the same author resumes), and the file replaces what is at that path in that section.
+- `GET` needs one file at the path (`HASH 'prefix'` picks among several) whose bytes are complete on this replica. With `TO` it writes a local file; otherwise it returns UTF-8 text, or base64 with `AS B64`, up to 1 MiB.
+- `LIST` prints section, owner, path, size, file hash and whether the bytes are complete, sorted; a prefix matches whole path segments.
+- `PUT STRING` stores the string's UTF-8 bytes and nothing else: `'hello world\n'` ends in a newline, `'hello world'` doesn't.
+- `PUT FILE` and `GET ... TO` go through the host (`LangBindContext.localFiles`; the `rdb` CLI resolves paths against its working directory). A host without it refuses them; `PUT STRING`, `PUT B64`, inline `GET` and `LIST` work everywhere. Local paths are ordinary strings, so write Windows paths with `/` or `\\`: `'C:\temp\new'` contains a tab and a newline.
+- `PUT`, `GET`, `LIST`, `FILE`, `B64`, `IN`, `KEY`, `COMMON` and `HASH` are contextual: all stay valid names.
 
 Names. Tables are `db.group.table`, `group.table` or `table` (in the current group); groups are `db.group` or `group`:
 
@@ -179,6 +233,8 @@ literal    = string | number | "TRUE" | "FALSE" | "NULL" ;
 json       = "JSON" string | "[" ... "]" ;
 ```
 
+- A string is single-quoted. `''` is a quote, and `\n`, `\r`, `\t` and `\\` are a line feed, carriage return, tab and backslash. A backslash before any other character is kept as it is (`'100\%'` is the five characters `100\%`), and `\'` is not a quote escape. A line break typed inside the quotes is part of the string.
+
 - A condition must be a comparison, `LIKE`, `EXISTS`, `TRUE`/`FALSE`, or a `NOT`/`AND`/`OR` of conditions; a bare value (`WHERE name`) is an error, and so is a condition used as a value (`a = (b > 1)`).
 - `+`, `-` and `*` are left-associative; `a - b - c` means `(a - b) - c`. `length(x)` is the string length in UTF-16 code units, like JavaScript's `.length`. In payloads they become the `add`, `sub`, `mul` and `len` operand functions.
 - Unary minus applies only to numeric literals (`-1`, `-(2)`, `-1.5e-3`); for anything else write `0 - x`. Numbers are otherwise unsigned, with an optional fraction and exponent.
@@ -192,7 +248,7 @@ json       = "JSON" string | "[" ... "]" ;
 `value LIKE pattern [ESCAPE 'c']` is SQL `LIKE`, in both `SELECT ... WHERE` and allow rules:
 
 - `%` matches any run of characters (including none) and `_` matches exactly one character (one Unicode code point).
-- `\` makes the next character literal: `'100\%'` matches only `100%`, and `'a\\b'` matches `a\b`.
+- `\` makes the next character literal: `'100\%'` matches only `100%`. A literal backslash is `\\` in the pattern, and each of those is `\\` in the string, so `'a\\\\b'` matches `a\b`.
 - Matching is case-sensitive and covers the whole value, so `name LIKE 'Widget'` is an exact match.
 - The pattern may be a string literal or a column (`name LIKE t.namePattern`). A literal pattern ending in a lone `\` is rejected.
 - `ESCAPE 'c'` (literal patterns only) picks a different escape character, and `ESCAPE ''` disables escaping. The compiler rewrites the pattern to the `\` form, so `'100!%' ESCAPE '!'` stores the pattern `100\%`.
@@ -251,7 +307,9 @@ ALLOW insert IF EXISTS users.caps
 
 Each table or `SET ALLOW RULES` block accepts at most one expression per operation. Use `ALLOW all IF ...` for a shared insert/update/delete rule; do not combine it with operation-specific rules in the same block.
 
-Omitted rules use RDb defaults: inserts are allowed, while updates and deletes require `rowAuthor = $author` (the row's insert author must equal the op signer). To explicitly open every operation, write `ALLOW all IF true`.
+Omitted rules use RDb defaults, which depend on the `TABLEGROUP` using the schema. Inserts are always allowed. On a group with `USING IDENTITIES`, updates and deletes require `rowAuthor = $author` (the row's insert author must equal the op signer); on a group without it, whose writes are all anonymous, they are allowed. To open every operation on any group, write `ALLOW all IF true`; to close one, `ALLOW delete IF false`.
+
+A rule that reads `$author` needs `USING IDENTITIES`: a `TABLEGROUP` without it can't use a schema version that has one.
 
 ### Tablegroup gates
 
@@ -267,7 +325,9 @@ ALLOW UPDATE REF users IF EXISTS users.caps
   AND grantee = $author
 ```
 
-`ALLOW DEPLOY IF ...` is evaluated when a schema version is deployed to the group (by the catalog planner, for `UPDATE CATALOG`). Without it, the group of a database with creators accepts deploys from those creators only, whose keys the group embeds for verification. `ALLOW UPDATE REF <binding> IF ...` gates who may advance the observed version of a bound foreign group via `UPDATE REF`. Both use object context: `$author` is available, but there is no subject row. A gated binding requires an authored `UPDATE REF ... BY ...`; ungated bindings still accept `BY NOBODY`.
+`ALLOW DEPLOY IF ...` is evaluated when a schema version is deployed to the group (by the catalog planner, for `UPDATE CATALOG`). Without it, the group of a database with creators accepts deploys from those creators only, whose keys the group embeds for verification, with or without `USING IDENTITIES`. `ALLOW UPDATE REF <binding> IF ...` gates who may advance the observed version of a bound foreign group via `UPDATE REF`. Both use object context: `$author` is available, but there is no subject row, and a gate that reads it needs `USING IDENTITIES`.
+
+A deploy or ref update is signed only when its gate reads `$author`. The planner signs such deploys with the statement's author. `UPDATE REF` without `BY` signs with the default author when the binding's gate reads `$author`, and is unauthored otherwise. A gate that reads `$author` requires an authored `UPDATE REF`; the other bindings accept `BY NOBODY`.
 
 ## Authorship
 
@@ -285,6 +345,14 @@ DELETE FROM docs WHERE rowId = #ab BY NOBODY;   -- explicitly unauthored
 The author is `$name` (an unlocked identity, resolved by the host) or `#keyid` (by key-id prefix). The bareword `NOBODY` forces an unauthored op even when a default author is set — useful for anonymous writes. Because `NOBODY` is a keyword, an identity literally named `nobody` is still referenced as `$nobody`.
 
 `BY` sits alongside the optional `AT <version>` clause and is written before it. `$author` and `$me` in value position resolve to the statement's effective author, so `VALUES ($author)` agrees with the identity chosen by `BY`. A `BUNDLE` is a single signed op: put `BY` on the `BUNDLE`, not on its inner writes (a `BY` on an inner write is a parse error). `ALTER SCHEMA`, `CREATE CATALOG` and `ALTER CATALOG` require an author (explicit or default), a catalog creator for the catalog statements; `UPDATE CATALOG` requires one when the database declares creators. The others fall back to an unauthored op when neither is present.
+
+A `TABLEGROUP` without `USING IDENTITIES` can't verify an author, so it rejects every signed write or ref update. The binder makes its statements anonymous instead:
+
+- `BY $name` or `BY #keyid` on an `INSERT`, `UPDATE`, `DELETE`, `BUNDLE` or `UPDATE REF` of such a group is an error; `BY NOBODY` is accepted.
+- The default author is left out.
+- In value position `$me` still names the session identity, while `$author` has no value and is an error.
+
+None of this applies to schema and catalog statements, whose authors are their objects' creators, or to deploys, which can verify through the database creators' embedded keys (see [Tablegroup gates](#tablegroup-gates)).
 
 ## Identity Providers
 
@@ -374,6 +442,9 @@ Reverse helpers render known payloads and DAG histories:
 - `renderCreateDatabase` (`USING CATALOG ... AT {#release} ... WITH PARAMS`), `renderUpdateCatalog`, `renderUseDatabase`
 - `renderRowOp`, `renderRefOp`, `renderBundle`, `renderOp`
 - `dumpSchema`, `dumpCatalog`, `dumpGroup`, `dumpDatabase`, `sortMemberGroupsByBindings`
+- the pieces: `renderMigrationRule` (one `ALTER SCHEMA` rule), `renderTableDef`, `renderTableOptions` (what follows a table's column list), `renderColumnDef`, `renderPredicate`, `renderLiteral`, `renderIdent`
+
+The source form (`reverse/source.ts`) is the inverse of source mode, for a catalog repository's `target-catalog.sql`: no `VERSION`, `AT` or `BY`, schemas and bindings by name, and keys through a label callback (`$dev`, or `publicKey('...')` for a key without a label). `renderSourceSchema`, `renderSourceTable`, `renderSourceGroup`, `renderSourceParam(s)`, `renderSourceCreators` and `renderSourceCatalog` take plain descriptions (`SourceSchema`, `SourceGroup`, `SourceCatalog`), not payloads. `renderSourceGroup` also takes `keyword: 'ADD TABLEGROUP'` and a rendered `pin`, for release plans. Parsing and binding the output gives back the same schema creates and group definitions (`[CLANG10]`).
 
 Entries with no C-SQL statement render as comment lines: a group genesis (`-- TABLEGROUP doc USING SCHEMA ... (created by its database)`), a group's schema deploy (`-- deploy hhs:doc TO {#v} (editor 1.1.0)`, labeled with the deployed release that pins the version when the host passes `deployLabels`, or noting that none does), and a catalog declare (`-- declare schemas {#s1, #s2}`).
 

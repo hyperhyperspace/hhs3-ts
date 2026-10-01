@@ -3,7 +3,7 @@
 -- developer who signs the schemas and the catalog, and the admin who deploys
 -- the database.
 
-CREATE SCHEMA hhs:user CREATORS ($admin) AS (
+CREATE SCHEMA hhs:user CREATORS ($admin) VERSION '1.0.0' AS (
   
   TABLE identities (
     keyId string PUB READONLY,
@@ -31,7 +31,7 @@ CREATE SCHEMA hhs:user CREATORS ($admin) AS (
     ALLOW delete IF profiles.keyId = $author
 );
 
-CREATE SCHEMA hhs:doc CREATORS ($admin) AS (
+CREATE SCHEMA hhs:doc CREATORS ($admin) VERSION '1.0.0' AS (
   
   TABLE pages (
     title string,

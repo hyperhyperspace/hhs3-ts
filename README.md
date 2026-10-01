@@ -7,14 +7,12 @@ Hyper Hyper Space is a data sync engine focused on **Authority Decentralization*
 This new version has three main goals:
 
 - **Greater modularization**. Previous versions of Hyper Hyper Space were bundled as a monolithic JavaScript app for usage in web browsers. While we still see the browser as a possible target, we're now trying to build a collection of modules that can be re-used on any platform. See below for the modules that have been ported to v3 so far.
-- **A new data model**. We've developed a new formalism for coordination-free replication, **Monotone View Types**, in which observations are monotonic but explicitly version-scoped, allowing historical views to be refined as additional information becomes available. MVTs are a powerful *monotonic transformation* mechanism, that helps application developers create coordination-free approximations for applications in any domain. Learn more in the [**mvt** module](modules/mvt).
+- **A new data model**. We've developed a new formalism for coordination-free replication, **Monotone View Types**, in which observations are monotonic but explicitly version-scoped, allowing historical views to be refined as additional information becomes available. MVTs are a powerful *monotonic transformation* mechanism, that helps application developers create coordination-free approximations for applications in any domain. Learn more in the **[mvt** module](modules/mvt).
 - **Database integration**. HHSv3 can be used as a secure, self-verifying bi-directional database replication protocol through the **[Rdb](modules/rdb)** co-transactional database engine and its **[projection](modules/rdb_projection)** mechanism, with **[adapters](modules/rdb_adapter/)** for [SQLite](modules/rdb_adapter_sqlite/) and [IndexedDb](modules/rdb_adapter_idb/).
-
-
 
 ### Current status
 
-The core sync engine is complete: the `dag` storage layer, `mvt` (Monotone View Types), `replica`, `sync` (synchronizer), and `mesh` (networking, plus transports and tracker) layers are all implemented and working together to enable live peer-to-peer state synchronization. A formal [protocol specification](modules/replica/SPECS.md) covers the full architecture — from authenticated mesh channels through DAG exchange to type-level validation. Standard replicable types (**RSet** and **RCap**, with permissioned RSet composition) are available in the `std_types` module. The **Causal/Relational database** modules `rdb`, `rdb_lang`, `rdb_runtime`, `rdb_repl`, and `rdb_tools` are implemented (causal relational MVT model, C-SQL, browser-safe runtime, portable REPL tooling, and Node CLI). `rdb_repl_web` is an ephemeral browser REPL; try the live [Causal DB demo](https://www.hyperhyperspace.org/db-demo/). The `rdb_adapter` family (`rdb_adapter`, `rdb_adapter_sqlite`, `rdb_adapter_idb`, `rdb_adapter_test`, and `rdb_projection`) projects an RDb into a regular relational database (SQLite, IndexedDB, or in-memory) and ingests local edits back, with `rdb_projection` supervising replica-wide, reactive bidirectional sync. Please see the individual module specs and the [roadmap](https://www.hyperhyperspace.org/work-plan-2025.html) for details.
+The core sync engine is complete: the `dag` storage layer, `mvt` (Monotone View Types), `replica`, `sync` (synchronizer), and `mesh` (networking, plus transports and tracker) layers are all implemented and working together to enable live peer-to-peer state synchronization. A formal [protocol specification](modules/replica/SPECS.md) covers the full architecture — from authenticated mesh channels through DAG exchange to type-level validation. Standard replicable types (**RSet** and **RCap**, with permissioned RSet composition) are available in the `std_types` module. The **Causal/Relational database** modules `rdb`, `rdb_lang`, `rdb_runtime`, `rdb_repl`, and `rdb_tools` are implemented (causal relational MVT model, C-SQL, browser-safe runtime, portable REPL tooling, and Node CLI). `rdb_repl_web` is an ephemeral browser REPL; try the live [Causal DB demo](https://www.hyperhyperspace.org/db-demo/). The `rdb_adapter` family (`rdb_adapter`, `rdb_adapter_sqlite`, `rdb_adapter_idb`, `rdb_adapter_test`, `rdb_adapter_test_gen`, and `rdb_projection`) projects an RDb into a regular relational database (SQLite, IndexedDB, or in-memory) and ingests local edits back, with `rdb_projection` supervising replica-wide, reactive bidirectional sync and mounting catalog FILES members as folders through `rdb_files_node` (local filesystem) and `rdb_files_web` (OPFS or a picked folder). `rpack` turns a catalog repository into signed release files (a catalog release and its past) that install and verify offline. `rhost` runs an app's databases on a device, one host per database, each with its own key and network settings: it installs those releases, deploys, syncs, and projects. It is browser-safe; `rhost_node` is the Node platform, `rhost_client` is the dependency-free client interface, and `rhost_client_node` reaches a running host over `rhost.sock` and its projected database. The `rdb`, `rpack`, `rhost`, and `rkeys` commands are the `rdb_tools` CLIs. Please see the individual module specs / README files for details.
 
 ### Organization
 
@@ -33,19 +31,25 @@ This monorepo is organized as a collection of modules. This is of course WIP.
 
 **Causal/Relational database**
 
-- [modules/rdb](modules/rdb) Causal/Relational database engine MVTs: RSchema, RTableGroup, RTable, and RDb
-- [modules/rpack](modules/rpack) Packaged RDb history for shipping with an app and updating an older replica (stub)
+- [modules/rdb](modules/rdb) Causal/Relational database engine MVTs: RSchema, RTableGroup, RTable, RDb, and the RBlobStore and RFileMap behind catalog FILES
+- [modules/rpack](modules/rpack) Catalog releases: planned from a catalog repository's source and signed, as release files (a signed catalog release and its past) that install and verify offline
+- [modules/rhost](modules/rhost) Runs an app's databases on a device, one host each: installs releases, deploys, syncs and projects (browser-safe)
+- [modules/rhost_node](modules/rhost_node) The Node platform for rhost: app and host folders, SQLite stores, the user's keystore, node mesh, `run/rhost.sock`
+- [modules/rhost_client](modules/rhost_client) The client interface of an rhost host and its wire protocol, with no dependencies
+- [modules/rhost_client_node](modules/rhost_client_node) Reaches an rhost host from a Node app, over `run/rhost.sock` and its projected database
 - [modules/rdb_lang](modules/rdb_lang) C-SQL: SQL-like language to parse, bind, compile, execute, and reverse-render RDb operations
 - [modules/rdb_runtime](modules/rdb_runtime) Browser-safe runtime: workspace, session, and C-SQL execution
 - [modules/rdb_repl](modules/rdb_repl) Portable presentation and command tooling for RDb
-- [modules/rdb_tools](modules/rdb_tools) Node REPL, CLI (`rdb`), workspace and key management, script runner
+- [modules/rdb_tools](modules/rdb_tools) Node REPL and CLIs (`rdb`, `rpack`, `rhost`, `rkeys`), script runner
 - [modules/rdb_repl_web](modules/rdb_repl_web) Ephemeral browser REPL ([live demo](https://www.hyperhyperspace.org/db-demo/))
 - [modules/rdb_adapter](modules/rdb_adapter) Engine-agnostic projection/ingestion core (Rdb ⇄ relational database)
 - [modules/rdb_adapter_sqlite](modules/rdb_adapter_sqlite) SQLite `MaterializationTarget` for rdb_adapter
 - [modules/rdb_adapter_idb](modules/rdb_adapter_idb) IndexedDB `MaterializationTarget` for rdb_adapter
 - [modules/rdb_adapter_test](modules/rdb_adapter_test) Backend-agnostic conformance suites + fixtures for rdb_adapter targets
 - [modules/rdb_adapter_test_gen](modules/rdb_adapter_test_gen) Shared pseudo-random RDb history generator for adapter fuzzers
-- [modules/rdb_projection](modules/rdb_projection) Reactive supervisor for replica-wide, bidirectional projection of an RDb
+- [modules/rdb_projection](modules/rdb_projection) Reactive supervisor for replica-wide, bidirectional projection of an RDb, and file mounts of its FILES members
+- [modules/rdb_files_node](modules/rdb_files_node) A file mount's folder on the local filesystem (`NodeDirectory`)
+- [modules/rdb_files_web](modules/rdb_files_web) A file mount's folder in the browser, over OPFS or a picked folder (`HandleDirectory`)
 
 **Synchronization**
 
@@ -69,8 +73,6 @@ This monorepo is organized as a collection of modules. This is of course WIP.
 - [modules/json](modules/json) JSON module for content-based addressing data structures
 - [modules/file_watch](modules/file_watch) Kernel-driven file change watcher (`fs.watch` with rearm)
 - [modules/util](modules/util) Collection of helper utilities used across HHS v3.0
-
-
 
 ### Building
 

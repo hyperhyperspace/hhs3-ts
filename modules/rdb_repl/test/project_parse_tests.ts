@@ -123,6 +123,21 @@ export async function runProjectParseTests(): Promise<void> {
     assertThrows(() => parseProjectCommand('indexes 3 ./idx.json extra'), 'indexes trailing token is rejected', 'Unexpected token');
     assertThrows(() => parseProjectCommand('indexes 3'), 'indexes without spec is rejected');
 
+    const files = parseProjectCommand('files 1 media to media');
+    assert(files.kind === 'files', 'files kind');
+    if (files.kind === 'files') {
+        assertEqual(files.id, 1, 'files id');
+        assertEqual(files.name, 'media', 'files name');
+        assertEqual(files.path, 'media', 'files path');
+    }
+    const filesQuoted = parseProjectCommand("files 2 media to './my media'");
+    assert(filesQuoted.kind === 'files' && filesQuoted.path === './my media', 'files quoted path with spaces');
+    assertThrows(() => parseProjectCommand('files 1 media media'), 'files without to is rejected', "Expected 'to'");
+    assertThrows(() => parseProjectCommand('files 1 to media'), 'files without a name is rejected', "Expected 'to'");
+    assertThrows(() => parseProjectCommand('files 1'), 'files without name and path is rejected');
+    assertThrows(() => parseProjectCommand('files media to media'), 'non-numeric files id is rejected', 'numeric session id');
+    assertThrows(() => parseProjectCommand('files 1 media to media extra'), 'files trailing token is rejected', 'Unexpected token');
+
     assertThrows(() => parseProjectCommand('start shopdb to :memory:'), 'start without as is rejected', "Expected 'as'");
     assertThrows(() => parseProjectCommand('start shopdb as alice'), 'start without to is rejected', "Expected 'to'");
     assertThrows(() => parseProjectCommand('start'), 'start without args is rejected');

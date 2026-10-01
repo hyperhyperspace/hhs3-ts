@@ -9,7 +9,7 @@ import {
     type ReplSessionOptions,
 } from "@hyper-hyper-space/hhs3_rdb_repl";
 
-import type { KeyStore } from "../keys/keystore.js";
+import type { KeyStore } from "@hyper-hyper-space/hhs3_rhost_node";
 import type { Workspace } from "../workspace/workspace.js";
 
 export { ReplSession, type OutputMode, type HashWidth };

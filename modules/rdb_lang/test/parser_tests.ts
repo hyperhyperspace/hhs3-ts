@@ -833,7 +833,7 @@ export const parserTests = {
             name: "[PARSE39] JSON '<json text>' writes any json value; null inside JSON is rejected",
             invoke: async () => {
                 const doc = { k: ['v', "it's", 'a\nb'], n: [1, 2.5] };
-                const text = `JSON '{"k": ["v", "it''s", "a\\nb"], "n": [1, 2.5]}'`;
+                const text = `JSON '{"k": ["v", "it''s", "a\\\\nb"], "n": [1, 2.5]}'`;
                 const same = (a: unknown, what: string) =>
                     assertEquals(JSON.stringify(a), JSON.stringify(doc), what);
 
@@ -1013,6 +1013,143 @@ export const parserTests = {
                 const params = parseStatement("CREATE CATALOG c VERSION '1.0.0' PARAMS (:who identity) AS (TABLEGROUP g USING SCHEMA s WITH ROWS (t (x = :who)));");
                 assertTrue(params.ok, ':param lexes in WITH ROWS and PARAMS');
                 assertTrue(!parseStatement('SELECT * FROM t WHERE x = : y;').ok, 'a bare colon is still unexpected');
+            },
+        },
+        {
+            name: '[PARSE46] VERSION on CREATE SCHEMA and ALTER SCHEMA is optional and parses before AS',
+            invoke: async () => {
+                const versioned = parseStatement("CREATE SCHEMA shop CREATORS ($dev) VERSION '1.2.0' AS (TABLE t (x string));");
+                assertTrue(versioned.ok && versioned.value.kind === 'create-schema', 'CREATE SCHEMA with VERSION parses');
+                if (versioned.ok && versioned.value.kind === 'create-schema') assertEquals(versioned.value.version, '1.2.0', 'schema version');
+
+                const unversioned = parseStatement('CREATE SCHEMA shop AS (TABLE t (x string));');
+                assertTrue(unversioned.ok && unversioned.value.kind === 'create-schema' && unversioned.value.version === undefined,
+                    'CREATE SCHEMA without VERSION parses with no version');
+
+                const alter = parseStatement("ALTER SCHEMA shop VERSION '1.3.0' AS (ADD COLUMN t.y string NULL) NOTE 'n' BY $dev;");
+                assertTrue(alter.ok && alter.value.kind === 'alter-schema', 'ALTER SCHEMA with VERSION parses');
+                if (alter.ok && alter.value.kind === 'alter-schema') {
+                    assertEquals(alter.value.version, '1.3.0', 'update version');
+                    assertEquals(alter.value.note, 'n', 'trailing clauses still parse');
+                }
+                const bare = parseStatement('ALTER SCHEMA shop AS (ADD COLUMN t.y string NULL);');
+                assertTrue(bare.ok && bare.value.kind === 'alter-schema' && bare.value.version === undefined,
+                    'ALTER SCHEMA without VERSION parses with no version');
+            },
+        },
+        {
+            name: '[PARSE47] source mode: CREATE CATALOG may omit VERSION only with catalogVersionOptional',
+            invoke: async () => {
+                const sql = 'CREATE CATALOG c AS (TABLEGROUP g USING SCHEMA s);';
+                assertTrue(parseMessages(sql).some((m) => m.includes('requires VERSION')), 'by default a catalog needs a version');
+
+                const source = parseStatement(sql, { catalogVersionOptional: true });
+                assertTrue(source.ok && source.value.kind === 'create-catalog' && source.value.version === undefined,
+                    'with the option the statement parses with no version');
+
+                const explicit = parseStatement("CREATE CATALOG c VERSION '2.0.0' AS (TABLEGROUP g USING SCHEMA s);", { catalogVersionOptional: true });
+                assertTrue(explicit.ok && explicit.value.kind === 'create-catalog' && explicit.value.version === '2.0.0',
+                    'an explicit version still parses under the option');
+            },
+        },
+        {
+            name: '[PARSE48] CREATE CATALOG carries the span of its VERSION clause',
+            invoke: async () => {
+                const sql = "CREATE CATALOG c CREATORS ($dev) VERSION '2.0.0' AS (TABLEGROUP g USING SCHEMA s);";
+                const stated = parseStatement(sql);
+                assertTrue(stated.ok && stated.value.kind === 'create-catalog', 'it parses');
+                if (!stated.ok || stated.value.kind !== 'create-catalog') return;
+                const span = stated.value.versionSpan!;
+                assertEquals(sql.slice(span.start, span.end), "VERSION '2.0.0'", 'the span covers the keyword and the string');
+
+                const omitted = parseStatement('CREATE CATALOG c AS (TABLEGROUP g USING SCHEMA s);', { catalogVersionOptional: true });
+                assertTrue(omitted.ok && omitted.value.kind === 'create-catalog' && omitted.value.versionSpan === undefined, 'no clause, no span');
+            },
+        },
+        {
+            name: '[PARSE49] parses FILES items in CREATE CATALOG and ADD FILES in ALTER CATALOG; FILES and WRITE are contextual',
+            invoke: async () => {
+                const created = parseStatement(`CREATE CATALOG c VERSION '1.0.0' AS (
+                    TABLEGROUP user USING SCHEMA s USING IDENTITIES identities,
+                    FILES media USING IDENTITIES user.identities
+                      ALLOW WRITE IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author,
+                    FILES files BIND u => #ab12cd34 USING IDENTITIES u.identities ALLOW WRITE IF true
+                );`);
+                assertTrue(created.ok, `CREATE CATALOG with FILES parses: ${created.ok ? '' : created.diagnostics.map((d) => d.message).join('; ')}`);
+                if (!created.ok || created.value.kind !== 'create-catalog') return;
+                assertEquals(created.value.groups.length, 1, 'one group');
+                const [media, files] = created.value.files;
+                assertEquals(media.name, 'media', 'the first FILES');
+                assertTrue(media.binding === undefined, 'no BIND');
+                assertEquals(media.idProvider, 'user.identities', 'the identity table');
+                assertEquals(media.canWrite.kind, 'exists', 'the write predicate');
+                assertEquals(files.name, 'files', 'files is a valid FILES name');
+                assertEquals(files.binding?.name, 'u', 'the BIND alias');
+                assertTrue(files.binding?.group.kind === 'hash' && files.binding.group.prefix === 'ab12cd34', 'the BIND target by hash');
+                assertEquals(files.canWrite.kind, 'true', 'ALLOW WRITE IF true');
+
+                const altered = parseStatement(`ALTER CATALOG c VERSION '1.1.0' AS (
+                    ADD FILES attachments USING IDENTITIES user.identities ALLOW WRITE IF true,
+                    ADD TABLEGROUP files USING SCHEMA s
+                ) BY $dev;`);
+                assertTrue(altered.ok && altered.value.kind === 'alter-catalog', 'ALTER CATALOG with ADD FILES parses');
+                if (!altered.ok || altered.value.kind !== 'alter-catalog') return;
+                const [addFiles, addGroup] = altered.value.changes;
+                assertTrue(addFiles.kind === 'add-files' && addFiles.files.name === 'attachments', 'ADD FILES');
+                assertTrue(addGroup.kind === 'add-group' && addGroup.group.name === 'files', 'files stays a group name');
+
+                const names = parseStatement('CREATE SCHEMA files AS (TABLE files (write string, files string) ALLOW all IF true);');
+                assertTrue(names.ok, 'files and write stay valid schema, table and column names');
+                const select = parseStatement('SELECT write, files FROM files.files WHERE write = files;');
+                assertTrue(select.ok, 'and valid in queries');
+            },
+        },
+        {
+            name: '[PARSE50] FILES requires USING IDENTITIES and ALLOW WRITE IF, and binds one group',
+            invoke: async () => {
+                const item = (body: string) => parseMessages(`CREATE CATALOG c VERSION '1.0.0' AS (FILES m ${body});`);
+                assertTrue(item('ALLOW WRITE IF true').some((m) => m.includes('FILES m requires USING IDENTITIES')), 'no identity table');
+                assertTrue(item('USING IDENTITIES u.identities').some((m) => m.includes('FILES m requires ALLOW WRITE IF')), 'no write predicate');
+                assertTrue(item('BIND a => x, b => y USING IDENTITIES a.identities ALLOW WRITE IF true')
+                    .some((m) => m.includes('FILES binds exactly one TABLEGROUP')), 'a second binding');
+                assertTrue(item('USING IDENTITIES u.identities ALLOW DEPLOY IF true').some((m) => m.includes('Expected ALLOW WRITE IF')),
+                    'ALLOW takes WRITE on a FILES');
+                assertTrue(parseMessages("ALTER CATALOG c VERSION '1.1.0' AS (DROP x);").some((m) => m.includes('ADD FILES')),
+                    'the ALTER CATALOG error names ADD FILES');
+            },
+        },
+        {
+            name: '[PARSE51] parses PUT, GET and LIST on FILES; their words stay valid names',
+            invoke: async () => {
+                const put = parseStatement("PUT FILE 'a/b.png' INTO app.media AT 'pics/b.png' IN KEY BY $admin;");
+                assertTrue(put.ok && put.value.kind === 'put-file', 'PUT FILE parses');
+                if (!put.ok || put.value.kind !== 'put-file') return;
+                assertEquals(`${put.value.source.kind} ${put.value.files.text} ${put.value.at} ${put.value.section} ${put.value.author?.kind}`,
+                    'file app.media pics/b.png key variable', 'its clauses');
+                const str = parseStatement("PUT STRING 'hi' INTO media AT 'x.txt';");
+                assertTrue(str.ok && str.value.kind === 'put-file' && str.value.source.kind === 'string' && str.value.section === 'common', 'PUT STRING');
+                const b64 = parseStatement("PUT B64 'AAE=' INTO media AT 'x.bin' IN COMMON;");
+                assertTrue(b64.ok && b64.value.kind === 'put-file' && b64.value.source.kind === 'b64', 'PUT B64');
+                assertTrue(parseMessages("PUT STRING 'hi' INTO media;").some((m) => m.includes("PUT STRING needs AT 'path'")), 'STRING needs AT');
+                assertTrue(parseMessages("PUT DATA 'hi' INTO media AT 'x';").some((m) => m.includes('FILE, STRING or B64')), 'an unknown source');
+
+                const get = parseStatement("GET 'x.txt' FROM media IN KEY $alice HASH 'dPu+' TO 'out/x.txt';");
+                assertTrue(get.ok && get.value.kind === 'get-file', 'GET parses');
+                if (!get.ok || get.value.kind !== 'get-file') return;
+                assertEquals(`${get.value.section} ${get.value.owner?.kind} ${get.value.hash} ${get.value.to} ${get.value.asB64}`,
+                    'key variable dPu+ out/x.txt false', 'its clauses');
+                const inline = parseStatement("GET 'x.bin' FROM media IN KEY AS B64;");
+                assertTrue(inline.ok && inline.value.kind === 'get-file' && inline.value.asB64 && inline.value.owner?.kind === 'current', 'GET AS B64, bare IN KEY');
+                assertTrue(parseMessages("GET 'x' FROM media AS B64 TO 'y';").some((m) => m.includes('AS B64 is for inline output')), 'AS B64 with TO');
+
+                const list = parseStatement("LIST 'docs' FROM media IN KEY #ab12;");
+                assertTrue(list.ok && list.value.kind === 'list-files' && list.value.prefix === 'docs' && list.value.owner?.kind === 'hash', 'LIST parses');
+                const bare = parseStatement('LIST FROM media;');
+                assertTrue(bare.ok && bare.value.kind === 'list-files' && bare.value.prefix === undefined && bare.value.section === undefined, 'a bare LIST');
+
+                assertTrue(parseStatement('CREATE SCHEMA s AS (TABLE put (get string, list string, key string, common string) ALLOW all IF true);').ok,
+                    'put, get, list, key and common stay valid names');
+                assertTrue(parseStatement('SELECT get, list FROM g.put WHERE key = common;').ok, 'and valid in queries');
             },
         },
     ],

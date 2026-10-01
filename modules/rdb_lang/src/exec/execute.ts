@@ -1,10 +1,11 @@
 import { deployCatalogRelease, deriveRowId } from "@hyper-hyper-space/hhs3_rdb";
 import { formatValidationFailure, ValidationRejectedError } from "@hyper-hyper-space/hhs3_mvt";
 
-import { DiagnosticBag, err, ok, Result } from "../diagnostics.js";
+import { DiagnosticBag, err, ok, Result, SpannedError } from "../diagnostics.js";
 import type { BoundExecutableStatement, BoundStatement } from "../bind/bind.js";
 import { compileCreate } from "../compile/create.js";
 import { executeLog } from "./history.js";
+import { executeGetFile, executeListFiles, executePutFile } from "./files.js";
 import type { LangExecutionResult, SelectLangResult } from "./result.js";
 
 export async function execute(bound: BoundStatement): Promise<Result<LangExecutionResult>> {
@@ -17,6 +18,10 @@ export async function execute(bound: BoundStatement): Promise<Result<LangExecuti
     } catch (e) {
         if (e instanceof ValidationRejectedError) {
             diagnostics.add('VALIDATION_REJECTED', formatValidationFailure(e.why), bound.ast.span);
+            return err(diagnostics.all());
+        }
+        if (e instanceof SpannedError) {
+            diagnostics.add(e.code, e.message, e.span);
             return err(diagnostics.all());
         }
         diagnostics.add('EXECUTION_FAILED', e instanceof Error ? e.message : String(e), bound.ast.span);
@@ -49,7 +54,11 @@ async function executeRuntime(bound: BoundExecutableStatement): Promise<LangExec
             return { kind: 'use-database', database: bound.database.id };
         case 'alter-schema': {
             if (bound.schema.schema === undefined) throw new Error('ALTER SCHEMA target is not loaded');
-            const entryHash = await bound.schema.schema.updateSchema(bound.rules, bound.author, bound.note, bound.at);
+            const entryHash = await bound.schema.schema.updateSchema(bound.rules, bound.author, {
+                ...(bound.version !== undefined ? { version: bound.version } : {}),
+                ...(bound.note !== undefined ? { note: bound.note } : {}),
+                at: bound.at,
+            });
             return { kind: 'alter-schema', entryHash, schema: bound.schema.id, rules: bound.rules.length };
         }
         case 'update-ref': {
@@ -117,5 +126,11 @@ async function executeRuntime(bound: BoundExecutableStatement): Promise<LangExec
         }
         case 'log':
             return executeLog(bound);
+        case 'put-file':
+            return executePutFile(bound);
+        case 'get-file':
+            return executeGetFile(bound);
+        case 'list-files':
+            return executeListFiles(bound);
     }
 }

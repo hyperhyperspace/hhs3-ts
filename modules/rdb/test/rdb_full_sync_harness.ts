@@ -22,6 +22,10 @@ import { RTableGroupImpl, rTableGroupFactory } from "../src/rtable_group/group.j
 import { RDbImpl, rDbFactory } from "../src/rdb/rdb.js";
 import { RCatalogImpl, rCatalogFactory } from "../src/rcatalog/rcatalog.js";
 import { RDeployGateImpl, rDeployGateFactory } from "../src/rdeploy_gate/rdeploy_gate.js";
+import { rBlobStoreFactory } from "../src/rblob_store/rblob_store.js";
+import { RBLOB_STORE_TYPE_ID } from "../src/rblob_store/payload.js";
+import { rFileMapFactory } from "../src/rfile_map/rfile_map.js";
+import { RFILE_MAP_TYPE_ID } from "../src/rfile_map/payload.js";
 import type { TableDef } from "../src/rschema/payload.js";
 
 export const crypto = createBasicCrypto();
@@ -49,6 +53,8 @@ export function registerRdbTypes(replica: Replica): void {
     replica.registerType(RTableGroupImpl.typeId, rTableGroupFactory);
     replica.registerType(RDeployGateImpl.typeId, rDeployGateFactory);
     replica.registerType(RDbImpl.typeId, rDbFactory);
+    replica.registerType(RBLOB_STORE_TYPE_ID, rBlobStoreFactory);
+    replica.registerType(RFILE_MAP_TYPE_ID, rFileMapFactory);
 }
 
 export type PeerSetup = {

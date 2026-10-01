@@ -1,6 +1,9 @@
 import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
-import { deriveRowId, RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory, TableDef } from "@hyper-hyper-space/hhs3_rdb";
+import {
+    deriveRowId, IDENTITIES_TABLE, identityRow, RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory, TableDef,
+    usersSchemaTables,
+} from "@hyper-hyper-space/hhs3_rdb";
 
 import { createMockRContext } from "@hyper-hyper-space/hhs3_rdb_adapter_test_gen";
 import { changesToEntries, type IngestPlan, type MappingLookup } from "../../src/ingest.js";
@@ -75,6 +78,7 @@ export async function runIngestPlannerSweep(options: ResolvedFuzzSweepOptions): 
                     memo: { type: 'string', nullable: true },
                     amount: { type: 'decimal', constraints: { scale: 2 } },
                 }),
+                usersSchemaTables().find((t) => t.name === IDENTITIES_TABLE)!,
             ],
         });
         const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
@@ -88,12 +92,16 @@ export async function runIngestPlannerSweep(options: ResolvedFuzzSweepOptions): 
                 return undefined;
             };
 
+            // The writer signs every entry, so each group registers it in a
+            // local identity provider.
             const makeGroup = async (suffix: string) => {
                 const init = await RTableGroupImpl.create({
                     name: `ingest-${seed}-${b}-${suffix}`,
                     seed: `ingest-${seed}-${b}-${suffix}`,
                     schemaRef: schema.getId(),
                     schemaVersion: pinned,
+                    idProvider: IDENTITIES_TABLE,
+                    initialRows: { [IDENTITIES_TABLE]: [identityRow('writer', writer)] },
                 });
                 return (await ctx.createObject(init)) as RTableGroupImpl;
             };

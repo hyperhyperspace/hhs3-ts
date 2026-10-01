@@ -11,7 +11,7 @@ import { bind, BoundStatement } from "../src/bind/bind.js";
 import { execute } from "../src/exec/execute.js";
 import { parseStatement } from "../src/syntax/parser.js";
 import { splitStatements } from "../src/syntax/scanner.js";
-import { renderAlterCatalog, renderCreateCatalog, renderCreateSchema, renderRowOp, renderSchemaUpdate } from "../src/reverse/render.js";
+import { renderAlterCatalog, renderCreateCatalog, renderCreateSchema, renderLiteral, renderRowOp, renderSchemaUpdate } from "../src/reverse/render.js";
 import { dumpDatabase, dumpGroup, dumpSchema } from "../src/reverse/dump.js";
 import type { RenderAliasContext, RenderVersionScope } from "../src/reverse/aliases.js";
 import type { TestBindContext } from "./mock_bind_context.js";
@@ -362,7 +362,7 @@ export const restPhaseTests = {
         {
             name: '[REST05] reverse rendering and dump produce C-SQL output',
             invoke: async () => {
-                const { schema, group, lang, catalog, usersGroup } = await createEnv();
+                const { env, admin, schema, group, lang, catalog, usersGroup } = await createEnv();
                 const renderedSchema = renderCreateSchema(schema.createOp);
                 const renderedParsed = parseStatement(renderedSchema);
                 assertTrue(renderedParsed.ok, 'rendered schema parses');
@@ -376,6 +376,7 @@ export const restPhaseTests = {
                 const authorKeyId = schema.createOp.creators[0].keyId;
                 const renderedMigration = renderSchemaUpdate({
                     action: 'schema-update',
+                    version: '0.0.2',
                     migration: [{
                         rule: 'set-restrictions',
                         table: 'products',
@@ -388,7 +389,8 @@ export const restPhaseTests = {
                     schemaName: schema.getName(),
                 });
                 assertTrue(renderedMigration.startsWith('-- shop\n'), 'rendered migration includes schema name comment');
-                assertTrue(renderedMigration.includes(`ALTER SCHEMA #${schema.getId()} AS (`), 'rendered migration uses schema hash ref');
+                assertTrue(renderedMigration.includes(`ALTER SCHEMA #${schema.getId()} VERSION '0.0.2' AS (`), 'rendered migration uses schema hash ref and carries the version');
+                assertTrue(renderedSchema.includes(`VERSION '${schema.createOp.version}'`), 'rendered schema carries its version');
                 assertTrue(renderedMigration.includes(` BY #${authorKeyId}`), 'rendered migration includes BY author');
                 assertTrue(renderedMigration.includes('SET ALLOW RULES products'), 'rendered migration uses SET ALLOW RULES syntax');
                 assertTrue(parseStatement(renderedMigration).ok, 'rendered migration parses');
@@ -398,7 +400,7 @@ export const restPhaseTests = {
                 const schemaDump = await dumpSchema(schema);
                 assertTrue(!schemaDump.includes('#unknown'), 'schema dump does not use unknown schema ref');
                 assertTrue(schemaDump.includes('-- shop\n'), 'schema dump includes schema name comment');
-                assertTrue(schemaDump.includes(`ALTER SCHEMA #${schema.getId()} AS (`), 'schema dump uses schema hash ref');
+                assertTrue(schemaDump.includes(`ALTER SCHEMA #${schema.getId()} VERSION '0.0.2' AS (`), 'schema dump uses schema hash ref and the default next-patch version');
                 assertTrue(schemaDump.includes('ADD COLUMN products."note" string NULL'), 'schema dump includes alter migration');
                 const noted = await execute(await parseBind("ALTER SCHEMA shop AS (ADD COLUMN products.memo string NULL) NOTE 'v3: it''s a memo';", lang));
                 assertTrue(noted.ok && noted.value.kind === 'alter-schema', 'alter with NOTE succeeds');
@@ -443,18 +445,36 @@ export const restPhaseTests = {
                 const del = await execute(await parseBind(`DELETE FROM shop_prod.products WHERE rowId = '${insert.value.rowId}';`, lang));
                 assertTrue(del.ok && del.value.kind === 'delete', 'delete for dump succeeds');
 
+                // shop_prod has no USING IDENTITIES, so its writes are anonymous
                 const dump = await dumpGroup(group);
                 assertTrue(dump.startsWith('-- TABLEGROUP shop_prod USING SCHEMA'), 'a group genesis renders as a comment');
                 assertTrue(!(await dumpGroup(usersGroup)).includes('CREATE TABLEGROUP'), 'no CREATE TABLEGROUP statement is rendered');
                 const dumpLines = dump.split('\n');
                 const hasLine = (needle: string) => dumpLines.some((line) =>
-                    line.includes(needle) && line.includes(' BY #') && line.includes(' AT {#'));
+                    line.includes(needle) && !line.includes(' BY ') && line.includes(' AT {#'));
                 assertTrue(dumpLines.some((line) =>
                     line.includes('INSERT INTO products') && line.includes('(uuid,') && line.includes("'A'")
-                    && line.includes(' BY #') && line.includes(' AT {#')),
-                    'dumped insert includes uuid, BY author and causal AT');
-                assertTrue(hasLine(`UPDATE products SET name = 'Widget 2' WHERE rowId = #${insert.value.rowId}`), 'dumped update includes BY author and causal AT');
-                assertTrue(hasLine(`DELETE FROM products WHERE rowId = #${insert.value.rowId}`), 'dumped delete includes BY author and causal AT');
+                    && !line.includes(' BY ') && line.includes(' AT {#')),
+                    'dumped anonymous insert includes uuid and causal AT, and no BY');
+                assertTrue(hasLine(`UPDATE products SET name = 'Widget 2' WHERE rowId = #${insert.value.rowId}`), 'dumped anonymous update includes causal AT');
+                assertTrue(hasLine(`DELETE FROM products WHERE rowId = #${insert.value.rowId}`), 'dumped anonymous delete includes causal AT');
+
+                await env.run(`
+                    CREATE SCHEMA test:members CREATORS ($admin) AS (
+                      TABLE identities (keyId string PUB READONLY, publicKey string PUB READONLY) IDENTITY PROVIDER ALLOW insert IF true,
+                      TABLE notes (body string)
+                    );
+                    CREATE CATALOG members_catalog VERSION '1.0.0' AS (
+                      TABLEGROUP members USING SCHEMA test:members USING IDENTITIES identities
+                        WITH ROWS (identities (keyId = $admin, publicKey = publicKey($admin)))
+                    );
+                    CREATE DATABASE members_db USING CATALOG members_catalog;
+                    INSERT INTO members.notes (body) VALUES ('hi');
+                `);
+                const signedLines = (await dumpGroup(await env.group('members'))).split('\n');
+                assertTrue(signedLines.some((line) =>
+                    line.includes('INSERT INTO notes') && line.includes(` BY #${admin.keyId}`) && line.includes(' AT {#')),
+                    'dumped insert of a group with USING IDENTITIES includes BY author and causal AT');
             },
         },
         {
@@ -583,7 +603,7 @@ export const restPhaseTests = {
         {
             name: '[REST08] SEED and uuid pseudo-column bind deterministically',
             invoke: async () => {
-                const { lang, admin } = await createEnv();
+                const { lang } = await createEnv();
                 const plan = async () => {
                     const result = await execute(await parseBind("CREATE DATABASE app2 SEED 'db-seed-fixed' USING CATALOG shop_catalog;", lang));
                     if (!result.ok || result.value.kind !== 'create-plan') throw new Error('database create failed');
@@ -597,7 +617,7 @@ export const restPhaseTests = {
                 ));
                 assertTrue(insert.ok && insert.value.kind === 'insert', 'insert with uuid succeeds');
                 if (!insert.ok || insert.value.kind !== 'insert') return;
-                assertEquals(insert.value.rowId, deriveRowId('row-uuid-1', admin.keyId), 'uuid pseudo-column fixes rowId');
+                assertEquals(insert.value.rowId, deriveRowId('row-uuid-1'), 'uuid pseudo-column fixes rowId (anonymous: shop_prod has no USING IDENTITIES)');
             },
         },
         {
@@ -674,7 +694,7 @@ export const restPhaseTests = {
             name: '[REST11] aliasMode dump uses aliases not raw hashes, and replays',
             invoke: async () => {
                 const { env, db, admin, schema, group, usersGroup, catalog } = await createEnv();
-                await env.run("INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget') BY $admin;");
+                await env.run("INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'Widget');");
                 await env.run('ALTER SCHEMA shop AS (ADD COLUMN products.note string NULL) BY $admin;');
                 await releaseAndDeploy(env, '1.1.0', 'UPDATE SCHEMA shop TO LATEST ON shop_prod', 'app', 'BY $admin');
 
@@ -808,7 +828,7 @@ export const restPhaseTests = {
                 const updated: json.Literal = [{ k: 'v' }, 'x', -2.5, true];
 
                 const insert = await execute(await parseBind(
-                    `INSERT INTO docs_prod.notes (slug, body) VALUES ('n1', JSON '${json.toStringCanonical(inserted).replace(/'/g, "''")}');`, lang));
+                    `INSERT INTO docs_prod.notes (slug, body) VALUES ('n1', ${renderLiteral(inserted)});`, lang));
                 assertTrue(insert.ok && insert.value.kind === 'insert', 'json object insert succeeds');
                 if (!insert.ok || insert.value.kind !== 'insert') return;
 
@@ -845,6 +865,42 @@ export const restPhaseTests = {
                         assertEquals(canon(bound.values['body']), canon(expected[i]), `dumped row op ${i} carries the original json value`);
                     }
                 }
+            },
+        },
+        {
+            name: '[REST14] a TABLEGROUP without USING IDENTITIES takes no BY, and drops the session author',
+            invoke: async () => {
+                const { lang, admin } = await createEnv();
+                const bindFailure = async (sql: string): Promise<string> => {
+                    const parsed = parseStatement(sql);
+                    if (!parsed.ok) throw new Error(parsed.diagnostics[0].message);
+                    const bound = await bind(parsed.value, lang);
+                    assertTrue(!bound.ok, `bind should fail: ${sql}`);
+                    return bound.ok ? '' : bound.diagnostics[0].message;
+                };
+
+                const noBy = 'TABLEGROUP shop_prod has no USING IDENTITIES; its writes are anonymous, so it takes no BY';
+                assertEquals(await bindFailure("INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'x') BY $admin;"), noBy,
+                    'BY on an insert is an error');
+                assertEquals(await bindFailure(`UPDATE shop_prod.products SET name = 'y' WHERE rowId = '${deriveRowId('A')}' BY $admin;`), noBy,
+                    'BY on an update is an error');
+                assertEquals(await bindFailure("BUNDLE ON shop_prod (INSERT INTO products (sku, name) VALUES ('B', 'y');) BY $admin;"), noBy,
+                    'BY on a bundle is an error');
+                assertEquals(await bindFailure('UPDATE REF users TO LATEST ON shop_prod BY $admin;'),
+                    'TABLEGROUP shop_prod has no USING IDENTITIES; its ref updates are anonymous, so it takes no BY',
+                    'BY on an UPDATE REF is an error');
+
+                const insert = await parseBind("INSERT INTO shop_prod.products (sku, name) VALUES ('A', 'x');", lang);
+                assertTrue(insert.kind === 'insert' && insert.author === undefined, 'without BY, the session author is dropped');
+                const nobody = await parseBind("INSERT INTO shop_prod.products (sku, name) VALUES ('B', 'x') BY NOBODY;", lang);
+                assertTrue(nobody.kind === 'insert' && nobody.author === undefined, 'BY NOBODY stays anonymous');
+                const updateRef = await parseBind('UPDATE REF users TO LATEST ON shop_prod;', lang);
+                assertTrue(updateRef.kind === 'update-ref' && updateRef.author === undefined, 'an UPDATE REF of an ungated binding is anonymous');
+
+                const authorValue = await bindFailure("INSERT INTO shop_prod.products (sku, name) VALUES ('C', $author);");
+                assertTrue(authorValue.includes('$author has no value: the statement is anonymous'), authorValue);
+                const me = await parseBind("INSERT INTO shop_prod.products (sku, name) VALUES ('D', $me);", lang);
+                assertTrue(me.kind === 'insert' && me.values['name'] === admin.keyId, '$me still names the session identity');
             },
         },
     ],

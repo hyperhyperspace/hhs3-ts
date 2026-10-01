@@ -1,6 +1,6 @@
 import { assertEquals } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 
-import { formatPredicate, formatRestrictionFailureReason } from "../src/rschema/format_predicate.js";
+import { formatPredicate, formatRestrictionFailureReason, renderStringLiteral } from "../src/rschema/format_predicate.js";
 import type { Operand, Predicate } from "../src/rschema/payload.js";
 import type { RowOpPayload } from "../src/rtable/payload.js";
 
@@ -116,8 +116,26 @@ export const formatPredicateTests = {
                 const long = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
                 assertEquals(
                     formatPredicate({ p: 'exists', table: 'docs', where: { meta: { tags: ["it's", 'a\nb'], n: -0 }, seq: long } }),
-                    `EXISTS docs WHERE docs.meta = JSON '{"n":0,"tags":["it''s","a\\nb"]}' AND docs.seq = JSON '[0,1,2,3,4,5,6,7,8,9,10,11]'`,
+                    `EXISTS docs WHERE docs.meta = JSON '{"n":0,"tags":["it''s","a\\\\nb"]}' AND docs.seq = JSON '[0,1,2,3,4,5,6,7,8,9,10,11]'`,
                     'objects and arrays render as JSON literals, arrays in order');
+            },
+        },
+        {
+            name: '[FORMAT01f] renderStringLiteral doubles a backslash only where the lexer would read it differently',
+            invoke: async () => {
+                const cases: [string, string, string][] = [
+                    ['100\\%', "'100\\%'", 'a lone backslash before % is kept'],
+                    ['a\\"b', "'a\\\"b'", 'a lone backslash before " is kept'],
+                    ['dir\\new', "'dir\\\\new'", 'a backslash before n is doubled'],
+                    ['a\\rb\\tc', "'a\\\\rb\\\\tc'", 'backslashes before r and t are doubled'],
+                    ['x\\\\y', "'x\\\\\\\\y'", 'a run of two becomes four'],
+                    ['end\\', "'end\\\\'", 'a trailing backslash is doubled'],
+                    ["a\\'b", "'a\\\\''b'", 'a backslash before a quote is doubled'],
+                    ['a\\\nb', "'a\\\\\\nb'", 'a backslash before a line feed is doubled'],
+                    ['l1\nl2\rl3\tl4', "'l1\\nl2\\rl3\\tl4'", 'control characters render as escapes'],
+                    ["it's", "'it''s'", 'a quote is doubled'],
+                ];
+                for (const [value, rendered, what] of cases) assertEquals(renderStringLiteral(value), rendered, what);
             },
         },
         {

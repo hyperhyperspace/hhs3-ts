@@ -1,0 +1,25 @@
+{
+  "name": "@hyper-hyper-space/hhs3_rdb_files_node",
+  "version": "0.1.0",
+  "description": "NodeDirectory: a file mount's folder on the local filesystem (atomic writes, recursive watch hint)",
+  "type": "module",
+  "source": "src/index.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "test": "TS_NODE_PROJECT=./tsconfig.test.json node --import ../../register.mjs ./test/run_tests.ts",
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist test-build test-tmp"
+  },
+  "author": "Santiago Bazerque",
+  "license": "MIT",
+  "dependencies": {
+    "@hyper-hyper-space/hhs3_rdb_projection": "^0.1.0"
+  },
+  "devDependencies": {
+    "@hyper-hyper-space/hhs3_util": "^0.1.0",
+    "@types/node": "^22.2.0",
+    "ts-node": "^10.9.2",
+    "typescript": "6.0.3"
+  }
+}

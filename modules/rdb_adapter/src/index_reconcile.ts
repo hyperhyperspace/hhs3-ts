@@ -1,16 +1,10 @@
-// Install a new projection index spec: the app-driven migration step for
-// projection-local indexes. Never triggered by sync - the app calls it when it
-// ships a new spec. It diffs the new spec (resolved at each member's current
-// checkpoint) against the indexes the target actually materialized, applies
-// the drops and ensures, and stores the spec as installed, atomically. From
-// then on every apply() maintains that spec across schema deltas.
-//
-// Version gate (forward only): a strictly newer version installs; the same
-// version with the same content is a no-op; the same version with different
-// content is an error (someone changed the spec without bumping it); an older
-// version is skipped, so an older build sharing the target runs against the
-// newer indexes instead of flapping them back. Indexes never affect
-// correctness, so "newest spec wins" needs no coordination.
+// Install a projection index spec. Never triggered by sync - the app calls it
+// when it ships a spec. The same fingerprint as the installed spec is a no-op.
+// Anything else is diffed (resolved at each member's current checkpoint)
+// against the indexes the target actually materialized, applied, and stored,
+// atomically. From then on every apply() maintains that spec across schema
+// deltas. An identical resolved index is left in place, so re-applying a spec
+// does not rebuild indexes that already match.
 
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
@@ -23,7 +17,7 @@ import {
 } from "./index_actions.js";
 import { GroupProjection, withDatabaseLock } from "./ingest_orchestrator.js";
 
-export type IndexReconcileStatus = 'installed' | 'unchanged' | 'skipped-older' | 'dry-run';
+export type IndexReconcileStatus = 'installed' | 'unchanged' | 'dry-run';
 
 export type IndexReconcileReport = {
     status: IndexReconcileStatus;
@@ -68,14 +62,8 @@ async function reconcileOnce(
     spec: IndexSpec, fingerprint: string, dryRun: boolean,
 ): Promise<IndexReconcileReport> {
     const state = await target.getIndexState();
-    const installed = state.spec;
-    if (installed !== undefined) {
-        if (spec.version < installed.version) return { status: 'skipped-older', actions: [], pending: [] };
-        if (spec.version === installed.version) {
-            if (fingerprint === state.specFingerprint) return { status: 'unchanged', actions: [], pending: [] };
-            throw new Error(
-                `index spec version ${spec.version} is already installed with different content; bump the version`);
-        }
+    if (state.spec !== undefined && fingerprint === state.specFingerprint) {
+        return { status: 'unchanged', actions: [], pending: [] };
     }
 
     const drops: SchemaAction[] = [];

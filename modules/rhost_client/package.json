@@ -1,0 +1,22 @@
+{
+  "name": "@hyper-hyper-space/hhs3_rhost_client",
+  "version": "0.1.0",
+  "description": "The client interface of an rhost host and its wire protocol (no replication stack)",
+  "type": "module",
+  "source": "src/index.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "test": "TS_NODE_PROJECT=./tsconfig.test.json node --import ../../register.mjs ./test/run_tests.ts",
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist test-build"
+  },
+  "author": "Santiago Bazerque",
+  "license": "MIT",
+  "devDependencies": {
+    "@hyper-hyper-space/hhs3_util": "^0.1.0",
+    "@types/node": "^22.2.0",
+    "ts-node": "^10.9.2",
+    "typescript": "6.0.3"
+  }
+}

@@ -23,6 +23,8 @@ export type CommandRun = {
 export type CommandRunOptions = {
     auth?: AuthInteractionContext;
     requestPassphrase?: (need: PassphraseRequest) => Promise<string | undefined>;
+    // The line of `file` the command starts on, when it is one statement of a script.
+    firstLine?: number;
 };
 
 export async function runLanguageWithUnlock(
@@ -76,7 +78,7 @@ export async function runCommand(
     } catch (error) {
         if (error instanceof KeyUnlockDeclinedError) return { exitCode: 1, output: 'unlock declined' };
         if (error instanceof LanguageError) {
-            return { exitCode: 2, output: formatDiagnostics(error.diagnostics, file, error.hints) };
+            return { exitCode: 2, output: formatDiagnostics(error.diagnostics, file, error.hints, options?.firstLine) };
         }
         return { exitCode: 1, output: error instanceof Error ? error.message : String(error) };
     }

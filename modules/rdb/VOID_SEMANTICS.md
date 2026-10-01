@@ -172,7 +172,8 @@ scoping, and `liveRowIds` live in `view.ts`. Diagnosing an entry **is** those
 `entryVoided` calls on cover candidates.
 
 **Why diagnose recurses.** An update or delete restriction — including the
-default `rowAuthor = $author` — is evaluated against the subject row, so
+default `rowAuthor = $author` of a group with an identity provider — is
+evaluated against the subject row, so
 diagnosing \(U\) or \(D\) calls `getRow` at that op's own position. `getRow` =
 identity cover + per-column covers. Each cover candidate is `entryVoided`,
 which is another diagnose. `EXISTS` / FK do the same for other rows. The

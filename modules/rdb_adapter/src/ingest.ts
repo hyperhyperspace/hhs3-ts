@@ -102,11 +102,12 @@ export type MappingLookup = (table: string, localId: number) => SyncMapping | un
 export type KeyLookup = (keyId: number) => { keyHash: string; publicKey?: string } | undefined;
 
 // Everything the planner needs about the group that owns a target table.
+// `writerKeyId` is undefined when the group's ops are anonymous (no idProvider).
 export type NodeContext = {
     groupId: string;
     schemaView: RSchemaView;
     config: AdapterConfig;
-    writerKeyId: KeyId;
+    writerKeyId: KeyId | undefined;
 };
 
 function keyOf(table: string, localId: number): string {
@@ -559,7 +560,7 @@ export function changesToEntries(
     schemaView: RSchemaView,
     lookup: MappingLookup,
     config: AdapterConfig,
-    writerKeyId: KeyId,
+    writerKeyId: KeyId | undefined,
     newUuid: () => string,
     keyLookup: KeyLookup = () => undefined,
 ): IngestPlan {

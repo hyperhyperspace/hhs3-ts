@@ -207,13 +207,13 @@ export const projectionTests = {
                 // A product in catalog; observe it from orders so the cross-group
                 // FK target is live; then an order referencing it.
                 const products = await catalog.group.getTable('products');
-                await products.insert('p1', { title: 'Widget' }, catalog.admin);
-                const p1 = deriveRowId('p1', catalog.admin.keyId);
+                await products.insert('p1', { title: 'Widget' });
+                const p1 = deriveRowId('p1');
                 await orders.group.observe('catalog', await frontier(catalog.group));
 
                 const ordersTable = await orders.group.getTable('orders');
-                await ordersTable.insert('o1', { item: p1 }, orders.admin);
-                const o1 = deriveRowId('o1', orders.admin.keyId);
+                await ordersTable.insert('o1', { item: p1 });
+                const o1 = deriveRowId('o1');
 
                 const target = new MemoryTarget();
                 const projection = await RdbProjection.open(rdb, ctx, target);
@@ -250,8 +250,8 @@ export const projectionTests = {
                     assertEquals(target.getRowIds('catalog_products').length, 0, 'no products before any insert');
 
                     const products = await catalog.group.getTable('products');
-                    await products.insert('p1', { title: 'Widget' }, catalog.admin);
-                    const p1 = deriveRowId('p1', catalog.admin.keyId);
+                    await products.insert('p1', { title: 'Widget' });
+                    const p1 = deriveRowId('p1');
 
                     // The group.subscribe trigger fires a debounced sync; wait for it.
                     await poll(() => target.getRowByRowId('catalog_products', p1) !== undefined);
@@ -268,7 +268,7 @@ export const projectionTests = {
                 const ctx = newCtx();
                 const { catalog, orders, rdb } = await makeCatalogAndOrders(ctx);
                 const products = await catalog.group.getTable('products');
-                await products.insert('p1', { title: 'Widget' }, catalog.admin);
+                await products.insert('p1', { title: 'Widget' });
 
                 const target = new MemoryTarget();
                 let applyCount = 0;
@@ -355,13 +355,12 @@ export const projectionTests = {
             invoke: async () => {
                 const ctx = newCtx();
                 const { g, rdb } = await makeConcurrency(ctx);
-                const admin = g.admin;
                 const caps = await g.group.getTable('caps');
                 const items = await g.group.getTable('items');
 
                 // Grant the cap, then project up to that horizon: the initial
                 // checkpoint becomes `base` (cap live, no items).
-                await caps.insert('c-1', { label: 'grant' }, admin);
+                await caps.insert('c-1', { label: 'grant' });
 
                 const target = new MemoryTarget();
                 const received: OpEvent[] = [];
@@ -375,8 +374,8 @@ export const projectionTests = {
                     // Concurrent siblings off `base`: revoke the cap AND insert the
                     // gated item. The insert is valid at its parent (cap still
                     // live) but the merged head sees the revoke and voids it.
-                    await caps.delete(deriveRowId('c-1', admin.keyId), admin, base);
-                    const insertHash = await items.insert('i-1', { name: 'thing' }, admin, base);
+                    await caps.delete(deriveRowId('c-1'), undefined, base);
+                    const insertHash = await items.insert('i-1', { name: 'thing' }, undefined, base);
 
                     await projection.sync();
 
@@ -411,7 +410,7 @@ export const projectionTests = {
                 try {
                     target.holdApplies = true;
                     const products = await catalog.group.getTable('products');
-                    await products.insert('p1', { title: 'Widget' }, catalog.admin);
+                    await products.insert('p1', { title: 'Widget' });
                     await poll(() => target.applyStarted);
 
                     const stopping = projection.stop();
@@ -569,7 +568,6 @@ export const projectionTests = {
                 const projection = await RdbProjection.open(rdb, ctx, target);
                 try {
                     const report = await projection.reconcileIndexes({
-                        version: 1,
                         indexes: [
                             { name: 'by_x', group: 'catalog', table: 'products', columns: ['title'] },
                             { name: 'by_x', group: 'orders', table: 'orders', columns: ['item', '@author'] },
@@ -588,11 +586,10 @@ export const projectionTests = {
                         'cross-group FK resolves to its co-projected id companion');
 
                     // A later sync keeps the installed spec; nothing is rebuilt.
-                    await catalog.group.getTable('products').then((t) => t.insert('p1', { title: 'W' }, catalog.admin));
+                    await catalog.group.getTable('products').then((t) => t.insert('p1', { title: 'W' }));
                     await projection.sync();
                     assertEquals((await target.getIndexState()).materialized.length, 2, 'sync leaves the indexes in place');
                     assertEquals((await projection.reconcileIndexes({
-                        version: 1,
                         indexes: [
                             { name: 'by_x', group: 'catalog', table: 'products', columns: ['title'] },
                             { name: 'by_x', group: 'orders', table: 'orders', columns: ['item', '@author'] },
@@ -612,7 +609,6 @@ export const projectionTests = {
                 const projection = await RdbProjection.open(rdb, ctx, target, { debounceMs: 10 });
                 try {
                     const report = await projection.reconcileIndexes({
-                        version: 1,
                         indexes: [
                             { name: 'by_title', group: 'forum', table: 'posts', columns: ['title'] },
                             { name: 'by_body', group: 'late', table: 'notes', columns: ['body'] },
@@ -635,7 +631,7 @@ export const projectionTests = {
                 } finally {
                     await projection.stop();
                 }
-                await expectRejects(() => projection.reconcileIndexes({ version: 2, indexes: [] }), 'stopped',
+                await expectRejects(() => projection.reconcileIndexes({ indexes: [] }), 'stopped',
                     'reconcile after stop is refused');
             },
         },

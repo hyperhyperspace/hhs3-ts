@@ -13,6 +13,10 @@ function isHashPart(ch: string): boolean {
     return /[A-Za-z0-9_+/=-]/.test(ch);
 }
 
+// Backslash escapes in '...' strings. A backslash before any other character
+// is literal, so LIKE patterns like '100\%' keep their backslash.
+const STRING_ESCAPES = new Map([['n', '\n'], ['r', '\r'], ['t', '\t'], ['\\', '\\']]);
+
 function token(source: string, kind: Token['kind'], text: string, start: number, end: number, value?: Token['value']): Token {
     const t: Token = {
         kind,
@@ -168,6 +172,14 @@ export function lex(source: string): Result<Token[]> {
                     i += 1;
                     closed = true;
                     break;
+                }
+                if (source[i] === '\\') {
+                    const escaped = STRING_ESCAPES.get(source[i + 1] ?? '');
+                    if (escaped !== undefined) {
+                        value += escaped;
+                        i += 2;
+                        continue;
+                    }
                 }
                 value += source[i];
                 i += 1;

@@ -69,7 +69,9 @@ export const MAX_GATE_WIDTH = 256;
 // flagged idProvider) or a qualified 'group.table' (name-resolvability only at
 // create — its group-name must be in `bindings`; the foreign table being a
 // provider is a runtime concern). Fixed v1 like bindings / canDeploy. A group
-// with no idProvider performs no authentication (claimed authors are trusted).
+// with no idProvider is ANONYMOUS: a row op, bundle or observation that claims
+// an author is invalid, no canObserve gate or table restriction may read
+// $author, and update/delete default to open (see defaultRestrictionRule).
 //
 // `deployKeys` is an embedded, self-certifying key list used only to verify
 // deploy signatures, alongside the idProvider: a deploy's author key resolves

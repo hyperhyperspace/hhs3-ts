@@ -6,6 +6,7 @@ import { signPayload } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
+import { applyMigrationRules } from "../src/rschema/validate_ops.js";
 import type { TableDef } from "../src/rschema/payload.js";
 
 const crypto = createBasicCrypto();
@@ -68,10 +69,12 @@ export const rschemaTests = {
                 assertFalse(view.getConcurrentDeletes('orders'), 'orders should have causal-only deletes');
                 assertTrue(view.getConcurrentDeletes('caps'), 'caps should default to concurrent deletes');
                 assertEquals(view.getPubColumns('orders').toString(), 'customer', 'customer should be pub');
-                assertEquals(json.toStringNormalized(view.getRestriction('orders', 'insert')),
+                assertEquals(json.toStringNormalized(view.getRestriction('orders', 'insert', true)),
                     json.toStringNormalized({ p: 'true' }), 'insert should default to true');
-                assertEquals(json.toStringNormalized(view.getRestriction('orders', 'delete')),
+                assertEquals(json.toStringNormalized(view.getRestriction('orders', 'delete', true)),
                     json.toStringNormalized({ p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: '$author' } }), 'delete should default to author');
+                assertEquals(json.toStringNormalized(view.getRestriction('orders', 'delete', false)),
+                    json.toStringNormalized({ p: 'true' }), 'delete should default to true in a group without an identity provider');
             }
         },
         {
@@ -140,6 +143,7 @@ export const rschemaTests = {
 
                 const signed = await signPayload({
                     action: 'schema-update',
+                    version: '0.0.2',
                     migration: [{ rule: 'set-concurrent-deletes', table: 'orders', value: true }],
                 } as unknown as json.LiteralMap, admin, at);
 
@@ -156,7 +160,7 @@ export const rschemaTests = {
                 const at = await scopedDag.getFrontier();
 
                 const signedUpdate = async (migration: json.Literal) =>
-                    signPayload({ action: 'schema-update', migration } as unknown as json.LiteralMap, admin, at);
+                    signPayload({ action: 'schema-update', version: '0.0.2', migration } as unknown as json.LiteralMap, admin, at);
 
                 assertFalse((await schema.validatePayload(await signedUpdate(
                     [{ rule: 'add-table', def: ordersTable() }]), at)).valid,
@@ -208,7 +212,70 @@ export const rschemaTests = {
                 const expected = ha > hb ? false : true;
                 const view = await schema.getView();
                 assertEquals(view.getConcurrentDeletes('orders'), expected,
-                    'concurrent same-slot writes should resolve by entry-hash tiebreak');
+                    'concurrent same-slot writes with equal versions should resolve by entry-hash tiebreak');
+            }
+        },
+        {
+            name: '[RSCHEMA07b] Concurrent slot writes go to the higher schema version before the hash',
+            invoke: async () => {
+                const { schema, admin } = await createTestEnv();
+                const scopedDag = await schema.getScopedDag();
+                const at0 = await scopedDag.getFrontier();
+
+                // the same slot from two lines: 0.5.0 says true, 2.0.0 says false
+                await schema.updateSchema([{ rule: 'set-concurrent-deletes', table: 'orders', value: true }], admin,
+                    { version: '0.5.0', at: at0 });
+                await schema.updateSchema([{ rule: 'set-concurrent-deletes', table: 'orders', value: false }], admin,
+                    { version: '2.0.0', at: at0 });
+
+                const view = await schema.getView();
+                assertEquals(view.getVersions().join(','), '2.0.0,0.5.0', 'a two-headed version lists both, highest first');
+                assertFalse(view.getConcurrentDeletes('orders'), 'the write from the higher version wins the slot');
+
+                // a later write on the lower line still wins: causality comes before the version
+                const at1 = await scopedDag.getFrontier();
+                await schema.updateSchema([{ rule: 'set-concurrent-deletes', table: 'orders', value: true }], admin,
+                    { version: '2.1.0', at: at1 });
+                assertTrue((await schema.getView()).getConcurrentDeletes('orders'), 'a causally later write wins regardless');
+            }
+        },
+        {
+            name: '[RSCHEMA07c] Schema versions: defaults, ordering and validation',
+            invoke: async () => {
+                const { schema, admin } = await createTestEnv();
+                assertEquals(schema.createOp.version, '0.0.1', 'a create defaults to 0.0.1');
+                assertEquals((await schema.getView()).getVersions().join(','), '0.0.1', 'the view reports the create version');
+
+                await schema.updateSchema([{ rule: 'set-concurrent-deletes', table: 'orders', value: true }], admin);
+                assertEquals((await schema.getView()).getVersions().join(','), '0.0.2', 'an update defaults to the next patch');
+
+                await schema.updateSchema([{ rule: 'set-concurrent-deletes', table: 'caps', value: false }], admin, { version: '1.0.0' });
+                assertEquals((await schema.getView()).getVersions().join(','), '1.0.0', 'an explicit version is kept');
+
+                let rejected: unknown;
+                try {
+                    await schema.updateSchema([{ rule: 'set-concurrent-deletes', table: 'caps', value: true }], admin, { version: '1.0.0' });
+                } catch (e) { rejected = e; }
+                assertTrue(rejected !== undefined, 'a version equal to the current one is rejected');
+                try {
+                    rejected = undefined;
+                    await schema.updateSchema([{ rule: 'set-concurrent-deletes', table: 'caps', value: true }], admin, { version: '0.9.9' });
+                } catch (e) { rejected = e; }
+                assertTrue(rejected !== undefined, 'a version below the current one is rejected');
+
+                const scopedDag = await schema.getScopedDag();
+                const at = await scopedDag.getFrontier();
+                const badFormat = await signPayload({
+                    action: 'schema-update', version: '1.1',
+                    migration: [{ rule: 'set-concurrent-deletes', table: 'caps', value: true }],
+                } as unknown as json.LiteralMap, admin, at);
+                assertFalse((await schema.validatePayload(badFormat, at)).valid, 'a non-semver version does not validate');
+
+                const created = await RSchemaImpl.create({
+                    name: 'versioned', version: '3.2.1',
+                    creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }], tables: [ordersTable()],
+                });
+                assertEquals(created.version, '3.2.1', 'a create keeps an explicit version');
             }
         },
         {
@@ -416,6 +483,47 @@ export const rschemaTests = {
                 assertTrue(table!.reincarnated, 'the table change is flagged reincarnated');
                 assertTrue(table!.existedBefore && table!.existsAfter,
                     'a same-name reincarnation persists the table across the delta');
+            }
+        },
+        {
+            name: '[RSCHEMA15] applyMigrationRules applies in order and names the first failing rule',
+            invoke: async () => {
+                const lines: TableDef = {
+                    name: 'lines',
+                    columns: { orderId: { type: 'string' }, qty: { type: 'integer' } },
+                    fks: { orderId: 'orders' },
+                };
+                const tables = () => new Map<string, TableDef>([['orders', ordersTable()], ['caps', capsTable()], ['lines', lines]]);
+
+                const ok = tables();
+                const done = applyMigrationRules(ok, [
+                    { rule: 'add-column', table: 'orders', column: 'note', def: { type: 'string', nullable: true } },
+                    { rule: 'drop-column', table: 'orders', column: 'total' },
+                    { rule: 'drop-table', table: 'caps' },
+                ]);
+                assertTrue(done.ok, 'a valid sequence applies');
+                assertEquals([...ok.keys()].sort().join(','), 'lines,orders', 'the working set ends migrated');
+                assertEquals(Object.keys(ok.get('orders')!.columns).sort().join(','), 'customer,note', 'later rules see earlier ones');
+
+                const referenced = applyMigrationRules(tables(), [
+                    { rule: 'add-column', table: 'caps', column: 'note', def: { type: 'string', nullable: true } },
+                    { rule: 'drop-table', table: 'orders' },
+                ]);
+                assertFalse(referenced.ok, 'dropping a referenced table fails');
+                if (!referenced.ok) {
+                    assertEquals(referenced.index, 1, 'the failing rule is named by index');
+                    assertEquals(referenced.reason, "table 'orders' is still referenced by the FK lines.orderId", 'the reason names the reference');
+                }
+
+                const notNull = applyMigrationRules(tables(), [
+                    { rule: 'add-column', table: 'orders', column: 'code', def: { type: 'string' } },
+                ]);
+                assertFalse(notNull.ok, 'the format check runs too');
+                if (!notNull.ok) assertTrue(notNull.reason.includes('without default'), 'NOT NULL without a default is refused');
+
+                const fk = applyMigrationRules(tables(), [{ rule: 'drop-column', table: 'lines', column: 'orderId' }]);
+                assertFalse(fk.ok, 'a column with an FK cannot be dropped');
+                if (!fk.ok) assertTrue(fk.reason.includes('still has an FK'), 'the reason says why');
             }
         },
     ],

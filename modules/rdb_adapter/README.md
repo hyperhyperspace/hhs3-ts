@@ -43,7 +43,7 @@ Projection can be configured from the [CLI-based REPL](../rdb_tools/) using the 
 \project indexes <idx> <spec.json | {inline json}> [dry-run]
 ```
 
-The identity passed as `<id>` is used to sign the operations that are ingested back into Rdb. A SQLite databse is created on `<path>`, and can be queried and modified using standard SQLite tooling.
+The identity passed as `<id>` is used to sign the operations that are ingested back into Rdb. Writes to a group without an identity provider are ingested anonymously, and a ref advance is signed only when the binding's `ALLOW UPDATE REF` gate reads `$author`. A SQLite databse is created on `<path>`, and can be queried and modified using standard SQLite tooling.
 
 If changes in the projection generate any ingestion failures, or Rdb concurrency generates op cancellations, those are reported live on the REPL console while the projection is running. `\project events` pages the durable log (default: newest 50, `order desc`).
 
@@ -76,7 +76,6 @@ An `IndexSpec` is written in **rdb names**, the names in the `RSchema`, not the 
 
 ```json
 {
-  "version": 3,
   "indexPub": true,
   "indexes": [
     { "name": "by_customer", "group": "orders", "table": "orders",
@@ -101,7 +100,7 @@ A declaration whose group, table, or column is not projected (yet) is **pending*
 
 ### Installing a spec
 
-The target stores the installed spec, and syncing never changes it. The app installs a new spec explicitly, as a migration step when it ships a new version:
+The target stores the installed spec, and syncing never changes it. The app installs a spec explicitly:
 
 ```typescript
 // Replica-wide, with rdb_projection. For hand-wired members, this package's
@@ -110,14 +109,12 @@ const report = await projection.reconcileIndexes(spec);
 console.log(report.status, report.actions, report.pending);
 ```
 
-Reconciling only moves forward, by `version`:
+Reconcile compares the spec's fingerprint with the one stored on the target:
 
-- nothing installed yet, or a higher version: the spec is installed (`installed`);
-- the same version with the same content: nothing happens (`unchanged`);
-- the same version with different content: it throws, asking you to bump the version;
-- a lower version: it is ignored (`skipped-older`), so an older app build sharing the same database does not flip the indexes back.
+- nothing installed yet, or a different fingerprint: the spec is installed (`installed`);
+- the same fingerprint: nothing happens (`unchanged`).
 
-Reconcile compares the new spec with the indexes actually built, then drops, builds, and records the new spec in one transaction. A declaration that changed in any way, `options` included, is a different index: the old one is dropped and the new one built. It holds the same per-database lock as sync, so the two never interleave. `{ dryRun: true }` returns the plan without changing anything. After that, every sync keeps the installed spec up to date across remote schema changes.
+A different spec is then compared with the indexes actually built. Reconcile drops, builds, and records the new spec in one transaction. A declaration that changed in any way, `options` included, is a different index: the old one is dropped and the new one built. An index whose resolved form is unchanged is left in place. It holds the same per-database lock as sync, so the two never interleave. `{ dryRun: true }` returns the plan without changing anything. After that, every sync keeps the installed spec up to date across remote schema changes.
 
 On first launch, open the projection (the initial backfill runs without indexes) and then call `reconcileIndexes`, which builds them. After a restart, the installed spec is already there and nothing needs to happen until the spec changes.
 
@@ -142,13 +139,13 @@ On first launch, open the projection (the initial backfill runs without indexes)
 - `ref_advance.ts` — cross-group ref-advance mechanism (observed→observer index + observe wrapper).
 - `project.ts`, `ingest_orchestrator.ts` — single-group and database-level orchestrators.
 - `index_actions.ts` — pure index planner (spec validation, rdb → target name resolution, diff against the built indexes).
-- `index_reconcile.ts` — `reconcileIndexes`: the version gate and the atomic install of a new index spec.
+- `index_reconcile.ts` — `reconcileIndexes`: the fingerprint check and the atomic install of an index spec.
 - `memory_target.ts` — a self-contained in-memory backend (used in tests).
 
 ## Implementation details
 
 - **Project** (rdb → relational): pure mappers turn an `RTableGroup`'s resolved schema and row deltas into ordered `SchemaAction` / `RowAction` lists (`schema_actions.ts`, `row_actions.ts`), which a `MaterializationTarget` applies transactionally per group checkpoint (`project.ts`). A same-shape **reincarnation** (a drop+re-add whose resolved def is unchanged, see [Rdb incarnations](../rdb#schema-evolution-and-incarnations)) is a reset, not an in-place diff: a table reincarnation projects as `drop-table` + `create-table` + a live-row backfill, and a column reincarnation as `drop-column` + `add-column`, so stale cells cannot survive an incremental apply. FK columns are reshaped to a companion form: a local (or co-projected cross-group) FK becomes an integer `<col>_id` referencing the target's serial id; a non-co-projected cross-group FK becomes a text `<col>_row_hash` passthrough. Authorship projects as integer `author_key_id` into a shared `rdb_keys(id, key_hash, public_key)` side table (duplicates of a key hash collapse to one id). An identity-provider table's keyId column projects as `key_id` (same side table); its publicKey column is **not** projected — crypto material lives only in `rdb_keys`. A first-class `identity` column type likewise projects as `<col>_key_id`.
-- **Ingest** (relational → rdb): the inverse planner (`ingest.ts`) replays the captured outbox in **commit order** — coalesce per row, mint rowIds, reverse-map names, rewrite FK / key-ref values (including reconstructing provider `keyId`+`publicKey` from `rdb_keys`) — then submits signed bundles via `group.bundle()` (`ingest_orchestrator.ts`). Commit order is already FK-respecting (a local FK can only be written against an already-local row), so nothing is reordered. Consecutive same-group ops joined by an explicit FK arc are bundled into one atomic entry (`fkBundling`, default on); to get parent-child atomicity, make the inserts consecutive. New keys are introduced with `KeyIndex.registerKey(domain, keyHash, publicKey)` (public key mandatory).
+- **Ingest** (relational → rdb): the inverse planner (`ingest.ts`) replays the captured outbox in **commit order** — coalesce per row, mint rowIds, reverse-map names, rewrite FK / key-ref values (including reconstructing provider `keyId`+`publicKey` from `rdb_keys`) — then submits bundles via `group.bundle()` (`ingest_orchestrator.ts`), signed by the configured `writer` when the group has an identity provider and anonymous otherwise (rowIds are then derived without an author). Commit order is already FK-respecting (a local FK can only be written against an already-local row), so nothing is reordered. Consecutive same-group ops joined by an explicit FK arc are bundled into one atomic entry (`fkBundling`, default on); to get parent-child atomicity, make the inserts consecutive. New keys are introduced with `KeyIndex.registerKey(domain, keyHash, publicKey)` (public key mandatory).
 - **Replica-wide**: `projectDatabase` / `ingestDatabaseChanges` / `syncDatabase` materialize several groups of one `RDb` into **one shared target** so cross-group FKs resolve to serial ids; group-qualified names keep tables from colliding. Ingestion advances co-projected cross-group refs as it drains: a dirty map (`ref_advance.ts`) tracks which observed groups changed, and before an observer's write is appended it observes them to the version present at that point — so cross-group FKs **and** `exists` / restriction reads validate against freshly-ingested rows. A closing drain advances observers that never wrote, transitively.
 - **Reactive inbound**: an optional `ChangeSignalSource` lets a target signal "the outbox advanced" so a runtime can ingest without polling.
 

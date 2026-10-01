@@ -1,10 +1,6 @@
-import { createAllowAuthorizer } from "../src/sync/authorizer.js";
-import {
-    allowIsEveryone,
-    formatAllow,
-    parseSyncCommand,
-    type AllowSource,
-} from "../src/sync/parse.js";
+import { allowIsEveryone, formatAllow } from "@hyper-hyper-space/hhs3_rhost";
+
+import { parseSyncCommand } from "../src/sync/parse.js";
 
 function assert(condition: unknown, message: string): asserts condition {
     if (!condition) throw new Error(message);
@@ -152,34 +148,4 @@ export async function runSyncParseTests(): Promise<void> {
     threw = false;
     try { parseSyncCommand('stop x'); } catch { threw = true; }
     assert(threw, 'non-numeric stop id is rejected');
-}
-
-export async function runSyncAuthorizerTests(): Promise<void> {
-    const alice = 'alice-key';
-    const bob = 'bob-key';
-    const eve = 'eve-key';
-    const sources: AllowSource[] = [
-        { type: 'column', group: 'users', table: 'caps', column: 'grantee' },
-        { type: 'column', group: 'users', table: 'identities', column: 'keyId' },
-    ];
-    const auth = createAllowAuthorizer(sources, async (source) => {
-        if (source.column === 'grantee') return [alice];
-        return [bob];
-    });
-    assert(auth !== undefined, 'column union has an authorizer');
-    assert(await auth!.authorize(alice), 'first column match');
-    assert(await auth!.authorize(bob), 'second column match');
-    assert(!(await auth!.authorize(eve)), 'neither column match');
-
-    assert(
-        createAllowAuthorizer([{ type: 'everyone' }], async () => []) === undefined,
-        'everyone short-circuits to no authorizer',
-    );
-    assert(
-        createAllowAuthorizer(
-            [{ type: 'everyone' }, { type: 'column', group: 'u', table: 't', column: 'c' }],
-            async () => [eve],
-        ) === undefined,
-        'union containing everyone is open',
-    );
 }

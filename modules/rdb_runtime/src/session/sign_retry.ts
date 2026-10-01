@@ -10,6 +10,7 @@ import { bind, execute } from "@hyper-hyper-space/hhs3_rdb_lang";
 
 import type { RdbSession } from "./session.js";
 import {
+    boundGroupVerifiesAuthors,
     boundWithAuthor,
     hasExplicitBy,
     hasExplicitByAst,
@@ -104,6 +105,7 @@ export async function tryAuthSignRetry(
     if (!isAuthRelatedFailure(diagnostics)) return undefined;
     if (!isAuthRetryBound(bound)) return undefined;
     if (hasExplicitBy(bound)) return undefined;
+    if (!boundGroupVerifiesAuthors(bound)) return undefined;
 
     const resolution = await resolveAuthorForBoundFailure(session, bound);
     const authorLabel = signRetryAuthorLabel(session, resolution);

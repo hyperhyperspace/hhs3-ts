@@ -71,9 +71,9 @@ export async function requestPassphrase(
         if (need.kind === 'statement-unlock') {
             await confirmStatementUnlock(activeRl, displayName);
         }
-        return need.kind === 'create'
+        return await (need.kind === 'create'
             ? promptNewPassphrase(activeRl, displayName)
-            : promptSecret(activeRl, `passphrase (${displayName}): `);
+            : promptSecret(activeRl, `passphrase (${displayName}): `));
     } finally {
         if (owned) {
             activeRl.close();

@@ -13,6 +13,7 @@ import type { RObject, SyncableObject, Version } from "@hyper-hyper-space/hhs3_m
 import type { RDbRuntimeConfig } from "./rdb.js";
 import type { ParamValue, SchemaCreator } from "./payload.js";
 import type { RDbResolution } from "./resolve.js";
+import type { MemberFiles } from "./instantiate.js";
 import type { CreateTableGroupPayload } from "../rtable_group/payload.js";
 import type { RCatalog } from "../rcatalog/interfaces.js";
 
@@ -25,8 +26,10 @@ export interface RDb extends RObject, SyncableObject {
     getCatalogRef(): B64Hash;
     getCatalog(): Promise<RCatalog | undefined>;
 
-    // Deploys a later release of the catalog (forward only), with the params
-    // it first needs. When the RDb declares creators, author is required.
+    // Deploys another release of the catalog (any release not at or below a
+    // deployed one; a concurrent release merges with the deployed ones), with
+    // the params it first needs. When the RDb declares creators, author is
+    // required.
     updateCatalog(release: B64Hash, params?: { [name: string]: ParamValue }, author?: OwnIdentity, note?: string, at?: Version): Promise<B64Hash>;
 
     resolve(at?: Version): Promise<RDbResolution>;
@@ -39,9 +42,11 @@ export interface RDb extends RObject, SyncableObject {
     getMemberGroupPayloads(at?: Version): Promise<Map<B64Hash, CreateTableGroupPayload>>;
     getMemberGroups(): Promise<B64Hash[]>;
     getMemberSchemas(): Promise<B64Hash[]>;
+    getMemberFiles(at?: Version): Promise<MemberFiles[]>;
 
-    // Creates the computed member groups (and their gates) that are absent
-    // and whose genesis deps are present. Returns the created group ids.
+    // Creates the computed member groups (and their gates) and FILES objects
+    // that are absent and whose genesis deps are present. Returns the created
+    // object ids.
     materializeMembers(): Promise<B64Hash[]>;
 
     // Adoption.

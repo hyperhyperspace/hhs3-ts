@@ -58,5 +58,27 @@ export const lexerTests = {
                 }
             },
         },
+        {
+            name: "[LEX05] strings decode \\n, \\r, \\t and \\\\; other backslashes and '' are kept",
+            invoke: async () => {
+                const valueOf = (source: string): unknown => {
+                    const result = lex(source);
+                    assertTrue(result.ok, `${source} should lex`);
+                    return result.ok ? result.value.find((t) => t.kind === 'string')?.value : undefined;
+                };
+                assertEquals(valueOf("'wachu\\n'"), 'wachu\n', '\\n is a line feed');
+                assertEquals(valueOf("'a\\rb\\tc'"), 'a\rb\tc', '\\r and \\t');
+                assertEquals(valueOf("'a\\\\b'"), 'a\\b', '\\\\ is one backslash');
+                assertEquals(valueOf("'a\\\\nb'"), 'a\\nb', '\\\\n is a backslash and an n');
+                assertEquals(valueOf("'100\\%'"), '100\\%', 'a backslash before another character is kept');
+                assertEquals(valueOf("'a\\'"), 'a\\', 'a backslash before the closing quote is kept');
+                assertEquals(valueOf("'it''s'"), "it's", "'' is one quote");
+                assertEquals(valueOf("'line\nbreak'"), 'line\nbreak', 'a raw newline is kept');
+
+                const result = lex("'x\\ny' ;");
+                assertTrue(result.ok, 'lexing should succeed');
+                if (result.ok) assertEquals(result.value[0].text, "'x\\ny'", 'token text is the raw source');
+            },
+        },
     ],
 };

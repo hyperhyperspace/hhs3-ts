@@ -16,7 +16,9 @@ import {
 } from "./payload.js";
 
 import { splitTableRef, parseRowFieldTerm } from "./payload.js";
+import type { RSchemaView } from "./interfaces.js";
 import { cmpTypesOk, likeTypesOk, isValidLikePattern } from "./expr.js";
+import { isValidSemver } from "../semver.js";
 import {
     isCanonicalBigint, isCanonicalDecimal, isCanonicalBase64, base64ByteLen,
     normalizeBigint, normalizeDecimal, intInRange, bigintInRange, decInRange, compareNumericStr,
@@ -289,7 +291,20 @@ export function predicateReferencesAuthor(pred: Predicate): boolean {
     }
 }
 
-type ExistsAtom = Extract<Predicate, { p: 'exists' }>;
+// The first restriction a schema view declares that reads `$author`, or
+// undefined. Default rules are not declared, so they never count. A group
+// without an idProvider admits only anonymous ops, so such a rule could never
+// pass there.
+export function findAuthorRestriction(view: RSchemaView): { table: string; restriction: Restriction } | undefined {
+    for (const table of view.getTableNames()) {
+        for (const restriction of view.getTable(table)?.restrictions ?? []) {
+            if (predicateReferencesAuthor(restriction.rule)) return { table, restriction };
+        }
+    }
+    return undefined;
+}
+
+export type ExistsAtom = Extract<Predicate, { p: 'exists' }>;
 type CmpAtom = Extract<Predicate, { p: 'cmp' }>;
 type LikeAtom = Extract<Predicate, { p: 'like' }>;
 
@@ -668,6 +683,7 @@ export function validateRSchemaPayloadFormat(payload: json.Literal): ValidationR
     if (action === 'create') {
         if (!json.checkFormat(createRSchemaFormat, payload)) return validationFailure("RSchema create payload format is invalid");
         const create = payload as CreateRSchemaPayload;
+        if (!isValidSemver(create.version)) return validationFailure(`RSchema create version '${create.version}' is not a semver`);
         if (create.creators.length === 0) return validationFailure("RSchema create payload must have at least one creator");
         const tablesReason = validateSchemaTables(create.tables);
         if (tablesReason !== undefined) {
@@ -679,6 +695,7 @@ export function validateRSchemaPayloadFormat(payload: json.Literal): ValidationR
     if (action === 'schema-update') {
         if (!json.checkFormat(schemaUpdateFormat, payload)) return validationFailure("schema-update payload format is invalid");
         const update = payload as SchemaUpdatePayload;
+        if (!isValidSemver(update.version)) return validationFailure(`schema-update version '${update.version}' is not a semver`);
         if (update.migration.length === 0) return validationFailure("schema-update migration is empty");
         for (const [index, rule] of update.migration.entries()) {
             const ruleReason = validateMigrationRule(rule);

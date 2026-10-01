@@ -12,7 +12,7 @@ import type { RTableView } from "../src/rtable/interfaces.js";
 import {
     usersSchemaTables, capRow, revokeCap,
     CAPS_TABLE, USERS_MANAGER_LABEL, USERS_SCHEMA_NAME,
-    USERS_BINDING, IDENTITIES_TABLE,
+    USERS_BINDING, USERS_IDENTITIES_PROVIDER, IDENTITIES_TABLE,
 } from "../src/users/users.js";
 
 const crypto = createBasicCrypto();
@@ -232,6 +232,7 @@ export const opDeltaTests = {
                     name: 'opdelta-app', seed: 'opdelta-app-g',
                     schemaRef: appSchema.getId(), schemaVersion: appPinned,
                     bindings: { [USERS_BINDING]: users.getId() },
+                    idProvider: USERS_IDENTITIES_PROVIDER,
                     canObserve: {
                         [USERS_BINDING]: { p: 'exists', table: CAPS_TABLE, where: { label: USERS_MANAGER_LABEL, grantee: '$author' } },
                     },

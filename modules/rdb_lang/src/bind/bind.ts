@@ -1,13 +1,13 @@
 import type { B64Hash, KeyId, OwnIdentity, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
 import type { json } from "@hyper-hyper-space/hhs3_json";
 import { serializePublicKeyToBase64, type Version } from "@hyper-hyper-space/hhs3_mvt";
-import { compareSemver, deriveRowId, isValidSemver, paramTypeFits } from "@hyper-hyper-space/hhs3_rdb";
+import { compareSemver, deriveRowId, isValidSemver, paramTypeFits, DEFAULT_SCHEMA_VERSION } from "@hyper-hyper-space/hhs3_rdb";
 import type {
-    CatalogGroupDef, CatalogParamDecl, CatalogReleaseSpec, ColumnDef, InsertRowPayload, MigrationRule, ParamValue,
-    RCatalogImpl, RDbImpl, RowOpPayload, RowQuery,
+    CatalogFilesDef, CatalogGroupDef, CatalogParamDecl, CatalogReleaseSpec, ColumnDef, InsertRowPayload, MigrationRule, ParamValue,
+    RCatalogImpl, RDbImpl, RowOpPayload, RowQuery, RTableGroup,
 } from "@hyper-hyper-space/hhs3_rdb";
 
-import { DiagnosticBag, err, ok, Result } from "../diagnostics.js";
+import { DiagnosticBag, err, ok, Result, SpannedError } from "../diagnostics.js";
 import type {
     AlterCatalogStatement, AlterSchemaStatement, AstStatement, AuthorExpr, BundleStatement, BundleWriteStatement,
     CreateCatalogStatement, CreateDatabaseStatement, CreateSchemaStatement,
@@ -18,12 +18,17 @@ import type {
 import { compileMigrationRules } from "../compile/ddl.js";
 import { buildAlterColumnsOf } from "../compile/rule_scope.js";
 import { lowerSelectQuery } from "../compile/query.js";
-import { CatalogDefScope, compileCatalogGroup, compileParamDecls, compileReleaseChanges } from "../compile/catalog.js";
+import {
+    CatalogDefScope, compileCatalogFilesItems, compileCatalogGroup, compileParamDecls, compileReleaseChanges, pinOf,
+} from "../compile/catalog.js";
 import type {
     LangBindContext, LangValue, ResolvedDatabaseRef, ResolvedGroupRef, ResolvedLogTarget, ResolvedSchemaRef,
     ResolvedTableRef, VersionScope,
 } from "./context.js";
 import { asJsonLiteral, canonicalEncodeRowValues, canonicalEncodeValue, resolveCreator, resolveValue } from "./values.js";
+import { bindGetFile, bindListFiles, bindPutFile, type BoundGetFile, type BoundListFiles, type BoundPutFile } from "./files.js";
+
+export type { BoundGetFile, BoundListFiles, BoundPutFile, OwnerRef } from "./files.js";
 
 /** Reserved INSERT pseudo-column; not a schema column. */
 export const PSEUDO_COLUMN_UUID = 'uuid';
@@ -43,7 +48,10 @@ export type BoundStatement =
     | BoundBundle
     | BoundSetView
     | BoundSelect
-    | BoundLog;
+    | BoundLog
+    | BoundPutFile
+    | BoundGetFile
+    | BoundListFiles;
 
 export type BoundCreateStatement = BoundCreateDatabase | BoundCreateSchema | BoundCreateCatalog;
 export type BoundExecutableStatement =
@@ -58,7 +66,10 @@ export type BoundExecutableStatement =
     | BoundBundle
     | BoundSetView
     | BoundSelect
-    | BoundLog;
+    | BoundLog
+    | BoundPutFile
+    | BoundGetFile
+    | BoundListFiles;
 
 export type LoadedCatalogRef = { id: B64Hash; catalog: RCatalogImpl };
 export type LoadedDatabaseRef = { id: B64Hash; db: RDbImpl };
@@ -78,15 +89,18 @@ export type BoundCreateDatabase = {
 export type BoundCreateSchema = {
     kind: 'create-schema';
     ast: CreateSchemaStatement;
+    version: string;
     creators: { keyId: KeyId; publicKey: PublicKey }[];
 };
 
 export type BoundCreateCatalog = {
     kind: 'create-catalog';
     ast: CreateCatalogStatement;
+    version: string;
     creators: { keyId: KeyId; publicKey: PublicKey }[];
     author: OwnIdentity;
     add: CatalogGroupDef[];
+    files: CatalogFilesDef[];
     params: CatalogParamDecl[];
 };
 
@@ -171,6 +185,7 @@ export type BoundAlterSchema = {
     ast: AlterSchemaStatement;
     schema: ResolvedSchemaRef;
     rules: MigrationRule[];
+    version?: string;
     note?: string;
     author: OwnIdentity;
     at: Version;
@@ -239,9 +254,16 @@ export async function bind(statement: AstStatement, context: LangBindContext): P
                 return ok(await bindSelect(statement, context));
             case 'log':
                 return ok(await bindLog(statement, context));
+            case 'put-file':
+                return ok(await bindPutFile(statement, context));
+            case 'get-file':
+                return ok(await bindGetFile(statement, context));
+            case 'list-files':
+                return ok(await bindListFiles(statement, context));
         }
     } catch (e) {
-        diagnostics.add('BIND_UNKNOWN_NAME', e instanceof Error ? e.message : String(e), statement.span);
+        if (e instanceof SpannedError) diagnostics.add(e.code, e.message, e.span);
+        else diagnostics.add('BIND_UNKNOWN_NAME', e instanceof Error ? e.message : String(e), statement.span);
         return err(diagnostics.all());
     }
 }
@@ -272,7 +294,9 @@ async function bindCreateCatalog(ast: CreateCatalogStatement, context: LangBindC
     if (!creators.some((c) => c.keyId === author.keyId)) {
         throw new Error('the CREATE CATALOG author must be one of its CREATORS');
     }
-    if (!isValidSemver(ast.version)) throw new Error(`VERSION '${ast.version}' is not a semver (major.minor.patch)`);
+    const version = ast.version ?? await context.defaultCatalogVersion?.();
+    if (version === undefined) throw new Error("CREATE CATALOG requires VERSION '<semver>'");
+    if (!isValidSemver(version)) throw new Error(`VERSION '${version}' is not a semver (major.minor.patch)`);
 
     const params = compileParamDecls(ast.params);
     const paramMap = new Map(params.map((p) => [p.name, p]));
@@ -284,7 +308,8 @@ async function bindCreateCatalog(ast: CreateCatalogStatement, context: LangBindC
         scope.add(def);
         add.push(def);
     }
-    return { kind: 'create-catalog', ast, creators, author, add, params };
+    const files = await compileCatalogFilesItems(ast.files, context, scope, (hash) => pinOf(scope.get(hash)!), scope.names());
+    return { kind: 'create-catalog', ast, version, creators, author, add, files, params };
 }
 
 async function bindAlterCatalog(ast: AlterCatalogStatement, context: LangBindContext): Promise<BoundAlterCatalog> {
@@ -314,11 +339,12 @@ async function bindAlterCatalog(ast: AlterCatalogStatement, context: LangBindCon
         if (paramMap.has(decl.name)) throw new Error(`param ':${decl.name}' is already declared by an earlier release`);
         paramMap.set(decl.name, decl);
     }
-    const { changes, add } = await compileReleaseChanges(ast.changes, fold, context, paramMap);
+    const { changes, add, files } = await compileReleaseChanges(ast.changes, fold, context, paramMap);
 
     const spec: CatalogReleaseSpec = { version: ast.version };
     if (Object.keys(changes).length > 0) spec.changes = changes;
     if (add.length > 0) spec.add = add;
+    if (files.length > 0) spec.files = files;
     if (params.length > 0) spec.params = params;
     if (ast.note !== undefined) spec.note = ast.note;
     return { kind: 'alter-catalog', ast, catalog, spec, author, at };
@@ -432,7 +458,9 @@ async function bindCreateSchema(ast: CreateSchemaStatement, context: LangBindCon
     for (const expr of ast.creators) {
         creators.push(await resolveCreator(expr, context));
     }
-    return { kind: 'create-schema', ast, creators };
+    const version = ast.version ?? await context.defaultSchemaVersion?.() ?? DEFAULT_SCHEMA_VERSION;
+    if (!isValidSemver(version)) throw new Error(`VERSION '${version}' is not a semver (major.minor.patch)`);
+    return { kind: 'create-schema', ast, version, creators };
 }
 
 // Resolve the effective author of an authored statement: an explicit `BY`
@@ -445,15 +473,37 @@ async function resolveEffectiveAuthor(expr: AuthorExpr | undefined, context: Lan
     return context.resolveAuthor({ kind: 'hash', prefix: expr.prefix });
 }
 
+// The author of a statement on a group. `sessionDropped` is set when the
+// session's default author was left out because the group can't verify it.
+type StatementAuthor = { author?: OwnIdentity; sessionDropped: boolean };
+
+// The author of a write or UPDATE REF on `group`. A group without USING
+// IDENTITIES rejects any author it is given, so its statements are anonymous:
+// `BY $x` / `BY #k` is an error there, and the session's default author is
+// dropped. `BY NOBODY` is anonymous on any group.
+async function resolveGroupAuthor(
+    expr: AuthorExpr | undefined, group: RTableGroup, what: 'writes' | 'ref updates', context: LangBindContext,
+): Promise<StatementAuthor> {
+    if (group.getIdProvider() !== undefined) return { author: await resolveEffectiveAuthor(expr, context), sessionDropped: false };
+    if (expr !== undefined && expr.kind !== 'nobody') {
+        throw new Error(`TABLEGROUP ${group.getName()} has no USING IDENTITIES; its ${what} are anonymous, so it takes no BY`);
+    }
+    return { sessionDropped: expr === undefined };
+}
+
 // A context view in which `$author` / `$me` resolve to the statement's effective
 // author rather than the session default, so values like `VALUES ($author)`
-// agree with the signer chosen by `BY`.
-function contextWithAuthor(context: LangBindContext, author: OwnIdentity | undefined): LangBindContext {
+// agree with the signer chosen by `BY`. When the session author was dropped,
+// `$me` still names the session identity, but `$author` has no value.
+function contextWithAuthor(context: LangBindContext, statement: StatementAuthor): LangBindContext {
+    const { author, sessionDropped } = statement;
     return {
         ...context,
         resolveVariable: (name: string): Promise<LangValue> => {
             if (name === 'me' || name === 'author') {
                 if (author !== undefined) return Promise.resolve(author);
+                if (sessionDropped && name === 'me') return context.resolveVariable(name);
+                if (sessionDropped) throw new Error('$author has no value: the statement is anonymous, since its TABLEGROUP has no USING IDENTITIES');
                 throw new Error(`$${name} has no value: the statement has no author (BY NOBODY or no default author)`);
             }
             return context.resolveVariable(name);
@@ -466,8 +516,9 @@ async function bindInsert(ast: InsertStatement, context: LangBindContext): Promi
         throw new Error(`INSERT column count (${ast.columns.length}) does not match value count (${ast.values.length})`);
     }
     const table = await resolveTableRef(ast.table, context);
-    const author = await resolveEffectiveAuthor(ast.author, context);
-    const valueContext = contextWithAuthor(context, author);
+    const statementAuthor = await resolveGroupAuthor(ast.author, table.group, 'writes', context);
+    const author = statementAuthor.author;
+    const valueContext = contextWithAuthor(context, statementAuthor);
     const at = await context.resolveVersion(ast.at, { kind: 'group', id: table.groupId, group: table.group });
     const { uuid, values } = await bindInsertColumns(ast.columns, ast.values, context, table, at, valueContext);
     const bound: BoundInsert = { kind: 'insert', ast, table, values, at, uuid };
@@ -477,8 +528,9 @@ async function bindInsert(ast: InsertStatement, context: LangBindContext): Promi
 
 async function bindUpdate(ast: UpdateStatement, context: LangBindContext): Promise<BoundUpdate> {
     const table = await resolveTableRef(ast.table, context);
-    const author = await resolveEffectiveAuthor(ast.author, context);
-    const valueContext = contextWithAuthor(context, author);
+    const statementAuthor = await resolveGroupAuthor(ast.author, table.group, 'writes', context);
+    const author = statementAuthor.author;
+    const valueContext = contextWithAuthor(context, statementAuthor);
     const rawValues: { [column: string]: json.Literal } = {};
     for (const v of ast.values) rawValues[v.column] = asJsonLiteral(await resolveValue(v.value, valueContext));
     const at = await context.resolveVersion(ast.at, { kind: 'group', id: table.groupId, group: table.group });
@@ -491,7 +543,7 @@ async function bindUpdate(ast: UpdateStatement, context: LangBindContext): Promi
 
 async function bindDelete(ast: DeleteStatement, context: LangBindContext): Promise<BoundDelete> {
     const table = await resolveTableRef(ast.table, context);
-    const author = await resolveEffectiveAuthor(ast.author, context);
+    const { author } = await resolveGroupAuthor(ast.author, table.group, 'writes', context);
     const at = await context.resolveVersion(ast.at, { kind: 'group', id: table.groupId, group: table.group });
     const rowId = await bindRowId(ast.rowId, context, table, at);
     const bound: BoundDelete = { kind: 'delete', ast, table, rowId, at };
@@ -502,8 +554,9 @@ async function bindDelete(ast: DeleteStatement, context: LangBindContext): Promi
 async function bindBundle(ast: BundleStatement, context: LangBindContext): Promise<BoundBundle> {
     const group = await context.resolveGroup(ast.group);
     if (group.group === undefined) throw new Error('BUNDLE target group is not loaded');
-    const author = await resolveEffectiveAuthor(ast.author, context);
-    const valueContext = contextWithAuthor(context, author);
+    const statementAuthor = await resolveGroupAuthor(ast.author, group.group, 'writes', context);
+    const author = statementAuthor.author;
+    const valueContext = contextWithAuthor(context, statementAuthor);
     const at = await context.resolveVersion(ast.at, { kind: 'group', id: group.id, group: group.group });
     const writes: BoundBundleWrite[] = [];
     for (const write of ast.writes) writes.push(await bindBundleWrite(write, valueContext, at, author?.keyId));
@@ -544,8 +597,17 @@ async function bindAlterSchema(ast: AlterSchemaStatement, context: LangBindConte
     if (author === undefined) throw new Error('ALTER SCHEMA requires an author identity');
     const at = await context.resolveVersion(ast.at, { kind: 'schema', id: schema.id, schema: schema.schema });
     const view = await schema.schema.getView(at, at);
+    if (ast.version !== undefined) {
+        if (!isValidSemver(ast.version)) throw new Error(`VERSION '${ast.version}' is not a semver (major.minor.patch)`);
+        for (const current of view.getVersions()) {
+            if (compareSemver(ast.version, current) <= 0) {
+                throw new Error(`VERSION '${ast.version}' must be greater than the schema's version '${current}' at AT`);
+            }
+        }
+    }
     const columnsOf = buildAlterColumnsOf(view, ast.rules);
     const bound: BoundAlterSchema = { kind: 'alter-schema', ast, schema, rules: compileMigrationRules(ast.rules, columnsOf), author, at };
+    if (ast.version !== undefined) bound.version = ast.version;
     if (ast.note !== undefined) bound.note = ast.note;
     return bound;
 }
@@ -556,7 +618,10 @@ async function bindUpdateRef(ast: UpdateRefStatement, context: LangBindContext):
     const ref = await resolveBoundGroupRef(ast.ref, group, context);
     const refVersion = await context.resolveVersion(ast.version, { kind: 'group', id: ref.foreign.id, group: ref.foreign.group });
     const at = await context.resolveVersion(ast.at, { kind: 'group', id: group.id, group: group.group });
-    const author = await resolveEffectiveAuthor(ast.author, context);
+    // without BY, only a gate that reads $author needs the session author
+    const author = ast.author === undefined && !group.group.observeNeedsAuthor(ref.observeRef)
+        ? undefined
+        : (await resolveGroupAuthor(ast.author, group.group, 'ref updates', context)).author;
     return { kind: 'update-ref', ast, group, ref: ref.observeRef, version: refVersion, author, at };
 }
 

@@ -4,7 +4,7 @@ import type { B64Hash, KeyId, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto
 import type { RObject, Version, View } from "@hyper-hyper-space/hhs3_mvt";
 
 import type {
-    CatalogGroupDef, CatalogGroupChange, CatalogParamDecl, SchemaCreator,
+    CatalogGroupDef, CatalogFilesDef, CatalogGroupChange, CatalogParamDecl, SchemaCreator,
 } from "./payload.js";
 import type { DeclareInfo, ReleaseState } from "./resolve.js";
 
@@ -13,6 +13,7 @@ export type CatalogReleaseSpec = {
     version: string;
     changes?: { [catalogGroupHash: string]: CatalogGroupChange };
     add?: CatalogGroupDef[];
+    files?: CatalogFilesDef[];
     params?: CatalogParamDecl[];
     note?: string;
 };
@@ -62,6 +63,7 @@ export interface RCatalogView extends View {
     isReleaseBelow(a: B64Hash, b: B64Hash): boolean;
 
     getGroupDef(hash: B64Hash): CatalogGroupDef | undefined;
+    getFilesDef(hash: B64Hash): CatalogFilesDef | undefined;
 
     getReferencedSchemas(): B64Hash[];
     getDeclares(): DeclareInfo[];

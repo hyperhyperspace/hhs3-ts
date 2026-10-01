@@ -35,7 +35,8 @@ export interface RTableGroup extends RObject, NestingParent {
     // or undefined when the group declares none.
     getCanObserve(): { [binding: string]: Predicate } | undefined;
     // The selected identity provider (local table name or 'group.table'), or
-    // undefined if the group performs no authentication.
+    // undefined for an anonymous group (its row ops and observations must be
+    // unauthored).
     getIdProvider(): string | undefined;
     // Embedded deploy signature keys (a key source beside the idProvider).
     getDeployKeys(): SchemaCreator[];
@@ -51,15 +52,22 @@ export interface RTableGroup extends RObject, NestingParent {
     // group's canDeploy predicate is evaluated against the verified author.
     deploy(refVersion: Version, author?: OwnIdentity, at?: Version): Promise<B64Hash>;
 
+    // Whether a deploy must be authored: the group's canDeploy reads $author.
+    deployNeedsAuthor(): boolean;
+
     // Observe a bound foreign group at refVersion: a BARRIER ref-advance of
     // that group's id, making its rows visible to cross-group FK /
     // exists targets (group.table) up to refVersion. A concurrent observation
     // revises the merged frontier, so a concurrent foreign revoke / deploy
     // voids a concurrent cross-group use there. `group` is a binding name or a
-    // bound group id. No authority is required to advance an ungated binding;
-    // when the binding declares canObserve, the observation must be authored
-    // (the gate is verified at validation and re-evaluated at-use).
+    // bound group id. A claimed author must verify through the idProvider.
+    // When the binding's canObserve reads $author, the observation must be
+    // authored (the gate is verified at validation and re-evaluated at-use).
     observe(group: string | B64Hash, refVersion: Version, author?: OwnIdentity, at?: Version): Promise<B64Hash>;
+
+    // Whether an observation of the bound `group` (a binding name or a bound
+    // group id) must be authored: its canObserve gate reads $author.
+    observeNeedsAuthor(group: string | B64Hash): boolean;
 
     // Single-entry atomic multi-table write. `writes` is ordered (the bundle
     // order): op i's FK conditions are checked at the sequential cut of `at`

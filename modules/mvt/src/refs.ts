@@ -130,7 +130,11 @@ export async function resolveRefVersionAtPosition(
     isLive?: (entryHash: B64Hash) => Promise<boolean>,
 ): Promise<Version> {
     const causal = await findRefAdvances(dag, refId, at);
-    const concurrent = await findConcurrentRefAdvanceBarriers(dag, refId, at, from);
+    // Nothing in from's past is concurrent to at when from == at, and the
+    // concurrent search would walk (and load) the whole causal past to say so.
+    const concurrent = sameSet(at, from)
+        ? position()
+        : await findConcurrentRefAdvanceBarriers(dag, refId, at, from);
 
     const result = version();
 
@@ -154,6 +158,13 @@ export async function resolveRefVersionAtPosition(
     }
 
     return result.size > 0 ? result : version(refId);
+}
+
+function sameSet(a: Version, b: Version): boolean {
+    if (a === b) return true;
+    if (a.size !== b.size) return false;
+    for (const h of a) if (!b.has(h)) return false;
+    return true;
 }
 
 // Resolve referenced-object versions for checking an observer entry against a foreign

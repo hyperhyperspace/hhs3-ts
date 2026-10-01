@@ -1,6 +1,6 @@
 import type { B64Hash, KeyId, OwnIdentity, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
-import type { AuthorRef, LangValue } from "@hyper-hyper-space/hhs3_rdb_lang";
+import type { AuthorRef, LangValue, LocalFileAccess } from "@hyper-hyper-space/hhs3_rdb_lang";
 
 import type { KeyVault } from "../keys/key_vault.js";
 import type { RdbWorkspace } from "../workspace/workspace.js";
@@ -41,6 +41,8 @@ export class RdbSession {
     currentGroup?: B64Hash;
     defaultView?: SessionView;
     refAutoUpdate: RefAutoUpdateMode;
+    // The host's local files, for PUT FILE and GET ... TO (unset: refused).
+    localFiles?: LocalFileAccess;
 
     constructor(options: RdbSessionOptions) {
         this.workspace = options.workspace;

@@ -16,7 +16,9 @@ Schemas, table groups, tables and databases are identified by the hash of their 
 
 ## Identities
 
-Operations are signed. An identity is a public key; its id is the key's hash. The signing suite is selectable — Ed25519, ML-DSA, or a hybrid requiring both — so post-quantum identities are opt-in. A group that declares an identity provider verifies signatures at validation and rejects forgeries.
+Operations are signed. An identity is a public key; its id is the key's hash. The signing suite is selectable — Ed25519, ML-DSA, or a hybrid requiring both — so post-quantum identities are opt-in. A group's identity provider, a table mapping key ids to public keys (its own or a bound group's), is where it finds an author's key: every operation that claims an author must verify through it at validation, or it is rejected. The provider is fixed when the group is created.
+
+A group without an identity provider is anonymous. It has no key source for row operations, bundles and observations, so it accepts them only unsigned. None of its restrictions or observation gates may read `$author`, and updates and deletes are open by default rather than reserved to the row's author. Deploys are the exception; see [Deploy authority](#deploy-authority).
 
 Permissions are data. A capability is a row; restrictions gate operations on positive existence predicates ("allowed if a live row grants it to the author"). Granting is an insert, revoking a delete, and delegation chains follow from re-evaluating each grant at use. There is no privileged table and no access-control server.
 
@@ -53,7 +55,7 @@ Deltas project the database into ordinary SQL. The delta from the version an app
 Rdb is driven through **C-SQL** (causal SQL), a SQL-like language with causal extensions: versions and views (`AT` / `FROM`), allow-rules, foreign-group bindings, and identity-aware authorship. It is implemented in [rdb_lang](../rdb_lang); [rdb_tools](../rdb_tools) provides a REPL and CLI.
 
 ```sql
-CREATE SCHEMA shop AS (
+CREATE SCHEMA shop VERSION '1.0.0' AS (
   TABLE products (
     sku string PUB READONLY,
     name string
@@ -84,14 +86,15 @@ LOG shop_prod LIMIT 20;
 
 ## Building blocks
 
-Rdb is six content-addressed MVT types. C-SQL and the adapter are the intended interfaces; the types are the vocabulary the rest of the docs use.
+Rdb is eight content-addressed MVT types. C-SQL and the adapter are the intended interfaces; the types are the vocabulary the rest of the docs use.
 
-- **RSchema** — the specification for one table group: tables, columns, foreign keys, restrictions, and migration rules. A standalone object with its own history; it evolves independently and is reusable by many groups. Spec authority belongs to its signed creators.
+- **RSchema** — the specification for one table group: tables, columns, foreign keys, restrictions, and migration rules. A standalone object with its own versioned history (every entry carries a semver that increases along every causal path); it evolves independently and is reusable by many groups. Spec authority belongs to its signed creators.
 - **RCatalog** — a developer-signed DAG of semver releases describing a database's table groups: which schema each group uses at which version, its bindings, gates, identity provider and genesis rows (with deploy-time `:params`). See [Databases, catalogs and releases](#databases-catalogs-and-releases).
 - **RTableGroup** — the unit of atomicity, snapshot, observation, and composition. Pins a schema version, binds and observes foreign groups, and is where deploys and cross-group references happen.
 - **RTable** — a member table on a scoped projection of its group's history. Rows are write-once identities with permanent deletes; both row liveness and per-field column values are pinned to the structural table/column incarnation active at write time (per-field last-writer-wins within that incarnation), so a drop+re-add resets the table or column. See [Schema evolution and incarnations](#schema-evolution-and-incarnations).
 - **RDb** — the deployment sync root: records which catalog releases were deployed and with which params, computes its member groups from them, and keeps the catalog, its schemas and the members present and syncing in the replica.
 - **RDeployGate** — a replica-local record of the schema versions one group has adopted. Never synced; see [Adoption and RDeployGate](#adoption-and-rdeploygate).
+- **RBlobStore** and **RFileMap** — a FILES member's bytes and its folder: content-addressed upload chains, and the files at their paths. See [Files](#files).
 
 All of them are `RObject`s, so a consumer can observe advances through `subscribe` and pull deltas in response — the mechanism [rdb_projection](../rdb_projection) uses to stay in sync without polling. See [mvt Reactivity](../mvt#reactivity).
 
@@ -100,29 +103,48 @@ All of them are `RObject`s, so a consumer can observe advances through `subscrib
 A database's structure is published by its developer as a catalog, deployed by an admin into an RDb, and adopted by each client. The three steps have three verbs:
 
 - **Release** (developer, `CREATE CATALOG` / `ALTER CATALOG`). Every catalog entry is signed by one of the catalog's creators; the genesis is the first release. A release is a diff against its parents (the maximal releases below its position): the group definitions it adds, and the versions it sets for existing groups. A merge of several parents must set every group they disagree on. Its semver must exceed every parent's. A release that introduces schemas is preceded by a signed, dependency-free `declare` entry naming them, so a replica discovers the new schemas from validated catalog state and fetches them before the release that pins them validates.
-- **Deploy** (admin, `CREATE DATABASE ... USING CATALOG`, `UPDATE CATALOG ... ON db`). The RDb records the deployed release and the params it first needs (forward only; signed by a database creator when the RDb declares creators). The catalog planner then creates any new member groups and deploys the new schema versions to existing ones, bound groups first (advancing their dependents' refs), and records the release last, as the commit point.
-- **Adopt** (client, automatic). Each replica admits deployed releases into its members' local deploy gates, within the database's adoption range (`^<major>` of the create release by default: patches and minors flow, a new major waits until the app widens the range). A group deploy synced from a peer waits until its version is adopted.
+- **Deploy** (admin, `CREATE DATABASE ... USING CATALOG`, `UPDATE CATALOG ... ON db`). The RDb records the deployed release and the params it first needs (signed by a database creator when the RDb declares creators). A deploy never moves backwards: the release must not be at or below one already deployed. A release concurrent with a deployed one merges with it: both stay deployed, and each member's target is the union of its versions in them, so an instance can run "2.0.0 + 1.5.1" until a release above both is deployed. The catalog planner then creates any new member groups and deploys the new schema versions to existing ones, bound groups first (advancing their dependents' refs), and records the release last, as the commit point.
+- **Adopt** (client, automatic). Each replica admits deployed releases into its members' local deploy gates, within the database's adoption range (`^<major>` of the create release by default: patches and minors flow, a new major waits until the app widens the range; a host built for major `M` sets `<(M+1).0.0`, every release below its next major). A group deploy synced from a peer waits until its version is adopted.
 
-Membership is computed, never stored: every replica derives the same group ids from the deployed releases, the params and the database id, so group creates are never served by peers. Two concurrently deployed definitions with the same name are told apart deterministically (the smaller definition hash keeps the name, the other gets a `_<hex8>` suffix).
+Membership is computed, never stored: every replica derives the same group ids from the deployed releases, the params and the database id, so group creates are never served by peers. Two concurrently deployed definitions with the same name are told apart deterministically: the definition from the higher release keeps the name, then the larger definition hash; the other gets a `_<hex8>` suffix.
 
 Schemas don't belong to the RDb: it reaches them only through its catalog's group definitions. `catalogStatus(rdb)` reports how a replica's database stands against its catalog: the released, deployed, adopted and held releases, and for each member its target version, current version and adopted version.
 
 ### Deploy authority
 
-Who may deploy a schema version to a group is its `canDeploy` predicate (`ALLOW DEPLOY IF` in the catalog). Without one, a group of a database with creators accepts deploys by those creators only: `canDeploy` defaults to an `$author` predicate over them, and their keys are embedded in the group (`deployKeys`) so deploy signatures verify with or without an identity provider. A deploy's author key resolves through the group's identity provider first, then `deployKeys`; a `canDeploy` that references `$author` needs one of the two.
+Who may deploy a schema version to a group is its `canDeploy` predicate (`ALLOW DEPLOY IF` in the catalog). Without one, a group of a database with creators accepts deploys by those creators only: `canDeploy` defaults to an `$author` predicate over them, and their keys are embedded in the group (`deployKeys`), so their deploys verify even in a group without an identity provider. A deploy's author key resolves through the group's identity provider first, then `deployKeys`; a signed deploy whose key resolves through neither is rejected, and a `canDeploy` that references `$author` needs one of the two (in a catalog, an explicit `ALLOW DEPLOY IF` over `$author` needs `USING IDENTITIES`). The planner signs a deploy only when `canDeploy` reads `$author`; a `canDeploy` that doesn't takes unsigned deploys.
 
 ### Adoption and RDeployGate
 
 Each group has a replica-local RDeployGate, derived from `{group, schema}`, that mirrors the part of the schema DAG this replica has adopted (each mirror entry tagged with its schema entry's hash). A group deploy carries the precomputed gate hashes of its target version; they are the deploy's sync dependencies on the gate, and validation recomputes them from the schema DAG rather than trusting them. So a synced deploy is applied only once the adoption policy admits the version into the local gate, while local deploys never wait. The gate never enters a group's view: it gates when a deploy arrives, not what the group means.
 
+## Files
+
+A catalog `FILES` definition (see [rdb_lang](../rdb_lang#catalog-files)) gives every database that deploys it two objects, computed like groups from the database id and the definition hash (`deriveFilesSeed`, `instantiateFiles`): an **RBlobStore** (`hhs/rblob_store_v1`) for the bytes and an **RFileMap** (`hhs/rfile_map_v1`) for the files at their paths. Both are bound to one member group, and name its identity table and a write predicate:
+
+```sql
+FILES media
+  USING IDENTITIES user.identities
+  ALLOW WRITE IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author
+```
+
+- **Access.** Every op is signed. A writer's key comes from the identity table, and `canWrite` holds, at the group version the op observes: the latest signed `ref-advance` of the group in its past, or the group's genesis. So a key the genesis rows admit writes right away, and the writers append a ref-advance when the group has moved. Admission is checked when an op is validated; a key that loses access later can still append at a position from before (no view-time voiding).
+- **RBlobStore.** A file is an upload chain: a signed `file` header (`size`, `first` link, `fileHash`), then 128 KiB `chunk` ops, each on the one before it, each carrying the link of the next. `fileHash = H("hhs3-blob-file-v1" || u64be(size) || first)` commits to every byte, and each chunk is checked on arrival against its predecessor alone. A file is complete once its last chunk arrives; `putFile` resumes an interrupted chain and skips files the store has. Uploads spread over six lanes for parallelism.
+- **RFileMap.** Elements `(section, owner, path, fileHash)` with add/remove semantics (`remove` is a barrier). `common` is shared by every writer; `key` elements belong to their owner, who must author them. Several hashes at one path coexist; a replace is a remove plus an add. Paths follow portable rules (NFC, no `\ : * ? " < > |`, no reserved Windows names, 1024 bytes, 32 segments). The map never waits on the store: an element can arrive before its bytes.
+- **Membership.** `getMemberFiles()` lists the FILES members; groups and FILES share one namespace per database, with the same tie-break for concurrent names. The RDb creates both objects after their group and syncs them with the rest; `catalogStatus` lists them under `files`.
+
+A FILES definition is immutable: a release can add new ones, never change or remove one. It is checked when it is added, against its group's schema at the group's version in that release: the identity table is an `IDENTITY PROVIDER`, and every table `canWrite` reads exists, with its `WHERE` columns PUB. Later releases are not checked against it, since concurrent releases deployed together would bypass any such check anyway. A group change that removes what a FILES reads leaves it **read-only**: at the group versions without it, no key resolves or `canWrite` is false (never an error), so reads keep working, writes and ref-advances are refused, and mounts report `writable: false` and keep local changes waiting. Publish a new FILES to take its place. [rdb_projection](../rdb_projection#file-mounts) mounts them as folders.
+
 ## Schema evolution and incarnations
 
 Schema evolution is coordination-free: `add-table` / `drop-table` / `add-column` / `drop-column` / `set-fks` / `set-restrictions` / `set-concurrent-deletes` are per-slot writes resolved by last-writer-wins, so two replicas can migrate concurrently and still converge. To make that convergence *meaningful* — and to make a drop+re-add genuinely reset a table or column — every table and column carries a **structural incarnation id**.
 
+Every schema entry also carries the schema's own **version** (strict semver: the create's is the first, `0.0.1` unless given; each update's must be above every version at its position, so versions increase along every causal path). The version decides last-writer-wins between *concurrent* writes to one slot: the write from the entry with the higher version wins, and only equal versions fall back to the larger entry hash. A causally later write wins regardless. So when two lines of a schema (say a 1.x patch and 2.0.0) both change the same slot, the schema's author's numbering says which one an instance that merges them keeps. `RSchemaView.getVersions()` reports the versions at a view's position, highest first.
+
 An incarnation id is a content hash of the birth definition plus a **drop generation** (the number of causal-ancestor drop tombstones for that slot). Three consequences follow directly:
 
 - **Structurally-identical concurrent adds converge.** Two branches that independently `add-table t` (or `add-column c`) with a byte-identical definition compute the *same* incarnation id, so neither masks the other and independently-run identical migrations are safe to merge. For a converged `add-table`, both branches' rows *and* column values merge under ordinary LWW; for a converged `add-column`, both branches' values for that column merge.
-- **Structurally-different concurrent adds pick a winner.** Different definitions (say a different default) yield different ids; the per-slot LWW picks one winner and the loser's writes are masked (resolve to the winning default / absent), exactly as a losing concurrent value write would.
+- **Structurally-different concurrent adds pick a winner.** Different definitions (say a different default) yield different ids; the per-slot LWW picks one winner (the higher schema version, then the larger entry hash) and the loser's writes are masked (resolve to the winning default / absent), exactly as a losing concurrent value write would.
 - **Drop + re-add resets.** A re-add is always causally after the drop it follows, so its drop generation is higher and its id differs — even for a byte-identical definition. The old incarnation's rows and column values are masked; the table/column starts empty. Because the generation is a *count* (not a set of drop hashes), two replicas that independently run the same drop+re-add migration still converge.
 
 Row **liveness** is incarnation-scoped, not just column values: a row belongs to the table incarnation it was written under, so a table reset makes prior rows non-live and lets a `rowId` be re-inserted under the new incarnation. A delta reports a same-shape reset as `reincarnated` on the table (or column) change; a projection consumer treats it as drop + create + backfill (see [rdb_adapter](../rdb_adapter)). Object identity is unchanged — a table's id stays `hash(groupId, name)`; the incarnation is a filter *within* that name-keyed scope. See `src/rschema/incarnation.ts`.

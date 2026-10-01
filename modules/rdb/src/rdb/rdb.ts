@@ -13,8 +13,11 @@
 //     hash algorithm. Validated without the catalog.
 //
 //   update-catalog
-//     Deploys a later release of the same catalog (forward only) with the
-//     params it first needs. Depends on the catalog at that release. When
+//     Deploys another release of the same catalog with the params it first
+//     needs: any release not at or below one already deployed (never
+//     backwards). A release concurrent with a deployed one merges with it:
+//     both stay deployed, and each member's target is the union of its
+//     versions in them. Depends on the catalog at that release. When
 //     creators are declared, requires author + signature from a creator.
 //
 // Invariants:
@@ -63,8 +66,12 @@ import { CreateRDbPayload, UpdateCatalogPayload, ParamValue, RDB_TYPE_ID, Schema
 import { validateRDbPayload } from "./validate_ops.js";
 import { RDbOps, RDbResolution, collectOps, resolveRDb } from "./resolve.js";
 import { adoptedReleases, runAdoptionPolicy } from "./adoption.js";
-import type { Membership } from "./instantiate.js";
+import type { Membership, MemberFiles } from "./instantiate.js";
 import { RTableGroupImpl, RTABLE_GROUP_TYPE_ID } from "../rtable_group/group.js";
+import { RBLOB_STORE_TYPE_ID } from "../rblob_store/payload.js";
+import type { RBlobStoreImpl } from "../rblob_store/rblob_store.js";
+import { RFILE_MAP_TYPE_ID } from "../rfile_map/payload.js";
+import type { RFileMapImpl } from "../rfile_map/rfile_map.js";
 import type { CreateTableGroupPayload } from "../rtable_group/payload.js";
 import { RCatalogImpl, RCATALOG_TYPE_ID } from "../rcatalog/rcatalog.js";
 import type { CatalogIndex } from "../rcatalog/resolve.js";
@@ -84,6 +91,19 @@ export type RDbRuntimeConfig = {
     // major version of the release the RDb was created at.
     adoptionRange?: string;
 };
+
+// The locally computed create payload of a member object: a group, or the
+// blob store or file map of a FILES member.
+function localMemberPayload(membership: Membership | undefined, id: B64Hash): Payload | undefined {
+    if (membership === undefined) return undefined;
+    const group = membership.byId.get(id);
+    if (group !== undefined) return group.payload as unknown as Payload;
+    for (const files of membership.files.values()) {
+        if (files.storeId === id) return files.store as unknown as Payload;
+        if (files.mapId === id) return files.map as unknown as Payload;
+    }
+    return undefined;
+}
 
 class SyncAbortedError extends Error {
     constructor() {
@@ -353,6 +373,12 @@ export class RDbImpl implements RDbContract, SyncableObject {
         return (membership?.order ?? []).map((hash) => membership!.byHash.get(hash)!.id);
     }
 
+    // The FILES members (blob store + file map each), sorted by name.
+    async getMemberFiles(at?: Version): Promise<MemberFiles[]> {
+        const membership = await this.getMembership(at);
+        return [...(membership?.files.values() ?? [])].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    }
+
     async getMemberSchemas(): Promise<B64Hash[]> {
         const membership = await this.getMembership();
         const schemas: B64Hash[] = [];
@@ -390,6 +416,15 @@ export class RDbImpl implements RDbContract, SyncableObject {
                 created.push(member.id);
             }
             await ensureDeployGate(this.ctx, member.id, member.def.schemaRef, backendLabel);
+        }
+        for (const files of membership.files.values()) {
+            for (const [id, payload] of [[files.storeId, files.store], [files.mapId, files.map]] as const) {
+                if (await this.ctx.getObject(id) !== undefined) continue;
+                const deps = await this.creationDepsFor(payload as unknown as Payload);
+                if (!await this.creationDepsSatisfied(deps)) continue;
+                await this.ctx.createObject(payload as unknown as Payload, backendLabel);
+                created.push(id);
+            }
         }
         return created;
     }
@@ -705,9 +740,9 @@ export class RDbImpl implements RDbContract, SyncableObject {
             if (!this.isCurrent(epoch)) throw new SyncAbortedError();
 
             if (obj === undefined) {
-                const member = membership?.byId.get(id);
-                if (member !== undefined) {
-                    obj = await this.tryMaterialize(id, epoch, member.payload as unknown as Payload);
+                const local = localMemberPayload(membership, id);
+                if (local !== undefined) {
+                    obj = await this.tryMaterialize(id, epoch, local);
                 } else {
                     // Prefer the deps-aware path (fetch the create payload, hold
                     // it pending until its genesis deps are satisfiable).
@@ -739,6 +774,9 @@ export class RDbImpl implements RDbContract, SyncableObject {
                 membership = (await this.resolve()).membership;
                 if (!this.isCurrent(epoch)) throw new SyncAbortedError();
                 for (const hash of membership?.order ?? []) queue.push(membership!.byHash.get(hash)!.id);
+                for (const files of membership?.files.values() ?? []) queue.push(files.storeId, files.mapId);
+            } else if (obj.getType() === RBLOB_STORE_TYPE_ID || obj.getType() === RFILE_MAP_TYPE_ID) {
+                queue.push((obj as RBlobStoreImpl | RFileMapImpl).getGroupId());
             } else if (obj.getType() === RTABLE_GROUP_TYPE_ID) {
                 const group = obj as RTableGroupImpl;
                 queue.push(group.getSchemaRef());

@@ -14,6 +14,15 @@ export type LangDiagnostic = {
     severity: DiagnosticSeverity;
 };
 
+// A failure inside a statement that knows which part of it is at fault: bind
+// and execute report it at `span`, with `code`, instead of at the statement.
+export class SpannedError extends Error {
+    constructor(message: string, readonly span: TextSpan, readonly code: string = 'EXECUTION_FAILED') {
+        super(message);
+        this.name = 'SpannedError';
+    }
+}
+
 export type LangResultOk<T> = { ok: true; value: T };
 export type LangResultErr = { ok: false; diagnostics: LangDiagnostic[] };
 export type Result<T> = LangResultOk<T> | LangResultErr;

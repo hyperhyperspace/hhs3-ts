@@ -8,11 +8,22 @@ import type {
 } from "./payload.js";
 import type { IncarnationId } from "./incarnation.js";
 
+// Options of a schema update. `version` is the update's schema version; it
+// must be above every version at `at`, and defaults to the next patch above
+// the highest of them. `at` defaults to the current frontier.
+export type SchemaUpdateOptions = {
+    version?: string;
+    note?: string;
+    at?: Version;
+};
+
 export interface RSchema extends RObject {
 
     // The only writer beyond creation. Builds a rules-only schema-update,
     // signs it (updates must be authored by one of the schema's creators)
-    // and appends it at `at` (defaults to the current frontier).
+    // and appends it at `at` (defaults to the current frontier). The
+    // positional form `(migration, author, note?, at?)` is still accepted.
+    updateSchema(migration: MigrationRule[], author: OwnIdentity, options?: SchemaUpdateOptions): Promise<B64Hash>;
     updateSchema(migration: MigrationRule[], author: OwnIdentity, note?: string, at?: Version): Promise<B64Hash>;
 
     getView(at?: Version, from?: Version): Promise<RSchemaView>;
@@ -39,6 +50,10 @@ export interface RSchemaView extends View {
     getCreators(): SchemaCreator[];
     isCreator(keyId: KeyId): boolean;
 
+    // The schema versions of the entries at this view's version (its maxima),
+    // highest first. One entry for a single-headed version.
+    getVersions(): string[];
+
     // The effective table set at this view's version. Dropped tables are
     // absent. getTable returns the resolved def (never a carried payload).
     getTableNames(): string[];
@@ -48,10 +63,12 @@ export interface RSchemaView extends View {
     // Per-slot accessors with defaults applied (what validators call).
     // getRestriction returns the single declared restriction matching the op
     // (its own tag or 'all'; validation allows at most one), falling back to
-    // defaultRestrictionRule.
+    // defaultRestrictionRule. The default depends on the group the schema is
+    // deployed in, so the caller says whether that group is `authenticated`
+    // (has an idProvider).
     getConcurrentDeletes(table: string): boolean;
     getFKs(table: string): FKs;
-    getRestriction(table: string, op: 'insert' | 'update' | 'delete'): Predicate;
+    getRestriction(table: string, op: 'insert' | 'update' | 'delete', authenticated: boolean): Predicate;
     getPubColumns(table: string): string[];
 
     // The identity-provider designation of a table, or undefined if the table

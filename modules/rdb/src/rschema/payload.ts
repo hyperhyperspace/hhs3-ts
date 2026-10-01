@@ -20,6 +20,8 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import { KeyId } from "@hyper-hyper-space/hhs3_crypto";
 import { createPayloadTypeFormat } from "@hyper-hyper-space/hhs3_mvt";
 
+import { MAX_SEMVER_LENGTH } from "../semver.js";
+
 // Size limits (payload formats)
 
 export const MAX_NAME_LENGTH = 256;
@@ -231,8 +233,12 @@ export const restrictionFormat: json.Format = {
     rule: json.Type.Something,
 };
 
-export function defaultRestrictionRule(op: 'insert' | 'update' | 'delete'): Predicate {
-    return op === 'insert'
+// The rule for an op the table declares no restriction for. Insert is open.
+// Update and delete are owner-only in a group that authenticates authors
+// (`authenticated`: it has an idProvider); a group without one admits only
+// anonymous ops, where an owner rule could never pass, so they are open too.
+export function defaultRestrictionRule(op: 'insert' | 'update' | 'delete', authenticated: boolean): Predicate {
+    return op === 'insert' || !authenticated
         ? { p: 'true' }
         : { p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: '$author' } };
 }
@@ -345,10 +351,19 @@ export const schemaCreatorFormat: json.Format = {
 
 export const RSCHEMA_TYPE_ID = 'hhs/rschema_v1';
 
+// Every schema entry carries the schema's own version (strict semver). The
+// create's version is the first; each update's must be above every version in
+// its causal past. Among concurrent writes to one slot, the higher version
+// wins (see resolve.ts), so the schema's author decides how concurrent lines
+// of one schema merge.
+
+export const DEFAULT_SCHEMA_VERSION = '0.0.1';
+
 export type CreateRSchemaPayload = {
     action: 'create';
     type: string;
     name: string;
+    version: string;
     creators: SchemaCreator[];             // may sign schema-updates; at least one
     tables: TableDef[];
     hashAlgorithm?: string;
@@ -358,6 +373,7 @@ export const createRSchemaFormat: json.Format = {
     action: [json.Type.Constant, 'create'],
     type: createPayloadTypeFormat(RSCHEMA_TYPE_ID),
     name: [json.Type.BoundedString, MAX_NAME_LENGTH],
+    version: [json.Type.BoundedString, MAX_SEMVER_LENGTH],
     creators: [json.Type.BoundedArray, schemaCreatorFormat, MAX_CREATORS],
     tables: [json.Type.BoundedArray, tableDefFormat, MAX_TABLES],
     hashAlgorithm: [json.Type.Option, [json.Type.BoundedString, MAX_HASH_ALGORITHM_LENGTH]],
@@ -368,6 +384,7 @@ export const createRSchemaFormat: json.Format = {
 
 export type SchemaUpdatePayload = {
     action: 'schema-update';
+    version: string;
     migration: MigrationRule[];            // the slot writes; at least one
     note?: string;
     author: KeyId;
@@ -376,6 +393,7 @@ export type SchemaUpdatePayload = {
 
 export const schemaUpdateFormat: json.Format = {
     action: [json.Type.Constant, 'schema-update'],
+    version: [json.Type.BoundedString, MAX_SEMVER_LENGTH],
     migration: [json.Type.BoundedArray, migrationRuleFormat, MAX_MIGRATION_RULES],
     note: [json.Type.Option, [json.Type.BoundedString, MAX_NOTE_LENGTH]],
     author: [json.Type.BoundedString, MAX_KEY_ID_LENGTH],

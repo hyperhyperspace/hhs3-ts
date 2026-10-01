@@ -30,9 +30,6 @@ export type PendingIndex = { name: string; group: string; table: string; missing
 // Structural validation. `options` is opaque here (each target checks its own
 // format in validateIndexOptions). Returns a reason, or undefined when valid.
 export function validateIndexSpec(spec: IndexSpec): string | undefined {
-    if (!Number.isInteger(spec.version) || spec.version < 0) {
-        return `index spec version must be a non-negative integer, got ${spec.version}`;
-    }
     if (!Array.isArray(spec.indexes)) return 'index spec must carry an `indexes` array';
     const seen = new Set<string>();
     for (const decl of spec.indexes) {
@@ -74,7 +71,6 @@ export function validateIndexSpec(spec: IndexSpec): string | undefined {
 // Canonical JSON of a whole spec (the installed-spec compare-and-set token).
 export function indexSpecFingerprint(spec: IndexSpec): string {
     const out: json.LiteralMap = {
-        version: spec.version,
         indexes: spec.indexes.map((d) => {
             const m: json.LiteralMap = {
                 name: d.name, group: d.group, table: d.table, columns: [...d.columns],

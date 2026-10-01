@@ -212,6 +212,7 @@ export async function evaluateRowRestrictionKey(
         op,
         table,
         schemaView,
+        group.getIdProvider() !== undefined,
         (name) => groupView.getTableView(name),
         (groupName, name) => group.resolveForeignTableView(groupName, name, at, at),
     );
@@ -255,6 +256,13 @@ export function isAuthRetryBound(bound: BoundStatement): bound is AuthRetryBound
 
 export function hasExplicitBy(bound: AuthRetryBound): boolean {
     return bound.ast.author !== undefined;
+}
+
+// Whether the target group can verify an author. One without an identity
+// provider rejects every author, so signing the statement can't help.
+export function boundGroupVerifiesAuthors(bound: AuthRetryBound): boolean {
+    const group = bound.kind === 'update-ref' ? bound.group.group : bound.table.group;
+    return group?.getIdProvider() !== undefined;
 }
 
 export function boundWithAuthor(bound: AuthRetryBound, author: OwnIdentity): AuthRetryBound {
@@ -303,6 +311,7 @@ export async function suggestAuthorsForFailure(
     diagnostics: LangDiagnostic[],
 ): Promise<string | undefined> {
     if (!isAuthRelatedFailure(diagnostics)) return undefined;
+    if (isAuthRetryBound(bound) && !boundGroupVerifiesAuthors(bound)) return undefined;
 
     let candidates: AuthorCandidate[] = [];
 

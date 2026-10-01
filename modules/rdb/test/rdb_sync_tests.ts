@@ -12,6 +12,7 @@ import { RSchemaImpl } from "../src/rschema/rschema.js";
 import type { CatalogGroupDef } from "../src/rcatalog/payload.js";
 import { RDbImpl } from "../src/rdb/rdb.js";
 import { deployGateId } from "../src/rdeploy_gate/mirror.js";
+import { identitiesTableDef } from "./identity_fixture.js";
 
 // A swarm stub that records its lifecycle (mirrors replica test stubs).
 type StubSwarm = {
@@ -444,5 +445,40 @@ export const rdbSyncTests = {
                 await rdb.stopSync();
             },
         },
+        {
+            name: '[RDB15] startSync creates the FILES objects from local payloads after their group, and syncs them',
+            invoke: async () => {
+                const mesh = createStubMesh();
+                const dev = await makeIdentity();
+                const built = await buildCatalog(filesSpec(dev, 'rdb15'));
+
+                let ctx!: RContext;
+                ctx = newCtx({ mesh, fetchObject: async () => ctx.createObject(built.catalogPayload) });
+                for (const payload of built.schemaPayloads.values()) await ctx.createObject(payload);
+                const { rdb, db } = await unmaterialized(ctx, built, 'rdb15');
+                const media = db.files.get('media')!;
+                assertTrue(await ctx.getObject(media.storeId) === undefined && await ctx.getObject(media.mapId) === undefined,
+                    'the FILES objects are absent before startSync');
+
+                await rdb.startSync();
+
+                assertTrue(await ctx.getObject(media.storeId) !== undefined, 'the blob store was created locally');
+                assertTrue(await ctx.getObject(media.mapId) !== undefined, 'the file map was created locally');
+                const topics = liveTopics(mesh);
+                assertTrue(topics.has(media.storeId) && topics.has(media.mapId), 'both FILES DAGs synced');
+                assertTrue(topics.has(db.groupIds.get('user')!), 'their group is synced');
+                assertEquals(topics.size, 6, 'RDb + catalog + schema + group + store + map');
+                await rdb.stopSync();
+            },
+        },
     ],
 };
+
+// One group with an identity provider, and a FILES bound to it.
+function filesSpec(dev: OwnIdentity, name: string): FixtureSpec {
+    return {
+        dev, name,
+        groups: [{ name: 'user', tables: [identitiesTableDef()], idProvider: 'identities' }],
+        files: [{ name: 'media', group: 'user', idProvider: 'user.identities', canWrite: { p: 'true' } }],
+    };
+}

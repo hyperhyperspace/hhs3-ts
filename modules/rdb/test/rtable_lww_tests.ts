@@ -8,6 +8,7 @@ import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
 import { RTableGroupImpl, rTableGroupFactory } from "../src/rtable_group/group.js";
 import { deriveRowId } from "../src/rtable/hash.js";
 import type { TableDef } from "../src/rschema/payload.js";
+import { identitiesTableDef, localIdentityProvider } from "./identity_fixture.js";
 
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
@@ -38,7 +39,8 @@ function itemsTable(): TableDef {
     };
 }
 
-async function createTestEnv() {
+// `authors` get a local identity provider, so their signed ops verify.
+async function createTestEnv(authors?: OwnIdentity[]) {
     const ctx = createMockRContext({ selfValidate: true });
     ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
     ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
@@ -48,7 +50,7 @@ async function createTestEnv() {
     const schemaInit = await RSchemaImpl.create({
         name: 'lww:test_schema',
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
-        tables: [itemsTable()],
+        tables: authors === undefined ? [itemsTable()] : [itemsTable(), identitiesTableDef()],
     });
     const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
     const pinned = await (await schema.getScopedDag()).getFrontier();
@@ -58,6 +60,7 @@ async function createTestEnv() {
         seed: 'lww-test-group',
         schemaRef: schema.getId(),
         schemaVersion: pinned,
+        ...(authors === undefined ? {} : localIdentityProvider(authors)),
     });
     const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
     const items = await group.getTable('items');
@@ -260,8 +263,8 @@ export const rtableLwwTests = {
         {
             name: '[LWW10] Signed update by the row author lands',
             invoke: async () => {
-                const { items } = await createTestEnv();
                 const author = await makeIdentity();
+                const { items } = await createTestEnv([author]);
                 const rowId = deriveRowId('i-1', author.keyId);
 
                 await items.insert('i-1', { sku: 'A1', tag: 'red', qty: 1 }, author);

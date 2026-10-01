@@ -7,7 +7,7 @@ import { createMockRContext } from "@hyper-hyper-space/hhs3_rdb_adapter_test_gen
 import {
     RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory,
     TableDef, RSchemaView, RTableChanges,
-    deriveRowId, deriveTableId,
+    deriveRowId, deriveTableId, IDENTITIES_TABLE, identityRow, usersSchemaTables,
 } from "@hyper-hyper-space/hhs3_rdb";
 
 import { AdapterConfig } from "../src/types.js";
@@ -44,6 +44,8 @@ function baseTables(): TableDef[] {
     ];
 }
 
+// The admin signs its writes, so the group verifies authors through a local
+// identities table that registers it.
 async function createGroup() {
     const ctx = createMockRContext({ selfValidate: true });
     ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
@@ -53,13 +55,15 @@ async function createGroup() {
     const schemaInit = await RSchemaImpl.create({
         name: 'finance',
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
-        tables: baseTables(),
+        tables: [...baseTables(), usersSchemaTables().find((t) => t.name === IDENTITIES_TABLE)!],
     });
     const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
     const pinned = await (await schema.getScopedDag()).getFrontier();
 
     const groupInit = await RTableGroupImpl.create({
         name: 'finance-prod', seed: 'finance-prod', schemaRef: schema.getId(), schemaVersion: pinned,
+        idProvider: IDENTITIES_TABLE,
+        initialRows: { [IDENTITIES_TABLE]: [identityRow('admin', admin)] },
     });
     const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
     return { ctx, schema, group, admin };

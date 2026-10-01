@@ -403,7 +403,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             // Projection-local indexes: the installed spec (one row) and the
             // indexes actually materialized (resolved definition as JSON).
             + 'CREATE TABLE IF NOT EXISTS rdb_index_spec ('
-            + 'id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL, spec TEXT NOT NULL, '
+            + 'id INTEGER PRIMARY KEY CHECK (id = 1), spec TEXT NOT NULL, '
             + 'fingerprint TEXT NOT NULL);'
             + 'CREATE TABLE IF NOT EXISTS rdb_index_meta ('
             + '"table" TEXT NOT NULL, name TEXT NOT NULL, group_id TEXT NOT NULL, def TEXT NOT NULL, '
@@ -636,8 +636,8 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             }
             for (const index of ensures) this.createIndex(index);
             this.db.prepare(
-                'INSERT OR REPLACE INTO rdb_index_spec (id, version, spec, fingerprint) VALUES (1, ?, ?, ?)')
-                .run(spec.version, JSON.stringify(spec), specFingerprint);
+                'INSERT OR REPLACE INTO rdb_index_spec (id, spec, fingerprint) VALUES (1, ?, ?)')
+                .run(JSON.stringify(spec), specFingerprint);
         });
         run.immediate();
     }

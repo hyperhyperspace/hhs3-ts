@@ -48,6 +48,23 @@ export * from "./rdeploy_gate/mirror.js";
 export * from "./rdeploy_gate/interfaces.js";
 export * from "./rdeploy_gate/rdeploy_gate.js";
 
+// Files: shared hashing, path rules and write access of the FILES types
+export * from "./rfiles/hashes.js";
+export * from "./rfiles/path.js";
+export * from "./rfiles/access.js";
+
+// RBlobStore: file contents as signed, hash-linked chunk chains
+export * from "./rblob_store/payload.js";
+export * from "./rblob_store/validate.js";
+export * from "./rblob_store/interfaces.js";
+export * from "./rblob_store/rblob_store.js";
+
+// RFileMap: which file contents sit at which path
+export * from "./rfile_map/payload.js";
+export * from "./rfile_map/validate.js";
+export * from "./rfile_map/interfaces.js";
+export * from "./rfile_map/rfile_map.js";
+
 // Users: a standard identities-provider + capabilities RTableGroup
 export * from "./users/users.js";
 export * from "./users/peer_authorizer.js";

@@ -6,7 +6,8 @@ export const PROJECT_USAGE =
     '       \\project events <id> [after <n>] [before <n>] [limit <m>] [order asc|desc]\n' +
     '       \\project register-key <id> <keyHash> <publicKey>\n' +
     '       \\project resolve-key <id> <token>\n' +
-    '       \\project indexes <id> <spec.json | {inline json}> [dry-run]';
+    '       \\project indexes <id> <spec.json | {inline json}> [dry-run]\n' +
+    '       \\project files <id> <name> to <path>';
 
 export type ProjectStartCommand = {
     kind: 'start';
@@ -31,6 +32,13 @@ export type ProjectIndexesCommand = {
     dryRun: boolean;
 };
 
+export type ProjectFilesCommand = {
+    kind: 'files';
+    id: number;
+    name: string;
+    path: string;
+};
+
 export type ProjectCommand =
     | ProjectStartCommand
     | { kind: 'status'; database?: string }
@@ -39,7 +47,8 @@ export type ProjectCommand =
     | ProjectEventsCommand
     | { kind: 'register-key'; id: number; keyHash: string; publicKey: string }
     | { kind: 'resolve-key'; id: number; token: string }
-    | ProjectIndexesCommand;
+    | ProjectIndexesCommand
+    | ProjectFilesCommand;
 
 export function parseProjectCommand(remainder: string): ProjectCommand {
     const p = new Parser(remainder);
@@ -60,7 +69,7 @@ export function parseProjectCommand(remainder: string): ProjectCommand {
         case 'update': {
             p.skipWs();
             if (p.done()) throw new Error(PROJECT_USAGE);
-            const id = parseSessionId(p.readToken());
+            const id = parseSessionId(p.readToken(), sub);
             p.expectEnd();
             return { kind: sub, id };
         }
@@ -68,7 +77,7 @@ export function parseProjectCommand(remainder: string): ProjectCommand {
         case 'register-key': {
             p.skipWs();
             if (p.done()) throw new Error(PROJECT_USAGE);
-            const id = parseSessionId(p.readToken());
+            const id = parseSessionId(p.readToken(), sub);
             const keyHash = p.readToken();
             const publicKey = p.readToken();
             p.expectEnd();
@@ -77,12 +86,13 @@ export function parseProjectCommand(remainder: string): ProjectCommand {
         case 'resolve-key': {
             p.skipWs();
             if (p.done()) throw new Error(PROJECT_USAGE);
-            const id = parseSessionId(p.readToken());
+            const id = parseSessionId(p.readToken(), sub);
             const token = p.readToken();
             p.expectEnd();
             return { kind: 'resolve-key', id, token };
         }
         case 'indexes': return p.parseIndexes();
+        case 'files': return p.parseFiles();
         default:
             throw new Error(PROJECT_USAGE);
     }
@@ -95,9 +105,9 @@ function parseNonNegInt(raw: string, label: string): number {
     return Number(raw);
 }
 
-function parseSessionId(raw: string): number {
+function parseSessionId(raw: string, sub: string): number {
     if (!/^\d+$/.test(raw)) {
-        throw new Error(`\\project stop/update/events require a numeric session id, got '${raw}'`);
+        throw new Error(`\\project ${sub} requires a numeric session id, got '${raw}'`);
     }
     return Number(raw);
 }
@@ -144,7 +154,7 @@ class Parser {
     parseEvents(): ProjectEventsCommand {
         this.skipWs();
         if (this.done()) throw new Error(PROJECT_USAGE);
-        const id = parseSessionId(this.readToken());
+        const id = parseSessionId(this.readToken(), 'events');
         const out: ProjectEventsCommand = { kind: 'events', id };
         while (!this.done()) {
             const kw = this.readToken();
@@ -170,13 +180,24 @@ class Parser {
     parseIndexes(): ProjectIndexesCommand {
         this.skipWs();
         if (this.done()) throw new Error(PROJECT_USAGE);
-        const id = parseSessionId(this.readToken());
+        const id = parseSessionId(this.readToken(), 'indexes');
         this.skipWs();
         if (this.done()) throw new Error(PROJECT_USAGE);
         const spec = this.peek() === '{' ? { inline: this.readJsonObject() } : { path: this.readPath() };
         const dryRun = this.tryKeyword('dry-run');
         this.expectEnd();
         return { kind: 'indexes', id, spec, dryRun };
+    }
+
+    parseFiles(): ProjectFilesCommand {
+        this.skipWs();
+        if (this.done()) throw new Error(PROJECT_USAGE);
+        const id = parseSessionId(this.readToken(), 'files');
+        const name = this.readToken();
+        this.expectKeyword('to');
+        const path = this.readPath();
+        this.expectEnd();
+        return { kind: 'files', id, name, path };
     }
 
     // A balanced {...} span; JSON.parse validates it later. Brackets inside

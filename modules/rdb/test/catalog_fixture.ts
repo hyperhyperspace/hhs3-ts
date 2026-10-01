@@ -21,15 +21,19 @@ import type { CreateRSchemaPayload, Predicate, TableDef } from "../src/rschema/p
 import { RTableGroupImpl, rTableGroupFactory } from "../src/rtable_group/group.js";
 import { RCatalogImpl, rCatalogFactory } from "../src/rcatalog/rcatalog.js";
 import { catalogGroupHash } from "../src/rcatalog/payload.js";
-import type { CatalogGroupDef, CatalogParamDecl, CatalogRowTemplate, CreateRCatalogPayload } from "../src/rcatalog/payload.js";
+import type { CatalogFilesDef, CatalogGroupDef, CatalogParamDecl, CatalogRowTemplate, CreateRCatalogPayload } from "../src/rcatalog/payload.js";
 import { CatalogIndex } from "../src/rcatalog/resolve.js";
 import { RDeployGateImpl, rDeployGateFactory } from "../src/rdeploy_gate/rdeploy_gate.js";
 import { RDbImpl, rDbFactory } from "../src/rdb/rdb.js";
 import type { CreateRDbPayload, ParamValue } from "../src/rdb/payload.js";
 import { resolveRDb } from "../src/rdb/resolve.js";
-import type { Membership } from "../src/rdb/instantiate.js";
+import type { MemberFiles, Membership } from "../src/rdb/instantiate.js";
 import { instantiateGroup, deriveGroupSeed, groupIdOf } from "../src/rdb/instantiate.js";
 import { deployCatalogRelease } from "../src/rdb/catalog_update.js";
+import { rBlobStoreFactory } from "../src/rblob_store/rblob_store.js";
+import { RBLOB_STORE_TYPE_ID } from "../src/rblob_store/payload.js";
+import { rFileMapFactory } from "../src/rfile_map/rfile_map.js";
+import { RFILE_MAP_TYPE_ID } from "../src/rfile_map/payload.js";
 
 export function registerCatalogTypes(ctx: RContext): void {
     const registry = ctx.getRegistry();
@@ -38,6 +42,8 @@ export function registerCatalogTypes(ctx: RContext): void {
     registry.register(RTableGroupImpl.typeId, rTableGroupFactory);
     registry.register(RDeployGateImpl.typeId, rDeployGateFactory);
     registry.register(RDbImpl.typeId, rDbFactory);
+    registry.register(RBLOB_STORE_TYPE_ID, rBlobStoreFactory);
+    registry.register(RFILE_MAP_TYPE_ID, rFileMapFactory);
 }
 
 export async function makeIdentity(): Promise<OwnIdentity> {
@@ -64,11 +70,20 @@ export type FixtureGroup = {
     initialRows?: { [table: string]: CatalogRowTemplate[] };
 };
 
+export type FixtureFiles = {
+    name: string;
+    group: string;                            // the bound fixture group
+    alias?: string;                           // defaults to the group name
+    idProvider: string;
+    canWrite: Predicate;
+};
+
 export type FixtureSpec = {
     dev: OwnIdentity;
     name?: string;
     version?: string;
     groups: FixtureGroup[];
+    files?: FixtureFiles[];
     params?: CatalogParamDecl[];
     note?: string;
 };
@@ -80,6 +95,7 @@ export type BuiltCatalog = {
     schemaIds: Map<string, B64Hash>;                     // by group name
     defs: Map<string, CatalogGroupDef>;
     hashes: Map<string, B64Hash>;
+    filesDefs: Map<string, CatalogFilesDef>;             // by FILES name
     catalogPayload: CreateRCatalogPayload;
     catalogId: B64Hash;
 };
@@ -134,17 +150,30 @@ export async function buildCatalog(spec: FixtureSpec): Promise<BuiltCatalog> {
         hashes.set(group.name, catalogGroupHash(def));
     }
 
+    const filesDefs = new Map<string, CatalogFilesDef>();
+    for (const files of spec.files ?? []) {
+        const target = hashes.get(files.group);
+        if (target === undefined) throw new Error(`fixture FILES '${files.name}' binds unknown group '${files.group}'`);
+        filesDefs.set(files.name, {
+            name: files.name,
+            bindings: { [files.alias ?? files.group]: target },
+            idProvider: files.idProvider,
+            canWrite: files.canWrite,
+        });
+    }
+
     const catalogPayload = await RCatalogImpl.create({
         name,
         creators,
         author: spec.dev,
         version: spec.version ?? '1.0.0',
         add: [...defs.values()],
+        files: [...filesDefs.values()],
         params: spec.params,
         note: spec.note,
     });
 
-    return { dev: spec.dev, name, schemaPayloads, schemaIds, defs, hashes, catalogPayload, catalogId: rootIdOf(catalogPayload) };
+    return { dev: spec.dev, name, schemaPayloads, schemaIds, defs, hashes, filesDefs, catalogPayload, catalogId: rootIdOf(catalogPayload) };
 }
 
 export type BuiltDatabase = {
@@ -152,6 +181,7 @@ export type BuiltDatabase = {
     rdbId: B64Hash;
     membership: Membership;
     groupIds: Map<string, B64Hash>;
+    files: Map<string, MemberFiles>;   // by FILES name
 };
 
 export async function buildDatabase(catalog: BuiltCatalog, opts: {
@@ -176,7 +206,9 @@ export async function buildDatabase(catalog: BuiltCatalog, opts: {
 
     const groupIds = new Map<string, B64Hash>();
     for (const [groupName, hash] of catalog.hashes) groupIds.set(groupName, resolution.membership.byHash.get(hash)!.id);
-    return { rdbPayload, rdbId, membership: resolution.membership, groupIds };
+    const files = new Map<string, MemberFiles>();
+    for (const member of resolution.membership.files.values()) files.set(member.name, member);
+    return { rdbPayload, rdbId, membership: resolution.membership, groupIds, files };
 }
 
 // Offline: the id a later release's definition gets as a member of `db`.
@@ -240,8 +272,9 @@ export async function catalogDatabase(ctx: RContext, spec: FixtureSpec, db: {
     return { built, builtDb, ...live, ...liveDb };
 }
 
-// The discovery topics of a database: the RDb, its catalog, its schemas and
-// its member groups (plus any extra ids).
+// The discovery topics of a database: the RDb, its catalog, its schemas, its
+// member groups and its FILES objects (plus any extra ids).
 export function databaseTopics(catalog: BuiltCatalog, db: BuiltDatabase, extra: B64Hash[] = []): B64Hash[] {
-    return [...new Set([db.rdbId, catalog.catalogId, ...catalog.schemaIds.values(), ...db.groupIds.values(), ...extra])];
+    const files = [...db.files.values()].flatMap((f) => [f.storeId, f.mapId]);
+    return [...new Set([db.rdbId, catalog.catalogId, ...catalog.schemaIds.values(), ...db.groupIds.values(), ...files, ...extra])];
 }

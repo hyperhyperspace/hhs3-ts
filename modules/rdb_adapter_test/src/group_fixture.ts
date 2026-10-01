@@ -8,7 +8,8 @@ import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from 
 import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import {
-    RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory, TableDef,
+    IDENTITIES_TABLE, identityRow, RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory, TableDef,
+    usersSchemaTables,
 } from "@hyper-hyper-space/hhs3_rdb";
 
 import { createMockRContext } from "./mock_rcontext.js";
@@ -98,6 +99,8 @@ export type GroupFixture = {
     admin: OwnIdentity;
 };
 
+// The group is its own identity provider with `admin` registered, so the
+// suites can sign rows as `admin`.
 async function buildGroup(name: string, tables: TableDef[]): Promise<GroupFixture> {
     const ctx = createMockRContext({ selfValidate: true });
     ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
@@ -107,13 +110,15 @@ async function buildGroup(name: string, tables: TableDef[]): Promise<GroupFixtur
     const schemaInit = await RSchemaImpl.create({
         name,
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
-        tables,
+        tables: [...tables, usersSchemaTables().find((t) => t.name === IDENTITIES_TABLE)!],
     });
     const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
     const pinned = await (await schema.getScopedDag()).getFrontier();
 
     const groupInit = await RTableGroupImpl.create({
         name: name + '-prod', seed: name + '-prod', schemaRef: schema.getId(), schemaVersion: pinned,
+        idProvider: IDENTITIES_TABLE,
+        initialRows: { [IDENTITIES_TABLE]: [identityRow('admin', admin)] },
     });
     const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
     return { schema, group, admin };

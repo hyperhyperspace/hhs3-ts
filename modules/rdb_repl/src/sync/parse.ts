@@ -1,15 +1,11 @@
+import type { AllowSource, SyncScope } from "@hyper-hyper-space/hhs3_rhost";
+
 export const SYNC_USAGE =
     'Usage: \\sync fetch #<rdb-id> as <local-id> on <localhost|internet> [--tracker URL] [--tracker-key KEYID] [--listen ADDR]\n' +
     '       \\sync start <db> as <local-id> [allow <sources>] on <localhost|internet> [--tracker URL] [--tracker-key KEYID] [--listen ADDR]\n' +
     '       \\sync status [<db>]\n' +
     '       \\sync stop <id>\n' +
     '       \\sync peers <id>';
-
-export type SyncScope = 'localhost' | 'internet';
-
-export type AllowSource =
-    | { type: 'everyone' }
-    | { type: 'column'; group: string; table: string; column: string; where?: string };
 
 export type SyncStartCommand = {
     kind: 'start';
@@ -71,22 +67,6 @@ export function parseSyncCommand(remainder: string): SyncCommand {
         default:
             throw new Error(`${SYNC_USAGE}`);
     }
-}
-
-export function allowIsEveryone(sources: AllowSource[]): boolean {
-    return sources.length === 0 || sources.some((s) => s.type === 'everyone');
-}
-
-export function formatAllow(sources: AllowSource[]): string {
-    if (allowIsEveryone(sources)) return 'everyone';
-    const parts = sources.map(formatAllowSource);
-    return parts.length === 1 ? parts[0]! : `[${parts.join(', ')}]`;
-}
-
-export function formatAllowSource(source: AllowSource): string {
-    if (source.type === 'everyone') return 'everyone';
-    const path = `${source.group}.${source.table}.${source.column}`;
-    return source.where === undefined ? path : `${path} where ${source.where}`;
 }
 
 function parseSessionId(raw: string): number {

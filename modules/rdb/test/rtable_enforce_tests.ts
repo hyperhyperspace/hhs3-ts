@@ -10,6 +10,7 @@ import { RTableGroupImpl, rTableGroupFactory } from "../src/rtable_group/group.j
 import { deriveRowId } from "../src/rtable/hash.js";
 import type { TableDef, Predicate } from "../src/rschema/payload.js";
 import type { RTableView } from "../src/rtable/interfaces.js";
+import { identitiesTableDef, localIdentityProvider } from "./identity_fixture.js";
 
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
@@ -18,10 +19,12 @@ async function makeIdentity(): Promise<OwnIdentity> {
     return createIdentity(SIGNING_ED25519, hashSuite);
 }
 
+// `authors` get a local identity provider, so their signed row ops verify.
 async function createEnv(tables: TableDef[], opts?: {
     canDeploy?: Predicate;
     deployKeys?: OwnIdentity[];
     initialRows?: { [t: string]: json.Literal[] };
+    authors?: OwnIdentity[];
     admin?: OwnIdentity;
     selfValidate?: boolean;
 }) {
@@ -33,7 +36,7 @@ async function createEnv(tables: TableDef[], opts?: {
     const schemaInit = await RSchemaImpl.create({
         name: 'enf:test_schema',
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
-        tables,
+        tables: opts?.authors === undefined ? tables : [...tables, identitiesTableDef()],
     });
     const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
     const pinned = await (await schema.getScopedDag()).getFrontier();
@@ -47,7 +50,8 @@ async function createEnv(tables: TableDef[], opts?: {
         ...(opts?.deployKeys !== undefined ? {
             deployKeys: opts.deployKeys.map((k) => ({ keyId: k.keyId, publicKey: serializePublicKeyToBase64(k.publicKey) })),
         } : {}),
-        ...(opts?.initialRows !== undefined ? { initialRows: opts.initialRows } : {}),
+        ...(opts?.authors !== undefined ? localIdentityProvider(opts.authors, opts.initialRows)
+            : opts?.initialRows !== undefined ? { initialRows: opts.initialRows } : {}),
     });
     const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
 
@@ -379,13 +383,13 @@ export const rtableEnforceTests = {
         {
             name: '[ENF10] Defaults: unauthored update/delete of an authored row reject; authored-by-author pass',
             invoke: async () => {
-                // default restrictions (no `restrictions` declared): insert
-                // true, update/delete author-is-author
+                // default restrictions (no `restrictions` declared) in a group
+                // with a provider: insert true, update/delete author-is-author
+                const author = await makeIdentity();
                 const { group } = await createEnv([
                     { name: 'docs', columns: { body: { type: 'string' } } },
-                ]);
+                ], { authors: [author] });
                 const docs = await group.getTable('docs');
-                const author = await makeIdentity();
                 const rowId = deriveRowId('d-1', author.keyId);
 
                 await docs.insert('d-1', { body: 'v1' }, author);
@@ -414,6 +418,8 @@ export const rtableEnforceTests = {
             name: '[ENF11] grantee-based exists predicates resolve correctly',
             invoke: async () => {
                 // items may be updated only by someone named as a cap grantee
+                const alice = await makeIdentity();
+                const bob = await makeIdentity();
                 const { group } = await createEnv([
                     open('caps', { label: { type: 'string', pub: true }, grantee: { type: 'string', pub: true } }),
                     {
@@ -424,12 +430,9 @@ export const rtableEnforceTests = {
                             { on: 'update', rule: { p: 'exists', table: 'caps', where: { grantee: '$author' } } },
                         ],
                     },
-                ]);
+                ], { authors: [alice, bob] });
                 const caps = await group.getTable('caps');
                 const items = await group.getTable('items');
-
-                const alice = await makeIdentity();
-                const bob = await makeIdentity();
 
                 // alice is named as a caps grantee; bob is not
                 await caps.insert('c-alice', { label: 'x', grantee: alice.keyId }, alice);

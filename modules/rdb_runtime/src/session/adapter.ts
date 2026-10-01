@@ -1,5 +1,5 @@
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { Version, version } from "@hyper-hyper-space/hhs3_mvt";
+import { formatValidationFailure, ValidationRejectedError, Version, version } from "@hyper-hyper-space/hhs3_mvt";
 import type { CatalogUpdateResult, RDbImpl, RTableGroup, RTableView } from "@hyper-hyper-space/hhs3_rdb";
 import { splitTableRef } from "@hyper-hyper-space/hhs3_rdb";
 import {
@@ -11,6 +11,7 @@ import {
     LangExecutionResult,
     parseScript,
     ResolvedTableRef,
+    TextSpan,
     VersionExpr,
     VersionScope,
 } from "@hyper-hyper-space/hhs3_rdb_lang";
@@ -39,7 +40,12 @@ export type ScriptRunResult = {
     results: StatementRunResult[];
 };
 
-export type ExecuteTextOptions = AuthInteractionContext;
+export type ExecuteTextOptions = AuthInteractionContext & {
+    // Source mode (a catalog repository's target-catalog.sql): CREATE CATALOG may omit
+    // VERSION, and takes catalogVersion. schemaVersion, when set, is the version
+    // a CREATE SCHEMA with no VERSION is created at (the catalog's version).
+    source?: { catalogVersion: string; schemaVersion?: string };
+};
 
 export function createBindContext(session: RdbSession): LangBindContext {
     const roots = session.workspace.roots;
@@ -49,6 +55,8 @@ export function createBindContext(session: RdbSession): LangBindContext {
         resolveDatabase: (ref) => roots.resolveDatabase(ref, rootCtx(session)),
         resolveCatalog: (ref) => roots.resolveCatalog(ref, rootCtx(session)),
         resolveTable: (ref) => roots.resolveTable(ref, rootCtx(session)),
+        resolveFiles: (ref) => roots.resolveFiles(ref, rootCtx(session)),
+        get localFiles() { return session.localFiles; },
         resolveDefaultGroup: async () => session.currentGroup === undefined
             ? undefined
             : {
@@ -88,11 +96,18 @@ export async function executeText(
     text: string,
     options?: ExecuteTextOptions,
 ): Promise<ScriptRunResult> {
-    const parsed = parseScript(text);
+    const source = options?.source;
+    const parsed = parseScript(text, source !== undefined ? { catalogVersionOptional: true } : undefined);
     if (!parsed.ok) throw new LanguageError(parsed.diagnostics);
 
     const results: StatementRunResult[] = [];
-    const context = createBindContext(session);
+    const context: LangBindContext = source !== undefined
+        ? {
+            ...createBindContext(session),
+            defaultCatalogVersion: async () => source.catalogVersion,
+            ...(source.schemaVersion !== undefined ? { defaultSchemaVersion: async () => source.schemaVersion } : {}),
+        }
+        : createBindContext(session);
     for (const statement of parsed.value.statements) {
         let bound = await bind(statement, context);
         if (!bound.ok) {
@@ -123,9 +138,10 @@ export async function executeText(
 
         const item: StatementRunResult = { result };
         if (result.kind === 'create-plan') {
-            const object = await session.workspace.createRoot(result.plan);
-            if (result.plan.kind === 'create-database') {
-                item.deploy = await result.plan.afterCreate(object);
+            const plan = result.plan;
+            const object = await rejectedAt(statement.span, () => session.workspace.createRoot(plan));
+            if (plan.kind === 'create-database') {
+                item.deploy = await rejectedAt(statement.span, () => plan.afterCreate(object));
                 await useDatabase(session, object.getId());
             }
         } else if (result.kind === 'use-database') {
@@ -148,6 +164,17 @@ export async function executeText(
     }
 
     return { results };
+}
+
+// Creating the root object validates it again; the binder catches what it
+// can, and anything else is reported at the statement.
+async function rejectedAt<T>(span: TextSpan, run: () => Promise<T>): Promise<T> {
+    try {
+        return await run();
+    } catch (e) {
+        if (!(e instanceof ValidationRejectedError)) throw e;
+        throw new LanguageError([{ code: 'VALIDATION_REJECTED', message: formatValidationFailure(e.why), span, severity: 'error' }]);
+    }
 }
 
 // Makes `id` the current database; a current group of another database is

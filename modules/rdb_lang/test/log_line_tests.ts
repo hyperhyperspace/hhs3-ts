@@ -40,6 +40,7 @@ export const logLineTests = {
             invoke: async () => {
                 const payload: SchemaUpdatePayload = {
                     action: 'schema-update',
+                    version: '0.0.2',
                     migration: [{ rule: 'add-column', table: 'products', column: 'tag', def: { type: 'string' } }],
                     author: 'author-key-id',
                     signature: 'sig',

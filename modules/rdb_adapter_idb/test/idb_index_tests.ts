@@ -429,12 +429,11 @@ export const idbIndexTests = {
                     await projectGroup(group, target);
                     const members: GroupProjection[] = [{ group, config: {} }];
                     const spec: IndexSpec = {
-                        version: 1,
                         indexes: [financeDecl('by_memo', 'ledger', ['memo', 'ref']), financeDecl('by_amount', 'ledger', ['amount'])],
                     };
 
                     await expectThrows(() => reconcileIndexes(members, target, {
-                        version: 1, indexes: [financeDecl('by_memo', 'ledger', ['memo'], {})],
+                        indexes: [financeDecl('by_memo', 'ledger', ['memo'], {})],
                     }), 'the indexeddb target takes no index options', 'options are refused');
                     assertEquals((await target.getIndexState()).spec, undefined, 'nothing installed by the refused spec');
 
@@ -470,7 +469,7 @@ export const idbIndexTests = {
                 const reopened = await IdbTarget.open(name);
                 try {
                     const state = await reopened.getIndexState();
-                    assertEquals(state.spec?.version, 1, 'spec survived reopen');
+                    assertEquals(state.spec?.indexes.map((d) => d.name).join(','), 'by_memo,by_amount', 'spec survived reopen');
                     assertEquals(state.materialized.map((m) => m.name).join(','), 'by_amount,by_memo', 'records survived reopen');
                     assertEquals(await entryCount(reopened, 'ledger', 'by_amount'), 4, 'entries survived reopen');
                     const byMemo = readIndex(reopened, 'ledger', 'by_memo').index;
@@ -496,7 +495,7 @@ export const idbIndexTests = {
                     const decl = (n: string, table: string, columns: string[]): IndexDecl =>
                         ({ name: n, group: 'flip-prod', table, columns });
                     await reconcileIndexes(members, target, {
-                        version: 1, indexes: [decl('by_title', 'posts', ['title']), decl('by_post', 'comments', ['post'])],
+                        indexes: [decl('by_title', 'posts', ['title']), decl('by_post', 'comments', ['post'])],
                     });
                     assertEquals(await entryCount(target, 'comments', 'by_post'), 1, 'by_post built on the plain column');
 
@@ -545,7 +544,7 @@ export const idbIndexTests = {
                     await target.apply(gid, [acctCreate], [
                         { kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { ref: 'a' } },
                     ], v1);
-                    const spec: IndexSpec = { version: 1, indexes: [] };
+                    const spec: IndexSpec = { indexes: [] };
                     const expect = { specFingerprint: undefined, checkpoints: new Map([[gid, v1]]) };
 
                     await expectThrows(() => target.installIndexSpec(spec, 'fp1', [

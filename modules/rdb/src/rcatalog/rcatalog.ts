@@ -47,7 +47,7 @@ import type {
 } from "./interfaces.js";
 import {
     CreateRCatalogPayload, CatalogReleasePayload, CatalogDeclarePayload,
-    CatalogGroupDef, CatalogParamDecl, SchemaCreator, RCATALOG_TYPE_ID,
+    CatalogGroupDef, CatalogFilesDef, CatalogParamDecl, SchemaCreator, RCATALOG_TYPE_ID,
 } from "./payload.js";
 import { validateRCatalogPayload } from "./validate_ops.js";
 import { CatalogIndex, ReleaseState, versionKey } from "./resolve.js";
@@ -100,6 +100,7 @@ function releaseBase(spec: CatalogReleaseSpec): json.LiteralMap {
     const base: json.LiteralMap = { version: spec.version };
     if (spec.changes !== undefined && Object.keys(spec.changes).length > 0) base['changes'] = spec.changes as unknown as json.Literal;
     if (spec.add !== undefined && spec.add.length > 0) base['add'] = spec.add as unknown as json.Literal;
+    if (spec.files !== undefined && spec.files.length > 0) base['files'] = spec.files as unknown as json.Literal;
     if (spec.params !== undefined && spec.params.length > 0) base['params'] = spec.params as unknown as json.Literal;
     if (spec.note !== undefined) base['note'] = spec.note;
     return base;
@@ -113,6 +114,7 @@ export class RCatalogImpl implements RCatalogContract {
         author: OwnIdentity;
         version: string;
         add?: CatalogGroupDef[];
+        files?: CatalogFilesDef[];
         params?: CatalogParamDecl[];
         note?: string;
         seed?: string;
@@ -127,7 +129,7 @@ export class RCatalogImpl implements RCatalogContract {
                 keyId: c.keyId,
                 publicKey: serializePublicKeyToBase64(c.publicKey),
             })),
-            ...releaseBase({ version: options.version, add: options.add, params: options.params, note: options.note }),
+            ...releaseBase({ version: options.version, add: options.add, files: options.files, params: options.params, note: options.note }),
         };
         if (options.seed !== undefined) base['seed'] = options.seed;
         if (options.hashAlgorithm !== undefined) base['hashAlgorithm'] = options.hashAlgorithm;

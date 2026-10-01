@@ -20,7 +20,7 @@
 
 import type { B64Hash, KeyId, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import type { Version, RContext } from "@hyper-hyper-space/hhs3_mvt";
-import type { RDb, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
+import type { RBlobStore, RDb, RFileMap, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 import {
     BidirectionalTarget, ChangeSignalListener, ChangeSignalSource, CheckpointMovedError,
     DEFAULT_KEY_DOMAIN, GroupProjection, IndexReconcileReport, IndexSpec, IngestResult, KeyIndex, OpEvent,
@@ -28,8 +28,28 @@ import {
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 import { buildScope, resolveMemberGroups, GroupConfigOverride } from "./scope.js";
+import type { FileDirectory } from "./files/directory.js";
+import { FileMount, type FilesMountSpec, type FilesMountStatus } from "./files/mount.js";
 
 export type OpEventListener = (events: OpEvent[]) => void;
+
+// Opens the folder of a mount; called once, when the mount attaches.
+export type FilesMountOpener = (spec: FilesMountSpec) => FileDirectory | Promise<FileDirectory>;
+
+export type FilesReconcileOptions = {
+    debounceMs?: number;
+    // Periodic scan of each mounted folder (ms); 0 disables. Default 5000.
+    scanIntervalMs?: number;
+    // How often a pending mount retries attaching (ms): a joining replica
+    // creates FILES objects on its own schedule. 0 disables. Default 1000.
+    retryMs?: number;
+};
+
+export type FilesReconcileReport = {
+    mounted: string[];
+    // Mounts whose FILES is not (yet) a member with both objects present.
+    pending: string[];
+};
 
 export type RdbProjectionOptions = {
     // Default writer for every member (enables local->rdb ingestion). Absent:
@@ -102,6 +122,14 @@ export class RdbProjection {
     private idle: Promise<void> = Promise.resolve();
     private idleResolve: (() => void) | undefined;
     private stopPromise: Promise<void> | undefined;
+    // File mounts: the specs from the last reconcileFiles, and those attached.
+    private fileSpecs: FilesMountSpec[] = [];
+    private fileMounts = new Map<string, FileMount>();
+    private fileOpener: FilesMountOpener | undefined;
+    private fileOptions: FilesReconcileOptions = {};
+    private fileErrors = new Map<string, string>();
+    private attaching: Promise<void> = Promise.resolve();
+    private attachRetry: ReturnType<typeof setTimeout> | undefined;
 
     private constructor(
         private readonly rdb: RDb,
@@ -180,11 +208,11 @@ export class RdbProjection {
         }
     }
 
-    // Install a new projection index spec (the app's migration step when it
-    // ships one; never triggered by sync, and open() takes no spec). Diffs the
-    // spec against what the target materialized, at each member's current
-    // checkpoint, and from then on every sync keeps it maintained across schema
-    // changes. Forward-only by `spec.version`; see IndexReconcileReport for the
+    // Install a projection index spec (never triggered by sync, and open()
+    // takes no spec). The same fingerprint as the installed spec is a no-op;
+    // anything else is diffed against what the target materialized, at each
+    // member's current checkpoint, and from then on every sync keeps it
+    // maintained across schema changes. See IndexReconcileReport for the
     // outcome and the declarations still pending. Throws when the target does
     // not support indexes or the spec is invalid.
     async reconcileIndexes(spec: IndexSpec, opts: ReconcileIndexesOptions = {}): Promise<IndexReconcileReport> {
@@ -197,10 +225,107 @@ export class RdbProjection {
         }
     }
 
+    // Mount FILES members as folders (files/mount.ts). A spec whose FILES is
+    // not a member yet, or whose objects are not present yet, is pending, and
+    // attaches when membership gains it. Specs missing from a later call are
+    // detached; their folders are left as they are.
+    async reconcileFiles(
+        specs: FilesMountSpec[], open: FilesMountOpener, opts: FilesReconcileOptions = {},
+    ): Promise<FilesReconcileReport> {
+        if (this.stopped) throw new Error('projection is stopped');
+        this.requireKeys();
+        this.fileSpecs = [...specs];
+        this.fileOpener = open;
+        this.fileOptions = opts;
+        for (const [name, mount] of [...this.fileMounts]) {
+            const spec = specs.find((s) => s.name === name);
+            if (spec === undefined || spec.path !== mount.spec.path) {
+                await mount.stop();
+                this.fileMounts.delete(name);
+            }
+        }
+        await this.attachPendingFiles();
+        const mounted = specs.filter((s) => this.fileMounts.has(s.name)).map((s) => s.name);
+        const pending = specs.filter((s) => !this.fileMounts.has(s.name)).map((s) => s.name);
+        return { mounted, pending };
+    }
+
+    filesStatus(): FilesMountStatus[] {
+        return this.fileSpecs.map((spec) => {
+            const mounted = this.fileMounts.get(spec.name);
+            if (mounted !== undefined) return mounted.status();
+            const error = this.fileErrors.get(spec.name);
+            return { name: spec.name, path: spec.path, state: 'pending', ...(error !== undefined ? { lastError: error } : {}) };
+        });
+    }
+
+    fileMount(name: string): FileMount | undefined {
+        return this.fileMounts.get(name);
+    }
+
+    // Serialized: reconcileFiles, membership changes and sync cycles all call it.
+    private attachPendingFiles(): Promise<void> {
+        const run = this.attaching.then(() => this.doAttachPendingFiles());
+        this.attaching = run.catch(() => undefined);
+        return run;
+    }
+
+    private async doAttachPendingFiles(): Promise<void> {
+        const pending = this.fileSpecs.filter((s) => !this.fileMounts.has(s.name));
+        if (pending.length === 0 || this.fileOpener === undefined || this.stopped) return;
+        const members = await this.rdb.getMemberFiles();
+        for (const spec of pending) {
+            const member = members.find((m) => m.name === spec.name);
+            if (member === undefined) continue;
+            const store = await this.ctx.getObject(member.storeId);
+            const map = await this.ctx.getObject(member.mapId);
+            if (store === undefined || map === undefined) continue;
+            // With a writer, the bound group decides access: wait for it too.
+            const writer = this.options.writer;
+            const group = writer === undefined ? undefined : await this.ctx.getObject((map as unknown as RFileMap).getGroupId());
+            if (writer !== undefined && group === undefined) continue;
+            let mount: FileMount;
+            try {
+                mount = await FileMount.open({
+                    spec,
+                    dir: await this.fileOpener(spec),
+                    store: store as unknown as RBlobStore,
+                    map: map as unknown as RFileMap,
+                    keys: this.requireKeys(),
+                    ...(writer !== undefined ? { writer, group } : {}),
+                    ...(this.fileOptions.debounceMs !== undefined ? { debounceMs: this.fileOptions.debounceMs } : {}),
+                    ...(this.fileOptions.scanIntervalMs !== undefined ? { scanIntervalMs: this.fileOptions.scanIntervalMs } : {}),
+                    onError: (err) => this.options.onError?.(err),
+                });
+            } catch (err) {
+                this.fileErrors.set(spec.name, err instanceof Error ? err.message : String(err));
+                this.options.onError?.(err);
+                continue;
+            }
+            this.fileErrors.delete(spec.name);
+            if (this.stopped) { await mount.stop(); return; }
+            this.fileMounts.set(spec.name, mount);
+        }
+        this.scheduleAttachRetry();
+    }
+
+    private scheduleAttachRetry(): void {
+        const every = this.fileOptions.retryMs ?? 1000;
+        const pending = this.fileSpecs.some((s) => !this.fileMounts.has(s.name));
+        if (this.stopped || !pending || every <= 0 || this.attachRetry !== undefined) return;
+        this.attachRetry = setTimeout(() => {
+            this.attachRetry = undefined;
+            void this.attachPendingFiles().catch((err) => this.options.onError?.(err));
+        }, every);
+        (this.attachRetry as unknown as { unref?: () => void }).unref?.();
+    }
+
     // Inbound trigger fallback for callers that cannot wire a ChangeSignalSource
-    // (schedules a debounced cycle, like the reactive triggers do).
+    // (schedules a debounced cycle, like the reactive triggers do). Mounted
+    // folders get a pass too.
     nudge(): void {
         this.schedule();
+        for (const mount of this.fileMounts.values()) mount.nudge();
     }
 
     // Inspect the durable op-event log. Non-destructive; independent of the
@@ -274,6 +399,7 @@ export class RdbProjection {
     private async doStop(): Promise<void> {
         this.stopped = true;
         if (this.timer !== undefined) { clearTimeout(this.timer); this.timer = undefined; }
+        if (this.attachRetry !== undefined) { clearTimeout(this.attachRetry); this.attachRetry = undefined; }
         for (const { group, cb } of this.groupCallbacks.values()) group.unsubscribe(cb);
         this.groupCallbacks.clear();
         if (this.rdbCallback !== undefined) { this.rdb.unsubscribe(this.rdbCallback); this.rdbCallback = undefined; }
@@ -282,6 +408,9 @@ export class RdbProjection {
             this.changeListener = undefined;
         }
         await this.idle;
+        await this.attaching;
+        for (const mount of this.fileMounts.values()) await mount.stop();
+        this.fileMounts.clear();
         this.opEventListeners.clear();
         this.opEventArmed = false;
         this.opEventCursor = 0;
@@ -347,6 +476,7 @@ export class RdbProjection {
             await group.subscribe(cb);
             this.groupCallbacks.set(id, { group, cb });
         }
+        await this.attachPendingFiles();
     }
 
     private async arm(): Promise<void> {
@@ -393,6 +523,7 @@ export class RdbProjection {
                 this.lastErrorMessage = undefined;
                 this.options.onResult?.(results);
                 await this.pushOpEvents();
+                await this.attachPendingFiles();
             } while (this.rerun && !this.stopped);
         } catch (e) {
             this.lastErrorMessage = e instanceof Error ? e.message : String(e);

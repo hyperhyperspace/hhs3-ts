@@ -8,9 +8,9 @@ import { createMockRContext } from "./mock_rcontext.js";
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
 import type { TableDef } from "../src/rschema/payload.js";
 import { RCatalogImpl, rCatalogFactory } from "../src/rcatalog/rcatalog.js";
-import { catalogGroupHash } from "../src/rcatalog/payload.js";
-import type { CatalogGroupDef } from "../src/rcatalog/payload.js";
-import { compareSemver, semverInRange, majorRange, isValidSemver } from "../src/rcatalog/semver.js";
+import { catalogFilesHash, catalogGroupHash } from "../src/rcatalog/payload.js";
+import type { CatalogFilesDef, CatalogGroupDef, CatalogParamDecl } from "../src/rcatalog/payload.js";
+import { compareSemver, semverInRange, majorRange, isValidSemver, isValidSemverRange, nextPatch } from "../src/rcatalog/semver.js";
 
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
@@ -147,6 +147,14 @@ export const catalogTests = {
                 assertTrue(semverInRange('1.2.3', '1.2.3'), 'an exact range includes itself');
                 assertFalse(semverInRange('1.2.4', '1.2.3'), 'an exact range excludes others');
                 assertEquals(majorRange('3.1.4'), '^3', 'the major range of 3.1.4 is ^3');
+                assertTrue(semverInRange('1.9.9', '<3.0.0'), '<3.0.0 includes 1.9.9');
+                assertTrue(semverInRange('2.5.0', '<3.0.0'), '<3.0.0 includes 2.5.0');
+                assertFalse(semverInRange('3.0.0', '<3.0.0'), '<3.0.0 excludes 3.0.0');
+                assertTrue(semverInRange('0.0.1', '<3'), '<3 includes 0.0.1');
+                assertFalse(semverInRange('3.0.1', '<3'), '<3 excludes 3.0.1');
+                assertTrue(isValidSemverRange('<2.1.0') && !isValidSemverRange('<2.1') && !isValidSemverRange('<=2.1.0'),
+                    'the upper-bound range is <M or <M.m.p');
+                assertEquals(nextPatch('1.2.9'), '1.2.10', 'nextPatch bumps the patch');
             }
         },
         {
@@ -336,11 +344,21 @@ export const catalogTests = {
                 await rejects(() => publish(docDef(docSchema, docPin, 'not-a-group'), '1.1.0'),
                     'is not defined earlier', 'a binding to an undefined group is rejected');
                 await rejects(() => publish(docDef(docSchema, docPin, userHash, { bindings: { owner: userHash }, idProvider: undefined }), '1.1.0'),
-                    "schema target group 'user' is not bound", 'the schema target group must be bound');
+                    "TABLEGROUP doc: schema hhs:doc references user.caps (from docs), and the TABLEGROUP doesn't BIND user",
+                    'the schema target group must be bound');
                 await rejects(() => publish(docDef(docSchema, docPin, userHash, {
                     idProvider: undefined,
                     canDeploy: { p: 'exists', table: 'user.caps', where: { grantee: '$author' } },
-                }), '1.1.0'), 'requires an identity provider', 'an ALLOW DEPLOY IF over $author without a provider is rejected');
+                }), '1.1.0'), 'TABLEGROUP doc: ALLOW DEPLOY IF reads $author, which needs USING IDENTITIES',
+                'an ALLOW DEPLOY IF over $author without a provider is rejected');
+                await rejects(() => publish(docDef(docSchema, docPin, userHash, {
+                    idProvider: undefined,
+                    canObserve: { user: { p: 'exists', table: 'caps', where: { grantee: '$author' } } },
+                }), '1.1.0'), 'TABLEGROUP doc: ALLOW UPDATE REF user IF reads $author, which needs USING IDENTITIES',
+                'an ALLOW UPDATE REF over $author without a provider is rejected');
+                await rejects(() => publish(docDef(docSchema, docPin, userHash, { idProvider: undefined }), '1.1.0'),
+                    'TABLEGROUP doc: schema hhs:doc: ALLOW insert IF on docs reads $author, which needs USING IDENTITIES',
+                    'a schema restriction over $author without a provider is rejected');
 
                 await rejects(() => catalog.publishRelease({
                     version: '1.1.0',
@@ -356,7 +374,8 @@ export const catalogTests = {
                         name: 'staff',
                         initialRows: { identities: [{ values: {}, params: { keyId: { param: 'admin' }, publicKey: { param: 'helper', fn: 'publicKey' } } }] },
                     })],
-                }, dev), 'must come from the same identity param', 'provider keyId and publicKey must come from the same identity param');
+                }, dev), 'identities row 1 in WITH ROWS: keyId and publicKey must be :p and publicKey(:p) of one identity param',
+                'provider keyId and publicKey must come from the same identity param');
                 await rejects(() => catalog.release({ version: '1.1.0', params: [{ name: 'admin', type: 'identity' }] }, dev),
                     'is already declared', 'a param declared twice is rejected');
 
@@ -368,5 +387,178 @@ export const catalogTests = {
                 assertTrue(state.groups.has(catalogGroupHash(doc)), 'a valid bound definition is accepted');
             }
         },
+        {
+            name: '[CAT09] a genesis whose groups do not fit their schemas says which row or clause, and how to fix it',
+            invoke: async () => {
+                const { ctx, dev, userSchema, noteSchema } = await createEnv();
+                const userPin = await frontierOf(userSchema);
+                const notePin = await frontierOf(noteSchema);
+                const admin = { param: 'admin' };
+                const genesis = (def: CatalogGroupDef, params: CatalogParamDecl[] = [{ name: 'admin', type: 'identity' }]) => RCatalogImpl.create({
+                    name: 'editor', creators: [{ keyId: dev.keyId, publicKey: dev.publicKey }], author: dev,
+                    version: '1.0.0', add: [def], params,
+                }).then((payload) => ctx.createObject(payload));
+
+                await rejects(() => genesis(userDef(userSchema, userPin, {
+                    initialRows: { caps: [{ values: { label: 'manager' }, params: { grantee: admin } }, { values: {}, params: { grantee: admin } }] },
+                })), "catalog genesis rejected: TABLEGROUP user: caps row 2 in WITH ROWS doesn't set label, which is NOT NULL with no DEFAULT: "
+                    + 'set it in the row, make label NULL, or give it a DEFAULT',
+                'a row missing a NOT NULL column names the row, the column, and the fixes');
+                await rejects(() => genesis(userDef(userSchema, userPin, {
+                    initialRows: { caps: [{ values: { label: 'manager', color: 'red' }, params: { grantee: admin } }] },
+                })), "TABLEGROUP user: caps row 1 in WITH ROWS sets color, which caps doesn't have", 'an unknown column is named');
+                await rejects(() => genesis(userDef(userSchema, userPin, {
+                    initialRows: { pages: [{ values: { title: 'Welcome' } }] },
+                })), "TABLEGROUP user: WITH ROWS fills pages, which schema hhs:user doesn't have", 'an unknown table is named');
+                await rejects(() => genesis(userDef(userSchema, userPin, {
+                    initialRows: { caps: [{ values: { label: 7 }, params: { grantee: admin } }] },
+                })), 'TABLEGROUP user: caps row 1 in WITH ROWS: label (string): expected a string', 'a bad value names its column and type');
+                await rejects(() => genesis(userDef(userSchema, userPin, {
+                    initialRows: { caps: [{ values: { label: 'manager' }, params: { grantee: { param: 'title' } } }] },
+                }), [{ name: 'admin', type: 'identity' }, { name: 'title', type: 'string' }]),
+                'TABLEGROUP user: caps row 1 in WITH ROWS: grantee is identity, and :title is a string param', 'a param that does not fit its column');
+                await rejects(() => genesis(userDef(userSchema, userPin, { idProvider: 'people' })),
+                    'TABLEGROUP user: USING IDENTITIES people: schema hhs:user has no table people', 'a missing identity table');
+                await rejects(() => genesis(userDef(userSchema, userPin, { idProvider: 'caps' })),
+                    "TABLEGROUP user: USING IDENTITIES caps: caps isn't an IDENTITY PROVIDER table", 'a table that is not an identity provider');
+                await rejects(() => genesis({
+                    name: 'notes', seedSource: 'rdb', schemaRef: noteSchema.getId(), schemaVersion: json.toSet([...notePin]),
+                    idProvider: 'user.identities',
+                }), "TABLEGROUP notes: USING IDENTITIES user.identities: the TABLEGROUP doesn't BIND user", 'a provider in an unbound group');
+            }
+        },
+        {
+            name: '[CAT10] a change is rejected when its target version breaks the group identity setup',
+            invoke: async () => {
+                const { ctx, dev, userSchema, noteSchema } = await createEnv();
+                const userPin = await frontierOf(userSchema);
+                const notePin = await frontierOf(noteSchema);
+                const user = userDef(userSchema, userPin);
+                const notes: CatalogGroupDef = {
+                    name: 'notes', seedSource: 'rdb', schemaRef: noteSchema.getId(), schemaVersion: json.toSet([...notePin]),
+                };
+                const catalog = await createCatalog(ctx, dev, [user, notes]);
+                const change = (def: CatalogGroupDef, schema: RSchemaImpl, v: Version) =>
+                    ({ [catalogGroupHash(def)]: { schema: schema.getId(), version: json.toSet([...v]) } });
+
+                await noteSchema.updateSchema([{ rule: 'set-restrictions', table: 'notes', restrictions: [
+                    { on: 'update', rule: { p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: '$author' } } },
+                ] }], dev);
+                const noteChange = change(notes, noteSchema, await frontierOf(noteSchema));
+                await rejects(() => catalog.release({ version: '1.1.0', changes: noteChange }, dev),
+                    'TABLEGROUP notes: schema hhs:note: ALLOW update IF on notes reads $author, which needs USING IDENTITIES',
+                    'a change that adds an $author rule to a group without a provider is rejected');
+
+                await userSchema.updateSchema([{ rule: 'drop-table', table: 'identities' }], dev);
+                const userChange = change(user, userSchema, await frontierOf(userSchema));
+                await rejects(() => catalog.release({ version: '1.1.0', changes: userChange }, dev),
+                    'TABLEGROUP user: USING IDENTITIES identities: schema hhs:user has no table identities',
+                    'a change that drops the identity provider table is rejected');
+            }
+        },
+        {
+            name: '[CAT11] FILES definition rules: one known binding, a provider table, qualified predicate tables with PUB where columns, and free names',
+            invoke: async () => {
+                const { ctx, dev, userSchema, docSchema } = await createEnv();
+                const userPin = await frontierOf(userSchema);
+                const docPin = await frontierOf(docSchema);
+                const user = userDef(userSchema, userPin);
+                const userHash = catalogGroupHash(user);
+                const media = mediaDef(userHash);
+
+                const catalog = (await ctx.createObject(await RCatalogImpl.create({
+                    name: 'editor', creators: [{ keyId: dev.keyId, publicKey: dev.publicKey }], author: dev,
+                    version: '1.0.0', add: [user], files: [media], params: [{ name: 'admin', type: 'identity' }],
+                }))) as RCatalogImpl;
+                const genesis = (await catalog.getView()).getRelease(catalog.getId())!;
+                assertEquals(genesis.files.get(catalogFilesHash(media))?.name, 'media', 'the genesis holds its FILES');
+                assertEquals(genesis.filesAddedIn.get(catalogFilesHash(media)), catalog.getId(), 'added in the genesis');
+
+                const withFiles = (def: CatalogFilesDef, v = '1.1.0') => catalog.release({ version: v, files: [def] }, dev);
+                const unknownHash = catalogFilesHash(media);
+
+                await rejects(() => withFiles(media), "FILES 'media' is already defined", 'a FILES defined twice is rejected');
+                await rejects(() => withFiles(mediaDef(userHash, 'media', { canWrite: { p: 'true' } })),
+                    "name 'media' is already used by a TABLEGROUP or FILES", 'a reused FILES name is rejected');
+                await rejects(() => withFiles(mediaDef(userHash, 'user')),
+                    "name 'user' is already used by a TABLEGROUP or FILES", 'a group name is rejected');
+                await rejects(() => withFiles(mediaDef(unknownHash, 'extra')),
+                    `FILES extra: BIND user points at '${unknownHash}', which is not a TABLEGROUP defined earlier`, 'an unknown group is rejected');
+                await rejects(() => withFiles(mediaDef(userHash, 'extra', { bindings: { user: userHash, other: userHash } })),
+                    'RCatalog release payload format is invalid', 'a second binding fails the strict format');
+                await rejects(() => withFiles(mediaDef(userHash, 'extra', { idProvider: 'identities' })),
+                    "idProvider 'identities' must be user.<table>", 'an unqualified identity table is rejected');
+                await rejects(() => withFiles(mediaDef(userHash, 'extra', { idProvider: 'user.people' })),
+                    'FILES extra: USING IDENTITIES user.people: schema hhs:user has no table people', 'a missing identity table is rejected');
+                await rejects(() => withFiles(mediaDef(userHash, 'extra', { idProvider: 'user.caps' })),
+                    "FILES extra: USING IDENTITIES user.caps: caps isn't an IDENTITY PROVIDER table", 'a non-provider table is rejected');
+                await rejects(() => withFiles(mediaDef(userHash, 'extra', { canWrite: { p: 'exists', table: 'caps', where: { grantee: '$author' } } })),
+                    "canWrite table 'caps' must be user.<table>", 'an unqualified predicate table is rejected');
+                await rejects(() => withFiles(mediaDef(userHash, 'extra', { canWrite: { p: 'exists', table: 'user.pages', where: { grantee: '$author' } } })),
+                    'FILES extra: ALLOW WRITE IF reads user.pages: schema hhs:user has no table pages', 'a missing predicate table is rejected');
+                await rejects(() => withFiles(mediaDef(userHash, 'extra', { canWrite: { p: 'exists', table: 'user.caps', where: { level: '$author' } } })),
+                    "FILES extra: ALLOW WRITE IF reads user.caps.level, which caps doesn't have", 'a missing where column is rejected');
+                await rejects(() => withFiles(mediaDef(userHash, 'extra', { canWrite: { p: 'exists', table: 'user.identities', where: { name: 'Admin' } } })),
+                    "FILES extra: ALLOW WRITE IF reads user.identities.name, which isn't PUB in identities", 'a non-PUB where column is rejected');
+                await rejects(() => catalog.publishRelease({ version: '1.1.0', add: [docDef(docSchema, docPin, userHash, { name: 'media' })] }, dev),
+                    "group name 'media' is already used", 'a later group cannot take a FILES name');
+                await rejects(() => catalog.release({
+                    version: '1.1.0',
+                    add: [withoutUndefined(userDef(userSchema, userPin, { name: 'staff', initialRows: undefined }))],
+                    files: [mediaDef(userHash, 'staff')],
+                }, dev), "name 'staff' is already used by a TABLEGROUP or FILES", 'a group and a FILES added together cannot share a name');
+                await rejects(() => catalog.release({
+                    version: '1.1.0', files: [mediaDef(userHash, 'extra'), mediaDef(userHash, 'extra')],
+                }, dev), "FILES 'extra' is added twice", 'the same FILES added twice in one release is rejected');
+
+                const staff = withoutUndefined(userDef(userSchema, userPin, { name: 'staff', initialRows: undefined }));
+                const staffFiles = mediaDef(catalogGroupHash(staff), 'desk');
+                const next = await catalog.release({
+                    version: '1.1.0',
+                    add: [staff],
+                    files: [mediaDef(userHash, 'attachments', { canWrite: { p: 'true' } }), staffFiles],
+                }, dev);
+                const state = (await catalog.getView()).getRelease(next)!;
+                assertEquals([...state.files.values()].map((d) => d.name).sort().join(','), 'attachments,desk,media',
+                    'a later release carries earlier FILES and adds its own, bound to a group added with it');
+                assertEquals(state.filesAddedIn.get(catalogFilesHash(staffFiles)), next, 'a later FILES records its release');
+                assertEquals(state.filesAddedIn.get(catalogFilesHash(media)), catalog.getId(), 'an earlier FILES keeps its release');
+            }
+        },
+        {
+            name: '[CAT12] a group change that breaks an existing FILES is accepted; a FILES added with it is checked at the new version',
+            invoke: async () => {
+                const { ctx, dev, userSchema } = await createEnv();
+                const userPin = await frontierOf(userSchema);
+                const user = userDef(userSchema, userPin);
+                const userHash = catalogGroupHash(user);
+                const media = mediaDef(userHash);
+                const catalog = (await ctx.createObject(await RCatalogImpl.create({
+                    name: 'editor', creators: [{ keyId: dev.keyId, publicKey: dev.publicKey }], author: dev,
+                    version: '1.0.0', add: [user], files: [media], params: [{ name: 'admin', type: 'identity' }],
+                }))) as RCatalogImpl;
+
+                await userSchema.updateSchema([{ rule: 'drop-table', table: 'caps' }], dev);
+                const changes = { [userHash]: { schema: userSchema.getId(), version: json.toSet([...await frontierOf(userSchema)]) } };
+                await rejects(() => catalog.release({ version: '1.1.0', changes, files: [mediaDef(userHash, 'extra')] }, dev),
+                    'FILES extra: ALLOW WRITE IF reads user.caps: schema hhs:user has no table caps',
+                    'a FILES added with the change is checked at the new version');
+
+                const next = await catalog.release({ version: '1.1.0', changes }, dev);
+                const state = (await catalog.getView()).getRelease(next)!;
+                assertEquals(state.files.get(catalogFilesHash(media))?.name, 'media',
+                    'a change that drops a table the FILES reads is accepted, and the release keeps the FILES');
+            }
+        },
     ],
 };
+
+function mediaDef(userHash: B64Hash, name = 'media', extra?: Partial<CatalogFilesDef>): CatalogFilesDef {
+    return {
+        name,
+        bindings: { user: userHash },
+        idProvider: 'user.identities',
+        canWrite: { p: 'exists', table: 'user.caps', where: { grantee: '$author' } },
+        ...extra,
+    };
+}

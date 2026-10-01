@@ -1,0 +1,4 @@
+dist
+test-build
+test-tmp
+node_modules

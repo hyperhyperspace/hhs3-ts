@@ -185,7 +185,7 @@ const TABLE_NAMES = ['items', 'caps', 'table', 'identity', 't', 'order', 'users'
 const COLUMN_NAMES = ['name', 'qty', 'price', 'amount', 'flag', 'identity', 'length', 'escape', 'label', 'note',
     'limit', 'string', 'json', 'all', 'hash', 'algorithm', 'value', 'true', 'null'];
 const TYPES: ColumnType[] = ['string', 'integer', 'float', 'boolean', 'bigint', 'decimal', 'bytes', 'identity', 'json'];
-const STRINGS = ['abc', "it's", 'a--b', '/* x */', 'line\nbreak', 'back\\slash', '', 'Ünïcode ✓', 'x"y', '50%'];
+const STRINGS = ['abc', "it's", 'a--b', '/* x */', 'line\nbreak', 'back\\slash', 'dir\\new', '', 'Ünïcode ✓', 'x"y', '50%'];
 const LIKE_PATTERNS = ['a%', '_b%', '100\\%', 'x\\\\y', "it's%", '%', '', '_', '%\\_%'];
 const ORDERED: ColumnType[] = ['integer', 'float', 'string', 'bigint', 'decimal'];
 const COMPARABLE: ColumnType[] = ['string', 'integer', 'float', 'boolean', 'bigint', 'decimal', 'bytes', 'identity'];
@@ -414,12 +414,13 @@ export const roundTripTests = {
                     { rule: 'drop-table', table: 'identities' },
                 ];
                 const payload: SchemaUpdatePayload = {
-                    action: 'schema-update', migration, note: "v2: it's -- fine", author: 'AUTHORKEY', signature: 'SIG',
+                    action: 'schema-update', version: '2.0.0', migration, note: "v2: it's -- fine", author: 'AUTHORKEY', signature: 'SIG',
                 };
                 const text = renderOp(payload as unknown as json.Literal, { schemaRef: 'SCHEMAREF' });
                 const ast = parseOrThrow(text);
                 if (ast.kind !== 'alter-schema') throw new Error(`expected alter-schema, got ${ast.kind}`);
                 assertEquals(ast.note, payload.note, 'NOTE round-trips');
+                assertEquals(ast.version, payload.version, 'VERSION round-trips');
                 const rules = compileMigrationRules(ast.rules, columnsOfDefs([...base, added]));
                 sameOrExplain('alter schema', text, migration, rules);
             },
@@ -474,6 +475,47 @@ export const roundTripTests = {
                 assertTrue(text.includes('BIND users => users'), 'the binding names the definition');
                 assertTrue(text.includes('ALLOW DEPLOY IF'), 'the deploy gate renders');
                 assertTrue(text.includes('publicKey=publicKey(:owner)'), 'param rows render as :param slots');
+            },
+        },
+        {
+            name: '[RT07] CREATE CATALOG with FILES round-trips; BIND renders only when the alias is not the group name',
+            invoke: async () => {
+                const dev = await newIdentity();
+                const env = await createLangEnv({ vars: { dev, me: dev } });
+                await env.run(`
+                    CREATE SCHEMA users_schema CREATORS ($dev) AS (
+                      TABLE identities (keyId string PUB READONLY, publicKey string PUB READONLY) IDENTITY PROVIDER ALLOW insert IF true,
+                      TABLE caps (label string PUB READONLY, grantee identity PUB READONLY) ALLOW all IF true
+                    );
+                `);
+                const users = await env.schema('users_schema');
+                const usersDef: CatalogGroupDef = {
+                    name: 'users', seedSource: 'rdb', schemaRef: users.getId(), schemaVersion: json.toSet([users.getId()]),
+                    idProvider: 'identities',
+                };
+                const usersHash = catalogGroupHash(usersDef);
+                const writers: Predicate = {
+                    p: 'or',
+                    args: [
+                        { p: 'exists', table: 'users.caps', where: { label: "it's", grantee: '$author' } },
+                        { p: 'false' },
+                    ],
+                };
+                const payload = await RCatalogImpl.create({
+                    name: 'app', creators: [dev], author: dev, version: '1.0.0',
+                    add: [usersDef],
+                    files: [
+                        { name: 'media', bindings: { users: usersHash }, idProvider: 'users.identities', canWrite: writers },
+                        { name: 'files', bindings: { u: usersHash }, idProvider: 'u.identities', canWrite: { p: 'exists', table: 'u.caps', where: { grantee: '$author' } } },
+                        { name: 'open', bindings: { users: usersHash }, idProvider: 'users.identities', canWrite: { p: 'true' } },
+                    ],
+                });
+                const text = await assertCreateRoundTrip(payload, 'catalog with FILES', env.lang, {
+                    resolveSchemaName: (id) => (id === users.getId() ? 'users_schema' : undefined),
+                });
+                assertTrue(text.includes('FILES media\n    USING IDENTITIES users.identities'), 'no BIND when the alias is the group name');
+                assertTrue(text.includes('FILES files\n    BIND u => users\n    USING IDENTITIES u.identities'), 'BIND for another alias; files stays a name');
+                assertTrue(text.includes('ALLOW WRITE IF true'), 'a trivial predicate renders');
             },
         },
     ],

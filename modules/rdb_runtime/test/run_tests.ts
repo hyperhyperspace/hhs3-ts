@@ -4,6 +4,7 @@ import { testing } from "@hyper-hyper-space/hhs3_util";
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import {
     executeText,
+    LanguageError,
     keyPassphraseRequiredFromError,
     KeyPassphraseRequiredError,
     MemoryKeyVault,
@@ -133,10 +134,12 @@ const tests = [
                 runtime.session.selectAuthor('alice');
                 await runtime.execute(setupScript());
 
+                // shop_prod has no USING IDENTITIES, so its writes are never
+                // signed; a schema change always is
                 const fresh = new RdbSession({ workspace: runtime.workspace, keyVault: runtime.session.keyVault });
                 let required: KeyPassphraseRequiredError | undefined;
                 try {
-                    await executeText(fresh, "INSERT INTO shop_prod.products (sku, name) VALUES ('B', 'Gadget') BY $alice;");
+                    await executeText(fresh, 'ALTER SCHEMA shop AS (ADD COLUMN products.note string NULL) BY $alice;');
                 } catch (e) {
                     required = e instanceof KeyPassphraseRequiredError
                         ? e
@@ -304,6 +307,72 @@ ALTER CATALOG shop_catalog VERSION '1.1.0' AS (UPDATE SCHEMA shop TO LATEST ON s
 
                 await expectRunError(runtime, "UPDATE CATALOG shop_catalog TO '9.9.9' ON shop_db;",
                     "no release '9.9.9'", 'an unknown release is rejected');
+            } finally {
+                await runtime.close();
+            }
+        },
+    },
+    {
+        name: '[RDB_RT13] source mode: CREATE CATALOG without VERSION takes the given version',
+        invoke: async () => {
+            const runtime = await RdbRuntime.openMemory({ keyVault: new FakeKeyVault() });
+            try {
+                await runtime.session.createKey('alice', 'correct');
+                runtime.session.selectAuthor('alice');
+                const source = `
+CREATE SCHEMA shop CREATORS ($alice) AS (TABLE products (sku string));
+CREATE CATALOG shop_catalog CREATORS ($alice) AS (TABLEGROUP shop_prod USING SCHEMA shop);
+`;
+                await expectRunError(runtime, source, 'requires VERSION', 'outside source mode a catalog needs VERSION');
+
+                const run = await runtime.execute(source, { source: { catalogVersion: '2.0.0', schemaVersion: '2.0.0' } });
+                const schema = run.results[0]!.result;
+                assertTrue(schema.kind === 'create-plan' && schema.plan.kind === 'create-schema', 'the schema is created');
+                if (schema.kind !== 'create-plan' || schema.plan.kind !== 'create-schema') return;
+                assertEquals(schema.plan.payload.version, '2.0.0', 'an omitted schema VERSION takes the catalog version');
+                const created = run.results[1]!.result;
+                assertTrue(created.kind === 'create-plan' && created.plan.kind === 'create-catalog', 'the catalog is created');
+                if (created.kind !== 'create-plan' || created.plan.kind !== 'create-catalog') return;
+                assertEquals(created.plan.payload.version, '2.0.0', 'with the source version');
+
+                const explicit = await runtime.execute(`
+CREATE SCHEMA other CREATORS ($alice) VERSION '0.9.0' AS (TABLE products (sku string));
+CREATE CATALOG other_catalog CREATORS ($alice) AS (TABLEGROUP other_prod USING SCHEMA other);
+`, { source: { catalogVersion: '2.0.0', schemaVersion: '2.0.0' } });
+                const kept = explicit.results[0]!.result;
+                assertTrue(kept.kind === 'create-plan' && kept.plan.kind === 'create-schema', 'the versioned schema is created');
+                if (kept.kind !== 'create-plan' || kept.plan.kind !== 'create-schema') return;
+                assertEquals(kept.plan.payload.version, '0.9.0', 'a written schema VERSION is kept');
+            } finally {
+                await runtime.close();
+            }
+        },
+    },
+    {
+        name: '[RDB_RT14] a rejected create is a VALIDATION_REJECTED diagnostic at its statement',
+        invoke: async () => {
+            const runtime = await RdbRuntime.openMemory({ keyVault: new FakeKeyVault() });
+            try {
+                await runtime.session.createKey('alice', 'correct');
+                runtime.session.selectAuthor('alice');
+                await runtime.execute(`
+CREATE SCHEMA stock CREATORS ($me) AS (TABLE items (label string, qty integer MIN 0 MAX 10));
+CREATE CATALOG stock_catalog VERSION '1.0.0' PARAMS (:qty integer) AS (
+  TABLEGROUP store USING SCHEMA stock WITH ROWS (items (label = 'start', qty = :qty))
+);
+`);
+                let error: unknown;
+                try {
+                    await runtime.execute("CREATE SCHEMA other CREATORS ($me) AS (TABLE t (x string));\n\nCREATE DATABASE stock_db\n  USING CATALOG stock_catalog WITH PARAMS (:qty = 200);");
+                } catch (e) {
+                    error = e;
+                }
+                assertTrue(error instanceof LanguageError, `a LanguageError, got ${String(error)}`);
+                if (!(error instanceof LanguageError)) return;
+                const [diagnostic] = error.diagnostics;
+                assertEquals(diagnostic?.code, 'VALIDATION_REJECTED', 'the rejection keeps its code');
+                assertTrue(diagnostic?.message.includes('200 is out of range [0, 10]') ?? false, diagnostic?.message ?? 'no message');
+                assertEquals(diagnostic?.span?.line, 3, 'reported at the CREATE DATABASE line');
             } finally {
                 await runtime.close();
             }

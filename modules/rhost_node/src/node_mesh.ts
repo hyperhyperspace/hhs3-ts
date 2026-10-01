@@ -1,9 +1,10 @@
 // RDb adapter over the generic Node mesh factory. Maps RDB_SYNC_* env vars and
-// command flags onto createNodeMesh, which owns all mesh composition (transports,
-// discovery, listen policy). Precedence: command flag > env > scope default.
+// the request (a command's flags, or a host's sync settings) onto
+// createNodeMesh, which owns all mesh composition (transports, discovery,
+// listen policy). Precedence: request > env > scope default.
 
 import { createNodeMesh } from "@hyper-hyper-space/hhs3_mesh_node";
-import type { BuiltSyncMesh, SyncMeshFactory } from "@hyper-hyper-space/hhs3_rdb_repl";
+import type { BuiltSyncMesh, SyncMeshFactory } from "@hyper-hyper-space/hhs3_rhost";
 
 export type NodeSyncMeshFactoryOptions = {
     folderRoot?: string;

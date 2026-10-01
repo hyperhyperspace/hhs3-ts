@@ -250,14 +250,18 @@ async function testTableDefFormatAndValidation() {
 }
 
 async function testRestrictionDefaults() {
-    const insertDefault = defaultRestrictionRule('insert');
-    assertTrue(insertDefault.p === 'true', 'insert should default to allowed for anyone');
+    for (const authenticated of [true, false]) {
+        const insertDefault = defaultRestrictionRule('insert', authenticated);
+        assertTrue(insertDefault.p === 'true', 'insert should default to allowed for anyone');
+    }
 
-    const updateDefault = defaultRestrictionRule('update');
-    const deleteDefault = defaultRestrictionRule('delete');
-    assertTrue(json.toStringNormalized(updateDefault) === json.toStringNormalized({ p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: '$author' } })
-        && json.toStringNormalized(deleteDefault) === json.toStringNormalized({ p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: '$author' } }),
-        'update/delete should default to insert-author-only (anonymous rows immutable)');
+    const owner = json.toStringNormalized({ p: 'cmp', cmp: 'eq', left: { col: 'rowAuthor' }, right: { lit: '$author' } });
+    assertTrue(json.toStringNormalized(defaultRestrictionRule('update', true)) === owner
+        && json.toStringNormalized(defaultRestrictionRule('delete', true)) === owner,
+        'with an identity provider, update/delete should default to insert-author-only (anonymous rows immutable)');
+
+    assertTrue(defaultRestrictionRule('update', false).p === 'true' && defaultRestrictionRule('delete', false).p === 'true',
+        'without an identity provider every op is anonymous, so update/delete should default to open');
 }
 
 async function testOneRestrictionPerOp() {

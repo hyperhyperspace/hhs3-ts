@@ -8,6 +8,7 @@ import type { RContext } from "@hyper-hyper-space/hhs3_mvt";
 import {
     RCatalogImpl, rCatalogFactory, RDbImpl, rDbFactory, RDeployGateImpl, rDeployGateFactory,
     RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory,
+    RBLOB_STORE_TYPE_ID, rBlobStoreFactory, RFILE_MAP_TYPE_ID, rFileMapFactory,
 } from "@hyper-hyper-space/hhs3_rdb";
 
 import { createMockRContext } from "../../rdb/test/mock_rcontext.js";
@@ -38,6 +39,8 @@ export function registerRdbTypes(ctx: RContext): void {
     ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
     ctx.getRegistry().register(RCatalogImpl.typeId, rCatalogFactory);
     ctx.getRegistry().register(RDeployGateImpl.typeId, rDeployGateFactory);
+    ctx.getRegistry().register(RBLOB_STORE_TYPE_ID, rBlobStoreFactory);
+    ctx.getRegistry().register(RFILE_MAP_TYPE_ID, rFileMapFactory);
 }
 
 export async function newIdentity(): Promise<OwnIdentity> {

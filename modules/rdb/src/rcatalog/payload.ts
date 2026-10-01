@@ -12,15 +12,17 @@
 //              own object id).
 //   release  - a diff against its parents (the maximal releases in its causal
 //              past): the group definitions it adds (`add`, at their pins),
-//              the version changes of existing groups (`changes`), and the
-//              params it declares. Its state is folded from its parents.
+//              the version changes of existing groups (`changes`), the FILES
+//              definitions it adds (`files`), and the params it declares. Its
+//              state is folded from its parents.
 //   declare  - dependency-free: names schemas that later releases will
 //              reference, so the RDb can discover and fetch them before the
 //              release that needs them validates.
 //
 // Group definitions are immutable and content-addressed: a definition's
 // identity is the hash of its normalized payload (catalogGroupHash), and
-// bindings point at other definitions by that hash.
+// bindings point at other definitions by that hash. FILES definitions are
+// immutable too, identified by catalogFilesHash.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, KeyId, sha256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
@@ -33,16 +35,19 @@ import {
     MAX_KEY_ID_LENGTH, MAX_SIGNATURE_LENGTH, MAX_NOTE_LENGTH, MAX_CREATORS,
 } from "../rschema/payload.js";
 import { MAX_BINDINGS, MAX_INITIAL_ROWS_PER_TABLE } from "../rtable_group/payload.js";
+import { filesAccessFormat } from "../rfiles/access.js";
+import { MAX_SEMVER_LENGTH } from "../semver.js";
 
 export type { SchemaCreator } from "../rschema/payload.js";
 
 export const RCATALOG_TYPE_ID = 'hhs/rcatalog_v1';
 
 export const MAX_CATALOG_GROUPS = 256;
+export const MAX_CATALOG_FILES = 64;
 export const MAX_CATALOG_PARAMS = 64;
 export const MAX_DECLARED_SCHEMAS = 256;
 export const MAX_VERSION_WIDTH = 64;
-export const MAX_SEMVER_LENGTH = 64;
+export { MAX_SEMVER_LENGTH };
 
 export const versionSetFormat: json.Format =
     [json.Type.BoundedMap, [json.Type.BoundedString, MAX_HASH_LENGTH], [json.Type.Constant, ''], MAX_VERSION_WIDTH];
@@ -122,6 +127,28 @@ export function catalogGroupHash(def: CatalogGroupDef): B64Hash {
     return sha256.hashToB64(stringToUint8Array(json.toStringNormalized(def as unknown as json.Literal)));
 }
 
+// A FILES definition: a blob store and a file map, both instantiated per RDb
+// (../rdb/instantiate.ts). `bindings` holds exactly one alias, bound to a
+// group definition by its catalog group hash; `idProvider` and every table of
+// `canWrite` are qualified with that alias (see ../rfiles/access.ts).
+
+export type CatalogFilesDef = {
+    name: string;
+    bindings: { [alias: string]: B64Hash };
+    idProvider: string;
+    canWrite: Predicate;
+};
+
+export const catalogFilesDefFormat: json.Format = {
+    name: [json.Type.BoundedString, MAX_NAME_LENGTH],
+    ...filesAccessFormat,
+};
+
+export function catalogFilesHash(def: CatalogFilesDef): B64Hash {
+    const literal: json.LiteralMap = { domain: 'hhs3-catalog-files-v1', files: def as unknown as json.Literal };
+    return sha256.hashToB64(stringToUint8Array(json.toStringNormalized(literal)));
+}
+
 // A version change of an existing group. `schema` repeats the definition's
 // schemaRef so that foreign deps can be extracted from the payload alone.
 
@@ -136,6 +163,7 @@ export type CatalogReleaseBody = {
     version: string;
     changes?: { [catalogGroupHash: string]: CatalogGroupChange };
     add?: CatalogGroupDef[];
+    files?: CatalogFilesDef[];
     params?: CatalogParamDecl[];
     note?: string;
     author: KeyId;
@@ -149,6 +177,7 @@ const releaseBodyFormat: { [key: string]: json.OptionFormat } = {
         catalogGroupChangeFormat,
         MAX_CATALOG_GROUPS]],
     add: [json.Type.Option, [json.Type.BoundedArray, catalogGroupDefFormat, MAX_CATALOG_GROUPS]],
+    files: [json.Type.Option, [json.Type.BoundedArray, catalogFilesDefFormat, MAX_CATALOG_FILES]],
     params: [json.Type.Option, [json.Type.BoundedArray, catalogParamDeclFormat, MAX_CATALOG_PARAMS]],
     note: [json.Type.Option, [json.Type.BoundedString, MAX_NOTE_LENGTH]],
     author: [json.Type.BoundedString, MAX_KEY_ID_LENGTH],

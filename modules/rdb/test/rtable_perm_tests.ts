@@ -705,23 +705,35 @@ export const rtablePermTests = {
             invoke: async () => {
                 const ctx = newCtx();
                 const admin = await makeIdentity();
-                const users = await createUsersGroup(ctx, admin);
-                const app = await makeAppGroup(ctx, 'users02', [docsTable], users.group.getId());
+
+                // A directory group that serves an identities table without
+                // using it as its own provider: a group can't drop its own
+                // provider table, but a bound group's can go away.
+                const directorySchema = (await ctx.createObject(await RSchemaImpl.create({
+                    name: 'users02:directory',
+                    creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
+                    tables: [usersSchemaTables()[0]],
+                }))) as RSchemaImpl;
+                const directory = (await ctx.createObject(await RTableGroupImpl.create({
+                    name: 'users02-directory', seed: 'users02-directory',
+                    schemaRef: directorySchema.getId(), schemaVersion: await (await directorySchema.getScopedDag()).getFrontier(),
+                }))) as RTableGroupImpl;
+                const app = await makeAppGroup(ctx, 'users02', [docsTable], directory.getId());
 
                 const alice = await makeIdentity();
-                await registerIdentity(users.group, alice);
-                await app.group.observe('users', await frontier(users.group));
+                await registerIdentity(directory, alice);
+                await app.group.observe('users', await frontier(directory));
 
                 // while the provider is present, alice's authored op validates
                 const at1 = await frontier(app.group);
                 const env1 = await authoredInsertEnvelope('docs', 'd-1', { body: 'x' }, alice, at1);
                 assertTrue((await app.group.validatePayload(env1, at1)).valid, 'authored op validates while the provider is present');
 
-                // drop the identities table in the Users schema, deploy, observe
-                await users.schema.updateSchema([{ rule: 'drop-table', table: IDENTITIES_TABLE }], admin);
-                const v2 = await (await users.schema.getScopedDag()).getFrontier();
-                await users.group.deploy(v2);
-                await app.group.observe('users', await frontier(users.group));
+                // drop the identities table in the directory schema, deploy, observe
+                await directorySchema.updateSchema([{ rule: 'drop-table', table: IDENTITIES_TABLE }], admin);
+                const v2 = await (await directorySchema.getScopedDag()).getFrontier();
+                await directory.deploy(v2);
+                await app.group.observe('users', await frontier(directory));
 
                 // now alice is unresolvable through the (present but provider-less)
                 // foreign group -> the authored op is REJECTED at validation, and

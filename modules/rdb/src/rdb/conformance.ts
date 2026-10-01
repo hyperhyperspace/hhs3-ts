@@ -17,6 +17,9 @@
 //   ahead         current is above the target
 //   diverged      current and target are concurrent
 //   missing       the group is not present on this replica
+//
+// For each FILES member: its blob store and file map ids, and whether each is
+// present on this replica.
 
 import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { refVersionAtOrAbove } from "@hyper-hyper-space/hhs3_mvt";
@@ -50,6 +53,15 @@ export type MemberStatus = {
     state: MemberState;
 };
 
+export type FilesMemberStatus = {
+    name: string;
+    catalogFilesHash: B64Hash;
+    groupId: B64Hash;
+    blobStoreId: B64Hash;
+    fileMapId: B64Hash;
+    present: boolean;          // both objects are present
+};
+
 export type CatalogStatus = {
     rdb: B64Hash;
     catalog: B64Hash;
@@ -61,6 +73,7 @@ export type CatalogStatus = {
     adopted: ReleaseInfo[];
     held: ReleaseInfo[];
     members: MemberStatus[];
+    files?: FilesMemberStatus[];   // present when the catalog defines FILES
 };
 
 export async function catalogStatus(rdb: RDbImpl): Promise<CatalogStatus> {
@@ -136,6 +149,21 @@ export async function catalogStatus(rdb: RDbImpl): Promise<CatalogStatus> {
         }
 
         status.members.push(entry);
+    }
+
+    const files = [...membership.files.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    if (files.length > 0) {
+        status.files = [];
+        for (const member of files) {
+            status.files.push({
+                name: member.name,
+                catalogFilesHash: member.catalogFilesHash,
+                groupId: member.groupId,
+                blobStoreId: member.storeId,
+                fileMapId: member.mapId,
+                present: await ctx.getObject(member.storeId) !== undefined && await ctx.getObject(member.mapId) !== undefined,
+            });
+        }
     }
 
     return status;

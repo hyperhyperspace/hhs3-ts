@@ -63,6 +63,10 @@ export class RSchemaViewImpl implements RSchemaView {
         return this.state.creators.some((c) => c.keyId === keyId);
     }
 
+    getVersions(): string[] {
+        return [...this.state.versions];
+    }
+
     // The effective table set
 
     getTableNames(): string[] {
@@ -95,10 +99,10 @@ export class RSchemaViewImpl implements RSchemaView {
         return this.requireTable(table).fks ?? {};
     }
 
-    getRestriction(table: string, op: 'insert' | 'update' | 'delete'): Predicate {
+    getRestriction(table: string, op: 'insert' | 'update' | 'delete', authenticated: boolean): Predicate {
         const def = this.requireTable(table);
         const matching = (def.restrictions ?? []).find((r) => r.on === op || r.on === 'all');
-        return matching?.rule ?? defaultRestrictionRule(op);
+        return matching?.rule ?? defaultRestrictionRule(op, authenticated);
     }
 
     getPubColumns(table: string): string[] {

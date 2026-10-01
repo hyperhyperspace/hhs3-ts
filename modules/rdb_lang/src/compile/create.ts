@@ -60,8 +60,9 @@ async function compileCreateCatalog(bound: BoundCreateCatalog): Promise<CreatePl
         name: bound.ast.name,
         creators: bound.creators,
         author: bound.author,
-        version: bound.ast.version,
+        version: bound.version,
         ...(bound.add.length > 0 ? { add: bound.add } : {}),
+        ...(bound.files.length > 0 ? { files: bound.files } : {}),
         ...(bound.params.length > 0 ? { params: bound.params } : {}),
         ...(bound.ast.note !== undefined ? { note: bound.ast.note } : {}),
         ...(bound.ast.seed !== undefined ? { seed: bound.ast.seed } : {}),
@@ -74,6 +75,7 @@ async function compileCreateSchema(bound: BoundCreateSchema): Promise<CreatePlan
     const columnsOf = columnsOfFromTableDecls(bound.ast.tables);
     const payload = await RSchemaImpl.create({
         name: bound.ast.name,
+        version: bound.version,
         creators: bound.creators,
         tables: bound.ast.tables.map((table) => compileTable(table, {
             gated: { name: table.name, columns: columnSetFromTableDecl(table) },

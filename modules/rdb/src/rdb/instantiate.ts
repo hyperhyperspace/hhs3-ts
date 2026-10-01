@@ -19,6 +19,11 @@
 //               verified author. With neither, deploys stay open.
 //   ids         rTableGroupFactory.computeRootObjectId of the payload; groups
 //               are instantiated bottom-up over their bindings.
+//   files       a FILES definition becomes an RBlobStore and an RFileMap
+//               (instantiateFiles), both seeded by deriveFilesSeed(rdbId,
+//               catalogFilesHash) and bound to the concrete id of their group;
+//               the map carries the store's id.
+//   names       groups and FILES share one namespace (assignNames).
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, base64, sha256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
@@ -30,8 +35,13 @@ import { columnValueMatchesType } from "../rschema/validate.js";
 import { deriveRowId } from "../rtable/hash.js";
 import type { InsertRowPayload } from "../rtable/payload.js";
 import { CreateTableGroupPayload, RTABLE_GROUP_TYPE_ID } from "../rtable_group/payload.js";
-import type { CatalogGroupDef, CatalogParamDecl } from "../rcatalog/payload.js";
+import type { CatalogFilesDef, CatalogGroupDef, CatalogParamDecl } from "../rcatalog/payload.js";
+import { RBlobStoreImpl } from "../rblob_store/rblob_store.js";
+import type { CreateBlobStorePayload } from "../rblob_store/payload.js";
+import { RFileMapImpl } from "../rfile_map/rfile_map.js";
+import type { CreateFileMapPayload } from "../rfile_map/payload.js";
 import type { ReleaseState } from "../rcatalog/resolve.js";
+import { compareSemver } from "../semver.js";
 import type { ParamValue } from "./payload.js";
 
 function digest(value: json.Literal): string {
@@ -42,12 +52,42 @@ export function deriveGroupSeed(rdbId: B64Hash, catalogGroupHash: B64Hash): stri
     return digest({ rdb: rdbId, group: catalogGroupHash });
 }
 
+export function deriveFilesSeed(rdbId: B64Hash, catalogFilesHash: B64Hash): string {
+    return digest({ rdb: rdbId, files: catalogFilesHash });
+}
+
 export function deriveGenesisRowUuid(seed: string, table: string, index: number): string {
     return digest({ seed, table, index });
 }
 
+function rootIdOf(payload: json.Literal): B64Hash {
+    return dag.createEntry(payload, {}, position(), sha256).hash;
+}
+
 export function groupIdOf(payload: CreateTableGroupPayload): B64Hash {
-    return dag.createEntry(payload as unknown as json.Literal, {}, position(), sha256).hash;
+    return rootIdOf(payload as unknown as json.Literal);
+}
+
+export type InstantiatedFiles = {
+    store: CreateBlobStorePayload;
+    storeId: B64Hash;
+    map: CreateFileMapPayload;
+    mapId: B64Hash;
+};
+
+export function instantiateFiles(def: CatalogFilesDef, opts: {
+    seed: string;
+    bindingIds: { [catalogGroupHash: string]: B64Hash };
+}): InstantiatedFiles {
+    const [alias, target] = Object.entries(def.bindings)[0];
+    const groupId = opts.bindingIds[target];
+    if (groupId === undefined) throw new Error(`binding '${alias}' of FILES '${def.name}' points at an uninstantiated group '${target}'`);
+    const access = { bindings: { [alias]: groupId }, idProvider: def.idProvider, canWrite: def.canWrite };
+
+    const store = RBlobStoreImpl.create({ name: def.name, seed: opts.seed, access });
+    const storeId = rootIdOf(store as unknown as json.Literal);
+    const map = RFileMapImpl.create({ name: def.name, seed: opts.seed, access, blobStore: storeId });
+    return { store, storeId, map, mapId: rootIdOf(map as unknown as json.Literal) };
 }
 
 // The canDeploy default for a group whose definition declares none.
@@ -149,11 +189,20 @@ export type MemberGroup = {
     target: Version;           // union of the group's versions across the deployed releases
 };
 
+// A computed FILES member of an RDb: its blob store and file map.
+export type MemberFiles = InstantiatedFiles & {
+    catalogFilesHash: B64Hash;
+    name: string;              // the definition's name, tie-broken on clashes
+    def: CatalogFilesDef;
+    groupId: B64Hash;          // the bound member group
+};
+
 export type Membership = {
     byHash: Map<B64Hash, MemberGroup>;
     byId: Map<B64Hash, MemberGroup>;
     order: B64Hash[];          // bottom-up over bindings (catalog group hashes)
     names: Map<string, B64Hash>;   // member name -> group id
+    files: Map<B64Hash, MemberFiles>;   // catalog FILES hash -> member, in hash order
 };
 
 // An identifier-safe prefix of a catalog group hash (hex of its first bytes).
@@ -163,9 +212,12 @@ function hashPrefix(hash: B64Hash, bytes: number): string {
 }
 
 // Names: a clash can only come from concurrent deploys (or a merge release)
-// joining definitions with the same name. The smallest catalog group hash
-// keeps the name; the others become `name_<hashPrefix>`.
-function assignNames(defs: Map<B64Hash, CatalogGroupDef>): Map<B64Hash, string> {
+// joining definitions with the same name. The definition from the higher
+// release keeps the name (`rank`: the highest deployed release version whose
+// state holds the definition), then the larger definition hash; the others
+// become `name_<hashPrefix>`. The same order decides schema slot conflicts.
+// Group and FILES definitions are named together, keyed by their hashes.
+function assignNames(defs: Map<B64Hash, { name: string }>, rank: Map<B64Hash, string>): Map<B64Hash, string> {
     const byName = new Map<string, B64Hash[]>();
     for (const [hash, def] of defs) {
         const list = byName.get(def.name) ?? [];
@@ -173,10 +225,16 @@ function assignNames(defs: Map<B64Hash, CatalogGroupDef>): Map<B64Hash, string> 
         byName.set(def.name, list);
     }
 
+    // highest rank first, then larger hash first
+    const outranks = (a: B64Hash, b: B64Hash): number => {
+        const byRank = compareSemver(rank.get(b)!, rank.get(a)!);
+        return byRank !== 0 ? byRank : (a > b ? -1 : 1);
+    };
+
     const taken = new Set(byName.keys());
     const names = new Map<B64Hash, string>();
     for (const [name, hashes] of [...byName.entries()].sort()) {
-        const sorted = [...hashes].sort();
+        const sorted = [...hashes].sort(outranks);
         names.set(sorted[0], name);
         for (const hash of sorted.slice(1)) {
             let bytes = 4;
@@ -223,7 +281,13 @@ export function computeMembership(input: {
     hashAlgorithm?: string;
 }): Membership {
     const defs = new Map<B64Hash, CatalogGroupDef>();
+    const filesDefs = new Map<B64Hash, CatalogFilesDef>();
     const targets = new Map<B64Hash, Set<B64Hash>>();
+    const rank = new Map<B64Hash, string>();
+    const raise = (hash: B64Hash, release: ReleaseState) => {
+        const current = rank.get(hash);
+        if (current === undefined || compareSemver(release.version, current) > 0) rank.set(hash, release.version);
+    };
     for (const release of input.releases) {
         for (const [hash, group] of release.groups) {
             const def = release.defs.get(hash);
@@ -232,10 +296,15 @@ export function computeMembership(input: {
             const target = targets.get(hash) ?? new Set<B64Hash>();
             for (const h of group.version) target.add(h);
             targets.set(hash, target);
+            raise(hash, release);
+        }
+        for (const [hash, def] of release.files) {
+            filesDefs.set(hash, def);
+            raise(hash, release);
         }
     }
 
-    const names = assignNames(defs);
+    const names = assignNames(new Map<B64Hash, { name: string }>([...defs, ...filesDefs]), rank);
     const order = instantiationOrder(defs);
 
     const bindingIds: { [hash: string]: B64Hash } = {};
@@ -267,5 +336,18 @@ export function computeMembership(input: {
         nameToId.set(member.name, id);
     }
 
-    return { byHash, byId, order, names: nameToId };
+    const files = new Map<B64Hash, MemberFiles>();
+    for (const hash of [...filesDefs.keys()].sort()) {
+        const def = filesDefs.get(hash)!;
+        const instantiated = instantiateFiles(def, { seed: deriveFilesSeed(input.rdbId, hash), bindingIds });
+        files.set(hash, {
+            ...instantiated,
+            catalogFilesHash: hash,
+            name: names.get(hash)!,
+            def,
+            groupId: bindingIds[Object.values(def.bindings)[0]],
+        });
+    }
+
+    return { byHash, byId, order, names: nameToId, files };
 }

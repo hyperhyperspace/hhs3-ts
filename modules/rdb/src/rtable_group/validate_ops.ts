@@ -5,9 +5,13 @@
 //                  object or binding target is an infrastructure error:
 //                  throw, never `false`) + every initial row validates as an
 //                  insert against the pinned schema + deployKeys are
-//                  self-certifying + a canDeploy over $author has a key source.
+//                  self-certifying + a canDeploy over $author has a key source
+//                  + without an idProvider, no canObserve gate or pinned
+//                  restriction reads $author.
 //   row          - format + table exists in the effective schema at `at` +
-//                  the op conforms to it + identity rules: rowIds are
+//                  the op conforms to it + a claimed author verifies through
+//                  the idProvider (no provider: the op must be anonymous) +
+//                  identity rules: rowIds are
 //                  write-once (an insert is valid only if NO insert or
 //                  delete for its rowId is at or below `at`, so a
 //                  deleted rowId can never be re-inserted); updates and
@@ -16,16 +20,18 @@
 //   ref-advance  - EITHER the schema deploy (refId is the group's schema ref:
 //                  its `gate` hashes are exactly the RDeployGate mirrors of the
 //                  target version; monotonic against the schema DAG, at or
-//                  above the pinned version; when authored and the group has a
-//                  key source (idProvider, then deployKeys), the signature is
-//                  verified at validation and canDeploy is evaluated in
-//                  'object' context against the verified author; PLUS the one-time add-fk
+//                  above the pinned version; a claimed author verifies through
+//                  the idProvider, then deployKeys, and canDeploy is evaluated
+//                  in 'object' context against the verified author; the new
+//                  version keeps a local provider table and, without a
+//                  provider, declares no restriction over $author; PLUS the one-time add-fk
 //                  prerequisite — a deploy whose newly-added/retargeted FK
 //                  would strand an existing live row at `at` is hard-rejected,
 //                  since FK reach is at-use and would otherwise leave the old
 //                  row live-but-dangling) OR a foreign-group observation (refId
-//                  is a bound group: monotonic against that group's DAG, no
-//                  deploy gate). Any other refId is unknown (false).
+//                  is a bound group: monotonic against that group's DAG; a
+//                  claimed author verifies through the idProvider; a canObserve
+//                  gate must hold). Any other refId is unknown (false).
 //   bundle       - format + every table exists + per-op schema conformance +
 //                  per-rowId uniqueness across the bundle + identity/liveness
 //                  and restrictions at the PRE-state (`at`) + FK checks at each
@@ -58,7 +64,7 @@ import type { RSchema, RSchemaView } from "../rschema/interfaces.js";
 import type { Predicate, SchemaCreator } from "../rschema/payload.js";
 import { splitTableRef } from "../rschema/payload.js";
 import { formatPredicate, formatRestrictionFailureReason } from "../rschema/format_predicate.js";
-import { collectExistsAtoms, predicateReferencesAuthor } from "../rschema/validate.js";
+import { collectExistsAtoms, findAuthorRestriction, predicateReferencesAuthor } from "../rschema/validate.js";
 import { isValidTableRef } from "../rschema/validate.js";
 import type { RTable, RTableView } from "../rtable/interfaces.js";
 import type { InsertRowPayload, RowOpPayload } from "../rtable/payload.js";
@@ -196,9 +202,9 @@ async function validateCreate(create: CreateTableGroupPayload, ctx: RContext): P
     // (The schema itself cannot check this: it is shared across group instances
     // and knows no bindings.)
     const bindings = create.bindings ?? {};
-    for (const groupName of qualifiedTargetGroups(schemaView)) {
+    for (const [groupName, reference] of qualifiedTargetReferences(schemaView)) {
         if (!Object.prototype.hasOwnProperty.call(bindings, groupName)) {
-            return validationFailure(`schema target group '${groupName}' is not bound`);
+            return validationFailure(unboundTargetReason(schema.getName(), groupName, reference));
         }
     }
 
@@ -233,6 +239,13 @@ async function validateCreate(create: CreateTableGroupPayload, ctx: RContext): P
         return validationFailure("a canDeploy predicate over $author requires an idProvider or deployKeys");
     }
 
+    // without an idProvider every row op and observation is anonymous, so a
+    // gate or restriction over $author could never pass
+    if (create.idProvider === undefined) {
+        const identityReason = anonymousGroupReason(create.canObserve ?? {}, schemaView);
+        if (identityReason !== undefined) return validationFailure(identityReason);
+    }
+
     // idProvider selection: a LOCAL provider must exist in the pinned schema and
     // be flagged idProvider; a qualified 'group.table' provider is
     // name-resolvability only (its group must be bound — the foreign table being
@@ -253,44 +266,72 @@ async function validateCreate(create: CreateTableGroupPayload, ctx: RContext): P
     return validationOk();
 }
 
-// The distinct group-names of all qualified (group.table) FK and exists
-// targets in the effective schema.
-export function qualifiedTargetGroups(schemaView: RSchemaView): Set<string> {
-    const groups = new Set<string>();
+// A qualified (group.table) FK or exists target, and the table that names it.
+export type QualifiedTargetReference = { from: string; target: string };
+
+// Each group-name that qualified FK and exists targets in the effective schema
+// use, with the first reference to it.
+export function qualifiedTargetReferences(schemaView: RSchemaView): Map<string, QualifiedTargetReference> {
+    const references = new Map<string, QualifiedTargetReference>();
+    const note = (from: string, target: string) => {
+        const [group] = splitTableRef(target);
+        if (group !== undefined && !references.has(group)) references.set(group, { from, target });
+    };
 
     for (const table of schemaView.getTableNames()) {
-        for (const target of Object.values(schemaView.getFKs(table))) {
-            const [group] = splitTableRef(target);
-            if (group !== undefined) groups.add(group);
-        }
+        for (const target of Object.values(schemaView.getFKs(table))) note(table, target);
 
         for (const restriction of schemaView.getTable(table)?.restrictions ?? []) {
-            for (const atom of collectExistsAtoms(restriction.rule)) {
-                const [group] = splitTableRef(atom.table);
-                if (group !== undefined) groups.add(group);
-            }
+            for (const atom of collectExistsAtoms(restriction.rule)) note(table, atom.table);
         }
     }
 
-    return groups;
+    return references;
 }
 
-// AUTHENTICATION at validation (the op's own (at, at) position). A bad or
-// present-but-unresolvable signature is a HARD REJECT (false): the op is
-// discarded, never a prev, never gossiped. A missing bound provider OBJECT
-// throws out of resolveAuthorKey (the sync layer defers, then revalidates). An
-// unauthored op is validly anonymous. A group with no idProvider performs no
-// authentication — the claimed author is trusted (configure an idProvider to
-// make authorship sound). Verdict is monotone, so the view-time `from` never
-// refines it (computeEntryVoided then TRUSTS op.author).
+// The distinct group-names of all qualified (group.table) FK and exists
+// targets in the effective schema.
+export function qualifiedTargetGroups(schemaView: RSchemaView): Set<string> {
+    return new Set(qualifiedTargetReferences(schemaView).keys());
+}
+
+export function unboundTargetReason(schemaName: string, alias: string, reference: QualifiedTargetReference): string {
+    return `schema ${schemaName} references ${reference.target} (from ${reference.from}), and the TABLEGROUP doesn't BIND ${alias}`;
+}
+
+// Why a group without an idProvider cannot hold these canObserve gates or
+// this schema version: one of them reads $author. undefined when none does.
+function anonymousGroupReason(canObserve: { [binding: string]: Predicate }, schemaView: RSchemaView): string | undefined {
+    for (const [binding, gate] of Object.entries(canObserve)) {
+        if (predicateReferencesAuthor(gate)) {
+            return `the canObserve gate on '${binding}' reads $author, which needs an idProvider`;
+        }
+    }
+    const found = findAuthorRestriction(schemaView);
+    if (found !== undefined) {
+        return `the ${found.restriction.on} restriction of table '${found.table}' reads $author, which needs an idProvider`;
+    }
+    return undefined;
+}
+
+// AUTHENTICATION at validation (the op's own (at, at) position). A claimed
+// author must verify: a bad or present-but-unresolvable signature is a HARD
+// REJECT (false), so the op is discarded, never a prev, never gossiped. A
+// missing bound provider OBJECT throws out of resolveAuthorKey (the sync layer
+// defers, then revalidates). An unauthored op is validly anonymous. A group
+// with no idProvider has no key source for row ops, bundles or observations,
+// so every op it admits is anonymous. Verdict is monotone, so the view-time
+// `from` never refines it (computeEntryVoided then TRUSTS op.author).
 //
 // `scope` is the signing scope the op was signed in: [tableSigningContext(t)]
 // for a single row op (signed by its RTable), [] for group-level ops (bundles,
-// deploys, observations). Groups are always root objects.
+// observations). Groups are always root objects.
 async function verifyOpAuthorship(op: json.Literal, group: GroupOpHost, at: Version, scope: SigningScope): Promise<ValidationResult> {
     const author = extractAuthor(op);
-    if (author === undefined) return validationOk();                   // anonymous: nothing to verify
-    if (group.getIdProvider() === undefined) return validationOk();    // no authentication configured
+    if (author === undefined) return validationOk();
+    if (group.getIdProvider() === undefined) {
+        return validationFailure(`author '${author}' cannot be verified: the group has no identity provider, so its ops must be anonymous`);
+    }
     return await verifyPayloadSignature(op as json.LiteralMap, at, (keyId) => group.resolveAuthorKey(keyId, at), scope)
         ? validationOk()
         : validationFailure(`signature from author '${author}' could not be verified`);
@@ -306,8 +347,9 @@ async function validateRowOpRestrictionAt(
     group: GroupOpHost,
     at: Version,
 ): Promise<ValidationResult> {
-    const rule = schemaView.getRestriction(table, op.action);
-    const ok = await evaluateRowOpRestriction(op, table, schemaView,
+    const authenticated = group.getIdProvider() !== undefined;
+    const rule = schemaView.getRestriction(table, op.action, authenticated);
+    const ok = await evaluateRowOpRestriction(op, table, schemaView, authenticated,
         (targetTable) => group.makeTable(targetTable).getView(at, at),
         (groupName, targetTable) => group.resolveForeignTableView(groupName, targetTable, at, at),
     );
@@ -521,35 +563,32 @@ async function validateRefAdvance(payload: RefAdvancePayload, group: GroupOpHost
     return validateObserveGate(payload, group, at, newRefVersion);
 }
 
-// canObserve gate at write-admission (mirrors validateDeploy's canDeploy block):
-// when the observed binding declares a gate, the observation must be authored,
-// its signature must verify (when a provider is configured), and the gate must
-// hold in the OBSERVED group's frame AT THE IMPORTED VERSION (refAt = refFrom =
+// Observation authorship and the canObserve gate at write-admission (mirrors
+// validateDeploy's canDeploy block). A claimed author is authenticated at the
+// op's own position through the group's OWN provider, gated binding or not. A
+// gate that reads $author requires an author; the gate must hold in the
+// OBSERVED group's frame AT THE IMPORTED VERSION (refAt = refFrom =
 // newRefVersion): "was the author authorized in G at the version they import".
 // At-use voiding (computeEntryVoided) then catches a back-dated observation a
 // later concurrent revoke retroactively unauthorizes.
 async function validateObserveGate(
     payload: RefAdvancePayload, group: GroupOpHost, at: Version, newRefVersion: Version,
 ): Promise<ValidationResult> {
-    if (group.observeGateFor(payload.refId) === undefined) return validationOk();   // ungated binding
-
     const p = payload as unknown as json.LiteralMap;
-    const author = extractAuthor(p);
-    if (author === undefined) {
-        return validationFailure(`observation of gated group '${payload.refId}' must be authored`);
-    }
+    const authorship = await verifyOpAuthorship(p, group, at, []);
+    if (!authorship.valid) return wrapValidationFailure('observation has invalid authorship', authorship);
 
-    // AUTHENTICATION at the op's own position (the group's OWN provider), like
-    // a deploy: a present-but-unverifiable signature is a hard reject.
-    if (group.getIdProvider() !== undefined) {
-        if (!await verifyPayloadSignature(p, at, (keyId) => group.resolveAuthorKey(keyId, at))) {
-            return validationFailure(`observation signature from author '${author}' could not be verified`);
-        }
+    const gate = group.observeGateFor(payload.refId);
+    if (gate === undefined) return validationOk();   // ungated binding
+
+    const author = extractAuthor(p);
+    if (author === undefined && predicateReferencesAuthor(gate)) {
+        return validationFailure(`observation of gated group '${payload.refId}' must be authored`);
     }
 
     return await group.evaluateObserveGate(payload.refId, author, newRefVersion, newRefVersion)
         ? validationOk()
-        : validationFailure(`canObserve predicate rejected observation of '${bindingNameFor(group, payload.refId)}': ${formatPredicate(group.observeGateFor(payload.refId)!)}`);
+        : validationFailure(`canObserve predicate rejected observation of '${bindingNameFor(group, payload.refId)}': ${formatPredicate(gate)}`);
 }
 
 function bindingNameFor(group: GroupOpHost, refId: B64Hash): string {
@@ -592,12 +631,12 @@ async function validateDeploy(payload: RefAdvancePayload, group: GroupOpHost, at
         return validationFailure("schema deploy gate hashes do not mirror its version");
     }
 
-    // AUTHENTICATION at validation: when the deploy is authored and the group
-    // has a key source (its OWN provider, or its embedded deployKeys), the
-    // signature must verify against the resolved key, else HARD REJECT. A
+    // AUTHENTICATION at validation: an authored deploy's signature must verify
+    // against a key from the group's OWN provider or its embedded deployKeys,
+    // else HARD REJECT (a group with neither admits only anonymous deploys). A
     // missing bound provider object throws (defer). canDeploy then evaluates
     // $author against the VERIFIED author.
-    if (author !== undefined && (group.getIdProvider() !== undefined || group.getDeployKeys().length > 0)) {
+    if (author !== undefined) {
         if (!await verifyPayloadSignature(p, at, (keyId) => resolveDeployKey(group, keyId, at))) {
             return validationFailure(`deploy signature from author '${author}' could not be verified`);
         }
@@ -630,7 +669,36 @@ async function validateDeploy(payload: RefAdvancePayload, group: GroupOpHost, at
         return validationFailure("schema deploy ref-advance is not monotonic");
     }
 
-    return validateAddFkPrerequisite(group, at, newRefVersion);
+    const newVersion = version(...group.getPinnedSchemaVersion());
+    for (const hash of newRefVersion) newVersion.add(hash);
+    const newSchema = await schema.getView(newVersion, newVersion);
+
+    const identityResult = validateDeployedIdentity(group, newSchema);
+    if (!identityResult.valid) return identityResult;
+
+    return validateAddFkPrerequisite(group, at, newSchema);
+}
+
+// The deployed version must keep what the group's identity setup relies on.
+// idProvider is fixed at create, so a local provider table must stay present
+// and flagged; a group without one admits only anonymous ops, so the version
+// must not declare a restriction over $author.
+function validateDeployedIdentity(group: GroupOpHost, newSchema: RSchemaView): ValidationResult {
+    const provider = group.getIdProvider();
+    if (provider === undefined) {
+        const reason = anonymousGroupReason({}, newSchema);
+        return reason === undefined ? validationOk() : validationFailure(`schema deploy rejected: ${reason}`);
+    }
+
+    const [groupName, table] = splitTableRef(provider);
+    if (groupName !== undefined) return validationOk();
+    if (!newSchema.hasTable(table)) {
+        return validationFailure(`schema deploy would drop identity provider table '${table}'`);
+    }
+    if (newSchema.getIdProvider(table) === undefined) {
+        return validationFailure(`schema deploy would unmark table '${table}' as the identity provider`);
+    }
+    return validationOk();
 }
 
 // add-fk PREREQUISITE (one-time, hard reject): a deploy that newly enforces an
@@ -642,13 +710,8 @@ async function validateDeploy(payload: RefAdvancePayload, group: GroupOpHost, at
 // point-in-time consistency check that the data honored the FK when adopted.
 // New columns hold no old explicit values (only the uniform schema default, a
 // schema-level effect), so they are not enumerated here.
-async function validateAddFkPrerequisite(group: GroupOpHost, at: Version, newRefVersion: Version): Promise<ValidationResult> {
+async function validateAddFkPrerequisite(group: GroupOpHost, at: Version, newSchema: RSchemaView): Promise<ValidationResult> {
     const oldSchema = await group.resolveSchemaView(at);
-
-    const schema = await group.getSchemaObject();
-    const newVersion = version(...group.getPinnedSchemaVersion());
-    for (const hash of newRefVersion) newVersion.add(hash);
-    const newSchema = await schema.getView(newVersion, newVersion);
 
     const isTargetLive = async (targetRef: string, rowId: B64Hash): Promise<boolean> => {
         const [groupName, targetTable] = splitTableRef(targetRef);

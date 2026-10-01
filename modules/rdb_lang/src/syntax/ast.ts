@@ -23,7 +23,55 @@ export type AstStatement =
     | BundleStatement
     | SetViewStatement
     | SelectStatement
-    | LogStatement;
+    | LogStatement
+    | PutFileStatement
+    | GetFileStatement
+    | ListFilesStatement;
+
+// The owner of a key section, for GET and LIST: `IN KEY $name` or
+// `IN KEY #prefix`, or the current author for a bare `IN KEY`.
+export type KeyOwnerExpr =
+    | { kind: 'current'; span: TextSpan }
+    | { kind: 'variable'; name: string; span: TextSpan }
+    | { kind: 'hash'; prefix: string; span: TextSpan };
+
+// PUT FILE 'local' | STRING 'text' | B64 'data' INTO files [AT 'path'] [IN KEY | IN COMMON] [BY author]
+export type PutFileStatement = {
+    kind: 'put-file';
+    source:
+        | { kind: 'file'; path: string }
+        | { kind: 'string'; text: string }
+        | { kind: 'b64'; data: string };
+    // `files` or `db.files`.
+    files: NameRef;
+    at?: string;
+    section: 'common' | 'key';
+    author?: AuthorExpr;
+    span: TextSpan;
+};
+
+// GET 'path' FROM files [IN KEY [owner] | IN COMMON] [HASH 'prefix'] [AS B64] [TO 'local']
+export type GetFileStatement = {
+    kind: 'get-file';
+    path: string;
+    files: NameRef;
+    section: 'common' | 'key';
+    owner?: KeyOwnerExpr;
+    hash?: string;
+    asB64: boolean;
+    to?: string;
+    span: TextSpan;
+};
+
+// LIST ['prefix'] FROM files [IN COMMON | IN KEY [owner]]
+export type ListFilesStatement = {
+    kind: 'list-files';
+    prefix?: string;
+    files: NameRef;
+    section?: 'common' | 'key';
+    owner?: KeyOwnerExpr;
+    span: TextSpan;
+};
 
 export type NameRef = {
     kind: 'name';
@@ -116,6 +164,8 @@ export type TableDecl = {
     name: string;
     columns: ColumnDecl[];
     options: TableOption[];
+    // The parenthesized column list.
+    body: TextSpan;
     span: TextSpan;
 };
 
@@ -123,8 +173,12 @@ export type CreateSchemaStatement = {
     kind: 'create-schema';
     name: string;
     creators: ValueExpr[];
+    // The schema's first version; the binder defaults it.
+    version?: string;
     tables: TableDecl[];
     hashAlgorithm?: string;
+    // `AS ( ... )`, from AS to the closing parenthesis.
+    body: TextSpan;
     span: TextSpan;
 };
 
@@ -183,8 +237,24 @@ export type CatalogGroupExpr = {
     span: TextSpan;
 };
 
+// A FILES definition inside a catalog body (`FILES ...` in CREATE CATALOG,
+// `ADD FILES ...` in ALTER CATALOG): a blob store and a file map per database,
+// bound to one group. Without BIND the alias is the group name, taken from the
+// qualifier of `idProvider`.
+export type CatalogFilesExpr = {
+    name: string;
+    binding?: { name: string; group: NameOrHashRef; span: TextSpan };
+    // `USING IDENTITIES alias.table`.
+    idProvider: string;
+    idProviderSpan: TextSpan;
+    // `ALLOW WRITE IF <predicate>`.
+    canWrite: PredicateExpr;
+    span: TextSpan;
+};
+
 export type CatalogChangeExpr =
     | { kind: 'add-group'; group: CatalogGroupExpr; span: TextSpan }
+    | { kind: 'add-files'; files: CatalogFilesExpr; span: TextSpan }
     // Sets a group's version in the release (not a deploy).
     | { kind: 'update-schema'; schema: NameOrHashRef; version: VersionExpr; group: NameOrHashRef; span: TextSpan };
 
@@ -193,9 +263,16 @@ export type CreateCatalogStatement = {
     name: string;
     seed?: string;
     creators: ValueExpr[];
-    version: string;
+    // Absent only when parsed with catalogVersionOptional (source mode); the
+    // binder then takes it from LangBindContext.defaultCatalogVersion.
+    version?: string;
+    // `VERSION '<semver>'`, when stated.
+    versionSpan?: TextSpan;
     params: CatalogParamDeclExpr[];
     groups: CatalogGroupExpr[];
+    files: CatalogFilesExpr[];
+    // `AS ( ... )`, from AS to the closing parenthesis.
+    body: TextSpan;
     hashAlgorithm?: string;
     note?: string;
     author?: AuthorExpr;
@@ -292,6 +369,8 @@ export type MigrationRuleExpr =
 export type AlterSchemaStatement = {
     kind: 'alter-schema';
     schema: NameOrHashRef;
+    // The update's schema version; absent, the runtime uses the next patch.
+    version?: string;
     rules: MigrationRuleExpr[];
     note?: string;
     author?: AuthorExpr;

@@ -6,25 +6,37 @@ import Database from "better-sqlite3";
 import { SqliteTarget } from "@hyper-hyper-space/hhs3_rdb_adapter_sqlite";
 import { stopAllProjections, stopAllSyncs } from "@hyper-hyper-space/hhs3_rdb_repl";
 
-import { defaultKeystorePath, KeyStore } from "../src/keys/keystore.js";
+import { createNodeSyncMeshFactory, defaultKeystorePath, KeyStore } from "@hyper-hyper-space/hhs3_rhost_node";
+import { nodeFilesDirectories } from "../src/files/folders.js";
+import { nodeLocalFiles } from "../src/files/local_files.js";
 import { startRepl } from "../src/repl/repl.js";
 import { runCommand } from "../src/script/run_command.js";
 import { runScriptFile, runScriptStdin } from "../src/script/run_script.js";
 import { WorkspaceSession } from "../src/session/session.js";
-import { createNodeSyncMeshFactory } from "../src/sync/node_mesh.js";
 import { Workspace } from "../src/workspace/workspace.js";
 
 async function main(): Promise<void> {
     const args = process.argv.slice(2);
     const workspacePath = args.shift();
     if (workspacePath === undefined) {
-        stderr.write("Usage: rdb <workspace.db> [-c command] [-f file|-] [-k] [--json]\n");
+        stderr.write("Usage: rdb <workspace.db> [-c command] [-f file|-] [-k] [--json] [--keystore <path>]\n");
         process.exitCode = 1;
         return;
     }
 
+    // `--keystore <path>` is the flag form of RDB_KEYSTORE: sign with another
+    // keystore file (an app's own, a staging app's) instead of the user's.
+    let keystorePath = defaultKeystorePath();
+    const ks = args.indexOf('--keystore');
+    if (ks >= 0) {
+        const path = args[ks + 1];
+        if (path === undefined || path.startsWith('-')) throw new Error('--keystore requires a path');
+        keystorePath = path;
+        args.splice(ks, 2);
+    }
+
     const workspace = await Workspace.open({ path: workspacePath });
-    const keystore = await KeyStore.open(defaultKeystorePath(), workspace.replica.getHashSuite());
+    const keystore = await KeyStore.open(keystorePath, workspace.replica.getHashSuite());
     const session = new WorkspaceSession({ workspace, keystore });
 
     // Async projection notices (reactive sync throws, ingest-reject warnings) go
@@ -41,6 +53,8 @@ async function main(): Promise<void> {
     };
 
     session.readTextFile = (path) => readFile(path, 'utf8');
+    session.localFiles = nodeLocalFiles();
+    session.filesDirectoryFactory = nodeFilesDirectories();
 
     session.syncMeshFactory = createNodeSyncMeshFactory();
 

@@ -1,12 +1,11 @@
 import { HASH_SHA256, createBasicCrypto } from "@hyper-hyper-space/hhs3_crypto";
+import { SqliteDagDb } from "@hyper-hyper-space/hhs3_dag_sqlite";
 import { Payload, RObject } from "@hyper-hyper-space/hhs3_mvt";
 import type { CreatePlan } from "@hyper-hyper-space/hhs3_rdb_lang";
 import {
     RdbWorkspace,
     payloadName,
 } from "@hyper-hyper-space/hhs3_rdb_runtime";
-
-import { SqliteReplicaDagBackend } from "./backend.js";
 
 export type WorkspaceOpenOptions = {
     path: string;
@@ -17,12 +16,12 @@ export class Workspace {
     readonly path: string;
     readonly backendLabel: string;
     readonly replica: RdbWorkspace['replica'];
-    readonly backend: SqliteReplicaDagBackend;
+    readonly backend: SqliteDagDb;
     readonly roots: RdbWorkspace['roots'];
 
     private readonly inner: RdbWorkspace;
 
-    private constructor(path: string, inner: RdbWorkspace, backend: SqliteReplicaDagBackend) {
+    private constructor(path: string, inner: RdbWorkspace, backend: SqliteDagDb) {
         this.path = path;
         this.inner = inner;
         this.backendLabel = inner.backendLabel;
@@ -34,7 +33,7 @@ export class Workspace {
     static async open(options: WorkspaceOpenOptions): Promise<Workspace> {
         const crypto = createBasicCrypto();
         const hashSuite = crypto.hash(HASH_SHA256);
-        const backend = await SqliteReplicaDagBackend.open({ path: options.path, hashSuite });
+        const backend = await SqliteDagDb.open(options.path, { hashSuite });
         const inner = await RdbWorkspace.open({ backend, backendLabel: options.backendLabel ?? 'default', hashSuite });
         return new Workspace(options.path, inner, backend);
     }

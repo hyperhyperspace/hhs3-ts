@@ -5,11 +5,13 @@ import type { RObject } from "@hyper-hyper-space/hhs3_mvt";
 import type { RCatalogImpl, RDbImpl, RSchema, RTableGroup, RTableView } from "@hyper-hyper-space/hhs3_rdb";
 import { splitTableRef } from "@hyper-hyper-space/hhs3_rdb";
 
+import type { RBlobStore, RFileMap } from "@hyper-hyper-space/hhs3_rdb";
+
 import type {
-    HashScope, LangBindContext, LangValue, ResolvedCatalogRef, ResolvedDatabaseRef, ResolvedGroupRef, ResolvedLogTarget,
-    ResolvedSchemaRef, ResolvedTableRef, VersionScope,
+    HashScope, LangBindContext, LangValue, LocalFileAccess, ResolvedCatalogRef, ResolvedDatabaseRef, ResolvedFilesRef, ResolvedGroupRef,
+    ResolvedLogTarget, ResolvedSchemaRef, ResolvedTableRef, VersionScope,
 } from "../src/bind/context.js";
-import type { HashRef, NameOrHashRef, TableRef, VersionExpr } from "../src/syntax/ast.js";
+import type { HashRef, NameOrHashRef, NameRef, TableRef, VersionExpr } from "../src/syntax/ast.js";
 
 type ScopedObject = RObject & { getScopedDag(): Promise<{ getFrontier(): Promise<Version>; loadAllEntries(): AsyncIterable<{ hash: B64Hash }> }> };
 
@@ -20,6 +22,7 @@ export type TestBindContext = LangBindContext & {
     registerCatalog(name: string, catalog: RCatalogImpl & ScopedObject): void;
     setCurrentDatabase(id: B64Hash | undefined): void;
     setCurrentGroup(id: B64Hash | undefined): void;
+    localFiles?: LocalFileAccess;
 };
 
 // Group names resolve like the runtime's: `db.group` exactly; a bare name in
@@ -97,6 +100,25 @@ export function createTestBindContext(ctx: RContext, vars: { [name: string]: Lan
         throw new Error(matches.length === 0 ? `Unknown group '${ref.text}'` : `Ambiguous group '${ref.text}'`);
     };
 
+    // FILES names resolve like group names.
+    const resolveFilesRef = async (ref: NameRef): Promise<ResolvedFilesRef> => {
+        const candidates = ref.parts.length === 2
+            ? [findByIdOrName(dbs, { kind: 'name', text: ref.parts[0], parts: [ref.parts[0]], span: ref.span }, 'database')]
+            : currentDatabase !== undefined ? [...dbs.values()].filter((d) => d.getId() === currentDatabase) : [...dbs.values()];
+        const name = ref.parts[ref.parts.length - 1];
+        const found: { db: RDbImpl; storeId: B64Hash; mapId: B64Hash; name: string }[] = [];
+        for (const db of candidates) {
+            const member = (await db.getMemberFiles()).find((m) => m.name === name);
+            if (member !== undefined) found.push({ db, storeId: member.storeId, mapId: member.mapId, name: member.name });
+        }
+        if (found.length !== 1) throw new Error(found.length === 0 ? `Unknown FILES '${ref.text}'` : `Ambiguous FILES '${ref.text}'`);
+        const [hit] = found;
+        const store = await ctx.getObject(hit.storeId);
+        const map = await ctx.getObject(hit.mapId);
+        if (store === undefined || map === undefined) throw new Error(`FILES '${hit.name}' hasn't arrived on this replica yet`);
+        return { name: hit.name, database: hit.db.getId(), store: store as unknown as RBlobStore, map: map as unknown as RFileMap };
+    };
+
     const scopeObject = (scope: VersionScope): ScopedObject | undefined => {
         if (scope.kind === 'schema') return scope.schema as ScopedObject | undefined;
         if (scope.kind === 'group') return scope.group as ScopedObject | undefined;
@@ -118,6 +140,7 @@ export function createTestBindContext(ctx: RContext, vars: { [name: string]: Lan
         registerCatalog(name, catalog) { catalogs.set(name, catalog); },
         setCurrentDatabase(id) { currentDatabase = id; },
         setCurrentGroup(id) { currentGroup = id; },
+        resolveFiles: resolveFilesRef,
 
         async resolveSchema(ref: NameOrHashRef): Promise<ResolvedSchemaRef> {
             const schema = findByIdOrName(schemas, ref, 'schema');

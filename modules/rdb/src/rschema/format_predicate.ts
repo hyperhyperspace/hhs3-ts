@@ -124,11 +124,25 @@ function formatCmp(cmp: string): string {
 }
 
 function formatLiteral(value: json.Literal): string {
-    if (typeof value === 'string') return sqlString(value);
-    if (typeof value === 'object') return `JSON ${sqlString(json.toStringCanonical(value))}`;
+    if (typeof value === 'string') return renderStringLiteral(value);
+    if (typeof value === 'object') return `JSON ${renderStringLiteral(json.toStringCanonical(value))}`;
     return json.toStringCanonical(value);
 }
 
-function sqlString(value: string): string {
-    return `'${value.replace(/'/g, "''")}'`;
+// A C-SQL '...' literal that lexes back to `value`. The lexer reads \n, \r,
+// \t and \\ as escapes and copies a backslash before anything else, so a lone
+// backslash before an ordinary character stays as it is ('100\%'); any other
+// run of backslashes is doubled, including before a quote or at the end,
+// where a single one would read back but look like an escaped quote.
+export function renderStringLiteral(value: string): string {
+    const body = value
+        .replace(/\\+/g, (run: string, at: number, s: string) => {
+            const next = s[at + run.length];
+            return run.length === 1 && next !== undefined && !"nrt'\n\r\t".includes(next) ? run : run.replace(/\\/g, '\\\\');
+        })
+        .replace(/\n/g, '\\n')
+        .replace(/\r/g, '\\r')
+        .replace(/\t/g, '\\t')
+        .replace(/'/g, "''");
+    return `'${body}'`;
 }
