@@ -40,8 +40,9 @@
 // the parent frontier `(at, at)`. Entries are still rechecked at-use in views:
 // a concurrent barrier delete of a witness / FK target voids the use, while a
 // causally-later one does not. Voided ops are invisible (a voided insert never
-// lives; a voided FK-update reverts via LWW); FK reference cycles resolve to
-// DENY. Cross-group FK / exists targets resolve through bound foreign groups.
+// lives; a voided FK-update reverts via LWW); an FK reference cycle is void,
+// since nothing outside it supports it. Cross-group FK / exists targets
+// resolve through bound foreign groups.
 // When the group selects an identity provider, an authored op's signature is
 // verified AT VALIDATION (hard reject / defer), so view-time evaluation trusts
 // op.author. Write-time validation rejects dangling FKs (local and cross-group)
@@ -65,8 +66,9 @@ import { signPayload as signPayloadHelper } from "@hyper-hyper-space/hhs3_mvt";
 import type { RSchemaView } from "../rschema/interfaces.js";
 import { deriveRowOpInnerMeta } from "../rtable_group/scopes.js";
 import type { RowEnvelopePayload } from "../rtable_group/payload.js";
+import type { Verdict, VerdictEvaluation } from "@hyper-hyper-space/hhs3_mvt";
 import type { OpVoidDetail } from "../rtable_group/op_void.js";
-import { VoidClosure, freshVoidClosure } from "../rtable_group/void_closure.js";
+import { freshVerdictEvaluation } from "../rtable_group/verdict_evaluation.js";
 
 import type { RTable as RTableContract, RTableView as RTableViewContract, RowValues } from "./interfaces.js";
 import { InsertRowPayload, UpdateRowPayload, DeleteRowPayload, RowOpPayload } from "./payload.js";
@@ -89,7 +91,7 @@ export type TableGroupHost = {
     validatePayload(payload: Payload, at: Version): Promise<ValidationResult>;
     makeTable(name: string): RTableImpl;
     isEntryVoided(entryHash: B64Hash, from: Version): Promise<boolean>;
-    isEntryVoidedClosure(closure: VoidClosure, entryHash: B64Hash, from: Version): Promise<boolean>;
+    entryStatusIn(evaluation: VerdictEvaluation<OpVoidDetail>, entryHash: B64Hash, from: Version): Promise<Verdict<OpVoidDetail>>;
     explainEntryVoided(entryHash: B64Hash, from: Version): Promise<OpVoidDetail | undefined>;
 };
 
@@ -125,14 +127,14 @@ export class RTableImpl implements RTableContract {
 
     // Entry voiding is the group's computation (an entry may carry ops for
     // several tables and voids as a unit); see isEntryVoided in group.ts. The
-    // closure-threaded variant is what views built inside a void computation
-    // call; the bare public ones mint a fresh closure through the group.
+    // evaluation-threaded variant is what views built inside a void computation
+    // call; the bare public ones mint a fresh evaluation through the group.
     isEntryVoided(entryHash: B64Hash, from: Version): Promise<boolean> {
         return this.group.isEntryVoided(entryHash, from);
     }
 
-    isEntryVoidedClosure(closure: VoidClosure, entryHash: B64Hash, from: Version): Promise<boolean> {
-        return this.group.isEntryVoidedClosure(closure, entryHash, from);
+    entryStatusIn(evaluation: VerdictEvaluation<OpVoidDetail>, entryHash: B64Hash, from: Version): Promise<Verdict<OpVoidDetail>> {
+        return this.group.entryStatusIn(evaluation, entryHash, from);
     }
 
     explainEntryVoided(entryHash: B64Hash, from: Version) {
@@ -230,8 +232,8 @@ export class RTableImpl implements RTableContract {
         at = at ?? frontier;
         from = from ?? frontier;
 
-        // top-level read: mint a fresh per-computation void closure.
-        return new RTableViewImpl(this, at, from, freshVoidClosure());
+        // top-level read: mint a fresh per-computation verdict evaluation.
+        return new RTableViewImpl(this, at, from, freshVerdictEvaluation());
     }
 
     // A nested table never leads a delta (the group orchestrates bounds + walk);

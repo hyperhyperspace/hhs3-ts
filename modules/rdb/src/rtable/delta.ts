@@ -4,25 +4,40 @@
 // delta's `nested` map.
 //
 // The row channel emits a RowChange for a row IFF its enforced liveness flipped
-// OR a WRITTEN (non-default) column value moved — i.e. only effects of row-ops
-// or at-use voiding-verdict flips, all of which sit above the combined revision
-// bound (at-use semantics make this floor exact: a causal-past schema/target
-// can no longer revise an old row). Schema-default and table/column-drop effects
-// are UNIFORM and never enumerated here; they live in the group's schema
-// sub-delta channel, applied by the consumer to rows not present in the walk.
+// OR a WRITTEN (non-default) column value moved, comparing the row within the
+// END horizon's incarnations: the row counts as live at start only if the
+// table had the same incarnation there, and a column's start value counts only
+// within the same column incarnation. What is left are effects of row-ops
+// (including the deletes a schema deploy carries for the rows stranded by an
+// FK it adopts, read from its meta like a delete's identity tags) and at-use
+// voiding-verdict flips, which sit above the combined revision bound
+// (at-use semantics make this floor exact: a causal-past schema/target can no
+// longer revise an old row), and writes under a new incarnation. Schema
+// defaults and table/column drops and re-adds are UNIFORM and never enumerated
+// here: liveness and written values are incarnation-scoped, so a drop or reset
+// changes every old row of the table, walked or not. They live in the group's
+// schema sub-delta channel, which the consumer applies table-wide.
 //
 // Diffing uses deltaRowState (LWW written values, no default fallback) over the
-// UNION of both horizons' schema columns; incarnation-scoped resolution keeps
-// drop/re-add from surfacing stale per-row diffs. See ../rtable/view.ts.
+// END horizon's columns. See ../rtable/view.ts.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, KeyId } from "@hyper-hyper-space/hhs3_crypto";
 import { dag } from "@hyper-hyper-space/hhs3_dag";
 import { Version, DeltaChanges, DeltaAccumulator } from "@hyper-hyper-space/hhs3_mvt";
 
-import { tableOpsFromGroupPayload } from "../rtable_group/scopes.js";
+import type { RSchemaView } from "../rschema/interfaces.js";
+import { killedRowIds, tableOpsFromGroupPayload } from "../rtable_group/scopes.js";
 
-import type { RTable } from "./interfaces.js";
+import type { DeltaRowState, RTable } from "./interfaces.js";
+
+// What the accumulator needs from its table: the public contract plus the
+// effective schema at a horizon (implemented by RTableImpl).
+type DeltaTable = RTable & {
+    resolveSchemaView(at: Version, from?: Version): Promise<RSchemaView>;
+};
+
+const NOT_LIVE: DeltaRowState = { live: false, author: undefined, written: {} };
 
 export type ColumnValueChange = {
     column: string;
@@ -52,18 +67,23 @@ export class RTableDeltaAccumulator implements DeltaAccumulator<RTableChanges> {
     private readonly candidates = new Set<B64Hash>();
 
     constructor(
-        private readonly table: RTable,
+        private readonly table: DeltaTable,
         private readonly start: Version,
         private readonly end: Version,
     ) {}
 
     // Collect every rowId this table touches in the walked entry (insert /
-    // update / delete all matter: any could flip liveness or a written value).
+    // update / delete all matter: any could flip liveness or a written value),
+    // including the rows a schema deploy deletes for an FK it adopts.
     async ingest(entry: dag.Entry): Promise<boolean> {
-        const ops = tableOpsFromGroupPayload(entry.payload, this.table.getTableName());
+        const table = this.table.getTableName();
         let touched = false;
-        for (const op of ops) {
+        for (const op of tableOpsFromGroupPayload(entry.payload, table)) {
             this.candidates.add(op.rowId);
+            touched = true;
+        }
+        for (const rowId of killedRowIds(entry, table)) {
+            this.candidates.add(rowId);
             touched = true;
         }
         return touched;
@@ -73,16 +93,20 @@ export class RTableDeltaAccumulator implements DeltaAccumulator<RTableChanges> {
         const viewStart = await this.table.getView(this.start, this.start);
         const viewEnd = await this.table.getView(this.end, this.end);
 
-        // diff over the union of both horizons' columns (schema-independent
-        // written resolution keeps drops/defaults out of the per-row diff)
-        const columns = [...new Set<string>([
-            ...(await viewStart.getColumns()),
-            ...(await viewEnd.getColumns()),
-        ])];
+        // compare within the end horizon's incarnations (see the header)
+        const name = this.table.getTableName();
+        const schemaStart = await this.table.resolveSchemaView(this.start, this.start);
+        const schemaEnd = await this.table.resolveSchemaView(this.end, this.end);
+        const tableIncarnation = schemaEnd.getTableIncarnation(name);
+        const sameTable = tableIncarnation !== undefined && schemaStart.getTableIncarnation(name) === tableIncarnation;
+        const columns = await viewEnd.getColumns();
+        const carried = sameTable
+            ? columns.filter((c) => schemaStart.getColumnIncarnation(name, c) === schemaEnd.getColumnIncarnation(name, c))
+            : [];
 
         const rowChanges: RowChange[] = [];
         for (const rowId of [...this.candidates].sort()) {
-            const before = await viewStart.deltaRowState(rowId, columns);
+            const before = sameTable ? await viewStart.deltaRowState(rowId, carried) : NOT_LIVE;
             const after = await viewEnd.deltaRowState(rowId, columns);
 
             const columnChanges: ColumnValueChange[] = [];

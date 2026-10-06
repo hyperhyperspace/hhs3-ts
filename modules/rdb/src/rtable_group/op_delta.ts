@@ -58,7 +58,7 @@ export function isVoidCheckable(payload: json.Literal): boolean {
 // Table-scope variant: TableScope.unwrapPayload surfaces the inner row op
 // (insert/update/delete) or a 'rows' slice (unwrapped bundle/create seed),
 // never the group-level 'row'/'bundle' envelope. Genesis-derived 'rows' still
-// resolves to OK via diagnoseEntryVoided's create-fiat path.
+// resolves to OK via diagnoseEntry's create-fiat path.
 export function isVoidCheckableTableOp(payload: json.Literal): boolean {
     if (isRefAdvancePayload(payload)) return true;
     const p = payload as json.LiteralMap;

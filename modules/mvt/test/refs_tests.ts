@@ -290,6 +290,38 @@ async function testResolveRefVersionAtPositionIsLive() {
     testing.assertTrue(none.has(refId) && none.size === 1, 'filtering all ref-advances falls back to version(refId)');
 }
 
+async function testResolveRefVersionAtPositionSeesThrough() {
+    const refId = 'foreignObj';
+    const foreignDag = createTestDag();
+    const fRoot = await foreignDag.append({ n: 0 }, {});
+    const fV1 = await foreignDag.append({ n: 1 }, {}, version(fRoot));
+    const fV2 = await foreignDag.append({ n: 2 }, {}, version(fV1));
+
+    const observerRaw = createTestDag();
+    const observer = new RootScopedDag(observerRaw);
+
+    const h0 = await observer.append({ action: 'create' }, {}, undefined);
+    // a live ref-advance, then a void one on top of it
+    const hLive = await observer.append(
+        createRefAdvancePayload(refId, version(fV1)),
+        createRefAdvanceMeta(refId),
+        version(h0),
+    );
+    const hVoid = await observer.append(
+        createRefAdvancePayload(refId, version(fV2)),
+        createRefAdvanceMeta(refId),
+        version(hLive),
+    );
+
+    const at = version(hVoid);
+    const resolved = await resolveRefVersionAtPosition(observer, refId, at, at, async (h) => h !== hVoid);
+    testing.assertTrue(resolved.has(fV1) && resolved.size === 1,
+        'a void ref-advance does not hide the live one below it');
+
+    const geometric = await resolveRefVersionAtPosition(observer, refId, at, at);
+    testing.assertTrue(geometric.has(fV2) && geometric.size === 1, 'without isLive the latest ref-advance counts');
+}
+
 async function testProjectForeignBound() {
     const refId = 'foreignObj';
     const foreignDag = createTestDag();
@@ -431,6 +463,7 @@ export const refsSuite = {
         { name: '[REFS_06] refVersionAtOrBelow ordering', invoke: testRefVersionAtOrBelow },
         { name: '[REFS_07] resolveRefVersions for entry', invoke: testResolveRefVersions },
         { name: '[REFS_07b] resolveRefVersionAtPosition isLive filter', invoke: testResolveRefVersionAtPositionIsLive },
+        { name: '[REFS_07c] resolveRefVersionAtPosition sees through a void ref-advance', invoke: testResolveRefVersionAtPositionSeesThrough },
         { name: '[REFS_08] projectForeignBound bound projection', invoke: testProjectForeignBound },
         { name: '[REFS_09] ref-advance monotonicity validation', invoke: testRefAdvanceMonotonicity },
     ],

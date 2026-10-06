@@ -291,6 +291,8 @@ ALTER SCHEMA shop AS (
 );
 ```
 
+Deploying an FK never fails on existing data: the deploy deletes the rows that don't honor it (a value that isn't the `rowId` of a live target), along with rows that point at them through other FKs the same deploy adds. See [rdb](../rdb#schema-evolution-and-incarnations).
+
 ## Allow Rules
 
 Allow rules are positive gates: an operation is permitted only when its predicate is true.

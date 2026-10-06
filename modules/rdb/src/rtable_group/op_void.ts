@@ -13,7 +13,7 @@ export type OpVoidDetail =
     | { kind: 'row-not-live'; table: string; action: 'update' | 'delete'; rowId: B64Hash }
     | { kind: 'fk'; table: string; action: RowOpPayload['action']; rowId: B64Hash; column: string; targetRef: string; targetRowId: B64Hash }
     | { kind: 'observe-gate'; binding: string; rule: Predicate }
-    | { kind: 'authorization-cycle' }
+    | { kind: 'undecided-cycle' }
     | { kind: 'bundle'; index: number; detail: OpVoidDetail };
 
 export function formatOpVoidDetail(detail: OpVoidDetail): string {
@@ -30,8 +30,8 @@ export function formatOpVoidDetail(detail: OpVoidDetail): string {
             return `FK column '${detail.column}' in table '${detail.table}' points to non-live row '${detail.targetRowId}' in '${detail.targetRef}'`;
         case 'observe-gate':
             return `canObserve predicate rejected observation of '${detail.binding}': ${formatPredicate(detail.rule)}`;
-        case 'authorization-cycle':
-            return 'authorization cycle (least-fixpoint deny)';
+        case 'undecided-cycle':
+            return 'undecided dependency cycle (denied)';
         case 'bundle':
             return `bundle write ${detail.index}: ${formatOpVoidDetail(detail.detail)}`;
     }

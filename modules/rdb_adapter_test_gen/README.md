@@ -12,7 +12,7 @@ This package never imports `rdb_adapter` or `rdb_adapter_test`. The ingest-side 
 - `lines.order` — required string **and** a local FK to `orders` (so a later `set-fks` flip is a required, no-default companion add)
 - `lines.qty` — required integer
 
-Row ops insert/update/delete from small pools. Schema ops add/drop defaulted columns, flip `set-fks`, drop+re-add the FK column, retype via drop+add, add/drop tables. About 30% of writes branch off an older checkpoint (`pickConcurrentAt`).
+Row ops insert/update/delete from small pools. Schema ops add/drop defaulted columns, flip `set-fks` (an add-fk deletes the lines it strands), drop+re-add the FK column, retype via drop+add, add/drop tables. Resetting `orders` lifts `lines`' FKs and restores them in the same migration, read from the schema, so the old lines stay live with dangling values. About 30% of writes branch off an older checkpoint (`pickConcurrentAt`).
 
 Pathological kinds are first-class menu entries **and** forced onto a seeded late-op schedule (`forcedRareAt`) so they appear even at small `ops`. After a sweep, `assertPathologicalCoverage` requires at least one accepted op of each:
 

@@ -8,7 +8,7 @@
 // view-time reference resolution.
 
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
-import type { EntryMetaFilter, MetaProps, Position } from "@hyper-hyper-space/hhs3_dag";
+import type { EntryMetaFilter, EntryPredicate, MetaProps, Position } from "@hyper-hyper-space/hhs3_dag";
 import { position } from "@hyper-hyper-space/hhs3_dag";
 import { json } from "@hyper-hyper-space/hhs3_json";
 
@@ -80,29 +80,34 @@ export function prepareRefAdvance(refId: B64Hash, refVersion: Version): RefAdvan
     };
 }
 
-// Find all ref-advance entries for a given refId up to a DAG position.
+// Find the latest ref-advance entries for a given refId up to a DAG position.
+// `predicate`, when supplied, makes the cover see-through: an entry it rejects
+// is skipped and the walk continues below it.
 export async function findRefAdvances(
     dag: ScopedDag,
     refId: B64Hash,
     at: Version,
+    predicate?: EntryPredicate,
 ): Promise<Position> {
-    return dag.findCoverWithFilter(at, { containsValues: { ref: [refId] } });
+    return dag.findCoverWithFilter(at, { containsValues: { ref: [refId] } }, predicate);
 }
 
 // Find ref-advance barrier entries for a given refId that are concurrent
 // to `at` when observed from `from`. Used for (at, from) revision semantics:
 // barriers in this set may retroactively affect how concurrent operations
-// are interpreted.
+// are interpreted. `predicate` is see-through, as in findRefAdvances.
 export async function findConcurrentRefAdvanceBarriers(
     dag: ScopedDag,
     refId: B64Hash,
     at: Version,
     from: Version,
+    predicate?: EntryPredicate,
 ): Promise<Position> {
     return dag.findConcurrentCoverWithFilter(
         from,
         at,
         { containsValues: { ref: [refId], barrier: ['t'] } },
+        predicate,
     );
 }
 
@@ -117,11 +122,13 @@ export async function findConcurrentRefAdvanceBarriers(
 // When from !== at, concurrent ref-advance barriers widen the result,
 // implementing the BFT revision mechanism in the observer DAG.
 //
-// `isLive`, when supplied, is consulted per ref-advance entry (in BOTH folds):
-// an entry for which it returns false is SKIPPED, so a voided ref-advance (e.g.
-// an observation rejected at-use by its authorization gate) contributes no
-// version. Omitting `isLive` is the geometric resolution (every ref-advance
-// counts) and is the default everywhere a gate does not apply.
+// `isLive`, when supplied, is the see-through predicate of BOTH folds: an entry
+// for which it returns false contributes no version and does not hide the
+// ref-advances below it, so a voided ref-advance (e.g. an observation rejected
+// at-use by its authorization gate) falls through to the latest live one, like
+// a voided write in a column read. Omitting `isLive` is the geometric
+// resolution (every ref-advance counts) and is the default everywhere a gate
+// does not apply.
 export async function resolveRefVersionAtPosition(
     dag: ScopedDag,
     refId: B64Hash,
@@ -129,17 +136,17 @@ export async function resolveRefVersionAtPosition(
     from: Version,
     isLive?: (entryHash: B64Hash) => Promise<boolean>,
 ): Promise<Version> {
-    const causal = await findRefAdvances(dag, refId, at);
+    const predicate: EntryPredicate | undefined = isLive === undefined ? undefined : (hash) => isLive(hash);
+    const causal = await findRefAdvances(dag, refId, at, predicate);
     // Nothing in from's past is concurrent to at when from == at, and the
     // concurrent search would walk (and load) the whole causal past to say so.
     const concurrent = sameSet(at, from)
         ? position()
-        : await findConcurrentRefAdvanceBarriers(dag, refId, at, from);
+        : await findConcurrentRefAdvanceBarriers(dag, refId, at, from, predicate);
 
     const result = version();
 
     for (const hash of causal) {
-        if (isLive !== undefined && !await isLive(hash)) continue;
         const entry = await dag.loadEntry(hash);
         if (entry === undefined) continue;
         if (isRefAdvancePayload(entry.payload)) {
@@ -149,7 +156,6 @@ export async function resolveRefVersionAtPosition(
 
     for (const hash of concurrent) {
         if (causal.has(hash)) continue;
-        if (isLive !== undefined && !await isLive(hash)) continue;
         const entry = await dag.loadEntry(hash);
         if (entry === undefined) continue;
         if (isRefAdvancePayload(entry.payload)) {

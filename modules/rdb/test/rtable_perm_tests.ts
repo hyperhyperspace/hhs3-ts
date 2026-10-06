@@ -109,10 +109,75 @@ async function authoredInsertEnvelope(
 // docs: insert open (default true), update/delete author-is-author (defaults)
 const docsTable: TableDef = { name: 'docs', columns: { body: { type: 'string' } } };
 
-// A Users group with TWO genesis co-admins, each holding a root manager cap in
-// the genesis create entry. A mutual revoke between them is a delete-vs-delete
-// negation cycle that resolves to deny-the-whole-cycle (both revokes voided,
-// both caps survive).
+// A Users group with N genesis co-admins, each holding a root manager cap in
+// the genesis create entry. Admin i revoking admin i+1 (mod N), all concurrent
+// off genesis, is an N-party negation cycle.
+async function createAdminRingGroup(
+    ctx: RContext, admins: OwnIdentity[],
+): Promise<{ schema: RSchemaImpl; group: RTableGroupImpl }> {
+    return createRingGroupWith(ctx, admins, usersSchemaTables(USERS_MANAGER_LABEL));
+}
+
+// The same ring over caller-chosen tables: identity `admin-i` and manager cap
+// `root-cap-i` per admin, plus `extraRows` at genesis.
+async function createRingGroupWith(
+    ctx: RContext, admins: OwnIdentity[], tables: TableDef[], extraRows: { [table: string]: json.Literal[] } = {},
+): Promise<{ schema: RSchemaImpl; group: RTableGroupImpl }> {
+    const schemaInit = await RSchemaImpl.create({
+        name: USERS_SCHEMA_NAME,
+        creators: [{ keyId: admins[0].keyId, publicKey: admins[0].publicKey }],
+        tables,
+    });
+    const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
+    const pinned = await (await schema.getScopedDag()).getFrontier();
+
+    const rootCaps = admins.map((a, i) => capRow('root-cap-' + i, a.keyId, USERS_MANAGER_LABEL) as unknown as json.Literal);
+    const groupInit = await RTableGroupImpl.create({
+        name: 'users', seed: 'users-group',
+        schemaRef: schema.getId(), schemaVersion: pinned,
+        idProvider: IDENTITIES_TABLE,
+        initialRows: {
+            ...extraRows,
+            [IDENTITIES_TABLE]: admins.map((a, i) => identityRow('admin-' + i, a)),
+            [CAPS_TABLE]: [...rootCaps, ...(extraRows[CAPS_TABLE] ?? [])],
+        },
+    });
+    const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
+    return { schema, group };
+}
+
+// The Users tables with the caps delete restriction replaced by `rule`.
+function usersTablesWithRevokeRule(rule: Predicate): TableDef[] {
+    return usersSchemaTables(USERS_MANAGER_LABEL).map((table) => table.name !== CAPS_TABLE ? table : {
+        ...table,
+        restrictions: [...(table.restrictions ?? []).filter((r) => r.on !== 'delete'), { on: 'delete', rule }],
+    });
+}
+
+function genesisRow(uuid: string, values: { [column: string]: json.Literal }): json.Literal {
+    return { action: 'insert', rowId: deriveRowId(uuid), uuid, values };
+}
+
+const MANAGER_ARM: Predicate = { p: 'exists', table: CAPS_TABLE, where: { label: USERS_MANAGER_LABEL, grantee: '$author' } };
+const BACKUP_ARM: Predicate = { p: 'exists', table: 'backups', where: { grantee: '$author' } };
+const backupsTable: TableDef = {
+    name: 'backups',
+    columns: { grantee: { type: 'string', pub: true, readonly: true } },
+    restrictions: [{ on: 'all', rule: { p: 'true' } }],
+};
+
+// The Users tables plus open `targets` (concurrent deletes honored) and
+// `items` whose `ref` is an FK into targets.
+function itemTables(): TableDef[] {
+    return [
+        ...usersSchemaTables(USERS_MANAGER_LABEL),
+        { name: 'targets', columns: { name: { type: 'string' } }, concurrentDeletes: true,
+          restrictions: [{ on: 'all', rule: { p: 'true' } }] },
+        { name: 'items', columns: { ref: { type: 'string' } }, fks: { ref: 'targets' },
+          restrictions: [{ on: 'all', rule: { p: 'true' } }] },
+    ];
+}
+
 async function createTwoAdminUsersGroup(
     ctx: RContext, a: OwnIdentity, b: OwnIdentity,
 ): Promise<{ schema: RSchemaImpl; group: RTableGroupImpl }> {
@@ -138,6 +203,39 @@ async function createTwoAdminUsersGroup(
     });
     const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
     return { schema, group };
+}
+
+// Every root cap survives and every ring revoke is void, on a fresh group
+// queried forward and on another queried in reverse.
+async function assertRevokeRingSurvives(n: number): Promise<void> {
+    const ctx = newCtx();
+    const admins: OwnIdentity[] = [];
+    for (let i = 0; i < n; i++) admins.push(await makeIdentity());
+    const { group } = await createAdminRingGroup(ctx, admins);
+
+    const capIds = admins.map((_, i) => deriveRowId('root-cap-' + i));
+    const base = await frontier(group);
+    const revokes: B64Hash[] = [];
+    for (let i = 0; i < n; i++) {
+        const hash = await revokeCap(group, admins[i], admins[(i + 1) % n].keyId, USERS_MANAGER_LABEL, base);
+        assertTrue(hash !== undefined, `admin ${i} revoke appends`);
+        revokes.push(hash!);
+    }
+    const merged = await frontier(group);
+
+    const check = async (g: RTableGroupImpl, order: number[], label: string) => {
+        const view = await (await g.getView(merged, merged)).getTableView(CAPS_TABLE);
+        for (const i of order) {
+            assertTrue(await view.hasRow(capIds[i]), `${label}: cap ${i} survives the ${n}-ring`);
+            assertTrue(await g.isEntryVoided(revokes[i], merged), `${label}: revoke ${i} is void in the ${n}-ring`);
+        }
+    };
+
+    const forward = [...admins.keys()];
+    const gForward = await freshGroup(ctx, group.getId());
+    await check(gForward, forward, 'forward');
+    const gReverse = await freshGroup(ctx, group.getId());
+    await check(gReverse, [...forward].reverse(), 'reverse');
 }
 
 // Reload a group as a FRESH RTableGroupImpl over the same DAG: a clean
@@ -1052,8 +1150,8 @@ export const rtablePermTests = {
                 const merged = await frontier(group);
 
                 // deny-the-whole-cycle: each revoke's authority depends on the
-                // other revoke being voided, so the cycle voids BOTH revokes and
-                // both caps survive (the conservative least fixpoint).
+                // other revoke being voided, so nothing decides either one; the
+                // undecided ring collapses to void and both caps survive.
                 const view = await tableView(group, CAPS_TABLE, merged);
                 const aLive = await view.hasRow(capA);
                 const bLive = await view.hasRow(capB);
@@ -1076,6 +1174,270 @@ export const rtablePermTests = {
                 assertEquals(a1, a2, 'cap A verdict is identical regardless of which cap is resolved first');
                 assertEquals(b1, b2, 'cap B verdict is identical regardless of which cap is resolved first');
                 assertEquals(a1, aLive, 'fresh-instance verdict matches the original instance');
+            }
+        },
+        {
+            name: '[PERM13] 3-party revoke ring: deny-the-whole-cycle (every cap survives, every revoke void)',
+            invoke: async () => { await assertRevokeRingSurvives(3); },
+        },
+        {
+            name: '[PERM14] 4-party revoke ring: deny-the-whole-cycle (every cap survives, every revoke void)',
+            invoke: async () => { await assertRevokeRingSurvives(4); },
+        },
+        {
+            name: '[PERM15] 5-party revoke ring: deny-the-whole-cycle (every cap survives, every revoke void)',
+            invoke: async () => { await assertRevokeRingSurvives(5); },
+        },
+        {
+            name: '[PERM16] a grantee deleting their own manager cap removes it',
+            invoke: async () => {
+                const ctx = newCtx();
+                const admin = await makeIdentity();
+                const { group } = await createUsersGroup(ctx, admin);
+                const capId = deriveRowId('root-cap');
+
+                const hash = await revokeCap(group, admin, admin.keyId, USERS_MANAGER_LABEL);
+                assertTrue(hash !== undefined, 'self-revoke appends');
+
+                const merged = await frontier(group);
+                assertFalse(await (await tableView(group, CAPS_TABLE, merged)).hasRow(capId),
+                    'a grantee deleting their own manager cap removes it');
+                assertFalse(await group.isEntryVoided(hash!, merged),
+                    'a self-revoke is not void: the revoke is not its own barrier');
+            }
+        },
+        {
+            name: '[PERM17] outsider revoked by a 3-ring member loses the cap',
+            invoke: async () => {
+                const ctx = newCtx();
+                const ring: OwnIdentity[] = [];
+                for (let i = 0; i < 3; i++) ring.push(await makeIdentity());
+                const outsider = await makeIdentity();
+                const admins = [...ring, outsider];
+                const { group } = await createAdminRingGroup(ctx, admins);
+
+                const base = await frontier(group);
+                for (let i = 0; i < 3; i++) {
+                    const hash = await revokeCap(group, ring[i], ring[(i + 1) % 3].keyId, USERS_MANAGER_LABEL, base);
+                    assertTrue(hash !== undefined, `ring revoke ${i} appends`);
+                }
+                const outsiderRevoke = await revokeCap(group, ring[0], outsider.keyId, USERS_MANAGER_LABEL, base);
+                assertTrue(outsiderRevoke !== undefined, 'outsider revoke appends');
+
+                const merged = await frontier(group);
+                const g = await freshGroup(ctx, group.getId());
+                const view = await (await g.getView(merged, merged)).getTableView(CAPS_TABLE);
+                assertFalse(await view.hasRow(deriveRowId('root-cap-3')),
+                    'outsider cap is removed by the ring member');
+                assertFalse(await g.isEntryVoided(outsiderRevoke!, merged),
+                    'the outsider revoke is authorized by the surviving ring cap');
+                for (let i = 0; i < 3; i++) {
+                    assertTrue(await view.hasRow(deriveRowId('root-cap-' + i)),
+                        `ring cap ${i} survives beside the outsider revoke`);
+                }
+            }
+        },
+        {
+            name: '[PERM18] an or-arm through a revoke ring does not hide a clean backup arm, in either arm or query order',
+            invoke: async () => {
+                const arms: [string, Predicate[]][] = [
+                    ['manager arm first', [MANAGER_ARM, BACKUP_ARM]],
+                    ['backup arm first', [BACKUP_ARM, MANAGER_ARM]],
+                ];
+                for (const [label, args] of arms) {
+                    const ctx = newCtx();
+                    const admins = [await makeIdentity(), await makeIdentity()];
+                    const { group } = await createRingGroupWith(ctx, admins,
+                        [...usersTablesWithRevokeRule({ p: 'or', args }), backupsTable],
+                        { backups: admins.map((a, i) => genesisRow('backup-' + i, { grantee: a.keyId })) });
+
+                    const base = await frontier(group);
+                    const revokes: B64Hash[] = [];
+                    for (let i = 0; i < 2; i++) {
+                        const hash = await revokeCap(group, admins[i], admins[(i + 1) % 2].keyId, USERS_MANAGER_LABEL, base);
+                        assertTrue(hash !== undefined, `${label}: revoke ${i} appends`);
+                        revokes.push(hash!);
+                    }
+                    const merged = await frontier(group);
+
+                    for (const order of [[0, 1], [1, 0]]) {
+                        const g = await freshGroup(ctx, group.getId());
+                        const view = await (await g.getView(merged, merged)).getTableView(CAPS_TABLE);
+                        for (const i of order) {
+                            assertFalse(await view.hasRow(deriveRowId('root-cap-' + i)),
+                                `${label}, order ${order}: cap ${i} is revoked (the backup arm authorizes the revoke)`);
+                            assertFalse(await g.isEntryVoided(revokes[(i + 1) % 2], merged),
+                                `${label}, order ${order}: the revoke of cap ${i} is live`);
+                        }
+                    }
+                }
+            }
+        },
+        {
+            name: '[PERM19] an exists with a clean candidate beside one in a revoke ring holds',
+            invoke: async () => {
+                const ctx = newCtx();
+                const admins = [await makeIdentity(), await makeIdentity()];
+                // each admin holds a second manager cap that no one revokes
+                const { group } = await createRingGroupWith(ctx, admins, usersSchemaTables(USERS_MANAGER_LABEL), {
+                    [CAPS_TABLE]: admins.map((a, i) => capRow('spare-cap-' + i, a.keyId, USERS_MANAGER_LABEL) as unknown as json.Literal),
+                });
+
+                // admin i deletes only admin i+1's root cap
+                const base = await frontier(group);
+                const caps = await group.getTable(CAPS_TABLE);
+                const revokes: B64Hash[] = [];
+                for (let i = 0; i < 2; i++) {
+                    revokes.push(await caps.delete(deriveRowId('root-cap-' + ((i + 1) % 2)), admins[i], base));
+                }
+                const merged = await frontier(group);
+
+                for (const order of [[0, 1], [1, 0]]) {
+                    const g = await freshGroup(ctx, group.getId());
+                    const view = await (await g.getView(merged, merged)).getTableView(CAPS_TABLE);
+                    for (const i of order) {
+                        assertFalse(await view.hasRow(deriveRowId('root-cap-' + i)),
+                            `order ${order}: root cap ${i} is revoked (its revoker is authorized by a spare cap)`);
+                        assertTrue(await view.hasRow(deriveRowId('spare-cap-' + i)),
+                            `order ${order}: spare cap ${i} survives`);
+                        assertFalse(await g.isEntryVoided(revokes[i], merged),
+                            `order ${order}: revoke ${i} is live`);
+                    }
+                }
+            }
+        },
+        {
+            name: '[PERM20] a bundle whose restriction rests on a revoke ring but whose FK target is dead is void for the FK, in either query order',
+            invoke: async () => {
+                const ctx = newCtx();
+                const admins = [await makeIdentity(), await makeIdentity(), await makeIdentity()];
+                const { group } = await createRingGroupWith(ctx, admins, itemTables(), {
+                    targets: [genesisRow('target-1', { name: 't' })],
+                });
+                const targetId = deriveRowId('target-1');
+
+                // admins 0 and 1 revoke each other; admin 0 revokes admin 2 in
+                // the same bundle as an item that points at the target; the
+                // target is deleted, all concurrently
+                const base = await frontier(group);
+                const ring = [
+                    await revokeCap(group, admins[0], admins[1].keyId, USERS_MANAGER_LABEL, base),
+                    await revokeCap(group, admins[1], admins[0].keyId, USERS_MANAGER_LABEL, base),
+                ];
+                const bundled = await group.bundle([
+                    { table: CAPS_TABLE, op: { action: 'delete', rowId: deriveRowId('root-cap-2') } },
+                    { table: 'items', op: { action: 'insert', rowId: deriveRowId('item-1', admins[0].keyId), uuid: 'item-1', values: { ref: targetId } } },
+                ], admins[0], base);
+                await (await group.getTable('targets')).delete(targetId, undefined, base);
+                const merged = await frontier(group);
+
+                for (const first of ['bundle', 'ring']) {
+                    const g = await freshGroup(ctx, group.getId());
+                    const checkBundle = async () => {
+                        const detail = await g.explainEntryVoided(bundled, merged);
+                        assertTrue(detail !== undefined && detail.kind === 'bundle' && detail.index === 1 && detail.detail.kind === 'fk',
+                            `${first} first: the bundle is void for its dangling FK, not for the ring (got ${JSON.stringify(detail)})`);
+                    };
+                    const checkRing = async () => {
+                        for (const revoke of ring) {
+                            assertEquals((await g.explainEntryVoided(revoke!, merged))?.kind, 'undecided-cycle',
+                                `${first} first: a ring revoke is void as undecided-cycle`);
+                        }
+                    };
+                    if (first === 'bundle') { await checkBundle(); await checkRing(); }
+                    else { await checkRing(); await checkBundle(); }
+
+                    const view = await (await g.getView(merged, merged)).getTableView(CAPS_TABLE);
+                    for (let i = 0; i < 3; i++) {
+                        assertTrue(await view.hasRow(deriveRowId('root-cap-' + i)), `${first} first: cap ${i} survives`);
+                    }
+                }
+            }
+        },
+        {
+            name: '[PERM20b] a void bundle whose own revoke is in a ring leaves the counter revoke live, in either query order',
+            invoke: async () => {
+                const ctx = newCtx();
+                const admins = [await makeIdentity(), await makeIdentity()];
+                const { group } = await createRingGroupWith(ctx, admins, itemTables(), {
+                    targets: [genesisRow('target-1', { name: 't' })],
+                });
+                const targetId = deriveRowId('target-1');
+
+                // admin 0 revokes admin 1 in the same bundle as an item that
+                // points at the target; admin 1 revokes admin 0; the target is
+                // deleted, all concurrently. The dead target decides the
+                // bundle, which decides the ring.
+                const base = await frontier(group);
+                const bundled = await group.bundle([
+                    { table: CAPS_TABLE, op: { action: 'delete', rowId: deriveRowId('root-cap-1') } },
+                    { table: 'items', op: { action: 'insert', rowId: deriveRowId('item-1', admins[0].keyId), uuid: 'item-1', values: { ref: targetId } } },
+                ], admins[0], base);
+                const counter = await revokeCap(group, admins[1], admins[0].keyId, USERS_MANAGER_LABEL, base);
+                assertTrue(counter !== undefined, 'the counter revoke appends');
+                await (await group.getTable('targets')).delete(targetId, undefined, base);
+                const merged = await frontier(group);
+
+                const reasons: string[] = [];
+                for (const first of ['bundle', 'counter']) {
+                    const g = await freshGroup(ctx, group.getId());
+                    const checkBundle = async () => {
+                        const detail = await g.explainEntryVoided(bundled, merged);
+                        assertTrue(detail !== undefined && detail.kind === 'bundle',
+                            `${first} first: the bundle is void for one of its ops, not for a cycle (got ${JSON.stringify(detail)})`);
+                        reasons.push(JSON.stringify(detail));
+                    };
+                    const checkCounter = async () => {
+                        assertFalse(await g.isEntryVoided(counter!, merged),
+                            `${first} first: the counter revoke is live once the bundle is void`);
+                    };
+                    if (first === 'bundle') { await checkBundle(); await checkCounter(); }
+                    else { await checkCounter(); await checkBundle(); }
+
+                    const view = await (await g.getView(merged, merged)).getTableView(CAPS_TABLE);
+                    assertFalse(await view.hasRow(deriveRowId('root-cap-0')), `${first} first: cap 0 is revoked`);
+                    assertTrue(await view.hasRow(deriveRowId('root-cap-1')), `${first} first: cap 1 survives the void bundle`);
+                }
+                assertEquals(reasons[0], reasons[1], 'the bundle reports the same reason in either query order');
+            }
+        },
+        {
+            name: '[PERM21] a revoke left undecided by a ring reports undecided-cycle',
+            invoke: async () => {
+                const ctx = newCtx();
+                const a = await makeIdentity();
+                const b = await makeIdentity();
+                const { group } = await createTwoAdminUsersGroup(ctx, a, b);
+
+                const base = await frontier(group);
+                const revoke = await revokeCap(group, a, b.keyId, USERS_MANAGER_LABEL, base);
+                await revokeCap(group, b, a.keyId, USERS_MANAGER_LABEL, base);
+                const merged = await frontier(group);
+
+                assertEquals((await group.explainEntryVoided(revoke!, merged))?.kind, 'undecided-cycle',
+                    'a ring revoke is void as undecided-cycle');
+            }
+        },
+        {
+            name: '[PERM22] two concurrent revokes by one admin do not depend on each other',
+            invoke: async () => {
+                const ctx = newCtx();
+                const admins = [await makeIdentity(), await makeIdentity(), await makeIdentity()];
+                const { group } = await createAdminRingGroup(ctx, admins);
+
+                // admin 0 revokes admins 1 and 2 on concurrent branches
+                const base = await frontier(group);
+                const first = await revokeCap(group, admins[0], admins[1].keyId, USERS_MANAGER_LABEL, base);
+                const second = await revokeCap(group, admins[0], admins[2].keyId, USERS_MANAGER_LABEL, base);
+                const merged = await frontier(group);
+
+                const g = await freshGroup(ctx, group.getId());
+                assertFalse(await g.isEntryVoided(first!, merged), 'the revoke of admin 1 is live');
+                assertFalse(await g.isEntryVoided(second!, merged), 'the revoke of admin 2 is live');
+                const view = await (await g.getView(merged, merged)).getTableView(CAPS_TABLE);
+                assertFalse(await view.hasRow(deriveRowId('root-cap-1')), 'admin 1 loses the cap');
+                assertFalse(await view.hasRow(deriveRowId('root-cap-2')), 'admin 2 loses the cap');
+                assertTrue(await view.hasRow(deriveRowId('root-cap-0')), 'admin 0 keeps the cap');
             }
         },
     ],

@@ -213,6 +213,25 @@ export async function generateProjectHistory(
         await group.deploy(v2, undefined, at);
     };
 
+    // The schema refuses to drop orders while lines.order references it, so a
+    // reset lifts lines' FKs and restores them in the same migration. They are
+    // read from the schema rather than `st`, which only tracks accepted deploys.
+    const resetOrders = async (orders: TableDef, note: string, at: Version | undefined): Promise<void> => {
+        const fks = (await schema.getView()).getFKs('lines');
+        const lift: MigrationRule[] = Object.keys(fks).length === 0
+            ? []
+            : [{ rule: 'set-fks', table: 'lines', fks: {} }];
+        const restore: MigrationRule[] = lift.length === 0
+            ? []
+            : [{ rule: 'set-fks', table: 'lines', fks: { ...fks } }];
+        await deploy([
+            ...lift,
+            { rule: 'drop-table', table: 'orders' },
+            { rule: 'add-table', def: orders },
+            ...restore,
+        ], note, at);
+    };
+
     const concurrentAdds = async (
         migA: MigrationRule[], noteA: string,
         migB: MigrationRule[], noteB: string,
@@ -259,21 +278,15 @@ export async function generateProjectHistory(
             st.hasOrderColumn = true;
             st.hasFk = schemaKind === 'add-order-fk';
         } else if (schemaKind === 'reincarnate-orders-table') {
-            await deploy([
-                { rule: 'drop-table', table: 'orders' },
-                { rule: 'add-table', def: open('orders', { customer: { type: 'string' } }) },
-            ], 'reincarnate orders', at);
+            await resetOrders(open('orders', { customer: { type: 'string' } }), 'reincarnate orders', at);
             st.hasStatus = false;
             st.hasNote = false;
             st.memo = 'absent';
         } else if (schemaKind === 'reincarnate-orders-reshaped') {
-            await deploy([
-                { rule: 'drop-table', table: 'orders' },
-                { rule: 'add-table', def: open('orders', {
-                    customer: { type: 'string' },
-                    note: { type: 'string', nullable: true },
-                }) },
-            ], 'reincarnate orders reshaped', at);
+            await resetOrders(open('orders', {
+                customer: { type: 'string' },
+                note: { type: 'string', nullable: true },
+            }), 'reincarnate orders reshaped', at);
             st.hasStatus = false;
             st.hasNote = true;
             st.memo = 'absent';
@@ -342,16 +355,30 @@ export async function generateProjectHistory(
             await items.insert(`ib-${opIndex}`, { label: 'from-b' }, undefined, version(deployB));
             st.hasItems = true;
         } else if (schemaKind === 'toggle-cd-concurrent-delete') {
-            st.concurrentDeletes = !st.concurrentDeletes;
-            await deploy(
-                [{ rule: 'set-concurrent-deletes', table: 'orders', value: st.concurrentDeletes }],
-                'toggle cd',
-                undefined,
-            );
-            const live = await liveIds(group, 'orders', atV, ORDER_POOL, orderRowId);
-            const target = pick(prng, live);
-            if (target === undefined) throw new Error('no live order for concurrent delete');
-            await (await group.getTable('orders')).delete(orderRowId(target), undefined, at);
+            // The delete needs an order live at `at`. An orders reset can leave
+            // none, so the episode then inserts one in a slot the current
+            // incarnation has not used, and deletes it beside the toggle.
+            const orders = await group.getTable('orders');
+            let target = pick(prng, await liveIds(group, 'orders', atV, ORDER_POOL, orderRowId));
+            let deleteAt = at;
+            if (target === undefined) {
+                const first = prng.nextInt(0, ORDER_POOL - 1);
+                for (let k = 0; k < ORDER_POOL && target === undefined; k++) {
+                    const i = (first + k) % ORDER_POOL;
+                    try {
+                        deleteAt = version(await orders.insert(orderUuid(i), { customer: 'c-cd' }, undefined, at));
+                        target = i;
+                    } catch {
+                        // the slot was used in this incarnation
+                    }
+                }
+                if (target === undefined) throw new Error('no order slot for concurrent delete');
+            }
+            // read from the schema: an orders reset restores the default flag
+            const value = !(await schema.getView()).getConcurrentDeletes('orders');
+            await deploy([{ rule: 'set-concurrent-deletes', table: 'orders', value }], 'toggle cd', undefined);
+            st.concurrentDeletes = value;
+            await orders.delete(orderRowId(target), undefined, deleteAt);
         } else if (schemaKind === 'add-tags') {
             await deploy([{ rule: 'add-table', def: open('tags', { code: { type: 'string' } }) }], 'add tags', at);
             st.hasTags = true;

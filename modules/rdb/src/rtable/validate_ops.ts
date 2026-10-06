@@ -8,7 +8,7 @@
 //
 // Signature enforcement and restriction authorization are the group's concern:
 // hard validation happens in rtable_group/validate_ops.ts, with view-time
-// restriction rechecks in computeEntryVoided for concurrent barrier effects.
+// restriction rechecks in isEntryVoided for concurrent barrier effects.
 // This file adds the provider content-integrity check for identity-provider
 // rows.
 

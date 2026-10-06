@@ -74,8 +74,11 @@ import {
 } from "@hyper-hyper-space/hhs3_mvt";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 import { signPayload as signPayloadHelper } from "@hyper-hyper-space/hhs3_mvt";
+import { TRUE, allTruth } from "@hyper-hyper-space/hhs3_mvt";
+import type { Truth, Verdict, VerdictEvaluation } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchema, RSchemaView } from "../rschema/interfaces.js";
+import type { IncarnationId } from "../rschema/incarnation.js";
 import type { Predicate, SchemaCreator } from "../rschema/payload.js";
 import { splitTableRef } from "../rschema/payload.js";
 import { predicateReferencesAuthor } from "../rschema/validate.js";
@@ -88,10 +91,11 @@ import { RTableViewImpl } from "../rtable/view.js";
 
 import type { RTableGroup as RTableGroupContract, RTableGroupView as RTableGroupViewContract, BundleWrite } from "./interfaces.js";
 import { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload, RTABLE_GROUP_TYPE_ID, deployGateSetFormat } from "./payload.js";
-import { TableScope, deriveCreateMeta, deriveEnvelopeMeta, deriveBundleMeta } from "./scopes.js";
-import { VoidClosure, freshVoidClosure, VOID_MAX_INFLIGHT } from "./void_closure.js";
+import { TableScope, deriveCreateMeta, deriveEnvelopeMeta, deriveBundleMeta, deriveDeployKillMeta } from "./scopes.js";
+import type { DeployKills } from "./scopes.js";
+import { freshVerdictEvaluation, VERDICT_MAX_INFLIGHT } from "./verdict_evaluation.js";
 import { validateTableGroupPayload } from "./validate_ops.js";
-import { evaluatePredicate, explainRowOpRestriction, explainRowOpFKReach } from "./predicates.js";
+import { evaluatePredicateTruth, explainRowOpRestriction, explainRowOpFKReach } from "./predicates.js";
 import type { OpVoidDetail } from "./op_void.js";
 import { RTableGroupViewImpl } from "./view.js";
 import {
@@ -208,57 +212,48 @@ export class RTableGroupImpl implements RTableGroupContract {
     private _causalDag: CausalDag | undefined;
     private tables: Map<string, RTableImpl> = new Map();
 
-    // The void-recursion cycle guard. Voiding can recurse: a restriction/exists
-    // (a caps insert gated by exists over caps, whose witness insert is itself
-    // gated, ...) AND FK reach (a write whose FK target's own
-    // liveness depends on another voided write). Both fold into ONE least-
-    // fixpoint: a cycle DENIES (the ENTIRE cycle is treated as VOID). This makes
-    // a self-granting op (its own witness) void — authority must root at a
-    // genesis fiat row, which is never voided — and an FK reference cycle resolve
-    // to DENY (replacing the former assume-live greatest-fixpoint FK guard).
+    // Entry verdicts. Voiding recurses: a restriction / exists (a caps insert
+    // gated by exists over caps, whose witness insert is itself gated, ...)
+    // and FK reach (a write whose FK target's own liveness depends on another
+    // entry) read other entries' verdicts. Every verdict is the well-founded
+    // one, computed by a VerdictEvaluation (mvt verdict_evaluation.ts;
+    // VOID_SEMANTICS.md section 4): entries that read each other form a
+    // component, solved by the alternating fixpoint, and whatever that leaves
+    // undecided collapses to void (`undecided-cycle`), bottom-up. So a
+    // self-granting op (its own witness) is void — authority must root at a
+    // genesis fiat row, which is never voided — an FK reference cycle that
+    // nothing outside it supports is void, and of two concurrent revokes of
+    // each other's revoker both are void (both caps survive) unless something
+    // outside the cycle decides one of them.
     //
-    // Deny-the-whole-cycle is the basic, replica-convergent semantics: it is a
-    // pure function of the entry and `from`, so every replica agrees regardless
-    // of which node a top-level query first touches. A delete-vs-delete negation
-    // cycle (mutual revocation) therefore resolves to BOTH deletes voided (both
-    // caps survive) — the conservative least fixpoint, not a single survivor.
+    // A verdict is a pure function of the entry and `from`, so every replica
+    // agrees regardless of which entry a top-level query touches first.
     //
-    // The visiting set lives in a PER-COMPUTATION VoidClosure (see
-    // void_closure.ts), NOT on the instance: one closure is minted at each
-    // top-level entry and threaded, mandatory, through every `*Closure` helper
-    // and every RTableViewImpl they build. This is what makes the guard safe
-    // under interleaved async evaluations on the same cached group instance — a
-    // shared instance Set let one computation observe another's transient
-    // visiting mark and falsely detect a cycle. Convention: a `*Closure` body
-    // may only call other `*Closure` helpers or `new RTableViewImpl(..., closure)`,
-    // never a minting wrapper. Keys are group-namespaced (createOpId | entry |
-    // from), so one closure flowing into a bound foreign group keeps today's
-    // per-group cycle semantics (an A->B->A ring still DENIES) without a shared
-    // cross-group guard.
+    // The evaluation is PER COMPUTATION, not on the instance: one is minted at
+    // each top-level entry and threaded, mandatory, through every helper that
+    // receives it and every RTableViewImpl those helpers build, so
+    // interleaved async computations on the same cached group instance never
+    // see each other's open components. A method that receives a
+    // VerdictEvaluation must pass that same evaluation on. It must never call
+    // a minting wrapper: isEntryVoided, explainEntryVoided,
+    // resolveForeignTableView, evaluateObserveGate, or the table's getView.
+    // Keys are group-namespaced (createOpId | entry | from), so one evaluation
+    // flows into bound foreign groups. Bindings form a DAG, so a component
+    // never spans two groups.
     //
-    // An INSTANCE-level (entry, from) cache is forbidden: it would leak a
-    // traversal-dependent intermediate (the in-stack deny) across independent
-    // top-level queries and break replica convergence (PERM12). The visiting
-    // mark stays transient (added before recursing, removed in finally).
+    // WITHIN one computation the evaluation memoizes completed components
+    // (`answers`); without that, an update chain is exponential (each
+    // update's getRow re-diagnoses every earlier write of the row).
     //
-    // WITHIN one computation the closure memoizes finished verdicts
-    // (`completed`); without that, an update chain is exponential (each
-    // update's getRow re-diagnoses every earlier write of the row). The rule
-    // that keeps the memo sound is in resolveVoidDetail: a verdict is stored
-    // unless its frame was open while some descendant was denied on a LOWER
-    // ancestor (a foreign cycle hit). A frame denied on its own key — getRow
-    // at version(U_k) seeing U_k — is a self hit and does not block storing.
-    // See VOID_SEMANTICS.md §4 for the argument and the PERM12 trace.
-    //
-    // `_voidInflight` is a FAIL-SAFE, not a verdict: the type system forces a
-    // closure onto every `*Closure` helper, but internal code could still call
-    // a minting wrapper by mistake, which on cyclic data would recurse forever
-    // through fresh closures (an unbounded microtask chain no timer can
-    // interrupt). The counter (bumped on each isEntryVoidedClosure /
-    // explainEntryVoidedClosure entry, released in finally) throws past
-    // VOID_MAX_INFLIGHT so such a bug surfaces as an immediate error, not a
-    // hang. It is additive under concurrency and never affects a verdict.
-    private _voidInflight = 0;
+    // `_verdictInflight` is a FAIL-SAFE, not a verdict: the type system forces
+    // an evaluation onto every helper that takes one, but internal code could
+    // still call a minting wrapper by mistake, which on cyclic data would
+    // recurse forever through fresh evaluations (an unbounded microtask chain
+    // no timer can interrupt). The counter (bumped in enterVerdictFrame on each
+    // diagnose run, released in finally) throws past VERDICT_MAX_INFLIGHT so
+    // such a bug surfaces as an immediate error, not a hang. It is additive
+    // under concurrency and never affects a verdict.
+    private _verdictInflight = 0;
 
     // Memoized inverse of the (injective) bindings map: group id -> binding
     // name. Injectivity is enforced at create-validation, so the inverse is a
@@ -421,58 +416,68 @@ export class RTableGroupImpl implements RTableGroupContract {
     // reference: the caller treats the FK target / exists atom as not-live).
     // Throws only if the bound group OBJECT is not present in the replica.
     //
-    // FK reach across the group boundary recurses through the foreign group's
-    // own least-fixpoint void guard (each group's per-closure visiting set
-    // self-terminates), so a mutual A->B->A FK ring resolves to DENY without a
-    // shared cross-group guard. The group-namespaced keys keep the marks of A
-    // and B distinct within the one closure that flows across the boundary.
+    // FK reach across the group boundary recurses into the foreign group's
+    // verdicts within the same evaluation; the group-namespaced keys keep the
+    // two groups' entries distinct.
     //
-    // Public entry: mints a fresh void closure (validation / view / auth call
+    // Public entry: mints a fresh void evaluation (validation / view / auth call
     // sites are top-level and never filter voided observes, so this wrapper
-    // hard-codes filterVoided=false). The internal, closure-threaded variant is
-    // resolveForeignTableViewClosure.
+    // hard-codes filterVoided=false). The internal, evaluation-threaded variant is
+    // resolveForeignTableViewIn.
     async resolveForeignTableView(
         groupName: string, table: string, at: Version, from: Version,
     ): Promise<RTableView | undefined> {
-        return this.resolveForeignTableViewClosure(freshVoidClosure(), groupName, table, at, from, false);
+        return this.resolveForeignTableViewIn(freshVerdictEvaluation(), groupName, table, at, from, false);
     }
 
-    // Cross-group table resolution threaded with the caller's void closure.
+    // Cross-group table resolution threaded with the caller's void evaluation.
     //
-    // `filterVoided` (view-time enforcement only): drop observations VOIDED at
-    // this `from` from the observed-version fold (Layer 2 of the observe gate),
-    // so a back-dated observation by a former principal contributes no foreign
-    // state. Only the void computation (diagnoseEntryVoidedClosure) enables it;
-    // the public wrapper leaves it false (the geometric resolution). Note the
-    // observed `from` stays geometric: voided-observe filtering is an `at`-fold
-    // property (which versions participate), not a negative-evidence horizon.
-    async resolveForeignTableViewClosure(
-        closure: VoidClosure, groupName: string, table: string, at: Version, from: Version, filterVoided: boolean,
-    ): Promise<RTableView | undefined> {
+    // `filterVoided` (view-time enforcement only): see through observations
+    // VOIDED at this `from` in the observed-version fold (Layer 2 of the
+    // observe gate), so a back-dated observation by a former principal
+    // contributes no foreign state. Only the void computation (diagnoseEntry)
+    // enables it; the public wrapper leaves it false (the geometric
+    // resolution). Note the observed `from` stays geometric: voided-observe
+    // filtering is an `at`-fold property (which versions participate), not a
+    // negative-evidence horizon.
+    async resolveForeignTableViewIn(
+        evaluation: VerdictEvaluation<OpVoidDetail>, groupName: string, table: string, at: Version, from: Version, filterVoided: boolean,
+    ): Promise<RTableViewImpl | undefined> {
         const groupId = this.getBindings()[groupName];
         if (groupId === undefined) return undefined;   // unbound name
 
         const foreign = await this.loadForeignGroup(groupId, groupName);
 
         const dag = await this.getScopedDag();
-        const isLive = filterVoided ? (h: B64Hash) => this.isObserveLiveClosure(closure, groupId, h, from) : undefined;
+        const isLive = filterVoided ? (h: B64Hash) => this.isObserveLive(evaluation, groupId, h, from) : undefined;
         const foreignAt = await resolveRefVersionAtPosition(dag, groupId, at, from, isLive);
         const foreignFrom = await resolveRefVersionAtPosition(dag, groupId, from, from);
 
         const foreignSchema = await foreign.resolveSchemaView(foreignAt, foreignFrom);
         if (!foreignSchema.hasTable(table)) return undefined;   // missing table
 
-        return new RTableViewImpl(foreign.makeTable(table), foreignAt, foreignFrom, closure);
+        return new RTableViewImpl(foreign.makeTable(table), foreignAt, foreignFrom, evaluation);
     }
 
     // Whether the observation entry `entryHash` (a ref-advance of bound group
     // `groupId`) is LIVE at this `from` horizon: ungated bindings are always
-    // live; a gated binding consults the at-use observe gate (the negation of
-    // isEntryVoided's verdict for the observe). Used as the `isLive` filter for
-    // the Layer 2 observed-version fold; threaded with the caller's closure.
-    private async isObserveLiveClosure(closure: VoidClosure, groupId: B64Hash, entryHash: B64Hash, from: Version): Promise<boolean> {
+    // live; a gated binding consults the at-use observe gate (the observe's
+    // verdict). Used as the `isLive` filter for the Layer 2 observed-version
+    // fold; threaded with the caller's evaluation.
+    private async isObserveLive(evaluation: VerdictEvaluation<OpVoidDetail>, groupId: B64Hash, entryHash: B64Hash, from: Version): Promise<boolean> {
         if (this.observeGateFor(groupId) === undefined) return true;   // ungated
-        return !await this.isEntryVoidedClosure(closure, entryHash, from);
+        return this.observeVerdictLive(evaluation, entryHash, from);
+    }
+
+    // An observe's verdict never rests on an open component: bindings form a
+    // DAG, so its gate reads only the observed group, and its widening reads
+    // only observes strictly above it (see resolveObserveGateRefAt).
+    private async observeVerdictLive(evaluation: VerdictEvaluation<OpVoidDetail>, entryHash: B64Hash, from: Version): Promise<boolean> {
+        const verdict = await this.resolveVerdict(evaluation, entryHash, from);
+        if (verdict.status === 'undecided') {
+            throw new Error(`observe '${entryHash}' is undecided: an observe is never on a verdict cycle`);
+        }
+        return verdict.status === 'live';
     }
 
     // Evaluate a binding's canObserve gate in the OBSERVED group's frame
@@ -480,25 +485,27 @@ export class RTableGroupImpl implements RTableGroupContract {
     // group's tables at the observed foreign version (refAt, refFrom). 'object'
     // context (no subject row). Returns true when the binding is ungated. Both
     // the validation path and the at-use path call this with their own anchors.
-    // Public entry: mints a fresh void closure. The internal, closure-threaded
-    // variant is evaluateObserveGateClosure.
+    // Public entry: mints a fresh void evaluation. The internal, evaluation-threaded
+    // variant is evaluateObserveGateIn.
     async evaluateObserveGate(
         refId: B64Hash, author: KeyId | undefined, refAt: Version, refFrom: Version,
     ): Promise<boolean> {
-        return this.evaluateObserveGateClosure(freshVoidClosure(), refId, author, refAt, refFrom);
+        const truth = await this.evaluateObserveGateIn(freshVerdictEvaluation(), refId, author, refAt, refFrom);
+        if (truth.status === 'undecided') throw new Error('an observe gate is undecided outside the component being solved');
+        return truth.status === 'true';
     }
 
-    async evaluateObserveGateClosure(
-        closure: VoidClosure, refId: B64Hash, author: KeyId | undefined, refAt: Version, refFrom: Version,
-    ): Promise<boolean> {
+    async evaluateObserveGateIn(
+        evaluation: VerdictEvaluation<OpVoidDetail>, refId: B64Hash, author: KeyId | undefined, refAt: Version, refFrom: Version,
+    ): Promise<Truth> {
         const gate = this.observeGateFor(refId);
-        if (gate === undefined) return true;   // ungated binding
+        if (gate === undefined) return TRUE;   // ungated binding
 
         const foreign = await this.loadForeignGroup(refId, this.bindingNameForId(refId));
-        return evaluatePredicate(gate, {
-            getTableView: async (table) => new RTableViewImpl(foreign.makeTable(table), refAt, refFrom, closure),
+        return evaluatePredicateTruth(gate, {
+            getTableView: async (table) => new RTableViewImpl(foreign.makeTable(table), refAt, refFrom, evaluation),
             getForeignTableView: (groupName, table) =>
-                foreign.resolveForeignTableViewClosure(closure, groupName, table, refAt, refFrom, false),
+                foreign.resolveForeignTableViewIn(evaluation, groupName, table, refAt, refFrom, false),
             author,
             context: 'object',
         });
@@ -515,27 +522,44 @@ export class RTableGroupImpl implements RTableGroupContract {
     // never recurse into each other. A negative edge (a revoke of this observe's
     // author) rides a strictly-dominating version under use-before-revoke, so
     // restricting to G-upward loses no security-relevant widening.
-    async resolveObserveGateRefAtClosure(closure: VoidClosure, refId: B64Hash, opPos: Version, from: Version): Promise<Version> {
+    //
+    // The walk sees through void candidates, so a void observe does not hide a
+    // live one below it. Liveness is asked only of candidates strictly above
+    // the base (the recursion keeps ascending). A candidate that is not
+    // strictly above stops the walk and is dropped: an A-predecessor's version
+    // is at or below its successor's (write-time monotonicity), so nothing
+    // below it can be strictly above either.
+    async resolveObserveGateRefAt(evaluation: VerdictEvaluation<OpVoidDetail>, refId: B64Hash, opPos: Version, from: Version): Promise<Version> {
         const dag = await this.getScopedDag();
         const base = await resolveRefVersionAtPosition(dag, refId, opPos, opPos);   // causal base (no widening)
 
         const foreignDag = await this.getForeignGroupCausalDag(refId);
         const refAt = version(...base);
 
-        const concurrent = await findConcurrentRefAdvanceBarriers(dag, refId, opPos, from);
+        const strictlyAbove = new Map<B64Hash, Version | undefined>();
+        const widening = async (z: B64Hash, entry: { payload: json.Literal }): Promise<Version | undefined> => {
+            if (!strictlyAbove.has(z)) {
+                let vz: Version | undefined;
+                if (isRefAdvancePayload(entry.payload)) {
+                    const candidate = extractRefVersion(entry.payload as RefAdvancePayload);
+                    // strictly G-above the base: vz >= base AND base !>= vz
+                    if (await refVersionAtOrAbove(foreignDag, candidate, base)
+                        && !await refVersionAtOrAbove(foreignDag, base, candidate)) {
+                        vz = candidate;
+                    }
+                }
+                strictlyAbove.set(z, vz);
+            }
+            return strictlyAbove.get(z);
+        };
+
+        const concurrent = await findConcurrentRefAdvanceBarriers(dag, refId, opPos, from,
+            async (z, entry) => (await widening(z, entry)) === undefined || await this.observeVerdictLive(evaluation, z, from));
         for (const z of concurrent) {
             const entry = await dag.loadEntry(z);
-            if (entry === undefined || !isRefAdvancePayload(entry.payload)) continue;
-            const vz = extractRefVersion(entry.payload as RefAdvancePayload);
-
-            // strictly G-above the base: vz >= base AND base !>= vz
-            const above = await refVersionAtOrAbove(foreignDag, vz, base);
-            if (!above) continue;
-            const below = await refVersionAtOrAbove(foreignDag, base, vz);
-            if (below) continue;   // equal / not strict -> not a widening candidate
-
-            if (await this.isEntryVoidedClosure(closure, z, from)) continue;   // skip voided concurrent observes
-
+            if (entry === undefined) continue;
+            const vz = await widening(z, entry);
+            if (vz === undefined) continue;
             for (const h of vz) refAt.add(h);
         }
 
@@ -596,8 +620,8 @@ export class RTableGroupImpl implements RTableGroupContract {
     // types that observe a group for their identities (rfiles).
     async providerPublicKeyAt(table: string, keyId: KeyId, at: Version): Promise<PublicKey | undefined> {
         // rawProviderPublicKey never reaches the void guard, but the view
-        // constructor requires a closure, so mint a throwaway one.
-        return new RTableViewImpl(this.makeTable(table), at, at, freshVoidClosure()).rawProviderPublicKey(keyId);
+        // constructor requires an evaluation, so mint a throwaway one.
+        return new RTableViewImpl(this.makeTable(table), at, at, freshVerdictEvaluation()).rawProviderPublicKey(keyId);
     }
 
     // Deploy: THE schema deploy moment — a barrier ref-advance of the schema
@@ -615,7 +639,8 @@ export class RTableGroupImpl implements RTableGroupContract {
             }
         }
 
-        return (await this.getScopedDag()).append(prepared.payload, prepared.meta, prepared.at);
+        const meta = await this.deriveDeployMeta(prepared.payload as unknown as RefAdvancePayload, prepared.at);
+        return (await this.getScopedDag()).append(prepared.payload, meta, prepared.at);
     }
 
     deployNeedsAuthor(): boolean {
@@ -630,7 +655,8 @@ export class RTableGroupImpl implements RTableGroupContract {
 
     // The deploy payload at `at` (defaults to the frontier), signed when an
     // author is given, without appending it: the catalog planner validates it
-    // in a dry run first.
+    // in a dry run first. The meta carries the ref-advance tags only; deploy()
+    // derives the full meta when it appends (deriveDeployMeta).
     async prepareDeploy(refVersion: Version, author?: OwnIdentity, at?: Version): Promise<{ payload: json.LiteralMap; meta: MetaProps; at: Version }> {
         const scopedDag = await this.getScopedDag();
         at = at ?? await scopedDag.getFrontier();
@@ -649,6 +675,107 @@ export class RTableGroupImpl implements RTableGroupContract {
             : base;
 
         return { payload, meta, at };
+    }
+
+    // The meta of a schema deploy appended at `at`: the ref-advance tags, plus
+    // the rows the deploy deletes because they do not honor an FK it adds or
+    // retargets (see fkAdoptionKills and deriveDeployKillMeta). The local
+    // deploy and sync ingestion (applyPayload) both derive it, on every
+    // replica, and it is stored with the entry. Meta is unhashed and never
+    // rewritten, so this derivation is protocol: changing it, or the liveness
+    // rules it reads at `at`, needs a store migration that re-applies entries.
+    async deriveDeployMeta(payload: RefAdvancePayload, at: Version): Promise<MetaProps> {
+        return { ...createRefAdvanceMeta(payload.refId), ...deriveDeployKillMeta(await this.fkAdoptionKills(payload, at)) };
+    }
+
+    // The rows a schema deploy at `at` deletes. An FK is adopted when the
+    // deploy adds or retargets it on a table it neither creates nor resets,
+    // over a column it does not re-create (a new column holds no old values).
+    // Each row live at `at` whose value in an adopted FK is not the rowId of a
+    // target live at `at` is deleted; a target table the deploy creates or
+    // resets holds no old rows. The set is closed over the adopted FKs, so a
+    // row pointing at a deleted row through one goes too (chains and
+    // self-references). Rows pointing at a deleted row through an FK that
+    // already held stay, as after any delete.
+    private async fkAdoptionKills(payload: RefAdvancePayload, at: Version): Promise<DeployKills> {
+        const before = await this.resolveSchemaView(at);
+        const deployed = version(...this.getPinnedSchemaVersion());
+        for (const hash of extractRefVersion(payload)) deployed.add(hash);
+        const after = await (await this.getSchemaObject()).getView(deployed, deployed);
+
+        const kept = (table: string): boolean => {
+            const incarnation = before.getTableIncarnation(table);
+            return incarnation !== undefined && incarnation === after.getTableIncarnation(table);
+        };
+
+        const adopted: { table: string; incarnation: IncarnationId; fks: [string, string][] }[] = [];
+        for (const table of after.getTableNames()) {
+            if (!kept(table)) continue;
+            const beforeFks = before.getFKs(table);
+            const fks = Object.entries(after.getFKs(table)).filter(([column, target]) =>
+                beforeFks[column] !== target
+                && before.getColumnIncarnation(table, column) === after.getColumnIncarnation(table, column));
+            if (fks.length > 0) adopted.push({ table, incarnation: before.getTableIncarnation(table)!, fks });
+        }
+        if (adopted.length === 0) return new Map();
+
+        const killed = new Map<string, Set<B64Hash>>();
+        const queue: [string, B64Hash][] = [];
+        const kill = (table: string, rowId: B64Hash): void => {
+            let rows = killed.get(table);
+            if (rows === undefined) killed.set(table, rows = new Set());
+            if (rows.has(rowId)) return;
+            rows.add(rowId);
+            queue.push([table, rowId]);
+        };
+        // target table -> target rowId -> the rows pointing at it through an adopted FK
+        const dependents = new Map<string, Map<B64Hash, [string, B64Hash][]>>();
+
+        for (const { table, fks } of adopted) {
+            const view = await this.makeTable(table).getView(at, at);
+            for (const rowId of await view.liveRowIds()) {
+                const row = await view.getRow(rowId);
+                if (row === undefined) continue;
+                for (const [column, target] of fks) {
+                    const value = row.values[column];
+                    if (value === undefined) continue;   // nullable / absent: unconstrained
+                    if (typeof value !== 'string' || !await this.adoptedTargetLive(target, value, at, kept)) {
+                        kill(table, rowId);
+                        break;
+                    }
+                    const [groupName, targetTable] = splitTableRef(target);
+                    if (groupName !== undefined) continue;   // this deploy deletes no foreign row
+                    let byRow = dependents.get(targetTable);
+                    if (byRow === undefined) dependents.set(targetTable, byRow = new Map());
+                    let pointing = byRow.get(value);
+                    if (pointing === undefined) byRow.set(value, pointing = []);
+                    pointing.push([table, rowId]);
+                }
+            }
+        }
+
+        while (queue.length > 0) {
+            const [table, rowId] = queue.shift()!;
+            for (const [dependentTable, dependentRowId] of dependents.get(table)?.get(rowId) ?? []) {
+                kill(dependentTable, dependentRowId);
+            }
+        }
+
+        const kills: DeployKills = new Map();
+        for (const { table, incarnation } of adopted) {
+            const rowIds = killed.get(table);
+            if (rowIds !== undefined) kills.set(table, { incarnation, rowIds });
+        }
+        return kills;
+    }
+
+    private async adoptedTargetLive(targetRef: string, rowId: B64Hash, at: Version, kept: (table: string) => boolean): Promise<boolean> {
+        const [groupName, table] = splitTableRef(targetRef);
+        if (groupName !== undefined) {
+            const view = await this.resolveForeignTableView(groupName, table, at, at);
+            return view !== undefined && await view.hasRow(rowId);
+        }
+        return kept(table) && await (await this.makeTable(table).getView(at, at)).hasRow(rowId);
     }
 
     // Observe a bound foreign group at `refVersion`: a BARRIER ref-advance of
@@ -737,101 +864,78 @@ export class RTableGroupImpl implements RTableGroupContract {
     // or schema/observation revisions can still void the entry. Written FK
     // columns use the same view-time path. Bundles are all-or-nothing. The
     // genesis create entry is fiat (never voided);
-    // ref-advances carry no row restrictions. A cycle on the
-    // authorization-recursion stack DENIES (treated as voided — least fixpoint;
-    // see the closure note above). Public entry: mints a fresh void closure;
-    // the internal, closure-threaded variant is isEntryVoidedClosure.
+    // ref-advances carry no row restrictions. Entries whose verdicts depend on
+    // each other are solved together (see the evaluation note above). Public
+    // entry: mints a fresh void evaluation; the internal, evaluation-threaded
+    // variant is entryStatusIn.
     async isEntryVoided(entryHash: B64Hash, from: Version): Promise<boolean> {
-        return this.isEntryVoidedClosure(freshVoidClosure(), entryHash, from);
-    }
-
-    async isEntryVoidedClosure(closure: VoidClosure, entryHash: B64Hash, from: Version): Promise<boolean> {
-        return (await this.resolveVoidDetail(closure, entryHash, from)) !== undefined;
+        return (await this.topLevelVerdict(entryHash, from)).status === 'void';
     }
 
     async explainEntryVoided(entryHash: B64Hash, from: Version): Promise<OpVoidDetail | undefined> {
-        return this.explainEntryVoidedClosure(freshVoidClosure(), entryHash, from);
+        const verdict = await this.topLevelVerdict(entryHash, from);
+        return verdict.status === 'void' ? verdict.reason : undefined;
     }
 
-    async explainEntryVoidedClosure(closure: VoidClosure, entryHash: B64Hash, from: Version): Promise<OpVoidDetail | undefined> {
-        return this.resolveVoidDetail(closure, entryHash, from);
+    // The entry's verdict within `evaluation`: undecided only while the entry
+    // belongs to the component being solved.
+    entryStatusIn(evaluation: VerdictEvaluation<OpVoidDetail>, entryHash: B64Hash, from: Version): Promise<Verdict<OpVoidDetail>> {
+        return this.resolveVerdict(evaluation, entryHash, from);
     }
 
-    // Shared diagnose + memo for isEntryVoidedClosure / explainEntryVoidedClosure
-    // (one body, so boolean and explain cannot drift). Protocol:
-    //
-    //   completed hit  -> return stored verdict; NOT a frame (no enterVoidFrame,
-    //                     no push).
-    //   visiting hit   -> DENY (authorization-cycle), never stored. If the asked
-    //                     key is not the current top it is a FOREIGN hit: bump
-    //                     the counter so every frame open right now declines to
-    //                     store. A hit on the top itself is getRow/hasRow at the
-    //                     op's own position seeing the op (self hit) — structural
-    //                     in every evaluation of that key, so it is harmless.
-    //   otherwise      -> push, diagnose, store iff no foreign hit happened in
-    //                     between (including `undefined` = live), pop in finally.
-    //
-    // Nothing is stored on throw (the set follows the await); finally still
-    // balances the in-flight counter and the stack. `stack` mirrors `visiting`
-    // and both assume one sequential traversal per closure (void_closure.ts).
-    private async resolveVoidDetail(
-        closure: VoidClosure, entryHash: B64Hash, from: Version,
-    ): Promise<OpVoidDetail | undefined> {
-        // group-namespaced key: one closure may span bound foreign groups, and
-        // each group's marks must stay distinct (see the closure note).
+    private async topLevelVerdict(entryHash: B64Hash, from: Version): Promise<Verdict<OpVoidDetail>> {
+        const verdict = await this.resolveVerdict(freshVerdictEvaluation(), entryHash, from);
+        if (verdict.status === 'undecided') throw new Error(`entry '${entryHash}' is undecided at the top level`);
+        return verdict;
+    }
+
+    // One body behind isEntryVoided / explainEntryVoided / entryStatusIn, so
+    // boolean and explain cannot drift.
+    private resolveVerdict(
+        evaluation: VerdictEvaluation<OpVoidDetail>, entryHash: B64Hash, from: Version,
+    ): Promise<Verdict<OpVoidDetail>> {
+        // group-namespaced key: one evaluation may span bound foreign groups
         const key = this.createOpId + '|' + entryHash + '|' + [...from].sort().join(',');
-
-        if (closure.completed.has(key)) return closure.completed.get(key);
-
-        // A cycle on the authorization-recursion stack: DENY (least fixpoint).
-        if (closure.visiting.has(key)) {
-            const top = closure.stack[closure.stack.length - 1];
-            if (top !== key) closure.foreignCycleHits++;
-            return { kind: 'authorization-cycle' };
-        }
-
-        closure.visiting.add(key);
-        closure.stack.push(key);
-        const cycleHitsBefore = closure.foreignCycleHits;
-        try {
-            this.enterVoidFrame();
-            const detail = await this.diagnoseEntryVoidedClosure(closure, entryHash, from);
-            if (closure.foreignCycleHits === cycleHitsBefore) {
-                closure.completed.set(key, detail);
+        return evaluation.resolve(key, async () => {
+            try {
+                this.enterVerdictFrame();
+                return await this.diagnoseEntry(evaluation, entryHash, from);
+            } finally {
+                this._verdictInflight--;
             }
-            return detail;
-        } finally {
-            this._voidInflight--;
-            closure.stack.pop();
-            closure.visiting.delete(key);
-        }
+        });
     }
 
-    // Fail-safe (not a verdict): a lost closure would recurse forever through
-    // fresh closures — an unbounded microtask chain no timer can interrupt — so
-    // bound the in-flight void frames and throw past it, turning the hang into
+    // Fail-safe (not a verdict): a lost evaluation would recurse forever through
+    // fresh evaluations — an unbounded microtask chain no timer can interrupt — so
+    // bound the in-flight diagnose runs and throw past it, turning the hang into
     // an immediate, self-explaining error. Called as the first statement inside
     // the try, so the caller's finally always balances the increment (even on
-    // the throw). See void_closure.ts.
-    private enterVoidFrame(): void {
-        if (++this._voidInflight > VOID_MAX_INFLIGHT) {
+    // the throw).
+    private enterVerdictFrame(): void {
+        if (++this._verdictInflight > VERDICT_MAX_INFLIGHT) {
             throw new Error(
-                `void recursion exceeded VOID_MAX_INFLIGHT (${VOID_MAX_INFLIGHT}) frames ` +
-                `— a VoidClosure was almost certainly dropped (a *Closure helper called a ` +
-                `minting wrapper instead of threading its closure)`);
+                `verdict recursion exceeded VERDICT_MAX_INFLIGHT (${VERDICT_MAX_INFLIGHT}) frames ` +
+                `— a VerdictEvaluation was almost certainly dropped (a helper that received one called a ` +
+                `minting wrapper instead of passing it on)`);
         }
     }
 
-    private async diagnoseEntryVoidedClosure(closure: VoidClosure, entryHash: B64Hash, from: Version): Promise<OpVoidDetail | undefined> {
-        if (entryHash === this.createOpId) return undefined;   // genesis fiat
+    // An entry is live when every op passes its restriction and FK reach, in
+    // bundle order: the first check that fails gives the reason; an undecided
+    // one leaves the entry undecided unless a later one fails. The views read
+    // the entry itself as void: an op is not its own witness, and its own
+    // delete does not hide its subject row.
+    private async diagnoseEntry(evaluation: VerdictEvaluation<OpVoidDetail>, entryHash: B64Hash, from: Version): Promise<Verdict<OpVoidDetail>> {
+        if (entryHash === this.createOpId) return { status: 'live' };   // genesis fiat
 
         const scopedDag = await this.getScopedDag();
         const entry = await scopedDag.loadEntry(entryHash);
-        if (entry === undefined) return undefined;
+        if (entry === undefined) return { status: 'live' };
 
         const payload = entry.payload as json.LiteralMap;
         if (isRefAdvancePayload(payload)) {
-            return this.diagnoseObserveVoidedClosure(closure, payload as unknown as RefAdvancePayload, entryHash, from);
+            return this.diagnoseObserve(evaluation, payload as unknown as RefAdvancePayload, entryHash, from);
         }
 
         const ops: { table: string; op: RowOpPayload }[] = [];
@@ -844,14 +948,14 @@ export class RTableGroupImpl implements RTableGroupContract {
                 ops.push({ table: write.table, op: write.op as RowOpPayload });
             }
         } else {
-            return undefined;   // create / unknown
+            return { status: 'live' };   // create / unknown
         }
 
         const opPos = version(entryHash);
         const schemaView = await this.resolveSchemaView(opPos, from);
-        const getTableView = async (table: string) => new RTableViewImpl(this.makeTable(table), opPos, from, closure);
+        const getTableView = async (table: string) => new RTableViewImpl(this.makeTable(table), opPos, from, evaluation, entryHash);
         const getForeignTableView = (group: string, table: string) =>
-            this.resolveForeignTableViewClosure(closure, group, table, opPos, from, true);
+            this.resolveForeignTableViewIn(evaluation, group, table, opPos, from, true);
 
         const selfInserted = new Map<string, Set<B64Hash>>();
         const selfDeleted = new Map<string, Set<B64Hash>>();
@@ -868,74 +972,79 @@ export class RTableGroupImpl implements RTableGroupContract {
         };
 
         const authenticated = this.getIdProvider() !== undefined;
+        const undecided: Truth[] = [];
         for (const [index, { table, op }] of ops.entries()) {
-            const restrictionFailure = await explainRowOpRestriction(
+            const restriction = await explainRowOpRestriction(
                 op, table, schemaView, authenticated, getTableView, getForeignTableView,
             );
-            if (restrictionFailure !== undefined) {
+            if (restriction.failure !== undefined) {
                 // row-not-live is an explain alias for restriction failure when
                 // enforced liveness is absent; it must not run before restriction
                 // diagnosis (valid deletes whose rules pass without a live target
                 // row would otherwise be voided incorrectly).
                 if ((op.action === 'update' || op.action === 'delete')
                     && localTargetProvided(table, op.rowId) !== true
-                    && !(await (await getTableView(table)).hasRow(op.rowId))) {
+                    && (await (await getTableView(table)).rowLiveness(op.rowId)).truth.status === 'false') {
                     const detail: OpVoidDetail = {
                         kind: 'row-not-live',
                         table,
                         action: op.action,
                         rowId: op.rowId,
                     };
-                    return isBundle ? { kind: 'bundle', index, detail } : detail;
+                    return { status: 'void', reason: isBundle ? { kind: 'bundle', index, detail } : detail };
                 }
                 const detail: OpVoidDetail = {
                     kind: 'restriction',
-                    table: restrictionFailure.table,
-                    action: restrictionFailure.action,
-                    rowId: restrictionFailure.rowId,
-                    rule: restrictionFailure.rule,
+                    table: restriction.failure.table,
+                    action: restriction.failure.action,
+                    rowId: restriction.failure.rowId,
+                    rule: restriction.failure.rule,
                 };
-                return isBundle ? { kind: 'bundle', index, detail } : detail;
+                return { status: 'void', reason: isBundle ? { kind: 'bundle', index, detail } : detail };
             }
+            undecided.push(restriction.truth);
 
-            const fkFailure = await explainRowOpFKReach(
+            const fk = await explainRowOpFKReach(
                 op, table, schemaView, getTableView, getForeignTableView, localTargetProvided,
             );
-            if (fkFailure !== undefined) {
+            if (fk.failure !== undefined) {
                 const detail: OpVoidDetail = {
                     kind: 'fk',
-                    table: fkFailure.table,
-                    action: fkFailure.action,
-                    rowId: fkFailure.rowId,
-                    column: fkFailure.column,
-                    targetRef: fkFailure.targetRef,
-                    targetRowId: fkFailure.targetRowId,
+                    table: fk.failure.table,
+                    action: fk.failure.action,
+                    rowId: fk.failure.rowId,
+                    column: fk.failure.column,
+                    targetRef: fk.failure.targetRef,
+                    targetRowId: fk.failure.targetRowId,
                 };
-                return isBundle ? { kind: 'bundle', index, detail } : detail;
+                return { status: 'void', reason: isBundle ? { kind: 'bundle', index, detail } : detail };
             }
+            undecided.push(fk.truth);
         }
-        return undefined;
+        const truth = allTruth(undecided);
+        return truth.status === 'undecided' ? truth : { status: 'live' };
     }
 
-    private async diagnoseObserveVoidedClosure(
-        closure: VoidClosure, payload: RefAdvancePayload, entryHash: B64Hash, from: Version,
-    ): Promise<OpVoidDetail | undefined> {
+    private async diagnoseObserve(
+        evaluation: VerdictEvaluation<OpVoidDetail>, payload: RefAdvancePayload, entryHash: B64Hash, from: Version,
+    ): Promise<Verdict<OpVoidDetail>> {
         const refId = payload.refId;
-        if (refId === this.getSchemaRef()) return undefined;
+        if (refId === this.getSchemaRef()) return { status: 'live' };
         const gate = this.observeGateFor(refId);
-        if (gate === undefined) return undefined;
+        if (gate === undefined) return { status: 'live' };
 
         const dag = await this.getScopedDag();
         const opPos = version(entryHash);
-        const refAt = await this.resolveObserveGateRefAtClosure(closure, refId, opPos, from);
+        const refAt = await this.resolveObserveGateRefAt(evaluation, refId, opPos, from);
         const refFrom = await resolveRefVersionAtPosition(dag, refId, from, from);
         const author = extractAuthor(payload as unknown as json.LiteralMap);
 
-        const ok = await this.evaluateObserveGateClosure(closure, refId, author, refAt, refFrom);
-        if (ok) return undefined;
+        const truth = await this.evaluateObserveGateIn(evaluation, refId, author, refAt, refFrom);
+        if (truth.status === 'true') return { status: 'live' };
+        if (truth.status === 'undecided') return truth;
 
         const binding = this.bindingNameForId(refId);
-        return { kind: 'observe-gate', binding: binding ?? refId, rule: gate };
+        return { status: 'void', reason: { kind: 'observe-gate', binding: binding ?? refId, rule: gate } };
     }
 
     // RObject interface
@@ -953,7 +1062,10 @@ export class RTableGroupImpl implements RTableGroupContract {
             // deploy AND a foreign-group observation revise the merged
             // frontier, so a concurrent deploy / foreign revoke voids a
             // concurrent use there (see observe + view.ts schemaView).
-            return scopedDag.append(payload, createRefAdvanceMeta(refPayload.refId), at);
+            const meta = refPayload.refId === this.getSchemaRef()
+                ? await this.deriveDeployMeta(refPayload, at)
+                : createRefAdvanceMeta(refPayload.refId);
+            return scopedDag.append(payload, meta, at);
         }
 
         const action = (payload as json.LiteralMap)['action'];

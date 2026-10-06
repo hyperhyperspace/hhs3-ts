@@ -35,7 +35,7 @@ export interface RCapView extends View {
     getObject(): RCap;
     isIdentity(keyId: KeyId): Promise<boolean>;
     capabilityExists(capName: string): Promise<boolean>;
-    hasCapability(grantee: KeyId, capName: string, visiting?: Set<string>): Promise<boolean>;
+    hasCapability(grantee: KeyId, capName: string): Promise<boolean>;
     getManagedBy(capName: string): Promise<string[]>;
     currentCapCreationVersion(capName: string): Promise<Version>;
     getCapabilities(): Promise<string[]>;

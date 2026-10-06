@@ -60,8 +60,9 @@ function pick<T>(prng: PRNG, arr: T[]): T | undefined {
 // random history of rows / updates / deletes (incl. FK-target deletes) /
 // bundles / schema deploys (add-column-default, drop-column, drop/re-add FK,
 // set-concurrent-deletes). Every op is attempted at a possibly-concurrent
-// checkpoint; write-time rejections (dangling FK, add-fk prerequisite, etc.)
-// are caught and skipped without aborting the history.
+// checkpoint; write-time rejections (dangling FK, etc.) are caught and skipped
+// without aborting the history. A re-added FK always deploys, deleting the
+// lines it strands, so parity covers deploy kills.
 export async function generateSingleGroupHistory(seed: number, ops: number): Promise<GroupHistory> {
     const prng = new PRNG(seed);
     const ctx = createMockRContext({ selfValidate: true });
@@ -184,7 +185,7 @@ export async function generateSingleGroupHistory(seed: number, ops: number): Pro
                 }
 
                 const v2 = await schemaFrontier();
-                await group.deploy(v2, undefined, at);   // may throw (add-fk prerequisite) -> caught
+                await group.deploy(v2, undefined, at);
 
                 // only reached when the deploy applied
                 if (kind === 'add-status') hasStatus = true;

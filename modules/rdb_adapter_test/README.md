@@ -6,7 +6,7 @@ Histories for the generative suite come from [rdb_adapter_test_gen](../rdb_adapt
 
 ## Contents
 
-- `createProjectionSuite(label, factory)` — initial materialization, incremental insert/update/delete with id stability, re-projection idempotence, `apply()` atomicity, and FK projection.
+- `createProjectionSuite(label, factory)` — initial materialization, incremental insert/update/delete with id stability, re-projection idempotence, `apply()` atomicity, FK projection, `set-fks` flips, the rows an add-fk deploy deletes, and the dangling FK values left when an FK's target table is reset.
 - `createIngestionSuite(label, factory)` — local-edit round-trips, coalescing, insert-then-delete cancellation, readonly rejection, FK ordering, and dangling-FK rejection.
 - `createKeysSuite(label, factory)` — `rdb_keys` / `author_key_id` round-trips (`keyHashForId`, register idempotence).
 - `createProjectionParitySuite(label, factory, profile?)` — seeded generative sweep (see below). Filter name is `PROJECTION`.

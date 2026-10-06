@@ -4,13 +4,16 @@
 //
 // Three channels:
 //   - schema sub-delta (uniform): `schemaChanges` carries column defaults,
-//     table/column drops, FK/restriction/concurrentDeletes flips as RSchema
-//     changes. The consumer applies these to rows NOT present in the row-walk;
-//     they are never enumerated per row (an old untouched row affected only by
-//     a default/drop produces no RowChange).
+//     table/column drops and re-adds, FK/restriction/concurrentDeletes flips
+//     as RSchema changes. The consumer applies these table-wide; they are
+//     never enumerated per row (the row channel compares each row within the
+//     end horizon's incarnations, so a row affected only by a default, a drop
+//     or a reset produces no RowChange, walked or not).
 //   - per-table row-walk (positional): each touched member table's RTableChanges
 //     in the root delta's `nested` map, keyed by the table id. A row appears
 //     only when its liveness flipped or a written value moved (see ../rtable/delta.ts).
+//     A schema deploy that deletes the rows stranded by an FK it adopts is
+//     walked like a delete: its `tables` meta routes it to those tables.
 //   - op verdict flips: `opVerdictChanges` lists group DAG entries whose
 //     at-use void verdict changed between the start and end view horizons
 //     (insert/update/delete/bundle ops and gated observes that flip). Row
@@ -104,9 +107,11 @@ export class RTableGroupDeltaAccumulator implements DeltaAccumulator<RTableGroup
     ) {}
 
     // Route the entry to each member table it touches (the `tables` meta lists
-    // them; ref-advance entries carry none and route nowhere). The schema
+    // them). Ref-advance entries carry none and route nowhere, except a schema
+    // deploy that deletes rows for an FK it adopts: it lists the tables it
+    // deletes from (see deriveDeployKillMeta in scopes.ts). The schema
     // sub-delta is computed wholesale in finalize, so deploy / observe entries
-    // need no per-entry routing here.
+    // need no other per-entry routing here.
     async ingest(entry: dag.Entry): Promise<boolean> {
         const tablesMeta = entry.meta['tables'];
         if (tablesMeta === undefined) return false;

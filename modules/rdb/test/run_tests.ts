@@ -13,6 +13,7 @@ import { rdbCatalogTests } from "./rdb_catalog_tests.js";
 import { rtableGroupTests } from "./rtable_group_tests.js";
 import { rtableLwwTests } from "./rtable_lww_tests.js";
 import { rtableVoidMemoTests } from "./rtable_void_memo_tests.js";
+import { verdictReadsTests } from "./verdict_reads_tests.js";
 import { rtableBundleTests } from "./rtable_bundle_tests.js";
 import { rtableEnforceTests } from "./rtable_enforce_tests.js";
 import { rtableXGroupTests } from "./rtable_xgroup_tests.js";
@@ -50,6 +51,7 @@ async function main() {
     allTests.set(rtableGroupTests.title, rtableGroupTests.tests);
     allTests.set(rtableLwwTests.title, rtableLwwTests.tests);
     allTests.set(rtableVoidMemoTests.title, rtableVoidMemoTests.tests);
+    allTests.set(verdictReadsTests.title, verdictReadsTests.tests);
     allTests.set(rtableBundleTests.title, rtableBundleTests.tests);
     allTests.set(rtableEnforceTests.title, rtableEnforceTests.tests);
     allTests.set(rtableXGroupTests.title, rtableXGroupTests.tests);
@@ -84,7 +86,7 @@ async function main() {
                 // instead of blocking CI. Delta-parity sweeps legitimately run
                 // long, so they get a wider bound. NOTE: the void guard's
                 // in-flight fail-safe (group.ts) is what catches a dropped
-                // VoidClosure — that spins purely in microtasks and would never
+                // VerdictEvaluation — that spins purely in microtasks and would never
                 // reach this timer; the timer covers everything that does yield.
                 const timeoutMs = title.indexOf('DELTA_PARITY') >= 0 ? 600_000 : 60_000;
                 testing.exitIfFailed(await testing.run(test.name, test.invoke, { timeoutMs }));

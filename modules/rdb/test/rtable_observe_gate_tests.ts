@@ -3,7 +3,7 @@ import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from 
 import type { B64Hash, KeyId, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import type { RContext, Version } from "@hyper-hyper-space/hhs3_mvt";
-import { formatValidationFailure, signPayload, ValidationRejectedError } from "@hyper-hyper-space/hhs3_mvt";
+import { formatValidationFailure, signPayload, ValidationRejectedError, version } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
@@ -12,7 +12,7 @@ import { tableSigningContext } from "../src/rtable_group/payload.js";
 import { deriveRowId } from "../src/rtable/hash.js";
 import type { Predicate, TableDef } from "../src/rschema/payload.js";
 import {
-    usersSchemaTables, identityRow, capRow, grantCap, revokeCap,
+    usersSchemaTables, identityRow, capRow, grantCap, revokeCap, registerIdentity,
     IDENTITIES_TABLE, CAPS_TABLE, USERS_MANAGER_LABEL, USERS_SCHEMA_NAME,
     USERS_BINDING, USERS_IDENTITIES_PROVIDER,
 } from "../src/users/users.js";
@@ -311,7 +311,7 @@ export const rtableObserveGateTests = {
             // transient visiting mark for the same (entry, from) and falsely
             // conclude a cycle — voiding a live manager cap and flipping the
             // result to empty/false/invalid at some phase offset. With the
-            // per-computation VoidClosure each computation is isolated, so all
+            // per-computation VerdictEvaluation each computation is isolated, so all
             // results are deterministically live.
             name: '[OBSGATE07] interleaved concurrent void computations on one shared group instance never cross-talk',
             invoke: async () => {
@@ -352,22 +352,101 @@ export const rtableObserveGateTests = {
                         const caps = await (await b.group.getView(at, at)).getTableView(CAPS_TABLE);
                         const found = await caps.findRowIds({ label: USERS_MANAGER_LABEL, grantee: m2.keyId });
                         assertTrue(found.length > 0,
-                            `iter ${i}: m2's manager cap must be found (a dropped/shared VoidClosure falsely voids it)`);
+                            `iter ${i}: m2's manager cap must be found (a dropped/shared VerdictEvaluation falsely voids it)`);
                     })());
                     tasks.push((async () => {
                         await hop((i + 2) % 5);
                         const ok = await a.group.evaluateObserveGate(usersId, m2.keyId, at, at);
                         assertTrue(ok,
-                            `iter ${i}: m2 must pass the manager observe gate (a dropped/shared VoidClosure falsely fails it)`);
+                            `iter ${i}: m2 must pass the manager observe gate (a dropped/shared VerdictEvaluation falsely fails it)`);
                     })());
                     tasks.push((async () => {
                         await hop((i + 4) % 5);
                         const result = await b.group.validatePayload(capInsert, at);
                         assertTrue(result.valid,
-                            `iter ${i}: a cap insert authored by manager m2 must validate (a dropped/shared VoidClosure falsely rejects it)`);
+                            `iter ${i}: a cap insert authored by manager m2 must validate (a dropped/shared VerdictEvaluation falsely rejects it)`);
                     })());
                 }
                 await Promise.all(tasks);
+            },
+        },
+        {
+            name: '[OBSGATE08] a void observe does not hide the live observe below it from a dependent FK',
+            invoke: async () => {
+                const ctx = newCtx();
+                const admin = await makeIdentity();
+                const p = await makeIdentity();
+                const carol = await makeIdentity();
+                const b = await makeUsers(ctx, 'og08-b', { identities: [admin, p], managers: [admin, p] });
+                const a = await makeApp(ctx, 'og08-a', b.group.getId(), {
+                    gated: true,
+                    extraTables: [{
+                        name: 'refs', columns: { ident: { type: 'string' } }, fks: { ident: `${USERS_BINDING}.${IDENTITIES_TABLE}` },
+                        restrictions: [{ on: 'all', rule: { p: 'true' } }],
+                    }],
+                });
+
+                // G: v1 registers carol, v2 extends v1; p's revoke branches off v0
+                const v0 = await frontier(b.group);
+                await registerIdentity(b.group, carol, undefined, v0);
+                const v1 = await frontier(b.group);
+                await registerIdentity(b.group, await makeIdentity(), undefined, v1);
+                const v2 = await frontier(b.group);
+                const revokeP = await revokeCap(b.group, admin, p.keyId, USERS_MANAGER_LABEL, v0);
+                const vRevoke = version(revokeP!);
+
+                // A: o1 (admin) imports v1, o2 (p) on top of it imports v2, and a
+                // concurrent o3 (admin) imports p's revoke, which voids o2
+                const base = await frontier(a.group);
+                const o1 = await a.group.observe(USERS_BINDING, v1, admin, base);
+                const o2 = await a.group.observe(USERS_BINDING, v2, p, version(o1));
+                await a.group.observe(USERS_BINDING, vRevoke, admin, base);
+
+                // X points at carol's identity, written on top of o2
+                const refs = await a.group.getTable('refs');
+                const carolRowId = deriveRowId('id-' + carol.keyId);
+                await refs.insert('x-1', { ident: carolRowId }, undefined, version(o2));
+
+                const merged = await frontier(a.group);
+                assertTrue(await a.group.isEntryVoided(o2, merged), 'o2 is void: p is revoked concurrently with v2');
+                assertFalse(await a.group.isEntryVoided(o1, merged), 'o1 stays live');
+                const view = await (await a.group.getView(merged, merged)).getTableView('refs');
+                assertTrue(await view.hasRow(deriveRowId('x-1')),
+                    'X stays live: the fold sees through the void o2 to o1, which observed carol');
+            },
+        },
+        {
+            name: '[OBSGATE09] a back-dated observe is widened by a revoke-import that sits under a void observe',
+            invoke: async () => {
+                const ctx = newCtx();
+                const admin = await makeIdentity();
+                const p1 = await makeIdentity();
+                const p2 = await makeIdentity();
+                const b = await makeUsers(ctx, 'og09-b', { identities: [admin, p1, p2], managers: [admin, p1, p2] });
+                const a = await makeApp(ctx, 'og09-a', b.group.getId(), { gated: true });
+
+                // G: v1 revokes p1, then vBoth also revokes p2
+                const v0 = await frontier(b.group);
+                await revokeCap(b.group, admin, p1.keyId, USERS_MANAGER_LABEL, v0);
+                const v1 = await frontier(b.group);
+                await revokeCap(b.group, admin, p2.keyId, USERS_MANAGER_LABEL, v1);
+                const vBoth = await frontier(b.group);
+
+                // A: y is p1's back-dated observe of v0. z' (admin) imports p1's
+                // revoke; z (p2) sits on top of z'; w (admin, after y) imports
+                // both revokes, which voids z
+                const base = await frontier(a.group);
+                const y = await a.group.observe(USERS_BINDING, v0, p1, base);
+                const zPrime = await a.group.observe(USERS_BINDING, v1, admin, base);
+                const z = await a.group.observe(USERS_BINDING, v1, p2, version(zPrime));
+                const w = await a.group.observe(USERS_BINDING, vBoth, admin, version(y));
+
+                const merged = await frontier(a.group);
+                assertTrue(await a.group.isEntryVoided(z, merged), "z is void: w imports p2's revoke");
+                assertFalse(await a.group.isEntryVoided(zPrime, merged), "the revoke-import z' is live");
+                assertFalse(await a.group.isEntryVoided(w, merged), 'w is live');
+                assertTrue(await a.group.isEntryVoided(y, merged),
+                    "y is void: the widening sees through the void z to z', which carries p1's revoke");
             },
         },
     ],

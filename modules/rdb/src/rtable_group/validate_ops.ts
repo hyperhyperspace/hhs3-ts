@@ -24,14 +24,14 @@
 //                  the idProvider, then deployKeys, and canDeploy is evaluated
 //                  in 'object' context against the verified author; the new
 //                  version keeps a local provider table and, without a
-//                  provider, declares no restriction over $author; PLUS the one-time add-fk
-//                  prerequisite — a deploy whose newly-added/retargeted FK
-//                  would strand an existing live row at `at` is hard-rejected,
-//                  since FK reach is at-use and would otherwise leave the old
-//                  row live-but-dangling) OR a foreign-group observation (refId
-//                  is a bound group: monotonic against that group's DAG; a
-//                  claimed author verifies through the idProvider; a canObserve
-//                  gate must hold). Any other refId is unknown (false).
+//                  provider, declares no restriction over $author. A deploy
+//                  that adds or retargets an FK is never rejected for the
+//                  existing rows it strands: it deletes them, see
+//                  deriveDeployMeta in group.ts) OR a foreign-group
+//                  observation (refId is a bound group: monotonic against
+//                  that group's DAG; a claimed author verifies through the
+//                  idProvider; a canObserve gate must hold). Any other refId
+//                  is unknown (false).
 //   bundle       - format + every table exists + per-op schema conformance +
 //                  per-rowId uniqueness across the bundle + identity/liveness
 //                  and restrictions at the PRE-state (`at`) + FK checks at each
@@ -43,7 +43,7 @@
 // (sequential cut inside a bundle); a `group.table` target resolves through
 // the bound foreign group at the foreign version observed at `at` (an absent
 // foreign table is a missing reference, so the dangling write is rejected).
-// At-use op-voiding (view-time, in computeEntryVoided) handles cases the
+// At-use op-voiding (view-time, in isEntryVoided) handles cases the
 // parent-frontier validation check cannot catch: a barrier delete of a
 // restriction witness or FK target CONCURRENT with the write voids it at the
 // merge (a causally-later delete is inert).
@@ -321,7 +321,7 @@ function anonymousGroupReason(canObserve: { [binding: string]: Predicate }, sche
 // defers, then revalidates). An unauthored op is validly anonymous. A group
 // with no idProvider has no key source for row ops, bundles or observations,
 // so every op it admits is anonymous. Verdict is monotone, so the view-time
-// `from` never refines it (computeEntryVoided then TRUSTS op.author).
+// `from` never refines it (isEntryVoided then TRUSTS op.author).
 //
 // `scope` is the signing scope the op was signed in: [tableSigningContext(t)]
 // for a single row op (signed by its RTable), [] for group-level ops (bundles,
@@ -569,7 +569,7 @@ async function validateRefAdvance(payload: RefAdvancePayload, group: GroupOpHost
 // gate that reads $author requires an author; the gate must hold in the
 // OBSERVED group's frame AT THE IMPORTED VERSION (refAt = refFrom =
 // newRefVersion): "was the author authorized in G at the version they import".
-// At-use voiding (computeEntryVoided) then catches a back-dated observation a
+// At-use voiding (isEntryVoided) then catches a back-dated observation a
 // later concurrent revoke retroactively unauthorizes.
 async function validateObserveGate(
     payload: RefAdvancePayload, group: GroupOpHost, at: Version, newRefVersion: Version,
@@ -673,10 +673,7 @@ async function validateDeploy(payload: RefAdvancePayload, group: GroupOpHost, at
     for (const hash of newRefVersion) newVersion.add(hash);
     const newSchema = await schema.getView(newVersion, newVersion);
 
-    const identityResult = validateDeployedIdentity(group, newSchema);
-    if (!identityResult.valid) return identityResult;
-
-    return validateAddFkPrerequisite(group, at, newSchema);
+    return validateDeployedIdentity(group, newSchema);
 }
 
 // The deployed version must keep what the group's identity setup relies on.
@@ -698,52 +695,5 @@ function validateDeployedIdentity(group: GroupOpHost, newSchema: RSchemaView): V
     if (newSchema.getIdProvider(table) === undefined) {
         return validationFailure(`schema deploy would unmark table '${table}' as the identity provider`);
     }
-    return validationOk();
-}
-
-// add-fk PREREQUISITE (one-time, hard reject): a deploy that newly enforces an
-// FK must not strand existing data. For each FK added or retargeted by this
-// deploy (vs the currently-deployed schema), every row live at `at` whose
-// (pre-existing) FK column carries a value must reach a live target at `at`.
-// Rationale: FK reach is at-use, so once deployed the FK is inert for these old
-// rows (a causally-later target delete never voids them) — this is the single
-// point-in-time consistency check that the data honored the FK when adopted.
-// New columns hold no old explicit values (only the uniform schema default, a
-// schema-level effect), so they are not enumerated here.
-async function validateAddFkPrerequisite(group: GroupOpHost, at: Version, newSchema: RSchemaView): Promise<ValidationResult> {
-    const oldSchema = await group.resolveSchemaView(at);
-
-    const isTargetLive = async (targetRef: string, rowId: B64Hash): Promise<boolean> => {
-        const [groupName, targetTable] = splitTableRef(targetRef);
-        if (groupName !== undefined) {
-            const fv = await group.resolveForeignTableView(groupName, targetTable, at, at);
-            return fv !== undefined && fv.hasRow(rowId);
-        }
-        return (await group.makeTable(targetTable).getView(at, at)).hasRow(rowId);
-    };
-
-    for (const table of newSchema.getTableNames()) {
-        const newFks = newSchema.getFKs(table);
-        const oldFks = oldSchema.hasTable(table) ? oldSchema.getFKs(table) : {};
-        const addedColumns = Object.keys(newFks).filter((c) => oldFks[c] !== newFks[c]);
-        if (addedColumns.length === 0) continue;
-
-        const view = await group.makeTable(table).getView(at, at);
-        for (const rowId of await view.liveRowIds()) {
-            const row = await view.getRow(rowId);
-            if (row === undefined) continue;
-            for (const column of addedColumns) {
-                const value = row.values[column];
-                if (value === undefined) continue;        // nullable / absent: unconstrained
-                if (typeof value !== 'string') {
-                    return validationFailure(`existing FK column '${column}' in table '${table}' is not a rowId string`);
-                }
-                if (!await isTargetLive(newFks[column], value)) {
-                    return validationFailure(`deploy would strand row '${rowId}' in table '${table}' on FK '${column}' -> '${newFks[column]}'`);
-                }
-            }
-        }
-    }
-
     return validationOk();
 }

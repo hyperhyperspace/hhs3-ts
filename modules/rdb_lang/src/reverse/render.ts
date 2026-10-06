@@ -388,6 +388,11 @@ function renderTableScopePayload(
             .map((op) => renderRowOp(op, tableName, options))
             .join('\n');
     }
+    // the table's view of a schema deploy: the rows it deletes are in the
+    // entry's meta, not in the payload
+    if (action === 'kills') {
+        return `-- schema deploy: deletes the rows of ${renderIdent(tableName)} that do not honor an FK it adopts`;
+    }
     return undefined;
 }
 

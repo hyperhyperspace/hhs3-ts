@@ -18,13 +18,13 @@ async function makeIdentity(): Promise<OwnIdentity> {
 
 // Regression net for the per-computation verdict memo (VOID_SEMANTICS.md §4).
 // The table has NO explicit restrictions, so updates run under the default
-// `rowAuthor = $author` rule — that getRow's the subject at the update's own
-// position (identity cover + column-tag covers; see-through `entryVoided`).
-// `visiting` is a stack, so without `completed` shared nodes are re-diagnosed
-// once per path (exponential). N = 24 is a long authored chain on one view;
-// getRow + query must stay snappy. PERM12 / OBSGATE07 are the matching
-// soundness nets (cycle participants are not memoized; independent
-// computations do not share a closure).
+// `rowAuthor = $author` rule — that reads the subject at the update's own
+// position (identity cover + column-tag covers, seeing through void writes).
+// Without `answers`, shared entries are re-diagnosed once per path
+// (exponential). N = 24 is a long authored chain on one view; getRow + query
+// must stay snappy. PERM12 / OBSGATE07 are the matching soundness nets (only
+// completed components are memoized; independent computations do not share
+// an evaluation).
 function pagesTable(): TableDef {
     return {
         name: 'pages',
@@ -62,7 +62,7 @@ async function createEnv() {
 }
 
 export const rtableVoidMemoTests = {
-    title: '[VOID_MEMO] Per-closure completed void-verdict memo',
+    title: '[VOID_MEMO] Per-evaluation answers void-verdict memo',
     tests: [
         {
             name: '[VOID_MEMO01] many authored updates of one row: getRow and query stay linear',

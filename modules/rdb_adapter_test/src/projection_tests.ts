@@ -14,7 +14,7 @@ import {
     DEFAULT_KEY_DOMAIN, KeyIndex, projectGroup, SchemaAction, RowAction,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
-import { createFkGroup, createFlipGroup, createGroup, frontier, sameVersion } from "./group_fixture.js";
+import { createFkGroup, createFlipGroup, createGroup, flipTables, frontier, sameVersion } from "./group_fixture.js";
 import { TargetFactory } from "./projection_reader.js";
 
 type NamedTest = { name: string; invoke: () => Promise<void> };
@@ -331,8 +331,8 @@ export function createProjectionSuite(label: string, factory: TargetFactory): { 
                     const comments = await group.getTable('comments');
                     await posts.insert('p1', { title: 'Hello' }, admin);
                     const p1 = deriveRowId('p1', admin.keyId);
-                    // The plain value honors the FUTURE FK (the target rowId) so the
-                    // add-fk deploy prerequisite passes (no stranded existing row).
+                    // The plain value honors the FUTURE FK (the target rowId), so the
+                    // add-fk deploy keeps the row (a row it strands is deleted, see [label10]).
                     await comments.insert('c1', { body: 'first', post: p1 }, admin);
                     const c1 = deriveRowId('c1', admin.keyId);
 
@@ -361,6 +361,87 @@ export function createProjectionSuite(label: string, factory: TargetFactory): { 
                         assertEquals(row!.values.post_id, postLocal,
                             'the FK companion is backfilled with the referenced local id (gold projection)');
                         assertEquals(row!.values.post, undefined, 'the old plain column no longer holds a value');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}10] an add-fk deploy deletes the projected row it strands`,
+                invoke: async () => {
+                    const { schema, group, admin } = await createFlipGroup();
+                    const posts = await group.getTable('posts');
+                    const comments = await group.getTable('comments');
+                    await posts.insert('p1', { title: 'Hello' }, admin);
+                    const p1 = deriveRowId('p1', admin.keyId);
+                    await comments.insert('c1', { body: 'kept', post: p1 }, admin);
+                    await comments.insert('c2', { body: 'stranded', post: deriveRowId('ghost', admin.keyId) }, admin);
+                    const c1 = deriveRowId('c1', admin.keyId);
+                    const c2 = deriveRowId('c2', admin.keyId);
+
+                    const { target, read, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);   // initial: both comments projected
+                        assertEquals((await read.getRowIds('comments')).length, 2, 'sanity: both comments start projected');
+
+                        await schema.updateSchema([
+                            { rule: 'set-fks', table: 'comments', fks: { post: 'posts' } },
+                        ], admin, 'add post fk');
+                        await group.deploy(await (await schema.getScopedDag()).getFrontier());
+
+                        await projectGroup(group, target);   // incremental: the deploy's deletion is a row change
+
+                        assertEquals(await read.getRow('comments', c2), undefined, 'the stranded comment is no longer projected');
+                        const live = await (await (await group.getView()).getTableView('comments')).liveRowIds();
+                        assertEquals([...(await read.getRowIds('comments'))].sort().join(','), [...live].sort().join(','),
+                            'the projected comments match the live view');
+                        assertEquals(live.join(','), c1, 'only the comment that honors the FK is live');
+                        assertEquals((await read.getRow('comments', c1))!.values.post_id, await read.syncId('posts', p1),
+                            'the kept comment projects its FK companion');
+                        assertTrue(sameVersion(await target.getCheckpoint(group.getId()), await frontier(group)),
+                            'checkpoint advanced past the deploy');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}11] resetting an FK target table keeps its dependents' dangling FK values`,
+                invoke: async () => {
+                    const { schema, group, admin } = await createFlipGroup();
+                    const posts = await group.getTable('posts');
+                    const comments = await group.getTable('comments');
+                    await schema.updateSchema([
+                        { rule: 'set-fks', table: 'comments', fks: { post: 'posts' } },
+                    ], admin, 'add post fk');
+                    await group.deploy(await (await schema.getScopedDag()).getFrontier());
+                    await posts.insert('p1', { title: 'Hello' }, admin);
+                    const p1 = deriveRowId('p1', admin.keyId);
+                    await comments.insert('c1', { body: 'first', post: p1 }, admin);
+                    const c1 = deriveRowId('c1', admin.keyId);
+
+                    const { target, read, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+
+                        // reset posts in one migration, lifting and restoring the FK
+                        // the schema would otherwise refuse the drop over
+                        await schema.updateSchema([
+                            { rule: 'set-fks', table: 'comments', fks: {} },
+                            { rule: 'drop-table', table: 'posts' },
+                            { rule: 'add-table', def: flipTables().find((t) => t.name === 'posts')! },
+                            { rule: 'set-fks', table: 'comments', fks: { post: 'posts' } },
+                        ], admin, 'reset posts');
+                        await group.deploy(await (await schema.getScopedDag()).getFrontier());
+
+                        await projectGroup(group, target);   // incremental: posts is dropped and recreated
+
+                        assertEquals((await read.getRowIds('posts')).length, 0, 'the reset posts table is empty');
+                        const row = await read.getRow('comments', c1);
+                        assertTrue(row !== undefined, 'the comment stays live, dangling');
+                        const local = await read.syncId('posts', p1);
+                        assertTrue(local !== undefined, 'the dangling target rowId is interned in the fresh posts table');
+                        assertEquals(row!.values.post_id, local, 'the companion holds the dangling target id');
                     } finally {
                         await cleanup?.();
                     }

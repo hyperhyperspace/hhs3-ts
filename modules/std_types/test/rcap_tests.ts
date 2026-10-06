@@ -983,5 +983,106 @@ export const rcapTests = {
                     'the replayed grant should fail signature verification');
             }
         },
+        {
+            name: '[CAP32] 2-party self-managed revoke ring: both holders keep the cap',
+            invoke: async () => { await assertCoadminRingSurvives(2); },
+        },
+        {
+            name: '[CAP33] 3-party self-managed revoke ring: every holder keeps the cap',
+            invoke: async () => { await assertCoadminRingSurvives(3); },
+        },
+        {
+            name: '[CAP34] outsider revoked by a 2-ring holder loses the cap',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv({
+                    extraCaps: { coadmin: { managedBy: ['coadmin'] } },
+                });
+                const holders: OwnIdentity[] = [await makeIdentity(), await makeIdentity()];
+                const outsider = await makeIdentity();
+                for (const identity of [...holders, outsider]) {
+                    await cap.addIdentity(identity.keyId, serializePublicKeyToBase64(identity.publicKey), admin);
+                    await cap.grant(identity.keyId, 'coadmin', admin);
+                }
+
+                const base = await (await cap.getScopedDag()).getFrontier();
+                await cap.revoke(holders[1].keyId, 'coadmin', holders[0], base);
+                await cap.revoke(holders[0].keyId, 'coadmin', holders[1], base);
+                await cap.revoke(outsider.keyId, 'coadmin', holders[0], base);
+
+                const view = await cap.getView();
+                assertTrue(await view.hasCapability(holders[0].keyId, 'coadmin'),
+                    'ring holder 0 keeps coadmin');
+                assertTrue(await view.hasCapability(holders[1].keyId, 'coadmin'),
+                    'ring holder 1 keeps coadmin');
+                assertFalse(await view.hasCapability(outsider.keyId, 'coadmin'),
+                    'outsider loses coadmin to the ring holder');
+            }
+        },
+        {
+            name: '[CAP35] A holder revoking their own self-managed cap loses it',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv({
+                    extraCaps: { coadmin: { managedBy: ['coadmin'] } },
+                });
+                const alice = await makeIdentity();
+                await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), admin);
+                await cap.grant(alice.keyId, 'coadmin', admin);
+                assertTrue(await (await cap.getView()).hasCapability(alice.keyId, 'coadmin'),
+                    'alice holds coadmin before her revoke');
+
+                await cap.revoke(alice.keyId, 'coadmin', alice);
+                assertFalse(await (await cap.getView()).hasCapability(alice.keyId, 'coadmin'),
+                    "alice's own revoke removes her coadmin");
+            }
+        },
+        {
+            name: '[CAP36] A re-delegation chain that revisits a holder at an earlier position is not a cycle',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv({
+                    extraCaps: { coadmin: { managedBy: ['coadmin'] } },
+                });
+                const a = await makeIdentity();
+                const b = await makeIdentity();
+                await cap.addIdentity(a.keyId, serializePublicKeyToBase64(a.publicKey), admin);
+                await cap.addIdentity(b.keyId, serializePublicKeyToBase64(b.publicKey), admin);
+
+                await cap.grant(a.keyId, 'coadmin', admin);   // the creator grants a
+                await cap.grant(b.keyId, 'coadmin', a);       // a grants b
+                await cap.revoke(a.keyId, 'coadmin', admin);  // the creator revokes a
+                const afterRevoke = await cap.getView();
+                assertFalse(await afterRevoke.hasCapability(a.keyId, 'coadmin'), 'a lost coadmin to the creator');
+                assertTrue(await afterRevoke.hasCapability(b.keyId, 'coadmin'),
+                    'b keeps the coadmin a granted before the revoke (use-before-revoke)');
+
+                await cap.grant(a.keyId, 'coadmin', b);       // b re-grants a
+                const view = await cap.getView();
+                assertTrue(await view.hasCapability(a.keyId, 'coadmin'),
+                    "a holds coadmin again: b's grant rests on a's holding at an earlier position, not on itself");
+                assertTrue(await view.hasCapability(b.keyId, 'coadmin'), 'b still holds coadmin');
+            }
+        },
     ]
 };
+
+async function assertCoadminRingSurvives(n: number): Promise<void> {
+    const { cap, admin } = await createTestEnv({
+        extraCaps: { coadmin: { managedBy: ['coadmin'] } },
+    });
+    const holders: OwnIdentity[] = [];
+    for (let i = 0; i < n; i++) holders.push(await makeIdentity());
+    for (const holder of holders) {
+        await cap.addIdentity(holder.keyId, serializePublicKeyToBase64(holder.publicKey), admin);
+        await cap.grant(holder.keyId, 'coadmin', admin);
+    }
+
+    const base = await (await cap.getScopedDag()).getFrontier();
+    for (let i = 0; i < n; i++) {
+        await cap.revoke(holders[(i + 1) % n].keyId, 'coadmin', holders[i], base);
+    }
+
+    const view = await cap.getView();
+    for (let i = 0; i < n; i++) {
+        assertTrue(await view.hasCapability(holders[i].keyId, 'coadmin'),
+            `holder ${i} keeps coadmin in the ${n}-ring`);
+    }
+}

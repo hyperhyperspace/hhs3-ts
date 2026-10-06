@@ -128,8 +128,8 @@ export const DEFAULT_CONCURRENT_DELETES = true;
 // the deleter may not have even received the ops that reference the row).
 // So we never PREVENT the delete. Referential integrity is folded into AT-USE
 // op-voiding, on the same view-time path used to recheck restrictions after
-// they pass hard validation (see computeEntryVoided in ../rtable_group/group.ts
-// and evaluateRowOpFKReach in ../rtable_group/predicates.ts):
+// they pass hard validation (see isEntryVoided in ../rtable_group/group.ts
+// and explainRowOpFKReach in ../rtable_group/predicates.ts):
 //
 //   - a write op whose own FK column points at a target that is not live at
 //     the OP's own position (observed from the view's `from`) is VOID — a
@@ -141,19 +141,36 @@ export const DEFAULT_CONCURRENT_DELETES = true;
 //     CONCURRENTLY with the write voids it at the merge (merge stability),
 //     while a causally-LATER delete is inert (use-before-revoke): the
 //     dependent becomes live-but-dangling rather than cascade-hidden. A
-//     reference cycle resolves to DENY (the group's least-fixpoint void guard).
+//     reference cycle that nothing outside it supports is void (the group's
+//     verdict evaluation).
 //
 // Insert-time-only checking is unsound on its own (a delete concurrent with
 // the dependent insert leaves a dangling reference both authors validly
 // produced); at-use op-voiding resolves that case deterministically at the
-// merge. To bound the one-time adoption, add-fk carries a DEPLOY PREREQUISITE
-// (validate_ops.ts validateDeploy): a deploy whose new FK would strand an
-// existing live row is hard-rejected.
+// merge.
+//
+// ADOPTION: a deploy that adds or retargets an FK is never rejected for the
+// data it finds. It deletes the rows live at its parents that do not honor
+// the FK (a value that is not the rowId of a live target), as if it carried
+// a delete of each: from the deploy on they are dead, permanently within the
+// table incarnation, and a branch concurrent to the deploy sees the deletion
+// at the merge when the table's concurrentDeletes flag is on, like any
+// delete. The deletion closes over the FKs the same deploy adopts (a row
+// pointing at a deleted row through one goes too); dependents through FKs
+// that already held stay live-but-dangling. Tables the deploy creates or
+// resets, and columns it re-creates, hold no old values and lose nothing. A
+// target deleted on a branch concurrent to the deploy is not seen, so its
+// dependents dangle at the merge. See RTableGroupImpl.deriveDeployMeta.
+//
+// The deleted rows are tagged in the deploy entry's meta, derived by every
+// replica when it applies the entry and never rewritten: changing the
+// adoption rule, or the liveness and verdict rules it reads at the deploy's
+// parents, needs a store migration that re-applies entries.
 //
 // Cost lands on reads: voiding resolves the referenced row id at the op
 // position (positional cover queries on the shared DAG for local FKs; the
 // ref-advance-resolved foreign version for 'group.table' FKs), memoized per
-// (entry, from) in the group's void cache.
+// (entry, from) within one verdict evaluation.
 
 export type FKs = { [column: string]: string };
 

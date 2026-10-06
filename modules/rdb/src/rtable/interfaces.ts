@@ -65,8 +65,9 @@ export interface RTableView extends View {
     // Liveness is INCARNATION-SCOPED (a row belongs to the table incarnation it
     // was written under; a table drop+re-add resets the row namespace) and has
     // two layers: (1) permanent-delete state — an insert in the row's history,
-    // no delete in it (deletes are permanent), no concurrent delete barrier of
-    // the SAME incarnation visible from `from` honored at-use by the
+    // no delete in it (deletes are permanent; a schema deploy that adopts an
+    // FK the row does not honor counts as one), no concurrent delete barrier
+    // of the SAME incarnation visible from `from` honored at-use by the
     // concurrentDeletes flag at the delete's position; (2) op validity — ops
     // from entries whose restriction predicates fail OR whose written FK columns
     // do not reach a live target are invisible (drop-on-void, at-use, bundles
@@ -76,8 +77,8 @@ export interface RTableView extends View {
     getAuthor(rowId: B64Hash): Promise<KeyId | undefined>;   // undefined: anonymous or not live
 
     // Every live rowId at this view's horizon (full enforced liveness). The
-    // unfiltered row enumeration behind the add-fk deploy prerequisite; prefer
-    // findRowIds when a pub/author filter is available.
+    // unfiltered row enumeration behind a deploy's FK adoption (the rows it
+    // deletes); prefer findRowIds when a pub/author filter is available.
     liveRowIds(): Promise<B64Hash[]>;
 
     // Search over pub columns via meta-indexed cover queries — the machinery
@@ -101,10 +102,10 @@ export interface RTableView extends View {
     // names at this horizon. deltaRowState: a row's enforced liveness, author,
     // and LWW-resolved WRITTEN values (no default fallback) for `columns`.
     // Written values are incarnation-scoped at this horizon (a dropped or
-    // re-added column yields no write for the old incarnation), so the caller
-    // diffs over the UNION of both horizons' columns, which keeps uniform
-    // schema effects (defaults/drops) out of the per-row diff — those live in
-    // the schema sub-delta channel.
+    // re-added column yields no write for the old incarnation), so the delta
+    // compares rows within the end horizon's incarnations, which keeps uniform
+    // schema effects (defaults, drops, resets) out of the per-row diff — those
+    // live in the schema sub-delta channel.
     getColumns(): Promise<string[]>;
     deltaRowState(rowId: B64Hash, columns: string[]): Promise<DeltaRowState>;
 }

@@ -375,11 +375,12 @@ async function deployReport(db: RDbImpl, before: Map<B64Hash, Version>): Promise
             const summary = summarizeRows(changes);
             if (summary !== undefined) parts.push(`${names.get(tableId) ?? tableId}: ${summary}`);
         }
-        // A dropped table's rows are not walked: the schema change names the
-        // drop, and the rows are counted at the version before it.
+        // A dropped or reset table's old rows are not in the row channel: the
+        // schema change names the drop, and the rows are counted at the version
+        // before it.
         const startView = await member.group.getView(earlier, earlier);
         for (const change of delta.schemaChanges.tableChanges) {
-            if (!change.existedBefore || change.existsAfter) continue;
+            if (!change.existedBefore || (change.existsAfter && !change.reincarnated)) continue;
             const n = (await (await startView.getTableView(change.table)).liveRowIds()).length;
             if (n > 0) parts.push(`${change.table}: ${n} ${n === 1 ? 'row' : 'rows'} gone`);
         }

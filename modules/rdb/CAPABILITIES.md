@@ -29,21 +29,18 @@ restriction (e.g. `exists manager-caps where owner=$author`).
 
 ## The key mechanism: recursive drop-on-void at use
 
-`exists` is not a shallow check. `evaluatePredicate`'s `exists` case calls
-`view.findRowIds(...)` ([`rtable_group/predicates.ts`](src/rtable_group/predicates.ts)),
-and `findRowIds` re-checks every candidate witness through the **fully enforced**
-`liveInsert` ([`rtable/view.ts`](src/rtable/view.ts)):
+`exists` is not a shallow check. The `exists` case of predicate evaluation calls
+`view.existsMatching(...)` ([`rtable_group/predicates.ts`](src/rtable_group/predicates.ts)),
+which re-checks every candidate witness through the **fully enforced** row
+liveness ([`rtable/view.ts`](src/rtable/view.ts)):
 
 ```ts
-for (const rowId of candidateRowIds) {
-    const insert = await this.liveInsert(rowId);   // drop-on-void + FK reach
-    if (insert === undefined) continue;
-    ...
-}
+const candidates = await this.candidateRowIds(where);   // index field + payload prefilter
+return someTruth(candidates, (rowId) => this.candidateMatch(rowId, where));   // values, then liveness
 ```
 
-`liveInsert` applies (1) permanent-delete liveness, (2) restriction drop-on-void
-(`isEntryVoided`, anchored at the op's own position), and (3) FK reach. So a
+Row liveness applies (1) permanent-delete liveness, (2) restriction drop-on-void
+(the entry's verdict, anchored at the op's own position), and (3) FK reach. So a
 witness row counts **only if its own insert restriction held at its own
 position** — which is itself an `exists`-over-caps, recursively. The full chain
 of grants that must be valid is therefore already enforced, decomposed across
@@ -57,11 +54,12 @@ express the chain.
 ## Why "the at-grant check looks like the at-use check for the grant op"
 
 Because it *is* the same operation. A grant is itself a **use** of the
-manager's authority. RCap's recursive `valid` predicate authorizes a grant on a
-view pinned at the grant op's own version; Rdb re-evaluates each cap row's
-insert restriction at that row's own position via `liveInsert`→`isEntryVoided`.
-RCap writes the recursion explicitly in one function; Rdb writes it implicitly,
-once per link, via drop-on-void. Same semantics, different decomposition.
+manager's authority. RCap's op verdict authorizes a grant on a view pinned at
+the grant op's own version; Rdb re-evaluates each cap row's insert restriction
+at that row's own position through the row's liveness, which reads the insert's
+verdict. RCap writes the recursion explicitly in one function; Rdb writes it
+implicitly, once per link, via drop-on-void. Same semantics, different
+decomposition.
 
 ## Why B1 / B2 dissolve
 
@@ -99,13 +97,19 @@ to arbitrate, so it has no Rdb counterpart.
    observation does not (`[XGROUP11]`, use-before-revoke). Cross-group caps
    therefore have the same B2 concurrent-revoke parity as intra-group caps.
 
-2. **Void-recursion cycle guard must DENY on cycle.** The op-voiding recursion
-   (cap A's insert needs cap B, B's needs A — and FK reach, where a write's FK
-   target liveness depends on another voided write) uses a least-fixpoint guard
-   whose safe default is **treat-as-void / deny**. Restriction / `exists`
-   recursion and FK reach share this guard, so an FK reference cycle also
-   resolves to DENY. RCap denies on cycle the same way
-   (`visiting.has(visitKey) → return false`).
+2. **A cycle that nothing outside it decides is void.** The op-voiding
+   recursion (cap A's insert needs cap B, B's needs A — and FK reach, where a
+   write's FK target liveness depends on another entry's verdict) is solved as a
+   logic program: entries that read each other form a component, solved to its
+   well-founded fixpoint, and whatever that leaves undecided collapses to void,
+   bottom-up ([VOID_SEMANTICS.md](VOID_SEMANTICS.md) §4). Restriction / `exists`
+   recursion and FK reach go through the same evaluation, so a self-supporting
+   grant ring or an FK reference cycle is void, and an odd revoke ring voids
+   every revoke the same way an even one does. A cap that a ring member revokes
+   outside the ring is decided by the ring's outcome, not collapsed with it
+   (`[PERM17]`). RCap solves its grants and revokes with the same engine, keyed
+   by op and `from`, so a ring's revokes do not stick there either: every holder
+   on it keeps the cap.
 
 ## Beyond RCap parity: subject-row attenuation
 

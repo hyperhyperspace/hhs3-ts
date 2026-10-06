@@ -4,22 +4,31 @@
 // Payloads: a row op appended through a member RTable is wrapped into a
 // `{action: 'row', table, op}` envelope. Reading back, an envelope unwraps to
 // its inner op; a group `create` (initial rows) or `bundle` entry unwraps to a
-// `{action: 'rows', ops}` slice carrying this table's ops only.
+// `{action: 'rows', ops}` slice carrying this table's ops only. A schema
+// deploy is in a table's scope only when it deletes rows of it (below), and
+// unwraps to a `{action: 'kills'}` marker: the rows are in its meta.
 //
 // Meta scheme (group DAG entries; all derived from the payload + the
 // effective schema at the entry position, and re-checked at validation since
-// meta is unhashed):
+// meta is unhashed). A schema deploy's tags also read the rows live at its
+// parents (RTableGroupImpl.deriveDeployMeta); every replica derives them when
+// it applies the entry, so that derivation is protocol:
 //
-//   tables: [touched table names]            - every row-carrying entry
-//   t-<table>-rows: ['<tableIncarnationId>:<rowId>'] - identity ops only
-//                                              (insert and delete). Liveness
-//                                              and write-once uniqueness cover
-//                                              this tag. Updates do NOT carry
-//                                              it (they are column writes).
-//                                              Scoped to the table incarnation
-//                                              active at write time so a table
-//                                              drop+re-add resets liveness
-//                                              (see ../rtable/view.ts).
+//   tables: [touched table names]            - every row-carrying entry, and a
+//                                              schema deploy that deletes rows
+//   t-<table>-rows: ['<tableIncarnationId>:<rowId>'] - identity ops (insert
+//                                              and delete), and a schema deploy
+//                                              for each row it deletes because
+//                                              the row does not honor an FK the
+//                                              deploy adopts (deriveDeployKillMeta).
+//                                              Liveness and write-once
+//                                              uniqueness cover this tag.
+//                                              Updates do NOT carry it (they
+//                                              are column writes). Scoped to
+//                                              the table incarnation active at
+//                                              write time so a table drop+re-add
+//                                              resets liveness (see
+//                                              ../rtable/view.ts).
 //   t-<table>-cols: ['<rowId>:<incarnationId>:<column>'] - column writes
 //                                              (insert and update): the
 //                                              per-column LWW cover queries,
@@ -58,6 +67,18 @@ export type RowsSlicePayload = {
     ops: RowOpPayload[];
 };
 
+// The unwrapped shape of a schema deploy within the scope of a table it
+// deletes rows from (see deriveDeployKillMeta). The rows are in the entry's
+// meta, not its payload: an entry the scope surfaces for a row tag deletes
+// that row.
+export type KillsMarkerPayload = {
+    action: 'kills';
+};
+
+// The rows a schema deploy deletes, per table, with the table incarnation they
+// belong to (see RTableGroupImpl.deriveDeployMeta).
+export type DeployKills = Map<string, { incarnation: IncarnationId; rowIds: ReadonlySet<B64Hash> }>;
+
 // What the group must expose to its table scopes (implemented by
 // RTableGroupImpl; kept minimal to avoid an import cycle).
 export type TableScopeHost = {
@@ -81,6 +102,30 @@ export function colTag(rowId: B64Hash, incarnationId: IncarnationId, column: str
 // liveness namespace. See ../rtable/view.ts.
 export function rowTag(incarnationId: IncarnationId, rowId: B64Hash): string {
     return incarnationId + ':' + rowId;
+}
+
+// The outer meta that makes a schema deploy delete rows: each table is tagged,
+// and each deleted row carries the identity tag a delete op would, so the
+// table's liveness covers, concurrent-delete searches and delta walks treat
+// the deploy as a delete of those rows.
+export function deriveDeployKillMeta(kills: DeployKills): MetaProps {
+    const meta: MetaProps = {};
+    if (kills.size === 0) return meta;
+    meta['tables'] = json.toSet([...kills.keys()]);
+    for (const [table, { incarnation, rowIds }] of kills) {
+        wrapInnerMeta(meta, table, { rows: json.toSet([...rowIds].map((rowId) => rowTag(incarnation, rowId))) });
+    }
+    return meta;
+}
+
+// The rows a GROUP-level schema deploy entry deletes from `table` (none for any
+// other entry).
+export function killedRowIds(entry: { payload: json.Literal; meta: MetaProps }, table: string): B64Hash[] {
+    const payload = entry.payload as json.LiteralMap;
+    if (payload['action'] !== 'ref-advance') return [];
+    const tags = entry.meta['t-' + table + '-rows'];
+    if (tags === undefined) return [];
+    return [...json.fromSet(tags)].map((tag) => tag.substring(tag.indexOf(':') + 1) as B64Hash);
 }
 
 // Extract one table's row ops from a GROUP-level entry payload (row envelope,
@@ -299,6 +344,11 @@ export class TableScope implements DagScope {
                     if (write.table === this.table) ops.push(write.op as RowOpPayload);
                 }
                 return { action: 'rows', ops };
+            }
+            case 'ref-advance': {
+                // only a schema deploy that deletes rows of this table is in its scope
+                const marker: KillsMarkerPayload = { action: 'kills' };
+                return marker;
             }
             default:
                 throw new Error(`Invalid payload action in TableScope.unwrapPayload: ${outer['action']}`);

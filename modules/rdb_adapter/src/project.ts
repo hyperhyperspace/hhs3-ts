@@ -20,7 +20,9 @@ import type {
 import {
     AdapterConfig, isIndexTarget, MaterializationTarget, OpEvent, RowAction, SchemaAction, versionsEqual,
 } from "./types.js";
-import { projectedColumnName, projectedIdentityColumnName, providerColumnRole, targetTableName } from "./names.js";
+import {
+    isLocalFkRef, projectedColumnName, projectedIdentityColumnName, providerColumnRole, targetTableName,
+} from "./names.js";
 import { initialSchemaActions, reprojectedTables, schemaDeltaActions } from "./schema_actions.js";
 import { rowActionsForDelta } from "./row_actions.js";
 import { groupIndexDecls, planIndexActions, resolveIndexes, withIndexActions } from "./index_actions.js";
@@ -186,7 +188,9 @@ export async function projectGroup(
 //   - NEWLY-CREATED tables, whose live rows may have been inserted BELOW the
 //     delta's revision bound (a concurrent create+insert), so the row walk does
 //     not enumerate them — the schema channel's create-table would otherwise
-//     leave an empty table where the full projection has rows.
+//     leave an empty table where the full projection has rows;
+//   - REINCARNATED tables, which the schema channel drops and recreates, and
+//     the tables with a local FK into one, whose companions point at its ids.
 // Shared with the planner-parity fuzzer so the sweep cannot drift from production.
 export async function planIncrementalRowActions(
     view: RTableGroupView,
@@ -204,6 +208,17 @@ export async function planIncrementalRowActions(
         // clearing every row) both need a full live-row re-scan to converge.
         if ((!change.existedBefore && change.existsAfter) || change.reincarnated) {
             backfillTables.add(change.table);
+        }
+    }
+    // Recreating a reincarnated table also resets its local ids, so a table
+    // with a local FK into it is re-scanned too: its rows' FK values (dangling
+    // into the fresh incarnation) must be interned again for their companions.
+    const reset = new Set(delta.schemaChanges.tableChanges.filter((c) => c.reincarnated).map((c) => c.table));
+    if (reset.size > 0) {
+        for (const table of endView.getTableNames()) {
+            if (Object.values(endView.getFKs(table)).some((ref) => isLocalFkRef(ref) && reset.has(ref))) {
+                backfillTables.add(table);
+            }
         }
     }
     return backfillTables.size === 0

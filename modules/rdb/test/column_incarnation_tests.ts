@@ -486,5 +486,73 @@ export const columnIncarnationTests = {
                     'a prior-incarnation row is not live after a same-shape reset');
             }
         },
+        {
+            name: '[INC11] the group delta leaves a dropped column to the schema channel, walked row or not',
+            invoke: async () => {
+                const { group, schema, admin } = await createEnv([
+                    open('orders', { customer: { type: 'string' } }),
+                ]);
+                const orders = await group.getTable('orders');
+                await schema.updateSchema([{
+                    rule: 'add-column', table: 'orders', column: 'status',
+                    def: { type: 'string', default: 'new' },
+                }], admin, 'add status');
+                await group.deploy(await schemaFrontier(schema));
+                await orders.insert('o-1', { customer: 'ada', status: 'paid' });
+                await orders.insert('o-2', { customer: 'bob', status: 'paid' });
+                const start = await groupFrontier(group);
+
+                // o-2 is written inside the window, o-1 is not
+                await orders.update(deriveRowId('o-2'), { customer: 'bea' });
+                await schema.updateSchema([{ rule: 'drop-column', table: 'orders', column: 'status' }], admin, 'drop status');
+                await group.deploy(await schemaFrontier(schema));
+                const end = await groupFrontier(group);
+
+                for (const strategy of ['bounded', 'full'] as const) {
+                    group.setDeltaStrategy(strategy);
+                    const delta = await group.computeDelta(start, end);
+                    const rows = delta.tableChanges.get(orders.getId())?.rowChanges ?? [];
+                    assertEquals(JSON.stringify(rows.map((r) => [r.rowId, r.columnChanges.map((c) => c.column)])),
+                        JSON.stringify([[deriveRowId('o-2'), ['customer']]]),
+                        `${strategy}: only the walked row's own write is a row change, not the dropped column`);
+                    const change = delta.schemaChanges.tableChanges.find((t) => t.table === 'orders');
+                    assertTrue(change !== undefined && change.columnChanges.some((c) => c.column === 'status'),
+                        `${strategy}: the schema channel carries the drop`);
+                }
+            }
+        },
+        {
+            name: '[INC12] the group delta leaves a table reset to the schema channel and reports the new incarnation\'s rows',
+            invoke: async () => {
+                const { group, schema, admin } = await createEnv([
+                    open('orders', { customer: { type: 'string' } }),
+                ]);
+                const orders = await group.getTable('orders');
+                await orders.insert('o-1', { customer: 'ada' });
+                await orders.insert('o-2', { customer: 'bob' });
+                const start = await groupFrontier(group);
+
+                // o-2 is written inside the window before the reset, o-3 after it
+                await orders.update(deriveRowId('o-2'), { customer: 'bea' });
+                await schema.updateSchema([
+                    { rule: 'drop-table', table: 'orders' },
+                    { rule: 'add-table', def: open('orders', { customer: { type: 'string' } }) },
+                ], admin, 'reset orders');
+                await group.deploy(await schemaFrontier(schema));
+                await orders.insert('o-3', { customer: 'cy' });
+                const end = await groupFrontier(group);
+
+                for (const strategy of ['bounded', 'full'] as const) {
+                    group.setDeltaStrategy(strategy);
+                    const delta = await group.computeDelta(start, end);
+                    const rows = delta.tableChanges.get(orders.getId())?.rowChanges ?? [];
+                    assertEquals(JSON.stringify(rows.map((r) => [r.rowId, r.liveBefore, r.liveAfter])),
+                        JSON.stringify([[deriveRowId('o-3'), false, true]]),
+                        `${strategy}: only the new incarnation's insert is a row change`);
+                    assertTrue(delta.schemaChanges.tableChanges.some((t) => t.table === 'orders' && t.reincarnated),
+                        `${strategy}: the schema channel carries the reset`);
+                }
+            }
+        },
     ],
 };

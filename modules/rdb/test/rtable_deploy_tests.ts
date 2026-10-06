@@ -11,7 +11,9 @@ import { createMockRContext } from "./mock_rcontext.js";
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
 import { RTableGroupImpl, rTableGroupFactory } from "../src/rtable_group/group.js";
 import { deriveRowId } from "../src/rtable/hash.js";
-import type { TableDef, Predicate, SchemaCreator } from "../src/rschema/payload.js";
+import type { TableDef, Predicate, SchemaCreator, CreateRSchemaPayload } from "../src/rschema/payload.js";
+import type { CreateTableGroupPayload } from "../src/rtable_group/payload.js";
+import { killedRowIds } from "../src/rtable_group/scopes.js";
 import type { RTableView } from "../src/rtable/interfaces.js";
 import { computeMirrorHashes, deployGateId } from "../src/rdeploy_gate/mirror.js";
 import { usersSchemaTables, IDENTITIES_TABLE, identityRow } from "../src/users/users.js";
@@ -52,7 +54,28 @@ async function createEnv(tables: TableDef[]) {
     });
     const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
 
-    return { ctx, schema, group, admin, pinned };
+    return { ctx, schema, group, admin, pinned, schemaInit, groupInit };
+}
+
+// A second replica of `group` built by sync-style ingestion: the schema's
+// entries are copied as stored, the group's are re-applied through
+// applyPayload, which derives each entry's meta locally.
+async function replicate(
+    schema: RSchemaImpl, schemaInit: CreateRSchemaPayload, group: RTableGroupImpl, groupInit: CreateTableGroupPayload,
+): Promise<RTableGroupImpl> {
+    const ctx = newCtx();
+    const schemaCopy = (await ctx.createObject(schemaInit)) as RSchemaImpl;
+    const schemaDag = await schemaCopy.getScopedDag();
+    for await (const entry of (await schema.getScopedDag()).loadAllEntries()) {
+        if (entry.hash === schema.getId()) continue;
+        await schemaDag.append(entry.payload, entry.meta, new Set(json.fromSet(entry.header.prevEntryHashes)));
+    }
+    const copy = (await ctx.createObject(groupInit)) as RTableGroupImpl;
+    for await (const entry of (await group.getScopedDag()).loadAllEntries()) {
+        if (entry.hash === group.getId()) continue;
+        await copy.applyPayload(entry.payload, new Set(json.fromSet(entry.header.prevEntryHashes)));
+    }
+    return copy;
 }
 
 // permissive table: unauthored ops never void (focus on the deploy revision)
@@ -337,30 +360,7 @@ export const rtableDeployTests = {
             }
         },
         {
-            name: '[DEPLOY07] add-fk prerequisite: a deploy that would strand an existing row is hard-rejected',
-            invoke: async () => {
-                const { group, schema, admin } = await createEnv([
-                    open('orders', { customer: { type: 'string' } }),
-                    open('lines', { order: { type: 'string' }, qty: { type: 'integer' } }),
-                ]);
-                const lines = await group.getTable('lines');
-
-                // a pre-existing line referencing a non-existent order: valid under
-                // v1 (no FK declared), so it is a live row
-                await lines.insert('l-1', { order: deriveRowId('ghost-order'), qty: 1 });
-
-                // deploy add-fk lines.order -> orders: the existing row dangles
-                // under the new FK, so the one-time prerequisite hard-rejects
-                await schema.updateSchema([{ rule: 'set-fks', table: 'lines', fks: { order: 'orders' } }], admin, 'add fk');
-                const v2 = await schemaFrontier(schema);
-
-                let rejected = false;
-                try { await group.deploy(v2); } catch { rejected = true; }
-                assertTrue(rejected, 'a sequential add-fk deploy that strands an existing row is hard-rejected');
-            }
-        },
-        {
-            name: '[DEPLOY08] add-fk prerequisite: a deploy succeeds when every existing row honors the new FK',
+            name: '[DEPLOY07] an add-fk deploy is accepted and deletes the existing row it strands',
             invoke: async () => {
                 const { group, schema, admin } = await createEnv([
                     open('orders', { customer: { type: 'string' } }),
@@ -369,20 +369,62 @@ export const rtableDeployTests = {
                 const orders = await group.getTable('orders');
                 const lines = await group.getTable('lines');
 
+                // a pre-existing line referencing a non-existent order: valid under
+                // v1 (no FK declared), so it is a live row
+                const lineId = deriveRowId('l-1');
+                await lines.insert('l-1', { order: deriveRowId('ghost-order'), qty: 1 });
+                await orders.insert('o-1', { customer: 'ada' });
+                const pre = await groupFrontier(group);
+
+                // deploy add-fk lines.order -> orders: the existing row dangles
+                // under the new FK, so the deploy deletes it
+                await schema.updateSchema([{ rule: 'set-fks', table: 'lines', fks: { order: 'orders' } }], admin, 'add fk');
+                const deployHash = await group.deploy(await schemaFrontier(schema));
+                const merged = await groupFrontier(group);
+
+                const entry = (await (await group.getScopedDag()).loadEntry(deployHash))!;
+                assertEquals(killedRowIds(entry, 'lines').join(','), lineId, 'the deploy entry carries the stranded row');
+                assertTrue(await (await viewAt(group, 'lines', pre, pre)).hasRow(lineId),
+                    'views before the deploy still show the row');
+                assertTrue(await (await viewAt(group, 'lines', pre, merged)).hasRow(lineId),
+                    'the deploy is causally after `pre`, so observing it from the merge does not revise `pre`');
+                assertFalse(await (await viewAt(group, 'lines', merged, merged)).hasRow(lineId),
+                    'from the deploy on, the stranded row is dead');
+
+                const update = await failureOf(() => lines.update(lineId, { qty: 2 }));
+                assertTrue(update?.includes('is not live') ?? false, `updating the deleted row is rejected, got: ${update}`);
+                const reinsert = await failureOf(() => lines.insert('l-1', { order: deriveRowId('o-1'), qty: 1 }));
+                assertTrue(reinsert?.includes('already exists or was deleted') ?? false,
+                    `re-inserting the deleted rowId is rejected, got: ${reinsert}`);
+            }
+        },
+        {
+            name: '[DEPLOY08] an add-fk deploy deletes nothing when every existing row honors the new FK',
+            invoke: async () => {
+                const { group, schema, admin } = await createEnv([
+                    open('orders', { customer: { type: 'string' } }),
+                    open('lines', { order: { type: 'string', nullable: true }, qty: { type: 'integer' } }),
+                ]);
+                const orders = await group.getTable('orders');
+                const lines = await group.getTable('lines');
+
                 const orderId = deriveRowId('o-1');
                 const lineId = deriveRowId('l-1');
+                const unsetId = deriveRowId('l-2');
                 await orders.insert('o-1', { customer: 'ada' });
                 await lines.insert('l-1', { order: orderId, qty: 1 });   // honors the future FK
+                await lines.insert('l-2', { qty: 1 });                   // no value: unconstrained
 
                 await schema.updateSchema([{ rule: 'set-fks', table: 'lines', fks: { order: 'orders' } }], admin, 'add fk');
-                const v2 = await schemaFrontier(schema);
-                await group.deploy(v2);   // prerequisite satisfied: no throw
+                const deployHash = await group.deploy(await schemaFrontier(schema));
 
-                // the FK is now adopted; the existing line that honored it at the
-                // deploy stays live (at-use: the FK is inert for its causal-earlier write)
+                const entry = (await (await group.getScopedDag()).loadEntry(deployHash))!;
+                assertTrue(entry.meta['tables'] === undefined, 'the deploy entry lists no table to delete from');
                 const merged = await groupFrontier(group);
                 assertTrue(await (await viewAt(group, 'lines', merged, merged)).hasRow(lineId),
                     'a row that honored the new FK at the deploy stays live afterwards');
+                assertTrue(await (await viewAt(group, 'lines', merged, merged)).hasRow(unsetId),
+                    'a row without a value in the FK column stays live');
             }
         },
         {
@@ -505,6 +547,236 @@ export const rtableDeployTests = {
                 const badKeyFailure = await failureOf(() => badKey.ctx.createObject(badKey.init));
                 assertTrue(badKeyFailure?.includes('does not match its public key') ?? false,
                     `deploy keys must be self-certifying, got: ${badKeyFailure}`);
+            }
+        },
+        {
+            name: '[DEPLOY13] a branch concurrent to an add-fk deploy sees its deletion at the merge iff concurrentDeletes is on',
+            invoke: async () => {
+                for (const concurrentDeletes of [true, false]) {
+                    const { group, schema, admin } = await createEnv([
+                        open('orders', { customer: { type: 'string' } }),
+                        open('lines', { order: { type: 'string' }, qty: { type: 'integer' } }, { concurrentDeletes }),
+                    ]);
+                    const lines = await group.getTable('lines');
+                    const lineId = deriveRowId('l-1');
+                    await lines.insert('l-1', { order: deriveRowId('ghost-order'), qty: 1 });
+                    const base = await groupFrontier(group);
+
+                    // branch A deploys the FK (deleting l-1); branch B updates l-1,
+                    // which is live at its own position
+                    await schema.updateSchema([{ rule: 'set-fks', table: 'lines', fks: { order: 'orders' } }], admin, 'add fk');
+                    await group.deploy(await schemaFrontier(schema), undefined, base);
+                    const updatePos = version(await lines.update(lineId, { qty: 2 }, undefined, base));
+                    const merged = await groupFrontier(group);
+
+                    assertTrue(await (await viewAt(group, 'lines', updatePos, updatePos)).hasRow(lineId),
+                        `cd=${concurrentDeletes}: the row is live on the branch before the merge`);
+                    assertEquals(await (await viewAt(group, 'lines', updatePos, merged)).hasRow(lineId), !concurrentDeletes,
+                        `cd=${concurrentDeletes}: observed from the merge, the branch sees the deletion only when concurrentDeletes is on`);
+                    assertFalse(await (await viewAt(group, 'lines', merged, merged)).hasRow(lineId),
+                        `cd=${concurrentDeletes}: at the merge itself the row is dead`);
+                }
+            }
+        },
+        {
+            name: '[DEPLOY14] a deploy that re-creates the FK column deletes nothing',
+            invoke: async () => {
+                const { group, schema, admin } = await createEnv([
+                    open('orders', { customer: { type: 'string' } }),
+                    open('lines', { order: { type: 'string', nullable: true }, qty: { type: 'integer' } }),
+                ]);
+                const lines = await group.getTable('lines');
+                const lineId = deriveRowId('l-1');
+                await lines.insert('l-1', { order: deriveRowId('ghost-order'), qty: 1 });
+
+                await schema.updateSchema([
+                    { rule: 'drop-column', table: 'lines', column: 'order' },
+                    { rule: 'add-column', table: 'lines', column: 'order', def: { type: 'string', nullable: true } },
+                    { rule: 'set-fks', table: 'lines', fks: { order: 'orders' } },
+                ], admin, 'recreate order with fk');
+                const deployHash = await group.deploy(await schemaFrontier(schema));
+
+                const entry = (await (await group.getScopedDag()).loadEntry(deployHash))!;
+                assertTrue(entry.meta['tables'] === undefined, 'the deploy deletes no row');
+                const merged = await groupFrontier(group);
+                const row = await (await viewAt(group, 'lines', merged, merged)).getRow(lineId);
+                assertTrue(row !== undefined && row.values['order'] === undefined,
+                    'the old row is live and holds no value in the re-created column');
+            }
+        },
+        {
+            name: '[DEPLOY15] a deploy deletion is permanent and scoped to the table incarnation',
+            invoke: async () => {
+                const { group, schema, admin } = await createEnv([
+                    open('orders', { customer: { type: 'string' } }),
+                    open('lines', { order: { type: 'string' }, qty: { type: 'integer' } }),
+                ]);
+                const lines = await group.getTable('lines');
+                const lineId = deriveRowId('l-1');
+                const ghost = deriveRowId('ghost-order');
+                await lines.insert('l-1', { order: ghost, qty: 1 });
+
+                await schema.updateSchema([{ rule: 'set-fks', table: 'lines', fks: { order: 'orders' } }], admin, 'add fk');
+                await group.deploy(await schemaFrontier(schema));
+                await schema.updateSchema([{ rule: 'set-fks', table: 'lines', fks: {} }], admin, 'drop fk');
+                await group.deploy(await schemaFrontier(schema));
+
+                const afterDrop = await groupFrontier(group);
+                assertFalse(await (await viewAt(group, 'lines', afterDrop, afterDrop)).hasRow(lineId),
+                    'dropping the FK again does not revive the deleted row');
+
+                await schema.updateSchema([
+                    { rule: 'drop-table', table: 'lines' },
+                    { rule: 'add-table', def: open('lines', { order: { type: 'string' }, qty: { type: 'integer' } }) },
+                ], admin, 'reset lines');
+                await group.deploy(await schemaFrontier(schema));
+                await lines.insert('l-1', { order: ghost, qty: 3 });
+
+                const reset = await groupFrontier(group);
+                const row = await (await viewAt(group, 'lines', reset, reset)).getRow(lineId);
+                assertTrue(row !== undefined && row.values['qty'] === 3,
+                    'after a table reset the rowId is free: the re-insert is a live row');
+            }
+        },
+        {
+            name: '[DEPLOY16] both delta strategies report a deploy deletion of a row the window does not write',
+            invoke: async () => {
+                const { group, schema, admin } = await createEnv([
+                    open('orders', { customer: { type: 'string' } }),
+                    open('lines', { order: { type: 'string' }, qty: { type: 'integer' } }),
+                ]);
+                const orders = await group.getTable('orders');
+                const lines = await group.getTable('lines');
+                const strandedId = deriveRowId('l-1');
+                await lines.insert('l-1', { order: deriveRowId('ghost-order'), qty: 1 });
+                await orders.insert('o-1', { customer: 'ada' });
+                await lines.insert('l-2', { order: deriveRowId('o-1'), qty: 1 });
+                const start = await groupFrontier(group);
+
+                await schema.updateSchema([{ rule: 'set-fks', table: 'lines', fks: { order: 'orders' } }], admin, 'add fk');
+                await group.deploy(await schemaFrontier(schema));
+                const end = await groupFrontier(group);
+
+                for (const strategy of ['bounded', 'full'] as const) {
+                    group.setDeltaStrategy(strategy);
+                    const delta = await group.computeDelta(start, end);
+                    const rows = delta.tableChanges.get(lines.getId())?.rowChanges ?? [];
+                    assertEquals(JSON.stringify(rows.map((r) => [r.rowId, r.liveBefore, r.liveAfter])),
+                        JSON.stringify([[strandedId, true, false]]),
+                        `${strategy}: the stranded row is the only row change, and it goes from live to dead`);
+                }
+            }
+        },
+        {
+            name: '[DEPLOY17] sync ingestion derives the same deploy meta as the local deploy',
+            invoke: async () => {
+                const { group, schema, admin, schemaInit, groupInit } = await createEnv([
+                    open('orders', { customer: { type: 'string' } }),
+                    open('lines', { order: { type: 'string' }, qty: { type: 'integer' } }),
+                ]);
+                const orders = await group.getTable('orders');
+                const lines = await group.getTable('lines');
+                await orders.insert('o-1', { customer: 'ada' });
+                await lines.insert('l-1', { order: deriveRowId('ghost-order'), qty: 1 });
+                await lines.insert('l-2', { order: deriveRowId('o-1'), qty: 1 });
+                const base = await groupFrontier(group);
+
+                // the deploy sits beside a concurrent dangling insert, which it
+                // does not delete (the at-use FK check covers it)
+                await lines.insert('l-3', { order: deriveRowId('ghost-order'), qty: 1 }, undefined, base);
+                await schema.updateSchema([{ rule: 'set-fks', table: 'lines', fks: { order: 'orders' } }], admin, 'add fk');
+                const deployHash = await group.deploy(await schemaFrontier(schema), undefined, base);
+                await orders.insert('o-2', { customer: 'bob' });
+
+                const local = (await (await group.getScopedDag()).loadEntry(deployHash))!;
+                assertEquals(killedRowIds(local, 'lines').join(','), deriveRowId('l-1'),
+                    'the deploy deletes the row stranded at its parents only');
+
+                const copy = await replicate(schema, schemaInit, group, groupInit);
+                const copyDag = await copy.getScopedDag();
+                for await (const entry of (await group.getScopedDag()).loadAllEntries()) {
+                    const ingested = await copyDag.loadEntry(entry.hash);
+                    assertTrue(ingested !== undefined, `entry ${entry.hash} replicates`);
+                    assertEquals(json.toStringNormalized(ingested!.meta), json.toStringNormalized(entry.meta),
+                        `entry ${entry.hash}: applyPayload derives the stored meta`);
+                }
+            }
+        },
+        {
+            name: '[DEPLOY18] deploy deletions close over the FKs the deploy adopts, not over older ones',
+            invoke: async () => {
+                // a self-referencing FK: the subtree under a broken link goes, a
+                // cycle of otherwise valid rows stays
+                {
+                    const { group, schema, admin } = await createEnv([
+                        open('nodes', { parent: { type: 'string', nullable: true } }),
+                    ]);
+                    const nodes = await group.getTable('nodes');
+                    const id = (name: string) => deriveRowId(name);
+                    await nodes.insert('root', {});
+                    await nodes.insert('a', { parent: id('root') });
+                    await nodes.insert('b', { parent: id('a') });
+                    await nodes.insert('x', { parent: id('ghost') });
+                    await nodes.insert('y', { parent: id('x') });
+                    await nodes.insert('z', { parent: id('y') });
+                    await nodes.insert('c1', { parent: id('c2') });
+                    await nodes.insert('c2', { parent: id('c1') });
+
+                    await schema.updateSchema([{ rule: 'set-fks', table: 'nodes', fks: { parent: 'nodes' } }], admin, 'tree fk');
+                    await group.deploy(await schemaFrontier(schema));
+
+                    const view = await viewAt(group, 'nodes', await groupFrontier(group), await groupFrontier(group));
+                    assertEquals((await view.liveRowIds()).join(','), ['root', 'a', 'b', 'c1', 'c2'].map(id).sort().join(','),
+                        'the subtree under the broken link is deleted; the tree and the cycle stay');
+                }
+
+                // FKs adopted together chain: a row pointing at a deleted row
+                // through another adopted FK is deleted too
+                {
+                    const { group, schema, admin } = await createEnv([
+                        open('c', { name: { type: 'string' } }),
+                        open('b', { y: { type: 'string' } }),
+                        open('a', { x: { type: 'string' } }),
+                    ]);
+                    await (await group.getTable('c')).insert('c1', { name: 'one' });
+                    await (await group.getTable('b')).insert('b1', { y: deriveRowId('ghost') });
+                    await (await group.getTable('b')).insert('b2', { y: deriveRowId('c1') });
+                    await (await group.getTable('a')).insert('a1', { x: deriveRowId('b1') });
+                    await (await group.getTable('a')).insert('a2', { x: deriveRowId('b2') });
+
+                    await schema.updateSchema([
+                        { rule: 'set-fks', table: 'a', fks: { x: 'b' } },
+                        { rule: 'set-fks', table: 'b', fks: { y: 'c' } },
+                    ], admin, 'chain fks');
+                    await group.deploy(await schemaFrontier(schema));
+
+                    const merged = await groupFrontier(group);
+                    assertEquals((await (await viewAt(group, 'b', merged, merged)).liveRowIds()).join(','), deriveRowId('b2'),
+                        'the dangling b row is deleted');
+                    assertEquals((await (await viewAt(group, 'a', merged, merged)).liveRowIds()).join(','), deriveRowId('a2'),
+                        'the a row pointing at the deleted b row is deleted with it');
+                }
+
+                // an FK that held before the deploy keeps delete semantics: its
+                // dependent stays live, dangling
+                {
+                    const { group, schema, admin } = await createEnv([
+                        open('c', { name: { type: 'string' } }),
+                        open('b', { y: { type: 'string' } }),
+                        open('a', { x: { type: 'string' } }, { fks: { x: 'b' } }),
+                    ]);
+                    await (await group.getTable('b')).insert('b1', { y: deriveRowId('ghost') });
+                    await (await group.getTable('a')).insert('a1', { x: deriveRowId('b1') });
+
+                    await schema.updateSchema([{ rule: 'set-fks', table: 'b', fks: { y: 'c' } }], admin, 'adopt b.y');
+                    await group.deploy(await schemaFrontier(schema));
+
+                    const merged = await groupFrontier(group);
+                    assertFalse(await (await viewAt(group, 'b', merged, merged)).hasRow(deriveRowId('b1')),
+                        'the dangling b row is deleted');
+                    assertTrue(await (await viewAt(group, 'a', merged, merged)).hasRow(deriveRowId('a1')),
+                        'the a row pointing at it through the older FK stays live');
+                }
             }
         },
     ],

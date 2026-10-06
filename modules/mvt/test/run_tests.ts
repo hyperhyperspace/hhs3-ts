@@ -3,12 +3,13 @@ import { dagNestingSuite } from "./dag_nesting_tests.js";
 import { refsSuite } from "./refs_tests.js";
 import { deltaSuite } from "./delta_tests.js";
 import { subscribeSuite } from "./subscribe_tests.js";
+import { verdictEvaluationSuite } from "./verdict_evaluation_tests.js";
 
 async function main() {
     const filters = process.argv.slice(2);
     console.log('Running tests for Hyper Hyper Space v3 MVT module' + (filters.length > 0 ? ` (filter: ${filters})` : '') + '\n');
 
-    const allSuites = [dagNestingSuite, refsSuite, deltaSuite, subscribeSuite];
+    const allSuites = [dagNestingSuite, refsSuite, deltaSuite, subscribeSuite, verdictEvaluationSuite];
 
     for (const suite of allSuites) {
         console.log(suite.title);
