@@ -78,7 +78,7 @@ export function anyTruth(truths: Iterable<Truth>): Truth {
 }
 
 // `and` over lazily tested items, stopping at the first false. The order of
-// `items` changes which tests run, never the result.
+// `items` changes which tests run, not the result.
 export async function everyTruth<T>(items: Iterable<T>, test: (item: T) => Promise<Truth>): Promise<Truth> {
     let support: Set<string> | undefined;
     for (const item of items) {

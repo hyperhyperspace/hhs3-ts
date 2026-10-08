@@ -901,7 +901,7 @@ export class RTableGroupImpl implements RTableGroupContract {
                 this.enterVerdictFrame();
                 return await this.diagnoseEntry(evaluation, entryHash, from);
             } finally {
-                this._verdictInflight--;
+                this.exitVeredictFrame();
             }
         });
     }
@@ -919,6 +919,10 @@ export class RTableGroupImpl implements RTableGroupContract {
                 `— a VerdictEvaluation was almost certainly dropped (a helper that received one called a ` +
                 `minting wrapper instead of passing it on)`);
         }
+    }
+
+    private exitVeredictFrame(): void {
+        this._verdictInflight--;
     }
 
     // An entry is live when every op passes its restriction and FK reach, in
