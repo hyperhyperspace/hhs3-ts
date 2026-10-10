@@ -1,6 +1,6 @@
 # Mesh Node
 
-Node mesh factory for HHSv3. Builds a `Mesh` for a single network environment (`MeshScope`) with WebSocket transports (`ws` + `wss`), a folder-discovery backup, and an optional tracker layer (probed, never spawned).
+Node mesh factory for HHSv3. Builds a `Mesh` for a single network environment (`MeshScope`) with WebSocket transports (`ws` + `wss`), a WebRTC transport (`rtc`, werift), a folder-discovery backup, and an optional tracker layer (probed, never spawned).
 
 ## `createNodeMesh(req, opts?)`
 
@@ -10,9 +10,9 @@ import { createNodeMesh } from '@hyper-hyper-space/hhs3_mesh_node';
 const built = await createNodeMesh({
     scope: 'localhost',          // 'localhost' | 'internet'
     identity,                    // OwnIdentity
-    // trackerAddress?, trackerKeyId?, listenAddress?  (explicit overrides)
+    // trackerAddress?, trackerKeyId?, listenAddress?, signalUrl?
 });
-// built: { mesh, discovery, listenAddresses, discoveryNotes, closeables }
+// built: { mesh, discovery, listenAddresses, trackerAddresses, discoveryNotes, closeables }
 ```
 
 The request takes only explicit overrides; it reads no environment variables. Callers (e.g. a CLI) map their own flags/env onto `trackerAddress` / `trackerKeyId` / `listenAddress`.
@@ -25,8 +25,10 @@ The addresses peers dial are exactly the ones the Mesh listens on. A bind-all pl
 |-------|-----------------|--------|
 | `localhost` | none | `ws://127.0.0.1:<free port>` |
 | `localhost` | set | that address (free port filled in if omitted) |
-| `internet` | none | dial-out only: empty listen set, a warning note, tracker still used for discovery/dial |
+| `internet` | none | dial-out only, unless `signalUrl` is set |
 | `internet` | set | that address |
+
+`signalUrl` is a public `wss://` signaling origin. When set, an `rtc://` address is appended to the listen set and announced. The WebRTC provider is always installed so the node can dial `rtc://` peers.
 
 Tracker defaults come from `@hyper-hyper-space/hhs3_mesh_tracker_client` (`resolveTrackerConfig`): the local tracker for `localhost`, the public tracker for `internet`.
 

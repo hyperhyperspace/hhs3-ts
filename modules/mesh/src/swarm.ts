@@ -366,7 +366,7 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
                 const localAddr = localPeer?.addresses.find(
                     a => a.startsWith(provider.scheme + '://')
                 );
-                const transport = await provider.connect(addr, localAddr);
+                const transport = await provider.connect(addr, localAddr, peerInfo.keyId);
                 connected = true;
                 if (TRACE_MESH) {
                     trace('mesh.connect ok', {

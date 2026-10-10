@@ -1,8 +1,10 @@
-// Node mesh factory: ws+wss transports, folder-discovery backup, and an
-// optional tracker (probed, never spawned). One Mesh per network environment
-// (MeshScope). Advertise == listen: the addresses peers dial are exactly the
-// ones the Mesh listens on, so 0.0.0.0 / bind-all is rejected as a listen
-// address. `internet` without an explicit listen address is dial-out only.
+// Node mesh factory: ws+wss and WebRTC transports, folder-discovery backup,
+// and an optional tracker (probed, never spawned). One Mesh per network
+// environment (MeshScope). Advertise == listen: the addresses peers dial are
+// exactly the ones the Mesh listens on, so 0.0.0.0 / bind-all is rejected as
+// a listen address. `internet` without an explicit listen address or signaling
+// server is dial-out only. WebRTC is always available for dialing; a
+// `signalUrl` also publishes an `rtc://` listen address.
 
 import { createServer } from "node:net";
 
@@ -27,6 +29,10 @@ import {
 } from "@hyper-hyper-space/hhs3_mesh";
 import { FolderDiscovery, defaultMeshFolderRoot } from "@hyper-hyper-space/hhs3_mesh_folder_discovery";
 import { TrackerClient, resolveTrackerConfig } from "@hyper-hyper-space/hhs3_mesh_tracker_client";
+import {
+    NodeRtcTransportProvider,
+    type NodeRtcTransportProviderOptions,
+} from "@hyper-hyper-space/hhs3_mesh_rtc_node";
 import { WsTransportProvider } from "@hyper-hyper-space/hhs3_mesh_ws";
 
 export type MeshCloseable = { close(): void | Promise<void> };
@@ -37,17 +43,23 @@ export type NodeMeshRequest = {
     trackerAddress?: string;
     trackerKeyId?: string;
     listenAddress?: string;
+    /** Public wss URL of a signaling server, without an endpoint id. */
+    signalUrl?: string;
     report?: IssueReporter;
 };
 
 export type NodeMeshOptions = {
     folderRoot?: string;
+    createPeer?: NodeRtcTransportProviderOptions["createPeer"];
+    openSignaling?: NodeRtcTransportProviderOptions["openSignaling"];
 };
 
 export type BuiltMesh = {
     mesh: Mesh;
     discovery: PeerDiscovery;
     listenAddresses: NetworkAddress[];
+    /** Addresses the tracker is asked to store. Same as `listenAddresses`. */
+    trackerAddresses: NetworkAddress[];
     discoveryNotes: string[];
     closeables: MeshCloseable[];
 };
@@ -62,6 +74,15 @@ export async function createNodeMesh(
     });
 
     const listenAddresses = await resolveListenAddresses(req.scope, req.listenAddress);
+    const rtc = new NodeRtcTransportProvider({
+        identity: req.identity,
+        signalBase: req.signalUrl,
+        createPeer: opts.createPeer,
+        openSignaling: opts.openSignaling,
+    });
+    if (req.signalUrl !== undefined && rtc.localAddress !== undefined) {
+        listenAddresses.push(rtc.localAddress);
+    }
 
     const authenticator = createAuthenticator({
         localKey: req.identity,
@@ -113,7 +134,7 @@ export async function createNodeMesh(
 
     const discovery = new DiscoveryStack(layers);
     const mesh = new Mesh({
-        transports: [ws, wss],
+        transports: [ws, wss, rtc],
         discovery,
         authenticator,
         localKeyId: req.identity.keyId,
@@ -125,6 +146,7 @@ export async function createNodeMesh(
         mesh,
         discovery,
         listenAddresses,
+        trackerAddresses: listenAddresses,
         discoveryNotes: notes,
         closeables,
     };

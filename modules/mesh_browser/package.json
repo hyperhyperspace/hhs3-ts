@@ -15,7 +15,10 @@
   "author": "Santiago Bazerque",
   "license": "MIT",
   "devDependencies": {
+    "@hyper-hyper-space/hhs3_mesh_signal": "^0.1.0",
     "@types/node": "^22.2.0",
+    "@types/ws": "^8.5.0",
+    "ws": "^8.18.0",
     "ts-node": "^10.9.2",
     "typescript": "6.0.3"
   },
@@ -23,6 +26,7 @@
     "@hyper-hyper-space/hhs3_crypto": "^0.1.0",
     "@hyper-hyper-space/hhs3_mesh": "^0.1.0",
     "@hyper-hyper-space/hhs3_mesh_bc": "^0.1.0",
+    "@hyper-hyper-space/hhs3_mesh_rtc_browser": "^0.1.0",
     "@hyper-hyper-space/hhs3_mesh_tracker_client": "^0.1.0",
     "@hyper-hyper-space/hhs3_mesh_ws_browser": "^0.1.0",
     "@hyper-hyper-space/hhs3_util": "^0.1.0"

@@ -1,9 +1,8 @@
-// Browser mesh factory: dial-only ws/wss + BroadcastChannel transport, a
-// BroadcastChannel discovery backup, and an optional tracker (probed, never
-// spawned). Listen addresses are `bc://` only (browsers cannot accept inbound
-// sockets). On `internet` the tracker is given an empty-address local peer so
-// the public tracker is never poisoned with a tab-local `bc://` address, while
-// BroadcastChannel discovery still advertises `bc://` for tab-to-tab sync.
+// Browser mesh factory: dial-only ws/wss, a WebRTC transport, BroadcastChannel
+// for tab-to-tab sync, and an optional tracker (probed, never spawned).
+// Listen addresses are `bc://` plus `rtc://` when a signaling server is
+// configured. On `internet` the tracker is given only the `rtc://` address
+// (or none), never the tab-local `bc://` address.
 
 import {
     KEM_X25519_HKDF,
@@ -31,6 +30,10 @@ import {
 } from "@hyper-hyper-space/hhs3_mesh_bc";
 import { TrackerClient, resolveTrackerConfig } from "@hyper-hyper-space/hhs3_mesh_tracker_client";
 import {
+    BrowserRtcTransportProvider,
+    type BrowserRtcTransportProviderOptions,
+} from "@hyper-hyper-space/hhs3_mesh_rtc_browser";
+import {
     BrowserWsTransportProvider,
     type WebSocketCtor,
 } from "@hyper-hyper-space/hhs3_mesh_ws_browser";
@@ -43,18 +46,24 @@ export type BrowserMeshRequest = {
     trackerAddress?: string;
     trackerKeyId?: string;
     listenAddress?: string;
+    /** Public wss URL of a signaling server, without an endpoint id. */
+    signalUrl?: string;
     report?: IssueReporter;
 };
 
 export type BrowserMeshOptions = {
     BroadcastChannelCtor?: BroadcastChannelCtor;
     WebSocketCtor?: WebSocketCtor;
+    createPeer?: BrowserRtcTransportProviderOptions["createPeer"];
+    openSignaling?: BrowserRtcTransportProviderOptions["openSignaling"];
 };
 
 export type BuiltMesh = {
     mesh: Mesh;
     discovery: PeerDiscovery;
     listenAddresses: NetworkAddress[];
+    /** Addresses the tracker is asked to store. On `internet` this omits `bc://`. */
+    trackerAddresses: NetworkAddress[];
     discoveryNotes: string[];
     closeables: MeshCloseable[];
 };
@@ -78,20 +87,25 @@ export async function createBrowserMesh(
         BroadcastChannelCtor: opts.BroadcastChannelCtor,
     });
     const listenAddresses: NetworkAddress[] = [bc.localAddress];
+    const rtc = tryBrowserRtc(req, opts);
+    const rtcAddress = req.signalUrl !== undefined ? rtc?.localAddress : undefined;
+    if (rtcAddress !== undefined) listenAddresses.push(rtcAddress);
 
     // Advertise == listen for the tab-local BroadcastChannel network. The
-    // public tracker, however, must not learn our `bc://` address (it is
-    // meaningless off-machine), so on `internet` the tracker peer is empty.
+    // public tracker must not learn `bc://`. It learns `rtc://` when we have
+    // registered with a signaling server.
     const localPeer: PeerInfo = { keyId: req.identity.keyId, addresses: listenAddresses };
-    const trackerPeer: PeerInfo = req.scope === 'internet'
-        ? { keyId: req.identity.keyId, addresses: [] }
-        : localPeer;
+    const trackerAddresses: NetworkAddress[] = req.scope === 'internet'
+        ? (rtcAddress !== undefined ? [rtcAddress] : [])
+        : listenAddresses;
+    const trackerPeer: PeerInfo = { keyId: req.identity.keyId, addresses: trackerAddresses };
 
     const transports: TransportProvider[] = [];
     const ws = tryBrowserWs('ws', opts.WebSocketCtor);
     const wss = tryBrowserWs('wss', opts.WebSocketCtor);
     if (ws !== undefined) transports.push(ws);
     if (wss !== undefined) transports.push(wss);
+    if (rtc !== undefined) transports.push(rtc);
     transports.push(bc);
 
     const layers: DiscoveryLayer[] = [];
@@ -128,6 +142,7 @@ export async function createBrowserMesh(
     layers.push({ source: backup, priority: 0 });
     closeables.push(backup);
     notes.push(`broadcast-channel ${bc.localAddress}`);
+    if (rtcAddress !== undefined) notes.push(`rtc ${rtcAddress}`);
 
     const discovery = new DiscoveryStack(layers);
     const mesh = new Mesh({
@@ -143,9 +158,27 @@ export async function createBrowserMesh(
         mesh,
         discovery,
         listenAddresses,
+        trackerAddresses,
         discoveryNotes: notes,
         closeables,
     };
+}
+
+function tryBrowserRtc(
+    req: BrowserMeshRequest,
+    opts: BrowserMeshOptions,
+): BrowserRtcTransportProvider | undefined {
+    try {
+        return new BrowserRtcTransportProvider({
+            identity: req.identity,
+            signalBase: req.signalUrl,
+            createPeer: opts.createPeer,
+            openSignaling: opts.openSignaling,
+        });
+    } catch (err) {
+        if (req.signalUrl !== undefined) throw err;
+        return undefined;
+    }
 }
 
 function tryBrowserWs(scheme: string, WebSocketCtor?: WebSocketCtor): BrowserWsTransportProvider | undefined {

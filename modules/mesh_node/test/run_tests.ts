@@ -1,4 +1,5 @@
 import { mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,6 +10,9 @@ import {
     HASH_SHA256,
     SIGNING_ED25519,
 } from "@hyper-hyper-space/hhs3_crypto";
+
+import { publicOriginFor, SignalServer } from "@hyper-hyper-space/hhs3_mesh_signal";
+import { openNodeSignaling } from "@hyper-hyper-space/hhs3_mesh_rtc_node";
 
 import { createNodeMesh, type BuiltMesh } from "../src/index.js";
 
@@ -152,6 +156,65 @@ async function testFolderDiscovery() {
     });
 }
 
+async function freePort(): Promise<number> {
+    return new Promise((resolve, reject) => {
+        const server = createServer();
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", () => {
+            const addr = server.address();
+            const port = typeof addr === "object" && addr !== null ? addr.port : 0;
+            server.close(err => err ? reject(err) : resolve(port));
+        });
+    });
+}
+
+async function testSignalUrl() {
+    await withTempDir(async (dir) => {
+        const port = await freePort();
+        const origin = publicOriginFor("127.0.0.1", port);
+        const signal = new SignalServer({
+            host: "127.0.0.1",
+            port,
+            publicOrigin: origin,
+            publicMode: true,
+            renewCheckMs: 60_000,
+        });
+        await signal.start();
+        const alice = await newIdentity();
+        let built: BuiltMesh | undefined;
+        try {
+            built = await createNodeMesh(
+                {
+                    scope: "internet",
+                    identity: alice,
+                    trackerAddress: UNREACHABLE_TRACKER,
+                    signalUrl: origin,
+                },
+                {
+                    folderRoot: dir,
+                    openSignaling: url => openNodeSignaling(url.replace(/^wss:/, "ws:")),
+                    createPeer: () => { throw new Error("factory address test does not dial"); },
+                },
+            );
+            testing.assertEquals(built.listenAddresses.length, 1, "rtc is the only listen address");
+            testing.assertTrue(built.listenAddresses[0]!.startsWith("rtc://"), `advertises rtc (${built.listenAddresses[0]})`);
+            testing.assertEquals(built.trackerAddresses[0], built.listenAddresses[0], "tracker gets the rtc address");
+            testing.assertTrue(
+                !built.discoveryNotes.some(n => n.includes("dial-out only")),
+                "a signaling listen address is not dial-out only",
+            );
+            const start = Date.now();
+            while (signal.registrationCount() < 1) {
+                if (Date.now() - start > 2_000) throw new Error("listener did not register");
+                await new Promise(resolve => setTimeout(resolve, 10));
+            }
+        } finally {
+            await teardown(built);
+            signal.stop();
+        }
+    });
+}
+
 const allSuites = [
     {
         title: "[MESH_NODE] Node mesh factory",
@@ -161,6 +224,7 @@ const allSuites = [
             { name: "[MESH_NODE_02] bind-all listen override rejected", invoke: testBindAllRejected },
             { name: "[MESH_NODE_03] internet without listen is dial-out only", invoke: testInternetDialOut },
             { name: "[MESH_NODE_04] folder discovery backup sees peers, not self", invoke: testFolderDiscovery },
+            { name: "[MESH_NODE_05] signalUrl advertises rtc://", invoke: testSignalUrl },
         ],
     },
 ];

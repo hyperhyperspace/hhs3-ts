@@ -86,7 +86,7 @@ interface Transport {
 interface TransportProvider {
     readonly scheme: string;
     listen(address: NetworkAddress, onConnection: (transport: Transport) => void): Promise<void>;
-    connect(remote: NetworkAddress): Promise<Transport>;
+    connect(remote: NetworkAddress, local?: NetworkAddress, expectedKeyId?: KeyId): Promise<Transport>;
     close(): void;
 }
 ```

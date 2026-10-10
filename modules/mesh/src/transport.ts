@@ -2,6 +2,8 @@
 // defines only the interfaces; concrete implementations (WebSocket, WebRTC,
 // etc.) live in separate modules and are injected by the application.
 
+import type { KeyId } from '@hyper-hyper-space/hhs3_crypto';
+
 export type NetworkAddress = string;
 
 export interface Transport {
@@ -17,6 +19,9 @@ export interface Transport {
 export interface TransportProvider {
     readonly scheme: string;
     listen(address: NetworkAddress, onConnection: (transport: Transport) => void): Promise<void>;
-    connect(remote: NetworkAddress, local?: NetworkAddress): Promise<Transport>;
+    // expectedKeyId is the peer discovery claims to be dialing. Providers that
+    // must check a credential before spending a connection (WebRTC ICE) use it.
+    // Others ignore it.
+    connect(remote: NetworkAddress, local?: NetworkAddress, expectedKeyId?: KeyId): Promise<Transport>;
     close(): void;
 }
