@@ -8,6 +8,7 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "test": "node --import ../../register.mjs ./test/run_tests.ts",
+    "test:live": "node --import ../../register.mjs ./test/live.ts",
     "debug": "node --import ../../register.mjs ./test/run_tests.ts",
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist"
@@ -15,6 +16,7 @@
   "author": "Santiago Bazerque",
   "license": "MIT",
   "devDependencies": {
+    "@hyper-hyper-space/hhs3_mesh_ws": "^0.1.0",
     "@types/node": "^22.2.0",
     "ts-node": "^10.9.2",
     "typescript": "6.0.3"

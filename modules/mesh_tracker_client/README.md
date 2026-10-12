@@ -62,3 +62,5 @@ npm run build
 ```
 npm run test
 ```
+
+`npm run test:live --workspace=modules/mesh_tracker_client` announces to and queries the public tracker at `wss://tracker.mypeer.net:4610`. It needs that host reachable and is not part of `npm test`.

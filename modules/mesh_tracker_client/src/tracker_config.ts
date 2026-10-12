@@ -6,7 +6,7 @@ import type { KeyId } from '@hyper-hyper-space/hhs3_crypto';
 import type { MeshScope } from '@hyper-hyper-space/hhs3_mesh';
 
 export const DEFAULT_LOCAL_TRACKER = 'ws://127.0.0.1:4610';
-export const DEFAULT_INTERNET_TRACKER = 'wss://mypeer.net:4610';
+export const DEFAULT_INTERNET_TRACKER = 'wss://tracker.mypeer.net:4610';
 export const DEFAULT_INTERNET_TRACKER_KEY = 'VjrVDsjsuEOzhsREAA0jl9Wj/TnQu8IF+XMLLbnXBeQ=';
 
 export type ResolvedTracker = {
