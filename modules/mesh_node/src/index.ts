@@ -1,10 +1,7 @@
-// Node mesh factory: ws+wss and WebRTC transports, folder-discovery backup,
-// and an optional tracker (probed, never spawned). One Mesh per network
-// environment (MeshScope). Advertise == listen: the addresses peers dial are
-// exactly the ones the Mesh listens on, so 0.0.0.0 / bind-all is rejected as
-// a listen address. `internet` without an explicit listen address or signaling
-// server is dial-out only. WebRTC is always available for dialing; a
-// `signalUrl` also publishes an `rtc://` listen address.
+// Node mesh factory: ws+wss and WebRTC transports, folder discovery, and
+// trackers (probed, never spawned). One Mesh per network environment.
+// Advertise == listen: the addresses peers dial are the ones the Mesh listens
+// on. An omitted section takes the scope default from MeshConfig.
 
 import { createServer } from "node:net";
 
@@ -18,10 +15,16 @@ import {
     Mesh,
     QuietDiscovery,
     createAuthenticator,
+    planBroadcastChannel,
+    planDiscovery,
+    planWebrtc,
+    planWs,
     probeTracker,
+    requireMeshScope,
     type DiscoveryLayer,
+    type DiscoverySource,
     type IssueReporter,
-    type MeshScope,
+    type MeshConfig,
     type NetworkAddress,
     type PeerDiscovery,
     type PeerInfo,
@@ -29,6 +32,7 @@ import {
 } from "@hyper-hyper-space/hhs3_mesh";
 import { FolderDiscovery, defaultMeshFolderRoot } from "@hyper-hyper-space/hhs3_mesh_folder_discovery";
 import { TrackerClient, resolveTrackerConfig } from "@hyper-hyper-space/hhs3_mesh_tracker_client";
+import { DEFAULT_INTERNET_SIGNAL } from "@hyper-hyper-space/hhs3_mesh_rtc_node";
 import {
     NodeRtcTransportProvider,
     type NodeRtcTransportProviderOptions,
@@ -37,20 +41,13 @@ import { WsTransportProvider } from "@hyper-hyper-space/hhs3_mesh_ws";
 
 export type MeshCloseable = { close(): void | Promise<void> };
 
-export type NodeMeshRequest = {
-    scope: MeshScope;
+export type NodeMeshRuntime = {
     identity: OwnIdentity;
-    trackerAddress?: string;
-    trackerKeyId?: string;
-    listenAddress?: string;
-    /** Public wss URL of a signaling server, without an endpoint id. */
-    signalUrl?: string;
     report?: IssueReporter;
 };
 
 export type NodeMeshOptions = {
-    folderRoot?: string;
-    createPeer?: NodeRtcTransportProviderOptions["createPeer"];
+    createRTCPeerConnection?: NodeRtcTransportProviderOptions["createRTCPeerConnection"];
     openSignaling?: NodeRtcTransportProviderOptions["openSignaling"];
 };
 
@@ -58,88 +55,81 @@ export type BuiltMesh = {
     mesh: Mesh;
     discovery: PeerDiscovery;
     listenAddresses: NetworkAddress[];
-    /** Addresses the tracker is asked to store. Same as `listenAddresses`. */
+    /** Addresses a tracker is asked to store. On Node this matches `listenAddresses`. */
     trackerAddresses: NetworkAddress[];
     discoveryNotes: string[];
     closeables: MeshCloseable[];
 };
 
 export async function createNodeMesh(
-    req: NodeMeshRequest,
+    config: MeshConfig,
+    runtime: NodeMeshRuntime,
     opts: NodeMeshOptions = {},
 ): Promise<BuiltMesh> {
-    const tracker = resolveTrackerConfig(req.scope, {
-        tracker: req.trackerAddress,
-        trackerKey: req.trackerKeyId,
-    });
+    const scoped = requireMeshScope(config);
+    planBroadcastChannel(scoped, 'node');
 
-    const listenAddresses = await resolveListenAddresses(req.scope, req.listenAddress);
-    const rtc = new NodeRtcTransportProvider({
-        identity: req.identity,
-        signalBase: req.signalUrl,
-        createPeer: opts.createPeer,
-        openSignaling: opts.openSignaling,
-    });
-    if (req.signalUrl !== undefined && rtc.localAddress !== undefined) {
-        listenAddresses.push(rtc.localAddress);
+    const listenAddresses: NetworkAddress[] = [];
+    const transports: TransportProvider[] = [];
+    const wsPlan = planWs(scoped, 'node');
+    const ws = new WsTransportProvider('ws');
+    const wss = new WsTransportProvider('wss');
+    if (wsPlan.dial) transports.push(ws);
+    transports.push(wss);
+    if (wsPlan.listen === 'loopback') {
+        const port = await pickFreePort('127.0.0.1');
+        listenAddresses.push(`ws://127.0.0.1:${port}`);
+    } else if (wsPlan.listen !== undefined) {
+        listenAddresses.push(await concreteListenAddress(wsPlan.listen));
+    }
+
+    const webrtc = planWebrtc(scoped, DEFAULT_INTERNET_SIGNAL);
+    let rtcAddress: NetworkAddress | undefined;
+    if (webrtc.install) {
+        const rtc = new NodeRtcTransportProvider({
+            identity: runtime.identity,
+            ...(webrtc.listen ? { signalBase: webrtc.signal } : {}),
+            ...(webrtc.iceServers !== undefined ? { iceServers: webrtc.iceServers } : {}),
+            createRTCPeerConnection: opts.createRTCPeerConnection,
+            openSignaling: opts.openSignaling,
+        });
+        transports.push(rtc);
+        if (webrtc.listen && rtc.localAddress !== undefined) {
+            rtcAddress = rtc.localAddress;
+            listenAddresses.push(rtcAddress);
+        }
     }
 
     const authenticator = createAuthenticator({
-        localKey: req.identity,
+        localKey: runtime.identity,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
 
-    const ws = new WsTransportProvider('ws');
-    const wss = new WsTransportProvider('wss');
-    const trackerProvider = providerFor(tracker.address, ws, wss);
-
-    // Advertise == listen. A dial-out-only mesh (empty listen set) advertises
-    // nothing, so peers found via the tracker are dialed but we register no
-    // presence of our own.
-    const localPeer: PeerInfo = { keyId: req.identity.keyId, addresses: listenAddresses };
-    const layers: DiscoveryLayer[] = [];
-    const closeables: MeshCloseable[] = [];
-    const notes: string[] = [];
-
-    if (req.scope === 'internet' && listenAddresses.length === 0) {
-        notes.push('dial-out only: pass --listen to accept inbound');
-    }
-
-    const reachable = await probeTracker(trackerProvider, tracker.address);
-    if (reachable) {
-        const client = new TrackerClient({
-            trackerAddress: tracker.address,
-            trackerKeyId: tracker.keyId,
-            transportProvider: trackerProvider,
-            authenticator,
-            localPeer,
-        });
-        layers.push({ source: new QuietDiscovery(client), priority: 0 });
-        closeables.push(client);
-        notes.push(`tracker ${tracker.address}`);
-    } else {
-        notes.push(`tracker ${tracker.address} unreachable`);
-    }
-
-    const folder = new FolderDiscovery({
-        root: opts.folderRoot ?? defaultMeshFolderRoot(),
-        self: localPeer,
+    const localPeer: PeerInfo = { keyId: runtime.identity.keyId, addresses: listenAddresses };
+    const sources = planDiscovery(scoped, 'node', false);
+    const { layers, closeables, notes } = await buildDiscovery({
+        scope: scoped.scope,
+        sources,
+        localPeer,
+        ws,
+        wss,
+        authenticator,
     });
-    // Same priority as the tracker so DiscoveryStack merges both sources in
-    // parallel; a slow or hung tracker query must not delay the backup layer.
-    layers.push({ source: folder, priority: 0 });
-    closeables.push(folder);
-    notes.push(`folder ${folder.root}`);
+
+    if (!wsPlan.dial) closeables.push({ close: () => ws.close() });
+    if (scoped.scope === 'internet' && listenAddresses.length === 0) {
+        notes.unshift('dial-out only');
+    }
 
     const discovery = new DiscoveryStack(layers);
     const mesh = new Mesh({
-        transports: [ws, wss, rtc],
+        transports,
         discovery,
         authenticator,
-        localKeyId: req.identity.keyId,
+        localKeyId: runtime.identity.keyId,
         listenAddresses,
-        report: req.report,
+        report: runtime.report,
     });
 
     return {
@@ -152,31 +142,63 @@ export async function createNodeMesh(
     };
 }
 
-async function resolveListenAddresses(
-    scope: MeshScope,
-    listenOverride?: string,
-): Promise<NetworkAddress[]> {
-    if (listenOverride !== undefined && listenOverride.trim() !== '') {
-        return [await concreteListenAddress(listenOverride)];
+async function buildDiscovery(args: {
+    scope: 'localhost' | 'internet';
+    sources: DiscoverySource[];
+    localPeer: PeerInfo;
+    ws: TransportProvider;
+    wss: TransportProvider;
+    authenticator: ReturnType<typeof createAuthenticator>;
+}): Promise<{ layers: DiscoveryLayer[]; closeables: MeshCloseable[]; notes: string[] }> {
+    const layers: DiscoveryLayer[] = [];
+    const closeables: MeshCloseable[] = [];
+    const notes: string[] = [];
+    for (const source of args.sources) {
+        const priority = source.priority ?? 0;
+        if (source.type === 'tracker') {
+            const tracker = resolveTrackerConfig(args.scope, {
+                tracker: source.url,
+                trackerKey: source.key,
+            });
+            const provider = providerFor(tracker.address, args.ws, args.wss);
+            const reachable = await probeTracker(provider, tracker.address);
+            if (reachable) {
+                const client = new TrackerClient({
+                    trackerAddress: tracker.address,
+                    trackerKeyId: tracker.keyId,
+                    transportProvider: provider,
+                    authenticator: args.authenticator,
+                    localPeer: args.localPeer,
+                });
+                layers.push({ source: new QuietDiscovery(client), priority });
+                closeables.push(client);
+                notes.push(`tracker ${tracker.address}`);
+            } else {
+                notes.push(`tracker ${tracker.address} unreachable`);
+            }
+        } else if (source.type === 'folder') {
+            const folder = new FolderDiscovery({
+                root: source.root ?? defaultMeshFolderRoot(),
+                self: args.localPeer,
+            });
+            layers.push({ source: folder, priority });
+            closeables.push(folder);
+            notes.push(`folder ${folder.root}`);
+        }
     }
-    if (scope === 'localhost') {
-        const port = await pickFreePort('127.0.0.1');
-        return [`ws://127.0.0.1:${port}`];
-    }
-    // internet without an explicit listen address: dial-out only.
-    return [];
+    return { layers, closeables, notes };
 }
 
 async function concreteListenAddress(listen: string): Promise<NetworkAddress> {
     const url = new URL(listen);
     if (url.hostname === '0.0.0.0' || url.hostname === '[::]' || url.hostname === '::') {
-        throw new Error(`--listen must be a dialable address, not bind-all (${listen})`);
+        throw new Error(`ws listen must be a dialable address, not bind-all (${listen})`);
     }
     if (url.port === '') {
         url.port = String(await pickFreePort(url.hostname));
     } else {
         const port = Number(url.port);
-        if (!Number.isInteger(port) || port <= 0) throw new Error(`invalid --listen port in ${listen}`);
+        if (!Number.isInteger(port) || port <= 0) throw new Error(`invalid ws listen port in ${listen}`);
     }
     return stripTrailingSlash(url.toString());
 }

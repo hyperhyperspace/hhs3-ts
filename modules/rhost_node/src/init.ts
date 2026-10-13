@@ -100,7 +100,7 @@ export async function chooseKey(
 // The sync scope of a new host: `given`, or asked.
 export async function chooseScope(given: SyncScope | undefined, prompter: Prompter, command = 'rhost create'): Promise<SyncScope> {
     if (given !== undefined) return given;
-    if (!prompter.interactive) throw new Error(`${command} needs --scope internet|localhost (there is no terminal to ask on)`);
+    if (!prompter.interactive) throw new Error(`${command} needs --mesh with a scope, internet or localhost (there is no terminal to ask on)`);
     prompter.say('Sync over:');
     prompter.say('  1. internet');
     prompter.say('  2. localhost');

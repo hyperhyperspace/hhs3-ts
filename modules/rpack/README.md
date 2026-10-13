@@ -69,7 +69,7 @@ The staged folder's `staging.json` follows the same split as rhost's files, and 
 
 ```json
 {
-  "sync": { "scope": "localhost", "listen": "ws://127.0.0.1:7400" },
+  "mesh": { "scope": "localhost", "transports": { "ws": { "listen": "ws://127.0.0.1:7400" } } },
   "allow": ["user.identities.keyId"],
   "projection": { "path": "db/data.sqlite" },
   "autoDeploy": "none",
@@ -77,7 +77,7 @@ The staged folder's `staging.json` follows the same split as rhost's files, and 
 }
 ```
 
-- `sync` is the host's network settings, written to its `host.json`; it defaults to `{ "scope": "localhost" }`.
+- `mesh` is the host's network settings, written to its `host.json`; it defaults to `{ "scope": "localhost" }`.
 - `allow`, `projection`, `autoDeploy` and `params` go to `app.json`. `autoDeploy` defaults to `none`, and a param the release declares and `params` leaves out defaults to `$me` when it's an identity; any other is an error. A name the staged release doesn't declare is an error too.
 
 ## Library

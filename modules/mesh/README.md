@@ -243,7 +243,7 @@ Top-level facade that ties everything together for a single network environment.
 The Mesh also handles `topic_interest` control messages on already-pooled connections, enabling the pool-reuse discovery pattern.
 
 ```typescript
-interface MeshConfig {
+interface MeshOptions {
     transports:             TransportProvider[];
     discovery:              PeerDiscovery;
     authenticator:          PeerAuthenticator;
@@ -254,7 +254,7 @@ interface MeshConfig {
 
 class Mesh {
     readonly pool: ConnectionPool;
-    constructor(config: MeshConfig);
+    constructor(config: MeshOptions);
 
     createSwarm(topic: TopicId, opts?: {
         targetPeers?: number;   // outbound seek goal (low water), default 6
@@ -438,7 +438,7 @@ const mesh = new Mesh({
     ]),
     authenticator,
     localKeyId,
-    listenAddresses: ['ws://0.0.0.0:9000'],
+    listenAddresses: ['ws://127.0.0.1:9000'],
 });
 
 const topic = sha256.hashToB64(stringToUint8Array('my-shared-document'));

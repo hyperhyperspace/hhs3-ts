@@ -128,7 +128,7 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
                 assertEquals(await chooseScope(undefined, scriptedPrompter(['1'])), 'internet', 'scope 1 is internet');
                 assertEquals(await chooseScope(undefined, scriptedPrompter(['localhost'])), 'localhost', 'or by name');
                 const noScope = await refusal(() => chooseScope(undefined, NON_INTERACTIVE, 'rhost join'));
-                assertTrue(noScope.includes('rhost join needs --scope'), `no terminal: --scope is named (${noScope})`);
+                assertTrue(noScope.includes('rhost join needs --mesh with a scope'), `no terminal: --mesh is named (${noScope})`);
             });
         },
     },
@@ -146,14 +146,14 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
                     assertTrue(existsSync(join(folder, 'host.json')) && existsSync(join(folder, 'rdb', 'replica.rdb')), 'the host folder');
                     assertEquals((await fs.readdir(join(appDir, 'hosts'))).join(','), 'default', 'no pending folder is left');
                     const record = JSON.parse(await fs.readFile(join(folder, 'host.json'), 'utf8')) as {
-                        key: { label: string; keyId: string; publicKey: string; passphrase?: string }; sync: { scope: string };
+                        key: { label: string; keyId: string; publicKey: string; passphrase?: string }; mesh: { scope: string };
                     };
                     const me = (await KeyStore.open(join(dir, 'user-keys.json'), hashSuite)).resolvePublic('me');
                     assertEquals(record.key.label, 'me', 'host.json names the key');
                     assertEquals(record.key.keyId, me.keyId, 'with its id');
                     assertEquals(record.key.publicKey, serializePublicKeyToBase64(me.publicKey), 'and its public key');
                     assertEquals(record.key.passphrase, 'prompt', 'and its passphrase source');
-                    assertEquals(record.sync.scope, 'localhost', 'host.json has the network settings');
+                    assertEquals(record.mesh.scope, 'localhost', 'host.json has the network settings');
 
                     await app.start('default');
                     const data = join(folder, 'db', 'data.sqlite');

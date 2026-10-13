@@ -148,7 +148,7 @@ export const rpackTests = [
                 const rhost = (...args: string[]) => runBin('rhost', ['--app', app, ...args]);
                 process.env['RPACK_TEST_PASS'] = 'pw';
                 try {
-                    ok(await rhost('create', '--key', 'me', '--scope', 'localhost', '--passphrase-env', 'RPACK_TEST_PASS'), 'rhost create at 1.0.1');
+                    ok(await rhost('create', '--key', 'me', '--mesh', '{"scope":"localhost"}', '--passphrase-env', 'RPACK_TEST_PASS'), 'rhost create at 1.0.1');
                     assertTrue((await rhost('status')).stdout.includes('deployed  1.0.1'), 'the host runs 1.0.1');
                     for (const version of ['1.1.0', '1.2.0']) await fs.copyFile(file(version), join(app, 'catalogs', basename(file(version))));
                     const deploy = await rhost('deploy');

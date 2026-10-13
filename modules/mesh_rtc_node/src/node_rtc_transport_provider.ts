@@ -23,7 +23,7 @@ export interface NodeRtcTransportProviderOptions {
     connectTimeoutMs?: number;
     delegationTtlSec?: number;
     now?: () => number;
-    createPeer?: RtcTransportProviderOptions['createPeer'];
+    createRTCPeerConnection?: RtcTransportProviderOptions['createRTCPeerConnection'];
     openSignaling?: RtcTransportProviderOptions['openSignaling'];
     /** Extra werift peer options. Used when the default peer connection is created. */
     werift?: Partial<PeerConfig>;
@@ -33,7 +33,7 @@ export class NodeRtcTransportProvider extends RtcTransportProvider {
     constructor(opts: NodeRtcTransportProviderOptions) {
         super({
             ...opts,
-            createPeer: opts.createPeer ?? (ice => adaptWerift(ice, opts.werift)),
+            createRTCPeerConnection: opts.createRTCPeerConnection ?? (ice => adaptWerift(ice, opts.werift)),
             openSignaling: opts.openSignaling ?? openNodeSignaling,
         });
     }

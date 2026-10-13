@@ -1,34 +1,26 @@
-// RDb adapter over the generic Node mesh factory. Maps RDB_SYNC_* env vars and
-// the request (a command's flags, or a host's sync settings) onto
-// createNodeMesh, which owns all mesh composition (transports, discovery,
-// listen policy). Precedence: request > env > scope default.
+// RDb adapter over the Node mesh factory. The request is a MeshConfig; identity
+// and the issue reporter travel beside it. `folderRoot`, when set, pins folder
+// discovery entries that omit a root (including the default list) so a test
+// does not write into the user's mesh folder.
 
+import type { MeshConfig, ScopedMeshConfig } from "@hyper-hyper-space/hhs3_mesh";
 import { createNodeMesh } from "@hyper-hyper-space/hhs3_mesh_node";
-import type { BuiltSyncMesh, SyncMeshFactory } from "@hyper-hyper-space/hhs3_rhost";
+import type { MeshRuntime, SyncMeshFactory } from "@hyper-hyper-space/hhs3_rhost";
 
 export type NodeSyncMeshFactoryOptions = {
     folderRoot?: string;
-    env?: NodeJS.ProcessEnv;
 };
 
 export function createNodeSyncMeshFactory(opts: NodeSyncMeshFactoryOptions = {}): SyncMeshFactory {
-    return async (req): Promise<BuiltSyncMesh> => {
-        const env = opts.env ?? process.env;
-        return createNodeMesh(
-            {
-                scope: req.scope,
-                identity: req.identity,
-                trackerAddress: req.trackerAddress ?? empty(env.RDB_SYNC_TRACKER),
-                trackerKeyId: req.trackerKeyId ?? empty(env.RDB_SYNC_TRACKER_KEY),
-                listenAddress: req.listenAddress ?? empty(env.RDB_SYNC_LISTEN),
-                report: req.report,
-            },
-            { folderRoot: opts.folderRoot },
-        );
+    return async (config, runtime: MeshRuntime) => {
+        return createNodeMesh(pinFolder(config, opts.folderRoot), runtime);
     };
 }
 
-function empty(value: string | undefined): string | undefined {
-    if (value === undefined || value.trim() === '') return undefined;
-    return value;
+function pinFolder(config: ScopedMeshConfig, root: string | undefined): ScopedMeshConfig {
+    if (root === undefined) return config;
+    const discovery = (config.discovery ?? [{ type: 'tracker' as const }, { type: 'folder' as const }]).map(source =>
+        source.type === 'folder' && source.root === undefined ? { ...source, root } : source,
+    );
+    return { ...config, discovery };
 }

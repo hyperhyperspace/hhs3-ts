@@ -1,4 +1,5 @@
 export {
+    DEFAULT_INTERNET_SIGNAL,
     parseRtcAddress,
     rtcAddressFor,
     type ParsedRtcAddress,

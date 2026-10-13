@@ -8,10 +8,11 @@ import { basename, dirname, join, resolve } from "node:path";
 import { stderr, stdin, stdout } from "node:process";
 import type { Readable } from "node:stream";
 
+import { parseMeshConfig, type MeshConfig } from "@hyper-hyper-space/hhs3_mesh";
 import { formatOpVoidDetail, type OpVoidDetail } from "@hyper-hyper-space/hhs3_rdb";
 import {
-    DEFAULT_HOST, formatReleases, parseParamText,
-    type CreateOptions, type HostSetup, type HostStatus, type ParamsConfig, type Rhost, type SyncConfig, type SyncScope,
+    DEFAULT_HOST, formatReleases, mergeMeshConfig, parseParamText,
+    type CreateOptions, type HostSetup, type HostStatus, type ParamsConfig, type Rhost,
     type UpdateReport,
 } from "@hyper-hyper-space/hhs3_rhost";
 import { formatFilesMount } from "@hyper-hyper-space/hhs3_rdb_repl";
@@ -40,14 +41,13 @@ const USAGE = [
     '  start [<host>]',
     '  stop [<host>]',
     '',
-    'Host options (create, join); --key and --scope are asked on a terminal:',
+    'Host options (create, join); --key is asked on a terminal, and --mesh when the app sets no scope:',
     '  --key <label>|#<key id>    the key the host signs with, from the keystore',
-    '  --scope internet|localhost',
+    '  --mesh <json>|@<file>      mesh settings; scope is asked when neither this nor app.json sets one',
     '  --passphrase-env <VAR>     the key\'s passphrase comes from $VAR (default: asked)',
-    '  --tracker <url>  --tracker-key <key id>  --listen <address>',
 ].join('\n');
 
-const HOST_FLAGS = ['--key', '--passphrase-env', '--scope', '--tracker', '--tracker-key', '--listen'];
+const HOST_FLAGS = ['--key', '--passphrase-env', '--mesh'];
 const PARAM_FORMS = '$me, $<key label>, or a JSON value';
 
 const START_TIMEOUT_MS = 60_000;
@@ -151,12 +151,16 @@ function paramHint(host: string, missing: ClientParam[] | undefined): string | u
     return `set ${missing.length === 1 ? 'it' : 'them'} in app.json's params, or run: rhost deploy ${host} ${paramFlagsFor(missing)}`;
 }
 
-function formatSync(sync: SyncConfig): string {
+function formatMesh(mesh: MeshConfig): string {
+    const trackers = (mesh.discovery ?? [])
+        .filter(source => source.type === 'tracker' && source.url !== undefined)
+        .map(source => source.type === 'tracker' ? source.url : undefined);
+    const ws = mesh.transports?.ws;
+    const listen = ws !== undefined && ws !== false ? ws.listen : undefined;
     return [
-        sync.scope,
-        ...(sync.tracker !== undefined ? [`tracker ${sync.tracker}`] : []),
-        ...(sync.trackerKey !== undefined ? [`tracker key ${sync.trackerKey}`] : []),
-        ...(sync.listen !== undefined ? [`listening on ${sync.listen}`] : []),
+        mesh.scope ?? 'scope from app.json',
+        ...trackers.map(url => `tracker ${url}`),
+        ...(listen !== undefined ? [`listening on ${listen}`] : []),
     ].join(', ');
 }
 
@@ -195,10 +199,6 @@ async function newHostName(app: Rhost, given: string | undefined): Promise<strin
 // flags or asked. A key pair created here goes into the app's keystore, and
 // its passphrase is not asked again to unlock it.
 async function hostSetup(app: Rhost, parsed: Parsed, prompter: Prompter, command: string): Promise<HostSetup> {
-    const scope = single(parsed, '--scope');
-    if (scope !== undefined && scope !== 'internet' && scope !== 'localhost') {
-        throw new UsageError(`--scope is internet or localhost, got '${scope}'`);
-    }
     const env = single(parsed, '--passphrase-env');
     const platform = nodePlatformOf(app);
     const keys = await platform.keyVault();
@@ -212,22 +212,47 @@ async function hostSetup(app: Rhost, parsed: Parsed, prompter: Prompter, command
     } else {
         keyId = choice.record.keyId;
     }
-    const sync: SyncConfig = { scope: await chooseScope(scope as SyncScope | undefined, prompter, command) };
+    let mesh = await meshFromFlag(single(parsed, '--mesh'), command);
+    if (mesh.scope === undefined && app.config.mesh?.scope === undefined) {
+        if (!prompter.interactive) {
+            throw new Error(`${command} needs --mesh with a scope (app.json does not set one, and there is no terminal to ask on)`);
+        }
+        mesh = { ...mesh, scope: await chooseScope(undefined, prompter, command) };
+    }
     if (env === undefined && choice.kind === 'existing' && !prompter.interactive) {
         throw new Error(`${command} needs --passphrase-env <VAR> to unlock '${choice.record.label}' (there is no terminal to ask on)`);
     }
-    const tracker = single(parsed, '--tracker');
-    const trackerKey = single(parsed, '--tracker-key');
-    const listen = single(parsed, '--listen');
-    if (tracker !== undefined) sync.tracker = tracker;
-    if (trackerKey !== undefined) sync.trackerKey = trackerKey;
-    if (listen !== undefined) sync.listen = listen;
-    return { key: `#${keyId}`, passphrase: env !== undefined ? `env:${env}` : 'prompt', sync };
+    return {
+        key: `#${keyId}`,
+        passphrase: env !== undefined ? `env:${env}` : 'prompt',
+        mesh: mergeMeshConfig(app.config.mesh, mesh),
+    };
 }
 
-function printHostSetup(app: Rhost, name: string, setup: { key: { label: string; keyId: string }; sync: SyncConfig }): void {
+async function meshFromFlag(flag: string | undefined, command: string): Promise<MeshConfig> {
+    if (flag === undefined) return {};
+    const text = flag.startsWith('@') ? await fs.readFile(flag.slice(1), 'utf8') : flag;
+    let value: unknown;
+    try {
+        value = JSON.parse(text);
+    } catch (err) {
+        throw new UsageError(`${command} --mesh is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const doc = isMeshWrapper(value) ? value.mesh : value;
+    try {
+        return parseMeshConfig(doc, command, 'mesh');
+    } catch (err) {
+        throw new UsageError(err instanceof Error ? err.message : String(err));
+    }
+}
+
+function isMeshWrapper(value: unknown): value is { mesh: unknown } {
+    return typeof value === 'object' && value !== null && !Array.isArray(value) && 'mesh' in value;
+}
+
+function printHostSetup(app: Rhost, name: string, setup: { key: { label: string; keyId: string }; mesh?: MeshConfig }): void {
     print(`  key       ${setup.key.label} (${setup.key.keyId.slice(0, 8)}, in ${app.platform.keystoreLocation ?? 'the keystore'})`);
-    print(`  sync      ${formatSync(setup.sync)}`);
+    if (setup.mesh !== undefined) print(`  mesh      ${formatMesh(setup.mesh)}`);
     print(`start it with: rhost start ${name}`);
 }
 

@@ -21,8 +21,9 @@ import {
 } from "@hyper-hyper-space/hhs3_rdb";
 import { lex, parseScript } from "@hyper-hyper-space/hhs3_rdb_lang";
 import { executeText, LanguageError, RdbRuntime, useDatabase, type KeyVault } from "@hyper-hyper-space/hhs3_rdb_runtime";
+import { parseMeshConfig, type MeshConfig } from "@hyper-hyper-space/hhs3_mesh";
 import {
-    ConfigError, DEFAULT_HOST, parseAppConfig, parseSyncConfig, type AppConfig, type Host, type SyncConfig,
+    ConfigError, DEFAULT_HOST, parseAppConfig, type AppConfig, type Host,
 } from "@hyper-hyper-space/hhs3_rhost";
 import { APP_CONFIG_FILE, KeyStore, openApp } from "@hyper-hyper-space/hhs3_rhost_node";
 import {
@@ -37,7 +38,7 @@ const CATALOGS_DIR = 'catalogs';
 const KEYS_FILE = 'keys.json';
 const HOST = DEFAULT_HOST;
 const ADMIN = 'admin';
-const STAGING_FIELDS = ['sync', 'allow', 'projection', 'autoDeploy', 'params'];
+const STAGING_FIELDS = ['mesh', 'allow', 'projection', 'autoDeploy', 'params'];
 const ROW_KINDS = new Set(['insert', 'update', 'delete', 'bundle']);
 const hashSuite = createBasicCrypto().hash(HASH_SHA256);
 
@@ -214,10 +215,10 @@ async function readJson(project: NodeProject, path: string): Promise<unknown> {
     }
 }
 
-// staging.json: the staging host's `sync`, and the `allow`, `projection`,
+// staging.json: the staging host's `mesh`, and the `allow`, `projection`,
 // `autoDeploy` and `params` of its app.json.
 type Staging = {
-    sync: SyncConfig;
+    mesh: MeshConfig;
     app: { allow?: unknown; projection?: unknown; autoDeploy?: unknown };
     params: { [name: string]: unknown };
 };
@@ -233,7 +234,11 @@ function parseStaging(value: unknown): Staging {
     if (value['allow'] !== undefined) app.allow = value['allow'];
     if (value['projection'] !== undefined) app.projection = value['projection'];
     if (value['autoDeploy'] !== undefined) app.autoDeploy = value['autoDeploy'];
-    return { sync: parseSyncConfig(value['sync'] ?? { scope: 'localhost' }, STAGING_FILE), app, params };
+    const mesh = value['mesh'] === undefined
+        ? { scope: 'localhost' as const }
+        : parseMeshConfig(value['mesh'], STAGING_FILE, 'mesh');
+    if (mesh.scope === undefined) mesh.scope = 'localhost';
+    return { mesh, app, params };
 }
 
 // Every param staging.json sets must be one the staged release declares.
@@ -287,7 +292,7 @@ async function replay(dir: string, steps: Step[], staging: Staging, labels: stri
         await fs.writeFile(join(dir, APP_CONFIG_FILE), JSON.stringify(appConfig(staging, step), undefined, 2) + '\n');
         const app = await openApp(dir);
         try {
-            const host = i === 0 ? await app.create(HOST, { key: ADMIN, sync: staging.sync }) : await app.host(HOST);
+            const host = i === 0 ? await app.create(HOST, { key: ADMIN, mesh: staging.mesh }) : await app.host(HOST);
             const before = i === 0 ? new Map<B64Hash, Version>() : await frontiers(host);
             if (i > 0) await host.deploy();
             if (i === steps.length - 1) report = await deployReport(host.db, before);

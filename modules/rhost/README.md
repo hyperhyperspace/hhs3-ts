@@ -1,6 +1,56 @@
 # rhost
 
-Hosts one app on one device. The app ships release files; each of its hosts is one [Rdb](../rdb) database with its own replica, signing key, mesh peer and projection. Hosts share nothing but the app's releases and settings. rhost installs the shipped releases, creates or joins databases, deploys releases where a host's key has the authority, and syncs and projects each host. [DESIGN.md](../rpack/DESIGN.md) describes the tool, and [ARCHITECTURE.md](../rpack/ARCHITECTURE.md) maps it onto the modules.
+The `rhost` tool handles all the configuration needed to use the replicated database [Rdb](../rdb) in a p2p application:
+
+- **Keystore, identity**: create a local keystore, define identities.
+- **Mesh network configuration** (usually an Internet overlay or a local network): peer discovery, transport protocols.
+- **Replica set up**: Import new [rdb](../rdb) schema versions (created using [rpack](../rpack)), that are used to create `rdb` instances, fetch `rdb` instances over the network, define schema upgrade acceptance policy.
+- **Local database**: set up a bidirectional projection between the replica and a local SQLite database, to get full SQL support (the replica is optimized for causal analysis and state reconciliation).
+- **Local files**: mount embedded folders in the replica in the local filesystem.
+
+`rhost` is meant to be used by the application as a library. It is also available as a command line tool, providing roughly the same functionality. If used in a node-based environment, it creates a folder to manage the application data (replicated database and files) with this structure:
+
+```
+my-app/
+  app.json            the app's settings, the same for every host
+  catalogs/           the release files this build ships
+  hosts/
+    default/
+      host.json           written by create or join: the database, the key, the network settings
+      rdb/replica.rdb     this host's replica
+      db/data.sqlite      its projection, which the app uses
+      files/<mount>/      its file mounts, if the app has any
+      run/                the running process: rhost.lock, rhost.sock, rhost.log
+    gaming/
+      ...
+```
+
+One application may have several instances. For example, a forum app may support having several forums, each with its own admin, sections, messages, etc. The application config is in the top level folder, while each instance gets its own folder under `hosts`. Some apps use a single isntance, if none is provided `default` is used. 
+
+The application can just point the `rhost` [node library](../rhost_node/) to that folder:
+
+```ts
+import { openApp } from '@hyper-hyper-space/hhs3_rhost_node';
+const app = await openApp('./my-app');
+
+const editor = await app.create('default', { key: 'me', mesh: { scope: 'internet' } }); // from the shipped release
+const gaming = await app.join(databaseId, 'gaming', { key: 'me', mesh: { scope: 'localhost' } }); // fetched from its peers
+await editor.start();                                 // or app.start() for every host
+
+const [status] = await app.status('default');
+editor.onStatus((s) => { /* deployed, held, members, peers, notDeployed, lastError */ });
+
+await app.update();                                   // install the shipped releases, deploy when due
+await editor.deploy({ params: { moderator: '$me' } }); // deploy now, whatever autoDeploy says
+await app.remove('gaming');                           // this device's copy only
+await app.close();
+```
+
+If in a browser environment, 
+
+`rhost` plays no part in distributing the application itself: its scope is just the data replicated through `rdb`. 
+
+Hosts one app on one device. The app developer ships database release files (catalog, schemas, see [rpack](../rpack) for details). The app can have one or serveral hosts, each one with an [Rdb](../rdb) database with its own replica, signing key, mesh peer and projection. Hosts share nothing but the app's releases and settings. rhost installs the shipped releases, creates or joins databases, deploys releases where a host's key has the authority, and syncs and projects each host. [DESIGN.md](../rpack/DESIGN.md) describes the tool, and [ARCHITECTURE.md](../rpack/ARCHITECTURE.md) maps it onto the modules.
 
 rhost is browser-safe: everything specific to the device comes from a `HostPlatform`.
 
@@ -15,8 +65,8 @@ import { Rhost } from '@hyper-hyper-space/hhs3_rhost';
 
 const app = await Rhost.open(config, platform);
 
-const editor = await app.create('default', { key: 'me', sync: { scope: 'internet' } }); // from the shipped release
-const gaming = await app.join(databaseId, 'gaming', { key: 'me', sync: { scope: 'localhost' } }); // fetched from its peers
+const editor = await app.create('default', { key: 'me', mesh: { scope: 'internet' } }); // from the shipped release
+const gaming = await app.join(databaseId, 'gaming', { key: 'me', mesh: { scope: 'localhost' } }); // fetched from its peers
 await editor.start();                                 // or app.start() for every host
 
 const [status] = await app.status('default');
@@ -30,7 +80,7 @@ await app.close();
 
 - **`create(name?, { key, sync, passphrase?, catalog?, name? })`** creates a database from the shipped release, with the host's key as creator and the app's params, and deploys it.
   - `key` is a label or `#<key id>` in the platform's keystore. `host.json` records its label, key id and public key, and `passphrase`, the source of its passphrase: `prompt`, `env:<VAR>`, or absent for a key stored without one.
-  - `sync` is the host's network settings, written to `host.json` as given (see [Config](#config)). Two hosts of an app can't listen on the same port.
+  - `mesh` is the host's network settings, written to `host.json` as given (see [Config](#config)). Two hosts of an app can't listen on the same WebSocket port.
   - The host name defaults to `default`, and the database name to the host name.
 - **`join(id, name?, { key, sync, passphrase? })`** fetches the database's genesis over a temporary mesh with the host's own `sync` settings, checks that the app ships its catalog, and installs that release. Sync brings the rest once the host starts.
 - **`update(name?)`** installs the shipped release (a no-op when its entries are present), sets the adoption range to everything below the next major (`<(M+1).0.0`), and deploys the release when all of these hold:
@@ -71,6 +121,9 @@ A host's key is unlocked once per app, by key id: relabeling it in the keystore 
   "params": { "admin": "$me" },
   "autoDeploy": "minor",
   "allow": ["user.identities.keyId"],
+  "mesh": {
+    "transports": { "webrtc": { "signal": "wss://signal.example.org" } }
+  },
   "projection": {
     "path": "db/data.sqlite",
     "indexPub": true,
@@ -101,13 +154,16 @@ Each host's `host.json` is written by `create` or `join`:
   "catalog": "editor",
   "created": true,
   "key": { "label": "me", "keyId": "...", "publicKey": "...", "passphrase": "prompt" },
-  "sync": { "scope": "internet", "tracker": "wss://tracker.example.org", "listen": "ws://0.0.0.0:7400" },
+  "mesh": {
+    "scope": "internet",
+    "transports": { "ws": { "listen": "ws://203.0.113.10:7400" } }
+  },
   "autoDeploy": "none"
 }
 ```
 
-- `sync.scope` is `internet` or `localhost`; `tracker`, `trackerKey` and `listen` are optional, like `\sync`'s flags. Without a `listen` port, a free one is picked when the host starts.
-- A host may override `params`, `autoDeploy` and `projection`. It can't set `releases`, `keystore` or `allow`.
+- `mesh` is a [MeshConfig](../mesh). `scope` is `internet` or `localhost`. `transports.ws.listen` is a dialable `ws://` URL (not `0.0.0.0`). `transports.webrtc` listens through a `wss://` signaling server. `discovery` is a list of `tracker`, `folder`, and `broadcast-channel` sources. A host value replaces the same key from `app.json`: `scope`, each transport, and the whole `discovery` array. On `internet`, an omitted WebRTC section listens at `wss://signal.mypeer.net:4612`, and an omitted tracker is `wss://tracker.mypeer.net:4610`. On `localhost`, an omitted WebSocket section listens at `ws://127.0.0.1` on a free port. `false` turns that transport off.
+- A host may override `params`, `autoDeploy`, `projection`, and `mesh`. It can't set `releases`, `keystore`, or `allow`.
 
 Both files are strict: every object in them, nested ones included, refuses a field it doesn't know and names it, and a missing required field is reported as missing. `parseAppConfig`, `parseHostRecord` and `effectiveConfig` do the checking and merging.
 
@@ -163,7 +219,7 @@ interface HostPlatform {
 
 The REPL's `\sync` and `\project` use the same services as rhost:
 
-- `SyncMeshFactory` and its request and result types;
+- `SyncMeshFactory(config, runtime)` and `BuiltSyncMesh`; `config` is a `MeshConfig` with `scope` set, and `runtime` carries the identity and the issue reporter;
 - `createAllowAuthorizer(sources, lookup)`, `columnLookup(session)` and `parseAllowSource(text)`;
 - `startDatabaseSync(...)`, which attaches a built mesh, starts the database's sync, and returns a handle with `peers()` and `stop()`;
 - `fetchDatabase(...)`, which fetches a genesis over a temporary mesh;

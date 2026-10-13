@@ -23,7 +23,7 @@ export interface BrowserRtcTransportProviderOptions {
     now?: () => number;
     WebSocketCtor?: new (url: string) => WebSocket;
     RTCPeerConnectionCtor?: typeof RTCPeerConnection;
-    createPeer?: RtcTransportProviderOptions['createPeer'];
+    createRTCPeerConnection?: RtcTransportProviderOptions['createRTCPeerConnection'];
     openSignaling?: RtcTransportProviderOptions['openSignaling'];
 }
 
@@ -33,7 +33,7 @@ export class BrowserRtcTransportProvider extends RtcTransportProvider {
             ?? (globalThis as { WebSocket?: new (url: string) => WebSocket }).WebSocket;
         const PC = opts.RTCPeerConnectionCtor
             ?? (globalThis as { RTCPeerConnection?: typeof RTCPeerConnection }).RTCPeerConnection;
-        const createPeer = opts.createPeer ?? (ice => {
+        const createRTCPeerConnection = opts.createRTCPeerConnection ?? (ice => {
             if (PC === undefined) throw new Error('no RTCPeerConnection implementation available');
             return adaptPeer(new PC({ iceServers: ice as RTCIceServer[] }));
         });
@@ -41,10 +41,10 @@ export class BrowserRtcTransportProvider extends RtcTransportProvider {
             if (WS === undefined) return Promise.reject(new Error('no WebSocket implementation available'));
             return openPlatformSocket(url, WS);
         });
-        if (opts.createPeer === undefined && PC === undefined) {
+        if (opts.createRTCPeerConnection === undefined && PC === undefined) {
             throw new Error('no RTCPeerConnection implementation available');
         }
-        super({ ...opts, createPeer, openSignaling });
+        super({ ...opts, createRTCPeerConnection, openSignaling });
     }
 }
 

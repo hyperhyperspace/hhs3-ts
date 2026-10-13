@@ -1,8 +1,7 @@
 // Browser mesh factory: dial-only ws/wss, a WebRTC transport, BroadcastChannel
-// for tab-to-tab sync, and an optional tracker (probed, never spawned).
-// Listen addresses are `bc://` plus `rtc://` when a signaling server is
-// configured. On `internet` the tracker is given only the `rtc://` address
-// (or none), never the tab-local `bc://` address.
+// for tab-to-tab sync, and trackers (probed, never spawned). Listen addresses
+// are `bc://` when that transport is on, plus `rtc://` when WebRTC listens.
+// On `internet` a tracker is given the public addresses only, never `bc://`.
 
 import {
     KEM_X25519_HKDF,
@@ -14,9 +13,16 @@ import {
     Mesh,
     QuietDiscovery,
     createAuthenticator,
+    planBroadcastChannel,
+    planDiscovery,
+    planWebrtc,
+    planWs,
     probeTracker,
+    requireMeshScope,
     type DiscoveryLayer,
+    type DiscoverySource,
     type IssueReporter,
+    type MeshConfig,
     type MeshScope,
     type NetworkAddress,
     type PeerDiscovery,
@@ -29,6 +35,7 @@ import {
     type BroadcastChannelCtor,
 } from "@hyper-hyper-space/hhs3_mesh_bc";
 import { TrackerClient, resolveTrackerConfig } from "@hyper-hyper-space/hhs3_mesh_tracker_client";
+import { DEFAULT_INTERNET_SIGNAL } from "@hyper-hyper-space/hhs3_mesh_rtc_browser";
 import {
     BrowserRtcTransportProvider,
     type BrowserRtcTransportProviderOptions,
@@ -40,21 +47,15 @@ import {
 
 export type MeshCloseable = { close(): void | Promise<void> };
 
-export type BrowserMeshRequest = {
-    scope: MeshScope;
+export type BrowserMeshRuntime = {
     identity: OwnIdentity;
-    trackerAddress?: string;
-    trackerKeyId?: string;
-    listenAddress?: string;
-    /** Public wss URL of a signaling server, without an endpoint id. */
-    signalUrl?: string;
     report?: IssueReporter;
 };
 
 export type BrowserMeshOptions = {
     BroadcastChannelCtor?: BroadcastChannelCtor;
     WebSocketCtor?: WebSocketCtor;
-    createPeer?: BrowserRtcTransportProviderOptions["createPeer"];
+    createRTCPeerConnection?: BrowserRtcTransportProviderOptions["createRTCPeerConnection"];
     openSignaling?: BrowserRtcTransportProviderOptions["openSignaling"];
 };
 
@@ -62,96 +63,117 @@ export type BuiltMesh = {
     mesh: Mesh;
     discovery: PeerDiscovery;
     listenAddresses: NetworkAddress[];
-    /** Addresses the tracker is asked to store. On `internet` this omits `bc://`. */
+    /** Addresses a tracker is asked to store. On `internet` this omits `bc://`. */
     trackerAddresses: NetworkAddress[];
     discoveryNotes: string[];
     closeables: MeshCloseable[];
 };
 
 export async function createBrowserMesh(
-    req: BrowserMeshRequest,
+    config: MeshConfig,
+    runtime: BrowserMeshRuntime,
     opts: BrowserMeshOptions = {},
 ): Promise<BuiltMesh> {
-    const tracker = resolveTrackerConfig(req.scope, {
-        tracker: req.trackerAddress,
-        trackerKey: req.trackerKeyId,
-    });
+    const scoped = requireMeshScope(config);
+    const channel = planBroadcastChannel(scoped, 'browser');
+    const wsPlan = planWs(scoped, 'browser');
+    const webrtc = planWebrtc(scoped, DEFAULT_INTERNET_SIGNAL);
 
     const authenticator = createAuthenticator({
-        localKey: req.identity,
+        localKey: runtime.identity,
         signingName: SIGNING_ED25519,
         kemPrefs: [KEM_X25519_HKDF],
     });
 
-    const bc = new BroadcastChannelTransportProvider({
-        BroadcastChannelCtor: opts.BroadcastChannelCtor,
-    });
-    const listenAddresses: NetworkAddress[] = [bc.localAddress];
-    const rtc = tryBrowserRtc(req, opts);
-    const rtcAddress = req.signalUrl !== undefined ? rtc?.localAddress : undefined;
-    if (rtcAddress !== undefined) listenAddresses.push(rtcAddress);
-
-    // Advertise == listen for the tab-local BroadcastChannel network. The
-    // public tracker must not learn `bc://`. It learns `rtc://` when we have
-    // registered with a signaling server.
-    const localPeer: PeerInfo = { keyId: req.identity.keyId, addresses: listenAddresses };
-    const trackerAddresses: NetworkAddress[] = req.scope === 'internet'
-        ? (rtcAddress !== undefined ? [rtcAddress] : [])
-        : listenAddresses;
-    const trackerPeer: PeerInfo = { keyId: req.identity.keyId, addresses: trackerAddresses };
-
+    const listenAddresses: NetworkAddress[] = [];
     const transports: TransportProvider[] = [];
+    let bc: BroadcastChannelTransportProvider | undefined;
+    if (channel.install) {
+        bc = new BroadcastChannelTransportProvider({
+            ...(channel.base !== undefined ? { base: channel.base } : {}),
+            BroadcastChannelCtor: opts.BroadcastChannelCtor,
+        });
+        listenAddresses.push(bc.localAddress);
+        transports.push(bc);
+    }
+
     const ws = tryBrowserWs('ws', opts.WebSocketCtor);
     const wss = tryBrowserWs('wss', opts.WebSocketCtor);
-    if (ws !== undefined) transports.push(ws);
+    if (wsPlan.dial && ws !== undefined) transports.push(ws);
     if (wss !== undefined) transports.push(wss);
-    if (rtc !== undefined) transports.push(rtc);
-    transports.push(bc);
+
+    let rtcAddress: NetworkAddress | undefined;
+    if (webrtc.install) {
+        const rtc = tryBrowserRtc(webrtc, runtime.identity, opts);
+        if (rtc !== undefined) {
+            transports.push(rtc);
+            if (webrtc.listen && rtc.localAddress !== undefined) {
+                rtcAddress = rtc.localAddress;
+                listenAddresses.push(rtcAddress);
+            }
+        }
+    }
+
+    const localPeer: PeerInfo = { keyId: runtime.identity.keyId, addresses: listenAddresses };
+    const trackerAddresses = publicAddresses(scoped.scope, listenAddresses);
+    const trackerPeer: PeerInfo = { keyId: runtime.identity.keyId, addresses: trackerAddresses };
+    const sources = planDiscovery(scoped, 'browser', channel.install);
 
     const layers: DiscoveryLayer[] = [];
     const closeables: MeshCloseable[] = [];
     const notes: string[] = [];
-
-    const trackerProvider = tracker.address.startsWith('wss://') ? wss : ws;
-    if (trackerProvider !== undefined) {
-        const reachable = await probeTracker(trackerProvider, tracker.address);
-        if (reachable) {
+    for (const source of sources) {
+        const priority = source.priority ?? 0;
+        if (source.type === 'tracker') {
+            const tracker = resolveTrackerConfig(scoped.scope, {
+                tracker: source.url,
+                trackerKey: source.key,
+            });
+            const provider = tracker.address.startsWith('wss://') ? wss : ws;
+            if (provider === undefined) {
+                notes.push(`tracker ${tracker.address} unreachable`);
+                continue;
+            }
+            const reachable = await probeTracker(provider, tracker.address);
+            if (!reachable) {
+                notes.push(`tracker ${tracker.address} unreachable`);
+                continue;
+            }
             const client = new TrackerClient({
                 trackerAddress: tracker.address,
                 trackerKeyId: tracker.keyId,
-                transportProvider: trackerProvider,
+                transportProvider: provider,
                 authenticator,
                 localPeer: trackerPeer,
             });
-            layers.push({ source: new QuietDiscovery(client), priority: 0 });
+            layers.push({ source: new QuietDiscovery(client), priority });
             closeables.push(client);
             notes.push(`tracker ${tracker.address}`);
-        } else {
-            notes.push(`tracker ${tracker.address} unreachable`);
+        } else if (source.type === 'broadcast-channel' && bc !== undefined) {
+            const backup = new BroadcastChannelDiscovery({
+                self: localPeer,
+                ...(channel.install && channel.base !== undefined ? { base: channel.base } : {}),
+                BroadcastChannelCtor: opts.BroadcastChannelCtor,
+            });
+            layers.push({ source: backup, priority });
+            closeables.push(backup);
+            notes.push(`broadcast-channel ${bc.localAddress}`);
         }
-    } else {
-        notes.push(`tracker ${tracker.address} unreachable`);
     }
-
-    const backup = new BroadcastChannelDiscovery({
-        self: localPeer,
-        BroadcastChannelCtor: opts.BroadcastChannelCtor,
-    });
-    // Same priority as the tracker so DiscoveryStack merges both sources in
-    // parallel; a slow or hung tracker query must not delay the backup layer.
-    layers.push({ source: backup, priority: 0 });
-    closeables.push(backup);
-    notes.push(`broadcast-channel ${bc.localAddress}`);
     if (rtcAddress !== undefined) notes.push(`rtc ${rtcAddress}`);
+    const acceptingWebRtc = webrtc.install && webrtc.listen;
+    if (scoped.scope === 'internet' && !acceptingWebRtc && wsPlan.listen === undefined) {
+        notes.unshift('dial-out only');
+    }
 
     const discovery = new DiscoveryStack(layers);
     const mesh = new Mesh({
         transports,
         discovery,
         authenticator,
-        localKeyId: req.identity.keyId,
+        localKeyId: runtime.identity.keyId,
         listenAddresses,
-        report: req.report,
+        report: runtime.report,
     });
 
     return {
@@ -164,19 +186,26 @@ export async function createBrowserMesh(
     };
 }
 
+function publicAddresses(scope: MeshScope, addresses: NetworkAddress[]): NetworkAddress[] {
+    if (scope !== 'internet') return addresses;
+    return addresses.filter(address => !address.startsWith('bc://'));
+}
+
 function tryBrowserRtc(
-    req: BrowserMeshRequest,
+    webrtc: { listen: boolean; signal?: string; iceServers?: BrowserRtcTransportProviderOptions['iceServers'] },
+    identity: OwnIdentity,
     opts: BrowserMeshOptions,
 ): BrowserRtcTransportProvider | undefined {
     try {
         return new BrowserRtcTransportProvider({
-            identity: req.identity,
-            signalBase: req.signalUrl,
-            createPeer: opts.createPeer,
+            identity,
+            ...(webrtc.listen && webrtc.signal !== undefined ? { signalBase: webrtc.signal } : {}),
+            ...(webrtc.iceServers !== undefined ? { iceServers: webrtc.iceServers } : {}),
+            createRTCPeerConnection: opts.createRTCPeerConnection,
             openSignaling: opts.openSignaling,
         });
     } catch (err) {
-        if (req.signalUrl !== undefined) throw err;
+        if (webrtc.listen) throw err;
         return undefined;
     }
 }

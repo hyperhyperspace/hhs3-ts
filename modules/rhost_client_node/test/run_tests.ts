@@ -75,7 +75,7 @@ async function withRunningHost(fn: (fixture: Fixture) => Promise<void>): Promise
         meshFactory: createNodeSyncMeshFactory({ folderRoot: join(dir, 'mesh') }),
     });
     try {
-        await app.create(undefined, { key: 'me', passphrase: 'prompt', sync: { scope: 'localhost' } });
+        await app.create(undefined, { key: 'me', passphrase: 'prompt', mesh: { scope: 'localhost' } });
         await app.start('default');
         await fn({ dir, keystore, hostDir: join(appDir, 'hosts', 'default'), app });
     } finally {
@@ -201,7 +201,7 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
                 await fs.mkdir(hostDir, { recursive: true });
                 const record = {
                     database: 'DB', catalog: 'editor', created: true,
-                    key: { label: 'me', keyId: 'KID', publicKey: 'PK' }, sync: { scope: 'localhost' },
+                    key: { label: 'me', keyId: 'KID', publicKey: 'PK' }, mesh: { scope: 'localhost' },
                 };
                 const writeRecord = (extra: object) => fs.writeFile(join(hostDir, 'host.json'), JSON.stringify({ ...record, ...extra }));
 

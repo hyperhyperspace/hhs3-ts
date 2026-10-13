@@ -1,35 +1,37 @@
 # Mesh Node
 
-Node mesh factory for HHSv3. Builds a `Mesh` for a single network environment (`MeshScope`) with WebSocket transports (`ws` + `wss`), a WebRTC transport (`rtc`, werift), a folder-discovery backup, and an optional tracker layer (probed, never spawned).
+Node mesh factory for HHSv3. Builds a `Mesh` for one network environment (`MeshScope`) from a `MeshConfig`: WebSocket (`ws` and `wss`), WebRTC (`rtc`, werift), folder discovery, and trackers (probed, never spawned).
 
-## `createNodeMesh(req, opts?)`
+## `createNodeMesh(config, runtime, options?)`
 
 ```typescript
 import { createNodeMesh } from '@hyper-hyper-space/hhs3_mesh_node';
 
-const built = await createNodeMesh({
-    scope: 'localhost',          // 'localhost' | 'internet'
-    identity,                    // OwnIdentity
-    // trackerAddress?, trackerKeyId?, listenAddress?, signalUrl?
-});
+const built = await createNodeMesh(
+    { scope: 'internet' },
+    { identity },
+);
 // built: { mesh, discovery, listenAddresses, trackerAddresses, discoveryNotes, closeables }
 ```
 
-The request takes only explicit overrides; it reads no environment variables. Callers (e.g. a CLI) map their own flags/env onto `trackerAddress` / `trackerKeyId` / `listenAddress`.
+`config` is a `MeshConfig` whose `scope` is set. `runtime` is `{ identity, report? }`. `options` may inject `createRTCPeerConnection` and `openSignaling` for tests. The factory reads no environment variables.
 
-## Listen policy (advertise == listen)
+## Defaults
 
-The addresses peers dial are exactly the ones the Mesh listens on. A bind-all placeholder (`0.0.0.0` / `::`) is **rejected** as a listen address.
+Advertise equals listen. A bind-all address (`0.0.0.0`, `::`) is rejected.
 
-| Scope | `listenAddress` | Result |
-|-------|-----------------|--------|
-| `localhost` | none | `ws://127.0.0.1:<free port>` |
-| `localhost` | set | that address (free port filled in if omitted) |
-| `internet` | none | dial-out only, unless `signalUrl` is set |
-| `internet` | set | that address |
+| Omitted on `internet` | Result |
+| --- | --- |
+| `transports.webrtc` | listen at `wss://signal.mypeer.net:4612` |
+| `transports.ws` | dial `ws://` and `wss://`, do not listen |
+| `discovery` | the public tracker plus folder discovery |
 
-`signalUrl` is a public `wss://` signaling origin. When set, an `rtc://` address is appended to the listen set and announced. The WebRTC provider is always installed so the node can dial `rtc://` peers.
+| Omitted on `localhost` | Result |
+| --- | --- |
+| `transports.webrtc` | installed so it can dial, no `rtc://` announced |
+| `transports.ws` | listen at `ws://127.0.0.1:<free port>` |
+| `discovery` | `ws://127.0.0.1:4610` plus folder discovery |
 
-Tracker defaults come from `@hyper-hyper-space/hhs3_mesh_tracker_client` (`resolveTrackerConfig`): the local tracker for `localhost`, the public tracker for `internet`.
+`transports.webrtc: false` removes WebRTC. `{ listen: false }` keeps dialing and does not advertise. `transports.ws: false` does not dial peer `ws://` addresses; a tracker still gets its own WebSocket. `transports.broadcastChannel` is rejected on Node. A `folder` discovery entry's omitted `root` is `$RDB_HOME/mesh` or `~/.rdb/mesh`. An explicit `discovery` array replaces the default. `[]` is no discovery.
 
-NAT traversal / port forwarding is out of scope: to accept inbound on `internet`, pass a dialable `listenAddress`.
+When `internet` has no WebSocket listen and WebRTC listen is off, a note says `dial-out only`.

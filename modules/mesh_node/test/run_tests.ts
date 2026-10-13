@@ -15,8 +15,18 @@ import { publicOriginFor, SignalServer } from "@hyper-hyper-space/hhs3_mesh_sign
 import { openNodeSignaling } from "@hyper-hyper-space/hhs3_mesh_rtc_node";
 
 import { createNodeMesh, type BuiltMesh } from "../src/index.js";
+import type { MeshConfig } from "@hyper-hyper-space/hhs3_mesh";
 
 const UNREACHABLE_TRACKER = "ws://127.0.0.1:1";
+
+function offline(dir: string): MeshConfig {
+    return {
+        discovery: [
+            { type: "tracker", url: UNREACHABLE_TRACKER },
+            { type: "folder", root: dir },
+        ],
+    };
+}
 
 async function newIdentity() {
     const hashSuite = createBasicCrypto().hash(HASH_SHA256);
@@ -45,8 +55,8 @@ async function testLocalhostDefault() {
         let built: BuiltMesh | undefined;
         try {
             built = await createNodeMesh(
-                { scope: "localhost", identity: alice, trackerAddress: UNREACHABLE_TRACKER },
-                { folderRoot: dir },
+                { scope: "localhost", ...offline(dir) },
+                { identity: alice },
             );
             testing.assertEquals(built.listenAddresses.length, 1, "one listen address");
             const addr = built.listenAddresses[0]!;
@@ -67,11 +77,10 @@ async function testListenOverride() {
             built = await createNodeMesh(
                 {
                     scope: "localhost",
-                    identity: alice,
-                    trackerAddress: UNREACHABLE_TRACKER,
-                    listenAddress: "ws://127.0.0.1",
+                    transports: { ws: { listen: "ws://127.0.0.1" } },
+                    ...offline(dir),
                 },
-                { folderRoot: dir },
+                { identity: alice },
             );
             const addr = built.listenAddresses[0]!;
             testing.assertTrue(addr.startsWith("ws://127.0.0.1:"), `override host preserved (got ${addr})`);
@@ -86,12 +95,14 @@ async function testBindAllRejected() {
     const alice = await newIdentity();
     let threw = false;
     try {
-        await createNodeMesh({
-            scope: "internet",
-            identity: alice,
-            trackerAddress: UNREACHABLE_TRACKER,
-            listenAddress: "ws://0.0.0.0:8080",
-        });
+        await createNodeMesh(
+            {
+                scope: "internet",
+                transports: { ws: { listen: "ws://0.0.0.0:8080" }, webrtc: { listen: false } },
+                discovery: [],
+            },
+            { identity: alice },
+        );
     } catch (e) {
         threw = true;
         testing.assertTrue(
@@ -108,8 +119,12 @@ async function testInternetDialOut() {
         let built: BuiltMesh | undefined;
         try {
             built = await createNodeMesh(
-                { scope: "internet", identity: alice, trackerAddress: UNREACHABLE_TRACKER },
-                { folderRoot: dir },
+                {
+                    scope: "internet",
+                    transports: { webrtc: { listen: false } },
+                    ...offline(dir),
+                },
+                { identity: alice },
             );
             testing.assertEquals(built.listenAddresses.length, 0, "dial-out: no listen addresses");
             testing.assertTrue(
@@ -134,12 +149,12 @@ async function testFolderDiscovery() {
         let builtB: BuiltMesh | undefined;
         try {
             builtA = await createNodeMesh(
-                { scope: "localhost", identity: alice, trackerAddress: UNREACHABLE_TRACKER },
-                { folderRoot: dir },
+                { scope: "localhost", ...offline(dir) },
+                { identity: alice },
             );
             builtB = await createNodeMesh(
-                { scope: "localhost", identity: bob, trackerAddress: UNREACHABLE_TRACKER },
-                { folderRoot: dir },
+                { scope: "localhost", ...offline(dir) },
+                { identity: bob },
             );
 
             const topic = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
@@ -186,14 +201,13 @@ async function testSignalUrl() {
             built = await createNodeMesh(
                 {
                     scope: "internet",
-                    identity: alice,
-                    trackerAddress: UNREACHABLE_TRACKER,
-                    signalUrl: origin,
+                    transports: { webrtc: { signal: origin } },
+                    ...offline(dir),
                 },
+                { identity: alice },
                 {
-                    folderRoot: dir,
                     openSignaling: url => openNodeSignaling(url.replace(/^wss:/, "ws:")),
-                    createPeer: () => { throw new Error("factory address test does not dial"); },
+                    createRTCPeerConnection: () => { throw new Error("factory address test does not dial"); },
                 },
             );
             testing.assertEquals(built.listenAddresses.length, 1, "rtc is the only listen address");
@@ -215,6 +229,32 @@ async function testSignalUrl() {
     });
 }
 
+async function testInternetDefaultRtc() {
+    const alice = await newIdentity();
+    let built: BuiltMesh | undefined;
+    try {
+        built = await createNodeMesh(
+            { scope: "internet", discovery: [] },
+            { identity: alice },
+            {
+                openSignaling: () => Promise.reject(new Error("not dialing")),
+                createRTCPeerConnection: () => { throw new Error("not dialing"); },
+            },
+        );
+        testing.assertEquals(built.listenAddresses.length, 1, "rtc is the listen address");
+        testing.assertTrue(
+            built.listenAddresses[0]!.startsWith("rtc://signal.mypeer.net:4612/"),
+            `advertises the default signal server (${built.listenAddresses[0]})`,
+        );
+        testing.assertTrue(
+            !built.discoveryNotes.some(n => n.includes("dial-out only")),
+            "a default rtc listen is not dial-out only",
+        );
+    } finally {
+        await teardown(built);
+    }
+}
+
 const allSuites = [
     {
         title: "[MESH_NODE] Node mesh factory",
@@ -225,6 +265,7 @@ const allSuites = [
             { name: "[MESH_NODE_03] internet without listen is dial-out only", invoke: testInternetDialOut },
             { name: "[MESH_NODE_04] folder discovery backup sees peers, not self", invoke: testFolderDiscovery },
             { name: "[MESH_NODE_05] signalUrl advertises rtc://", invoke: testSignalUrl },
+            { name: "[MESH_NODE_06] internet default advertises rtc://signal.mypeer.net", invoke: testInternetDefaultRtc },
         ],
     },
 ];

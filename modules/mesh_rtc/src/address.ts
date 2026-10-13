@@ -59,6 +59,8 @@ export function parseRtcAddress(address: string): ParsedRtcAddress {
     };
 }
 
+export const DEFAULT_INTERNET_SIGNAL = 'wss://signal.mypeer.net:4612';
+
 /** `signalBase` is the public wss URL of the server, without an endpoint id. */
 export function rtcAddressFor(signalBase: string, endpointId: string): string {
     let url: URL;

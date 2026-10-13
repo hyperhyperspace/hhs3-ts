@@ -75,7 +75,10 @@ function without(value: unknown, field: string): Json {
 const RECORD = {
     database: 'DB', catalog: 'editor', created: false,
     key: { label: 'mine', keyId: 'KID', publicKey: 'PK', passphrase: 'prompt' },
-    sync: { scope: 'internet', tracker: 'wss://tracker.example' },
+    mesh: {
+        scope: 'internet',
+        discovery: [{ type: 'tracker', url: 'wss://tracker.example' }],
+    },
 };
 
 const tests: { name: string; invoke: () => Promise<void> }[] = [
@@ -133,19 +136,21 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
             throwsWith(() => parseHostRecord({ ...RECORD, key: { ...RECORD.key, extra: 1 } }), 'key.extra is not a known field', 'unknown key field');
             throwsWith(() => parseHostRecord({ ...RECORD, key: without(RECORD.key, 'keyId') }), 'key.keyId is missing', 'missing key id');
             throwsWith(() => parseHostRecord({ ...RECORD, key: { ...RECORD.key, passphrase: 'env:' } }), 'key.passphrase', 'bad passphrase source');
-            throwsWith(() => parseHostRecord(without(RECORD, 'sync')), 'sync is missing', 'missing sync');
-            throwsWith(() => parseHostRecord({ ...RECORD, sync: {} }), 'sync.scope is missing', 'missing scope');
-            throwsWith(() => parseHostRecord({ ...RECORD, sync: { scope: 'lan' } }), 'sync.scope must be', 'bad scope');
-            throwsWith(() => parseHostRecord({ ...RECORD, sync: { scope: 'localhost', port: 1 } }), 'sync.port is not a known field', 'unknown sync field');
-            throwsWith(() => parseHostRecord({ ...RECORD, sync: { scope: 'localhost', allow: [] } }), 'sync.allow is not a known field', 'allow is not a network setting');
-            throwsWith(() => parseHostRecord({ ...RECORD, sync: { scope: 'localhost', listen: 'port 7400' } }), 'sync.listen must be an address', 'bad listen');
+            const bare = parseHostRecord(without(RECORD, 'mesh'));
+            throwsWith(() => effectiveConfig(app, bare), 'scope is missing', 'a host with no mesh and no app mesh has no scope');
+            throwsWith(() => effectiveConfig(app, parseHostRecord({ ...RECORD, mesh: {} })), 'scope is missing', 'missing scope');
+            throwsWith(() => parseHostRecord({ ...RECORD, mesh: { scope: 'lan' } }), 'mesh.scope must be', 'bad scope');
+            throwsWith(() => parseHostRecord({ ...RECORD, mesh: { scope: 'localhost', port: 1 } }), 'mesh.port is not a known field', 'unknown mesh field');
+            throwsWith(() => parseHostRecord({ ...RECORD, mesh: { scope: 'localhost', allow: [] } }), 'mesh.allow is not a known field', 'allow is not a network setting');
+            throwsWith(() => parseHostRecord({ ...RECORD, mesh: { scope: 'localhost', transports: { ws: { listen: 'port 7400' } } } }), 'must be a URL', 'bad listen');
             throwsWith(() => parseHostRecord({ ...RECORD, projection: { path: 'data.sqlite', extra: 1 } }),
                 'projection.extra is not a known field', 'unknown projection override field');
 
             const plain = effectiveConfig(app, record);
             assertEquals(plain.key.label, 'mine', 'the key comes from host.json');
             assertEquals(plain.key.passphrase, 'prompt', 'and its passphrase source');
-            assertEquals(plain.sync.tracker, 'wss://tracker.example', 'the host has its own tracker');
+            const tracker = plain.mesh.discovery?.find(source => source.type === 'tracker');
+            assertEquals(tracker?.type === 'tracker' ? tracker.url : undefined, 'wss://tracker.example', 'the host has its own tracker');
             assertEquals(plain.allow.length, 1, "and keeps the app's allow list");
             assertEquals(plain.autoDeploy, 'minor', 'autoDeploy defaults to minor');
             assertEquals(plain.projection.path, 'data.sqlite', 'the projection is the app\'s');
@@ -183,7 +188,7 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
                 assertEquals(host.record.key.keyId, me.keyId, 'with its id');
                 assertEquals(host.record.key.publicKey, serializePublicKeyToBase64(me.publicKey), 'and its public key');
                 assertEquals(host.record.key.passphrase, 'prompt', 'and where its passphrase comes from');
-                assertEquals(host.record.sync.scope, 'localhost', 'the record has the network settings');
+                assertEquals(host.record.mesh?.scope, 'localhost', 'the record has the network settings');
                 assertTrue(host.record.created, 'the record says it was created here');
                 assertEquals(host.db.getName(), 'default', 'the database name defaults to the host name');
                 assertTrue(host.db.isCreator(me.keyId), 'the host key is the creator');
@@ -206,9 +211,9 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
                 await rejectsWith(() => extra.create('other', hostSetup()), "declares no param 'color'", 'an undeclared param is named');
                 await rejectsWith(() => app.create('other', hostSetup({ key: 'nobody' })), "host 'other': no key 'nobody' in the test vault", 'an unknown key');
                 await rejectsWith(() => app.create('other', hostSetup({ passphrase: 'ask' })), "host 'other': passphrase must be", 'a bad passphrase source');
-                await rejectsWith(() => app.create('other', hostSetup({ sync: { scope: 'lan' } as never })), "host 'other': sync.scope must be", 'a bad scope');
-                await rejectsWith(() => app.create('other', hostSetup({ sync: { scope: 'localhost', allow: [] } as never })),
-                    'sync.allow is not a known field', 'network settings are checked as host.json would be');
+                await rejectsWith(() => app.create('other', hostSetup({ mesh: { scope: 'lan' } as never })), "host 'other': mesh.scope must be", 'a bad scope');
+                await rejectsWith(() => app.create('other', hostSetup({ mesh: { scope: 'localhost', allow: [] } as never })),
+                    'mesh.allow is not a known field', 'network settings are checked as host.json would be');
                 assertEquals((await app.hosts()).join(','), 'default', 'a failed create leaves no host');
             } finally {
                 await app.close();
@@ -691,18 +696,23 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
             const app = await Rhost.open(appConfig({ allow: ['user.identities.keyId'] }), platform);
             try {
                 const internet = (listen?: string) => hostSetup({
-                    sync: { scope: 'internet', tracker: 'wss://tracker.example', ...(listen !== undefined ? { listen } : {}) },
+                    mesh: {
+                        scope: 'internet',
+                        discovery: [{ type: 'tracker', url: 'wss://tracker.example' }],
+                        ...(listen !== undefined ? { transports: { ws: { listen } } } : {}),
+                    },
                 });
-                const a = await app.create('a', internet('ws://0.0.0.0:7400'));
-                assertEquals(a.config.sync.tracker, 'wss://tracker.example', 'the host has its own tracker');
+                const a = await app.create('a', internet('ws://127.0.0.1:7400'));
+                const tracker = a.config.mesh.discovery?.find(source => source.type === 'tracker');
+                assertEquals(tracker?.type === 'tracker' ? tracker.url : undefined, 'wss://tracker.example', 'the host has its own tracker');
                 assertEquals(a.config.allow.length, 1, "and keeps the app's allow list");
                 await rejectsWith(() => app.create('b', internet('ws://127.0.0.1:7400')),
-                    "host 'b': port 7400 (sync.listen) is already used by host 'a'", 'a second host on the same port');
-                await app.create('b', internet('ws://0.0.0.0:7401'));
+                    "host 'b': port 7400 (mesh.transports.ws.listen) is already used by host 'a'", 'a second host on the same port');
+                await app.create('b', internet('ws://127.0.0.1:7401'));
                 await app.create('c', internet());
-                await app.create('d', internet('ws://0.0.0.0'));
-                await rejectsWith(() => app.join(a.db.getId(), 'e', internet('ws://0.0.0.0:7401')),
-                    "host 'e': port 7401 (sync.listen) is already used by host 'b'", 'join checks it too');
+                await app.create('d', internet('ws://127.0.0.1'));
+                await rejectsWith(() => app.join(a.db.getId(), 'e', internet('ws://127.0.0.1:7401')),
+                    "host 'e': port 7401 (mesh.transports.ws.listen) is already used by host 'b'", 'join checks it too');
                 assertEquals((await app.hosts()).join(','), 'a,b,c,d', 'hosts without a port never clash');
             } finally {
                 await app.close();

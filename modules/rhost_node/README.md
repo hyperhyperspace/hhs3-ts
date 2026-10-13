@@ -23,7 +23,7 @@ Keys stay in the user's keystore: `RDB_KEYSTORE`, else `$RDB_HOME/keys.json`, el
 import { openApp } from '@hyper-hyper-space/hhs3_rhost_node';
 
 const app = await openApp('./my-app', { passphrase: async (key) => '...' });
-await app.create('default', { key: 'me', passphrase: 'env:EDITOR_PASS', sync: { scope: 'internet' } });
+await app.create('default', { key: 'me', passphrase: 'env:EDITOR_PASS', mesh: { scope: 'internet' } });
 await app.start();
 ```
 

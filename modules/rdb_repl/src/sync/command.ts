@@ -1,3 +1,4 @@
+import { parseMeshConfig, type MeshConfig, type ScopedMeshConfig } from "@hyper-hyper-space/hhs3_mesh";
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { Payload, RObject } from "@hyper-hyper-space/hhs3_mvt";
 import { RDB_TYPE_ID, type RDb } from "@hyper-hyper-space/hhs3_rdb";
@@ -85,13 +86,10 @@ async function start(session: ReplSession, cmd: SyncStartCommand): Promise<SyncC
     }
     const authorizer = createAllowAuthorizer(cmd.sources, lookup);
 
-    const built = await session.syncMeshFactory({
-        scope: cmd.scope,
+    const mesh = await loadMesh(cmd);
+    const built = await session.syncMeshFactory(mesh, {
         identity,
-        trackerAddress: cmd.tracker,
-        trackerKeyId: cmd.trackerKey,
-        listenAddress: cmd.listen,
-        report: session.report,
+        ...(session.report !== undefined ? { report: session.report } : {}),
     });
 
     const syncId = session.nextSyncId;
@@ -111,13 +109,13 @@ async function start(session: ReplSession, cmd: SyncStartCommand): Promise<SyncC
         dbName: name,
         identityLabel: record.label,
         identityKeyId: identity.keyId,
-        scope: cmd.scope,
+        scope: mesh.scope,
         sources: cmd.sources,
         sync,
     });
     const notes = built.discoveryNotes.length === 0 ? '' : `\n${built.discoveryNotes.join('\n')}`;
     return {
-        output: `started sync ${syncId} for ${name} as ${record.label} on ${cmd.scope}${notes}`,
+        output: `started sync ${syncId} for ${name} as ${record.label} on ${mesh.scope}${notes}`,
     };
 }
 
@@ -149,13 +147,10 @@ async function fetch(session: ReplSession, cmd: SyncFetchCommand): Promise<SyncC
         replica,
         id: cmd.rdbId,
         meshFactory: session.syncMeshFactory,
-        request: {
-            scope: cmd.scope,
+        config: await loadMesh(cmd),
+        runtime: {
             identity,
-            trackerAddress: cmd.tracker,
-            trackerKeyId: cmd.trackerKey,
-            listenAddress: cmd.listen,
-            report: session.report,
+            ...(session.report !== undefined ? { report: session.report } : {}),
         },
         meshLabel: `fetch-${fetchId}`,
         backendLabel: session.workspace.backendLabel,
@@ -230,4 +225,33 @@ function formatFetchOutput(session: ReplSession, obj: RObject, alreadyLocal: boo
     const name = session.workspace.roots.get(obj.getId())?.name ?? `#${obj.getId()}`;
     const already = alreadyLocal ? 'already local; ' : '';
     return `fetched ${name} (${already}genesis only; use \\sync start to share)`;
+}
+
+async function loadMesh(cmd: { mesh: MeshConfig; meshPath?: string }): Promise<ScopedMeshConfig> {
+    let mesh = cmd.mesh;
+    if (cmd.meshPath !== undefined) {
+        const load = new Function('specifier', 'return import(specifier)') as (
+            specifier: string,
+        ) => Promise<{ readFile: (path: string, encoding: 'utf8') => Promise<string> }>;
+        const fs = await load('node:fs/promises');
+        let text: string;
+        try {
+            text = await fs.readFile(cmd.meshPath, 'utf8');
+        } catch (err) {
+            throw new Error(`cannot read mesh file '${cmd.meshPath}': ${err instanceof Error ? err.message : String(err)}`);
+        }
+        let value: unknown;
+        try {
+            value = JSON.parse(text);
+        } catch (err) {
+            throw new Error(`${cmd.meshPath} is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        const doc = isMeshWrapper(value) ? value.mesh : value;
+        mesh = parseMeshConfig(doc, cmd.meshPath, 'mesh');
+    }
+    return { ...mesh, scope: mesh.scope ?? 'internet' };
+}
+
+function isMeshWrapper(value: unknown): value is { mesh: unknown } {
+    return typeof value === 'object' && value !== null && !Array.isArray(value) && 'mesh' in value;
 }

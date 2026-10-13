@@ -91,7 +91,7 @@ export async function editConfig(app: string, edit: (config: Record<string, unkn
 }
 
 export function hostSetup(overrides: Partial<HostSetup> = {}): HostSetup {
-    return { key: 'me', passphrase: 'prompt', sync: { scope: 'localhost' }, ...overrides };
+    return { key: 'me', passphrase: 'prompt', mesh: { scope: 'localhost' }, ...overrides };
 }
 
 export function appOptions(dir: string) {

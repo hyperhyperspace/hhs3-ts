@@ -14,8 +14,6 @@ const DEFAULT_TTL_MS = 180_000;
 const DEFAULT_HEARTBEAT_MS = 60_000;
 
 export function defaultMeshFolderRoot(): string {
-    const explicit = process.env.RDB_MESH;
-    if (explicit !== undefined && explicit !== '') return explicit;
     const home = process.env.RDB_HOME ?? join(homedir(), '.rdb');
     return join(home, 'mesh');
 }

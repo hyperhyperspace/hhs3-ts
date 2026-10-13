@@ -4,7 +4,7 @@
 // and projection.
 
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
-import type { IssueReporter } from "@hyper-hyper-space/hhs3_mesh";
+import { parseMeshConfig, type IssueReporter } from "@hyper-hyper-space/hhs3_mesh";
 import { deserializePublicKeyFromBase64, serializePublicKeyToBase64, type Version } from "@hyper-hyper-space/hhs3_mvt";
 import {
     CatalogUpdateError, RDbImpl, catalogStatus, compareSemver, deployCatalogRelease,
@@ -17,8 +17,8 @@ import { installRelease, releaseTag, type ReleaseFile } from "@hyper-hyper-space
 
 import { inProcessClient } from "./client.js";
 import {
-    checkPassphraseSource, effectiveConfig, listenPort, parseSyncConfig, projectionIndexSpec,
-    type AppConfig, type EffectiveConfig, type HostKeyConfig, type HostRecord, type ParamsConfig, type SyncConfig,
+    checkPassphraseSource, effectiveConfig, listenPort, mergeMeshConfig, projectionIndexSpec,
+    type AppConfig, type EffectiveConfig, type HostKeyConfig, type HostRecord, type MeshConfig, type ParamsConfig, type ScopedMeshConfig,
 } from "./config.js";
 import { ParamError, resolveParams } from "./params.js";
 import type { HostPlatform } from "./platform.js";
@@ -27,7 +27,7 @@ import { adoptionRangeFor, majorOf, shippedReleases } from "./releases.js";
 import { serveClient } from "./serve.js";
 import {
     allowIsEveryone, columnLookup, createAllowAuthorizer, fetchDatabase, startDatabaseSync, validateAllowSources,
-    type DatabaseSync, type SyncMeshBuildRequest,
+    type DatabaseSync,
 } from "./sync.js";
 
 export type { HostStatus };
@@ -58,7 +58,7 @@ export type RhostOptions = { report?: IssueReporter };
 // What create and join set up for a new host. `key` is a label or `#<key id>`
 // in the platform's keystore; `passphrase` is where its passphrase comes from
 // ('prompt' or 'env:<VAR>'), absent for a key stored without one.
-export type HostSetup = { key: string; passphrase?: string; sync: SyncConfig };
+export type HostSetup = { key: string; passphrase?: string; mesh: MeshConfig };
 
 // `catalog` picks the shipped catalog when the app ships several; `name` is
 // the database's name (the host's by default).
@@ -252,11 +252,12 @@ export class Rhost {
     }
 
     // The network settings of a new host, checked as host.json would be. Two
-    // hosts of an app can't listen on the same port.
-    private async hostSync(host: string, sync: SyncConfig): Promise<SyncConfig> {
-        const checked = parseSyncConfig(sync, `host '${host}'`);
-        const port = listenPort(checked.listen);
-        if (port === undefined) return checked;
+    // hosts of an app can't listen on the same WebSocket port.
+    private async hostMesh(host: string, mesh: MeshConfig): Promise<ScopedMeshConfig> {
+        const checked = parseMeshConfig(mesh, `host '${host}'`, 'mesh');
+        const merged = mergeMeshConfig(this.config.mesh, checked);
+        const port = listenPort(merged);
+        if (port === undefined) return merged;
         for (const other of await this.hosts()) {
             let record: HostRecord | undefined;
             try {
@@ -264,11 +265,11 @@ export class Rhost {
             } catch {
                 continue;
             }
-            if (record !== undefined && listenPort(record.sync.listen) === port) {
-                throw new Error(`host '${host}': port ${port} (sync.listen) is already used by host '${other}'`);
+            if (record !== undefined && listenPort(record.mesh) === port) {
+                throw new Error(`host '${host}': port ${port} (mesh.transports.ws.listen) is already used by host '${other}'`);
             }
         }
-        return checked;
+        return merged;
     }
 
     private async requireNew(name: string): Promise<void> {
@@ -296,7 +297,7 @@ export class Rhost {
         await this.requireNew(name);
         const file = this.pickCatalog(options.catalog);
         const key = this.hostKey(name, options.key, options.passphrase);
-        const sync = await this.hostSync(name, options.sync);
+        const mesh = await this.hostMesh(name, options.mesh);
         const me = await this.identity(name, key);
         const { catalog, release, version } = file.manifest;
 
@@ -320,7 +321,7 @@ export class Rhost {
                 runtime.workspace.roots.registerObject(db.getId(), db, dbName);
                 await deployCatalogRelease(db as RDbImpl, { release, author: me });
                 await (db as RDbImpl).setAdoptionRange(adoptionRangeFor(version));
-                return { database: db.getId(), catalog: file.manifest.name, created: true, key, sync };
+                return { database: db.getId(), catalog: file.manifest.name, created: true, key, mesh };
             } catch (err) {
                 if (err instanceof CatalogUpdateError) throw new Error(`${err.message}: ${err.problems.join('; ')}`);
                 throw err;
@@ -337,7 +338,7 @@ export class Rhost {
     async join(databaseId: B64Hash, name: string | undefined = DEFAULT_HOST, options: HostSetup): Promise<Host> {
         await this.requireNew(name);
         const key = this.hostKey(name, options.key, options.passphrase);
-        const sync = await this.hostSync(name, options.sync);
+        const mesh = await this.hostMesh(name, options.mesh);
         const me = await this.identity(name, key);
 
         await this.platform.hosts.create(name, async (backend) => {
@@ -348,7 +349,8 @@ export class Rhost {
                     replica,
                     id: databaseId,
                     meshFactory: this.platform.meshFactory,
-                    request: meshRequest(sync, me, this.report),
+                    config: mesh,
+                    runtime: { identity: me, ...(this.report !== undefined ? { report: this.report } : {}) },
                     meshLabel: `rhost-join-${name}`,
                     backendLabel: runtime.workspace.backendLabel,
                 }) as RDbImpl;
@@ -358,7 +360,7 @@ export class Rhost {
                     throw new Error(`database #${databaseId} uses catalog #${catalogId}, which this app doesn't ship`);
                 }
                 await installRelease(replica, file);
-                return { database: databaseId, catalog: file.manifest.name, created: false, key, sync };
+                return { database: databaseId, catalog: file.manifest.name, created: false, key, mesh };
             } finally {
                 await runtime.close();
             }
@@ -424,17 +426,6 @@ export class Rhost {
             this.opened.delete(name);
         }
     }
-}
-
-function meshRequest(sync: SyncConfig, identity: OwnIdentity, report: IssueReporter | undefined): SyncMeshBuildRequest {
-    return {
-        scope: sync.scope,
-        identity,
-        ...(sync.tracker !== undefined ? { trackerAddress: sync.tracker } : {}),
-        ...(sync.trackerKey !== undefined ? { trackerKeyId: sync.trackerKey } : {}),
-        ...(sync.listen !== undefined ? { listenAddress: sync.listen } : {}),
-        ...(report !== undefined ? { report } : {}),
-    };
 }
 
 type Services = {
@@ -844,7 +835,10 @@ export class Host {
 
             const lookup = columnLookup(this.runtime.session);
             if (!allowIsEveryone(this.config.allow)) await validateAllowSources(this.config.allow, lookup);
-            const built = await this.app.platform.meshFactory(meshRequest(this.config.sync, identity, this.app.report));
+            const built = await this.app.platform.meshFactory(this.config.mesh, {
+                identity,
+                ...(this.app.report !== undefined ? { report: this.app.report } : {}),
+            });
             services.sync = await startDatabaseSync({
                 replica: this.runtime.workspace.replica,
                 db: this.db,

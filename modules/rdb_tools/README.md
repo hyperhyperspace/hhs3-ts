@@ -174,8 +174,8 @@ rhost --app my-app init --release r.rpack --param 'admin=$me'
 
 # a host; asks for the key and the scope the flags leave out
 rhost --app my-app create                   # 'default', from the shipped release
-rhost --app my-app create --key me --scope internet --passphrase-env EDITOR_PASS --listen ws://0.0.0.0:7400
-rhost --app my-app join <database-id> gaming --key me --scope localhost
+rhost --app my-app create --key me --mesh '{"scope":"internet","transports":{"ws":{"listen":"ws://203.0.113.10:7400"}}}' --passphrase-env EDITOR_PASS
+rhost --app my-app join <database-id> gaming --key me --mesh '{"scope":"localhost"}'
 
 rhost --app my-app start                    # one background process per host
 rhost --app my-app status                   # every host, or name one
@@ -193,8 +193,8 @@ rhost --app my-app remove gaming            # this device's copy only
 - **`create` and `join`** set up the host, and write its `host.json`:
   - `--key <label>` names a key of the keystore by label or `#<key id>`. Without it, they list the keystore's keys and offer "Create new key pair", which is created in that keystore.
   - `--passphrase-env <VAR>` records `env:<VAR>` as the key's passphrase source, for unattended hosts. Without it, the source is `prompt`.
-  - `--scope internet|localhost` is asked when left out; `--tracker <url>`, `--tracker-key <key id>` and `--listen <address>` are optional. Two hosts can't listen on one port.
-  - Without a terminal, `--key`, `--scope` and `--passphrase-env` are required.
+  - `--mesh <json>|@<file>` is the host's mesh settings. On a terminal, if neither `--mesh` nor `app.json` sets `scope`, it is asked. `--passphrase-env <VAR>` records `env:<VAR>` as the key's passphrase source. Two hosts can't listen on one WebSocket port.
+  - Without a terminal, `--key`, a mesh `scope`, and `--passphrase-env` are required.
   - They don't start the host. Run `rhost start <name>` afterwards.
 - **The keystore** is the user's: `RDB_KEYSTORE`, else `$RDB_HOME/keys.json`, else `~/.rdb/keys.json`. An app that keeps its own sets `keystore` in `app.json`, relative to the app folder. A host finds its key by key id, so relabeling it changes nothing; a missing key is named with the host and the keystore.
 - **`start`** unlocks each host's key, asking for each key's passphrase once, so a wrong one fails before anything starts. It hands the passphrase to each host's `serve` process over a pipe, and returns when every process reports that it's serving. Output goes to `hosts/<name>/run/rhost.log`.

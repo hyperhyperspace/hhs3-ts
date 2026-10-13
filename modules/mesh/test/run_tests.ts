@@ -34,6 +34,7 @@ import {
     encodeControlTopicInterest, encodeControlTopicAccept, encodeControlTopicReject,
     decodeControlPayload,
 } from '../src/mux.js';
+import { meshConfigTests } from './mesh_config_tests.js';
 
 // --- helpers ---
 
@@ -2242,6 +2243,7 @@ const reuseTests = {
 };
 
 const allSuites = [
+    meshConfigTests,
     transportTests, muxTests, poolTests, swarmTests, meshTests, authTests, staticTests, stackTests,
     ctrlTests, authZTests, announceTests, listenTests, poolCtrlTests, reuseTests,
 ];

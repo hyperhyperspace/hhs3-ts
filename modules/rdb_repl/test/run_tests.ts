@@ -518,19 +518,19 @@ CREATE DATABASE app_db USING CATALOG app WITH PARAMS (:admin = $me);
 }
 
 function memSyncFactory(): SyncMeshFactory {
-    return async (req) => {
+    return async (_config, runtime) => {
         const provider = new MemTransportProvider();
-        const addr = `mem://sync-${req.identity.keyId.slice(0, 12)}`;
+        const addr = `mem://sync-${runtime.identity.keyId.slice(0, 12)}`;
         const discovery = new StaticDiscovery([], []);
         const mesh = new Mesh({
             transports: [provider],
             discovery,
             authenticator: createAuthenticator({
-                localKey: req.identity,
+                localKey: runtime.identity,
                 signingName: SIGNING_ED25519,
                 kemPrefs: [KEM_X25519_HKDF],
             }),
-            localKeyId: req.identity.keyId,
+            localKeyId: runtime.identity.keyId,
             listenAddresses: [addr],
         });
         return {
@@ -544,16 +544,16 @@ function memSyncFactory(): SyncMeshFactory {
 }
 
 async function runSyncCommandTests(session: ReplSession): Promise<void> {
-    const missingFactory = await runCommand(session, '\\sync start shopdb as alice on localhost');
+    const missingFactory = await runCommand(session, '\\sync start shopdb as alice');
     assert(missingFactory.exitCode === 1 && missingFactory.output.includes('No sync mesh factory'), 'sync start without factory');
 
     session.syncMeshFactory = memSyncFactory();
 
-    const started = await runCommand(session, '\\sync start shopdb as alice on localhost');
+    const started = await runCommand(session, '\\sync start shopdb as alice');
     assert(started.exitCode === 0 && started.output.includes('started sync 1'), `sync start (${started.output})`);
     assert(started.output.includes('as alice'), 'sync start names the local id');
 
-    const dup = await runCommand(session, '\\sync start shopdb as alice on localhost');
+    const dup = await runCommand(session, '\\sync start shopdb as alice');
     assert(dup.exitCode === 1 && dup.output.includes('already syncing'), 'second start on the same db is refused');
 
     const st = await runCommand(session, '\\sync status');
@@ -570,13 +570,13 @@ async function runSyncCommandTests(session: ReplSession): Promise<void> {
     const after = await runCommand(session, '\\sync status');
     assertEqual(after.output, '(no active syncs)', 'sync removed after stop');
 
-    const reused = await runCommand(session, '\\sync start shopdb as alice on localhost');
+    const reused = await runCommand(session, '\\sync start shopdb as alice');
     assert(reused.exitCode === 0 && reused.output.includes('started sync 2'), 'ids are never reused after stop');
     await runCommand(session, '\\sync stop 2');
 
     const shop = session.workspace.roots.list('database').find((root) => root.name === 'shopdb');
     assert(shop !== undefined, 'shopdb is a local root for fetch tests');
-    const fetched = await runCommand(session, `\\sync fetch #${shop.id} as alice on localhost`);
+    const fetched = await runCommand(session, `\\sync fetch #${shop.id} as alice`);
     assert(fetched.exitCode === 0, `already-local fetch (${fetched.output})`);
     assert(fetched.output.includes('fetched'), 'fetch output mentions fetched');
     assert(fetched.output.includes('already local') || fetched.output.includes('genesis only'), 'fetch notes genesis / already local');
@@ -585,7 +585,7 @@ async function runSyncCommandTests(session: ReplSession): Promise<void> {
     const afterFetch = await runCommand(session, '\\sync status');
     assertEqual(afterFetch.output, '(no active syncs)', 'fetch does not create a sync session');
 
-    const named = await runCommand(session, '\\sync fetch shopdb as alice on localhost');
+    const named = await runCommand(session, '\\sync fetch shopdb as alice');
     assert(named.exitCode === 1 && named.output.includes('full #hash'), 'fetch rejects a database name');
 }
 
@@ -651,18 +651,18 @@ function registryDiscovery(registry: SharedPeerRegistry, selfKeyId: string): Pee
 }
 
 function sharedMemSyncFactory(provider: MemTransportProvider, registry: SharedPeerRegistry): SyncMeshFactory {
-    return async (req) => {
-        const addr = `mem://sync-${req.identity.keyId.slice(0, 12)}`;
-        const discovery = registryDiscovery(registry, req.identity.keyId);
+    return async (_config, runtime) => {
+        const addr = `mem://sync-${runtime.identity.keyId.slice(0, 12)}`;
+        const discovery = registryDiscovery(registry, runtime.identity.keyId);
         const mesh = new Mesh({
             transports: [new NonClosingProvider(provider)],
             discovery,
             authenticator: createAuthenticator({
-                localKey: req.identity,
+                localKey: runtime.identity,
                 signingName: SIGNING_ED25519,
                 kemPrefs: [KEM_X25519_HKDF],
             }),
-            localKeyId: req.identity.keyId,
+            localKeyId: runtime.identity.keyId,
             listenAddresses: [addr],
         });
         return {
@@ -711,7 +711,7 @@ CREATE DATABASE shopdb USING CATALOG shop_catalog;
 `);
         assertEqual(setup.exitCode, 0, `alice shopdb (${setup.output})`);
 
-        const started = await runCommand(alice, '\\sync start shopdb as alice on localhost');
+        const started = await runCommand(alice, '\\sync start shopdb as alice');
         assert(started.exitCode === 0, `alice sync start (${started.output})`);
 
         const shop = alice.workspace.roots.list('database').find((root) => root.name === 'shopdb');
@@ -720,7 +720,7 @@ CREATE DATABASE shopdb USING CATALOG shop_catalog;
         const createdBob = await runCommand(bob, '\\key create bob', undefined, { requestPassphrase: passphrase });
         assertEqual(createdBob.exitCode, 0, 'bob key');
 
-        const fetched = await runCommand(bob, `\\sync fetch #${shop.id} as bob on localhost`);
+        const fetched = await runCommand(bob, `\\sync fetch #${shop.id} as bob`);
         assert(fetched.exitCode === 0, `remote fetch (${fetched.output})`);
         assert(!fetched.output.includes('No backend attached'), `must not fail on backend label (${fetched.output})`);
         assert(fetched.output.includes('fetched'), 'fetch output mentions fetched');

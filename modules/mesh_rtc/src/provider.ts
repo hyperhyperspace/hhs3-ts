@@ -44,7 +44,7 @@ export interface RtcTransportProviderOptions {
     delegationTtlSec?: number;
     clockSkewMs?: number;
     now?: () => number;
-    createPeer: (iceServers: RtcIceServer[]) => RtcPeerLike;
+    createRTCPeerConnection: (iceServers: RtcIceServer[]) => RtcPeerLike;
     openSignaling: (signalingUrl: string) => Promise<SignalSocket>;
 }
 
@@ -69,7 +69,7 @@ export class RtcTransportProvider implements TransportProvider {
     private readonly delegationTtlSec: number;
     private readonly clockSkewMs: number;
     private readonly now: () => number;
-    private readonly createPeer: (iceServers: RtcIceServer[]) => RtcPeerLike;
+    private readonly createRTCPeerConnection: (iceServers: RtcIceServer[]) => RtcPeerLike;
     private readonly openSignaling: (signalingUrl: string) => Promise<SignalSocket>;
     private readonly signalingUrl?: string;
     private readonly signalingOrigin?: string;
@@ -95,7 +95,7 @@ export class RtcTransportProvider implements TransportProvider {
         this.delegationTtlSec = opts.delegationTtlSec ?? DEFAULT_DELEGATION_TTL_SEC;
         this.clockSkewMs = opts.clockSkewMs ?? DEFAULT_CLOCK_SKEW_MS;
         this.now = opts.now ?? (() => Date.now());
-        this.createPeer = opts.createPeer;
+        this.createRTCPeerConnection = opts.createRTCPeerConnection;
         this.openSignaling = opts.openSignaling;
         if (opts.signalBase !== undefined) {
             this.localAddress = rtcAddressFor(opts.signalBase, this.endpointId);
@@ -201,7 +201,7 @@ export class RtcTransportProvider implements TransportProvider {
                         expectedKeyId,
                     });
                     stage = 'ice';
-                    peer = this.createPeer(this.iceServers);
+                    peer = this.createRTCPeerConnection(this.iceServers);
                     peer.onicecandidate = (candidate) => {
                         if (settled || !candidate?.candidate) return;
                         send({
@@ -372,7 +372,7 @@ export class RtcTransportProvider implements TransportProvider {
                 return;
             }
         }
-        const peer = this.createPeer(this.iceServers);
+        const peer = this.createRTCPeerConnection(this.iceServers);
         const inbound: InboundSession = { peer, pending: [], remoteSet: false };
         this.sessions.set(session, inbound);
         peer.onicecandidate = (candidate) => {

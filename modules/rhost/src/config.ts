@@ -4,20 +4,19 @@
 
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { json } from "@hyper-hyper-space/hhs3_json";
+import {
+    parseMeshConfig,
+    type MeshConfig,
+    type MeshTransports,
+    type ScopedMeshConfig,
+} from "@hyper-hyper-space/hhs3_mesh";
 import { validateIndexSpec, type IndexDecl, type IndexSpec } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
-import { parseAllowSource, type AllowSource, type SyncScope } from "./sync.js";
+import { parseAllowSource, type AllowSource } from "./sync.js";
 
 export type AutoDeploy = 'minor' | 'major' | 'none';
 
-// How a host meets its peers. Without `listen`, a free port is picked when the
-// host starts.
-export type SyncConfig = {
-    scope: SyncScope;
-    tracker?: string;
-    trackerKey?: string;
-    listen?: string;
-};
+export type { MeshConfig, ScopedMeshConfig };
 
 // The key a host signs with. `label` is its name in the keystore when the
 // host was set up; the host unlocks it by `keyId`, so relabeling it changes
@@ -54,6 +53,7 @@ export type AppConfig = {
     params?: ParamsConfig;
     autoDeploy?: AutoDeploy;
     allow?: string[];
+    mesh?: MeshConfig;
     projection: ProjectionConfig;
 };
 
@@ -62,7 +62,7 @@ export type HostRecord = {
     catalog: string;
     created: boolean;
     key: HostKeyConfig;
-    sync: SyncConfig;
+    mesh?: MeshConfig;
     params?: ParamsConfig;
     autoDeploy?: AutoDeploy;
     projection?: ProjectionConfig;
@@ -73,7 +73,7 @@ export type EffectiveConfig = {
     key: HostKeyConfig;
     params: ParamsConfig;
     autoDeploy: AutoDeploy;
-    sync: SyncConfig;
+    mesh: ScopedMeshConfig;
     allow: AllowSource[];
     projection: ProjectionConfig;
 };
@@ -151,24 +151,13 @@ function checkAutoDeploy(c: Checker, value: unknown, field: string): AutoDeploy 
     return value;
 }
 
-function checkSync(c: Checker, value: unknown, field: string): SyncConfig {
-    const o = c.object(value, field, ['scope', 'tracker', 'trackerKey', 'listen']);
-    const scope = o['scope'];
-    if (scope === undefined) c.fail(`${field}.scope`, 'is missing');
-    if (scope !== 'internet' && scope !== 'localhost') {
-        c.fail(`${field}.scope`, `must be 'internet' or 'localhost', got ${JSON.stringify(scope)}`);
+function readMesh(value: unknown, source: string, field: string): MeshConfig {
+    try {
+        return parseMeshConfig(value, source, field);
+    } catch (err) {
+        if (err instanceof ConfigError) throw err;
+        throw new ConfigError(err instanceof Error ? err.message : String(err));
     }
-    const out: SyncConfig = { scope };
-    const tracker = c.optionalString(o['tracker'], `${field}.tracker`);
-    const trackerKey = c.optionalString(o['trackerKey'], `${field}.trackerKey`);
-    const listen = c.optionalString(o['listen'], `${field}.listen`);
-    if (tracker !== undefined) out.tracker = tracker;
-    if (trackerKey !== undefined) out.trackerKey = trackerKey;
-    if (listen !== undefined) {
-        if (listenUrl(listen) === undefined) c.fail(`${field}.listen`, `must be an address such as ws://0.0.0.0:7400, got '${listen}'`);
-        out.listen = listen;
-    }
-    return out;
 }
 
 function listenUrl(listen: string): URL | undefined {
@@ -179,10 +168,11 @@ function listenUrl(listen: string): URL | undefined {
     }
 }
 
-// The port a `listen` address names, if it names one.
-export function listenPort(listen: string | undefined): string | undefined {
-    if (listen === undefined) return undefined;
-    const port = listenUrl(listen)?.port;
+// The port a WebSocket listen address names, if it names one.
+export function listenPort(mesh: MeshConfig | undefined): string | undefined {
+    const ws = mesh?.transports?.ws;
+    if (ws === undefined || ws === false || ws.listen === undefined) return undefined;
+    const port = listenUrl(ws.listen)?.port;
     return port === undefined || port === '' ? undefined : port;
 }
 
@@ -303,7 +293,7 @@ function checkLiteral(c: Checker, value: unknown, field: string): json.Literal {
 
 export function parseAppConfig(value: unknown, source = 'app.json'): AppConfig {
     const c = new Checker(source);
-    const o = c.object(value, '', ['releases', 'keystore', 'params', 'autoDeploy', 'allow', 'projection']);
+    const o = c.object(value, '', ['releases', 'keystore', 'params', 'autoDeploy', 'allow', 'mesh', 'projection']);
     const config: AppConfig = {
         releases: c.string(o['releases'], 'releases'),
         projection: checkProjection(c, o['projection'], 'projection'),
@@ -313,12 +303,13 @@ export function parseAppConfig(value: unknown, source = 'app.json'): AppConfig {
     if (o['params'] !== undefined) config.params = checkParams(c, o['params'], 'params');
     if (o['autoDeploy'] !== undefined) config.autoDeploy = checkAutoDeploy(c, o['autoDeploy'], 'autoDeploy');
     if (o['allow'] !== undefined) config.allow = checkAllow(c, o['allow'], 'allow');
+    if (o['mesh'] !== undefined) config.mesh = readMesh(o['mesh'], source, 'mesh');
     return config;
 }
 
 export function parseHostRecord(value: unknown, source = 'host.json'): HostRecord {
     const c = new Checker(source);
-    const o = c.object(value, '', ['database', 'catalog', 'created', 'key', 'sync', 'params', 'autoDeploy', 'projection']);
+    const o = c.object(value, '', ['database', 'catalog', 'created', 'key', 'mesh', 'params', 'autoDeploy', 'projection']);
     const created = o['created'];
     if (created === undefined) return c.fail('created', 'is missing');
     if (typeof created !== 'boolean') return c.fail('created', 'must be true or false');
@@ -327,7 +318,7 @@ export function parseHostRecord(value: unknown, source = 'host.json'): HostRecor
         catalog: c.string(o['catalog'], 'catalog'),
         created,
         key: checkKey(c, o['key'], 'key'),
-        sync: checkSync(c, o['sync'], 'sync'),
+        ...(o['mesh'] !== undefined ? { mesh: readMesh(o['mesh'], source, 'mesh') } : {}),
     };
     if (o['params'] !== undefined) record.params = checkParams(c, o['params'], 'params');
     if (o['autoDeploy'] !== undefined) record.autoDeploy = checkAutoDeploy(c, o['autoDeploy'], 'autoDeploy');
@@ -335,10 +326,28 @@ export function parseHostRecord(value: unknown, source = 'host.json'): HostRecor
     return record;
 }
 
-// The network settings given to create or join, checked as host.json would
-// check them.
-export function parseSyncConfig(value: unknown, source: string): SyncConfig {
-    return checkSync(new Checker(source), value, 'sync');
+// Host keys replace the app's. Scope is the host's when set, otherwise the
+// app's. The result always has a scope.
+export function mergeMeshConfig(appMesh: MeshConfig | undefined, hostMesh: MeshConfig | undefined): ScopedMeshConfig {
+    const scope = hostMesh?.scope ?? appMesh?.scope;
+    if (scope !== 'localhost' && scope !== 'internet') {
+        throw new ConfigError('mesh: scope is missing');
+    }
+    const transports: MeshTransports = { ...(appMesh?.transports ?? {}) };
+    const hostTransports = hostMesh?.transports;
+    if (hostTransports !== undefined) {
+        if (Object.prototype.hasOwnProperty.call(hostTransports, 'ws')) transports.ws = hostTransports.ws;
+        if (Object.prototype.hasOwnProperty.call(hostTransports, 'webrtc')) transports.webrtc = hostTransports.webrtc;
+        if (Object.prototype.hasOwnProperty.call(hostTransports, 'broadcastChannel')) {
+            transports.broadcastChannel = hostTransports.broadcastChannel;
+        }
+    }
+    const discovery = hostMesh?.discovery !== undefined ? hostMesh.discovery : appMesh?.discovery;
+    return {
+        scope,
+        ...(Object.keys(transports).length > 0 ? { transports } : {}),
+        ...(discovery !== undefined ? { discovery } : {}),
+    };
 }
 
 export function checkPassphraseSource(passphrase: string, source: string): void {
@@ -347,15 +356,15 @@ export function checkPassphraseSource(passphrase: string, source: string): void 
     }
 }
 
-// app.json with each section the host overrides replaced. The key and the
-// network settings are the host's own; the allow list is always the app's.
+// app.json with each mesh section the host overrides replaced. The key is the
+// host's own; the allow list is always the app's.
 export function effectiveConfig(app: AppConfig, record: HostRecord): EffectiveConfig {
     return {
         releases: app.releases,
         key: record.key,
         params: record.params ?? app.params ?? {},
         autoDeploy: record.autoDeploy ?? app.autoDeploy ?? 'minor',
-        sync: record.sync,
+        mesh: mergeMeshConfig(app.mesh, record.mesh),
         allow: (app.allow ?? []).map(parseAllowSource),
         projection: record.projection ?? app.projection,
     };

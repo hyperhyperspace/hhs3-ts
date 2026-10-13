@@ -1547,12 +1547,16 @@ const tests = [
                 const hashSuite = createBasicCrypto().hash(HASH_SHA256);
                 const alice = await createIdentity(SIGNING_ED25519, hashSuite);
                 const bob = await createIdentity(SIGNING_ED25519, hashSuite);
-                const factory = createNodeSyncMeshFactory({
-                    folderRoot: dir,
-                    env: { RDB_SYNC_TRACKER: 'ws://127.0.0.1:1' },
-                });
-                builtA = await factory({ scope: 'localhost', identity: alice });
-                builtB = await factory({ scope: 'localhost', identity: bob });
+                const factory = createNodeSyncMeshFactory({ folderRoot: dir });
+                const mesh = {
+                    scope: 'localhost' as const,
+                    discovery: [
+                        { type: 'tracker' as const, url: 'ws://127.0.0.1:1' },
+                        { type: 'folder' as const },
+                    ],
+                };
+                builtA = await factory(mesh, { identity: alice });
+                builtB = await factory(mesh, { identity: bob });
                 assertTrue(
                     builtA.discoveryNotes.some((n) => n.includes('unreachable')),
                     `tracker noted unreachable (${builtA.discoveryNotes.join('; ')})`,

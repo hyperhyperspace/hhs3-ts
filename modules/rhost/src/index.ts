@@ -17,10 +17,10 @@ export {
     type FetchDatabaseOptions,
     type StartDatabaseSyncOptions,
     type SyncCloseable,
-    type SyncMeshBuildRequest,
     type SyncMeshFactory,
     type SyncPeer,
     type SyncScope,
+    type MeshRuntime,
 } from "./sync.js";
 export { openProjection, type OpenProjectionOptions, type OpenedProjection } from "./projection.js";
 export {
@@ -28,9 +28,9 @@ export {
     checkPassphraseSource,
     effectiveConfig,
     listenPort,
+    mergeMeshConfig,
     parseAppConfig,
     parseHostRecord,
-    parseSyncConfig,
     type AppConfig,
     type AutoDeploy,
     type EffectiveConfig,
@@ -39,7 +39,8 @@ export {
     type HostRecord,
     type ParamsConfig,
     type ProjectionConfig,
-    type SyncConfig,
+    type MeshConfig,
+    type ScopedMeshConfig,
 } from "./config.js";
 export { ShippedReleaseError, adoptionRangeFor, majorOf, shippedReleases } from "./releases.js";
 export { ParamError, parseParamText, resolveParams } from "./params.js";

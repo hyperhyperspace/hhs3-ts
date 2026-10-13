@@ -1,8 +1,9 @@
-import type { AllowSource, SyncScope } from "@hyper-hyper-space/hhs3_rhost";
+import { parseMeshConfig, type MeshConfig } from "@hyper-hyper-space/hhs3_mesh";
+import type { AllowSource } from "@hyper-hyper-space/hhs3_rhost";
 
 export const SYNC_USAGE =
-    'Usage: \\sync fetch #<rdb-id> as <local-id> on <localhost|internet> [--tracker URL] [--tracker-key KEYID] [--listen ADDR]\n' +
-    '       \\sync start <db> as <local-id> [allow <sources>] on <localhost|internet> [--tracker URL] [--tracker-key KEYID] [--listen ADDR]\n' +
+    'Usage: \\sync fetch #<rdb-id> as <local-id> [<mesh-json>|@<file>]\n' +
+    '       \\sync start <db> as <local-id> [allow <sources>] [<mesh-json>|@<file>]\n' +
     '       \\sync status [<db>]\n' +
     '       \\sync stop <id>\n' +
     '       \\sync peers <id>';
@@ -12,20 +13,16 @@ export type SyncStartCommand = {
     database: string;
     localId: string;
     sources: AllowSource[];
-    scope: SyncScope;
-    tracker?: string;
-    trackerKey?: string;
-    listen?: string;
+    mesh: MeshConfig;
+    meshPath?: string;
 };
 
 export type SyncFetchCommand = {
     kind: 'fetch';
     rdbId: string;
     localId: string;
-    scope: SyncScope;
-    tracker?: string;
-    trackerKey?: string;
-    listen?: string;
+    mesh: MeshConfig;
+    meshPath?: string;
 };
 
 export type SyncCommand =
@@ -37,8 +34,6 @@ export type SyncCommand =
 
 // SHA-256 / blake3 digestSize is 32 bytes; standard btoa is 44 chars (43 + '=').
 const FULL_HASH_RE = /^[A-Za-z0-9+/]{43,}={0,2}$/;
-
-const FLAG_NAMES = new Set(['--tracker', '--tracker-key', '--listen']);
 
 export function parseSyncCommand(remainder: string): SyncCommand {
     const p = new Parser(remainder);
@@ -125,18 +120,8 @@ class Parser {
             if (sources.length === 0) throw new Error('allow list is empty');
         }
 
-        this.expectKeyword('on');
-        const scope = this.parseScope();
-        const flags = this.parseFlags();
-        this.expectEnd();
-        return {
-            kind: 'start',
-            database,
-            localId,
-            sources,
-            scope,
-            ...flags,
-        };
+        const mesh = this.parseMesh();
+        return { kind: 'start', database, localId, sources, ...mesh };
     }
 
     parseFetch(): SyncFetchCommand {
@@ -148,19 +133,70 @@ class Parser {
         if (this.tryKeyword('allow')) {
             throw new Error('\\sync fetch does not take allow; use \\sync start to share');
         }
-        this.expectKeyword('on');
-        const scope = this.parseScope();
-        const flags = this.parseFlags();
-        this.expectEnd();
-        return { kind: 'fetch', rdbId, localId, scope, ...flags };
+        const mesh = this.parseMesh();
+        return { kind: 'fetch', rdbId, localId, ...mesh };
     }
 
-    parseScope(): SyncScope {
-        const scopeTok = this.readToken();
-        if (scopeTok !== 'localhost' && scopeTok !== 'internet') {
-            throw new Error(`Expected localhost or internet after on, got '${scopeTok}'`);
+    // No mesh argument is internet. `{...}` is inline JSON. `@path` is a file
+    // the command reads.
+    parseMesh(): { mesh: MeshConfig; meshPath?: string } {
+        this.skipWs();
+        if (this.done()) return { mesh: { scope: 'internet' } };
+        if (this.peek() === '{') {
+            const raw = this.readJsonObject();
+            let value: unknown;
+            try {
+                value = JSON.parse(raw);
+            } catch (err) {
+                throw new Error(`mesh JSON is not valid: ${err instanceof Error ? err.message : String(err)}`);
+            }
+            const mesh = parseMeshConfig(value, '\\sync', 'mesh');
+            this.expectEnd();
+            return { mesh: { ...mesh, scope: mesh.scope ?? 'internet' } };
         }
-        return scopeTok;
+        if (this.peek() === '@') {
+            this.i += 1;
+            const meshPath = this.readToken();
+            if (meshPath.length === 0) throw new Error(`${SYNC_USAGE}`);
+            this.expectEnd();
+            return { mesh: { scope: 'internet' }, meshPath };
+        }
+        throw new Error(`Unexpected token '${this.readToken()}'. ${SYNC_USAGE}`);
+    }
+
+    readJsonObject(): string {
+        const start = this.i;
+        let depth = 0;
+        let quote: '"' | undefined;
+        let escape = false;
+        while (this.i < this.s.length) {
+            const ch = this.s[this.i]!;
+            if (quote !== undefined) {
+                if (escape) escape = false;
+                else if (ch === '\\') escape = true;
+                else if (ch === quote) quote = undefined;
+                this.i += 1;
+                continue;
+            }
+            if (ch === '"') {
+                quote = '"';
+                this.i += 1;
+                continue;
+            }
+            if (ch === '{') {
+                depth += 1;
+                this.i += 1;
+                continue;
+            }
+            if (ch === '}') {
+                depth -= 1;
+                this.i += 1;
+                if (depth === 0) return this.s.slice(start, this.i);
+                continue;
+            }
+            this.i += 1;
+        }
+        throw new Error('mesh JSON object is not closed');
     }
 
     parseSources(): AllowSource[] {
@@ -219,32 +255,6 @@ class Parser {
             if (where.length === 0) throw new Error('Expected a condition after where');
         }
         return { type: 'column', group, table, column, ...(where !== undefined ? { where } : {}) };
-    }
-
-    parseFlags(): { tracker?: string; trackerKey?: string; listen?: string } {
-        const out: { tracker?: string; trackerKey?: string; listen?: string } = {};
-        while (true) {
-            this.skipWs();
-            if (this.done() || !this.s.startsWith('--', this.i)) break;
-            const name = this.readToken();
-            if (!FLAG_NAMES.has(name)) throw new Error(`Unknown flag '${name}'. ${SYNC_USAGE}`);
-            this.skipWs();
-            if (this.done() || this.s.startsWith('--', this.i)) {
-                throw new Error(`${name} requires a value`);
-            }
-            const value = this.readToken();
-            if (name === '--tracker') {
-                if (out.tracker !== undefined) throw new Error('duplicate --tracker');
-                out.tracker = value;
-            } else if (name === '--tracker-key') {
-                if (out.trackerKey !== undefined) throw new Error('duplicate --tracker-key');
-                out.trackerKey = value;
-            } else {
-                if (out.listen !== undefined) throw new Error('duplicate --listen');
-                out.listen = value;
-            }
-        }
-        return out;
     }
 
     readIdent(skipWhitespace = true): string {
@@ -337,8 +347,7 @@ class Parser {
             }
             if (depth === 0) {
                 if (inList && (ch === ',' || ch === ']')) break;
-                if (!inList && this.matchWord(this.i, 'on')) break;
-                if (this.s.startsWith('--', this.i) && (this.i === 0 || /\s/.test(this.s[this.i - 1]!))) break;
+                if (!inList && (this.peek() === '{' || this.peek() === '@')) break;
             }
             this.i += 1;
         }

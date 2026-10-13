@@ -25,7 +25,7 @@ import { TRACE_MESH, trace } from './trace.js';
 
 const DEFAULT_NEGOTIATION_TIMEOUT_MS = 10_000;
 
-export interface MeshConfig {
+export interface MeshOptions {
     transports:             TransportProvider[];
     discovery:              PeerDiscovery;
     authenticator:          PeerAuthenticator;
@@ -39,14 +39,14 @@ export class Mesh {
 
     readonly pool: ConnectionPool;
 
-    private config: MeshConfig;
+    private config: MeshOptions;
     private activeSwarms: Swarm[] = [];
     private closed = false;
     private localPeer: PeerInfo | undefined;
     private negotiationTimeoutMs: number;
     private report: IssueReporter | undefined;
 
-    constructor(config: MeshConfig) {
+    constructor(config: MeshOptions) {
         this.config = config;
         this.negotiationTimeoutMs = config.negotiationTimeoutMs ?? DEFAULT_NEGOTIATION_TIMEOUT_MS;
         this.report = config.report;

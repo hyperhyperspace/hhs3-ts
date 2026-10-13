@@ -77,11 +77,27 @@ async function runScope(scope: "localhost" | "internet") {
     let builtB: BuiltMesh | undefined;
     try {
         builtA = await createBrowserMesh(
-            { scope, identity: alice, trackerAddress: UNREACHABLE_TRACKER },
+            {
+                scope,
+                transports: { webrtc: { listen: false } },
+                discovery: [
+                    { type: "tracker", url: UNREACHABLE_TRACKER },
+                    { type: "broadcast-channel" },
+                ],
+            },
+            { identity: alice },
             { BroadcastChannelCtor: FakeCtor },
         );
         builtB = await createBrowserMesh(
-            { scope, identity: bob, trackerAddress: UNREACHABLE_TRACKER },
+            {
+                scope,
+                transports: { webrtc: { listen: false } },
+                discovery: [
+                    { type: "tracker", url: UNREACHABLE_TRACKER },
+                    { type: "broadcast-channel" },
+                ],
+            },
+            { identity: bob },
             { BroadcastChannelCtor: FakeCtor },
         );
 
@@ -182,14 +198,17 @@ async function testInternetSignal() {
         built = await createBrowserMesh(
             {
                 scope: "internet",
-                identity: alice,
-                trackerAddress: UNREACHABLE_TRACKER,
-                signalUrl: origin,
+                transports: { webrtc: { signal: origin } },
+                discovery: [
+                    { type: "tracker", url: UNREACHABLE_TRACKER },
+                    { type: "broadcast-channel" },
+                ],
             },
+            { identity: alice },
             {
                 BroadcastChannelCtor: FakeCtor,
                 openSignaling: openTestSignaling,
-                createPeer: () => { throw new Error("factory address test does not dial"); },
+                createRTCPeerConnection: () => { throw new Error("factory address test does not dial"); },
             },
         );
         testing.assertEquals(built.listenAddresses.length, 2, "bc and rtc listen addresses");
@@ -209,6 +228,32 @@ async function testInternetSignal() {
     }
 }
 
+async function testInternetDefaultRtc() {
+    const alice = await newIdentity();
+    let built: BuiltMesh | undefined;
+    try {
+        built = await createBrowserMesh(
+            {
+                scope: "internet",
+                discovery: [{ type: "broadcast-channel" }],
+            },
+            { identity: alice },
+            {
+                BroadcastChannelCtor: FakeCtor,
+                openSignaling: () => Promise.reject(new Error("not dialing")),
+                createRTCPeerConnection: () => { throw new Error("not dialing"); },
+            },
+        );
+        testing.assertTrue(
+            built.listenAddresses.some(a => a.startsWith("rtc://signal.mypeer.net:4612/")),
+            `advertises the default signal server (${built.listenAddresses.join(", ")})`,
+        );
+        testing.assertTrue(built.trackerAddresses.every(a => a.startsWith("rtc://")), "tracker is not given bc://");
+    } finally {
+        await teardown(built);
+    }
+}
+
 const allSuites = [
     {
         title: "[MESH_BROWSER] Browser mesh factory",
@@ -216,6 +261,7 @@ const allSuites = [
             { name: "[MESH_BROWSER_00] localhost: bc listen + discovery", invoke: testLocalhost },
             { name: "[MESH_BROWSER_01] internet: bc listen + discovery (tracker not advertised bc)", invoke: testInternet },
             { name: "[MESH_BROWSER_02] internet signalUrl: listen bc+rtc, tracker gets rtc only", invoke: testInternetSignal },
+            { name: "[MESH_BROWSER_03] internet default advertises rtc://signal.mypeer.net", invoke: testInternetDefaultRtc },
         ],
     },
 ];

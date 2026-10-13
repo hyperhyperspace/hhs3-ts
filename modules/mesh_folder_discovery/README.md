@@ -10,7 +10,7 @@ Presence is a lease. Swarm calls `announce()` once per `activate()`, so this sou
 <root>/<encTopic>/<encKeyId>.<instanceId>.json
 ```
 
-- **`root`** defaults to `$RDB_MESH`, else `$RDB_HOME/mesh`, else `~/.rdb/mesh`.
+- **`root`** defaults to `$RDB_HOME/mesh`, or `~/.rdb/mesh` when `RDB_HOME` is unset.
 - **`encTopic` / `encKeyId`** are base64url encodings of the topic and key id (filesystem-safe).
 - **`instanceId`** is a per-process random id so the same identity in two processes does not collide.
 - File content: `{ keyId, addresses, topic, updatedAt }`.

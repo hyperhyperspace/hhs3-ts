@@ -3,7 +3,7 @@
 // database's sync over a mesh attached to its replica.
 
 import type { KeyId, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
-import type { IssueReporter, Mesh, PeerAuthorizer, PeerDiscovery } from "@hyper-hyper-space/hhs3_mesh";
+import type { IssueReporter, Mesh, PeerAuthorizer, PeerDiscovery, ScopedMeshConfig } from "@hyper-hyper-space/hhs3_mesh";
 import type { RObject } from "@hyper-hyper-space/hhs3_mvt";
 import { RDB_TYPE_ID, type RDb } from "@hyper-hyper-space/hhs3_rdb";
 import { executeText, type RdbSession } from "@hyper-hyper-space/hhs3_rdb_runtime";
@@ -11,14 +11,11 @@ import type { Replica } from "@hyper-hyper-space/hhs3_replica";
 
 const MESH_CLOSEABLE_WAIT_MS = 1_000;
 
-export type SyncScope = 'localhost' | 'internet';
+export type { ScopedMeshConfig };
+export type SyncScope = ScopedMeshConfig['scope'];
 
-export type SyncMeshBuildRequest = {
-    scope: SyncScope;
+export type MeshRuntime = {
     identity: OwnIdentity;
-    trackerAddress?: string;
-    trackerKeyId?: string;
-    listenAddress?: string;
     report?: IssueReporter;
 };
 
@@ -34,7 +31,7 @@ export type BuiltSyncMesh = {
 
 // Host-injected: Node builds a tracker/folder mesh, the browser a BroadcastChannel
 // or WebSocket one, tests an in-memory one.
-export type SyncMeshFactory = (req: SyncMeshBuildRequest) => Promise<BuiltSyncMesh>;
+export type SyncMeshFactory = (config: ScopedMeshConfig, runtime: MeshRuntime) => Promise<BuiltSyncMesh>;
 
 // --- Allow lists ---
 
@@ -234,7 +231,8 @@ export type FetchDatabaseOptions = {
     replica: Replica;
     id: string;
     meshFactory: SyncMeshFactory;
-    request: SyncMeshBuildRequest;
+    config: ScopedMeshConfig;
+    runtime: MeshRuntime;
     meshLabel: string;
     backendLabel?: string;
 };
@@ -245,7 +243,7 @@ export async function fetchDatabase(options: FetchDatabaseOptions): Promise<RObj
     const { replica, meshLabel } = options;
     let built: BuiltSyncMesh | undefined;
     try {
-        built = await options.meshFactory(options.request);
+        built = await options.meshFactory(options.config, options.runtime);
         replica.attachMesh(meshLabel, built.mesh);
         const obj = await replica.fetchObject(options.id, {
             meshLabel,

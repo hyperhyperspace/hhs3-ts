@@ -22,7 +22,7 @@ const SECOND_RELEASE = `
 const THIRD_RELEASE = "ALTER CATALOG editor VERSION '1.2.0' PARAMS (:moderator identity) BY $admin;";
 const hashSuite = createBasicCrypto().hash(HASH_SHA256);
 const PASS_ENV = 'RHOST_TEST_PASS';
-const HOST_FLAGS = ['--key', 'me', '--scope', 'localhost', '--passphrase-env', PASS_ENV];
+const HOST_FLAGS = ['--key', 'me', '--mesh', '{"scope":"localhost"}', '--passphrase-env', PASS_ENV];
 
 function nameRef(text: string) {
     return { kind: 'name' as const, text, parts: text.split('.'), span: { start: 0, end: text.length, line: 1, column: 1 } };
@@ -110,7 +110,7 @@ function appOptions(dir: string) {
     };
 }
 
-const SETUP: HostSetup = { key: 'me', passphrase: 'prompt', sync: { scope: 'localhost' } };
+const SETUP: HostSetup = { key: 'me', passphrase: 'prompt', mesh: { scope: 'localhost' } };
 
 type Run = { code: number; stdout: string; stderr: string };
 
@@ -436,47 +436,53 @@ export const hostTests = [
                 const noKey = await rhost('create');
                 assertTrue(noKey.code === 1 && noKey.stderr.includes('rhost create needs --key <label>'), `no terminal, no key (${noKey.stderr})`);
                 const noScope = await rhost('create', '--key', 'me');
-                assertTrue(noScope.code === 1 && noScope.stderr.includes('rhost create needs --scope internet|localhost'),
+                assertTrue(noScope.code === 1 && noScope.stderr.includes('needs --mesh with a scope'),
                     `no terminal, no scope (${noScope.stderr})`);
-                const noPass = await rhost('create', '--key', 'me', '--scope', 'localhost');
+                const noPass = await rhost('create', '--key', 'me', '--mesh', '{"scope":"localhost"}');
                 assertTrue(noPass.code === 1 && noPass.stderr.includes("rhost create needs --passphrase-env <VAR> to unlock 'me'"),
                     `no terminal, no passphrase source (${noPass.stderr})`);
-                const unknown = await rhost('create', '--key', 'nobody', '--scope', 'localhost');
+                const unknown = await rhost('create', '--key', 'nobody', '--mesh', '{"scope":"localhost"}');
                 assertTrue(unknown.code === 1 && unknown.stderr.includes(`no key 'nobody' in ${keystore}`),
                     `an unknown key names the keystore (${unknown.stderr})`);
-                const badScope = await rhost('create', '--key', 'me', '--scope', 'lan');
-                assertTrue(badScope.code === 1 && badScope.stderr.includes("--scope is internet or localhost, got 'lan'"), `a bad scope (${badScope.stderr})`);
+                const badScope = await rhost('create', '--key', 'me', '--mesh', '{"scope":"lan"}');
+                assertTrue(badScope.code === 1 && badScope.stderr.includes("mesh.scope must be"), `a bad scope (${badScope.stderr})`);
                 assertTrue(!existsSync(join(appDir, 'hosts')), 'nothing was created');
 
-                const created = await rhost('create', '--key', 'me', '--scope', 'internet', '--passphrase-env', PASS_ENV,
-                    '--tracker', 'wss://tracker.example', '--tracker-key', 'TK', '--listen', 'ws://127.0.0.1:7499');
+                const mesh = JSON.stringify({
+                    scope: 'internet',
+                    discovery: [{ type: 'tracker', url: 'wss://tracker.example', key: 'TK' }],
+                    transports: { ws: { listen: 'ws://127.0.0.1:7499' } },
+                });
+                const created = await rhost('create', '--key', 'me', '--passphrase-env', PASS_ENV, '--mesh', mesh);
                 assertEquals(created.code, 0, `create (${created.stdout}${created.stderr})`);
                 assertTrue(created.stdout.includes(`key       me (`) && created.stdout.includes(`in ${keystore})`),
                     `create names the key and the keystore (${created.stdout})`);
-                assertTrue(created.stdout.includes('sync      internet, tracker wss://tracker.example, tracker key TK, listening on ws://127.0.0.1:7499'),
+                assertTrue(created.stdout.includes('mesh      internet, tracker wss://tracker.example, listening on ws://127.0.0.1:7499'),
                     `and the network settings (${created.stdout})`);
                 const record = await readHostJson(appDir, 'default');
                 const key = (await KeyStore.open(keystore, hashSuite)).resolvePublic('me');
                 assertEquals(JSON.stringify(record['key']), JSON.stringify({
                     label: 'me', keyId: key.keyId, publicKey: serializePublicKeyToBase64(key.publicKey), passphrase: `env:${PASS_ENV}`,
                 }), 'host.json records the key, its public key and its passphrase source');
-                assertEquals(JSON.stringify(record['sync']),
-                    '{"scope":"internet","tracker":"wss://tracker.example","trackerKey":"TK","listen":"ws://127.0.0.1:7499"}',
-                    'and the network settings');
+                assertEquals(JSON.stringify(record['mesh']), JSON.stringify({
+                    scope: 'internet',
+                    transports: { ws: { listen: 'ws://127.0.0.1:7499' } },
+                    discovery: [{ type: 'tracker', url: 'wss://tracker.example', key: 'TK' }],
+                }), 'and the network settings');
 
-                const clash = await rhost('create', 'second', '--key', 'me', '--scope', 'localhost', '--passphrase-env', PASS_ENV,
-                    '--listen', 'ws://127.0.0.1:7499');
-                assertTrue(clash.code === 1 && clash.stderr.includes("port 7499 (sync.listen) is already used by host 'default'"),
+                const clash = await rhost('create', 'second', '--key', 'me', '--passphrase-env', PASS_ENV,
+                    '--mesh', '{"scope":"localhost","transports":{"ws":{"listen":"ws://127.0.0.1:7499"}}}');
+                assertTrue(clash.code === 1 && clash.stderr.includes("port 7499 (mesh.transports.ws.listen) is already used by host 'default'"),
                     `a listen port is one host's (${clash.stderr})`);
-                const taken = await rhost('create', '--key', 'me', '--scope', 'localhost', '--passphrase-env', PASS_ENV);
+                const taken = await rhost('create', '--key', 'me', '--mesh', '{"scope":"localhost"}', '--passphrase-env', PASS_ENV);
                 assertTrue(taken.code === 1 && taken.stderr.includes("host 'default' already exists"), `a taken name (${taken.stderr})`);
 
                 const noId = await rhost('join');
                 assertTrue(noId.code === 1 && noId.stderr.includes('join needs a database id'), `join needs an id (${noId.stderr})`);
                 const joinScope = await rhost('join', '#XYZ', 'joined', '--key', 'me');
-                assertTrue(joinScope.code === 1 && joinScope.stderr.includes('rhost join needs --scope internet|localhost'),
+                assertTrue(joinScope.code === 1 && joinScope.stderr.includes('needs --mesh with a scope'),
                     `join asks for the same settings (${joinScope.stderr})`);
-                const joinKey = await rhost('join', '#XYZ', 'joined', '--scope', 'localhost');
+                const joinKey = await rhost('join', '#XYZ', 'joined', '--mesh', '{"scope":"localhost"}');
                 assertTrue(joinKey.code === 1 && joinKey.stderr.includes('rhost join needs --key <label>'), `and the key (${joinKey.stderr})`);
             });
         },

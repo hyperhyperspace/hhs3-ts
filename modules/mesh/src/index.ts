@@ -11,7 +11,29 @@ export {
 export type { DecodedControlMessage } from './mux.js';
 export { PooledConnection, ConnectionPool, connectionKey } from './connection_pool.js';
 export { PeerAuthorizer, SwarmMode, SwarmConfig, SwarmPeer, Swarm, SwarmDeps, createSwarm } from './swarm.js';
-export { MeshConfig, Mesh } from './mesh.js';
+export { MeshOptions, Mesh } from './mesh.js';
+export {
+    parseMeshConfig,
+    requireMeshScope,
+    planWebrtc,
+    planWs,
+    planBroadcastChannel,
+    planDiscovery,
+    type IceServer,
+    type WsTransportConfig,
+    type WebrtcTransportConfig,
+    type BroadcastChannelTransportConfig,
+    type MeshTransports,
+    type TrackerDiscovery,
+    type FolderDiscoveryConfig,
+    type BroadcastChannelDiscoveryConfig,
+    type DiscoverySource,
+    type MeshConfig,
+    type ScopedMeshConfig,
+    type WebrtcPlan,
+    type WsPlan,
+    type BroadcastChannelPlan,
+} from './mesh_config.js';
 export { AuthenticatorConfig, createAuthenticator } from './kem_authenticator.js';
 export { StaticDiscovery } from './static_discovery.js';
 export { DiscoveryLayer, DiscoveryStack } from './discovery_stack.js';

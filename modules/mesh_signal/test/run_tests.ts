@@ -95,7 +95,7 @@ async function boot(opts: { publicMode?: boolean; allow?: OwnIdentity[]; now?: (
 }
 
 function provider(identity: OwnIdentity, signalBase: string, extra?: {
-    createPeer?: () => FakePeer;
+    createRTCPeerConnection?: () => FakePeer;
     connectTimeoutMs?: number;
     now?: () => number;
     delegationTtlSec?: number;
@@ -109,7 +109,7 @@ function provider(identity: OwnIdentity, signalBase: string, extra?: {
         connectTimeoutMs: extra?.connectTimeoutMs,
         now: extra?.now,
         delegationTtlSec: extra?.delegationTtlSec,
-        createPeer: () => extra?.createPeer?.() ?? new FakePeer(),
+        createRTCPeerConnection: () => extra?.createRTCPeerConnection?.() ?? new FakePeer(),
         openSignaling: openTestSignaling,
     });
 }
@@ -330,7 +330,7 @@ async function testTimeoutsAndKey() {
         identity: bob,
         iceServers: [],
         connectTimeoutMs: 200,
-        createPeer: () => {
+        createRTCPeerConnection: () => {
             created++;
             return hungPeer();
         },
@@ -340,7 +340,7 @@ async function testTimeoutsAndKey() {
         identity: bob,
         iceServers: [],
         connectTimeoutMs: 80,
-        createPeer: () => {
+        createRTCPeerConnection: () => {
             created++;
             return new FakePeer();
         },

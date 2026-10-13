@@ -142,7 +142,7 @@ export const stageTests = [
                 const record = JSON.parse(await fs.readFile(join(app, 'hosts', 'default', 'host.json'), 'utf8')) as Record<string, any>;
                 assertTrue(record['key'].label === 'admin' && record['key'].keyId === standIns.resolveRecord('admin').keyId
                     && record['key'].passphrase === undefined, `the host signs as admin, with no passphrase (${JSON.stringify(record['key'])})`);
-                assertEquals(JSON.stringify(record['sync']), '{"scope":"localhost"}', 'and syncs on localhost by default');
+                assertEquals(JSON.stringify(record['mesh']), '{"scope":"localhost"}', 'and meshes on localhost by default');
 
                 await fs.writeFile(join(app, 'marker'), 'keep');
                 ok(await rpack(['stage'], undefined, folder('1.1.0')), 'stage again');
@@ -155,20 +155,20 @@ export const stageTests = [
                 await fs.writeFile(join(folder('2.0.0'), 'target-catalog.sql'), merged.replace(/\n\n  -- blocks go away\n  TABLE blocks \([\s\S]*?IF true/, ''));
 
                 const stagingJson = join(folder('2.0.0'), 'staging.json');
-                await fs.writeFile(stagingJson, '{ "sync": { "scope": "localhost" }, "identity": { "key": "admin" } }\n');
+                await fs.writeFile(stagingJson, '{ "mesh": { "scope": "localhost" }, "identity": { "key": "admin" } }\n');
                 const unknownField = await rpack(['stage', '--passphrase-stdin'], 'pw\n', folder('2.0.0'));
                 assertTrue(unknownField.code === 1 && unknownField.stderr.includes("staging.json: 'identity' is not a known field"),
                     `staging.json is strict (${unknownField.stderr})`);
-                await fs.writeFile(stagingJson, '{ "sync": { "scope": "localhost", "allow": ["user.identities.keyId"] } }\n');
+                await fs.writeFile(stagingJson, '{ "mesh": { "scope": "localhost", "allow": ["user.identities.keyId"] } }\n');
                 const nestedAllow = await rpack(['stage', '--passphrase-stdin'], 'pw\n', folder('2.0.0'));
-                assertTrue(nestedAllow.code === 1 && nestedAllow.stderr.includes('sync.allow is not a known field'),
-                    `allow is not a sync setting (${nestedAllow.stderr})`);
+                assertTrue(nestedAllow.code === 1 && nestedAllow.stderr.includes('mesh.allow is not a known field'),
+                    `allow is not a mesh setting (${nestedAllow.stderr})`);
                 await fs.writeFile(stagingJson, '{ "params": { "nope": 1 } }\n');
                 const undeclared = await rpack(['stage', '--passphrase-stdin'], 'pw\n', folder('2.0.0'));
                 assertTrue(undeclared.code === 1 && undeclared.stderr.includes("staging.json sets :nope, which 2.0.0 doesn't declare"),
                     `a param the release doesn't declare (${undeclared.stderr})`);
                 await fs.writeFile(stagingJson, JSON.stringify({
-                    sync: { scope: 'localhost', listen: 'ws://127.0.0.1:7600' },
+                    mesh: { scope: 'localhost', transports: { ws: { listen: 'ws://127.0.0.1:7600' } } },
                     allow: ['user.identities.keyId'],
                 }) + '\n');
 
@@ -183,7 +183,7 @@ export const stageTests = [
                 const nextConfig = JSON.parse(await fs.readFile(join(nextApp, 'app.json'), 'utf8')) as Record<string, unknown>;
                 assertEquals(JSON.stringify(nextConfig['allow']), '["user.identities.keyId"]', "staging.json's allow goes to app.json");
                 const nextRecord = JSON.parse(await fs.readFile(join(nextApp, 'hosts', 'default', 'host.json'), 'utf8')) as Record<string, unknown>;
-                assertEquals(JSON.stringify(nextRecord['sync']), '{"scope":"localhost","listen":"ws://127.0.0.1:7600"}', 'and its sync to host.json');
+                assertEquals(JSON.stringify(nextRecord['mesh']), '{"scope":"localhost","transports":{"ws":{"listen":"ws://127.0.0.1:7600"}}}', 'and its mesh to host.json');
                 const nextData = join(nextApp, 'hosts', 'default', 'db', 'data.sqlite');
                 assertEquals(hasTable(nextData, 'doc_blocks'), false, 'blocks is dropped');
                 assertEquals(titles(nextData).join(','), 'Notes,Patch,Welcome', 'the merge kept every line\'s rows');

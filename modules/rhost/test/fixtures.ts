@@ -115,7 +115,7 @@ export function appConfig(overrides: Partial<AppConfig> = {}): AppConfig {
 
 // What create and join get: the platform's key 'me', and a localhost mesh.
 export function hostSetup(overrides: Partial<HostSetup> = {}): HostSetup {
-    return { key: 'me', passphrase: 'prompt', sync: { scope: 'localhost' }, ...overrides };
+    return { key: 'me', passphrase: 'prompt', mesh: { scope: 'localhost' }, ...overrides };
 }
 
 // --- A shared in-memory mesh, so hosts in one process find each other ---
@@ -185,19 +185,19 @@ export class SharedMesh {
     private readonly registry = new PeerRegistry();
     private counter = 0;
 
-    readonly factory: SyncMeshFactory = async (req) => {
+    readonly factory: SyncMeshFactory = async (_config, runtime) => {
         this.counter += 1;
-        const addr = `mem://rhost-${req.identity.keyId.slice(0, 12)}-${this.counter}`;
-        const discovery = registryDiscovery(this.registry, req.identity.keyId);
+        const addr = `mem://rhost-${runtime.identity.keyId.slice(0, 12)}-${this.counter}`;
+        const discovery = registryDiscovery(this.registry, runtime.identity.keyId);
         const mesh = new Mesh({
             transports: [new NonClosingProvider(this.provider)],
             discovery,
             authenticator: createAuthenticator({
-                localKey: req.identity,
+                localKey: runtime.identity,
                 signingName: SIGNING_ED25519,
                 kemPrefs: [KEM_X25519_HKDF],
             }),
-            localKeyId: req.identity.keyId,
+            localKeyId: runtime.identity.keyId,
             listenAddresses: [addr],
         });
         return { mesh, discovery, listenAddresses: [addr], discoveryNotes: ['mem-shared'], closeables: [] };
