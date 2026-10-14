@@ -46,7 +46,7 @@ await app.remove('gaming');                           // this device's copy only
 await app.close();
 ```
 
-If in a browser environment, 
+In a browser, [rhost_browser](../rhost_browser) is the platform: pass `app.json` as an object and the release files' bytes, and `serve(app, host)` runs the host in that tab. Other tabs use [rhost_client_browser](../rhost_client_browser).
 
 `rhost` plays no part in distributing the application itself: its scope is just the data replicated through `rdb`. 
 
@@ -55,8 +55,9 @@ Hosts one app on one device. The app developer ships database release files (cat
 rhost is browser-safe: everything specific to the device comes from a `HostPlatform`.
 
 - The Node platform, with `openApp(dir)`, is [rhost_node](../rhost_node), and the `rhost` bin is in [rdb_tools](../rdb_tools).
+- The browser platform is [rhost_browser](../rhost_browser).
 - The client interface an app programs against is [rhost_client](../rhost_client); rhost implements it in process.
-- [rhost_client_node](../rhost_client_node) reaches a host that runs in another process.
+- [rhost_client_node](../rhost_client_node) reaches a host that runs in another process. [rhost_client_browser](../rhost_client_browser) reaches one from another tab.
 
 ## Apps and hosts
 

@@ -26,7 +26,7 @@ import { Mesh } from '../src/mesh.js';
 import { createAuthenticator } from '../src/kem_authenticator.js';
 import { StaticDiscovery } from '../src/static_discovery.js';
 import { DiscoveryStack } from '../src/discovery_stack.js';
-import { PoolReuseDiscovery } from '../src/pool_reuse_discovery.js';
+import { PoolReuseDiscovery, attachPoolReuse } from '../src/pool_reuse_discovery.js';
 import {
     encodeTopicMessage, encodeControlMessage, decodeMessage,
     MSG_TYPE_TOPIC, MSG_TYPE_CONTROL,
@@ -35,6 +35,7 @@ import {
     decodeControlPayload,
 } from '../src/mux.js';
 import { meshConfigTests } from './mesh_config_tests.js';
+import { trackerProbeTests } from './tracker_probe_tests.js';
 
 // --- helpers ---
 
@@ -842,6 +843,11 @@ async function testMeshSwarmsTracking() {
     const swarmB = mesh.createSwarm(topicB);
     testing.assertEquals(mesh.swarms().length, 2, 'two swarms after second create');
 
+    swarmA.destroy();
+    testing.assertTrue(swarmA.destroyed, 'destroyed swarm reports destroyed');
+    testing.assertEquals(mesh.swarms().length, 1, 'destroy removes swarm from mesh');
+    testing.assertEquals(mesh.swarms()[0], swarmB, 'remaining swarm is the live one');
+
     mesh.close();
 }
 
@@ -908,6 +914,38 @@ async function testAuthEncryptedRoundTrip() {
 
     testing.assertEquals(received.length, 1, 'bob should receive one message');
     testing.assertTrue(bytesEqual(received[0], payload), 'decrypted payload should match');
+}
+
+async function testAuthEarlyFrameBeforeSubscribe() {
+    const alice = await makeNoiseKeyPair();
+    const bob = await makeNoiseKeyPair();
+
+    const aliceAuth = createAuthenticator({
+        localKey: alice,
+        signingName: SIGNING_ED25519,
+        kemPrefs: [KEM_X25519_HKDF],
+    });
+    const bobAuth = createAuthenticator({
+        localKey: bob,
+        signingName: SIGNING_ED25519,
+        kemPrefs: [KEM_X25519_HKDF],
+    });
+
+    const [tA, tB] = createMemTransportPair();
+    const payload = new TextEncoder().encode('early frame');
+
+    const bobPromise = bobAuth.authenticate(tB, 'responder');
+    const alicePromise = aliceAuth.authenticate(tA, 'initiator', bob.keyId).then((chanA) => {
+        chanA.send(payload);
+        return chanA;
+    });
+
+    const [, chanB] = await Promise.all([alicePromise, bobPromise]);
+    const received: Uint8Array[] = [];
+    chanB.onMessage((msg) => received.push(msg));
+
+    testing.assertEquals(received.length, 1, 'responder receives the frame sent before subscribe');
+    testing.assertTrue(bytesEqual(received[0]!, payload), 'early plaintext matches');
 }
 
 async function testAuthBidirectionalEncryption() {
@@ -1769,6 +1807,70 @@ async function testAnnounceOnActivate() {
     swarm.destroy();
 }
 
+async function testAnnounceWaitsForListen() {
+    const pool = new ConnectionPool();
+    const topic = sha256.hashToB64(stringToUint8Array('announce-after-listen'));
+    const localPeer: PeerInfo = { keyId: 'local-key' as KeyId, addresses: ['mem://local'] };
+
+    let resolveListen: () => void = () => {};
+    const whenListening = new Promise<void>((resolve) => { resolveListen = resolve; });
+    let announced = 0;
+    let discovered = 0;
+    const discovery: PeerDiscovery = {
+        async *discover() { discovered++; },
+        async announce() { announced++; },
+        async leave() {},
+    };
+
+    const swarm = createSwarm({ topic }, {
+        pool, discovery,
+        authenticator: makeStubAuthenticator(new Map()),
+        transports: [],
+        localPeer,
+        whenListening,
+    });
+
+    swarm.activate();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    testing.assertEquals(announced, 0, 'announce waits until listen resolves');
+    testing.assertTrue(discovered >= 1, 'discovery runs without waiting for listen');
+
+    resolveListen();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    testing.assertEquals(announced, 1, 'announce runs after listen resolves');
+
+    swarm.destroy();
+}
+
+async function testAnnounceSkippedWhenDestroyedDuringListen() {
+    const pool = new ConnectionPool();
+    const topic = sha256.hashToB64(stringToUint8Array('announce-skip-destroyed'));
+    const localPeer: PeerInfo = { keyId: 'local-key' as KeyId, addresses: ['mem://local'] };
+
+    let resolveListen: () => void = () => {};
+    const whenListening = new Promise<void>((resolve) => { resolveListen = resolve; });
+    let announced = 0;
+    const discovery: PeerDiscovery = {
+        async *discover() {},
+        async announce() { announced++; },
+        async leave() {},
+    };
+
+    const swarm = createSwarm({ topic }, {
+        pool, discovery,
+        authenticator: makeStubAuthenticator(new Map()),
+        transports: [],
+        localPeer,
+        whenListening,
+    });
+
+    swarm.activate();
+    swarm.destroy();
+    resolveListen();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    testing.assertEquals(announced, 0, 'a swarm destroyed while listening does not announce');
+}
+
 async function testLeaveOnSleep() {
     const pool = new ConnectionPool();
     const topic = sha256.hashToB64(stringToUint8Array('leave-sleep-topic'));
@@ -1977,6 +2079,60 @@ async function testMeshListenTopicData() {
     bobMesh.close();
 }
 
+async function testMeshListenAfterDestroyedSwarm() {
+    const alice = await makeNoiseKeyPair();
+    const bob = await makeNoiseKeyPair();
+    const topic = sha256.hashToB64(stringToUint8Array('listen-after-destroy-topic'));
+
+    const provider = new MemTransportProvider();
+
+    const aliceAuth = createAuthenticator({
+        localKey: alice,
+        signingName: SIGNING_ED25519,
+        kemPrefs: [KEM_X25519_HKDF],
+    });
+    const bobAuth = createAuthenticator({
+        localKey: bob,
+        signingName: SIGNING_ED25519,
+        kemPrefs: [KEM_X25519_HKDF],
+    });
+
+    const bobMesh = new Mesh({
+        transports: [provider],
+        discovery: makeStubDiscovery([]),
+        authenticator: bobAuth,
+        localKeyId: bob.keyId,
+        listenAddresses: ['mem://bob-after-destroy'],
+    });
+    // Mimic fetchCreatePayload: temporary swarm destroyed before the durable one.
+    const stale = bobMesh.createSwarm(topic, { mode: 'passive' });
+    stale.destroy();
+    testing.assertTrue(stale.destroyed, 'stale swarm is destroyed');
+    testing.assertEquals(bobMesh.swarms().length, 0, 'destroyed swarm leaves mesh.swarms()');
+
+    const bobSwarm = bobMesh.createSwarm(topic, { mode: 'passive' });
+    testing.assertEquals(bobMesh.swarms().length, 1, 'live swarm is tracked');
+    testing.assertFalse(bobMesh.swarms().includes(stale), 'stale swarm is not listed');
+
+    const aliceMesh = new Mesh({
+        transports: [provider],
+        discovery: makeStubDiscovery([{ keyId: bob.keyId, addresses: ['mem://bob-after-destroy'] }]),
+        authenticator: aliceAuth,
+        localKeyId: alice.keyId,
+    });
+    const aliceSwarm = aliceMesh.createSwarm(topic);
+    aliceSwarm.activate();
+
+    await new Promise(resolve => setTimeout(resolve, 200));
+
+    testing.assertEquals(aliceSwarm.peers().length, 1, 'alice should have bob after stale destroy');
+    testing.assertEquals(bobSwarm.peers().length, 1, 'bob live swarm should accept alice');
+    testing.assertEquals(bobSwarm.peers()[0].keyId, alice.keyId, 'bob peer should be alice');
+
+    aliceMesh.close();
+    bobMesh.close();
+}
+
 // --- pool control dispatch test ---
 
 async function testPoolControlMessageDispatch() {
@@ -2079,6 +2235,61 @@ async function testPoolReuseDiscovery() {
     bobMesh.close();
 }
 
+async function testAttachPoolReuse() {
+    const topic = sha256.hashToB64(stringToUint8Array('attach-reuse-topic'));
+    const peer = makeFakePeer('mem://pooled');
+    const pool = new ConnectionPool();
+    const { channel, remote } = makeFakeChannel(peer);
+    // Reply on a later turn. A synchronous accept arrives before the probe
+    // has registered its waiter.
+    remote.onMessage((data) => {
+        const msg = decodeMessage(data);
+        if (msg.type !== MSG_TYPE_CONTROL) return;
+        const ctrl = decodeControlPayload(msg.payload);
+        if (ctrl.ctrl !== CTRL_TOPIC_INTEREST) return;
+        queueMicrotask(() => remote.send(encodeControlTopicAccept(ctrl.topic)));
+    });
+    pool.add(channel, peer.endpoint);
+
+    let fallbackDiscovers = 0;
+    let fallbackAnnounces = 0;
+    const fallback: PeerDiscovery = {
+        async *discover() { fallbackDiscovers++; },
+        async announce() { fallbackAnnounces++; },
+        async leave() {},
+    };
+
+    const slot = attachPoolReuse(fallback);
+    slot.attach(pool);
+
+    const found: PeerInfo[] = [];
+    for await (const foundPeer of slot.discovery.discover(topic, undefined, 1)) found.push(foundPeer);
+    testing.assertEquals(found.length, 1, 'pooled peer is yielded');
+    testing.assertEquals(found[0].keyId, peer.keyId, 'yielded peer is the pooled one');
+    testing.assertEquals(found[0].addresses[0], peer.endpoint, 'yielded address is the pooled endpoint');
+    testing.assertEquals(fallbackDiscovers, 0, 'fallback is not asked when the pool satisfies the target');
+
+    await slot.discovery.announce(topic, { keyId: peer.keyId, addresses: [peer.endpoint] });
+    testing.assertEquals(fallbackAnnounces, 1, 'announce reaches the fallback');
+
+    const empty = new ConnectionPool();
+    let emptyFallbackDiscovers = 0;
+    const emptyFallback: PeerDiscovery = {
+        async *discover() { emptyFallbackDiscovers++; },
+        async announce() {},
+        async leave() {},
+    };
+    const emptySlot = attachPoolReuse(emptyFallback);
+    emptySlot.attach(empty);
+    const none: PeerInfo[] = [];
+    for await (const foundPeer of emptySlot.discovery.discover(topic)) none.push(foundPeer);
+    testing.assertEquals(none.length, 0, 'empty pool yields no peer');
+    testing.assertEquals(emptyFallbackDiscovers, 1, 'fallback runs when the pool is empty');
+
+    pool.close();
+    empty.close();
+}
+
 // --- main ---
 
 const transportTests = {
@@ -2150,6 +2361,7 @@ const authTests = {
     tests: [
         { name: '[AUTH_00] Successful handshake produces authenticated channel', invoke: testAuthHandshakeSuccess },
         { name: '[AUTH_01] Encrypted messages round-trip after handshake', invoke: testAuthEncryptedRoundTrip },
+        { name: '[AUTH_01b] Frame sent as the initiator handshake resolves is delivered on subscribe', invoke: testAuthEarlyFrameBeforeSubscribe },
         { name: '[AUTH_02] Bidirectional encrypted communication', invoke: testAuthBidirectionalEncryption },
         { name: '[AUTH_03] KEM negotiation picks best common suite', invoke: testAuthKemNegotiation },
         { name: '[AUTH_04] KEM negotiation fails when no common suite', invoke: testAuthKemNegotiationNoCommon },
@@ -2216,6 +2428,8 @@ const announceTests = {
         { name: '[ANNOUNCE_00] activate calls announce', invoke: testAnnounceOnActivate },
         { name: '[ANNOUNCE_01] sleep calls leave', invoke: testLeaveOnSleep },
         { name: '[ANNOUNCE_02] destroy calls leave', invoke: testLeaveOnDestroy },
+        { name: '[ANNOUNCE_03] announce waits until listen resolves', invoke: testAnnounceWaitsForListen },
+        { name: '[ANNOUNCE_04] destroy during listen skips announce', invoke: testAnnounceSkippedWhenDestroyedDuringListen },
     ],
 };
 
@@ -2225,6 +2439,7 @@ const listenTests = {
         { name: '[LISTEN_00] End-to-end: two meshes, topic negotiation, both sides see peer', invoke: testMeshListenEndToEnd },
         { name: '[LISTEN_01] Rejection: authorizer refuses, no peers on either side', invoke: testMeshListenRejection },
         { name: '[LISTEN_02] Topic data flows after negotiation', invoke: testMeshListenTopicData },
+        { name: '[LISTEN_03] Live swarm accepts after a destroyed same-topic swarm', invoke: testMeshListenAfterDestroyedSwarm },
     ],
 };
 
@@ -2239,11 +2454,13 @@ const reuseTests = {
     title: '[REUSE] Pool-reuse discovery',
     tests: [
         { name: '[REUSE_00] Existing connection, new topic via control channel', invoke: testPoolReuseDiscovery },
+        { name: '[REUSE_01] attachPoolReuse prefers a pooled peer and falls back when the pool is empty', invoke: testAttachPoolReuse },
     ],
 };
 
 const allSuites = [
     meshConfigTests,
+    trackerProbeTests,
     transportTests, muxTests, poolTests, swarmTests, meshTests, authTests, staticTests, stackTests,
     ctrlTests, authZTests, announceTests, listenTests, poolCtrlTests, reuseTests,
 ];

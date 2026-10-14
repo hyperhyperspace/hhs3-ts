@@ -9,6 +9,8 @@ import type { InitRequest, SyncMsg } from './protocol.js';
 import { TRACE_SYNC, trace } from './trace.js';
 
 const DEFAULT_TIMEOUT_MS = 10_000;
+// Discovery plus one RTC connect. The connect budget alone is 20s.
+const DEFAULT_PEER_TIMEOUT_MS = 25_000;
 const RETRY_INTERVAL_MS = 200;
 
 export function fetchInit(
@@ -16,25 +18,40 @@ export function fetchInit(
     swarms: Swarm[],
     hashSuite: HashSuite,
     timeoutMs: number = DEFAULT_TIMEOUT_MS,
+    peerTimeoutMs: number = DEFAULT_PEER_TIMEOUT_MS,
 ): Promise<Payload> {
 
     return new Promise<Payload>((resolve, reject) => {
         let settled = false;
+        let initStarted = false;
         const retryTimers: ReturnType<typeof setInterval>[] = [];
         const started = Date.now();
+        let initTimer: ReturnType<typeof setTimeout> | undefined;
+        let peerTimer: ReturnType<typeof setTimeout> | undefined;
 
-        const timer = setTimeout(() => {
-            if (settled) return;
-            settled = true;
-            cleanup();
-            if (TRACE_SYNC) {
-                trace('sync.init timeout', { objectId, ms: Date.now() - started });
+        // The init clock starts when the first peer is handled. Until then only
+        // the peer budget is running, so a slow handshake is not a missed init.
+        function startInitBudget() {
+            if (initStarted || settled) return;
+            initStarted = true;
+            if (peerTimer !== undefined) {
+                clearTimeout(peerTimer);
+                peerTimer = undefined;
             }
-            reject(new Error(`fetchInit timed out after ${timeoutMs}ms for object ${objectId}`));
-        }, timeoutMs);
+            initTimer = setTimeout(() => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                if (TRACE_SYNC) {
+                    trace('sync.init timeout', { objectId, ms: Date.now() - started });
+                }
+                reject(new Error(`fetchInit timed out after ${timeoutMs}ms for object ${objectId}`));
+            }, timeoutMs);
+        }
 
         function cleanup() {
-            clearTimeout(timer);
+            if (initTimer !== undefined) clearTimeout(initTimer);
+            if (peerTimer !== undefined) clearTimeout(peerTimer);
             for (const t of retryTimers) clearInterval(t);
         }
 
@@ -55,11 +72,16 @@ export function fetchInit(
             reject(new Error(reason));
         }
 
+        const seen = new Set<string>();
+
         function handlePeer(sp: SwarmPeer) {
             if (settled) return;
+            const peer = `${sp.keyId}@${sp.endpoint}`;
+            if (seen.has(peer)) return;
+            seen.add(peer);
+            startInitBudget();
 
             const request: InitRequest = { type: 'init-request', objectId };
-            const peer = `${sp.keyId}@${sp.endpoint}`;
             let attempt = 0;
 
             function sendRequest() {
@@ -107,11 +129,22 @@ export function fetchInit(
             });
         }
 
+        const initial: SwarmPeer[] = [];
         for (const swarm of swarms) {
-            for (const existing of swarm.peers()) {
-                handlePeer(existing);
-            }
             swarm.onPeerJoin(handlePeer);
+            for (const existing of swarm.peers()) initial.push(existing);
         }
+        if (initial.length === 0 && !initStarted) {
+            peerTimer = setTimeout(() => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                if (TRACE_SYNC) {
+                    trace('sync.init no-peer', { objectId, ms: Date.now() - started });
+                }
+                reject(new Error(`no peer for ${objectId}`));
+            }, peerTimeoutMs);
+        }
+        for (const existing of initial) handlePeer(existing);
     });
 }

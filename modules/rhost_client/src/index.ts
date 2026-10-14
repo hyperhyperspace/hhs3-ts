@@ -29,3 +29,16 @@ export {
     type ServerMessage,
 } from "./protocol.js";
 export { SOCKET_FILE, socketPathFor } from "./socket_path.js";
+export {
+    BROWSER_HOSTS_STORE,
+    BROWSER_HOSTS_VERSION,
+    browserClientChannel,
+    browserFilePath,
+    browserHostsDatabase,
+    browserKeysDatabase,
+    browserLockName,
+    browserProjectionDatabase,
+    browserReplicaDatabase,
+    isBrowserChannelMessage,
+    type BrowserChannelMessage,
+} from "./browser_names.js";

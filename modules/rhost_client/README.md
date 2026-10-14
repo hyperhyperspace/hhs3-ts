@@ -29,7 +29,7 @@ There are three implementations:
 
 - in process, `host.client` in rhost;
 - over `run/rhost.sock`, [rhost_client_node](../rhost_client_node);
-- a browser transport, in step 7.
+- over a BroadcastChannel, [rhost_client_browser](../rhost_client_browser).
 
 ## Protocol
 
@@ -45,6 +45,7 @@ host -> client   { id, result }   { id, error }   { id, event }   (a push on a w
 - `encodeMessage`, `decodeRequest` and `decodeServerMessage` encode and parse messages.
 - `LineDecoder` splits a stream of text chunks into lines.
 - `socketPathFor(hostDir, platform)` is where a running host listens: `run/rhost.sock` under its folder (`SOCKET_FILE`), or a named pipe on Windows.
+- `browserLockName(app, host)` is the Web Lock and the client BroadcastChannel (`rhost-<app>-<host>`). `browserKeysDatabase`, `browserHostsDatabase`, `browserReplicaDatabase`, `browserProjectionDatabase` and `browserFilePath` are the IndexedDB databases and the origin-private file path for that app and host.
 
 ## Test
 

@@ -1,5 +1,8 @@
 import { testing } from '@hyper-hyper-space/hhs3_util';
-import { WsTransportProvider, type WsClientCtor } from '../src/ws_transport_provider.js';
+import {
+    WsTransportProvider,
+    type WsClientCtor,
+} from '../src/ws_transport_provider.js';
 import type { Transport } from '@hyper-hyper-space/hhs3_mesh';
 
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
@@ -234,6 +237,7 @@ async function testConnectTimeout() {
 
     class HungSocket {
         binaryType = 'nodebuffer';
+        readyState = 0; // CONNECTING
         closed = false;
         constructor(_url: string) {
             hung.push(this);
@@ -241,6 +245,7 @@ async function testConnectTimeout() {
         on(_event: string, _cb: (...args: unknown[]) => void): void {}
         close(): void {
             this.closed = true;
+            this.readyState = 2;
         }
     }
 
@@ -265,6 +270,22 @@ async function testConnectTimeout() {
     provider.close();
 }
 
+async function testConnectAfterProviderClose() {
+    const provider = new WsTransportProvider();
+    provider.close();
+    let threw = false;
+    try {
+        await provider.connect('ws://127.0.0.1:9');
+    } catch (e) {
+        threw = true;
+        testing.assertTrue(
+            (e as Error).message.includes('closed'),
+            `connect after close should mention closed (got: ${(e as Error).message})`,
+        );
+    }
+    testing.assertTrue(threw, 'connect after provider.close() should reject');
+}
+
 // --- main ---
 
 const allSuites = [
@@ -279,6 +300,7 @@ const allSuites = [
             { name: '[WS_05] Binary integrity', invoke: testBinaryIntegrity },
             { name: '[WS_06] Scheme default and wss listen guard', invoke: testSchemeDefaultAndWss },
             { name: '[WS_07] Connect timeout closes hung socket', invoke: testConnectTimeout },
+            { name: '[WS_08] Connect after provider.close rejects', invoke: testConnectAfterProviderClose },
         ],
     },
 ];

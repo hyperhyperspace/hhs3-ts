@@ -15,6 +15,8 @@ export interface AnnounceRequest {
     type: 'announce';
     entries: AnnounceEntry[];
     peer: PeerInfo;
+    // Distinguishes processes that share one identity. Omitted by older clients.
+    instance?: string;
 }
 
 export interface QueryRequest {
@@ -26,6 +28,8 @@ export interface QueryRequest {
 export interface LeaveRequest {
     type: 'leave';
     topics: TopicId[];
+    // Same process id as announce. Omitted by older clients.
+    instance?: string;
 }
 
 export type TrackerRequest = AnnounceRequest | QueryRequest | LeaveRequest;

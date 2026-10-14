@@ -10,6 +10,7 @@ import type { KeyId } from '@hyper-hyper-space/hhs3_crypto';
 import type { PeerInfo, PeerDiscovery, TopicId } from './discovery.js';
 import type { NetworkAddress } from './transport.js';
 import { ConnectionPool, connectionKey } from './connection_pool.js';
+import { DiscoveryStack } from './discovery_stack.js';
 import {
     encodeControlTopicInterest, decodeControlPayload,
     CTRL_TOPIC_ACCEPT, CTRL_TOPIC_REJECT,
@@ -112,4 +113,36 @@ export class PoolReuseDiscovery implements PeerDiscovery {
 
     async announce(_topic: TopicId, _self: PeerInfo): Promise<void> {}
     async leave(_topic: TopicId, _self: KeyId): Promise<void> {}
+}
+
+// Pool reuse has to sit ahead of the other sources, but it needs the mesh
+// pool, which does not exist until Mesh is constructed. The returned
+// discovery forwards to `fallback` until `attach`, then probes that pool
+// before the fallback. Its identity stays stable so Mesh can hold it.
+const POOL_REUSE_PRIORITY = -1;
+const FALLBACK_PRIORITY = 0;
+
+export interface PoolReuseBinding {
+    readonly discovery: PeerDiscovery;
+    attach(pool: ConnectionPool): void;
+}
+
+export function attachPoolReuse(fallback: PeerDiscovery): PoolReuseBinding {
+    let current: PeerDiscovery = fallback;
+    let attached = false;
+    return {
+        discovery: {
+            discover: (topic, schemes, targetPeers) => current.discover(topic, schemes, targetPeers),
+            announce: (topic, self) => current.announce(topic, self),
+            leave: (topic, self) => current.leave(topic, self),
+        },
+        attach(pool: ConnectionPool): void {
+            if (attached) return;
+            attached = true;
+            current = new DiscoveryStack([
+                { source: new PoolReuseDiscovery(pool), priority: POOL_REUSE_PRIORITY },
+                { source: fallback, priority: FALLBACK_PRIORITY },
+            ]);
+        },
+    };
 }

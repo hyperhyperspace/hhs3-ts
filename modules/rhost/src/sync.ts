@@ -9,8 +9,6 @@ import { RDB_TYPE_ID, type RDb } from "@hyper-hyper-space/hhs3_rdb";
 import { executeText, type RdbSession } from "@hyper-hyper-space/hhs3_rdb_runtime";
 import type { Replica } from "@hyper-hyper-space/hhs3_replica";
 
-const MESH_CLOSEABLE_WAIT_MS = 1_000;
-
 export type { ScopedMeshConfig };
 export type SyncScope = ScopedMeshConfig['scope'];
 
@@ -131,17 +129,16 @@ export async function closeBuiltMesh(
     mesh: { close(): void },
     closeables: SyncCloseable[],
 ): Promise<void> {
-    const closing = Promise.all(closeables.map(async (closeable) => {
+    // Await discovery close (tracker chain drain / leave) before mesh.close()
+    // tears down transports. A short race here used to kill in-flight tracker
+    // exchanges and crash the process with an unhandled rejection.
+    await Promise.all(closeables.map(async (closeable) => {
         try {
             await closeable.close();
         } catch {
             // best-effort
         }
     }));
-    await Promise.race([
-        closing,
-        new Promise<void>((resolve) => setTimeout(resolve, MESH_CLOSEABLE_WAIT_MS)),
-    ]);
     try {
         mesh.close();
     } catch {

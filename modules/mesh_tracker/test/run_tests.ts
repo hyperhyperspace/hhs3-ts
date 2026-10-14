@@ -12,7 +12,11 @@ import type {
     PeerAuthenticator, AuthenticatedChannel, PeerInfo, TopicId,
 } from '@hyper-hyper-space/hhs3_mesh';
 import { createAuthenticator } from '@hyper-hyper-space/hhs3_mesh';
-import { TrackerClient } from '@hyper-hyper-space/hhs3_mesh_tracker_client';
+import {
+    TrackerClient,
+    encodeMessage, decodeResponse,
+    type AnnounceRequest, type LeaveRequest, type TrackerResponse,
+} from '@hyper-hyper-space/hhs3_mesh_tracker_client';
 import { TrackerServer } from '../src/tracker_server.js';
 import {
     generateIdentity, saveIdentity, loadIdentity, loadOrCreateIdentity, identityKeyId,
@@ -405,6 +409,133 @@ async function testMultipleClientsSeeEachOther() {
     server.stop();
 }
 
+async function testTwoInstancesOfOneKey() {
+    const serverKp = await makeKeyPair();
+    const clientKp = await makeKeyPair();
+    const provider = new MemTransportProvider();
+    const server = new TrackerServer({
+        transportProvider: provider,
+        authenticator: makeAuth(serverKp),
+        listenAddress: 'mem://tracker',
+        sweepInterval: 999_999,
+    });
+    await server.start();
+
+    const topic = 'test-topic-instance' as TopicId;
+    const shared = makeAuth(clientKp);
+    const peerA: PeerInfo = { keyId: clientKp.keyId, addresses: ['ws://a:1'] };
+    const peerB: PeerInfo = { keyId: clientKp.keyId, addresses: ['ws://b:2'] };
+    const client = (peer: PeerInfo, instanceId: string) => new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        trackerKeyId: serverKp.keyId,
+        transportProvider: provider,
+        authenticator: shared,
+        localPeer: peer,
+        instanceId,
+        heartbeatInterval: 999_999,
+    });
+    const a = client(peerA, 'proc-a');
+    const b = client(peerB, 'proc-b');
+    await a.announce(topic, peerA);
+    await b.announce(topic, peerB);
+
+    const querier = await makeQuerier(provider, serverKp);
+    const both = await collectAll(querier.discover(topic));
+    const addresses = both.flatMap((peer) => peer.addresses).sort();
+    testing.assertEquals(both.length, 2, 'both processes of one key are listed');
+    testing.assertEquals(addresses[0], 'ws://a:1', 'first process address');
+    testing.assertEquals(addresses[1], 'ws://b:2', 'second process address');
+
+    await a.leave(topic, clientKp.keyId);
+    const left = await collectAll(querier.discover(topic));
+    testing.assertEquals(left.length, 1, 'leave removes only that process');
+    testing.assertEquals(left[0].addresses[0], 'ws://b:2', 'the other process stays');
+
+    await a.close();
+    await b.close();
+    await querier.close();
+    server.stop();
+}
+
+async function exchangeRaw(
+    provider: TransportProvider,
+    clientAuth: ReturnType<typeof makeAuth>,
+    serverKeyId: KeyId,
+    req: AnnounceRequest | LeaveRequest,
+): Promise<TrackerResponse> {
+    const raw = await provider.connect('mem://tracker');
+    const channel = await clientAuth.authenticate(raw, 'initiator', serverKeyId);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    let settled = false;
+    const response = new Promise<TrackerResponse>((resolve, reject) => {
+        channel.onMessage((data) => {
+            if (settled) return;
+            settled = true;
+            try { resolve(decodeResponse(data)); }
+            catch (err) { reject(err); }
+        });
+        channel.onClose(() => {
+            if (settled) return;
+            settled = true;
+            reject(new Error('channel closed before response'));
+        });
+    });
+    channel.send(encodeMessage(req));
+    try {
+        return await response;
+    } finally {
+        settled = true;
+        channel.close();
+    }
+}
+
+async function testLegacyInstanceSlotAndRejection() {
+    const serverKp = await makeKeyPair();
+    const clientKp = await makeKeyPair();
+    const provider = new MemTransportProvider();
+    const server = new TrackerServer({
+        transportProvider: provider,
+        authenticator: makeAuth(serverKp),
+        listenAddress: 'mem://tracker',
+        sweepInterval: 999_999,
+    });
+    await server.start();
+
+    const topic = 'test-topic-legacy' as TopicId;
+    const auth = makeAuth(clientKp);
+    const peer = (address: string): PeerInfo => ({ keyId: clientKp.keyId, addresses: [address] });
+    const announce = (address: string, instance?: string): AnnounceRequest => ({
+        type: 'announce',
+        entries: [{ topic, ttl: 180 }],
+        peer: peer(address),
+        ...(instance !== undefined ? { instance } : {}),
+    });
+
+    await exchangeRaw(provider, auth, serverKp.keyId, announce('ws://old:1'));
+    await exchangeRaw(provider, auth, serverKp.keyId, announce('ws://new:1'));
+    const querier = await makeQuerier(provider, serverKp);
+    const replaced = await collectAll(querier.discover(topic));
+    testing.assertEquals(replaced.length, 1, 'a missing instance is one slot per key');
+    testing.assertEquals(replaced[0].addresses[0], 'ws://new:1', 'the second announce replaces the first');
+
+    const empty = await exchangeRaw(provider, auth, serverKp.keyId, announce('ws://x:1', ''));
+    testing.assertEquals(empty.type, 'error', 'an empty instance is rejected');
+    const long = await exchangeRaw(provider, auth, serverKp.keyId, announce('ws://x:1', 'x'.repeat(65)));
+    testing.assertEquals(long.type, 'error', 'an over-long instance is rejected');
+    const still = await collectAll(querier.discover(topic));
+    testing.assertEquals(still.length, 1, 'a rejected announce does not change the registry');
+    testing.assertEquals(still[0].addresses[0], 'ws://new:1', 'the legacy entry is unchanged');
+
+    const leave: LeaveRequest = { type: 'leave', topics: [topic] };
+    const left = await exchangeRaw(provider, auth, serverKp.keyId, leave);
+    testing.assertEquals(left.type, 'leave_ack', 'a legacy leave is accepted');
+    const gone = await collectAll(querier.discover(topic));
+    testing.assertEquals(gone.length, 0, 'the legacy leave removes that slot');
+
+    await querier.close();
+    server.stop();
+}
+
 async function testIdentityFileRoundTrip() {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'hhs3-tracker-test-'));
     const filePath = path.join(tmpDir, 'identity.json');
@@ -454,6 +585,8 @@ const allSuites = [
             { name: '[TRACKER_SERVER_04] Expired entries are swept', invoke: testExpiredEntriesAreSwept },
             { name: '[TRACKER_SERVER_05] Multiple clients see each other', invoke: testMultipleClientsSeeEachOther },
             { name: '[TRACKER_SERVER_06] Identity file generate/load/loadOrCreate', invoke: testIdentityFileRoundTrip },
+            { name: '[TRACKER_SERVER_07] Two instances of one key stay independent', invoke: testTwoInstancesOfOneKey },
+            { name: '[TRACKER_SERVER_08] Missing instance is one slot; a bad instance is rejected', invoke: testLegacyInstanceSlotAndRejection },
         ],
     },
 ];

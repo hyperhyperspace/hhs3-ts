@@ -37,6 +37,8 @@ This monorepo is organized as a collection of modules. This is of course WIP.
 - [modules/rhost_node](modules/rhost_node) The Node platform for rhost: app and host folders, SQLite stores, the user's keystore, node mesh, `run/rhost.sock`
 - [modules/rhost_client](modules/rhost_client) The client interface of an rhost host and its wire protocol, with no dependencies
 - [modules/rhost_client_node](modules/rhost_client_node) Reaches an rhost host from a Node app, over `run/rhost.sock` and its projected database
+- [modules/rhost_browser](modules/rhost_browser) The browser platform for rhost: IndexedDB stores, the browser mesh, OPFS file mounts, a Web Lock and a BroadcastChannel
+- [modules/rhost_client_browser](modules/rhost_client_browser) Reaches an rhost host from another browser tab
 - [modules/rdb_lang](modules/rdb_lang) C-SQL: SQL-like language to parse, bind, compile, execute, and reverse-render RDb operations
 - [modules/rdb_runtime](modules/rdb_runtime) Browser-safe runtime: workspace, session, and C-SQL execution
 - [modules/rdb_repl](modules/rdb_repl) Portable presentation and command tooling for RDb

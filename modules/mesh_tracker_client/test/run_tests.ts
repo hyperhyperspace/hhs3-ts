@@ -66,6 +66,7 @@ function createMemTransportPair(): [MemTransport, MemTransport] {
 interface MockTrackerOpts {
     ttlMin?: number;
     ttlMax?: number;
+    onRequest?: (req: TrackerRequest) => void;
 }
 
 function createMockTracker(opts: MockTrackerOpts = {}) {
@@ -118,6 +119,7 @@ function createMockTracker(opts: MockTrackerOpts = {}) {
     function attachHandler(serverSide: AuthenticatedChannel): void {
         serverSide.onMessage((data) => {
             const req = decodeRequest(data);
+            opts.onRequest?.(req);
             const res = handleRequest(req);
             serverSide.send(res);
         });
@@ -641,6 +643,268 @@ async function testCloseTimesOutOnHungLeave() {
     testing.assertTrue(Date.now() - started < 1000, 'close should return well under a second when leave hangs');
 }
 
+async function testCloseAfterSuccessDoesNotUnhandledReject() {
+    const tracker = createMockTracker();
+    const clientKeyId = fakeKeyId('client');
+    const clientPk = fakePk('client');
+    const trackerKeyId = fakeKeyId('tracker');
+    const trackerPk = fakePk('tracker');
+    const clientAuth = makePassthroughAuth(clientKeyId, clientPk, trackerKeyId, trackerPk);
+    const serverAuth = makePassthroughAuth(trackerKeyId, trackerPk, clientKeyId, clientPk);
+    const provider = makeMockProvider(tracker, serverAuth);
+
+    const localPeer = fakePeerInfo('client', ['ws://client:1234']);
+    const client = new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        transportProvider: provider,
+        authenticator: clientAuth,
+        localPeer,
+        heartbeatInterval: 999_999,
+    });
+
+    const unhandled: unknown[] = [];
+    const onUnhandled = (err: unknown) => { unhandled.push(err); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+        await client.announce('topic-ok' as TopicId, localPeer);
+        await client.close();
+        // Let any deferred onClose reject surface.
+        await new Promise(resolve => setTimeout(resolve, 20));
+        testing.assertEquals(unhandled.length, 0, 'successful exchange must not reject on channel close');
+    } finally {
+        process.off('unhandledRejection', onUnhandled);
+    }
+}
+
+async function testCloseDrainsInFlightDiscover() {
+    const tracker = createMockTracker();
+    const clientKeyId = fakeKeyId('client');
+    const clientPk = fakePk('client');
+    const trackerKeyId = fakeKeyId('tracker');
+    const trackerPk = fakePk('tracker');
+    const clientAuth = makePassthroughAuth(clientKeyId, clientPk, trackerKeyId, trackerPk);
+    const serverAuth = makePassthroughAuth(trackerKeyId, trackerPk, clientKeyId, clientPk);
+
+    let releaseReply: (() => void) | undefined;
+    const gate = new Promise<void>(resolve => { releaseReply = resolve; });
+    const provider: TransportProvider = {
+        scheme: 'mem',
+        async listen() {},
+        async connect(_remote: NetworkAddress): Promise<Transport> {
+            const [client, server] = createMemTransportPair();
+            const serverCh = await serverAuth.authenticate(server, 'responder');
+            serverCh.onMessage(async (data) => {
+                await gate;
+                const req = decodeRequest(data);
+                if (req.type === 'announce') {
+                    serverCh.send(encodeMessage({ type: 'announce_ack', ttls: [180] }));
+                    return;
+                }
+                if (req.type === 'query') {
+                    serverCh.send(encodeMessage({
+                        type: 'query_response',
+                        results: { [req.topics[0]!]: [] },
+                    }));
+                    return;
+                }
+                if (req.type === 'leave') {
+                    serverCh.send(encodeMessage({ type: 'leave_ack' }));
+                }
+            });
+            return client;
+        },
+        close() {},
+    };
+
+    const localPeer = fakePeerInfo('client', ['ws://client:1234']);
+    const client = new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        transportProvider: provider,
+        authenticator: clientAuth,
+        localPeer,
+        heartbeatInterval: 999_999,
+        timeoutMs: 500,
+    });
+
+    const unhandled: unknown[] = [];
+    const onUnhandled = (err: unknown) => { unhandled.push(err); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+        const discoverDone = collectAll(client.discover('topic-slow' as TopicId));
+        // Abandon the consumer while the exchange is gated (swarm destroy pattern).
+        void discoverDone.catch(() => {});
+        await new Promise(resolve => setTimeout(resolve, 10));
+
+        const closeStarted = Date.now();
+        const closing = client.close();
+        releaseReply!();
+        await closing;
+        testing.assertTrue(Date.now() - closeStarted < 1000, 'close should finish after draining the query');
+        await new Promise(resolve => setTimeout(resolve, 20));
+        testing.assertEquals(unhandled.length, 0, 'drained discover must not unhandled-reject');
+    } finally {
+        process.off('unhandledRejection', onUnhandled);
+        releaseReply?.();
+    }
+}
+
+async function testLeaveAfterCloseDoesNotConnect() {
+    const tracker = createMockTracker();
+    const clientKeyId = fakeKeyId('client');
+    const clientPk = fakePk('client');
+    const trackerKeyId = fakeKeyId('tracker');
+    const trackerPk = fakePk('tracker');
+    const clientAuth = makePassthroughAuth(clientKeyId, clientPk, trackerKeyId, trackerPk);
+    const serverAuth = makePassthroughAuth(trackerKeyId, trackerPk, clientKeyId, clientPk);
+    const inner = makeMockProvider(tracker, serverAuth);
+
+    let connects = 0;
+    const provider: TransportProvider = {
+        scheme: inner.scheme,
+        async listen(addr, onConn) { return inner.listen(addr, onConn); },
+        async connect(remote) {
+            connects += 1;
+            return inner.connect(remote);
+        },
+        close() { inner.close(); },
+    };
+
+    const localPeer = fakePeerInfo('client', ['ws://client:1234']);
+    const client = new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        transportProvider: provider,
+        authenticator: clientAuth,
+        localPeer,
+        heartbeatInterval: 999_999,
+    });
+
+    const topic = 'topic-post-close' as TopicId;
+    await client.announce(topic, localPeer);
+    const beforeClose = connects;
+    await client.close();
+    const afterClose = connects;
+    await client.leave(topic, localPeer.keyId);
+    testing.assertEquals(connects, afterClose, 'leave after close must not open another socket');
+    testing.assertTrue(afterClose >= beforeClose, 'close may open one leave exchange');
+}
+
+async function testInstanceCarriedOnAnnounceAndLeave() {
+    const seen: TrackerRequest[] = [];
+    const tracker = createMockTracker({ onRequest: (req) => seen.push(req) });
+    const clientKeyId = fakeKeyId('client');
+    const clientPk = fakePk('client');
+    const trackerKeyId = fakeKeyId('tracker');
+    const trackerPk = fakePk('tracker');
+    const clientAuth = makePassthroughAuth(clientKeyId, clientPk, trackerKeyId, trackerPk);
+    const serverAuth = makePassthroughAuth(trackerKeyId, trackerPk, clientKeyId, clientPk);
+    const provider = makeMockProvider(tracker, serverAuth);
+    const localPeer = fakePeerInfo('client', ['ws://client:1234']);
+    const client = new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        transportProvider: provider,
+        authenticator: clientAuth,
+        localPeer,
+        heartbeatInterval: 999_999,
+        instanceId: 'proc-a',
+    });
+
+    const topic = 'topic-instance' as TopicId;
+    await client.announce(topic, localPeer);
+    await client.leave(topic, localPeer.keyId);
+
+    const announced = seen.find((req) => req.type === 'announce');
+    const left = seen.find((req) => req.type === 'leave');
+    testing.assertEquals(announced?.type === 'announce' ? announced.instance : undefined, 'proc-a', 'announce carries the instance');
+    testing.assertEquals(left?.type === 'leave' ? left.instance : undefined, 'proc-a', 'leave carries the same instance');
+
+    const other = new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        transportProvider: provider,
+        authenticator: clientAuth,
+        localPeer: fakePeerInfo('other', []),
+        heartbeatInterval: 999_999,
+    });
+    const another = new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        transportProvider: provider,
+        authenticator: clientAuth,
+        localPeer: fakePeerInfo('another', []),
+        heartbeatInterval: 999_999,
+    });
+    testing.assertTrue(other.instanceId.length > 0, 'a generated instance is non-empty');
+    testing.assertTrue(other.instanceId !== another.instanceId, 'two clients get different instances');
+    testing.assertEquals(client.instanceId, 'proc-a', 'an explicit instance is kept');
+
+    await client.close();
+    await other.close();
+    await another.close();
+}
+
+async function testConcurrentLeavesAreOneRequest() {
+    const clientKeyId = fakeKeyId('client');
+    const clientPk = fakePk('client');
+    const trackerKeyId = fakeKeyId('tracker');
+    const trackerPk = fakePk('tracker');
+    const clientAuth = makePassthroughAuth(clientKeyId, clientPk, trackerKeyId, trackerPk);
+    const serverAuth = makePassthroughAuth(trackerKeyId, trackerPk, clientKeyId, clientPk);
+
+    const delayMs = 200;
+    const seen: TrackerRequest[] = [];
+    let connects = 0;
+    const provider: TransportProvider = {
+        scheme: 'mem',
+        async listen() {},
+        async connect(_remote: NetworkAddress): Promise<Transport> {
+            connects += 1;
+            const [client, server] = createMemTransportPair();
+            const serverCh = await serverAuth.authenticate(server, 'responder');
+            serverCh.onMessage(async (data) => {
+                const req = decodeRequest(data);
+                if (req.type === 'announce') {
+                    serverCh.send(encodeMessage({ type: 'announce_ack', ttls: req.entries.map(() => 180) }));
+                    return;
+                }
+                if (req.type !== 'leave') return;
+                seen.push(req);
+                await new Promise(resolve => setTimeout(resolve, delayMs));
+                serverCh.send(encodeMessage({ type: 'leave_ack' }));
+            });
+            return client;
+        },
+        close() {},
+    };
+
+    const localPeer = fakePeerInfo('client', ['ws://client:1234']);
+    const client = new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        transportProvider: provider,
+        authenticator: clientAuth,
+        localPeer,
+        heartbeatInterval: 999_999,
+        instanceId: 'quit-1',
+    });
+
+    const topics = ['topic-a', 'topic-b', 'topic-c', 'topic-d'] as TopicId[];
+    for (const topic of topics) await client.announce(topic, localPeer);
+    const afterAnnounce = connects;
+
+    const started = Date.now();
+    await Promise.all(topics.map(topic => client.leave(topic, localPeer.keyId)));
+    await client.close();
+    const elapsed = Date.now() - started;
+
+    const leaves = seen.filter(req => req.type === 'leave');
+    testing.assertEquals(leaves.length, 1, 'concurrent leaves are one request');
+    const leave = leaves[0];
+    testing.assertTrue(
+        leave !== undefined && topics.every(topic => leave.topics.includes(topic)),
+        `the leave lists every topic (got ${leave?.topics.join(', ')})`,
+    );
+    testing.assertEquals(leave?.instance, 'quit-1', 'coalesced leave carries the instance');
+    testing.assertTrue(elapsed < delayMs * 2, `quit should wait for one reply (took ${elapsed}ms)`);
+    testing.assertEquals(connects, afterAnnounce + 1, 'close does not open a second leave socket');
+}
+
 async function testResolveTrackerConfig() {
     const local = resolveTrackerConfig('localhost', {});
     testing.assertEquals(local.address, DEFAULT_LOCAL_TRACKER, 'localhost tracker default');
@@ -679,7 +943,12 @@ const allSuites = [
             { name: '[TRACKER_CLIENT_05b] Concurrent announce and discover do not overlap connects', invoke: testConcurrentAnnounceAndDiscoverDoNotOverlap },
             { name: '[TRACKER_CLIENT_06] Exchange times out on hung connect', invoke: testExchangeTimesOutOnHungConnect },
             { name: '[TRACKER_CLIENT_07] Close times out on hung leave', invoke: testCloseTimesOutOnHungLeave },
+            { name: '[TRACKER_CLIENT_07b] Close after success does not unhandled-reject', invoke: testCloseAfterSuccessDoesNotUnhandledReject },
+            { name: '[TRACKER_CLIENT_07c] Close drains in-flight discover without unhandled reject', invoke: testCloseDrainsInFlightDiscover },
+            { name: '[TRACKER_CLIENT_07d] Leave after close does not connect', invoke: testLeaveAfterCloseDoesNotConnect },
+            { name: '[TRACKER_CLIENT_07e] Concurrent leaves are one request', invoke: testConcurrentLeavesAreOneRequest },
             { name: '[TRACKER_CLIENT_08] resolveTrackerConfig scope defaults and overrides', invoke: testResolveTrackerConfig },
+            { name: '[TRACKER_CLIENT_09] Announce and leave carry one instance per client', invoke: testInstanceCarriedOnAnnounceAndLeave },
         ],
     },
 ];

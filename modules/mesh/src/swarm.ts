@@ -44,6 +44,7 @@ type PeerCallback = (peer: SwarmPeer) => void;
 export interface Swarm {
     readonly topic: TopicId;
     readonly mode:  SwarmMode;
+    readonly destroyed: boolean;
 
     activate():   void;
     deactivate(): void;
@@ -65,6 +66,9 @@ export interface SwarmDeps {
     transports:    TransportProvider[];
     localPeer?:    PeerInfo;
     report?:       IssueReporter;
+    // Resolves when the mesh's listen sockets are up. Announce waits for it
+    // so a dialable address is not published before it can accept a call.
+    whenListening?: Promise<void>;
 }
 
 const DEFAULT_TARGET_PEERS = 6;
@@ -73,7 +77,7 @@ const REFILL_DEBOUNCE_MS = 150;
 
 export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
 
-    const { pool, discovery, authenticator, transports, localPeer, report } = deps;
+    const { pool, discovery, authenticator, transports, localPeer, report, whenListening } = deps;
 
     const topic       = config.topic;
     const targetPeers = config.targetPeers ?? DEFAULT_TARGET_PEERS;
@@ -413,9 +417,14 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
         // (empty listen/announce set) must not register useless presence on a
         // tracker: peers could not reach it anyway.
         if (localPeer !== undefined && localPeer.addresses.length > 0) {
-            discovery.announce(topic, localPeer).then(() => {
-                if (TRACE_SWARM) trace('swarm.announce', { topic });
-            }).catch(() => {});
+            const announce = () => {
+                if (destroyed || mode === 'dormant') return;
+                discovery.announce(topic, localPeer).then(() => {
+                    if (TRACE_SWARM) trace('swarm.announce', { topic });
+                }).catch(() => {});
+            };
+            if (whenListening !== undefined) whenListening.then(announce, () => {});
+            else announce();
         }
         runDiscovery();
     }
@@ -466,6 +475,7 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
     return {
         get topic() { return topic; },
         get mode()  { return mode; },
+        get destroyed() { return destroyed; },
         activate,
         deactivate,
         sleep,

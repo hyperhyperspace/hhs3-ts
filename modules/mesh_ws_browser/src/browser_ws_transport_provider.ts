@@ -43,6 +43,7 @@ export class BrowserWsTransportProvider implements TransportProvider {
     connect(remote: NetworkAddress, _local?: NetworkAddress): Promise<Transport> {
         return new Promise<Transport>((resolve, reject) => {
             let settled = false;
+            let opened = false;
             const ws = new this.WS(remote);
             ws.binaryType = 'arraybuffer';
             this.sockets.add(ws);
@@ -55,19 +56,22 @@ export class BrowserWsTransportProvider implements TransportProvider {
                 reject(new Error(`ws connect timeout: ${remote}`));
             }, this.connectTimeoutMs);
 
-            ws.addEventListener('close', () => this.sockets.delete(ws));
+            // Firefox can emit error and still open. A failed handshake also
+            // closes, so error alone does not settle the attempt.
+            ws.addEventListener('error', () => {});
+            ws.addEventListener('close', () => {
+                this.sockets.delete(ws);
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                if (!opened) reject(new Error(`ws connect failed: ${remote}`));
+            });
             ws.addEventListener('open', () => {
                 if (settled) return;
+                opened = true;
                 settled = true;
                 clearTimeout(timer);
                 resolve(new BrowserWsTransport(ws, remote));
-            });
-            ws.addEventListener('error', () => {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timer);
-                this.sockets.delete(ws);
-                reject(new Error(`ws connect failed: ${remote}`));
             });
         });
     }

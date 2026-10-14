@@ -37,10 +37,12 @@ export {
 export { AuthenticatorConfig, createAuthenticator } from './kem_authenticator.js';
 export { StaticDiscovery } from './static_discovery.js';
 export { DiscoveryLayer, DiscoveryStack } from './discovery_stack.js';
-export { PoolReuseDiscovery } from './pool_reuse_discovery.js';
+export { PoolReuseDiscovery, attachPoolReuse } from './pool_reuse_discovery.js';
+export type { PoolReuseBinding } from './pool_reuse_discovery.js';
 export { MemTransport, MemTransportProvider, createMemTransportPair } from './mem_transport.js';
 export type { MeshScope } from './scope.js';
 export { QuietDiscovery } from './quiet_discovery.js';
 export { probeTracker, TRACKER_PROBE_TIMEOUT_MS } from './tracker_probe.js';
+export type { TrackerProbeResult } from './tracker_probe.js';
 export { severityRank } from '@hyper-hyper-space/hhs3_util';
 export type { IssueReport, IssueReporter, IssueSeverity } from '@hyper-hyper-space/hhs3_util';

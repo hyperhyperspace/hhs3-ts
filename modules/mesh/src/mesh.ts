@@ -45,6 +45,7 @@ export class Mesh {
     private localPeer: PeerInfo | undefined;
     private negotiationTimeoutMs: number;
     private report: IssueReporter | undefined;
+    private listening: Promise<void>;
 
     constructor(config: MeshOptions) {
         this.config = config;
@@ -59,7 +60,7 @@ export class Mesh {
             };
         }
 
-        this.startListening();
+        this.listening = this.startListening();
         this.registerPoolControlHandler();
     }
 
@@ -115,8 +116,16 @@ export class Mesh {
                 transports:    this.config.transports,
                 localPeer:     this.localPeer,
                 report:        this.report,
+                whenListening: this.listening,
             },
         );
+
+        const innerDestroy = swarm.destroy;
+        swarm.destroy = () => {
+            innerDestroy();
+            const i = this.activeSwarms.indexOf(swarm);
+            if (i !== -1) this.activeSwarms.splice(i, 1);
+        };
 
         this.activeSwarms.push(swarm);
         return swarm;
@@ -130,10 +139,11 @@ export class Mesh {
         if (this.closed) return;
         this.closed = true;
 
-        for (const swarm of this.activeSwarms) {
+        const swarms = this.activeSwarms;
+        this.activeSwarms = [];
+        for (const swarm of swarms) {
             swarm.destroy();
         }
-        this.activeSwarms = [];
 
         this.pool.close();
 
@@ -152,7 +162,7 @@ export class Mesh {
     // --- topic interest evaluation (shared by inbound + pool-reuse responders) ---
 
     private async evaluateTopicInterest(topic: TopicId, peerId: KeyId): Promise<Swarm | undefined> {
-        const swarm = this.activeSwarms.find(s => s.topic === topic);
+        const swarm = this.activeSwarms.find(s => s.topic === topic && !s.destroyed);
         if (swarm === undefined) return undefined;
         if (!(await swarm.wouldAccept(peerId))) return undefined;
         return swarm;
@@ -160,16 +170,17 @@ export class Mesh {
 
     // --- incoming connection handling ---
 
-    private startListening(): void {
+    private startListening(): Promise<void> {
         const addrs = this.config.listenAddresses;
-        if (addrs === undefined) return;
+        if (addrs === undefined) return Promise.resolve();
 
+        const pending: Promise<void>[] = [];
         for (const addr of addrs) {
             const provider = this.config.transports.find(
                 t => addr.startsWith(t.scheme + '://')
             );
             if (provider === undefined) continue;
-            provider.listen(addr, (transport) => {
+            pending.push(provider.listen(addr, (transport) => {
                 this.handleIncoming(transport, addr).catch((err) => {
                     this.reportMeshIssue({
                         kind: 'handshake-failed', severity: 'low',
@@ -187,8 +198,9 @@ export class Mesh {
                     message: err instanceof Error ? err.message : String(err),
                     stack: err instanceof Error ? err.stack : undefined,
                 });
-            });
+            }));
         }
+        return Promise.allSettled(pending).then(() => {});
     }
 
     private async handleIncoming(transport: Transport, localListenAddress: NetworkAddress): Promise<void> {

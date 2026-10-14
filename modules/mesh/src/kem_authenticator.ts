@@ -123,10 +123,15 @@ class MessageQueue {
         });
     }
 
-    finish(): void {
+    // Frames that arrived after the last handshake message, while the signature
+    // check was still running. The caller must hand them to the encrypted channel.
+    finish(): Uint8Array[] {
         this.done = true;
+        const leftover = this.queue;
+        this.queue = [];
         this.waiting = null;
         this.errCb = null;
+        return leftover;
     }
 }
 
@@ -156,6 +161,8 @@ class EncryptedChannel implements AuthenticatedChannel {
     private recvCounter = 0;
     private messageCallbacks: ((msg: Uint8Array) => void)[] = [];
     private closeCallbacks: (() => void)[] = [];
+    private pending: Uint8Array[] = [];
+    private subscribed = false;
     private _closed = false;
 
     constructor(
@@ -165,6 +172,7 @@ class EncryptedChannel implements AuthenticatedChannel {
         aead: AeadSuite,
         sendKey: Uint8Array,
         recvKey: Uint8Array,
+        earlyCiphertext: Uint8Array[] = [],
     ) {
         this.transport = transport;
         this.remotePeer = remotePeer;
@@ -173,16 +181,9 @@ class EncryptedChannel implements AuthenticatedChannel {
         this.sendKey = sendKey;
         this.recvKey = recvKey;
 
-        transport.onMessage((ct) => {
-            if (this._closed) return;
-            try {
-                const nonce = makeNonce(this.recvCounter++);
-                const pt = this.aead.decrypt(ct, this.recvKey, nonce);
-                for (const cb of this.messageCallbacks) cb(pt);
-            } catch {
-                this.close();
-            }
-        });
+        for (const ct of earlyCiphertext) this.ingest(ct);
+
+        transport.onMessage((ct) => this.ingest(ct));
 
         transport.onClose(() => {
             if (this._closed) return;
@@ -210,7 +211,30 @@ class EncryptedChannel implements AuthenticatedChannel {
     }
 
     onMessage(callback: (message: Uint8Array) => void): void {
+        const first = !this.subscribed;
+        this.subscribed = true;
         this.messageCallbacks.push(callback);
+        if (!first) return;
+        const buffered = this.pending;
+        this.pending = [];
+        for (const pt of buffered) callback(pt);
+    }
+
+    private ingest(ct: Uint8Array): void {
+        if (this._closed) return;
+        let pt: Uint8Array;
+        try {
+            const nonce = makeNonce(this.recvCounter++);
+            pt = this.aead.decrypt(ct, this.recvKey, nonce);
+        } catch {
+            this.close();
+            return;
+        }
+        if (!this.subscribed) {
+            this.pending.push(pt);
+            return;
+        }
+        for (const cb of this.messageCallbacks) cb(pt);
     }
 
     onClose(callback: () => void): void {
@@ -318,10 +342,8 @@ async function handshakeAsInitiator(
     const msg3 = writeFields([ciphertext, encryptedIdentity]);
     transport.send(msg3);
 
-    queue.finish();
-
     const remoteKeyId = keyIdFromPublicKey(remotePk, sha256Suite);
-    return new EncryptedChannel(transport, remotePk, remoteKeyId, aead, i2rKey, r2iKey);
+    return new EncryptedChannel(transport, remotePk, remoteKeyId, aead, i2rKey, r2iKey, queue.finish());
 }
 
 async function handshakeAsResponder(
@@ -396,10 +418,8 @@ async function handshakeAsResponder(
     const sig3Valid = await remoteSigning.verify(transcript3, sig3, remotePk.key);
     if (!sig3Valid) throw new Error('initiator identity signature verification failed');
 
-    queue.finish();
-
     const remoteKeyId = keyIdFromPublicKey(remotePk, sha256Suite);
-    return new EncryptedChannel(transport, remotePk, remoteKeyId, aead, r2iKey, i2rKey);
+    return new EncryptedChannel(transport, remotePk, remoteKeyId, aead, r2iKey, i2rKey, queue.finish());
 }
 
 // ---------------------------------------------------------------------------

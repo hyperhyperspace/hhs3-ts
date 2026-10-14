@@ -234,6 +234,62 @@ async function testConnectTimeout() {
     clientProvider.close();
 }
 
+async function testErrorThenOpen(): Promise<void> {
+    const provider = new BrowserWsTransportProvider({
+        WebSocketCtor: scriptedSocket(['error', 'open']),
+        connectTimeoutMs: 200,
+    });
+    const transport = await provider.connect('ws://127.0.0.1:9');
+    testing.assertTrue(transport !== undefined, 'error followed by open still connects');
+    provider.close();
+}
+
+async function testErrorThenClose(): Promise<void> {
+    const provider = new BrowserWsTransportProvider({
+        WebSocketCtor: scriptedSocket(['error', 'close']),
+        connectTimeoutMs: 200,
+    });
+    let threw = false;
+    try {
+        await provider.connect('ws://127.0.0.1:9');
+    } catch (e) {
+        threw = true;
+        testing.assertTrue(
+            (e as Error).message.includes('connect failed'),
+            `close before open should fail the connect (got: ${(e as Error).message})`,
+        );
+    }
+    testing.assertTrue(threw, 'error followed by close should reject');
+    provider.close();
+}
+
+function scriptedSocket(events: string[]): WebSocketCtor {
+    return class ScriptedSocket {
+        binaryType = 'arraybuffer';
+        private listeners = new Map<string, Array<() => void>>();
+
+        constructor(_url: string) {
+            queueMicrotask(() => {
+                for (const event of events) this.emit(event);
+            });
+        }
+
+        addEventListener(type: string, listener: () => void): void {
+            const list = this.listeners.get(type) ?? [];
+            list.push(listener);
+            this.listeners.set(type, list);
+        }
+
+        emit(type: string): void {
+            for (const listener of this.listeners.get(type) ?? []) listener();
+        }
+
+        close(): void {
+            this.emit('close');
+        }
+    } as unknown as WebSocketCtor;
+}
+
 export const browserWsTests = {
     title: '[BROWSER_WS] Browser WebSocket transport',
     tests: [
@@ -246,5 +302,7 @@ export const browserWsTests = {
         { name: '[BWS_06] Connect failure', invoke: testConnectFailure },
         { name: '[BWS_07] Provider close', invoke: testProviderClose },
         { name: '[BWS_08] Connect timeout closes hung socket', invoke: testConnectTimeout },
+        { name: '[BWS_09] error then open still connects', invoke: testErrorThenOpen },
+        { name: '[BWS_10] error then close without open rejects', invoke: testErrorThenClose },
     ],
 };

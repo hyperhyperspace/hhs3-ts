@@ -6,8 +6,9 @@ Status: Initial Version v0.1
 
 The tracker protocol provides peer rendezvous for topic-based synchronization.
 Clients announce their presence on topics, query for other peers, and leave.
-The server maintains a registry of `(topic, peer)` entries with TTL-based
-expiry.
+The server maintains a registry of `(topic, keyId, instance)` entries with
+TTL-based expiry. `instance` distinguishes processes that share one identity.
+A missing `instance` is the legacy slot, one entry per key.
 
 All messages are JSON-encoded and exchanged over an authenticated channel
 (see the [mesh spec](https://github.com/hyperhyperspace/hhs3-ts/blob/main/modules/mesh/SPECS.md)
@@ -52,7 +53,8 @@ Register or refresh presence on one or more topics.
   "peer": {
     "keyId": "<B64Hash>",
     "addresses": ["<scheme>://<address>", ...]
-  }
+  },
+  "instance": "<process id>"
 }
 ```
 
@@ -60,6 +62,12 @@ Register or refresh presence on one or more topics.
 - `peer.keyId`: MUST match the authenticated identity of the connection.
   The server MUST reject requests where it does not.
 - `peer.addresses`: transport addresses where this peer can be reached.
+- `instance`: optional process id, a string of 1 to 64 characters. The server
+  keys the entry by `(topic, keyId, instance)`. Two processes with one identity
+  MUST use different ids so one announce or leave does not replace the other.
+  A request that omits `instance` uses the legacy one-entry-per-key slot.
+  The server MUST reject a present `instance` that is empty or longer than
+  64 characters.
 
 Multiple entries allow a single request to announce on several topics and
 to refresh all active registrations in a single heartbeat.
@@ -87,12 +95,14 @@ Deregister from one or more topics.
 ```json
 {
   "type": "leave",
-  "topics": ["<B64Hash>", ...]
+  "topics": ["<B64Hash>", ...],
+  "instance": "<process id>"
 }
 ```
 
-The server removes entries for the authenticated client on the listed
-topics.
+The server removes entries for the authenticated client and this `instance`
+on the listed topics. The same rules apply to `instance` as on `announce`.
+A leave does not remove another process's entry for the same key.
 
 ## 5. Response Messages (Server -> Client)
 
@@ -168,6 +178,7 @@ failures.
 | Condition | Behavior |
 |-----------|----------|
 | `peer.keyId` does not match authenticated identity | Server returns `error` |
+| `instance` present but empty or longer than 64 characters | Server returns `error` |
 | Malformed JSON or missing `type` | Server returns `error` |
 | Unknown `type` value | Server returns `error` |
 | Connection lost before response | Client retries or gives up |

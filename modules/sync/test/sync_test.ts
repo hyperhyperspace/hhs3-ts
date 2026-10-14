@@ -835,6 +835,7 @@ function stubSwarm(peers: SwarmPeer[]): Swarm {
     return {
         topic: 'fetch-init',
         mode: 'active',
+        destroyed: false,
         activate() {},
         deactivate() {},
         sleep() {},
@@ -845,6 +846,33 @@ function stubSwarm(peers: SwarmPeer[]): Swarm {
         blockPeer() {},
         wouldAccept() { return Promise.resolve(true); },
         adopt() { return false; },
+    };
+}
+
+function joinableSwarm(): { swarm: Swarm; join(peer: SwarmPeer): void } {
+    const peers: SwarmPeer[] = [];
+    const joins: Array<(peer: SwarmPeer) => void> = [];
+    const swarm: Swarm = {
+        topic: 'fetch-init',
+        mode: 'active',
+        destroyed: false,
+        activate() {},
+        deactivate() {},
+        sleep() {},
+        destroy() {},
+        peers: () => peers,
+        onPeerJoin(cb) { joins.push(cb); },
+        onPeerLeave() {},
+        blockPeer() {},
+        wouldAccept() { return Promise.resolve(true); },
+        adopt() { return false; },
+    };
+    return {
+        swarm,
+        join(peer) {
+            peers.push(peer);
+            for (const cb of joins) cb(peer);
+        },
     };
 }
 
@@ -883,6 +911,84 @@ async function testFetchInitHashMismatch() {
         );
     }
     testing.assertTrue(threw, 'fetchInit should reject a createPayload that does not hash to objectId');
+
+    local.close();
+}
+
+async function testFetchInitLatePeer() {
+    const payload = { action: 'create', type: 'hhs/test', seed: 'late' };
+    const objectId = dag.createEntry(payload, {}, dag.position(), sha256).hash;
+    const initTimeoutMs = 200;
+    const peerTimeoutMs = 2_000;
+
+    const { local, remote } = createChannelPair('fetch-init-late', 'peerA', 'peerB');
+    const { swarm, join } = joinableSwarm();
+    remote.onMessage((data) => {
+        const msg = decode(data);
+        if (msg.type !== 'init-request' || msg.objectId !== objectId) return;
+        const resp: InitResponse = { type: 'init-response', objectId, createPayload: payload };
+        remote.send(encode(resp));
+    });
+
+    const started = Date.now();
+    const pending = fetchInit(objectId, [swarm], sha256, initTimeoutMs, peerTimeoutMs);
+    // Past the init budget. The old single clock would already have rejected.
+    await wait(initTimeoutMs + 100);
+    join({ keyId: 'peerB', endpoint: 'mem://peerB', channel: local });
+
+    const got = await pending as { seed?: string };
+    testing.assertTrue(Date.now() - started > initTimeoutMs, 'peer arrived after the init budget');
+    testing.assertTrue(Date.now() - started < peerTimeoutMs, 'resolved inside the peer budget');
+    testing.assertEquals(got.seed, 'late', 'late peer still delivers the create payload');
+
+    local.close();
+}
+
+async function testFetchInitNoPeer() {
+    const { swarm } = joinableSwarm();
+    const peerTimeoutMs = 150;
+    const started = Date.now();
+    let threw = false;
+    try {
+        await fetchInit('no-peer-object', [swarm], sha256, 5_000, peerTimeoutMs);
+    } catch (e: any) {
+        threw = true;
+        testing.assertTrue(
+            typeof e.message === 'string' && e.message.includes('no peer for no-peer-object'),
+            `error should be the peer budget, got: ${e.message}`,
+        );
+        testing.assertTrue(
+            !e.message.includes('fetchInit timed out'),
+            'a missing peer is not an init timeout',
+        );
+    }
+    testing.assertTrue(threw, 'fetchInit should reject when no peer arrives');
+    const elapsed = Date.now() - started;
+    testing.assertTrue(elapsed < 1_000, `rejected on the peer budget (elapsed ${elapsed}ms)`);
+}
+
+async function testFetchInitAlreadyConnectedTimeout() {
+    const payload = { action: 'create', type: 'hhs/test', seed: 'silent' };
+    const objectId = dag.createEntry(payload, {}, dag.position(), sha256).hash;
+    const { local } = createChannelPair('fetch-init-silent', 'peerA', 'peerB');
+    const swarmPeer: SwarmPeer = { keyId: 'peerB', endpoint: 'mem://peerB', channel: local };
+    const swarm = stubSwarm([swarmPeer]);
+
+    const initTimeoutMs = 200;
+    const started = Date.now();
+    let threw = false;
+    try {
+        await fetchInit(objectId, [swarm], sha256, initTimeoutMs, 5_000);
+    } catch (e: any) {
+        threw = true;
+        testing.assertTrue(
+            typeof e.message === 'string' && e.message.includes(`fetchInit timed out after ${initTimeoutMs}ms`),
+            `error should be the init budget, got: ${e.message}`,
+        );
+    }
+    testing.assertTrue(threw, 'a present peer that never answers should hit the init budget');
+    const elapsed = Date.now() - started;
+    testing.assertTrue(elapsed < 1_000, `init budget, not the peer budget (elapsed ${elapsed}ms)`);
 
     local.close();
 }
@@ -1322,6 +1428,9 @@ export const syncSuite = {
         { name: '[SYNC_08] Multi-peer sync', invoke: testMultiPeerSync },
         { name: '[SYNC_09] Foreign dep deferral', invoke: testForeignDepDeferral },
         { name: '[SYNC_10] fetchInit rejects createPayload hash mismatch', invoke: testFetchInitHashMismatch },
+        { name: '[SYNC_19] fetchInit accepts a peer that arrives after the init budget', invoke: testFetchInitLatePeer },
+        { name: '[SYNC_20] fetchInit rejects on the peer budget when nobody arrives', invoke: testFetchInitNoPeer },
+        { name: '[SYNC_21] fetchInit with a peer already present times out on the init budget', invoke: testFetchInitAlreadyConnectedTimeout },
         { name: '[SYNC_11] Foreign dep appearance then growth', invoke: testForeignDepAppearance },
         { name: '[SYNC_12] Auto-payload FIFO survives yielding loadHeader', invoke: testAutoPayloadFifo },
         { name: '[SYNC_13] Auto-payload payloadCount mismatch fails', invoke: testAutoPayloadCountMismatch },

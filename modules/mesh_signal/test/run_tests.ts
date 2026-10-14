@@ -319,6 +319,42 @@ async function testDataAndGlare() {
     }
 }
 
+async function testByeKeepsDataChannel() {
+    resetFakePeers();
+    const alice = await createIdentity(SIGNING_ED25519, sha256);
+    const bob = await createIdentity(SIGNING_ED25519, sha256);
+    const { server, signalBase } = await boot({ publicMode: true });
+    const dialer = provider(alice, signalBase, { endpointId: 'bye-dialer' });
+    const listener = provider(bob, signalBase, { endpointId: 'bye-listener' });
+    const inbound: Transport[] = [];
+    try {
+        await listener.listen(listener.localAddress!, t => inbound.push(t));
+        const dial = await dialer.connect(listener.localAddress!, dialer.localAddress, bob.keyId);
+        // Wait past signaling bye forwarding so a hangup would already have closed the PC.
+        await delay(200);
+        testing.assertEquals(inbound.length, 1, 'listener accepted one inbound');
+        testing.assertTrue(dial.open, 'dialer transport stays open after bye');
+        testing.assertTrue(inbound[0]!.open, 'listener transport stays open after bye');
+
+        const got = new Promise<Uint8Array>((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error('no mesh message after bye')), 2_000);
+            inbound[0]!.onMessage(msg => {
+                clearTimeout(timer);
+                resolve(msg);
+            });
+        });
+        dial.send(Uint8Array.from([4, 5, 6]));
+        const msg = await got;
+        testing.assertEquals(msg.length, 3, 'post-bye payload length');
+        testing.assertEquals(msg[0]!, 4, 'post-bye payload head');
+        dial.close();
+    } finally {
+        dialer.close();
+        listener.close();
+        server.stop();
+    }
+}
+
 async function testTimeoutsAndKey() {
     resetFakePeers();
     const alice = await createIdentity(SIGNING_ED25519, sha256);
@@ -391,6 +427,7 @@ const allSuites = [
             { name: '[MESH_SIGNAL_01] copied delegation cannot take the slot', invoke: testBadPossession },
             { name: '[MESH_SIGNAL_02] renewal keeps the endpoint id', invoke: testRenewalKeepsEndpoint },
             { name: '[MESH_SIGNAL_03] data channel message, fragments, and glare', invoke: testDataAndGlare },
+            { name: '[MESH_SIGNAL_03b] bye ends signaling without closing the data channel', invoke: testByeKeepsDataChannel },
             { name: '[MESH_SIGNAL_04] key check precedes ICE; timeouts name the stage', invoke: testTimeoutsAndKey },
         ],
     },

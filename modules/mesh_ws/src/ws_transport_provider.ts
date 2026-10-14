@@ -23,6 +23,7 @@ export class WsTransportProvider implements TransportProvider {
 
     private server?: WebSocketServer;
     private sockets = new Set<WebSocket>();
+    private closed = false;
 
     constructor(scheme: string = 'ws', opts?: WsTransportProviderOptions) {
         this.scheme = scheme;
@@ -34,6 +35,7 @@ export class WsTransportProvider implements TransportProvider {
         address: NetworkAddress,
         onConnection: (transport: Transport) => void
     ): Promise<void> {
+        if (this.closed) throw new Error('ws transport is closed');
         if (this.scheme === 'wss') {
             throw new Error('wss listen requires TLS termination; run behind a reverse proxy and listen on ws');
         }
@@ -57,6 +59,7 @@ export class WsTransportProvider implements TransportProvider {
     }
 
     async connect(remote: NetworkAddress): Promise<Transport> {
+        if (this.closed) throw new Error('ws transport is closed');
         return new Promise<Transport>((resolve, reject) => {
             let settled = false;
             const ws = new this.WS(remote);
@@ -89,6 +92,8 @@ export class WsTransportProvider implements TransportProvider {
     }
 
     close(): void {
+        if (this.closed) return;
+        this.closed = true;
         for (const ws of this.sockets) {
             ws.close();
         }

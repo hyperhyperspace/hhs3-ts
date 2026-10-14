@@ -2,7 +2,9 @@ import { testing } from "@hyper-hyper-space/hhs3_util";
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 
 import {
-    LineDecoder, decodeRequest, decodeServerMessage, encodeMessage, isHostStatus,
+    LineDecoder, browserClientChannel, browserFilePath, browserHostsDatabase, browserKeysDatabase,
+    browserLockName, browserProjectionDatabase, browserReplicaDatabase, decodeRequest, decodeServerMessage,
+    encodeMessage, isBrowserChannelMessage, isHostStatus,
     type HostStatus, type StoppedStatus,
 } from "../src/index.js";
 
@@ -62,6 +64,25 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
 
             const stopped: StoppedStatus = { host: 'default', database: 'DB', catalog: 'editor', created: true, running: false };
             assertTrue(isHostStatus(status) && !isHostStatus(stopped), 'a full status and a stopped one are told apart');
+        },
+    },
+    {
+        name: '[RHOST_CLIENT03] browser names are per app and host, and the client channel is not a mesh or projection channel',
+        invoke: async () => {
+            assertEquals(browserLockName('editor', 'default'), 'rhost-editor-default', 'the lock');
+            assertEquals(browserClientChannel('editor', 'default'), browserLockName('editor', 'default'), 'the client channel is the lock name');
+            assertEquals(browserKeysDatabase('editor'), 'rhost-editor-keys', 'the keys database');
+            assertEquals(browserHostsDatabase('editor'), 'rhost-editor-hosts', 'the host records');
+            assertEquals(browserReplicaDatabase('editor', 'default'), 'rhost-editor-default-store', 'the replica');
+            assertEquals(browserProjectionDatabase('editor', 'default'), 'rhost-editor-default-data', 'the projection, not projection.path');
+            assertEquals(browserFilePath('editor', 'default', 'files/media').join('/'), 'rhost/editor/default/files/media', 'a file mount');
+            assertTrue(!browserClientChannel('editor', 'default').startsWith('hhs3-'), 'not the mesh channel or the projection ping');
+            assertTrue(isBrowserChannelMessage({ stop: true }), 'a stop broadcast');
+            assertTrue(isBrowserChannelMessage({ client: 'c', line: '{}' }), 'a client line');
+            assertTrue(isBrowserChannelMessage({ client: 'c', close: true }), 'a client close');
+            assertTrue(!isBrowserChannelMessage({ client: '', line: 'x' }) && !isBrowserChannelMessage(null), 'rejects anything else');
+            throwsWith(() => browserLockName('', 'default'), 'app name', 'an app name is required');
+            throwsWith(() => browserFilePath('editor', 'default', '../media'), 'mount path', 'a mount path stays relative');
         },
     },
 ];

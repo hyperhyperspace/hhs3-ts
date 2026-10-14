@@ -120,6 +120,8 @@ export class TrackerServer {
         if (req.peer.keyId !== clientKeyId) {
             return { type: 'error', message: 'peer keyId does not match authenticated identity' };
         }
+        const slot = registrySlot(clientKeyId, req.instance);
+        if (typeof slot !== 'string') return slot;
 
         const ttls: number[] = [];
         const now = Date.now();
@@ -132,7 +134,7 @@ export class TrackerServer {
                 topicMap = new Map();
                 this.registry.set(entry.topic, topicMap);
             }
-            topicMap.set(clientKeyId, {
+            topicMap.set(slot, {
                 info: req.peer,
                 expiresAt: now + clamped * 1000,
             });
@@ -154,9 +156,9 @@ export class TrackerServer {
                 continue;
             }
             let peers: PeerInfo[] = [];
-            for (const [keyId, entry] of topicMap) {
+            for (const [slot, entry] of topicMap) {
                 if (entry.expiresAt <= now) {
-                    topicMap.delete(keyId);
+                    topicMap.delete(slot);
                     continue;
                 }
                 peers.push(entry.info);
@@ -175,11 +177,13 @@ export class TrackerServer {
     private handleLeave(
         req: import('@hyper-hyper-space/hhs3_mesh_tracker_client').LeaveRequest,
         clientKeyId: KeyId,
-    ): LeaveAck {
+    ): LeaveAck | ErrorResponse {
+        const slot = registrySlot(clientKeyId, req.instance);
+        if (typeof slot !== 'string') return slot;
         for (const topic of req.topics) {
             const topicMap = this.registry.get(topic);
             if (topicMap) {
-                topicMap.delete(clientKeyId);
+                topicMap.delete(slot);
                 if (topicMap.size === 0) this.registry.delete(topic);
             }
         }
@@ -191,10 +195,21 @@ export class TrackerServer {
     private sweep(): void {
         const now = Date.now();
         for (const [topic, topicMap] of this.registry) {
-            for (const [keyId, entry] of topicMap) {
-                if (entry.expiresAt <= now) topicMap.delete(keyId);
+            for (const [slot, entry] of topicMap) {
+                if (entry.expiresAt <= now) topicMap.delete(slot);
             }
             if (topicMap.size === 0) this.registry.delete(topic);
         }
     }
+}
+
+const MAX_INSTANCE_LENGTH = 64;
+
+// One slot per process. A missing instance is the legacy one-entry-per-key slot.
+function registrySlot(clientKeyId: KeyId, instance: unknown): string | ErrorResponse {
+    if (instance === undefined) return `${clientKeyId}#`;
+    if (typeof instance !== 'string' || instance.length === 0 || instance.length > MAX_INSTANCE_LENGTH) {
+        return { type: 'error', message: 'instance must be a string of 1 to 64 characters' };
+    }
+    return `${clientKeyId}#${instance}`;
 }

@@ -12,6 +12,7 @@ import {
     DiscoveryStack,
     Mesh,
     QuietDiscovery,
+    attachPoolReuse,
     createAuthenticator,
     planBroadcastChannel,
     planDiscovery,
@@ -131,12 +132,12 @@ export async function createBrowserMesh(
             });
             const provider = tracker.address.startsWith('wss://') ? wss : ws;
             if (provider === undefined) {
-                notes.push(`tracker ${tracker.address} unreachable`);
+                notes.push(`tracker ${tracker.address} (no WebSocket)`);
                 continue;
             }
-            const reachable = await probeTracker(provider, tracker.address);
-            if (!reachable) {
-                notes.push(`tracker ${tracker.address} unreachable`);
+            const probe = await probeTracker(provider, tracker.address);
+            if (!probe.ok) {
+                notes.push(`tracker ${tracker.address} (${probe.reason})`);
                 continue;
             }
             const client = new TrackerClient({
@@ -166,19 +167,20 @@ export async function createBrowserMesh(
         notes.unshift('dial-out only');
     }
 
-    const discovery = new DiscoveryStack(layers);
+    const reuse = attachPoolReuse(new DiscoveryStack(layers));
     const mesh = new Mesh({
         transports,
-        discovery,
+        discovery: reuse.discovery,
         authenticator,
         localKeyId: runtime.identity.keyId,
         listenAddresses,
         report: runtime.report,
     });
+    reuse.attach(mesh.pool);
 
     return {
         mesh,
-        discovery,
+        discovery: reuse.discovery,
         listenAddresses,
         trackerAddresses,
         discoveryNotes: notes,

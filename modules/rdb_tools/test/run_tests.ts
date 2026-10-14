@@ -1558,8 +1558,8 @@ const tests = [
                 builtA = await factory(mesh, { identity: alice });
                 builtB = await factory(mesh, { identity: bob });
                 assertTrue(
-                    builtA.discoveryNotes.some((n) => n.includes('unreachable')),
-                    `tracker noted unreachable (${builtA.discoveryNotes.join('; ')})`,
+                    builtA.discoveryNotes.some((n) => n.startsWith('tracker ws://127.0.0.1:1 (')),
+                    `tracker noted with a reason (${builtA.discoveryNotes.join('; ')})`,
                 );
                 assertTrue(
                     builtA.discoveryNotes.some((n) => n.startsWith('folder ')),

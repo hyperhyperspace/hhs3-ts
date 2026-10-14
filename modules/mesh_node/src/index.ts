@@ -14,6 +14,7 @@ import {
     DiscoveryStack,
     Mesh,
     QuietDiscovery,
+    attachPoolReuse,
     createAuthenticator,
     planBroadcastChannel,
     planDiscovery,
@@ -122,19 +123,20 @@ export async function createNodeMesh(
         notes.unshift('dial-out only');
     }
 
-    const discovery = new DiscoveryStack(layers);
+    const reuse = attachPoolReuse(new DiscoveryStack(layers));
     const mesh = new Mesh({
         transports,
-        discovery,
+        discovery: reuse.discovery,
         authenticator,
         localKeyId: runtime.identity.keyId,
         listenAddresses,
         report: runtime.report,
     });
+    reuse.attach(mesh.pool);
 
     return {
         mesh,
-        discovery,
+        discovery: reuse.discovery,
         listenAddresses,
         trackerAddresses: listenAddresses,
         discoveryNotes: notes,
@@ -161,8 +163,8 @@ async function buildDiscovery(args: {
                 trackerKey: source.key,
             });
             const provider = providerFor(tracker.address, args.ws, args.wss);
-            const reachable = await probeTracker(provider, tracker.address);
-            if (reachable) {
+            const probe = await probeTracker(provider, tracker.address);
+            if (probe.ok) {
                 const client = new TrackerClient({
                     trackerAddress: tracker.address,
                     trackerKeyId: tracker.keyId,
@@ -174,7 +176,7 @@ async function buildDiscovery(args: {
                 closeables.push(client);
                 notes.push(`tracker ${tracker.address}`);
             } else {
-                notes.push(`tracker ${tracker.address} unreachable`);
+                notes.push(`tracker ${tracker.address} (${probe.reason})`);
             }
         } else if (source.type === 'folder') {
             const folder = new FolderDiscovery({

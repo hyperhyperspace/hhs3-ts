@@ -19,6 +19,7 @@
   "dependencies": {
     "@hyper-hyper-space/hhs3_crypto": "^0.1.0",
     "@hyper-hyper-space/hhs3_mesh_rtc": "^0.1.0",
+    "@hyper-hyper-space/hhs3_mesh_ws": "^0.1.0",
     "werift": "^0.22.9",
     "ws": "^8.18.0"
   },

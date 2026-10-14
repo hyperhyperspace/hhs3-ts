@@ -56,6 +56,9 @@ interface InboundSession {
     peer: RtcPeerLike;
     pending: RtcCandidateInit[];
     remoteSet: boolean;
+    // True once the data channel has been handed to the mesh. Signaling bye
+    // must not close the peer connection after that point.
+    handedOff: boolean;
 }
 
 export class RtcTransportProvider implements TransportProvider {
@@ -357,7 +360,11 @@ export class RtcTransportProvider implements TransportProvider {
             await this.onInboundSignal(msg.session, msg.data);
             return;
         }
-        if ((msg.type === 'bye' || msg.type === 'reject') && msg.session !== undefined) {
+        if (msg.type === 'bye' && msg.session !== undefined) {
+            this.releaseSession(msg.session);
+            return;
+        }
+        if (msg.type === 'reject' && msg.session !== undefined) {
             this.dropSession(msg.session);
         }
     }
@@ -373,7 +380,7 @@ export class RtcTransportProvider implements TransportProvider {
             }
         }
         const peer = this.createRTCPeerConnection(this.iceServers);
-        const inbound: InboundSession = { peer, pending: [], remoteSet: false };
+        const inbound: InboundSession = { peer, pending: [], remoteSet: false, handedOff: false };
         this.sessions.set(session, inbound);
         peer.onicecandidate = (candidate) => {
             if (!candidate?.candidate) return;
@@ -389,6 +396,7 @@ export class RtcTransportProvider implements TransportProvider {
             });
         };
         peer.ondatachannel = (channel) => {
+            inbound.handedOff = true;
             const transport = new RtcByteTransport(channel, this.localAddress, from, () => {
                 try { peer.close(); } catch { /* ignore */ }
             });
@@ -421,6 +429,18 @@ export class RtcTransportProvider implements TransportProvider {
         }
     }
 
+    // bye ends signaling only. Close the peer when setup never handed off a
+    // data channel; otherwise the mesh transport owns the connection.
+    private releaseSession(session: string): void {
+        const inbound = this.sessions.get(session);
+        if (inbound === undefined) return;
+        this.sessions.delete(session);
+        if (!inbound.handedOff) {
+            try { inbound.peer.close(); } catch { /* ignore */ }
+        }
+    }
+
+    // reject aborts setup: always tear down the peer connection.
     private dropSession(session: string): void {
         const inbound = this.sessions.get(session);
         if (inbound === undefined) return;

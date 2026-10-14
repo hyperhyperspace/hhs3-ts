@@ -132,8 +132,8 @@ async function testInternetDialOut() {
                 `warns dial-out only (${built.discoveryNotes.join("; ")})`,
             );
             testing.assertTrue(
-                built.discoveryNotes.some((n) => n.includes("unreachable")),
-                "tracker was still probed",
+                built.discoveryNotes.some((n) => n.startsWith("tracker ws://127.0.0.1:1 (")),
+                `tracker probe kept its reason (${built.discoveryNotes.join("; ")})`,
             );
         } finally {
             await teardown(built);

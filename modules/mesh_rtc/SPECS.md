@@ -45,7 +45,7 @@ An honest server accepts the listen socket only when this proof matches the curr
 
 JSON text frames: `hello`, `register`, `registered`, `renew`, `dial`, `warrant`, `signal`, `bye`, `reject`. `signal` carries an opaque offer, answer, or ICE candidate. Topics are not part of this protocol.
 
-The listener keeps one socket. The dialer opens a socket, reads the warrant, exchanges signals, and closes that socket when the data channel opens. A dead data channel is a closed mesh transport. The swarm dials again.
+The listener keeps one socket. The dialer opens a socket, reads the warrant, exchanges signals, and closes that socket when the data channel opens. `bye` ends signaling only; after the data channel opens, that channel owns the mesh transport lifetime. A dead data channel is a closed mesh transport. The swarm dials again.
 
 ## Data channel
 
