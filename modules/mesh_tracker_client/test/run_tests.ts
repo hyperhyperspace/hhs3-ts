@@ -694,21 +694,25 @@ async function testCloseDrainsInFlightDiscover() {
             const [client, server] = createMemTransportPair();
             const serverCh = await serverAuth.authenticate(server, 'responder');
             serverCh.onMessage(async (data) => {
-                await gate;
-                const req = decodeRequest(data);
-                if (req.type === 'announce') {
-                    serverCh.send(encodeMessage({ type: 'announce_ack', ttls: [180] }));
-                    return;
-                }
-                if (req.type === 'query') {
-                    serverCh.send(encodeMessage({
-                        type: 'query_response',
-                        results: { [req.topics[0]!]: [] },
-                    }));
-                    return;
-                }
-                if (req.type === 'leave') {
-                    serverCh.send(encodeMessage({ type: 'leave_ack' }));
+                try {
+                    await gate;
+                    const req = decodeRequest(data);
+                    if (req.type === 'announce') {
+                        serverCh.send(encodeMessage({ type: 'announce_ack', ttls: [180] }));
+                        return;
+                    }
+                    if (req.type === 'query') {
+                        serverCh.send(encodeMessage({
+                            type: 'query_response',
+                            results: { [req.topics[0]!]: [] },
+                        }));
+                        return;
+                    }
+                    if (req.type === 'leave') {
+                        serverCh.send(encodeMessage({ type: 'leave_ack' }));
+                    }
+                } catch {
+                    // close() aborts the socket while the reply is still gated
                 }
             });
             return client;
@@ -736,12 +740,13 @@ async function testCloseDrainsInFlightDiscover() {
         await new Promise(resolve => setTimeout(resolve, 10));
 
         const closeStarted = Date.now();
-        const closing = client.close();
-        releaseReply!();
-        await closing;
-        testing.assertTrue(Date.now() - closeStarted < 1000, 'close should finish after draining the query');
+        await client.close();
+        testing.assertTrue(
+            Date.now() - closeStarted < 1000,
+            'close should abort an in-flight query instead of waiting for it',
+        );
         await new Promise(resolve => setTimeout(resolve, 20));
-        testing.assertEquals(unhandled.length, 0, 'drained discover must not unhandled-reject');
+        testing.assertEquals(unhandled.length, 0, 'aborted discover must not unhandled-reject');
     } finally {
         process.off('unhandledRejection', onUnhandled);
         releaseReply?.();
@@ -905,6 +910,171 @@ async function testConcurrentLeavesAreOneRequest() {
     testing.assertEquals(connects, afterAnnounce + 1, 'close does not open a second leave socket');
 }
 
+async function testConcurrentAnnouncesAreOneRequest() {
+    const seen: TrackerRequest[] = [];
+    const tracker = createMockTracker({ onRequest: (req) => seen.push(req) });
+    const clientKeyId = fakeKeyId('client');
+    const clientPk = fakePk('client');
+    const trackerKeyId = fakeKeyId('tracker');
+    const trackerPk = fakePk('tracker');
+    const clientAuth = makePassthroughAuth(clientKeyId, clientPk, trackerKeyId, trackerPk);
+    const serverAuth = makePassthroughAuth(trackerKeyId, trackerPk, clientKeyId, clientPk);
+    const provider = makeMockProvider(tracker, serverAuth);
+    const localPeer = fakePeerInfo('client', ['ws://client:1234']);
+    const client = new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        transportProvider: provider,
+        authenticator: clientAuth,
+        localPeer,
+        heartbeatInterval: 999_999,
+        instanceId: 'batch-announce',
+    });
+
+    const topics = ['topic-a', 'topic-b', 'topic-c', 'topic-d'] as TopicId[];
+    await Promise.all(topics.map((topic) => client.announce(topic, localPeer)));
+
+    const announces = seen.filter((req) => req.type === 'announce');
+    testing.assertEquals(announces.length, 1, 'same-turn announces share one request');
+    const announced = announces[0];
+    testing.assertTrue(
+        announced?.type === 'announce' && topics.every((topic) => announced.entries.some((entry) => entry.topic === topic)),
+        'the announce lists every topic',
+    );
+    await client.close();
+    const leaves = seen.filter((req) => req.type === 'leave');
+    testing.assertEquals(leaves.length, 1, 'close sends one leave for the batch');
+    const leave = leaves[0];
+    testing.assertTrue(
+        leave?.type === 'leave' && topics.every((topic) => leave.topics.includes(topic)),
+        'the leave lists every announced topic',
+    );
+}
+
+async function testConcurrentDiscoversAreOneRequest() {
+    const seen: TrackerRequest[] = [];
+    const tracker = createMockTracker({ onRequest: (req) => seen.push(req) });
+    const clientKeyId = fakeKeyId('client');
+    const clientPk = fakePk('client');
+    const trackerKeyId = fakeKeyId('tracker');
+    const trackerPk = fakePk('tracker');
+    const clientAuth = makePassthroughAuth(clientKeyId, clientPk, trackerKeyId, trackerPk);
+    const serverAuth = makePassthroughAuth(trackerKeyId, trackerPk, clientKeyId, clientPk);
+    const provider = makeMockProvider(tracker, serverAuth);
+    const localPeer = fakePeerInfo('client', ['ws://client:1234']);
+    const client = new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        transportProvider: provider,
+        authenticator: clientAuth,
+        localPeer,
+        heartbeatInterval: 999_999,
+    });
+
+    const topics = ['topic-a', 'topic-b', 'topic-c'] as TopicId[];
+    await Promise.all(topics.map((topic) => collectAll(client.discover(topic, ['ws']))));
+    const queries = seen.filter((req) => req.type === 'query');
+    testing.assertEquals(queries.length, 1, 'same-turn discovers share one query');
+    const query = queries[0];
+    testing.assertTrue(
+        query?.type === 'query' && topics.every((topic) => query.topics.includes(topic)),
+        'the query lists every topic',
+    );
+    await client.close();
+}
+
+async function testCloseSkipsUnsentAnnounce() {
+    const seen: TrackerRequest[] = [];
+    const tracker = createMockTracker({ onRequest: (req) => seen.push(req) });
+    const clientKeyId = fakeKeyId('client');
+    const clientPk = fakePk('client');
+    const trackerKeyId = fakeKeyId('tracker');
+    const trackerPk = fakePk('tracker');
+    const clientAuth = makePassthroughAuth(clientKeyId, clientPk, trackerKeyId, trackerPk);
+    const serverAuth = makePassthroughAuth(trackerKeyId, trackerPk, clientKeyId, clientPk);
+    const inner = makeMockProvider(tracker, serverAuth);
+    let connects = 0;
+    const provider: TransportProvider = {
+        scheme: inner.scheme,
+        async listen(addr, onConn) { return inner.listen(addr, onConn); },
+        async connect(remote) {
+            connects += 1;
+            return inner.connect(remote);
+        },
+        close() { inner.close(); },
+    };
+    const localPeer = fakePeerInfo('client', ['ws://client:1234']);
+    const client = new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        transportProvider: provider,
+        authenticator: clientAuth,
+        localPeer,
+        heartbeatInterval: 999_999,
+    });
+
+    const announcing = client.announce('topic-unsent' as TopicId, localPeer);
+    await client.close();
+    await announcing;
+    testing.assertEquals(connects, 0, 'close cancels an announce that has not started');
+    testing.assertEquals(seen.length, 0, 'no announce and no leave when nothing was registered');
+}
+
+async function testCloseDuringInFlightAnnounceStillLeaves() {
+    const seen: TrackerRequest[] = [];
+    const clientKeyId = fakeKeyId('client');
+    const clientPk = fakePk('client');
+    const trackerKeyId = fakeKeyId('tracker');
+    const trackerPk = fakePk('tracker');
+    const clientAuth = makePassthroughAuth(clientKeyId, clientPk, trackerKeyId, trackerPk);
+    const serverAuth = makePassthroughAuth(trackerKeyId, trackerPk, clientKeyId, clientPk);
+
+    let releaseReply: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => { releaseReply = resolve; });
+    const provider: TransportProvider = {
+        scheme: 'mem',
+        async listen() {},
+        async connect(_remote: NetworkAddress): Promise<Transport> {
+            const [client, server] = createMemTransportPair();
+            const serverCh = await serverAuth.authenticate(server, 'responder');
+            serverCh.onMessage(async (data) => {
+                const req = decodeRequest(data);
+                seen.push(req);
+                if (req.type === 'announce') await gate;
+                const res = req.type === 'announce'
+                    ? { type: 'announce_ack' as const, ttls: req.entries.map(() => 180) }
+                    : req.type === 'leave'
+                        ? { type: 'leave_ack' as const }
+                        : { type: 'query_response' as const, results: {} };
+                try { serverCh.send(encodeMessage(res)); } catch { /* client closed */ }
+            });
+            return client;
+        },
+        close() {},
+    };
+
+    const localPeer = fakePeerInfo('client', ['ws://client:1234']);
+    const client = new TrackerClient({
+        trackerAddress: 'mem://tracker',
+        transportProvider: provider,
+        authenticator: clientAuth,
+        localPeer,
+        heartbeatInterval: 999_999,
+        instanceId: 'inflight',
+    });
+
+    const topic = 'topic-inflight' as TopicId;
+    const announcing = client.announce(topic, localPeer);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const closing = client.close();
+    releaseReply!();
+    await announcing;
+    await closing;
+
+    const announced = seen.find((req) => req.type === 'announce');
+    const left = seen.find((req) => req.type === 'leave');
+    testing.assertTrue(announced?.type === 'announce' && announced.entries.some((entry) => entry.topic === topic), 'in-flight announce is allowed to finish');
+    testing.assertTrue(left?.type === 'leave' && left.topics.includes(topic), 'close deregisters the topic the announce registered');
+    testing.assertEquals(seen.filter((req) => req.type === 'leave').length, 1, 'one leave');
+}
+
 async function testResolveTrackerConfig() {
     const local = resolveTrackerConfig('localhost', {});
     testing.assertEquals(local.address, DEFAULT_LOCAL_TRACKER, 'localhost tracker default');
@@ -944,9 +1114,13 @@ const allSuites = [
             { name: '[TRACKER_CLIENT_06] Exchange times out on hung connect', invoke: testExchangeTimesOutOnHungConnect },
             { name: '[TRACKER_CLIENT_07] Close times out on hung leave', invoke: testCloseTimesOutOnHungLeave },
             { name: '[TRACKER_CLIENT_07b] Close after success does not unhandled-reject', invoke: testCloseAfterSuccessDoesNotUnhandledReject },
-            { name: '[TRACKER_CLIENT_07c] Close drains in-flight discover without unhandled reject', invoke: testCloseDrainsInFlightDiscover },
+            { name: '[TRACKER_CLIENT_07c] Close aborts in-flight discover without unhandled reject', invoke: testCloseDrainsInFlightDiscover },
             { name: '[TRACKER_CLIENT_07d] Leave after close does not connect', invoke: testLeaveAfterCloseDoesNotConnect },
             { name: '[TRACKER_CLIENT_07e] Concurrent leaves are one request', invoke: testConcurrentLeavesAreOneRequest },
+            { name: '[TRACKER_CLIENT_07f] Concurrent announces are one request and close leaves them', invoke: testConcurrentAnnouncesAreOneRequest },
+            { name: '[TRACKER_CLIENT_07g] Concurrent discovers are one query', invoke: testConcurrentDiscoversAreOneRequest },
+            { name: '[TRACKER_CLIENT_07h] Close skips an announce that has not started', invoke: testCloseSkipsUnsentAnnounce },
+            { name: '[TRACKER_CLIENT_07i] Close leaves a topic whose announce is in flight', invoke: testCloseDuringInFlightAnnounceStillLeaves },
             { name: '[TRACKER_CLIENT_08] resolveTrackerConfig scope defaults and overrides', invoke: testResolveTrackerConfig },
             { name: '[TRACKER_CLIENT_09] Announce and leave carry one instance per client', invoke: testInstanceCarriedOnAnnounceAndLeave },
         ],

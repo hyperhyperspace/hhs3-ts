@@ -1,5 +1,5 @@
 import type { NetworkAddress, Transport } from '@hyper-hyper-space/hhs3_mesh';
-import { FrameDecoder, encodeFrames } from './frame.js';
+import { FrameDecoder, encodeCloseFrame, encodeFrames, isCloseFrame } from './frame.js';
 import type { RtcDataChannelLike } from './peer.js';
 
 export class RtcByteTransport implements Transport {
@@ -33,13 +33,17 @@ export class RtcByteTransport implements Transport {
             };
         });
         channel.onmessage = (data) => {
+            if (isCloseFrame(data)) {
+                this.shutdown(false);
+                return;
+            }
             const payload = this.decoder.push(data);
             if (payload === undefined) return;
             const copy = new Uint8Array(payload);
             for (const cb of this.messageCallbacks) cb(copy);
         };
-        channel.onclose = () => this.shutdown();
-        channel.onerror = () => this.shutdown();
+        channel.onclose = () => this.shutdown(false);
+        channel.onerror = () => this.shutdown(false);
     }
 
     get open(): boolean { return this._open; }
@@ -50,7 +54,7 @@ export class RtcByteTransport implements Transport {
     }
 
     close(): void {
-        this.shutdown();
+        this.shutdown(true);
     }
 
     onMessage(callback: (message: Uint8Array) => void): void {
@@ -61,9 +65,14 @@ export class RtcByteTransport implements Transport {
         this.closeCallbacks.push(callback);
     }
 
-    private shutdown(): void {
+    // `notify` sends one CLOSE frame first. A received CLOSE, or a channel
+    // that is already gone, must not echo it.
+    private shutdown(notify: boolean): void {
         if (this.disposed) return;
         this.disposed = true;
+        if (notify && this.channel.readyState === 'open') {
+            try { this.channel.send(encodeCloseFrame()); } catch { /* ignore */ }
+        }
         this.markClosed();
         try { this.channel.close(); } catch { /* ignore */ }
         try { this.dispose?.(); } catch { /* ignore */ }

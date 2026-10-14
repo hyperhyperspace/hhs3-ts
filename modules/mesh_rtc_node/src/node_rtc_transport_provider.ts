@@ -30,12 +30,26 @@ export interface NodeRtcTransportProviderOptions {
 }
 
 export class NodeRtcTransportProvider extends RtcTransportProvider {
+    private readonly settling: Promise<void>[];
+
     constructor(opts: NodeRtcTransportProviderOptions) {
+        const settling: Promise<void>[] = [];
         super({
             ...opts,
-            createRTCPeerConnection: opts.createRTCPeerConnection ?? (ice => adaptWerift(ice, opts.werift)),
+            createRTCPeerConnection: opts.createRTCPeerConnection ?? (ice => adaptWerift(ice, opts.werift, (job) => {
+                settling.push(job);
+            })),
             openSignaling: opts.openSignaling ?? openNodeSignaling,
         });
+        this.settling = settling;
+    }
+
+    // Peer closes flush the CLOSE frame and the SCTP abort before the ICE
+    // socket goes away. Mesh teardown awaits this so those packets leave the
+    // process.
+    flushClose(): Promise<void> {
+        const pending = this.settling.splice(0);
+        return Promise.allSettled(pending).then(() => {});
     }
 }
 
@@ -43,18 +57,22 @@ export function openNodeSignaling(url: string): Promise<SignalSocket> {
     const ws = new WebSocket(url);
     const sock = wrapNodeSocket(ws);
     return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
+        let settled = false;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const finish = (err?: Error) => {
+            if (settled) return;
+            settled = true;
+            if (timer !== undefined) clearTimeout(timer);
+            if (err !== undefined) reject(err);
+            else resolve(sock);
+        };
+        timer = setTimeout(() => {
             try { ws.close(); } catch { /* ignore */ }
-            reject(new Error('signaling socket timeout'));
+            finish(new Error('signaling socket timeout'));
         }, 10_000);
-        ws.once('open', () => {
-            clearTimeout(timer);
-            resolve(sock);
-        });
-        ws.once('error', () => {
-            clearTimeout(timer);
-            reject(new Error(`signaling socket failed: ${url}`));
-        });
+        ws.once('open', () => finish());
+        ws.once('error', () => finish(new Error(`signaling socket failed: ${url}`)));
+        ws.once('close', () => finish(new Error('signaling socket closed')));
     });
 }
 
@@ -88,15 +106,35 @@ function wrapNodeSocket(ws: WebSocket): SignalSocket {
     };
 }
 
-function adaptWerift(iceServers: RtcIceServer[], extra?: Partial<PeerConfig>): RtcPeerLike {
+const SCTP_FLUSH_BUDGET_MS = 500;
+
+interface FlushableChannel {
+    readyState: string;
+    bufferedAmount: number;
+}
+
+interface WeriftClosing {
+    readonly sctpManager: { close(): Promise<void> };
+    close(): Promise<void>;
+}
+
+function adaptWerift(
+    iceServers: RtcIceServer[],
+    extra?: Partial<PeerConfig>,
+    onClosing?: (job: Promise<void>) => void,
+): RtcPeerLike {
     const pc = new RTCPeerConnection({
         ...extra,
         iceServers: iceServers.map(toWeriftIce),
     });
+    const channels: FlushableChannel[] = [];
+    let closed = false;
     const peer: RtcPeerLike = {
         get connectionState() { return pc.connectionState; },
         createDataChannel(label: string) {
-            return adaptChannel(pc.createDataChannel(label, { ordered: true }));
+            const native = pc.createDataChannel(label, { ordered: true });
+            channels.push(native);
+            return adaptChannel(native);
         },
         async createOffer(): Promise<RtcDescription> {
             const desc = await pc.createOffer();
@@ -120,7 +158,13 @@ function adaptWerift(iceServers: RtcIceServer[], extra?: Partial<PeerConfig>): R
                 sdpMLineIndex: candidate.sdpMLineIndex ?? undefined,
             });
         },
-        close() { void pc.close(); },
+        close() {
+            if (closed) return;
+            closed = true;
+            const job = shutdownWerift(pc, channels);
+            onClosing?.(job);
+            void job.catch(() => {});
+        },
         onicecandidate: null,
         ondatachannel: null,
         onconnectionstatechange: null,
@@ -135,12 +179,29 @@ function adaptWerift(iceServers: RtcIceServer[], extra?: Partial<PeerConfig>): R
         });
     };
     pc.ondatachannel = ev => {
+        channels.push(ev.channel);
         peer.ondatachannel?.(adaptChannel(ev.channel));
     };
     pc.onconnectionstatechange = () => {
         peer.onconnectionstatechange?.();
     };
     return peer;
+}
+
+// werift's RTCPeerConnection.close() drops the ICE socket before SCTP abort,
+// so the remote peer sees nothing. Flush queued data-channel bytes (the CLOSE
+// frame), abort SCTP while UDP is still up, then close the peer connection.
+async function shutdownWerift(pc: RTCPeerConnection, channels: FlushableChannel[]): Promise<void> {
+    const peer = pc as unknown as WeriftClosing;
+    const live = channels.some((channel) => channel.readyState === 'open' || channel.readyState === 'closing');
+    if (live) {
+        const deadline = Date.now() + SCTP_FLUSH_BUDGET_MS;
+        while (channels.some((channel) => channel.bufferedAmount > 0) && Date.now() < deadline) {
+            await new Promise((resolve) => setImmediate(resolve));
+        }
+        try { await peer.sctpManager.close(); } catch { /* best-effort */ }
+    }
+    try { await peer.close(); } catch { /* best-effort */ }
 }
 
 function toWeriftIce(server: RtcIceServer): WeriftIceServer {

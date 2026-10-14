@@ -74,7 +74,13 @@ export class WsTransportProvider implements TransportProvider {
                 reject(new Error(`ws connect timeout: ${remote}`));
             }, this.connectTimeoutMs);
 
-            ws.on('close', () => this.sockets.delete(ws));
+            ws.on('close', () => {
+                this.sockets.delete(ws);
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                reject(new Error('ws closed before open'));
+            });
             ws.on('open', () => {
                 if (settled) return;
                 settled = true;

@@ -3,6 +3,7 @@
 
 const FULL = 0x01;
 const PART = 0x02;
+const CLOSE = 0x03;
 const HEADER_PART = 9;
 
 export const DEFAULT_MAX_FRAME = 16 * 1024;
@@ -29,6 +30,16 @@ export function encodeFrames(payload: Uint8Array, maxFrame = DEFAULT_MAX_FRAME):
         frames.push(frame);
     }
     return frames;
+}
+
+// One byte, distinct from a framed mesh message (those start with FULL or PART).
+// The peer that receives it tears the transport down immediately.
+export function encodeCloseFrame(): Uint8Array {
+    return Uint8Array.of(CLOSE);
+}
+
+export function isCloseFrame(frame: Uint8Array): boolean {
+    return frame.byteLength === 1 && frame[0] === CLOSE;
 }
 
 export class FrameDecoder {

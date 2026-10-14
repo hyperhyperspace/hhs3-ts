@@ -52,22 +52,22 @@ function openPlatformSocket(url: string, WS: new (url: string) => WebSocket): Pr
     const ws = new WS(url);
     const sock = wrapPlatformSocket(ws);
     return new Promise((resolve, reject) => {
-        let opened = false;
-        const timer = setTimeout(() => {
-            if (opened) return;
+        let settled = false;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const finish = (err?: Error) => {
+            if (settled) return;
+            settled = true;
+            if (timer !== undefined) clearTimeout(timer);
+            if (err !== undefined) reject(err);
+            else resolve(sock);
+        };
+        timer = setTimeout(() => {
             try { ws.close(); } catch { /* ignore */ }
-            reject(new Error('signaling socket timeout'));
+            finish(new Error('signaling socket timeout'));
         }, 10_000);
-        ws.addEventListener('open', () => {
-            opened = true;
-            clearTimeout(timer);
-            resolve(sock);
-        });
-        ws.addEventListener('error', () => {
-            if (opened) return;
-            clearTimeout(timer);
-            reject(new Error('signaling socket failed'));
-        });
+        ws.addEventListener('open', () => finish());
+        ws.addEventListener('error', () => finish(new Error('signaling socket failed')));
+        ws.addEventListener('close', () => finish(new Error('signaling socket closed')));
     });
 }
 

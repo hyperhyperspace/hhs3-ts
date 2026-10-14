@@ -25,7 +25,7 @@ export {
     type SignalMessage,
     type SignalData,
 } from './protocol.js';
-export { encodeFrames, FrameDecoder, DEFAULT_MAX_FRAME } from './frame.js';
+export { encodeFrames, encodeCloseFrame, isCloseFrame, FrameDecoder, DEFAULT_MAX_FRAME } from './frame.js';
 export {
     DEFAULT_ICE_SERVERS,
     DATA_CHANNEL_LABEL,

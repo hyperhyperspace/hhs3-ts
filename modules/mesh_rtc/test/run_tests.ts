@@ -6,8 +6,10 @@ import {
 } from '@hyper-hyper-space/hhs3_crypto';
 import {
     delegationToWire,
+    encodeCloseFrame,
     encodeFrames,
     FrameDecoder,
+    isCloseFrame,
     parseRtcAddress,
     rtcAddressFor,
     signDelegation,
@@ -86,6 +88,10 @@ async function testFrames() {
     testing.assertTrue(joined !== undefined && joined.length === big.length, 'fragment length');
     testing.assertEquals(joined![0], big[0]!, 'fragment head');
     testing.assertEquals(joined![joined!.length - 1], big[big.length - 1]!, 'fragment tail');
+
+    const close = encodeCloseFrame();
+    testing.assertTrue(isCloseFrame(close), 'close frame is recognized');
+    testing.assertTrue(new FrameDecoder().push(close) === undefined, 'close frame is not a mesh payload');
 }
 
 const allSuites = [

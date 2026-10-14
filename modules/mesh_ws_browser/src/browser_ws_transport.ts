@@ -8,11 +8,25 @@ export class BrowserWsTransport implements Transport {
 
     private ws: WebSocket;
     readonly remoteAddress?: NetworkAddress;
+    private pending: Uint8Array[] = [];
+    private messageCallbacks: ((message: Uint8Array) => void)[] = [];
+    private subscribed = false;
 
     constructor(ws: WebSocket, remoteAddress?: NetworkAddress) {
         this.ws = ws;
         this.ws.binaryType = 'arraybuffer';
         this.remoteAddress = remoteAddress;
+        // Attach immediately so a frame that arrives before onMessage (the
+        // first Noise message) is not dropped.
+        this.ws.addEventListener('message', (ev: MessageEvent) => {
+            const bytes = toBytes(ev.data);
+            if (bytes === undefined) return;
+            if (!this.subscribed) {
+                this.pending.push(bytes);
+                return;
+            }
+            for (const cb of this.messageCallbacks) cb(bytes);
+        });
     }
 
     get open(): boolean {
@@ -35,18 +49,22 @@ export class BrowserWsTransport implements Transport {
     }
 
     onMessage(callback: (message: Uint8Array) => void): void {
-        this.ws.addEventListener('message', (ev: MessageEvent) => {
-            const d = ev.data;
-            if (d instanceof ArrayBuffer) {
-                callback(new Uint8Array(d));
-            } else if (ArrayBuffer.isView(d)) {
-                callback(new Uint8Array(d.buffer, d.byteOffset, d.byteLength));
-            }
-            // string frames ignored: the wire protocol is binary
-        });
+        const first = !this.subscribed;
+        this.subscribed = true;
+        this.messageCallbacks.push(callback);
+        if (!first) return;
+        const buffered = this.pending;
+        this.pending = [];
+        for (const bytes of buffered) callback(bytes);
     }
 
     onClose(callback: () => void): void {
         this.ws.addEventListener('close', () => callback());
     }
+}
+
+function toBytes(data: unknown): Uint8Array | undefined {
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    return undefined;
 }

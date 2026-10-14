@@ -8,9 +8,23 @@ import type { Transport } from '@hyper-hyper-space/hhs3_mesh';
 export class WsTransport implements Transport {
 
     private ws: WebSocket;
+    private pending: Uint8Array[] = [];
+    private messageCallbacks: ((message: Uint8Array) => void)[] = [];
+    private subscribed = false;
 
     constructor(ws: WebSocket) {
         this.ws = ws;
+        // Attach immediately. The Noise responder registers onMessage only after
+        // its handshake returns, and the initiator's first frame can already be
+        // sitting on the socket by then.
+        this.ws.on('message', (data: WebSocket.RawData) => {
+            const bytes = toBytes(data);
+            if (!this.subscribed) {
+                this.pending.push(bytes);
+                return;
+            }
+            for (const cb of this.messageCallbacks) cb(bytes);
+        });
     }
 
     get open(): boolean {
@@ -32,20 +46,23 @@ export class WsTransport implements Transport {
     }
 
     onMessage(callback: (message: Uint8Array) => void): void {
-        this.ws.on('message', (data: WebSocket.RawData) => {
-            if (data instanceof ArrayBuffer) {
-                callback(new Uint8Array(data));
-            } else if (data instanceof Buffer) {
-                callback(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
-            } else if (Array.isArray(data)) {
-                callback(new Uint8Array(Buffer.concat(data)));
-            } else {
-                callback(new Uint8Array(data));
-            }
-        });
+        const first = !this.subscribed;
+        this.subscribed = true;
+        this.messageCallbacks.push(callback);
+        if (!first) return;
+        const buffered = this.pending;
+        this.pending = [];
+        for (const bytes of buffered) callback(bytes);
     }
 
     onClose(callback: () => void): void {
         this.ws.on('close', callback);
     }
+}
+
+function toBytes(data: WebSocket.RawData): Uint8Array {
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    if (data instanceof Buffer) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    if (Array.isArray(data)) return new Uint8Array(Buffer.concat(data));
+    return new Uint8Array(data);
 }

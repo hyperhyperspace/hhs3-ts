@@ -126,9 +126,16 @@ export async function validateAllowSources(sources: AllowSource[], lookup: Colum
 // --- Meshes and database sync ---
 
 export async function closeBuiltMesh(
-    mesh: { close(): void },
+    mesh: { close(): void; closePeers?(): void },
     closeables: SyncCloseable[],
 ): Promise<void> {
+    // Tell swarm peers immediately. Discovery close (the tracker leave) still
+    // needs the listen/dial transports, so those stay up until mesh.close().
+    try {
+        mesh.closePeers?.();
+    } catch {
+        // best-effort
+    }
     // Await discovery close (tracker chain drain / leave) before mesh.close()
     // tears down transports. A short race here used to kill in-flight tracker
     // exchanges and crash the process with an unhandled rejection.

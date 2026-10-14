@@ -23,7 +23,7 @@ export class PoolReuseDiscovery implements PeerDiscovery {
 
     private pool: ConnectionPool;
     private timeoutMs: number;
-    private pending = new Map<string, { resolve: (v: boolean) => void }>();
+    private pending = new Map<string, { resolve: (v: boolean) => void; timer: ReturnType<typeof setTimeout> }>();
     private rejected = new Set<string>();
 
     constructor(pool: ConnectionPool, timeoutMs = DEFAULT_TIMEOUT_MS) {
@@ -38,6 +38,14 @@ export class PoolReuseDiscovery implements PeerDiscovery {
             for (const key of this.rejected) {
                 if (key.startsWith(connKey + '#')) this.rejected.delete(key);
             }
+            for (const key of [...this.pending.keys()]) {
+                if (!key.startsWith(connKey + '#')) continue;
+                const entry = this.pending.get(key);
+                if (entry === undefined) continue;
+                clearTimeout(entry.timer);
+                this.pending.delete(key);
+                entry.resolve(false);
+            }
         });
     }
 
@@ -50,6 +58,7 @@ export class PoolReuseDiscovery implements PeerDiscovery {
             const entry = this.pending.get(key);
             if (entry === undefined) return;
 
+            clearTimeout(entry.timer);
             this.pending.delete(key);
             if (ctrl.ctrl === CTRL_TOPIC_REJECT) this.rejected.add(key);
             entry.resolve(ctrl.ctrl === CTRL_TOPIC_ACCEPT);
@@ -106,6 +115,7 @@ export class PoolReuseDiscovery implements PeerDiscovery {
             }, this.timeoutMs);
 
             this.pending.set(key, {
+                timer,
                 resolve: (v) => { clearTimeout(timer); resolve(v); },
             });
         });

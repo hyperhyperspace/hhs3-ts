@@ -86,8 +86,9 @@ export async function createNodeMesh(
 
     const webrtc = planWebrtc(scoped, DEFAULT_INTERNET_SIGNAL);
     let rtcAddress: NetworkAddress | undefined;
+    let rtc: NodeRtcTransportProvider | undefined;
     if (webrtc.install) {
-        const rtc = new NodeRtcTransportProvider({
+        rtc = new NodeRtcTransportProvider({
             identity: runtime.identity,
             ...(webrtc.listen ? { signalBase: webrtc.signal } : {}),
             ...(webrtc.iceServers !== undefined ? { iceServers: webrtc.iceServers } : {}),
@@ -119,6 +120,10 @@ export async function createNodeMesh(
     });
 
     if (!wsPlan.dial) closeables.push({ close: () => ws.close() });
+    if (rtc !== undefined) {
+        const closing = rtc;
+        closeables.push({ close: () => closing.flushClose() });
+    }
     if (scoped.scope === 'internet' && listenAddresses.length === 0) {
         notes.unshift('dial-out only');
     }

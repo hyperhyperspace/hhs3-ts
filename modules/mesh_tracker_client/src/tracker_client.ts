@@ -2,6 +2,11 @@
 // tracker server over Transport + Noise, sends list-based protocol messages,
 // and disconnects after each exchange. A periodic heartbeat re-announces all
 // active topics to keep registrations alive.
+//
+// announce() and discover() from the same turn share one request each, so a
+// database that opens many swarms at once does not open one socket per topic.
+// close() drops discovery that has not reached the wire, lets an in-flight
+// announce finish, and sends one leave for every topic the tracker accepted.
 
 import type {
     TopicId, PeerInfo, PeerDiscovery,
@@ -12,7 +17,7 @@ import { random, type KeyId } from '@hyper-hyper-space/hhs3_crypto';
 import {
     encodeMessage, decodeResponse,
     type TrackerRequest, type TrackerResponse,
-    type AnnounceRequest, type QueryRequest, type LeaveRequest,
+    type AnnounceEntry, type AnnounceRequest, type QueryRequest, type LeaveRequest,
 } from './protocol.js';
 import { TRACE_TRACKER, trace } from './trace.js';
 
@@ -34,6 +39,18 @@ export interface TrackerClientConfig {
 
 const DEFAULT_TTL = 180;
 const DEFAULT_HEARTBEAT_MS = 60_000;
+const CLOSED_ERROR = 'tracker client closed';
+
+interface QueryWaiter {
+    resolve: (peers: PeerInfo[]) => void;
+    reject: (err: Error) => void;
+}
+
+interface QueryBatch {
+    schemes?: string[];
+    topics: TopicId[];
+    waiters: Map<TopicId, QueryWaiter[]>;
+}
 
 export class TrackerClient implements PeerDiscovery {
     readonly instanceId: string;
@@ -50,18 +67,31 @@ export class TrackerClient implements PeerDiscovery {
     // Topics already handed to a leave. Announce and heartbeat acks must not
     // put them back, or close() would open a second leave for them.
     private leftTopics = new Set<TopicId>();
+    // Same-turn announces share one request. A leave that arrives before that
+    // request is on the wire removes the topic here instead.
+    private pendingAnnounces = new Map<TopicId, number>();
+    private announceSend: Promise<void> | undefined;
+    // Same-turn discovers with the same scheme filter share one query.
+    private pendingQueries = new Map<string, QueryBatch>();
+    private querySend: Promise<void> | undefined;
     // leave() only records the topic. One send runs on the next turn so a
     // destroy loop's back-to-back leaves share a single request.
     private pendingLeaves = new Set<TopicId>();
     private leaveSend: Promise<void> | undefined;
+    // Topics in an announce that has reached exchangeOnce. A leave during that
+    // exchange still deregisters them after the ack.
+    private inflightAnnounceTopics = new Set<TopicId>();
     private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
     // One in-flight connect-on-demand exchange at a time. Overlapping
     // handshakes can drop the first post-handshake frame (browser \sync fetch
     // raced announce vs query). Failures must not stall the chain.
     private chain: Promise<void> = Promise.resolve();
+    private inflightKind: TrackerRequest['type'] | undefined;
+    private inflightAbort: (() => void) | undefined;
     // After close(), leave/announce/discover must not open a new socket: mesh
     // teardown destroys swarms (which fire leave) after discovery closeables
     // have already run, and a late connect would outlive provider.close().
+    // A leave for topics already on the tracker still runs.
     private closed = false;
 
     constructor(config: TrackerClientConfig) {
@@ -84,11 +114,7 @@ export class TrackerClient implements PeerDiscovery {
         targetPeers?: number,
     ): AsyncIterable<PeerInfo> {
         if (this.closed) return;
-        const req: QueryRequest = { type: 'query', topics: [topic], schemes };
-        const res = await this.exchange(req);
-        if (res.type === 'error') throw new Error(res.message);
-        if (res.type !== 'query_response') throw new Error('unexpected response');
-        const peers = res.results[topic] ?? [];
+        const peers = await this.enqueueQuery(topic, schemes);
         let count = 0;
         for (const peer of peers) {
             if (targetPeers !== undefined && count >= targetPeers) break;
@@ -115,22 +141,16 @@ export class TrackerClient implements PeerDiscovery {
     async announce(topic: TopicId, _self: PeerInfo): Promise<void> {
         if (this.closed) return;
         this.leftTopics.delete(topic);
-        const req: AnnounceRequest = {
-            type: 'announce',
-            entries: [{ topic, ttl: this.requestedTtl }],
-            peer: this.localPeer,
-            instance: this.instanceId,
-        };
-        const res = await this.exchange(req);
-        if (res.type === 'error') throw new Error(res.message);
-        if (res.type !== 'announce_ack') throw new Error('unexpected response');
-        if (this.leftTopics.has(topic)) return;
-        this.activeTopics.set(topic, res.ttls[0] ?? this.requestedTtl);
-        this.ensureHeartbeat();
+        this.pendingLeaves.delete(topic);
+        this.pendingAnnounces.set(topic, this.requestedTtl);
+        const send = this.announceSend ?? this.scheduleAnnounceSend();
+        this.announceSend = send;
+        return send;
     }
 
     async leave(topic: TopicId, _self: KeyId): Promise<void> {
         if (this.closed) return;
+        this.pendingAnnounces.delete(topic);
         this.pendingLeaves.add(topic);
         const send = this.leaveSend ?? this.scheduleLeaveSend();
         this.leaveSend = send;
@@ -145,27 +165,160 @@ export class TrackerClient implements PeerDiscovery {
         // swarm.destroy() → discovery.leave cannot open another socket afterward.
         this.closed = true;
         this.stopHeartbeat();
+        // Announces that have not been snapshotted never reached the tracker.
+        this.pendingAnnounces.clear();
+        this.rejectPendingQueries(new Error(CLOSED_ERROR));
+        // A discover sitting on the wire is useless during shutdown. An announce
+        // or leave already on the wire must finish so the tracker entry is real
+        // before we deregister it.
+        if (this.inflightKind === 'query') this.inflightAbort?.();
         // leave() only remembers topics until the next turn. Yield so a destroy
         // loop's leaves enqueue their one exchange before we snapshot the chain.
         await Promise.resolve();
-        // Finish announce/query already on the chain, and that coalesced leave
-        // if the destroy loop queued one, before reading activeTopics. An
-        // in-flight announce has not registered yet, and an abandoned discover
-        // must not reject after the mesh tears down its transports.
         await this.chain;
         const topics = [...this.activeTopics.keys()];
         this.activeTopics.clear();
         if (topics.length === 0) return;
         for (const topic of topics) this.leftTopics.add(topic);
-        const req: LeaveRequest = { type: 'leave', topics, instance: this.instanceId };
         try {
-            await this.exchange(req);
+            await this.enqueue(() => this.exchangeOnce({
+                type: 'leave',
+                topics,
+                instance: this.instanceId,
+            }));
         } catch {
             // best-effort; the TTL will expire on the server
         }
     }
 
     // -- internal -------------------------------------------------------------
+
+    private enqueueQuery(topic: TopicId, schemes?: string[]): Promise<PeerInfo[]> {
+        const key = schemesKey(schemes);
+        let batch = this.pendingQueries.get(key);
+        if (batch === undefined) {
+            batch = { schemes, topics: [], waiters: new Map() };
+            this.pendingQueries.set(key, batch);
+        }
+        if (!batch.topics.includes(topic)) batch.topics.push(topic);
+        const result = new Promise<PeerInfo[]>((resolve, reject) => {
+            const waiters = batch!.waiters.get(topic) ?? [];
+            waiters.push({ resolve, reject });
+            batch!.waiters.set(topic, waiters);
+        });
+        // The generator awaits this too. An abandoned discover must not surface
+        // as an unhandled rejection when shutdown rejects the waiter.
+        void result.catch(() => {});
+        if (this.querySend === undefined) this.querySend = this.scheduleQuerySend();
+        return result;
+    }
+
+    private scheduleQuerySend(): Promise<void> {
+        const run = Promise.resolve().then(() => this.sendPendingQueries());
+        void run.catch(() => {});
+        return run;
+    }
+
+    private async sendPendingQueries(): Promise<void> {
+        const batches = [...this.pendingQueries.values()];
+        this.pendingQueries.clear();
+        this.querySend = undefined;
+        for (const batch of batches) {
+            try {
+                const res = await this.enqueue(async () => {
+                    if (this.closed) throw new Error(CLOSED_ERROR);
+                    const req: QueryRequest = {
+                        type: 'query',
+                        topics: batch.topics,
+                        ...(batch.schemes !== undefined ? { schemes: batch.schemes } : {}),
+                    };
+                    return this.exchangeOnce(req);
+                });
+                if (res.type === 'error') throw new Error(res.message);
+                if (res.type !== 'query_response') throw new Error('unexpected response');
+                for (const [topic, waiters] of batch.waiters) {
+                    const peers = res.results[topic] ?? [];
+                    for (const waiter of waiters) waiter.resolve(peers);
+                }
+            } catch (err) {
+                const error = err instanceof Error ? err : new Error(String(err));
+                for (const waiters of batch.waiters.values()) {
+                    for (const waiter of waiters) waiter.reject(error);
+                }
+            }
+        }
+    }
+
+    private rejectPendingQueries(err: Error): void {
+        const batches = [...this.pendingQueries.values()];
+        this.pendingQueries.clear();
+        for (const batch of batches) {
+            for (const waiters of batch.waiters.values()) {
+                for (const waiter of waiters) waiter.reject(err);
+            }
+        }
+    }
+
+    private scheduleAnnounceSend(): Promise<void> {
+        const run = Promise.resolve().then(() => this.sendPendingAnnounces());
+        void run.catch(() => {});
+        return run;
+    }
+
+    private async sendPendingAnnounces(): Promise<void> {
+        const entries: AnnounceEntry[] = [...this.pendingAnnounces.entries()].map(
+            ([topic, ttl]) => ({ topic, ttl }),
+        );
+        this.pendingAnnounces.clear();
+        this.announceSend = undefined;
+        if (entries.length === 0) return;
+
+        // Ack handling stays inside the chain slot so close(), waiting on
+        // `this.chain`, observes activeTopics before it sends leave.
+        await this.enqueue(async () => {
+            if (this.closed) return;
+            const live = entries.filter((entry) =>
+                !this.leftTopics.has(entry.topic) && !this.pendingLeaves.has(entry.topic),
+            );
+            if (live.length === 0) return;
+            this.inflightAnnounceTopics = new Set(live.map((entry) => entry.topic));
+            try {
+                const res = await this.exchangeOnce(this.announceRequest(live));
+                if (res.type === 'error') throw new Error(res.message);
+                if (res.type !== 'announce_ack') throw new Error('unexpected response');
+                for (let i = 0; i < live.length; i++) {
+                    const topic = live[i]!.topic;
+                    if (this.leftTopics.has(topic)) continue;
+                    this.activeTopics.set(topic, res.ttls[i] ?? live[i]!.ttl);
+                }
+                if (!this.closed && this.activeTopics.size > 0) this.ensureHeartbeat();
+            } catch (err) {
+                // The request may have reached the tracker even though we never
+                // saw the ack. Remember it so close() still deregisters.
+                if (this.closed && !isClosedError(err)) {
+                    for (const entry of live) {
+                        if (!this.leftTopics.has(entry.topic)) {
+                            this.activeTopics.set(entry.topic, entry.ttl);
+                        }
+                    }
+                    return;
+                }
+                if (isClosedError(err)) return;
+                throw err;
+            } finally {
+                this.inflightAnnounceTopics.clear();
+            }
+        });
+    }
+
+    private announceRequest(entries: AnnounceEntry[]): AnnounceRequest {
+        return {
+            type: 'announce',
+            entries,
+            peer: this.localPeer,
+            instance: this.instanceId,
+        };
+    }
 
     /** Remembered leaves become one request on the next turn. Every leave()
      *  from the same turn waits on this one reply. */
@@ -182,23 +335,28 @@ export class TrackerClient implements PeerDiscovery {
         if (topics.length === 0) return;
         for (const topic of topics) {
             this.leftTopics.add(topic);
-            this.activeTopics.delete(topic);
+            this.pendingAnnounces.delete(topic);
         }
+        // Only topics the tracker knows about. A leave that cancelled a pending
+        // announce, or that raced a discover, must not open a socket.
+        const toLeave = topics.filter((topic) =>
+            this.activeTopics.has(topic) || this.inflightAnnounceTopics.has(topic),
+        );
+        for (const topic of toLeave) this.activeTopics.delete(topic);
         if (this.activeTopics.size === 0) this.stopHeartbeat();
-        const res = await this.exchange({
+        if (toLeave.length === 0) return;
+        const res = await this.enqueue(() => this.exchangeOnce({
             type: 'leave',
-            topics,
+            topics: toLeave,
             instance: this.instanceId,
-        });
+        }));
         if (res.type === 'error') throw new Error(res.message);
     }
 
-    /** Enqueue an exchange so announce/query/leave/heartbeat never overlap. */
-    private exchange(req: TrackerRequest): Promise<TrackerResponse> {
-        const run = this.chain.then(() => this.exchangeOnce(req));
+    /** Run `op` only when the previous exchange has finished. */
+    private enqueue<T>(op: () => Promise<T>): Promise<T> {
+        const run = this.chain.then(op);
         this.chain = run.then(() => {}, () => {});
-        // Callers may abandon (async generator closed on swarm destroy). Keep
-        // rejections observed so Node does not treat them as unhandled.
         void run.catch(() => {});
         return run;
     }
@@ -229,6 +387,13 @@ export class TrackerClient implements PeerDiscovery {
         const fields = exchangeFields(req, this.address);
         if (TRACE_TRACKER) trace('tracker.exchange start', fields);
 
+        this.inflightKind = req.type;
+        this.inflightAbort = () => {
+            try { channel?.close(); } catch { /* ignore */ }
+            try { raw?.close(); } catch { /* ignore */ }
+            finish(new Error(CLOSED_ERROR));
+        };
+
         timer = setTimeout(() => {
             try { channel?.close(); } catch { /* ignore */ }
             try { raw?.close(); } catch { /* ignore */ }
@@ -237,10 +402,16 @@ export class TrackerClient implements PeerDiscovery {
 
         const work = (async () => {
             raw = await this.transport.connect(this.address);
+            if (settled) {
+                try { raw.close(); } catch { /* ignore */ }
+                throw new Error(CLOSED_ERROR);
+            }
             channel = await this.authenticator.authenticate(
                 raw, 'initiator', this.trackerKeyId,
             );
+            if (settled) throw new Error(CLOSED_ERROR);
             await new Promise(resolve => setTimeout(resolve, 0));
+            if (settled) throw new Error(CLOSED_ERROR);
 
             const responsePromise = new Promise<TrackerResponse>((resolve, reject) => {
                 channel!.onMessage((data) => {
@@ -287,6 +458,8 @@ export class TrackerClient implements PeerDiscovery {
         } finally {
             if (timer !== undefined) clearTimeout(timer);
             settled = true;
+            this.inflightKind = undefined;
+            this.inflightAbort = undefined;
             try { channel?.close(); } catch { /* ignore */ }
             try { raw?.close(); } catch { /* ignore */ }
         }
@@ -308,26 +481,26 @@ export class TrackerClient implements PeerDiscovery {
     }
 
     private async heartbeat(): Promise<void> {
-        if (this.activeTopics.size === 0) return;
+        if (this.closed || this.activeTopics.size === 0) return;
         const entries = [...this.activeTopics.entries()].map(
             ([topic, ttl]) => ({ topic, ttl }),
         );
-        const req: AnnounceRequest = {
-            type: 'announce',
-            entries,
-            peer: this.localPeer,
-            instance: this.instanceId,
-        };
         try {
-            const res = await this.exchange(req);
-            if (res.type === 'announce_ack') {
-                for (let i = 0; i < entries.length; i++) {
-                    const topic = entries[i].topic;
-                    if (res.ttls[i] !== undefined && !this.leftTopics.has(topic)) {
-                        this.activeTopics.set(topic, res.ttls[i]);
+            await this.enqueue(async () => {
+                if (this.closed) return;
+                const live = entries.filter((entry) =>
+                    this.activeTopics.has(entry.topic) && !this.leftTopics.has(entry.topic),
+                );
+                if (live.length === 0) return;
+                const res = await this.exchangeOnce(this.announceRequest(live));
+                if (res.type !== 'announce_ack') return;
+                for (let i = 0; i < live.length; i++) {
+                    const topic = live[i]!.topic;
+                    if (res.ttls[i] !== undefined && !this.leftTopics.has(topic) && this.activeTopics.has(topic)) {
+                        this.activeTopics.set(topic, res.ttls[i]!);
                     }
                 }
-            }
+            });
         } catch {
             // transient failure; will retry on next tick
         }
@@ -339,6 +512,15 @@ function randomInstanceId(): string {
     const bytes = random.getBytes(8);
     for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!);
     return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function schemesKey(schemes: string[] | undefined): string {
+    if (schemes === undefined || schemes.length === 0) return '';
+    return [...schemes].sort().join('\0');
+}
+
+function isClosedError(err: unknown): boolean {
+    return err instanceof Error && err.message === CLOSED_ERROR;
 }
 
 function exchangeFields(req: TrackerRequest, addr: NetworkAddress): Record<string, unknown> {

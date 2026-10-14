@@ -49,6 +49,7 @@ export interface RtcTransportProviderOptions {
 }
 
 interface Outbound {
+    endpointId: string;
     abort: (err: Error) => void;
 }
 
@@ -155,7 +156,7 @@ export class RtcTransportProvider implements TransportProvider {
                 if (settled) return;
                 settled = true;
                 clearTimeout(timer);
-                this.outbounds.delete(parsed.endpointId);
+                this.outbounds.delete(session);
                 try { peer?.close(); } catch { /* ignore */ }
                 try { socket?.close(); } catch { /* ignore */ }
                 reject(err);
@@ -167,7 +168,7 @@ export class RtcTransportProvider implements TransportProvider {
                 }
                 settled = true;
                 clearTimeout(timer);
-                this.outbounds.delete(parsed.endpointId);
+                this.outbounds.delete(session);
                 try { socket?.send(encodeSignalMessage({ type: 'bye', session })); } catch { /* ignore */ }
                 try { socket?.close(); } catch { /* ignore */ }
                 resolve(transport);
@@ -186,7 +187,7 @@ export class RtcTransportProvider implements TransportProvider {
                 }
             };
 
-            this.outbounds.set(parsed.endpointId, { abort: fail });
+            this.outbounds.set(session, { endpointId: parsed.endpointId, abort: fail });
 
             const onText = async (text: string) => {
                 const msg = parseSignalMessage(text);
@@ -369,11 +370,20 @@ export class RtcTransportProvider implements TransportProvider {
         }
     }
 
+    private outboundsTo(endpointId: string): Outbound[] {
+        const matches: Outbound[] = [];
+        for (const outbound of this.outbounds.values()) {
+            if (outbound.endpointId === endpointId) matches.push(outbound);
+        }
+        return matches;
+    }
+
     private acceptDial(session: string, from: NetworkAddress | undefined): void {
         const remoteId = from === undefined ? undefined : endpointIdOf(from);
-        if (remoteId !== undefined && this.outbounds.has(remoteId)) {
+        const outbound = remoteId === undefined ? [] : this.outboundsTo(remoteId);
+        if (remoteId !== undefined && outbound.length > 0) {
             if (this.endpointId < remoteId) {
-                this.outbounds.get(remoteId)?.abort(new Error('rtc connect rejected: glare'));
+                for (const attempt of outbound) attempt.abort(new Error('rtc connect rejected: glare'));
             } else {
                 this.listenerSend({ type: 'reject', session, reason: 'glare' });
                 return;

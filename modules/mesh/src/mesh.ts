@@ -42,6 +42,10 @@ export class Mesh {
     private config: MeshOptions;
     private activeSwarms: Swarm[] = [];
     private closed = false;
+    // closePeers() drops live connections but leaves listen sockets up so a
+    // tracker leave can still be sent. New handshakes abort while it is set.
+    private dropping = false;
+    private readonly opening = new Set<Transport>();
     private localPeer: PeerInfo | undefined;
     private negotiationTimeoutMs: number;
     private report: IssueReporter | undefined;
@@ -74,30 +78,39 @@ export class Mesh {
         const timeoutMs = this.negotiationTimeoutMs;
 
         const negotiatingAuth: PeerAuthenticator = {
-            async authenticate(transport: Transport, role: 'initiator' | 'responder', expectedRemote?: KeyId) {
-                const channel = await innerAuth.authenticate(transport, role, expectedRemote);
-                if (role === 'initiator') {
-                    // Defer to the macro-task queue so the responder's
-                    // handshake microtask chain finishes and its
-                    // EncryptedChannel is ready to receive.
-                    await new Promise(resolve => setTimeout(resolve, 0));
-                    channel.send(encodeControlTopicInterest(topic));
-                    if (TRACE_MESH) trace('mesh.topic interest', { topic, role: 'initiator' });
-                    const response = await awaitMessage(channel, timeoutMs);
-                    const decoded = decodeMessage(response);
-                    if (decoded.type !== MSG_TYPE_CONTROL) {
+            authenticate: async (transport: Transport, role: 'initiator' | 'responder', expectedRemote?: KeyId) => {
+                this.opening.add(transport);
+                try {
+                    const channel = await innerAuth.authenticate(transport, role, expectedRemote);
+                    if (this.closed || this.dropping) {
                         channel.close();
-                        throw new Error('expected control message during topic negotiation');
+                        throw new Error('mesh is closed');
                     }
-                    const ctrl = decodeControlPayload(decoded.payload);
-                    if (ctrl.ctrl !== CTRL_TOPIC_ACCEPT || ctrl.topic !== topic) {
-                        if (TRACE_MESH) trace('mesh.topic reject', { topic, via: 'initiator' });
-                        channel.close();
-                        throw new Error('topic rejected by remote');
+                    if (role === 'initiator') {
+                        // Defer to the macro-task queue so the responder's
+                        // handshake microtask chain finishes and its
+                        // EncryptedChannel is ready to receive.
+                        await new Promise(resolve => setTimeout(resolve, 0));
+                        channel.send(encodeControlTopicInterest(topic));
+                        if (TRACE_MESH) trace('mesh.topic interest', { topic, role: 'initiator' });
+                        const response = await awaitMessage(channel, timeoutMs);
+                        const decoded = decodeMessage(response);
+                        if (decoded.type !== MSG_TYPE_CONTROL) {
+                            channel.close();
+                            throw new Error('expected control message during topic negotiation');
+                        }
+                        const ctrl = decodeControlPayload(decoded.payload);
+                        if (ctrl.ctrl !== CTRL_TOPIC_ACCEPT || ctrl.topic !== topic) {
+                            if (TRACE_MESH) trace('mesh.topic reject', { topic, via: 'initiator' });
+                            channel.close();
+                            throw new Error('topic rejected by remote');
+                        }
+                        if (TRACE_MESH) trace('mesh.topic accept', { topic, via: 'initiator' });
                     }
-                    if (TRACE_MESH) trace('mesh.topic accept', { topic, via: 'initiator' });
+                    return channel;
+                } finally {
+                    this.opening.delete(transport);
                 }
-                return channel;
             },
         };
 
@@ -135,9 +148,10 @@ export class Mesh {
         return [...this.activeSwarms];
     }
 
-    close(): void {
-        if (this.closed) return;
-        this.closed = true;
+    // Close pooled peer connections and in-flight handshakes. Listen sockets
+    // stay open so discovery can still reach a tracker.
+    closePeers(): void {
+        this.dropping = true;
 
         const swarms = this.activeSwarms;
         this.activeSwarms = [];
@@ -146,6 +160,17 @@ export class Mesh {
         }
 
         this.pool.close();
+
+        for (const transport of this.opening) {
+            try { transport.close(); } catch { /* ignore */ }
+        }
+        this.opening.clear();
+    }
+
+    close(): void {
+        if (this.closed) return;
+        this.closed = true;
+        this.closePeers();
 
         for (const t of this.config.transports) {
             t.close();
@@ -204,44 +229,49 @@ export class Mesh {
     }
 
     private async handleIncoming(transport: Transport, localListenAddress: NetworkAddress): Promise<void> {
-        if (this.closed) { transport.close(); return; }
+        if (this.closed || this.dropping) { transport.close(); return; }
+        this.opening.add(transport);
+        try {
+            const channel = await this.config.authenticator.authenticate(transport, 'responder');
+            if (this.closed || this.dropping) { channel.close(); return; }
 
-        const channel = await this.config.authenticator.authenticate(transport, 'responder');
-
-        const msg = await awaitMessage(channel, this.negotiationTimeoutMs);
-        const decoded = decodeMessage(msg);
-        if (decoded.type !== MSG_TYPE_CONTROL) {
-            channel.close();
-            return;
-        }
-
-        const ctrl = decodeControlPayload(decoded.payload);
-        if (ctrl.ctrl !== CTRL_TOPIC_INTEREST) {
-            channel.close();
-            return;
-        }
-
-        const swarm = await this.evaluateTopicInterest(ctrl.topic, channel.remoteKeyId);
-        if (swarm === undefined) {
-            this.reportMeshIssue({
-                kind: 'topic-rejected', severity: 'low',
-                keyId: channel.remoteKeyId,
-                message: `no swarm accepted topic ${ctrl.topic}`,
-            });
-            if (TRACE_MESH) {
-                trace('mesh.topic reject', { topic: ctrl.topic, peer: channel.remoteKeyId, via: 'inbound' });
+            const msg = await awaitMessage(channel, this.negotiationTimeoutMs);
+            const decoded = decodeMessage(msg);
+            if (decoded.type !== MSG_TYPE_CONTROL) {
+                channel.close();
+                return;
             }
-            channel.send(encodeControlTopicReject(ctrl.topic));
-            channel.close();
-            return;
-        }
 
-        if (TRACE_MESH) {
-            trace('mesh.topic accept', { topic: ctrl.topic, peer: channel.remoteKeyId, via: 'inbound' });
+            const ctrl = decodeControlPayload(decoded.payload);
+            if (ctrl.ctrl !== CTRL_TOPIC_INTEREST) {
+                channel.close();
+                return;
+            }
+
+            const swarm = await this.evaluateTopicInterest(ctrl.topic, channel.remoteKeyId);
+            if (swarm === undefined) {
+                this.reportMeshIssue({
+                    kind: 'topic-rejected', severity: 'low',
+                    keyId: channel.remoteKeyId,
+                    message: `no swarm accepted topic ${ctrl.topic}`,
+                });
+                if (TRACE_MESH) {
+                    trace('mesh.topic reject', { topic: ctrl.topic, peer: channel.remoteKeyId, via: 'inbound' });
+                }
+                channel.send(encodeControlTopicReject(ctrl.topic));
+                channel.close();
+                return;
+            }
+
+            if (TRACE_MESH) {
+                trace('mesh.topic accept', { topic: ctrl.topic, peer: channel.remoteKeyId, via: 'inbound' });
+            }
+            channel.send(encodeControlTopicAccept(ctrl.topic));
+            const remoteEndpoint = transport.remoteAddress ?? localListenAddress;
+            this.pool.add(channel, remoteEndpoint);
+        } finally {
+            this.opening.delete(transport);
         }
-        channel.send(encodeControlTopicAccept(ctrl.topic));
-        const remoteEndpoint = transport.remoteAddress ?? localListenAddress;
-        this.pool.add(channel, remoteEndpoint);
     }
 
     // --- control messages on established connections (for pool reuse) ---

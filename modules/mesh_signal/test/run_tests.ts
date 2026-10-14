@@ -355,6 +355,31 @@ async function testByeKeepsDataChannel() {
     }
 }
 
+async function testCloseNotifiesPeer() {
+    resetFakePeers();
+    const alice = await createIdentity(SIGNING_ED25519, sha256);
+    const bob = await createIdentity(SIGNING_ED25519, sha256);
+    const { server, signalBase } = await boot({ publicMode: true });
+    const dialer = provider(alice, signalBase, { endpointId: 'close-dialer' });
+    const listener = provider(bob, signalBase, { endpointId: 'close-listener' });
+    const inbound: Transport[] = [];
+    try {
+        await listener.listen(listener.localAddress!, t => inbound.push(t));
+        const dial = await dialer.connect(listener.localAddress!, dialer.localAddress, bob.keyId);
+        testing.assertEquals(inbound.length, 1, 'listener accepted the dial');
+        let remoteClosed = false;
+        inbound[0]!.onClose(() => { remoteClosed = true; });
+        dial.close();
+        await delay(20);
+        testing.assertTrue(remoteClosed, 'CLOSE frame closes the remote transport');
+        testing.assertTrue(!inbound[0]!.open, 'remote transport reports closed');
+    } finally {
+        dialer.close();
+        listener.close();
+        server.stop();
+    }
+}
+
 async function testTimeoutsAndKey() {
     resetFakePeers();
     const alice = await createIdentity(SIGNING_ED25519, sha256);
@@ -428,6 +453,7 @@ const allSuites = [
             { name: '[MESH_SIGNAL_02] renewal keeps the endpoint id', invoke: testRenewalKeepsEndpoint },
             { name: '[MESH_SIGNAL_03] data channel message, fragments, and glare', invoke: testDataAndGlare },
             { name: '[MESH_SIGNAL_03b] bye ends signaling without closing the data channel', invoke: testByeKeepsDataChannel },
+            { name: '[MESH_SIGNAL_03c] close frame tells the other peer immediately', invoke: testCloseNotifiesPeer },
             { name: '[MESH_SIGNAL_04] key check precedes ICE; timeouts name the stage', invoke: testTimeoutsAndKey },
         ],
     },
