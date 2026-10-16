@@ -2,7 +2,7 @@ import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.
 import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { Version } from "@hyper-hyper-space/hhs3_mvt";
+import { Version, version } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
@@ -424,6 +424,155 @@ export const rtableXGroupTests = {
                 const merged = await frontier(a.group);
                 assertTrue(await (await tableView(a.group, 'items', merged)).hasRow(itemId),
                     'a causally-later barrier observation is in the use\'s future -> use-before-revoke holds across the boundary (cross-group analogue of [ENF07])');
+            }
+        },
+        {
+            name: '[XGROUP12] cross-group exists fails closed (no throw) when the foreign where column is missing or not pub',
+            invoke: async () => {
+                const ctx = newCtx();
+                const b = await makeSchemaGroup(ctx, 'xg12-b', [open('caps', {
+                    label: { type: 'string', pub: true },
+                    secret: { type: 'string' },
+                })]);
+                const a = await makeSchemaGroup(ctx, 'xg12-a', [
+                    {
+                        name: 'by_missing',
+                        columns: { name: { type: 'string' } },
+                        restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'users.caps', where: { ghost: 'grant' } } }],
+                    },
+                    {
+                        name: 'by_nonpub',
+                        columns: { name: { type: 'string' } },
+                        restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'users.caps', where: { secret: 'grant' } } }],
+                    },
+                    {
+                        name: 'by_label',
+                        columns: { name: { type: 'string' } },
+                        restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'users.caps', where: { label: 'grant' } } }],
+                    },
+                ], { bindings: { users: b.group.getId() } });
+
+                const caps = await b.group.getTable('caps');
+                await caps.insert('c-1', { label: 'grant', secret: 'grant' });
+                await a.group.observe('users', await frontier(b.group));
+
+                const at = await frontier(a.group);
+                const missingRes = await a.group.validatePayload({
+                    action: 'row', table: 'by_missing', op: { action: 'insert', rowId: deriveRowId('m-1'), uuid: 'm-1', values: { name: 'x' } },
+                }, at);
+                assertFalse(missingRes.valid, 'missing foreign column fails closed at validation (does not throw)');
+
+                const nonPubRes = await a.group.validatePayload({
+                    action: 'row', table: 'by_nonpub', op: { action: 'insert', rowId: deriveRowId('n-1'), uuid: 'n-1', values: { name: 'x' } },
+                }, at);
+                assertFalse(nonPubRes.valid, 'non-pub foreign column fails closed at validation (does not throw)');
+
+                // Also test concurrent foreign column drop voiding a concurrent use at merge without throwing
+                const byLabel = await a.group.getTable('by_label');
+                const itemId = deriveRowId('l-1');
+                await byLabel.insert('l-1', { name: 'ok' }, undefined, at);
+
+                const vDrop = await b.schema.updateSchema([{ rule: 'drop-column', table: 'caps', column: 'label' }], b.creator);
+                await b.group.deploy(version(vDrop));
+                await a.group.observe('users', await frontier(b.group), undefined, at);
+
+                const merged = await frontier(a.group);
+                assertFalse(await (await tableView(a.group, 'by_label', merged)).hasRow(itemId),
+                    'a concurrent foreign column drop observed via barrier voids the use cleanly without throwing');
+            }
+        },
+        {
+            name: '[XGROUP13] tableMaps remaps schema FKs, schema EXISTS and FK adoption while leaving catalog references on real names',
+            invoke: async () => {
+                const ctx = newCtx();
+                const dev = await makeIdentity();
+                const creators = [{ keyId: dev.keyId, publicKey: dev.publicKey }];
+
+                const blogSchema = (await ctx.createObject(await RSchemaImpl.create({
+                    name: 'xg13:blog',
+                    creators,
+                    tables: [
+                        open('posts', { title: { type: 'string', pub: true } }),
+                        open('photos', { url: { type: 'string', pub: true } }),
+                        open('flags', { mode: { type: 'string', pub: true } }, { concurrentDeletes: true }),
+                    ],
+                }))) as RSchemaImpl;
+                const blogGroup = (await ctx.createObject(await RTableGroupImpl.create({
+                    name: 'blog',
+                    seed: 'xg13-blog',
+                    schemaRef: blogSchema.getId(),
+                    schemaVersion: await (await blogSchema.getScopedDag()).getFrontier(),
+                }))) as RTableGroupImpl;
+
+                // One reusable comments schema referencing symbolic target.subject and target.gate
+                const commentsSchema = (await ctx.createObject(await RSchemaImpl.create({
+                    name: 'xg13:comments',
+                    creators,
+                    tables: [{
+                        name: 'comments',
+                        columns: { item: { type: 'string' }, body: { type: 'string' } },
+                        fks: { item: 'target.subject' },
+                        restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'target.gate', where: { mode: 'open' } } }],
+                    }],
+                }))) as RSchemaImpl;
+                const commentsPin = await (await commentsSchema.getScopedDag()).getFrontier();
+
+                // Group 1 maps subject => posts, gate => flags; Group 2 maps subject => photos, gate => flags
+                // Both also set canDeploy using the real table name target.flags (and mapping flags => posts in group 2 to prove canDeploy is NOT remapped!)
+                const postComments = (await ctx.createObject(await RTableGroupImpl.create({
+                    name: 'post_comments',
+                    seed: 'xg13-post-comments',
+                    schemaRef: commentsSchema.getId(),
+                    schemaVersion: commentsPin,
+                    bindings: { target: blogGroup.getId() },
+                    tableMaps: { target: { subject: 'posts', gate: 'flags' } },
+                }))) as RTableGroupImpl;
+                const photoComments = (await ctx.createObject(await RTableGroupImpl.create({
+                    name: 'photo_comments',
+                    seed: 'xg13-photo-comments',
+                    schemaRef: commentsSchema.getId(),
+                    schemaVersion: commentsPin,
+                    bindings: { target: blogGroup.getId() },
+                    tableMaps: { target: { subject: 'photos', gate: 'flags', flags: 'posts' } },
+                    canDeploy: { p: 'exists', table: 'target.flags', where: { mode: 'open' } },
+                }))) as RTableGroupImpl;
+
+                const posts = await blogGroup.getTable('posts');
+                const photos = await blogGroup.getTable('photos');
+                const flags = await blogGroup.getTable('flags');
+                const postId = deriveRowId('post-1');
+                const photoId = deriveRowId('photo-1');
+                await posts.insert('post-1', { title: 'Hello' });
+                await photos.insert('photo-1', { url: 'pic.png' });
+                await flags.insert('flag-1', { mode: 'open' });
+
+                await postComments.observe('target', await frontier(blogGroup));
+                await photoComments.observe('target', await frontier(blogGroup));
+
+                const pcTable = await postComments.getTable('comments');
+                const phcTable = await photoComments.getTable('comments');
+
+                await pcTable.insert('c-1', { item: postId, body: 'nice post' });
+                await phcTable.insert('c-2', { item: photoId, body: 'nice photo' });
+
+                // Cross-wired FK is rejected (postId is not in blog.photos)
+                let crossRejected = false;
+                try {
+                    await phcTable.insert('c-bad', { item: postId, body: 'wrong target' });
+                } catch {
+                    crossRejected = true;
+                }
+                assertTrue(crossRejected, 'photo_comments maps target.subject to blog.photos, so a postId is rejected');
+
+                // Deploy on photoComments checks canDeploy against real table target.flags (even though tableMaps maps flags => posts),
+                // and FK adoption on a new FK column resolves through tableMaps
+                const v2 = await commentsSchema.updateSchema([
+                    { rule: 'add-column', table: 'comments', column: 'extraItem', def: { type: 'string', nullable: true } },
+                    { rule: 'set-fks', table: 'comments', fks: { item: 'target.subject', extraItem: 'target.subject' } },
+                ], dev);
+                await photoComments.deploy(version(v2));
+                assertTrue(await (await tableView(photoComments, 'comments')).hasRow(deriveRowId('c-2')),
+                    'canDeploy resolved real target.flags and FK adoption resolved target.subject -> blog.photos');
             }
         },
     ],

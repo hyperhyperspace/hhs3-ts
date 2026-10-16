@@ -4,18 +4,19 @@ import { serializePublicKeyToBase64, type Version } from "@hyper-hyper-space/hhs
 import { compareSemver, deriveRowId, isValidSemver, paramTypeFits, DEFAULT_SCHEMA_VERSION } from "@hyper-hyper-space/hhs3_rdb";
 import type {
     CatalogFilesDef, CatalogGroupDef, CatalogParamDecl, CatalogReleaseSpec, ColumnDef, InsertRowPayload, MigrationRule, ParamValue,
-    RCatalogImpl, RDbImpl, RowOpPayload, RowQuery, RTableGroup,
+    RCatalogImpl, RDbImpl, RowOpPayload, RowQuery, RTableGroup, SchemaParamDecl,
 } from "@hyper-hyper-space/hhs3_rdb";
 
 import { DiagnosticBag, err, ok, Result, SpannedError } from "../diagnostics.js";
 import type {
     AlterCatalogStatement, AlterSchemaStatement, AstStatement, AuthorExpr, BundleStatement, BundleWriteStatement,
     CreateCatalogStatement, CreateDatabaseStatement, CreateSchemaStatement,
-    DeleteStatement, InsertStatement, LogStatement, NameOrHashRef, ParamAssignment, ReleaseSelector,
+    DeleteStatement, ImportSchemaStatement, InsertStatement, LogStatement, NameOrHashRef, ParamAssignment, ReleaseSelector,
     SelectStatement, SetViewStatement, TableRef, UpdateCatalogStatement, UpdateRefStatement, UpdateStatement,
     UseDatabaseStatement, ValueExpr,
 } from "../syntax/ast.js";
 import { compileMigrationRules } from "../compile/ddl.js";
+import { compileSchemaParamDecls } from "../compile/create.js";
 import { buildAlterColumnsOf } from "../compile/rule_scope.js";
 import { lowerSelectQuery } from "../compile/query.js";
 import {
@@ -36,6 +37,7 @@ export const PSEUDO_COLUMN_UUID = 'uuid';
 export type BoundStatement =
     | BoundCreateDatabase
     | BoundCreateSchema
+    | BoundImportSchema
     | BoundCreateCatalog
     | BoundAlterCatalog
     | BoundUpdateCatalog
@@ -55,6 +57,7 @@ export type BoundStatement =
 
 export type BoundCreateStatement = BoundCreateDatabase | BoundCreateSchema | BoundCreateCatalog;
 export type BoundExecutableStatement =
+    | BoundImportSchema
     | BoundAlterCatalog
     | BoundUpdateCatalog
     | BoundUseDatabase
@@ -91,6 +94,16 @@ export type BoundCreateSchema = {
     ast: CreateSchemaStatement;
     version: string;
     creators: { keyId: KeyId; publicKey: PublicKey }[];
+};
+
+export type BoundImportSchema = {
+    kind: 'import-schema';
+    ast: ImportSchemaStatement;
+    name: string;
+    version: string;
+    schemaId: B64Hash;
+    schema?: import("@hyper-hyper-space/hhs3_rdb").RSchema;
+    at: Version;
 };
 
 export type BoundCreateCatalog = {
@@ -184,6 +197,7 @@ export type BoundAlterSchema = {
     kind: 'alter-schema';
     ast: AlterSchemaStatement;
     schema: ResolvedSchemaRef;
+    params?: SchemaParamDecl[];
     rules: MigrationRule[];
     version?: string;
     note?: string;
@@ -228,6 +242,8 @@ export async function bind(statement: AstStatement, context: LangBindContext): P
                 return ok(await bindCreateDatabase(statement, context));
             case 'create-schema':
                 return ok(await bindCreateSchema(statement, context));
+            case 'import-schema':
+                return ok(await bindImportSchema(statement, context));
             case 'create-catalog':
                 return ok(await bindCreateCatalog(statement, context));
             case 'alter-catalog':
@@ -446,6 +462,25 @@ async function bindParamValue(expr: ValueExpr, decl: CatalogParamDecl, context: 
     return value;
 }
 
+async function bindImportSchema(ast: ImportSchemaStatement, context: LangBindContext): Promise<BoundImportSchema> {
+    if (!isValidSemver(ast.version)) {
+        throw new SpannedError(`VERSION '${ast.version}' is not a semver (major.minor.patch)`, ast.versionSpan, 'BIND_INVALID_SYNTAX');
+    }
+    const resolved = await context.resolveImport?.(ast.name, ast.version);
+    if (resolved === undefined) {
+        throw new SpannedError(`imported schema '${ast.name}' version '${ast.version}' is not available`, ast.span, 'BIND_UNKNOWN_NAME');
+    }
+    return {
+        kind: 'import-schema',
+        ast,
+        name: ast.name,
+        version: ast.version,
+        schemaId: resolved.schemaId,
+        ...(resolved.schema !== undefined ? { schema: resolved.schema } : {}),
+        at: resolved.at,
+    };
+}
+
 async function bindCreateSchema(ast: CreateSchemaStatement, context: LangBindContext): Promise<BoundCreateSchema> {
     for (const table of ast.tables) {
         for (const column of table.columns) {
@@ -457,6 +492,13 @@ async function bindCreateSchema(ast: CreateSchemaStatement, context: LangBindCon
     const creators: { keyId: KeyId; publicKey: PublicKey }[] = [];
     for (const expr of ast.creators) {
         creators.push(await resolveCreator(expr, context));
+    }
+    if (creators.length === 0) {
+        const author = await context.currentAuthor();
+        if (author === undefined) {
+            throw new Error('CREATE SCHEMA requires CREATORS (...) or a selected author');
+        }
+        creators.push({ keyId: author.keyId, publicKey: author.publicKey });
     }
     const version = ast.version ?? await context.defaultSchemaVersion?.() ?? DEFAULT_SCHEMA_VERSION;
     if (!isValidSemver(version)) throw new Error(`VERSION '${version}' is not a semver (major.minor.patch)`);
@@ -605,8 +647,21 @@ async function bindAlterSchema(ast: AlterSchemaStatement, context: LangBindConte
             }
         }
     }
+    const addedParams = compileSchemaParamDecls(ast.params, true);
+    const paramNames = new Set(view.getParams().map((p) => p.name));
+    for (const decl of addedParams) {
+        if (paramNames.has(decl.name)) {
+            throw new Error(`param ':${decl.name}' is already declared by the schema`);
+        }
+        paramNames.add(decl.name);
+    }
     const columnsOf = buildAlterColumnsOf(view, ast.rules);
-    const bound: BoundAlterSchema = { kind: 'alter-schema', ast, schema, rules: compileMigrationRules(ast.rules, columnsOf), author, at };
+    const rules = compileMigrationRules(ast.rules, columnsOf, paramNames.size > 0 ? paramNames : undefined);
+    if (rules.length === 0 && addedParams.length === 0) {
+        throw new Error('ALTER SCHEMA migration is empty');
+    }
+    const bound: BoundAlterSchema = { kind: 'alter-schema', ast, schema, rules, author, at };
+    if (addedParams.length > 0) bound.params = addedParams;
     if (ast.version !== undefined) bound.version = ast.version;
     if (ast.note !== undefined) bound.note = ast.note;
     return bound;

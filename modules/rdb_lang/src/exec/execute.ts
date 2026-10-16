@@ -31,6 +31,14 @@ export async function execute(bound: BoundStatement): Promise<Result<LangExecuti
 
 async function executeRuntime(bound: BoundExecutableStatement): Promise<LangExecutionResult> {
     switch (bound.kind) {
+        case 'import-schema':
+            return {
+                kind: 'import-schema',
+                name: bound.name,
+                version: bound.version,
+                schemaId: bound.schemaId,
+                at: bound.at,
+            };
         case 'alter-catalog': {
             const published = await bound.catalog.catalog.publishRelease(bound.spec, bound.author, bound.at);
             return {
@@ -56,6 +64,7 @@ async function executeRuntime(bound: BoundExecutableStatement): Promise<LangExec
             if (bound.schema.schema === undefined) throw new Error('ALTER SCHEMA target is not loaded');
             const entryHash = await bound.schema.schema.updateSchema(bound.rules, bound.author, {
                 ...(bound.version !== undefined ? { version: bound.version } : {}),
+                ...(bound.params !== undefined ? { params: bound.params } : {}),
                 ...(bound.note !== undefined ? { note: bound.note } : {}),
                 at: bound.at,
             });

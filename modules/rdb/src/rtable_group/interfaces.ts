@@ -14,6 +14,7 @@ import type { RTable, RTableView } from "../rtable/interfaces.js";
 import type { RowOpPayload } from "../rtable/payload.js";
 import type { RTableGroupDeltaStrategy } from "./delta.js";
 import type { OpVoidDetail } from "./op_void.js";
+import type { GroupParams, TableMaps } from "./payload.js";
 
 // One write in a bundle: a row op tagged with its target table. The bundle
 // carries these in order (the bundle order; see RTableGroup.bundle).
@@ -30,6 +31,13 @@ export interface RTableGroup extends RObject, NestingParent {
     getSchemaRef(): B64Hash;
     getPinnedSchemaVersion(): Version;
     getBindings(): { [name: string]: B64Hash };
+    getTableMaps(): TableMaps;
+    getParams(): GroupParams;
+    resolveGroupParams(at?: Version, from?: Version): Promise<GroupParams>;
+    resolveEffectiveParams(at: Version, from?: Version): Promise<GroupParams>;
+    resolveForeignTableName(alias: string, schemaTable: string): string;
+    resolveForeignTableView(groupName: string, table: string, at: Version, from: Version): Promise<RTableView | undefined>;
+    resolveSchemaForeignTableView(groupName: string, schemaTable: string, at: Version, from: Version): Promise<RTableView | undefined>;
     getCanDeploy(): Predicate | undefined;
     // Per-binding gate on foreign-group observations (keyed by binding name),
     // or undefined when the group declares none.
@@ -50,7 +58,7 @@ export interface RTableGroup extends RObject, NestingParent {
     // THE deploy moment: barrier ref-advance of the schema ref to refVersion.
     // When authored, the deploy signature is verified at validation and the
     // group's canDeploy predicate is evaluated against the verified author.
-    deploy(refVersion: Version, author?: OwnIdentity, at?: Version): Promise<B64Hash>;
+    deploy(refVersion: Version, author?: OwnIdentity, at?: Version, params?: GroupParams): Promise<B64Hash>;
 
     // Whether a deploy must be authored: the group's canDeploy reads $author.
     deployNeedsAuthor(): boolean;

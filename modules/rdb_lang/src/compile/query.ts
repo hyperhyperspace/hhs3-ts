@@ -1,5 +1,5 @@
 import type { json } from "@hyper-hyper-space/hhs3_json";
-import type { Operand, Predicate } from "@hyper-hyper-space/hhs3_rdb";
+import type { Operand, Predicate, RuleOperand } from "@hyper-hyper-space/hhs3_rdb";
 import type { RowFilter, RowQuery } from "@hyper-hyper-space/hhs3_rdb";
 import { isValidLikePattern } from "@hyper-hyper-space/hhs3_rdb";
 
@@ -76,10 +76,10 @@ export async function lowerRowFilter(expr: PredicateExpr, context: LangBindConte
 
 type LikeExpr = Extract<PredicateExpr, { kind: 'like' }>;
 
-// The payload pattern for a lowered LIKE: a column pattern passes through; a
+// The payload pattern for a lowered LIKE: a column/param pattern passes through; a
 // literal pattern must be a string, and an ESCAPE clause (literal patterns
 // only) is rewritten into the canonical `\` escape form.
-function lowerLikePattern(expr: LikeExpr, pattern: Operand): Operand {
+function lowerLikePattern<T extends Operand | RuleOperand>(expr: LikeExpr, pattern: T): T {
     if (expr.escape !== undefined && expr.pattern.kind !== 'literal') {
         throw new Error('LIKE ... ESCAPE requires a literal pattern');
     }
@@ -87,7 +87,7 @@ function lowerLikePattern(expr: LikeExpr, pattern: Operand): Operand {
     if (typeof pattern.lit !== 'string') throw new Error('LIKE pattern must be a string');
     const canonical = expr.escape !== undefined ? canonicalLikePattern(pattern.lit, expr.escape) : pattern.lit;
     if (!isValidLikePattern(canonical)) throw new Error("LIKE pattern ends in an unescaped '\\'");
-    return { lit: canonical };
+    return { lit: canonical } as T;
 }
 
 // Rewrite a pattern written with `ESCAPE '<c>'` into the payload's form, where
@@ -280,7 +280,7 @@ function resolveUnqualifiedColumn(column: string, scope: RuleScope): ResolvedCol
     return { role: 'exists', column };
 }
 
-function lowerRestrictionOperand(expr: OperandExpr, scope: RuleScope): Operand {
+function lowerRestrictionOperand(expr: OperandExpr, scope: RuleScope): RuleOperand {
     if (expr.kind === 'column') {
         if (scope.exists !== undefined) {
             throw new Error('column references in EXISTS WHERE must appear inside the EXISTS WHERE clause');
@@ -293,6 +293,12 @@ function lowerRestrictionOperand(expr: OperandExpr, scope: RuleScope): Operand {
         }
         return { col: resolved.column };
     }
+    if (expr.kind === 'param') {
+        if (scope.params === undefined || !scope.params.has(expr.name)) {
+            throw new Error(`param ':${expr.name}' is not declared by the schema`);
+        }
+        return { param: expr.name };
+    }
     if (expr.kind === 'arith') {
         return { fn: ARITH_FN[expr.op], args: [lowerRestrictionOperand(expr.left, scope), lowerRestrictionOperand(expr.right, scope)] };
     }
@@ -300,6 +306,9 @@ function lowerRestrictionOperand(expr: OperandExpr, scope: RuleScope): Operand {
         return { fn: 'len', args: [lowerRestrictionOperand(expr.arg, scope)] };
     }
     if (expr.kind === 'literal') {
+        if (expr.constant !== undefined && scope.params?.has(expr.constant)) {
+            throw new Error(`Constant ':${expr.constant}' cannot share its name with schema param ':${expr.constant}'`);
+        }
         if (expr.value === null) throw new Error('NULL is not supported in allow rule operands');
         rejectReservedString(expr.value);
         return { lit: expr.value };
@@ -315,7 +324,7 @@ function lowerRestrictionOperand(expr: OperandExpr, scope: RuleScope): Operand {
 }
 
 // In allow rules a '$'-prefixed string payload value is a term ($author,
-// $row.<col>), so a quoted '$...' literal would silently change meaning.
+// $row.<col>, $param.<name>), so a quoted '$...' literal would silently change meaning.
 function rejectReservedString(value: json.Literal): void {
     if (typeof value === 'string' && value.startsWith('$')) {
         throw new Error(`string literal '${value}' is reserved in allow rules: strings starting with '$' denote terms (write $author, not '$author')`);
@@ -324,9 +333,18 @@ function rejectReservedString(value: json.Literal): void {
 
 function lowerExistsWhereValue(expr: OperandExpr, scope: RuleScope): json.Literal | '$author' | string {
     if (expr.kind === 'literal') {
+        if (expr.constant !== undefined && scope.params?.has(expr.constant)) {
+            throw new Error(`Constant ':${expr.constant}' cannot share its name with schema param ':${expr.constant}'`);
+        }
         if (expr.value === null) throw new Error('NULL is not supported in EXISTS WHERE values');
         rejectReservedString(expr.value);
         return expr.value;
+    }
+    if (expr.kind === 'param') {
+        if (scope.params === undefined || !scope.params.has(expr.name)) {
+            throw new Error(`param ':${expr.name}' is not declared by the schema`);
+        }
+        return `$param.${expr.name}`;
     }
     if (expr.kind === 'variable') {
         if (expr.field !== undefined) {

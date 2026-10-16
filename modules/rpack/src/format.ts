@@ -14,12 +14,17 @@
 // Files are written pretty-printed with sorted keys, so the same release
 // always serializes to the same bytes; parsing accepts any JSON layout.
 
-import { B64Hash, base64 } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash, base64, sha256, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
+import {
+    migrationRuleFormat, schemaParamDeclFormat, tableDefFormat,
+    type MigrationRule, type SchemaParamDecl, type TableDef,
+} from "@hyper-hyper-space/hhs3_rdb";
 
 export const RELEASE_FILE_FORMAT = 1;
 
 export type ReleaseManifest = {
+    kind?: 'catalog';
     name: string;
     catalog: B64Hash;
     version: string;
@@ -27,6 +32,51 @@ export type ReleaseManifest = {
     parents: B64Hash[];
     note?: string;
 };
+
+export type SchemaReleaseManifest = {
+    kind: 'schema';
+    name: string;
+    version: string;
+    release: B64Hash;
+    parents: B64Hash[];
+    note?: string;
+};
+
+export type SchemaReleaseStep = {
+    hash: B64Hash;
+    parents: B64Hash[];
+    version: string;
+    params?: SchemaParamDecl[];
+    tables?: TableDef[];
+    migration?: MigrationRule[];
+    note?: string;
+};
+
+export type SchemaReleaseFile = {
+    format: number;
+    manifest: SchemaReleaseManifest;
+    steps: SchemaReleaseStep[];
+};
+
+export type AnyReleaseFile = ReleaseFile | SchemaReleaseFile;
+
+export function isSchemaReleaseFile(file: AnyReleaseFile): file is SchemaReleaseFile {
+    return file.manifest.kind === 'schema';
+}
+
+export function schemaStepHash(name: string, step: Omit<SchemaReleaseStep, 'hash'>): B64Hash {
+    const literal: json.LiteralMap = {
+        domain: 'hhs3-rpack-schema-step-v1',
+        name,
+        version: step.version,
+        parents: [...step.parents].sort(),
+        ...(step.params !== undefined && step.params.length > 0 ? { params: step.params as unknown as json.Literal } : {}),
+        ...(step.tables !== undefined ? { tables: step.tables as unknown as json.Literal } : {}),
+        ...(step.migration !== undefined && step.migration.length > 0 ? { migration: step.migration as unknown as json.Literal } : {}),
+        ...(step.note !== undefined ? { note: step.note } : {}),
+    };
+    return sha256.hashToB64(stringToUint8Array(json.toStringNormalized(literal)));
+}
 
 export type ReleaseEntry = {
     hash: B64Hash;
@@ -54,11 +104,31 @@ export class ReleaseFileError extends Error {
 }
 
 const manifestFormat: json.Format = {
+    kind: [json.Type.Option, [json.Type.Constant, 'catalog']],
     name: json.Type.String,
     catalog: json.Type.String,
     version: json.Type.String,
     release: json.Type.String,
     parents: [json.Type.Array, json.Type.String],
+    note: [json.Type.Option, json.Type.String],
+};
+
+const schemaManifestFormat: json.Format = {
+    kind: [json.Type.Constant, 'schema'],
+    name: json.Type.String,
+    version: json.Type.String,
+    release: json.Type.String,
+    parents: [json.Type.Array, json.Type.String],
+    note: [json.Type.Option, json.Type.String],
+};
+
+const schemaStepFormat: json.Format = {
+    hash: json.Type.String,
+    parents: [json.Type.Array, json.Type.String],
+    version: json.Type.String,
+    params: [json.Type.Option, [json.Type.Array, schemaParamDeclFormat]],
+    tables: [json.Type.Option, [json.Type.Array, tableDefFormat]],
+    migration: [json.Type.Option, [json.Type.Array, migrationRuleFormat]],
     note: [json.Type.Option, json.Type.String],
 };
 
@@ -115,6 +185,45 @@ export function checkReleaseFile(value: unknown): ReleaseFile {
     return value as unknown as ReleaseFile;
 }
 
+export function checkSchemaReleaseFile(value: unknown): SchemaReleaseFile {
+    if (!isMap(value)) throw new ReleaseFileError('a release file must be a JSON object');
+    if (!json.isLiteral(value)) throw new ReleaseFileError('a release file must not contain null values');
+
+    const format = value['format'];
+    if (format !== RELEASE_FILE_FORMAT) {
+        throw new ReleaseFileError(`unsupported release file format ${JSON.stringify(format)} (expected ${RELEASE_FILE_FORMAT})`);
+    }
+    for (const key of Object.keys(value)) {
+        if (key !== 'format' && key !== 'manifest' && key !== 'steps') {
+            throw new ReleaseFileError(`unexpected top-level key '${key}'`);
+        }
+    }
+
+    const manifest = value['manifest'];
+    if (manifest === undefined || !json.checkFormat(schemaManifestFormat, manifest)) {
+        throw new ReleaseFileError('the schema manifest is malformed (expected kind: "schema", name, version, release, parents and an optional note)');
+    }
+
+    const steps = value['steps'];
+    if (!Array.isArray(steps) || steps.length === 0) {
+        throw new ReleaseFileError('steps must be a non-empty array');
+    }
+    steps.forEach((step, i) => {
+        if (!json.checkFormat(schemaStepFormat, step)) {
+            throw new ReleaseFileError(`step ${i} is malformed`);
+        }
+    });
+
+    return value as unknown as SchemaReleaseFile;
+}
+
+export function checkAnyReleaseFile(value: unknown): AnyReleaseFile {
+    if (isMap(value) && isMap(value['manifest']) && value['manifest']['kind'] === 'schema') {
+        return checkSchemaReleaseFile(value);
+    }
+    return checkReleaseFile(value);
+}
+
 export function parseReleaseFile(text: string): ReleaseFile {
     let value: unknown;
     try {
@@ -122,13 +231,39 @@ export function parseReleaseFile(text: string): ReleaseFile {
     } catch (e) {
         throw new ReleaseFileError(`not valid JSON: ${e instanceof Error ? e.message : String(e)}`);
     }
+    if (isMap(value) && isMap(value['manifest']) && value['manifest']['kind'] === 'schema') {
+        throw new ReleaseFileError(`'${String(value['manifest']['name'])}' is a schema release file, not a catalog release file`);
+    }
     return checkReleaseFile(value);
+}
+
+export function parseSchemaReleaseFile(text: string): SchemaReleaseFile {
+    let value: unknown;
+    try {
+        value = JSON.parse(text);
+    } catch (e) {
+        throw new ReleaseFileError(`not valid JSON: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (isMap(value) && isMap(value['manifest']) && value['manifest']['kind'] !== 'schema') {
+        throw new ReleaseFileError(`'${String(value['manifest']['name'])}' is a catalog release file, not a schema release file`);
+    }
+    return checkSchemaReleaseFile(value);
+}
+
+export function parseAnyReleaseFile(text: string): AnyReleaseFile {
+    let value: unknown;
+    try {
+        value = JSON.parse(text);
+    } catch (e) {
+        throw new ReleaseFileError(`not valid JSON: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    return checkAnyReleaseFile(value);
 }
 
 // Pretty-printed JSON with sorted object keys (2-space indent, trailing
 // newline). Keys are ordered by our own sort, not by insertion, so the output
 // is the same whatever order the object was built in.
-export function serializeReleaseFile(file: ReleaseFile): string {
+export function serializeReleaseFile(file: AnyReleaseFile): string {
     return serializeSorted(file as unknown as json.Literal, '') + '\n';
 }
 
@@ -156,8 +291,16 @@ export function releaseTag(hash: B64Hash): string {
     return [...raw.slice(0, 4)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+export function sanitizedReleasePrefix(name: string): string {
+    return name.replace(/:/g, '_');
+}
+
+export function releaseName(name: string, version: string, hash: B64Hash): string {
+    return `${sanitizedReleasePrefix(name)}-${version}-${releaseTag(hash)}`;
+}
+
 export function releaseFileName(name: string, version: string, hash: B64Hash): string {
-    return `${name}-${version}-${releaseTag(hash)}.rpack`;
+    return `${releaseName(name, version, hash)}.rpack`;
 }
 
 // A deterministic topological order: repeatedly emit the smallest-hash entry

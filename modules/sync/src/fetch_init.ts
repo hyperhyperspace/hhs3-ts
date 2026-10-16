@@ -13,13 +13,21 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_PEER_TIMEOUT_MS = 25_000;
 const RETRY_INTERVAL_MS = 200;
 
+export type FetchInitOptions = {
+    // Starts once a peer is handled. A slow handshake is not a missed init.
+    timeoutMs?: number;
+    // How long to wait for the first peer. Defaults to a full RTC connect.
+    peerTimeoutMs?: number;
+};
+
 export function fetchInit(
     objectId: B64Hash,
     swarms: Swarm[],
     hashSuite: HashSuite,
-    timeoutMs: number = DEFAULT_TIMEOUT_MS,
-    peerTimeoutMs: number = DEFAULT_PEER_TIMEOUT_MS,
+    opts?: FetchInitOptions,
 ): Promise<Payload> {
+    const timeoutMs = opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const peerTimeoutMs = opts?.peerTimeoutMs ?? DEFAULT_PEER_TIMEOUT_MS;
 
     return new Promise<Payload>((resolve, reject) => {
         let settled = false;

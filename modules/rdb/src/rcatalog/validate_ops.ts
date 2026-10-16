@@ -31,15 +31,18 @@ import {
 } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchema, RSchemaView } from "../rschema/interfaces.js";
-import { RSCHEMA_TYPE_ID, splitTableRef, ColumnType, type IdProvider, type TableDef } from "../rschema/payload.js";
-import { columnValueValidReason, findAuthorRestriction, predicateReferencesAuthor } from "../rschema/validate.js";
+import { RSCHEMA_TYPE_ID, splitTableRef, parseParamTerm, parseRowFieldTerm, ColumnType, type IdProvider, type TableDef } from "../rschema/payload.js";
+import {
+    collectExistsAtoms, columnValueMatchesType, columnValueValidReason, findAuthorRestriction, predicateReferencesAuthor,
+    type ExistsAtom,
+} from "../rschema/validate.js";
 import { filesSchemaReason } from "../rfiles/access.js";
 import { validateProviderValues } from "../rtable/validate_ops.js";
 import { qualifiedTargetReferences, unboundTargetReason } from "../rtable_group/validate_ops.js";
 
 import {
     CreateRCatalogPayload, CatalogReleasePayload, CatalogDeclarePayload, CatalogReleaseBody,
-    CatalogGroupDef, CatalogFilesDef, CatalogParamDecl, CatalogRowParam, CatalogRowTemplate, SchemaCreator,
+    CatalogGroupChange, CatalogGroupDef, CatalogFilesDef, CatalogParamDecl, CatalogRowParam, CatalogRowTemplate, SchemaCreator,
     catalogGroupHash, catalogFilesHash,
 } from "./payload.js";
 import { validateRCatalogPayloadFormat } from "./validate.js";
@@ -204,6 +207,27 @@ async function validateReleaseBody(
         }
     }
 
+    const groupViews = new Map<B64Hash, BoundGroupView>();
+    for (const [hash, def] of fold.defs) {
+        const change = body.changes?.[hash];
+        let v = fold.groups.get(hash)?.version;
+        if (change !== undefined && change.schema === def.schemaRef) {
+            const schema = await loadSchema(ctx, change.schema);
+            const target = version(...json.fromSet(change.version));
+            if (schema !== undefined && await isMinimalCover(schema, target)) {
+                v = sortedVersion(json.fromSet(change.version));
+            }
+        }
+        if (v !== undefined) {
+            const schema = await loadSchema(ctx, def.schemaRef);
+            if (schema !== undefined) {
+                const at = version(...v);
+                groupViews.set(hash, { def, view: await schema.getView(at, at) });
+            }
+        }
+    }
+    const boundViews = (hash: B64Hash) => groupViews.get(hash);
+
     const names = new Set([...fold.defs.values(), ...fold.files.values()].map((def) => def.name));
     const addedSoFar = new Set<B64Hash>();
     for (const def of body.add ?? []) {
@@ -212,7 +236,7 @@ async function validateReleaseBody(
         if (names.has(def.name)) return validationFailure(`group name '${def.name}' is already used`);
         names.add(def.name);
 
-        const result = await validateGroupDef(def, fold, addedSoFar, params, ctx);
+        const result = await validateGroupDef(def, fold, addedSoFar, params, ctx, boundViews, groupViews);
         if (!result.valid) return wrapValidationFailure(`TABLEGROUP ${def.name}`, result);
         addedSoFar.add(hash);
     }
@@ -220,7 +244,7 @@ async function validateReleaseBody(
     for (const [hash, change] of Object.entries(body.changes ?? {})) {
         const def = fold.defs.get(hash);
         if (def === undefined) return validationFailure(`change names unknown group '${hash}'`);
-        const result = await validateChange(hash, def, change.schema, json.fromSet(change.version), parents, ctx);
+        const result = await validateChange(hash, def, change, fold, parents, ctx, boundViews);
         if (!result.valid) return result;
     }
 
@@ -287,12 +311,19 @@ export function filesViewReason(def: CatalogFilesDef, view: RSchemaView): string
     return filesSchemaReason(def, view.getName(), (t) => view.getTable(t));
 }
 
+export type BoundGroupView = {
+    def: CatalogGroupDef;
+    view: RSchemaView;
+};
+
 async function validateGroupDef(
     def: CatalogGroupDef,
     fold: ParentFold,
     addedSoFar: Set<B64Hash>,
     params: Map<string, CatalogParamDecl>,
     ctx: RContext,
+    boundViews: (groupHash: B64Hash) => BoundGroupView | undefined,
+    groupViews: Map<B64Hash, BoundGroupView>,
 ): Promise<ValidationResult> {
     const bindings = def.bindings ?? {};
     for (const [alias, target] of Object.entries(bindings)) {
@@ -308,22 +339,201 @@ async function validateGroupDef(
     if (!await isMinimalCover(schema, pin)) return validationFailure("the pinned schema version is not a minimal cover");
     const view = await schema.getView(pin, pin);
 
-    const viewReason = groupViewReason(def, schema.getName(), view);
+    const viewReason = groupViewReason(def, schema.getName(), view, boundViews);
     if (viewReason !== undefined) return validationFailure(viewReason);
 
+    groupViews.set(catalogGroupHash(def), { def, view });
     return validateRowTemplates(def, schema.getName(), view, params, ctx.getHashSuite());
 }
 
-// Why a group definition doesn't fit the schema at its pin: the schema names
-// a group it doesn't bind, or its identity setup doesn't fit (see
-// groupIdentityReason). Messages use C-SQL terms and name no file, so any
-// front end can show them.
-export function groupViewReason(def: CatalogGroupDef, schemaName: string, view: RSchemaView): string | undefined {
+function whereTypesCompatible(a: ColumnType, b: ColumnType): boolean {
+    if (a === b) return true;
+    return (a === 'identity' && b === 'string') || (a === 'string' && b === 'identity');
+}
+
+function checkExistsAtomAgainstTable(
+    clause: string,
+    atom: ExistsAtom,
+    targetTable: string,
+    targetDef: TableDef | undefined,
+    targetSchemaName: string,
+    subjectTable?: TableDef,
+    sourceSchemaView?: RSchemaView,
+): string | undefined {
+    if (targetDef === undefined) return `${clause} reads ${atom.table}: schema ${targetSchemaName} has no table ${targetTable}`;
+    for (const [field, value] of Object.entries(atom.where ?? {})) {
+        if (field === 'rowAuthor') continue;
+        const column = targetDef.columns[field];
+        if (column === undefined) return `${clause} reads ${atom.table}.${field}, which ${targetTable} doesn't have`;
+        if (!(column.pub ?? false)) return `${clause} reads ${atom.table}.${field}, which isn't PUB in ${targetTable}`;
+        if (typeof value === 'string' && value.startsWith('$')) {
+            if (value === '$author') {
+                if (!whereTypesCompatible('identity', column.type)) {
+                    return `${clause}: ${atom.table}.${field} is ${column.type}, and $author is an identity`;
+                }
+            } else {
+                const param = parseParamTerm(value);
+                if (param !== undefined) {
+                    const paramType = sourceSchemaView?.getParam(param)?.type;
+                    if (paramType !== undefined && !whereTypesCompatible(paramType, column.type)) {
+                        return `${clause}: :${param} (${paramType}) does not match ${atom.table}.${field} (${column.type})`;
+                    }
+                } else if (subjectTable !== undefined) {
+                    const rowCol = parseRowFieldTerm(value);
+                    if (rowCol !== undefined) {
+                        const subjectType = rowCol === 'rowAuthor' ? 'string' : subjectTable.columns[rowCol]?.type;
+                        if (subjectType !== undefined && !whereTypesCompatible(subjectType, column.type)) {
+                            return `${clause}: $row field '${rowCol}' type '${subjectType}' does not match ${atom.table}.${field} type '${column.type}'`;
+                        }
+                    }
+                }
+            }
+        } else if (!columnValueMatchesType(value, column.type)) {
+            return `${clause}: ${atom.table}.${field} is ${column.type}, and ${JSON.stringify(value)} is not`;
+        }
+    }
+    return undefined;
+}
+
+export function groupParamsReason(
+    params: { [name: string]: json.Literal } | undefined,
+    view: RSchemaView,
+    schemaName: string,
+    checkRequired = true,
+): string | undefined {
+    const map = params ?? {};
+    for (const [name, value] of Object.entries(map)) {
+        const decl = view.getParam(name);
+        if (decl === undefined) {
+            return `WITH PARAMS sets :${name}, which schema ${schemaName} doesn't declare`;
+        }
+        if (typeof value === 'string' && value.startsWith('$')) {
+            return `WITH PARAMS: :${name} string value cannot start with '$'`;
+        }
+        if (!columnValueMatchesType(value, decl.type)) {
+            const reason = columnValueValidReason(value, { type: decl.type }) ?? `expected a ${decl.type}`;
+            return `WITH PARAMS: :${name} (${decl.type}): ${reason}`;
+        }
+    }
+    if (checkRequired) {
+        for (const decl of view.getParams()) {
+            if (decl.default === undefined && map[decl.name] === undefined) {
+                return `schema ${schemaName} requires a value for :${decl.name} (${decl.type}) in WITH PARAMS`;
+            }
+        }
+    }
+    return undefined;
+}
+
+// Why a group definition doesn't fit the schema at `view`: the schema names
+// a group it doesn't bind, its identity setup doesn't fit (see
+// groupIdentityReason), its schema params don't match `view`, or a cross-group
+// reference / gate doesn't fit the bound group's schema when `boundViews` is
+// supplied. Messages use C-SQL terms and name no file, so any front end can
+// show them.
+export function groupViewReason(
+    def: CatalogGroupDef,
+    schemaName: string,
+    view: RSchemaView,
+    boundViews?: (groupHash: B64Hash) => BoundGroupView | undefined,
+    effectiveParams: { [name: string]: json.Literal } | undefined = def.params,
+): string | undefined {
     const bindings = def.bindings ?? {};
     for (const [alias, reference] of qualifiedTargetReferences(view)) {
         if (!Object.prototype.hasOwnProperty.call(bindings, alias)) return unboundTargetReason(schemaName, alias, reference);
     }
-    return groupIdentityReason(def, view);
+    const identityReason = groupIdentityReason(def, view, boundViews);
+    if (identityReason !== undefined) return identityReason;
+
+    const paramsReason = groupParamsReason(effectiveParams, view, schemaName);
+    if (paramsReason !== undefined) return paramsReason;
+
+    if (boundViews !== undefined) {
+        for (const [alias, map] of Object.entries(def.tableMaps ?? {})) {
+            const bound = boundViews(bindings[alias]);
+            if (bound === undefined) continue;
+            for (const [schemaTable, foreignTable] of Object.entries(map)) {
+                if (!bound.view.hasTable(foreignTable)) {
+                    return `BIND ${alias} (${schemaTable} => ${foreignTable}): schema ${bound.view.getName()} has no table ${foreignTable}`;
+                }
+            }
+        }
+
+        for (const table of view.getTableNames()) {
+            const tableDef = view.getTable(table)!;
+            for (const [column, target] of Object.entries(view.getFKs(table))) {
+                const [alias, targetTable] = splitTableRef(target);
+                if (alias === undefined) continue;
+                const bound = boundViews(bindings[alias]);
+                const mappedTable = def.tableMaps?.[alias]?.[targetTable] ?? targetTable;
+                if (bound !== undefined && !bound.view.hasTable(mappedTable)) {
+                    return `schema ${schemaName}: ${table}.${column} references ${target}: schema ${bound.view.getName()} has no table ${mappedTable}`;
+                }
+            }
+            for (const restriction of tableDef.restrictions ?? []) {
+                const clause = `schema ${schemaName}: ALLOW ${restriction.on} IF on ${table}`;
+                for (const atom of collectExistsAtoms(restriction.rule)) {
+                    const [alias, targetTable] = splitTableRef(atom.table);
+                    if (alias === undefined) continue;
+                    const bound = boundViews(bindings[alias]);
+                    if (bound === undefined) continue;
+                    const mappedTable = def.tableMaps?.[alias]?.[targetTable] ?? targetTable;
+                    const reason = checkExistsAtomAgainstTable(
+                        clause, atom, mappedTable, bound.view.getTable(mappedTable), bound.view.getName(), tableDef, view,
+                    );
+                    if (reason !== undefined) return reason;
+                }
+            }
+        }
+    }
+
+    if (def.canDeploy !== undefined) {
+        for (const atom of collectExistsAtoms(def.canDeploy)) {
+            const [alias, targetTable] = splitTableRef(atom.table);
+            if (alias === undefined) {
+                const reason = checkExistsAtomAgainstTable('ALLOW DEPLOY IF', atom, targetTable, view.getTable(targetTable), schemaName);
+                if (reason !== undefined) return reason;
+            } else {
+                if (!Object.prototype.hasOwnProperty.call(bindings, alias)) {
+                    return `ALLOW DEPLOY IF reads ${atom.table}, and the TABLEGROUP doesn't BIND ${alias}`;
+                }
+                if (boundViews !== undefined) {
+                    const bound = boundViews(bindings[alias]);
+                    if (bound !== undefined) {
+                        const reason = checkExistsAtomAgainstTable('ALLOW DEPLOY IF', atom, targetTable, bound.view.getTable(targetTable), bound.view.getName());
+                        if (reason !== undefined) return reason;
+                    }
+                }
+            }
+        }
+    }
+
+    if (boundViews !== undefined) {
+        for (const [bindingAlias, gate] of Object.entries(def.canObserve ?? {})) {
+            const observed = boundViews(bindings[bindingAlias]);
+            if (observed === undefined) continue;
+            const clause = `ALLOW UPDATE REF ${bindingAlias} IF`;
+            for (const atom of collectExistsAtoms(gate)) {
+                const [qual, targetTable] = splitTableRef(atom.table);
+                if (qual === undefined) {
+                    const reason = checkExistsAtomAgainstTable(clause, atom, targetTable, observed.view.getTable(targetTable), observed.view.getName());
+                    if (reason !== undefined) return reason;
+                } else {
+                    const observedBindings = observed.def.bindings ?? {};
+                    if (!Object.prototype.hasOwnProperty.call(observedBindings, qual)) {
+                        return `${clause} reads ${atom.table}, and TABLEGROUP ${observed.def.name} doesn't BIND ${qual}`;
+                    }
+                    const further = boundViews(observedBindings[qual]);
+                    if (further !== undefined) {
+                        const reason = checkExistsAtomAgainstTable(clause, atom, targetTable, further.view.getTable(targetTable), further.view.getName());
+                        if (reason !== undefined) return reason;
+                    }
+                }
+            }
+        }
+    }
+
+    return undefined;
 }
 
 // Why a group definition's identity setup doesn't fit the schema at `view`.
@@ -333,7 +543,11 @@ export function groupViewReason(def: CatalogGroupDef, schemaName: string, view: 
 // declared ALLOW DEPLOY IF counts too, since the group then embeds no creator
 // keys to verify deploys with. Checked on the pinned version when a group is
 // added, and on the target version whenever a release changes it.
-export function groupIdentityReason(def: CatalogGroupDef, view: RSchemaView): string | undefined {
+export function groupIdentityReason(
+    def: CatalogGroupDef,
+    view: RSchemaView,
+    boundViews?: (groupHash: B64Hash) => BoundGroupView | undefined,
+): string | undefined {
     if (def.idProvider !== undefined) {
         const [alias, table] = splitTableRef(def.idProvider);
         if (alias === undefined) {
@@ -341,6 +555,12 @@ export function groupIdentityReason(def: CatalogGroupDef, view: RSchemaView): st
             if (view.getIdProvider(table) === undefined) return `USING IDENTITIES ${table}: ${table} isn't an IDENTITY PROVIDER table`;
         } else if (!Object.prototype.hasOwnProperty.call(def.bindings ?? {}, alias)) {
             return `USING IDENTITIES ${def.idProvider}: the TABLEGROUP doesn't BIND ${alias}`;
+        } else if (boundViews !== undefined) {
+            const bound = boundViews((def.bindings ?? {})[alias]);
+            if (bound !== undefined) {
+                if (!bound.view.hasTable(table)) return `USING IDENTITIES ${def.idProvider}: schema ${bound.view.getName()} has no table ${table}`;
+                if (bound.view.getIdProvider(table) === undefined) return `USING IDENTITIES ${def.idProvider}: ${table} isn't an IDENTITY PROVIDER table`;
+            }
         }
         return undefined;
     }
@@ -453,18 +673,20 @@ function validateRowTemplates(
 async function validateChange(
     hash: B64Hash,
     def: CatalogGroupDef,
-    schemaRef: B64Hash,
-    versionHashes: Iterable<B64Hash>,
+    change: CatalogGroupChange,
+    fold: ParentFold,
     parents: ReleaseState[],
     ctx: RContext,
+    boundViews?: (groupHash: B64Hash) => BoundGroupView | undefined,
 ): Promise<ValidationResult> {
     const label = `'${def.name}'`;
+    const schemaRef = change.schema;
     if (schemaRef !== def.schemaRef) return validationFailure(`change of group ${label} names schema '${schemaRef}', not its own`);
 
     const schema = await loadSchema(ctx, schemaRef);
     if (schema === undefined) return validationFailure(`'${schemaRef}' is not a schema`);
 
-    const target = version(...versionHashes);
+    const target = version(...json.fromSet(change.version));
     if (!await isMinimalCover(schema, target)) return validationFailure(`the version of group ${label} is not a minimal cover`);
 
     const causal = await schema.getCausalDag();
@@ -482,7 +704,13 @@ async function validateChange(
     if (!present) return validationFailure(`group ${label} is not in any parent release`);
     if (!differs) return validationFailure(`the change of group ${label} does not change its version`);
 
-    const identityReason = groupIdentityReason(def, await schema.getView(target, target));
-    if (identityReason !== undefined) return validationFailure(`TABLEGROUP ${def.name}: ${identityReason}`);
+    const targetView = await schema.getView(target, target);
+    if (change.params !== undefined) {
+        const changeReason = groupParamsReason(change.params, targetView, schema.getName(), false);
+        if (changeReason !== undefined) return validationFailure(`TABLEGROUP ${def.name}: ${changeReason}`);
+    }
+    const foldedParams = { ...(fold.groups.get(hash)?.params ?? {}), ...(change.params ?? {}) };
+    const viewReason = groupViewReason(def, schema.getName(), targetView, boundViews, foldedParams);
+    if (viewReason !== undefined) return validationFailure(`TABLEGROUP ${def.name}: ${viewReason}`);
     return validationOk();
 }

@@ -10,19 +10,20 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import { createBasicCrypto, HASH_SHA256, type B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { version as versionOf, type Version } from "@hyper-hyper-space/hhs3_mvt";
 import {
-    catalogGroupHash, filesAccessReason, filesViewReason, groupIdentityReason, groupViewReason, rowsTableReason, rowTemplateReason,
+    catalogGroupHash, filesAccessReason, filesViewReason, groupViewReason, rowsTableReason, rowTemplateReason,
+    type BoundGroupView,
 } from "@hyper-hyper-space/hhs3_rdb";
 import type {
-    CatalogFilesDef, CatalogGroupChange, CatalogGroupDef, CatalogParamDecl, CatalogRowTemplate, ParentFold, Predicate,
+    CatalogFilesDef, CatalogGroupChange, CatalogGroupDef, CatalogParamDecl, CatalogRowTemplate, ColumnDef, ParentFold, Predicate, RSchemaView, TableMaps,
 } from "@hyper-hyper-space/hhs3_rdb";
 
 import type {
-    CatalogChangeExpr, CatalogFilesExpr, CatalogGroupExpr, CatalogParamDeclExpr, NameOrHashRef, ValueExpr,
+    CatalogChangeExpr, CatalogFilesExpr, CatalogGroupExpr, CatalogParamDeclExpr, NameOrHashRef, ParamAssignment, ValueExpr,
 } from "../syntax/ast.js";
 import type { LangBindContext } from "../bind/context.js";
 import { asJsonLiteral, canonicalEncodeValue, resolveValue } from "../bind/values.js";
-import { SpannedError } from "../diagnostics.js";
-import { columnSetFromTableDef, columnsOfFromSchemaView, splitExistsTableRef, type RuleScope } from "./rule_scope.js";
+import { SpannedError, type TextSpan } from "../diagnostics.js";
+import { columnSetFromTableDef, splitExistsTableRef, type RuleScope } from "./rule_scope.js";
 import { lowerRestrictionPredicate } from "./query.js";
 
 const PSEUDO_COLUMN_UUID = 'uuid';
@@ -44,6 +45,10 @@ export class CatalogDefScope {
 
     get(hash: B64Hash): CatalogGroupDef | undefined {
         return this.defs.get(hash);
+    }
+
+    entries(): IterableIterator<[B64Hash, CatalogGroupDef]> {
+        return this.defs.entries();
     }
 
     names(): Set<string> {
@@ -74,11 +79,83 @@ export function compileParamDecls(exprs: CatalogParamDeclExpr[]): CatalogParamDe
     });
 }
 
+function compileGroupParams(
+    assignments: ParamAssignment[] | undefined,
+    view: RSchemaView,
+    catalogParams: Map<string, CatalogParamDecl>,
+    where: string,
+): { [name: string]: json.Literal } | undefined {
+    if (assignments === undefined || assignments.length === 0) return undefined;
+    const out: { [name: string]: json.Literal } = {};
+    for (const item of assignments) {
+        if (out[item.name] !== undefined) {
+            throw new SpannedError(`${where}: param ':${item.name}' is set twice in WITH PARAMS`, item.span, 'VALIDATION_REJECTED');
+        }
+        if (item.value.kind === 'param') {
+            if (catalogParams.has(item.value.name)) {
+                throw new SpannedError(
+                    `${where}: ':${item.value.name}' is a per-database param; schema params take literals or constants`,
+                    item.value.span,
+                    'VALIDATION_REJECTED',
+                );
+            }
+            throw new SpannedError(`${where}: unknown constant ':${item.value.name}'`, item.value.span, 'VALIDATION_REJECTED');
+        }
+        if (item.value.kind === 'literal' && item.value.constant !== undefined) {
+            if (view.getParam(item.value.constant) !== undefined) {
+                throw new SpannedError(
+                    `${where}: Constant ':${item.value.constant}' cannot share its name with schema param ':${item.value.constant}'`,
+                    item.value.span,
+                    'VALIDATION_REJECTED',
+                );
+            }
+        }
+        if (item.value.kind !== 'literal' || item.value.value === null) {
+            throw new SpannedError(`${where}: WITH PARAMS value for ':${item.name}' must be a literal`, item.value.span, 'VALIDATION_REJECTED');
+        }
+        const decl = view.getParam(item.name);
+        if (decl === undefined) {
+            throw new SpannedError(
+                `${where}: WITH PARAMS sets :${item.name}, which schema ${view.getName()} doesn't declare`,
+                item.span,
+                'VALIDATION_REJECTED',
+            );
+        }
+        if (typeof item.value.value === 'string' && item.value.value.startsWith('$')) {
+            throw new SpannedError(`${where}: WITH PARAMS: :${item.name} string value cannot start with '$'`, item.value.span, 'VALIDATION_REJECTED');
+        }
+        try {
+            out[item.name] = canonicalEncodeValue(item.value.value, { type: decl.type } as ColumnDef);
+        } catch (e) {
+            const message = e instanceof Error ? e.message : String(e);
+            throw new SpannedError(`${where}: WITH PARAMS: :${item.name} (${decl.type}): ${message}`, item.value.span, 'VALIDATION_REJECTED');
+        }
+    }
+    return out;
+}
+
+async function loadScopeGroupViews(
+    scope: CatalogDefScope,
+    context: LangBindContext,
+    groupVersion: (hash: B64Hash) => Version,
+    span: TextSpan,
+): Promise<Map<B64Hash, BoundGroupView>> {
+    const views = new Map<B64Hash, BoundGroupView>();
+    for (const [hash, def] of scope.entries()) {
+        const schema = await context.resolveSchema({ kind: 'hash', prefix: def.schemaRef, span });
+        if (schema.schema === undefined) continue;
+        const at = groupVersion(hash);
+        views.set(hash, { def, view: await schema.schema.getView(at, at) });
+    }
+    return views;
+}
+
 export async function compileCatalogGroup(
     expr: CatalogGroupExpr,
     context: LangBindContext,
     scope: CatalogDefScope,
     params: Map<string, CatalogParamDecl>,
+    groupVersion: (hash: B64Hash) => Version = (hash) => pinOf(scope.get(hash)!),
 ): Promise<CatalogGroupDef> {
     const label = `TABLEGROUP ${expr.name}`;
     const schema = await context.resolveSchema(expr.schema);
@@ -88,7 +165,6 @@ export async function compileCatalogGroup(
         { kind: 'schema', id: schema.id, schema: schema.schema },
     );
     const view = await schema.schema.getView(pin, pin);
-    const gateScope: RuleScope = { columnsOf: columnsOfFromSchemaView(view) };
 
     const def: CatalogGroupDef = {
         name: expr.name,
@@ -99,28 +175,72 @@ export async function compileCatalogGroup(
 
     if (expr.bindings.length > 0) {
         const bindings: { [alias: string]: B64Hash } = {};
+        const tableMaps: TableMaps = {};
         for (const binding of expr.bindings) {
             if (bindings[binding.name] !== undefined) throw new Error(`${label}: binding '${binding.name}' is declared twice`);
             bindings[binding.name] = scope.resolve(binding.group, `${label} BIND ${binding.name}`);
+            if (binding.tables !== undefined) {
+                if (binding.tables.length === 0) {
+                    throw new SpannedError(`${label}: BIND ${binding.name} () must list at least one table mapping`, binding.span, 'VALIDATION_REJECTED');
+                }
+                const map: { [schemaTable: string]: string } = {};
+                for (const item of binding.tables) {
+                    if (map[item.from] !== undefined) {
+                        throw new SpannedError(`${label}: BIND ${binding.name} maps table '${item.from}' twice`, item.span, 'VALIDATION_REJECTED');
+                    }
+                    if (item.from === item.to) {
+                        throw new SpannedError(`${label}: BIND ${binding.name} maps '${item.from}' to itself; omit unchanged table names`, item.span, 'VALIDATION_REJECTED');
+                    }
+                    map[item.from] = item.to;
+                }
+                tableMaps[binding.name] = map;
+            }
         }
         def.bindings = bindings;
+        if (Object.keys(tableMaps).length > 0) def.tableMaps = tableMaps;
     }
     if (expr.idProvider !== undefined) def.idProvider = expr.idProvider;
+    const groupParams = compileGroupParams(expr.params, view, params, label);
+    if (groupParams !== undefined) def.params = groupParams;
 
-    if (expr.canDeploy !== undefined) def.canDeploy = lowerRestrictionPredicate(expr.canDeploy, gateScope);
+    const boundViews = await loadScopeGroupViews(scope, context, groupVersion, expr.span);
+    const deployScope: RuleScope = {
+        columnsOf: (tableRef) => {
+            const { group: alias, table } = splitExistsTableRef(tableRef);
+            const targetView = alias === undefined
+                ? view
+                : (def.bindings?.[alias] !== undefined ? boundViews.get(def.bindings[alias])?.view : undefined);
+            const tableDef = targetView?.getTable(table);
+            return tableDef === undefined ? undefined : columnSetFromTableDef(tableDef);
+        },
+    };
+    if (expr.canDeploy !== undefined) def.canDeploy = lowerRestrictionPredicate(expr.canDeploy, deployScope);
     if (expr.canObserve.length > 0) {
         const canObserve: { [binding: string]: Predicate } = {};
         for (const clause of expr.canObserve) {
-            if (def.bindings?.[clause.binding] === undefined) {
+            const targetHash = def.bindings?.[clause.binding];
+            if (targetHash === undefined) {
                 throw new Error(`${label}: ALLOW UPDATE REF names '${clause.binding}', which is not a binding`);
             }
-            canObserve[clause.binding] = lowerRestrictionPredicate(clause.predicate, gateScope);
+            const observed = boundViews.get(targetHash);
+            const observeScope: RuleScope = {
+                columnsOf: (tableRef) => {
+                    if (observed === undefined) return undefined;
+                    const { group: qual, table } = splitExistsTableRef(tableRef);
+                    const targetView = qual === undefined
+                        ? observed.view
+                        : (observed.def.bindings?.[qual] !== undefined ? boundViews.get(observed.def.bindings[qual])?.view : undefined);
+                    const tableDef = targetView?.getTable(table);
+                    return tableDef === undefined ? undefined : columnSetFromTableDef(tableDef);
+                },
+            };
+            canObserve[clause.binding] = lowerRestrictionPredicate(clause.predicate, observeScope);
         }
         def.canObserve = canObserve;
     }
 
     const schemaName = schema.schema.getName();
-    const viewReason = groupViewReason(def, schemaName, view);
+    const viewReason = groupViewReason(def, schemaName, view, (h) => boundViews.get(h));
     if (viewReason !== undefined) throw new SpannedError(`${label}: ${viewReason}`, expr.span, 'VALIDATION_REJECTED');
 
     if (expr.initialRows.length > 0) {
@@ -295,17 +415,16 @@ export async function compileReleaseChanges(
     const add: CatalogGroupDef[] = [];
     const filesExprs: CatalogFilesExpr[] = [];
 
+    const pendingUpdates: {
+        hash: B64Hash;
+        def: CatalogGroupDef;
+        schemaName: string;
+        view: RSchemaView;
+        params?: { [name: string]: json.Literal };
+        span: TextSpan;
+    }[] = [];
     for (const change of changes) {
-        if (change.kind === 'add-group') {
-            const def = await compileCatalogGroup(change.group, context, scope, params);
-            scope.add(def);
-            add.push(def);
-            continue;
-        }
-        if (change.kind === 'add-files') {
-            filesExprs.push(change.files);
-            continue;
-        }
+        if (change.kind !== 'update-schema') continue;
         const hash = parentScope.resolve(change.group, 'UPDATE SCHEMA ... ON');
         const def = fold.defs.get(hash)!;
         if (out[hash] !== undefined) throw new Error(`UPDATE SCHEMA ... ON ${def.name}: the group is set twice`);
@@ -314,20 +433,24 @@ export async function compileReleaseChanges(
             throw new Error(`UPDATE SCHEMA ... ON ${def.name}: the group uses schema '${def.schemaRef}', not '${schema.id}'`);
         }
         const version: Version = await context.resolveVersion(change.version, { kind: 'schema', id: schema.id, schema: schema.schema });
+        let changeParams: { [name: string]: json.Literal } | undefined;
         if (schema.schema !== undefined) {
-            const identityReason = groupIdentityReason(def, await schema.schema.getView(version, version));
-            if (identityReason !== undefined) {
-                throw new SpannedError(`UPDATE SCHEMA ... ON ${def.name}: ${identityReason}`, change.span, 'VALIDATION_REJECTED');
-            }
+            const view = await schema.schema.getView(version, version);
+            changeParams = compileGroupParams(change.params, view, params, `UPDATE SCHEMA ... ON ${def.name}`);
+            pendingUpdates.push({
+                hash,
+                def,
+                schemaName: schema.schema.getName(),
+                view,
+                ...(changeParams !== undefined ? { params: changeParams } : {}),
+                span: change.span,
+            });
         }
-        out[hash] = { schema: schema.id, version: json.toSet([...version]) };
-    }
-
-    const unresolved = [...fold.conflicts.keys()].filter((hash) => out[hash] === undefined);
-    if (unresolved.length > 0) {
-        const names = unresolved.map((hash) => fold.defs.get(hash)?.name ?? hash).sort();
-        throw new Error(`the parent releases disagree on the version of ${names.map((n) => `'${n}'`).join(', ')}; `
-            + `add UPDATE SCHEMA schema TO version ON group for each`);
+        out[hash] = {
+            schema: schema.id,
+            version: json.toSet([...version]),
+            ...(changeParams !== undefined ? { params: changeParams } : {}),
+        };
     }
 
     const groupVersion = (hash: B64Hash): Version => {
@@ -337,6 +460,38 @@ export async function compileReleaseChanges(
         if (parent !== undefined) return versionOf(...parent.version);
         return pinOf(scope.get(hash)!);
     };
+
+    for (const change of changes) {
+        if (change.kind === 'add-group') {
+            const def = await compileCatalogGroup(change.group, context, scope, params, groupVersion);
+            scope.add(def);
+            add.push(def);
+            continue;
+        }
+        if (change.kind === 'add-files') {
+            filesExprs.push(change.files);
+            continue;
+        }
+    }
+
+    if (pendingUpdates.length > 0) {
+        const boundViews = await loadScopeGroupViews(scope, context, groupVersion, pendingUpdates[0].span);
+        for (const item of pendingUpdates) {
+            const foldedParams = { ...(fold.groups.get(item.hash)?.params ?? {}), ...(item.params ?? {}) };
+            const viewReason = groupViewReason(item.def, item.schemaName, item.view, (h) => boundViews.get(h), foldedParams);
+            if (viewReason !== undefined) {
+                throw new SpannedError(`UPDATE SCHEMA ... ON ${item.def.name}: ${viewReason}`, item.span, 'VALIDATION_REJECTED');
+            }
+        }
+    }
+
+    const unresolved = [...fold.conflicts.keys()].filter((hash) => out[hash] === undefined);
+    if (unresolved.length > 0) {
+        const names = unresolved.map((hash) => fold.defs.get(hash)?.name ?? hash).sort();
+        throw new Error(`the parent releases disagree on the version of ${names.map((n) => `'${n}'`).join(', ')}; `
+            + `add UPDATE SCHEMA schema TO version ON group for each`);
+    }
+
     const taken = new Set([...scope.names(), ...[...fold.files.values()].map((def) => def.name)]);
     const files = await compileCatalogFilesItems(filesExprs, context, scope, groupVersion, taken);
 

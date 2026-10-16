@@ -2,7 +2,7 @@ import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import {
-    catalogFilesHash, catalogGroupHash,
+    catalogFilesHash, catalogGroupHash, deriveRowId,
     type RBlobStoreImpl, type RFileMapImpl, type RSchemaImpl, type RTableGroupImpl,
 } from "@hyper-hyper-space/hhs3_rdb";
 
@@ -654,6 +654,272 @@ export const catalogLangTests = {
                 if (!bound.ok || bound.value.kind !== 'create-catalog') throw new Error('the source binds');
                 assertEquals(bound.value.files.map(catalogFilesHash).join(','), [...genesis.files.keys()].join(','),
                     'the FILES reads back to the same definition');
+            },
+        },
+        {
+            name: '[CLANG17] ALLOW UPDATE REF compiles in the observed group frame; cross-group references are checked on ADD and UPDATE SCHEMA',
+            invoke: async () => {
+                const a = await actors();
+                const env = await appEnv(a);
+                await env.run(`
+                    CREATE SCHEMA notes_schema CREATORS ($dev) AS (
+                      TABLE notes (body string) ALLOW all IF true
+                    );
+                `);
+
+                // Qualified ALLOW UPDATE REF on docs (which binds users => users) compiles in docs's frame
+                await env.run(`
+                    ALTER CATALOG app VERSION '1.1.0' AS (
+                      ADD TABLEGROUP notes USING SCHEMA notes_schema
+                        BIND docs => docs, users => users
+                        USING IDENTITIES users.identities
+                        ALLOW UPDATE REF docs IF EXISTS users.caps WHERE label = 'writer' AND grantee = $author
+                    );
+                `);
+
+                const nonPub = await env.fail(`
+                    ALTER CATALOG app VERSION '1.2.0' AS (
+                      ADD TABLEGROUP notes2 USING SCHEMA notes_schema
+                        BIND users => users
+                        USING IDENTITIES users.identities
+                        ALLOW UPDATE REF users IF EXISTS caps WHERE memo = 'secret'
+                    );
+                `);
+                assertTrue(nonPub.includes("ALLOW UPDATE REF users IF reads caps.memo, which isn't PUB in caps"), nonPub);
+
+                const unboundOnObserved = await env.fail(`
+                    ALTER CATALOG app VERSION '1.2.0' AS (
+                      ADD TABLEGROUP notes2 USING SCHEMA notes_schema
+                        BIND docs => docs, users => users
+                        USING IDENTITIES users.identities
+                        ALLOW UPDATE REF docs IF EXISTS other.caps WHERE grantee = $author
+                    );
+                `);
+                assertTrue(unboundOnObserved.includes("ALLOW UPDATE REF docs IF reads other.caps, and TABLEGROUP docs doesn't BIND other"), unboundOnObserved);
+
+                // UPDATE SCHEMA checks cross-group references on the updated schema
+                await env.run(`
+                    ALTER SCHEMA notes_schema AS (
+                      SET ALLOW RULES notes (ALLOW insert IF EXISTS ghost.caps WHERE grantee = $author)
+                    );
+                `);
+                const badUpdate = await env.fail(`
+                    ALTER CATALOG app VERSION '1.2.0' AS (
+                      UPDATE SCHEMA notes_schema TO LATEST ON notes
+                    );
+                `);
+                assertTrue(badUpdate.includes("UPDATE SCHEMA ... ON notes: schema notes_schema references ghost.caps (from notes), and the TABLEGROUP doesn't BIND ghost"), badUpdate);
+            },
+        },
+        {
+            name: '[CLANG18] BIND alias => group (from => to, ...) remaps schema tables, validates against bound groups, and round-trips in dumps and source form',
+            invoke: async () => {
+                const a = await actors();
+                const env = await appEnv(a);
+                await env.run(`
+                    CREATE SCHEMA blog_schema CREATORS ($dev) AS (
+                      TABLE posts (title string PUB),
+                      TABLE photos (url string PUB)
+                    );
+                    CREATE SCHEMA comments_schema CREATORS ($dev) AS (
+                      TABLE comments (
+                        item string READONLY REFERENCES target.subject,
+                        body string
+                      ) ALLOW insert IF EXISTS auth.perms WHERE label = 'writer' AND grantee = $author
+                    );
+                `);
+
+                const selfMap = await env.fail(`
+                    ALTER CATALOG app VERSION '1.1.0' AS (
+                      ADD TABLEGROUP blog USING SCHEMA blog_schema,
+                      ADD TABLEGROUP c1 USING SCHEMA comments_schema
+                        BIND target => blog (posts => posts), auth => users (perms => caps)
+                        USING IDENTITIES auth.identities
+                    );
+                `);
+                assertTrue(selfMap.includes("maps 'posts' to itself"), selfMap);
+
+                const missingTarget = await env.fail(`
+                    ALTER CATALOG app VERSION '1.1.0' AS (
+                      ADD TABLEGROUP blog USING SCHEMA blog_schema,
+                      ADD TABLEGROUP c1 USING SCHEMA comments_schema
+                        BIND target => blog (subject => videos), auth => users (perms => caps)
+                        USING IDENTITIES auth.identities
+                    );
+                `);
+                assertTrue(missingTarget.includes('BIND target (subject => videos): schema blog_schema has no table videos'), missingTarget);
+
+                await env.run(`
+                    ALTER CATALOG app VERSION '1.1.0' AS (
+                      ADD TABLEGROUP blog USING SCHEMA blog_schema,
+                      ADD TABLEGROUP post_comments USING SCHEMA comments_schema
+                        BIND target => blog (subject => posts), auth => users (perms => caps)
+                        USING IDENTITIES auth.identities,
+                      ADD TABLEGROUP photo_comments USING SCHEMA comments_schema
+                        BIND target => blog (subject => photos), auth => users (perms => caps)
+                        USING IDENTITIES auth.identities
+                    );
+                `);
+
+                env.vars['me'] = a.admin;
+                await env.run(`
+                    CREATE DATABASE prod USING CATALOG app AT '1.1.0' CREATORS ($admin) WITH PARAMS (:admin = $admin) BY $admin;
+                    INSERT INTO users.identities (keyId, publicKey, name) VALUES ($alice, publicKey($alice), 'Alice');
+                    INSERT INTO users.caps (label, grantee) VALUES ('writer', $alice);
+                    INSERT INTO blog.posts (uuid, title) VALUES ('p-1', 'Hello');
+                    INSERT INTO blog.photos (uuid, url) VALUES ('ph-1', 'pic.jpg');
+                    UPDATE REF auth TO LATEST ON post_comments;
+                    UPDATE REF target TO LATEST ON post_comments;
+                    UPDATE REF auth TO LATEST ON photo_comments;
+                    UPDATE REF target TO LATEST ON photo_comments;
+                `);
+
+                const postId = deriveRowId('p-1');
+                const photoId = deriveRowId('ph-1');
+                env.vars['me'] = a.alice;
+                await env.run(`
+                    INSERT INTO post_comments.comments (item, body) VALUES (#${postId.slice(0, 8)}, 'on post');
+                    INSERT INTO photo_comments.comments (item, body) VALUES (#${photoId.slice(0, 8)}, 'on photo');
+                `);
+
+                const catalog = await env.catalog('app');
+                const dump = await dumpCatalog(catalog, { loadSchema: loaders(env).loadSchema });
+                assertTrue(dump.includes('BIND target => blog (subject => posts), auth => users (perms => caps)'), `dump renders tableMaps:\n${dump}`);
+
+                const replay = await createLangEnv({ vars: { ...a, me: a.dev } });
+                await replay.run(dump);
+                assertEquals(await frontierKey(await replay.catalog('app')), await frontierKey(catalog), 'catalog dump with tableMaps replays to identical DAG');
+            },
+        },
+        {
+            name: '[CLANG19] schema PARAMS, TABLEGROUP / UPDATE SCHEMA WITH PARAMS, default CREATORS, and CONSTANT statements end to end',
+            invoke: async () => {
+                const a = await actors();
+                const env = await createLangEnv({ vars: { ...a, me: a.dev } });
+
+                // CONSTANT rules: literal only, no redeclaration, no collision with schema or catalog params
+                const badConst = parseScript("CONSTANT :x = 1 + 2;");
+                assertTrue(!badConst.ok && badConst.diagnostics[0]!.message.includes('requires a string, number, or boolean literal'),
+                    'non-literal CONSTANT is rejected');
+                const dupConst = parseScript("CONSTANT :x = 1; CONSTANT :x = 2;");
+                assertTrue(!dupConst.ok && dupConst.diagnostics[0]!.message.includes("Constant ':x' is declared twice"),
+                    'duplicate CONSTANT is rejected');
+                const collideCatalog = parseScript("CONSTANT :admin = 'x'; CREATE CATALOG c VERSION '1.0.0' PARAMS (:admin identity) AS (TABLEGROUP g USING SCHEMA s);");
+                assertTrue(!collideCatalog.ok && collideCatalog.diagnostics[0]!.message.includes("cannot share its name with constant ':admin'"),
+                    'CONSTANT colliding with catalog param is rejected');
+                const collideSchema = parseScript("CONSTANT :cap = 'x'; CREATE SCHEMA s PARAMS (:cap string) AS (TABLE t (x string));");
+                assertTrue(!collideSchema.ok && collideSchema.diagnostics[0]!.message.includes("cannot share its name with constant ':cap'"),
+                    'CONSTANT colliding with inline schema param is rejected');
+
+                await env.run(`
+                    CONSTANT :writer_role = 'writer';
+                    CONSTANT :initial_max = 10;
+
+                    CREATE SCHEMA users_schema AS (
+                      TABLE identities (
+                        keyId string PUB READONLY,
+                        publicKey string PUB READONLY,
+                        name string NULL PUB
+                      ) IDENTITY PROVIDER ALLOW insert IF true,
+                      TABLE caps (
+                        label string PUB READONLY,
+                        grantee string PUB READONLY
+                      ) CONCURRENT DELETES ALLOW insert IF true
+                    );
+
+                    CREATE SCHEMA comments_schema PARAMS (:write_cap string, :max_len integer DEFAULT 50) AS (
+                      TABLE comments (
+                        body string READONLY
+                      ) ALLOW insert IF length(body) <= :max_len
+                                    AND EXISTS auth.caps WHERE label = :write_cap AND grantee = $author
+                    );
+
+                    CREATE CATALOG app VERSION '1.0.0' PARAMS (:admin identity) AS (
+                      TABLEGROUP users USING SCHEMA users_schema
+                        USING IDENTITIES identities
+                        WITH ROWS (
+                          identities (keyId = :admin, publicKey = publicKey(:admin), name = 'Admin'),
+                          caps (label = 'manager', grantee = :admin)
+                        ),
+                      TABLEGROUP short_comments USING SCHEMA comments_schema
+                        BIND auth => users
+                        USING IDENTITIES auth.identities
+                        WITH PARAMS (:write_cap = :writer_role, :max_len = :initial_max),
+                      TABLEGROUP default_comments USING SCHEMA comments_schema
+                        BIND auth => users
+                        USING IDENTITIES auth.identities
+                        WITH PARAMS (:write_cap = :writer_role)
+                    );
+                `);
+
+                // Forwarding a per-database catalog param into schema WITH PARAMS is rejected with a clear message
+                const forwarded = await env.fail(`
+                    ALTER CATALOG app VERSION '1.1.0' AS (
+                      ADD TABLEGROUP bad USING SCHEMA comments_schema
+                        BIND auth => users
+                        USING IDENTITIES auth.identities
+                        WITH PARAMS (:write_cap = :admin)
+                    );
+                `);
+                assertTrue(forwarded.includes("':admin' is a per-database param; schema params take literals or constants"), forwarded);
+
+                // Missing required schema param (with no DEFAULT) is rejected
+                const missingParam = await env.fail(`
+                    ALTER CATALOG app VERSION '1.1.0' AS (
+                      ADD TABLEGROUP bad USING SCHEMA comments_schema
+                        BIND auth => users
+                        USING IDENTITIES auth.identities
+                    );
+                `);
+                assertTrue(missingParam.includes('schema comments_schema requires a value for :write_cap (string) in WITH PARAMS'), missingParam);
+
+                env.vars['me'] = a.admin;
+                await env.run(`
+                    CREATE DATABASE prod USING CATALOG app AT '1.0.0' CREATORS ($admin) WITH PARAMS (:admin = $admin) BY $admin;
+                    INSERT INTO users.identities (keyId, publicKey, name) VALUES ($alice, publicKey($alice), 'Alice');
+                    INSERT INTO users.caps (label, grantee) VALUES ('writer', $alice);
+                    UPDATE REF auth TO LATEST ON short_comments;
+                    UPDATE REF auth TO LATEST ON default_comments;
+                `);
+
+                env.vars['me'] = a.alice;
+                await env.run("INSERT INTO short_comments.comments (body) VALUES ('1234567890');");
+                const tooLong = await env.fail("INSERT INTO short_comments.comments (body) VALUES ('12345678901');");
+                assertTrue(tooLong.length > 0, 'body length 11 > :max_len 10 is rejected on short_comments');
+                await env.run("INSERT INTO default_comments.comments (body) VALUES ('12345678901234567890');");
+
+                // ALTER SCHEMA adding a new param with DEFAULT, and UPDATE SCHEMA ... WITH PARAMS revising :max_len
+                env.vars['me'] = a.dev;
+                await env.run(`
+                    ALTER SCHEMA comments_schema VERSION '1.1.0' PARAMS (:prefix string DEFAULT 'ok:') AS (
+                      SET ALLOW RULES comments (
+                        ALLOW insert IF length(body) <= :max_len
+                                    AND body LIKE :prefix
+                                    AND EXISTS auth.caps WHERE label = :write_cap AND grantee = $author
+                      )
+                    );
+                    ALTER CATALOG app VERSION '1.1.0' AS (
+                      UPDATE SCHEMA comments_schema TO LATEST ON short_comments WITH PARAMS (:max_len = 25, :prefix = 'note:%')
+                    );
+                `);
+
+                env.vars['me'] = a.admin;
+                await env.run("UPDATE CATALOG app TO '1.1.0' ON prod BY $admin;");
+
+                env.vars['me'] = a.alice;
+                await env.run("INSERT INTO short_comments.comments (body) VALUES ('note: now up to 25 chars!');");
+                const wrongPrefix = await env.fail("INSERT INTO short_comments.comments (body) VALUES ('bad: prefix');");
+                assertTrue(wrongPrefix.length > 0, 'wrong prefix is rejected after deploy');
+
+                const db = await env.database('prod');
+                const dump = await dumpDatabase(db, loaders(env));
+                assertTrue(dump.includes('PARAMS (:write_cap string, :max_len integer DEFAULT 50)'), `dump includes schema PARAMS:\n${dump}`);
+                assertTrue(dump.includes("WITH PARAMS (:max_len = 25, :prefix = 'note:%')"), `dump includes UPDATE SCHEMA WITH PARAMS:\n${dump}`);
+
+                const replay = await createLangEnv({ vars: { ...a, me: a.dev } });
+                await replay.run(dump);
+                assertEquals(await frontierKey(await replay.group('prod.short_comments')), await frontierKey(await env.group('prod.short_comments')),
+                    'the short_comments group replays to the identical DAG');
             },
         },
     ],

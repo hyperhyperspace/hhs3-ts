@@ -14,11 +14,30 @@ import {
     createTableGroupFormat, CreateTableGroupPayload,
     rowEnvelopeFormat, RowEnvelopePayload,
     bundleFormat, BundlePayload,
+    groupParamsFormat,
 } from "./payload.js";
 
 import { isValidName, isValidTableRef, validatePredicate } from "../rschema/validate.js";
 import { validateRowOpFormat } from "../rtable/validate.js";
 import { InsertRowPayload } from "../rtable/payload.js";
+
+function validateGroupParamsFormat(params: json.Literal, label: string): ValidationResult {
+    if (!json.checkFormat(groupParamsFormat, params)) {
+        return validationFailure(`${label} params format is invalid`);
+    }
+    const map = params as json.LiteralMap;
+    const names = Object.keys(map);
+    if (names.length === 0) return validationFailure(`${label} params must be omitted when empty`);
+    for (const name of names) {
+        if (!isValidName(name)) return validationFailure(`invalid parameter name '${name}' in ${label}`);
+        const val = map[name];
+        if (!json.isLiteral(val)) return validationFailure(`invalid parameter value for ':${name}' in ${label}`);
+        if (typeof val === 'string' && val.startsWith('$')) {
+            return validationFailure(`parameter ':${name}' string value cannot start with '$'`);
+        }
+    }
+    return validationOk();
+}
 
 export function validateTableGroupPayloadFormat(payload: json.Literal): ValidationResult {
     if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
@@ -28,10 +47,16 @@ export function validateTableGroupPayloadFormat(payload: json.Literal): Validati
     if (isRefAdvancePayload(payload)) {
         // canonical mvt ref-advance; used for both the RSchema ref (deploy)
         // and foreign group refs (cross-group FKs). Non-strict: deploy-gated
-        // ref-advances carry author/signature as extra fields.
-        return json.checkFormat(refAdvanceFormat, payload, { strict: false })
-            ? validationOk()
-            : validationFailure("ref-advance payload format is invalid");
+        // ref-advances carry author/signature/gate/params as extra fields.
+        if (!json.checkFormat(refAdvanceFormat, payload, { strict: false })) {
+            return validationFailure("ref-advance payload format is invalid");
+        }
+        const p = payload as json.LiteralMap;
+        if (p['params'] !== undefined) {
+            const paramsRes = validateGroupParamsFormat(p['params'], 'ref-advance');
+            if (!paramsRes.valid) return paramsRes;
+        }
+        return validationOk();
     }
 
     const action = (payload as json.LiteralMap)['action'];
@@ -55,19 +80,39 @@ export function validateTableGroupPayloadFormat(payload: json.Literal): Validati
             }
         }
 
-        // bindings must be INJECTIVE (name -> id is one-to-one): the reverse
-        // map (group id -> binding name) has to be well-defined so a ref-advance
-        // / observe op (keyed by object id) can be attributed to a single
-        // binding name and its gate. A pure structural property of the payload,
-        // so the rejection is deterministic and replica-convergent.
-        const seenTargets = new Map<string, string>();
-        for (const [name, target] of Object.entries(create.bindings ?? {})) {
+        for (const name of Object.keys(create.bindings ?? {})) {
             if (!isValidName(name)) return validationFailure(`invalid binding name '${name}'`);
-            const prior = seenTargets.get(target);
-            if (prior !== undefined) {
-                return validationFailure(`bindings must be injective: names '${prior}' and '${name}' both bind group id '${target}'`);
+        }
+
+        if (create.tableMaps !== undefined) {
+            const aliases = Object.keys(create.tableMaps);
+            if (aliases.length === 0) return validationFailure('tableMaps must be omitted when empty');
+            const bindings = create.bindings ?? {};
+            for (const alias of aliases) {
+                if (!Object.prototype.hasOwnProperty.call(bindings, alias)) {
+                    return validationFailure(`tableMaps alias '${alias}' is not a bound group`);
+                }
+                const entries = Object.entries(create.tableMaps[alias]);
+                if (entries.length === 0) {
+                    return validationFailure(`tableMaps for '${alias}' must not be empty`);
+                }
+                for (const [schemaTable, foreignTable] of entries) {
+                    if (!isValidName(schemaTable)) {
+                        return validationFailure(`invalid schema table name '${schemaTable}' in tableMaps for '${alias}'`);
+                    }
+                    if (!isValidName(foreignTable)) {
+                        return validationFailure(`invalid foreign table name '${foreignTable}' in tableMaps for '${alias}'`);
+                    }
+                    if (schemaTable === foreignTable) {
+                        return validationFailure(`tableMaps for '${alias}' maps '${schemaTable}' to itself`);
+                    }
+                }
             }
-            seenTargets.set(target, name);
+        }
+
+        if (create.params !== undefined) {
+            const paramsRes = validateGroupParamsFormat(create.params, 'group create');
+            if (!paramsRes.valid) return paramsRes;
         }
 
         // canDeploy runs without a subject row: 'object' context ($row.* rejected)

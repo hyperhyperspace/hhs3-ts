@@ -99,7 +99,9 @@ export type GroupOpHost = {
     getScopedDag(): Promise<ScopedDag>;
     getSchemaObject(): Promise<RSchema>;
     getForeignGroupCausalDag(groupId: B64Hash): Promise<CausalDag>;
+    resolveSchemaVersion(at: Version, from?: Version): Promise<Version>;
     resolveSchemaView(at: Version, from?: Version): Promise<RSchemaView>;
+    resolveEffectiveParams(at: Version, from?: Version): Promise<{ [name: string]: json.Literal }>;
     // KeyLookup over the selected provider, anchored at a group position,
     // liveness-bypassed. undefined = unresolvable (reject); throws on a missing
     // bound provider object (defer).
@@ -110,6 +112,7 @@ export type GroupOpHost = {
     // caller treats both as a missing reference); throws if the bound object
     // is not present in the replica.
     resolveForeignTableView(groupName: string, table: string, at: Version, from: Version): Promise<RTableView | undefined>;
+    resolveSchemaForeignTableView(groupName: string, schemaTable: string, at: Version, from: Version): Promise<RTableView | undefined>;
 };
 
 export type TableGroupValidationContext =
@@ -246,6 +249,12 @@ async function validateCreate(create: CreateTableGroupPayload, ctx: RContext): P
         if (identityReason !== undefined) return validationFailure(identityReason);
     }
 
+    for (const name of Object.keys(create.params ?? {})) {
+        if (schemaView.getParam(name) === undefined) {
+            return validationFailure(`group create sets undeclared schema parameter ':${name}'`);
+        }
+    }
+
     // idProvider selection: a LOCAL provider must exist in the pinned schema and
     // be flagged idProvider; a qualified 'group.table' provider is
     // name-resolvability only (its group must be bound — the foreign table being
@@ -349,9 +358,11 @@ async function validateRowOpRestrictionAt(
 ): Promise<ValidationResult> {
     const authenticated = group.getIdProvider() !== undefined;
     const rule = schemaView.getRestriction(table, op.action, authenticated);
+    const effectiveParams = await group.resolveEffectiveParams(at, at);
     const ok = await evaluateRowOpRestriction(op, table, schemaView, authenticated,
         (targetTable) => group.makeTable(targetTable).getView(at, at),
-        (groupName, targetTable) => group.resolveForeignTableView(groupName, targetTable, at, at),
+        (groupName, targetTable) => group.resolveSchemaForeignTableView(groupName, targetTable, at, at),
+        effectiveParams,
     );
     return ok
         ? validationOk()
@@ -409,7 +420,7 @@ async function validateRowEnvelope(envelope: RowEnvelopePayload, group: GroupOpH
         async (ref, rowId) => {
             const [groupName, targetTable] = splitTableRef(ref);
             if (groupName !== undefined) {
-                const fv = await group.resolveForeignTableView(groupName, targetTable, at, at);
+                const fv = await group.resolveSchemaForeignTableView(groupName, targetTable, at, at);
                 return fv !== undefined && fv.hasRow(rowId);
             }
             return (await group.makeTable(targetTable).getView(at, at)).hasRow(rowId);
@@ -472,7 +483,7 @@ async function validateBundle(bundle: BundlePayload, group: GroupOpHost, at: Ver
     const isTargetLive = async (targetRef: string, rowId: B64Hash): Promise<boolean> => {
         const [groupName, targetTable] = splitTableRef(targetRef);
         if (groupName !== undefined) {
-            const fv = await group.resolveForeignTableView(groupName, targetTable, at, at);
+            const fv = await group.resolveSchemaForeignTableView(groupName, targetTable, at, at);
             return fv !== undefined && fv.hasRow(rowId);
         }
         if ((deletedBefore.get(targetTable)?.has(rowId)) ?? false) return false;
@@ -546,6 +557,10 @@ async function validateRefAdvance(payload: RefAdvancePayload, group: GroupOpHost
         return validateDeploy(payload, group, at);
     }
 
+    if ((payload as unknown as json.LiteralMap)['params'] !== undefined) {
+        return validationFailure("foreign-group observation cannot carry schema params");
+    }
+
     // foreign-group observation (cross-group FK / exists). The refId must be a
     // bound group; advancing observation needs no deploy authority unless the
     // binding declares a canObserve gate. A missing bound-group object is an
@@ -592,10 +607,11 @@ async function validateObserveGate(
 }
 
 function bindingNameFor(group: GroupOpHost, refId: B64Hash): string {
-    for (const [name, id] of Object.entries(group.getBindings())) {
-        if (id === refId) return name;
-    }
-    return refId;
+    const names = Object.entries(group.getBindings())
+        .filter(([, id]) => id === refId)
+        .map(([name]) => name)
+        .sort();
+    return names.length > 0 ? names.join('/') : refId;
 }
 
 // A deploy author's key: through the group's provider first, then the embedded
@@ -672,6 +688,22 @@ async function validateDeploy(payload: RefAdvancePayload, group: GroupOpHost, at
     const newVersion = version(...group.getPinnedSchemaVersion());
     for (const hash of newRefVersion) newVersion.add(hash);
     const newSchema = await schema.getView(newVersion, newVersion);
+
+    const deployParams = p['params'] as { [name: string]: json.Literal } | undefined;
+    if (deployParams !== undefined) {
+        for (const name of Object.keys(deployParams)) {
+            if (newSchema.getParam(name) === undefined) {
+                return validationFailure(`schema deploy sets undeclared parameter ':${name}'`);
+            }
+        }
+        const currentVersion = await group.resolveSchemaVersion(at, at);
+        const schemaScopedDag = await schema.getScopedDag();
+        const currentCover = await schemaScopedDag.findMinimalCover(currentVersion);
+        const targetCover = await schemaScopedDag.findMinimalCover(newVersion);
+        if ([...currentCover].sort().join(',') === [...targetCover].sort().join(',')) {
+            return validationFailure("a schema deploy carrying params must advance the schema version");
+        }
+    }
 
     return validateDeployedIdentity(group, newSchema);
 }

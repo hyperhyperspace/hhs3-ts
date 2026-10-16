@@ -11,7 +11,7 @@ import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from 
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import type { Version, RContext } from "@hyper-hyper-space/hhs3_mvt";
 import { json } from "@hyper-hyper-space/hhs3_json";
-import type { CatalogGroupDef, TableDef } from "@hyper-hyper-space/hhs3_rdb";
+import type { CatalogGroupDef, TableDef, TableMaps } from "@hyper-hyper-space/hhs3_rdb";
 import {
     RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory, RDbImpl, rDbFactory, deriveRowId,
     RCatalogImpl, rCatalogFactory, RDeployGateImpl, rDeployGateFactory, catalogGroupHash, deployCatalogRelease,
@@ -42,7 +42,7 @@ function open(name: string, columns: TableDef['columns'], extra?: Partial<TableD
     return { name, columns, restrictions: [{ on: 'all', rule: { p: 'true' } }], ...extra };
 }
 
-type GroupSpec = { name: string; tables: TableDef[]; bindings?: { [alias: string]: string } };
+type GroupSpec = { name: string; tables: TableDef[]; bindings?: { [alias: string]: string }; tableMaps?: TableMaps };
 type Member = { schema: RSchemaImpl; group: RTableGroupImpl; admin: OwnIdentity };
 
 // A schema per group and a catalog group definition pinned at its genesis;
@@ -62,6 +62,7 @@ async function defineGroups(ctx: RContext, dev: OwnIdentity, specs: GroupSpec[],
         if (spec.bindings !== undefined) {
             def.bindings = Object.fromEntries(Object.entries(spec.bindings).map(([alias, target]) => [alias, known.get(target)!]));
         }
+        if (spec.tableMaps !== undefined) def.tableMaps = spec.tableMaps;
         known.set(spec.name, catalogGroupHash(def));
         defs.push(def);
         schemas.set(spec.name, schema);
@@ -633,6 +634,67 @@ export const projectionTests = {
                 }
                 await expectRejects(() => projection.reconcileIndexes({ indexes: [] }), 'stopped',
                     'reconcile after stop is refused');
+            },
+        },
+        {
+            name: '[RDBPROJ14] tableMaps remaps cross-group FK projection and bidirectional ingestion',
+            invoke: async () => {
+                const ctx = newCtx();
+                const { rdb, members } = await makeDatabase(ctx, 'proj-tablemaps', [
+                    {
+                        name: 'blog',
+                        tables: [
+                            open('posts', { title: { type: 'string' } }),
+                            open('photos', { url: { type: 'string' } }),
+                        ],
+                    },
+                    {
+                        name: 'post_comments',
+                        tables: [open('comments', { item: { type: 'string' }, body: { type: 'string' } }, { fks: { item: 'target.subject' } })],
+                        bindings: { target: 'blog' },
+                        tableMaps: { target: { subject: 'posts' } },
+                    },
+                    {
+                        name: 'photo_comments',
+                        tables: [open('comments', { item: { type: 'string' }, body: { type: 'string' } }, { fks: { item: 'target.subject' } })],
+                        bindings: { target: 'blog' },
+                        tableMaps: { target: { subject: 'photos' } },
+                    },
+                ]);
+
+                const posts = await members['blog'].group.getTable('posts');
+                const photos = await members['blog'].group.getTable('photos');
+                await posts.insert('p1', { title: 'First Post' });
+                await photos.insert('ph1', { url: 'first.jpg' });
+                const blogFrontier = await (await members['blog'].group.getScopedDag()).getFrontier();
+                await members['post_comments'].group.observe('target', blogFrontier);
+                await members['photo_comments'].group.observe('target', blogFrontier);
+
+                const pc = await members['post_comments'].group.getTable('comments');
+                await pc.insert('c1', { item: deriveRowId('p1'), body: 'On post' });
+
+                const target = new MemoryTarget({ captureChanges: true });
+                const projection = await RdbProjection.open(rdb, ctx, target, { writer: members['blog'].admin });
+                try {
+                    const postSerial = target.syncId('blog_posts', deriveRowId('p1'));
+                    const photoSerial = target.syncId('blog_photos', deriveRowId('ph1'));
+                    assertTrue(postSerial !== undefined && photoSerial !== undefined, 'serial ids assigned');
+                    const pcRow = target.getRowByRowId('post_comments_comments', deriveRowId('c1'));
+                    assertTrue(pcRow !== undefined, 'post comment projected');
+                    assertEquals(pcRow!.values['item_id'], postSerial, 'remapped FK target.subject -> blog_posts resolved to serial id');
+
+                    // Local insert into photo_comments_comments using blog_photos serial id ingests back into Rdb
+                    target.localInsert('photo_comments_comments', { item_id: photoSerial!, body: 'On photo' });
+                    await projection.sync();
+
+                    const phcView = await (await members['photo_comments'].group.getTable('comments')).getView();
+                    const liveIds = await phcView.liveRowIds();
+                    assertEquals(liveIds.length, 1, 'ingested photo comment is live in Rdb');
+                    const row = await phcView.getRow(liveIds[0]);
+                    assertEquals(row?.values['item'], deriveRowId('ph1'), 'ingested FK reverse-resolved to photo rowId');
+                } finally {
+                    await projection.stop();
+                }
             },
         },
     ],

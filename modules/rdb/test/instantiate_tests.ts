@@ -71,6 +71,15 @@ export const instantiateTests = {
 
                 const none = instantiateGroup(userDef(), { seed, bindingIds: {}, params: ADMIN, creators: [] });
                 assertEquals(groupIdOf(none), 'f/8z84GVdU9sTsexd+Uoq+h7COTLqRgqaba7RRSkEW4=', 'group id vector, no creators');
+
+                const withMaps = instantiateGroup({
+                    ...userDef(),
+                    bindings: { target: 'grp-target' },
+                    tableMaps: { target: { subject: 'posts' } },
+                }, { seed, bindingIds: { 'grp-target': 'target-id-1' }, params: ADMIN, creators: [] });
+                assertEquals(json.toStringNormalized(withMaps.tableMaps!), json.toStringNormalized({ target: { subject: 'posts' } }),
+                    'tableMaps is copied to the instantiated payload');
+                assertEquals(groupIdOf(withMaps), 'CkSOFOsvYLPOc/kSDs9K2hdk7Dvy/KsgJiJMpnnv63I=', 'group id vector with tableMaps');
             }
         },
         {

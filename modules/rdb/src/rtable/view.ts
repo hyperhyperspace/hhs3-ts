@@ -561,8 +561,21 @@ export class RTableViewImpl implements RTableView, TruthTableView {
     }
 
     // Whether some row matches `where`: the `or` over the candidates of
-    // findRowIds, stopping at the first that surely matches.
+    // findRowIds, stopping at the first that surely matches. A searched field
+    // that is missing or not a pub column (or a non-string rowAuthor) at this
+    // horizon fails closed to FALSE instead of throwing out of candidateRowIds.
     async existsMatching(where: { [field: string]: json.Literal }): Promise<Truth> {
+        const fields = Object.keys(where);
+        if (fields.length === 0) return FALSE;
+        const schemaView = await this.schemaView();
+        const pubColumns = new Set(schemaView.getPubColumns(this.target.getTableName()));
+        for (const field of fields) {
+            if (field === 'rowAuthor') {
+                if (typeof where[field] !== 'string') return FALSE;
+            } else if (!pubColumns.has(field)) {
+                return FALSE;
+            }
+        }
         const candidates = await this.candidateRowIds(where);
         return someTruth(candidates, (rowId) => this.candidateMatch(rowId, where));
     }

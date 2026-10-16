@@ -39,7 +39,7 @@ import { Entry, Position } from "@hyper-hyper-space/hhs3_dag";
 
 import {
     TableDef, ColumnDef, FKs, Restriction,
-    MigrationRule,
+    MigrationRule, SchemaParamDecl,
 } from "./payload.js";
 import { CreateRSchemaPayload, SchemaUpdatePayload, SchemaCreator } from "./payload.js";
 import { IncarnationId, tableIncarnationId, columnIncarnationId } from "./incarnation.js";
@@ -54,6 +54,7 @@ export type SchemaState = {
     // The schema versions of the entries at `at` (the position's maxima),
     // highest first. A single-headed position has one.
     versions: string[];
+    params: Map<string, SchemaParamDecl>;
     tables: Map<string, TableDef>;
     // The live table incarnation id per existing table (see incarnation.ts).
     tableIncarnations: Map<string, IncarnationId>;
@@ -68,6 +69,7 @@ type SlotValue =
     | { kind: 'concurrent-deletes'; value: boolean | undefined }
     | { kind: 'fks'; fks: FKs | undefined }
     | { kind: 'restrictions'; restrictions: Restriction[] | undefined }
+    | { kind: 'param'; decl: SchemaParamDecl }
     | { kind: 'tombstone' };
 
 type SlotWrite = {
@@ -88,6 +90,7 @@ function modeSlot(table: string): string { return `m:${table}`; }
 function fksSlot(table: string): string { return `f:${table}`; }
 function restrictionsSlot(table: string): string { return `r:${table}`; }
 function columnSlot(table: string, column: string): string { return `c:${table}:${column}`; }
+function paramSlot(name: string): string { return `p:${name}`; }
 
 // Decompose one migration rule into its slot writes. Exported for the
 // validation and delta code, which need to know which slots a rule touches.
@@ -276,6 +279,9 @@ export function resolveSchemaState(entries: Entry[], at: Position): SchemaState 
             create = payload as CreateRSchemaPayload;
             const version = entryVersion(entry, create.version);
             if (at.has(entry.hash)) headVersions.push(version);
+            (create.params ?? []).forEach((decl, i) => {
+                pushWrite(writes, paramSlot(decl.name), { entryHash: entry.hash, entryIdx, ruleIndex: i, version, value: { kind: 'param', decl } });
+            });
             create.tables.forEach((def, i) => {
                 pushTableWrites(writes, def, { entryHash: entry.hash, entryIdx, ruleIndex: i, version });
             });
@@ -283,6 +289,9 @@ export function resolveSchemaState(entries: Entry[], at: Position): SchemaState 
             const update = payload as SchemaUpdatePayload;
             const version = entryVersion(entry, update.version);
             if (at.has(entry.hash)) headVersions.push(version);
+            (update.params ?? []).forEach((decl, i) => {
+                pushWrite(writes, paramSlot(decl.name), { entryHash: entry.hash, entryIdx, ruleIndex: i, version, value: { kind: 'param', decl } });
+            });
             update.migration.forEach((rule, i) => {
                 pushRuleWrites(writes, rule, { entryHash: entry.hash, entryIdx, ruleIndex: i, version });
             });
@@ -407,10 +416,20 @@ export function resolveSchemaState(entries: Entry[], at: Position): SchemaState 
         tables.set(table, def);
     }
 
+    const params = new Map<string, SchemaParamDecl>();
+    for (const [slot, slotWrites] of writes) {
+        if (!slot.startsWith('p:')) continue;
+        const winner = resolveSlot(causality, slotWrites);
+        if (winner !== undefined && winner.value.kind === 'param') {
+            params.set(winner.value.decl.name, winner.value.decl);
+        }
+    }
+
     const state: SchemaState = {
         name: create.name,
         creators: create.creators,
         versions: headVersions.sort((a, b) => compareParsedSemver(b, a)).map(formatSemver),
+        params,
         tables,
         tableIncarnations,
         columnIncarnations,

@@ -449,5 +449,71 @@ export const rtableObserveGateTests = {
                     "y is void: the widening sees through the void z to z', which carries p1's revoke");
             },
         },
+        {
+            name: '[OBSGATE10] multiple aliases bound to one group share one ref-advance stream and combine their canObserve gates with and',
+            invoke: async () => {
+                const ctx = newCtx();
+                const admin = await makeIdentity();
+                const alice = await makeIdentity();
+                const bob = await makeIdentity();
+                const b = await makeUsers(ctx, 'og10-b', { identities: [admin, alice, bob], managers: [admin] });
+                await grantCap(b.group, admin, alice.keyId, 'source_sync');
+                await grantCap(b.group, admin, bob.keyId, 'source_sync');
+                await grantCap(b.group, admin, bob.keyId, 'target_sync');
+
+                const schemaInit = await RSchemaImpl.create({
+                    name: 'og10:follows',
+                    creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
+                    tables: [{
+                        name: 'follows',
+                        columns: { follower: { type: 'string' }, followee: { type: 'string' } },
+                        fks: { follower: 'source.identities', followee: 'target.identities' },
+                        restrictions: [{ on: 'all', rule: { p: 'true' } }],
+                    }],
+                });
+                const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
+                const pinned = await (await schema.getScopedDag()).getFrontier();
+
+                const groupInit = await RTableGroupImpl.create({
+                    name: 'follows',
+                    seed: 'og10-follows',
+                    schemaRef: schema.getId(),
+                    schemaVersion: pinned,
+                    bindings: { source: b.group.getId(), target: b.group.getId() },
+                    idProvider: 'source.identities',
+                    canObserve: {
+                        source: { p: 'exists', table: CAPS_TABLE, where: { label: 'source_sync', grantee: '$author' } },
+                        target: { p: 'exists', table: CAPS_TABLE, where: { label: 'target_sync', grantee: '$author' } },
+                    },
+                });
+                const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
+
+                const bFrontier = await frontier(b.group);
+                // Alice only holds source_sync, not target_sync -> combined gate rejects
+                await expectThrow(() => group.observe('source', bFrontier, alice),
+                    'alice lacks target_sync, so the combined source/target gate rejects',
+                    "canObserve predicate rejected observation of 'source/target'");
+
+                // Bob holds both source_sync and target_sync -> combined gate passes
+                const obsHash = await group.observe('source', bFrontier, bob);
+                assertFalse(await group.isEntryVoided(obsHash, await frontier(group)), 'bob satisfies both gates');
+
+                // Revoking target_sync from bob concurrently voids the observation and reports binding 'source/target'
+                const base = await frontier(group);
+                const vBeforeRevoke = bFrontier;
+                await revokeCap(b.group, admin, bob.keyId, 'target_sync', vBeforeRevoke);
+                await grantCap(b.group, admin, admin.keyId, 'source_sync');
+                await grantCap(b.group, admin, admin.keyId, 'target_sync');
+                const vAfterRevoke = await frontier(b.group);
+
+                const backdated = await group.observe('target', vBeforeRevoke, bob, base);
+                await group.observe('source', vAfterRevoke, admin, base);
+
+                const merged = await frontier(group);
+                const detail = await group.explainEntryVoided(backdated, merged);
+                assertTrue(detail !== undefined && detail.kind === 'observe-gate' && detail.binding === 'source/target',
+                    'voided observe reports combined binding label source/target');
+            },
+        },
     ],
 };

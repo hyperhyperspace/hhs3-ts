@@ -216,15 +216,52 @@ async function testGroupCreate() {
         bindings: { '2bad': 'someGroupId' },
     } as json.Literal), 'binding with invalid name should not validate');
 
-    assertFalse(validateTableGroupPayloadFormat({
+    assertTrue(validateTableGroupPayloadFormat({
         ...create,
         bindings: { users: 'sharedGroupId', accounts: 'sharedGroupId' },
-    } as json.Literal), 'non-injective bindings (two names -> one id) should not validate');
+    } as json.Literal), 'multiple aliases bound to the same group id should validate');
 
     assertTrue(validateTableGroupPayloadFormat({
         ...create,
         bindings: { users: 'usersGroupId', accounts: 'accountsGroupId' },
-    } as json.Literal), 'injective bindings (distinct ids) should validate');
+        tableMaps: { users: { subject: 'posts', perms: 'caps' } },
+    } as json.Literal), 'bindings with valid tableMaps should validate');
+
+    assertFalse(validateTableGroupPayloadFormat({
+        ...create,
+        bindings: { users: 'usersGroupId' },
+        tableMaps: {},
+    } as json.Literal), 'empty tableMaps should not validate');
+
+    assertFalse(validateTableGroupPayloadFormat({
+        ...create,
+        bindings: { users: 'usersGroupId' },
+        tableMaps: { other: { subject: 'posts' } },
+    } as json.Literal), 'tableMaps for an unbound alias should not validate');
+
+    assertFalse(validateTableGroupPayloadFormat({
+        ...create,
+        bindings: { users: 'usersGroupId' },
+        tableMaps: { users: {} },
+    } as json.Literal), 'empty inner tableMaps should not validate');
+
+    assertFalse(validateTableGroupPayloadFormat({
+        ...create,
+        bindings: { users: 'usersGroupId' },
+        tableMaps: { users: { posts: 'posts' } },
+    } as json.Literal), 'identity mapping in tableMaps should not validate');
+
+    assertFalse(validateTableGroupPayloadFormat({
+        ...create,
+        bindings: { users: 'usersGroupId' },
+        tableMaps: { users: { '2bad': 'posts' } },
+    } as json.Literal), 'invalid schemaTable in tableMaps should not validate');
+
+    assertFalse(validateTableGroupPayloadFormat({
+        ...create,
+        bindings: { users: 'usersGroupId' },
+        tableMaps: { users: { subject: '2bad' } },
+    } as json.Literal), 'invalid foreignTable in tableMaps should not validate');
 
     const withDeploy: CreateTableGroupPayload = {
         ...create,

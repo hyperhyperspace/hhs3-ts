@@ -44,6 +44,7 @@ import type { RDbImpl } from "./rdb.js";
 export type PlannedDeploy = {
     member: MemberGroup;
     target: Version;
+    params?: { [name: string]: json.Literal };
 };
 
 export type CatalogPlan = {
@@ -81,6 +82,19 @@ function failureMessage(err: unknown): string {
 
 async function currentVersion(group: RTableGroupImpl): Promise<Version> {
     return group.resolveSchemaVersion(await (await group.getScopedDag()).getFrontier());
+}
+
+function diffGroupParams(
+    current: { [name: string]: json.Literal },
+    target: { [name: string]: json.Literal },
+): { [name: string]: json.Literal } {
+    const out: { [name: string]: json.Literal } = {};
+    for (const [name, value] of Object.entries(target)) {
+        if (current[name] === undefined || json.toStringNormalized(current[name]) !== json.toStringNormalized(value)) {
+            out[name] = value;
+        }
+    }
+    return out;
 }
 
 export async function planCatalogUpdate(rdb: RDbImpl, spec: {
@@ -126,7 +140,12 @@ export async function planCatalogUpdate(rdb: RDbImpl, spec: {
         if (obj === undefined) {
             plan.creates.push(member);
             if (versionKey(member.target) !== versionKey(json.fromSet(member.payload.schemaVersion))) {
-                plan.deploys.push({ member, target: member.target });
+                const diffParams = diffGroupParams(member.def.params ?? {}, member.targetParams);
+                plan.deploys.push({
+                    member,
+                    target: member.target,
+                    ...(Object.keys(diffParams).length > 0 ? { params: diffParams } : {}),
+                });
             }
             continue;
         }
@@ -141,9 +160,17 @@ export async function planCatalogUpdate(rdb: RDbImpl, spec: {
             continue;
         }
 
-        plan.deploys.push({ member, target: member.target });
+        const currentParams = await group.resolveGroupParams(await (await group.getScopedDag()).getFrontier());
+        const diffParams = diffGroupParams(currentParams, member.targetParams);
+        const deployParams = Object.keys(diffParams).length > 0 ? diffParams : undefined;
+        plan.deploys.push({ member, target: member.target, ...(deployParams !== undefined ? { params: deployParams } : {}) });
         try {
-            const prepared = await group.prepareDeploy(member.target, group.deployNeedsAuthor() ? spec.author : undefined);
+            const prepared = await group.prepareDeploy(
+                member.target,
+                group.deployNeedsAuthor() ? spec.author : undefined,
+                undefined,
+                deployParams,
+            );
             const result = await group.validatePayload(prepared.payload, prepared.at);
             if (!result.valid) plan.problems.push(`deploy of '${member.name}': ${formatValidationFailure(result.why)}`);
         } catch (err) {
@@ -182,13 +209,15 @@ export async function applyCatalogPlan(plan: CatalogPlan, author?: OwnIdentity):
     }
 
     const deployedIds = new Set<B64Hash>();
-    const targets = new Map(plan.deploys.map((d) => [d.member.id, d.target]));
+    const plannedDeploys = new Map(plan.deploys.map((d) => [d.member.id, d]));
     for (const member of plan.order) {
         const group = await ctx.getObject(member.id) as RTableGroupImpl;
 
         // advance this group's refs to the bound groups deployed in this plan
+        const seenBoundIds = new Set<B64Hash>();
         for (const [binding, boundId] of Object.entries(group.getBindings())) {
-            if (!deployedIds.has(boundId)) continue;
+            if (!deployedIds.has(boundId) || seenBoundIds.has(boundId)) continue;
+            seenBoundIds.add(boundId);
             try {
                 const bound = await ctx.getObject(boundId) as RTableGroupImpl;
                 const frontier = await (await bound.getScopedDag()).getFrontier();
@@ -199,10 +228,15 @@ export async function applyCatalogPlan(plan: CatalogPlan, author?: OwnIdentity):
             }
         }
 
-        const target = targets.get(member.id);
-        if (target === undefined) continue;
+        const planned = plannedDeploys.get(member.id);
+        if (planned === undefined) continue;
         try {
-            const entry = await group.deploy(target, group.deployNeedsAuthor() ? author : undefined);
+            const entry = await group.deploy(
+                planned.target,
+                group.deployNeedsAuthor() ? author : undefined,
+                undefined,
+                planned.params,
+            );
             result.deployed.push({ groupId: member.id, name: member.name, entry });
             deployedIds.add(member.id);
         } catch (err) {

@@ -9,13 +9,13 @@ import { validationFailure, validationOk, ValidationResult } from "@hyper-hyper-
 import {
     createRSchemaFormat, CreateRSchemaPayload,
     schemaUpdateFormat, SchemaUpdatePayload,
-    ColumnDef, ColumnConstraints, ColumnType, FKs, IdProvider, IdTerm, MigrationRule, Operand, Predicate, PredicateContext,
-    Restriction, TableDef,
+    ColumnDef, ColumnConstraints, ColumnType, FKs, IdProvider, IdTerm, MigrationRule, Predicate, PredicateContext,
+    Restriction, RuleOperand, SchemaParamDecl, TableDef,
     MAX_FKS, MAX_NAME_LENGTH, MAX_QUALIFIED_NAME_LENGTH, MAX_RESTRICTIONS,
     ID_TERMS, CMP_OPS, CmpOp,
 } from "./payload.js";
 
-import { splitTableRef, parseRowFieldTerm } from "./payload.js";
+import { splitTableRef, parseParamTerm, parseRowFieldTerm } from "./payload.js";
 import type { RSchemaView } from "./interfaces.js";
 import { cmpTypesOk, likeTypesOk, isValidLikePattern } from "./expr.js";
 import { isValidSemver } from "../semver.js";
@@ -165,19 +165,21 @@ function isValidTerm(value: json.Literal, context: PredicateContext): boolean {
 }
 
 // A `where` value that is a reserved ($-prefixed) string must be either a valid
-// identity term ($author) or a subject-row field term ($row.<col>);
-// $row.* is row-context only. Non-$ values are plain literals (checked here as
-// "not reserved", i.e. accepted).
+// identity term ($author), a subject-row field term ($row.<col>), or a schema
+// parameter term ($param.<name>); $row.* and $param.* are row-context only.
+// Non-$ values are plain literals (checked here as "not reserved", i.e. accepted).
 function isValidWhereValue(value: json.Literal, context: PredicateContext): boolean {
     if (typeof value !== 'string') return json.isLiteral(value);
     if (!value.startsWith('$')) return true;
     if (ID_TERMS.includes(value as IdTerm)) return isValidTerm(value, context);
     if (parseRowFieldTerm(value) !== undefined) return context === 'row';
+    if (parseParamTerm(value) !== undefined) return context === 'row';
     return false;   // any other $-string is reserved and not a known term
 }
 
-// Structural check for a value-expression operand. `{col}` ($row.<col>) is
-// row-context only; arithmetic fns are integer-only and len takes one arg.
+// Structural check for a value-expression operand. `{col}` ($row.<col>) and
+// `{param}` (:param) are row-context only; arithmetic fns are integer-only and
+// len takes one arg.
 function validateOperand(op: json.Literal, context: PredicateContext, depth: number): boolean {
     if (depth > MAX_EXPR_DEPTH) return false;
     if (typeof op !== 'object' || op === null || Array.isArray(op)) return false;
@@ -195,6 +197,10 @@ function validateOperand(op: json.Literal, context: PredicateContext, depth: num
     if ('col' in e) {
         if (context !== 'row') return false;   // no subject row
         return keys.length === 1 && typeof e['col'] === 'string' && isValidName(e['col']);
+    }
+    if ('param' in e) {
+        if (context !== 'row') return false;   // schema params are row-context only
+        return keys.length === 1 && typeof e['param'] === 'string' && isValidName(e['param']);
     }
     if ('fn' in e) {
         if (keys.length !== 2 || !Array.isArray(e['args'])) return false;
@@ -266,7 +272,7 @@ export function validatePredicate(pred: json.Literal, context: PredicateContext 
     }
 }
 
-function operandReferencesAuthor(op: Operand): boolean {
+function operandReferencesAuthor(op: RuleOperand): boolean {
     if ('lit' in op) return op.lit === '$author';
     if ('fn' in op) return op.args.some(operandReferencesAuthor);
     return false;
@@ -324,9 +330,14 @@ export function collectCmpLikeAtoms(pred: Predicate, out: (CmpAtom | LikeAtom)[]
     return out;
 }
 
-function collectOperandCols(op: Operand, out: Set<string>): void {
+function collectOperandCols(op: RuleOperand, out: Set<string>): void {
     if ('col' in op) out.add(op.col);
     else if ('fn' in op) for (const a of op.args) collectOperandCols(a, out);
+}
+
+function collectOperandParams(op: RuleOperand, out: Set<string>): void {
+    if ('param' in op) out.add(op.param);
+    else if ('fn' in op) for (const a of op.args) collectOperandParams(a, out);
 }
 
 // Every subject-row column referenced by the predicate: via `{col}` operands in
@@ -357,22 +368,57 @@ export function collectRowFieldRefs(pred: Predicate, out: Set<string> = new Set(
     return out;
 }
 
+// Every schema parameter referenced by the predicate: via `{param}` operands
+// in cmp/like atoms and via `$param.<name>` exists where-values.
+export function collectParamRefs(pred: Predicate, out: Set<string> = new Set()): Set<string> {
+    switch (pred.p) {
+        case 'cmp':
+            collectOperandParams(pred.left, out);
+            collectOperandParams(pred.right, out);
+            break;
+        case 'like':
+            collectOperandParams(pred.value, out);
+            collectOperandParams(pred.pattern, out);
+            break;
+        case 'exists':
+            for (const value of Object.values(pred.where ?? {})) {
+                if (typeof value === 'string') {
+                    const param = parseParamTerm(value);
+                    if (param !== undefined) out.add(param);
+                }
+            }
+            break;
+        case 'and':
+        case 'or':
+            for (const arg of pred.args) collectParamRefs(arg, out);
+            break;
+    }
+    return out;
+}
+
 // Column-type lookup for the declaring table (operand type-checking).
 function columnTypeOf(columns: { [c: string]: ColumnDef }): (column: string) => ColumnType | undefined {
     return (column) => column === 'rowAuthor' ? 'string' : columns[column]?.type;
 }
 
+function whereColumnTypeMatches(a: ColumnType, b: ColumnType): boolean {
+    if (a === b) return true;
+    return (a === 'identity' && b === 'string') || (a === 'string' && b === 'identity');
+}
+
 // Tier 1+2 column-level checks for one restriction rule declared on `def`:
 //   - every $row.<col> reference names an existing READONLY column of `def`;
-//   - cmp/like operand types are coherent over `def`'s columns;
-//   - an exists where-value $row.<col> matches the (local) target field's type
-//     (identity also matches string; the target field's pub-ness is enforced
-//     separately by the exists check).
+//   - every $param.<name> / {param} reference names a declared schema param;
+//   - cmp/like operand types are coherent over `def`'s columns and schema params;
+//   - an exists where-value $row.<col> or $param.<name> matches the (local)
+//     target field's type (identity also matches string; the target field's
+//     pub-ness is enforced separately by the exists check).
 // Foreign (group.table) exists targets are skipped (checked at binding time).
 export function checkPredicateColumns(
     def: TableDef,
     rule: Predicate,
     resolveLocalTable: (table: string) => TableDef | undefined,
+    resolveParam?: (name: string) => ColumnType | undefined,
 ): ValidateReason {
     for (const col of collectRowFieldRefs(rule)) {
         if (col === 'rowAuthor') continue;
@@ -381,13 +427,19 @@ export function checkPredicateColumns(
         if (!(cd.readonly ?? false)) return `$row field '${col}' in table '${def.name}' is not readonly`;
     }
 
+    for (const param of collectParamRefs(rule)) {
+        if (resolveParam?.(param) === undefined) {
+            return `parameter ':${param}' not declared in schema (referenced in table '${def.name}')`;
+        }
+    }
+
     const typeOf = columnTypeOf(def.columns);
     for (const atom of collectCmpLikeAtoms(rule)) {
         if (atom.p === 'cmp') {
-            if (!cmpTypesOk(atom.cmp, atom.left, atom.right, typeOf)) {
+            if (!cmpTypesOk(atom.cmp, atom.left, atom.right, typeOf, resolveParam)) {
                 return `cmp operand types are incompatible in table '${def.name}'`;
             }
-        } else if (!likeTypesOk(atom.value, atom.pattern, typeOf)) {
+        } else if (!likeTypesOk(atom.value, atom.pattern, typeOf, resolveParam)) {
             return `like operand types are incompatible in table '${def.name}'`;
         }
     }
@@ -400,15 +452,31 @@ export function checkPredicateColumns(
         for (const [field, value] of Object.entries(atom.where ?? {})) {
             if (typeof value !== 'string') continue;
             const col = parseRowFieldTerm(value);
-            if (col === undefined) continue;
-            const subjectCol = def.columns[col];
-            const targetCol = target.columns[field];
-            if (subjectCol === undefined) return `$row field '${col}' not found in table '${def.name}'`;
-            if (targetCol === undefined) return `exists where field '${field}' not found in table '${table}'`;
-            if (subjectCol.type !== targetCol.type
-                && !((subjectCol.type === 'identity' && targetCol.type === 'string')
-                  || (subjectCol.type === 'string' && targetCol.type === 'identity'))) {
-                return `$row field '${col}' type '${subjectCol.type}' does not match exists where field '${field}' type '${targetCol.type}'`;
+            if (col !== undefined) {
+                const subjectCol = def.columns[col];
+                const targetCol = target.columns[field];
+                if (subjectCol === undefined) return `$row field '${col}' not found in table '${def.name}'`;
+                if (targetCol === undefined) return `exists where field '${field}' not found in table '${table}'`;
+                if (!whereColumnTypeMatches(subjectCol.type, targetCol.type)) {
+                    return `$row field '${col}' type '${subjectCol.type}' does not match exists where field '${field}' type '${targetCol.type}'`;
+                }
+                continue;
+            }
+            const param = parseParamTerm(value);
+            if (param !== undefined) {
+                const paramType = resolveParam?.(param);
+                if (paramType === undefined) return `parameter ':${param}' not declared in schema (referenced in table '${def.name}')`;
+                if (field === 'rowAuthor') {
+                    if (!whereColumnTypeMatches(paramType, 'string')) {
+                        return `parameter ':${param}' type '${paramType}' does not match exists where field 'rowAuthor'`;
+                    }
+                    continue;
+                }
+                const targetCol = target.columns[field];
+                if (targetCol === undefined) return `exists where field '${field}' not found in table '${table}'`;
+                if (!whereColumnTypeMatches(paramType, targetCol.type)) {
+                    return `parameter ':${param}' type '${paramType}' does not match exists where field '${field}' type '${targetCol.type}'`;
+                }
             }
         }
     }
@@ -577,12 +645,35 @@ export function validateTableDef(def: TableDef): ValidateReason {
     return undefined;
 }
 
+export function validateSchemaParams(params: SchemaParamDecl[], requireDefault: boolean): ValidateReason {
+    const seen = new Set<string>();
+    for (const decl of params) {
+        if (!isValidName(decl.name)) return `invalid parameter name '${decl.name}'`;
+        if (seen.has(decl.name)) return `duplicate parameter name ':${decl.name}'`;
+        seen.add(decl.name);
+        if (requireDefault && decl.default === undefined) {
+            return `parameter ':${decl.name}' declared by a schema update requires a default value`;
+        }
+        if (decl.default !== undefined) {
+            if (!columnValueMatchesType(decl.default, decl.type)) {
+                return `default value for parameter ':${decl.name}' does not match type '${decl.type}'`;
+            }
+            if (typeof decl.default === 'string' && decl.default.startsWith('$')) {
+                return `default value for parameter ':${decl.name}' cannot start with '$'`;
+            }
+        }
+    }
+    return undefined;
+}
+
 // Validates a full set of table defs: each def is valid, names are unique,
 // local (unqualified) FK and exists-atom targets exist in the set, and exists
 // `where` fields are pub columns of the local target.
-export function validateSchemaTables(tables: TableDef[]): ValidateReason {
+export function validateSchemaTables(tables: TableDef[], params?: SchemaParamDecl[]): ValidateReason {
     const names = new Set<string>();
     const byName = new Map<string, TableDef>();
+    const paramTypes = new Map<string, ColumnType>((params ?? []).map((p) => [p.name, p.type]));
+    const resolveParam = (name: string) => paramTypes.get(name);
 
     for (const def of tables) {
         const defReason = validateTableDef(def);
@@ -623,7 +714,7 @@ export function validateSchemaTables(tables: TableDef[]): ValidateReason {
                 const atomReason = checkExistsAtom(atom);
                 if (atomReason !== undefined) return `table '${def.name}': ${atomReason}`;
             }
-            const predReason = checkPredicateColumns(def, restriction.rule, (t) => byName.get(t));
+            const predReason = checkPredicateColumns(def, restriction.rule, (t) => byName.get(t), resolveParam);
             if (predReason !== undefined) return `table '${def.name}': ${predReason}`;
         }
     }
@@ -685,7 +776,12 @@ export function validateRSchemaPayloadFormat(payload: json.Literal): ValidationR
         const create = payload as CreateRSchemaPayload;
         if (!isValidSemver(create.version)) return validationFailure(`RSchema create version '${create.version}' is not a semver`);
         if (create.creators.length === 0) return validationFailure("RSchema create payload must have at least one creator");
-        const tablesReason = validateSchemaTables(create.tables);
+        if (create.params !== undefined) {
+            if (create.params.length === 0) return validationFailure("RSchema create params must be omitted when empty");
+            const paramsReason = validateSchemaParams(create.params, false);
+            if (paramsReason !== undefined) return validationFailure(`RSchema create params are invalid: ${paramsReason}`);
+        }
+        const tablesReason = validateSchemaTables(create.tables, create.params);
         if (tablesReason !== undefined) {
             return validationFailure(`RSchema create tables are invalid: ${tablesReason}`);
         }
@@ -696,7 +792,14 @@ export function validateRSchemaPayloadFormat(payload: json.Literal): ValidationR
         if (!json.checkFormat(schemaUpdateFormat, payload)) return validationFailure("schema-update payload format is invalid");
         const update = payload as SchemaUpdatePayload;
         if (!isValidSemver(update.version)) return validationFailure(`schema-update version '${update.version}' is not a semver`);
-        if (update.migration.length === 0) return validationFailure("schema-update migration is empty");
+        if (update.params !== undefined) {
+            if (update.params.length === 0) return validationFailure("schema-update params must be omitted when empty");
+            const paramsReason = validateSchemaParams(update.params, true);
+            if (paramsReason !== undefined) return validationFailure(`schema-update params are invalid: ${paramsReason}`);
+        }
+        if (update.migration.length === 0 && (update.params === undefined || update.params.length === 0)) {
+            return validationFailure("schema-update migration is empty");
+        }
         for (const [index, rule] of update.migration.entries()) {
             const ruleReason = validateMigrationRule(rule);
             if (ruleReason !== undefined) {

@@ -2,13 +2,15 @@
 // rpack: the developer's release tool for catalogs.
 //
 //   rpack [-C <dir>] [--keystore <path>] <command>
-//     init <name> [--key <label>]
+//     init [--schema] <name> [--key <label>]
 //     new <version> [--base <release> [+ <release>]...]
 //     set base <release> [+ <release>]... [--force]
+//     import <schema> [<version>] [--registry <dir>]
 //     status
 //     build
 //     stage [--passphrase-stdin]
 //     release [--passphrase-stdin] [--force] [--yes]
+//     publish [<version>] [--registry <dir>]
 //     log
 //     verify <file>
 //     export <store.db> <catalog> [<version>] [--out <dir>]
@@ -21,6 +23,7 @@
 // the release file of a release made by hand in the rdb REPL.
 
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { stderr, stdin, stdout } from "node:process";
 
@@ -28,9 +31,10 @@ import { createBasicCrypto, HASH_SHA256, type B64Hash } from "@hyper-hyper-space
 import type { NameOrHashRef } from "@hyper-hyper-space/hhs3_rdb_lang";
 import { chooseKey, defaultKeystorePath, KeyStore } from "@hyper-hyper-space/hhs3_rhost_node";
 import {
-    buildVersion, CONFIG_FILE, exportRelease, formatReleasePreview, formatVerifyReport, initProject, logReleases, newVersion, releaseFileName,
-    releaseTag, releaseVersion, RpackError, serializeReleaseFile, setBase, SourceError, statusOf, verifyRelease, VERSION_FILE, WORK_DIR,
-    type RpackContext,
+    buildVersion, CONFIG_FILE, exportRelease, formatReleasePreview, formatVerifyReport, importSchema, initProject, logReleases, newVersion,
+    parseRpackConfig, publishRelease, releaseFileName, releaseTag, releaseVersion, RpackError, serializeReleaseFile, setBase, SourceError,
+    statusOf, verifyRelease, VERSION_FILE, WORK_DIR,
+    type RpackConfig, type RpackContext,
 } from "@hyper-hyper-space/hhs3_rpack";
 
 import { ttyPrompter } from "../src/host/tty_prompter.js";
@@ -41,13 +45,15 @@ import { Workspace } from "../src/workspace/workspace.js";
 
 const USAGE = [
     'Usage: rpack [-C <dir>] [--keystore <path>] <command>',
-    '  init <name> [--key <label>]',
+    '  init [--schema] <name> [--key <label>]',
     '  new <version> [--base <release> [+ <release>]...]',
     '  set base <release> [+ <release>]... [--force]',
+    '  import <schema> [<version>] [--registry <dir>]',
     '  status',
     '  build',
     '  stage [--passphrase-stdin]',
     '  release [--passphrase-stdin] [--force] [--yes]',
+    '  publish [<version>] [--registry <dir>]',
     '  log',
     '  verify <file>',
     '  export <store.db> <catalog> [<version>] [--out <dir>]',
@@ -134,6 +140,7 @@ async function readStdin(): Promise<string> {
 
 function unlocker(ctx: RpackContext, parsed: Parsed, prompter: ReturnType<typeof ttyPrompter>, command: string) {
     return async (label: string) => {
+        if (ctx.vault === undefined) throw new RpackError(`Rpack ${command} needs a keystore`);
         const passphrase = parsed.switches.has('--passphrase-stdin')
             ? await readStdin()
             : prompter.interactive
@@ -143,11 +150,31 @@ function unlocker(ctx: RpackContext, parsed: Parsed, prompter: ReturnType<typeof
     };
 }
 
+function resolveRegistryDir(root: string, config: RpackConfig | undefined, explicitFlag: string | undefined): string {
+    if (explicitFlag !== undefined) return resolve(explicitFlag);
+    const envReg = process.env.HHS_REGISTRY;
+    if (envReg !== undefined && envReg !== '') return resolve(envReg);
+    if (config?.registry !== undefined) return resolve(root, config.registry);
+    return join(homedir(), '.hhs', 'registry');
+}
+
+async function readRepoConfig(project: NodeProject): Promise<RpackConfig | undefined> {
+    const text = await project.read(CONFIG_FILE);
+    return text !== undefined ? parseRpackConfig(text) : undefined;
+}
+
 async function initCommand(global: Global, args: string[]): Promise<number> {
-    const parsed = parseArgs(args, ['--key'], []);
+    const parsed = parseArgs(args, ['--key'], ['--schema']);
     const [name, ...rest] = parsed.positional;
     if (name === undefined) throw new UsageError('Init needs a name');
     noArguments(rest);
+    if (parsed.switches.has('--schema')) {
+        if (single(parsed, '--key') !== undefined) {
+            throw new RpackError('A schema repository does not use --key; schema packs are unsigned and signed by the catalog that imports them');
+        }
+        print(await initProject(new NodeProject(global.start), name, '', { kind: 'schema' }));
+        return 0;
+    }
     const keys = await openKeys(global);
     const prompter = ttyPrompter();
     try {
@@ -239,6 +266,11 @@ async function stageCommand(global: Global, args: string[]): Promise<number> {
     const parsed = parseArgs(args, [], ['--passphrase-stdin']);
     noArguments(parsed.positional);
     const { ctx, project, folder } = await inFolder(global, 'stage');
+    const config = await readRepoConfig(project);
+    if (config?.kind === 'schema') {
+        throw new RpackError('rpack stage runs a catalog; a schema pack has no catalog or table groups to instantiate');
+    }
+    if (ctx.vault === undefined) throw new RpackError('rpack stage requires a keystore');
     const prompter = ttyPrompter();
     try {
         print(await stageHost(project, ctx.vault, folder, { unlock: unlocker(ctx, parsed, prompter, 'stage') }));
@@ -246,6 +278,32 @@ async function stageCommand(global: Global, args: string[]): Promise<number> {
     } finally {
         prompter.close();
     }
+}
+
+async function publishCommand(global: Global, args: string[]): Promise<number> {
+    const parsed = parseArgs(args, ['--registry'], []);
+    const [selector, ...rest] = parsed.positional;
+    noArguments(rest);
+    const { root } = await repository(global);
+    const project = new NodeProject(root);
+    const config = await readRepoConfig(project);
+    const regDir = resolveRegistryDir(root, config, single(parsed, '--registry'));
+    print(await publishRelease(project, new NodeProject(regDir), selector));
+    return 0;
+}
+
+async function importCommand(global: Global, args: string[]): Promise<number> {
+    const parsed = parseArgs(args, ['--registry'], []);
+    const [schemaName, versionSelector, ...rest] = parsed.positional;
+    if (schemaName === undefined) throw new UsageError('Import needs a schema name');
+    noArguments(rest);
+    const { project, folder } = await inFolder(global, 'import');
+    const located = await repository(global);
+    const config = await readRepoConfig(project);
+    const regDir = resolveRegistryDir(located.root, config, single(parsed, '--registry'));
+    const res = await importSchema(project, new NodeProject(regDir), folder, schemaName, versionSelector);
+    print(res.lines);
+    return 0;
 }
 
 async function logCommand(global: Global, args: string[]): Promise<number> {
@@ -341,9 +399,11 @@ async function main(): Promise<void> {
     if (command === 'init') process.exitCode = await initCommand(global, args);
     else if (command === 'new') process.exitCode = await newCommand(global, args);
     else if (command === 'set') process.exitCode = await setCommand(global, args);
+    else if (command === 'import') process.exitCode = await importCommand(global, args);
     else if (command === 'status') process.exitCode = await statusCommand(global, args);
     else if (command === 'build') process.exitCode = await buildCommand(global, args);
     else if (command === 'release') process.exitCode = await releaseCommand(global, args);
+    else if (command === 'publish') process.exitCode = await publishCommand(global, args);
     else if (command === 'stage') process.exitCode = await stageCommand(global, args);
     else if (command === 'log') process.exitCode = await logCommand(global, args);
     else if (command === 'verify') process.exitCode = await verifyCommand(args);

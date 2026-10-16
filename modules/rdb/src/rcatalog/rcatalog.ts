@@ -41,6 +41,8 @@ import {
 import { RootScopedDag, ScopedDag, CausalDag, ScopedDagSubscription } from "@hyper-hyper-space/hhs3_mvt";
 import { signPayload as signPayloadHelper, serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 
+import type { RSchema } from "../rschema/interfaces.js";
+import { RSCHEMA_TYPE_ID } from "../rschema/payload.js";
 import type {
     RCatalog as RCatalogContract, RCatalogView as RCatalogViewContract,
     CatalogReleaseSpec, PublishedRelease,
@@ -50,7 +52,7 @@ import {
     CatalogGroupDef, CatalogFilesDef, CatalogParamDecl, SchemaCreator, RCATALOG_TYPE_ID,
 } from "./payload.js";
 import { validateRCatalogPayload } from "./validate_ops.js";
-import { CatalogIndex, ReleaseState, versionKey } from "./resolve.js";
+import { CatalogIndex, ReleaseState, schemaVersionLookupKey, versionKey } from "./resolve.js";
 import { RCatalogViewImpl } from "./view.js";
 
 export { RCATALOG_TYPE_ID } from "./payload.js";
@@ -182,7 +184,30 @@ export class RCatalogImpl implements RCatalogContract {
 
         const entries: Entry[] = [];
         for await (const entry of scopedDag.loadAllEntries()) entries.push(entry);
-        const index = new CatalogIndex(entries, this.releaseMemo);
+
+        const schemaSemvers = new Map<string, string>();
+        for (const entry of entries) {
+            const payload = entry.payload as json.LiteralMap;
+            const action = payload['action'];
+            if (action !== 'create' && action !== 'release') continue;
+            const body = payload as unknown as CatalogReleasePayload;
+            const recordSemver = async (schemaRef: B64Hash, versionSet: json.Set) => {
+                const hashes = [...json.fromSet(versionSet)];
+                const lookupKey = schemaVersionLookupKey(schemaRef, hashes);
+                if (schemaSemvers.has(lookupKey)) return;
+                const obj = await this.ctx.getObject(schemaRef);
+                if (obj !== undefined && obj.getType() === RSCHEMA_TYPE_ID) {
+                    const v = version(...hashes);
+                    const view = await (obj as RSchema).getView(v, v);
+                    const semver = view.getVersions()[0];
+                    if (semver !== undefined) schemaSemvers.set(lookupKey, semver);
+                }
+            };
+            for (const def of body.add ?? []) await recordSemver(def.schemaRef, def.schemaVersion);
+            for (const change of Object.values(body.changes ?? {})) await recordSemver(change.schema, change.version);
+        }
+
+        const index = new CatalogIndex(entries, this.releaseMemo, schemaSemvers);
         this.indexCache = { key, index };
         return index;
     }

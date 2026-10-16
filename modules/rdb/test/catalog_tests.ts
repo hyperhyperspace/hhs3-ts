@@ -550,6 +550,83 @@ export const catalogTests = {
                     'a change that drops a table the FILES reads is accepted, and the release keeps the FILES');
             }
         },
+        {
+            name: '[CAT13] cross-group checks on add and changes: FKs, EXISTS, USING IDENTITIES, ALLOW DEPLOY IF and ALLOW UPDATE REF',
+            invoke: async () => {
+                const { ctx, dev, creators, userSchema, docSchema } = await createEnv();
+                const userPin = await frontierOf(userSchema);
+                const docPin = await frontierOf(docSchema);
+                const user = userDef(userSchema, userPin);
+                const userHash = catalogGroupHash(user);
+                const doc = docDef(docSchema, docPin, userHash);
+                const docHash = catalogGroupHash(doc);
+                const catalog = await createCatalog(ctx, dev, [user, doc]);
+
+                const publish = (def: CatalogGroupDef, v = '1.1.0') => catalog.publishRelease({ version: v, add: [def] }, dev);
+
+                // Foreign USING IDENTITIES checks
+                await rejects(() => publish(docDef(docSchema, docPin, userHash, { name: 'd1', idProvider: 'user.people' })),
+                    'TABLEGROUP d1: USING IDENTITIES user.people: schema hhs:user has no table people',
+                    'foreign idProvider table must exist');
+                await rejects(() => publish(docDef(docSchema, docPin, userHash, { name: 'd1', idProvider: 'user.caps' })),
+                    "TABLEGROUP d1: USING IDENTITIES user.caps: caps isn't an IDENTITY PROVIDER table",
+                    'foreign idProvider table must be an IDENTITY PROVIDER');
+
+                // ALLOW DEPLOY IF checks
+                await rejects(() => publish(docDef(docSchema, docPin, userHash, {
+                    name: 'd1', canDeploy: { p: 'exists', table: 'other.caps', where: { grantee: '$author' } },
+                })), "TABLEGROUP d1: ALLOW DEPLOY IF reads other.caps, and the TABLEGROUP doesn't BIND other",
+                'ALLOW DEPLOY IF must reference a bound group');
+                await rejects(() => publish(docDef(docSchema, docPin, userHash, {
+                    name: 'd1', canDeploy: { p: 'exists', table: 'user.identities', where: { name: 'Admin' } },
+                })), "TABLEGROUP d1: ALLOW DEPLOY IF reads user.identities.name, which isn't PUB in identities",
+                'ALLOW DEPLOY IF where column must be PUB');
+
+                // ALLOW UPDATE REF checks (evaluated in the observed group's frame)
+                await rejects(() => publish(docDef(docSchema, docPin, userHash, {
+                    name: 'd1', canObserve: { user: { p: 'exists', table: 'identities', where: { name: 'Admin' } } },
+                })), "TABLEGROUP d1: ALLOW UPDATE REF user IF reads identities.name, which isn't PUB in identities",
+                'ALLOW UPDATE REF unqualified table is checked against the observed group');
+                await rejects(() => publish(docDef(docSchema, docPin, docHash, {
+                    name: 'd1', bindings: { doc: docHash, user: userHash },
+                    canObserve: { doc: { p: 'exists', table: 'other.caps', where: { grantee: '$author' } } },
+                })), "TABLEGROUP d1: ALLOW UPDATE REF doc IF reads other.caps, and TABLEGROUP doc doesn't BIND other",
+                'ALLOW UPDATE REF qualified table must be bound on the observed group');
+
+                // Cross-group FK and EXISTS checks on add and on changes
+                const badFkSchema = (await ctx.createObject(await RSchemaImpl.create({
+                    name: 'hhs:bad_fk', creators,
+                    tables: [{ name: 'items', columns: { ref: { type: 'string' } }, fks: { ref: 'user.missing' } }],
+                }))) as RSchemaImpl;
+                const badFkPin = await frontierOf(badFkSchema);
+                await rejects(() => publish({
+                    name: 'bad_fk', seedSource: 'rdb', schemaRef: badFkSchema.getId(),
+                    schemaVersion: json.toSet([...badFkPin]), bindings: { user: userHash },
+                }), 'TABLEGROUP bad_fk: schema hhs:bad_fk: items.ref references user.missing: schema hhs:user has no table missing',
+                'a cross-group FK to a missing foreign table is rejected');
+
+                // validateChange runs groupViewReason and cross-group checks on schema updates
+                await docSchema.updateSchema([{
+                    rule: 'set-restrictions', table: 'docs',
+                    restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'ghost.caps', where: { grantee: '$author' } } }],
+                }], dev, undefined, docPin);
+                const vUnbound = await frontierOf(docSchema);
+                await rejects(() => catalog.release({
+                    version: '1.1.0', changes: { [docHash]: { schema: docSchema.getId(), version: json.toSet([...vUnbound]) } },
+                }, dev), "TABLEGROUP doc: schema hhs:doc references ghost.caps (from docs), and the TABLEGROUP doesn't BIND ghost",
+                'a change introducing an unbound group reference is rejected');
+
+                await docSchema.updateSchema([{
+                    rule: 'set-restrictions', table: 'docs',
+                    restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'user.identities', where: { name: 'Admin' } } }],
+                }], dev, undefined, docPin);
+                const vNonPub = version(...[...await frontierOf(docSchema)].filter((h) => !vUnbound.has(h)));
+                await rejects(() => catalog.release({
+                    version: '1.1.0', changes: { [docHash]: { schema: docSchema.getId(), version: json.toSet([...vNonPub]) } },
+                }, dev), "TABLEGROUP doc: schema hhs:doc: ALLOW insert IF on docs reads user.identities.name, which isn't PUB in identities",
+                'a change referencing a non-PUB foreign column is rejected');
+            }
+        },
     ],
 };
 

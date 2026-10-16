@@ -34,8 +34,8 @@ import { TRUE, FALSE, truthOf, allTruth, everyTruth, someTruth } from "@hyper-hy
 import type { Truth } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchemaView } from "../rschema/interfaces.js";
-import type { ColumnType, Predicate, PredicateContext, Operand, TableDef } from "../rschema/payload.js";
-import { splitTableRef, parseRowFieldTerm } from "../rschema/payload.js";
+import type { ColumnType, Predicate, PredicateContext, RuleOperand, TableDef } from "../rschema/payload.js";
+import { splitTableRef, parseParamTerm, parseRowFieldTerm } from "../rschema/payload.js";
 import { evalOperand, compareOperands, resolveCmpType, likeMatch } from "../rschema/expr.js";
 import type { RTableView, RowValues } from "../rtable/interfaces.js";
 import type { RowOpPayload } from "../rtable/payload.js";
@@ -57,12 +57,14 @@ export type PredicateEnv = {
     // row's values overlaid with the op's writes (post-image). $row refs are
     // readonly-only, so a missing entry makes the referencing atom false.
     subjectRow?: RowValues;
+    params?: { [name: string]: json.Literal };
     context: PredicateContext;
     // Column-type lookup for the subject table (rowAuthor -> 'string'), used to
     // resolve cmp ordering by numeric value for bigint/decimal columns. Absent
     // for callers that only use eq/ne (comparison then falls back to normalized
     // string equality, which is correct for canonical carriers).
     typeOf?: (column: string) => ColumnType | undefined;
+    paramTypeOf?: (param: string) => ColumnType | undefined;
 };
 
 // The subject row behind $row.<col> terms, read lazily: whether the row is
@@ -78,8 +80,10 @@ export type TruthPredicateEnv = {
     getForeignTableView: (group: string, table: string) => Promise<TruthTableView | undefined>;
     author?: KeyId;
     subject?: SubjectRow;
+    params?: { [name: string]: json.Literal };
     context: PredicateContext;
     typeOf?: (column: string) => ColumnType | undefined;
+    paramTypeOf?: (param: string) => ColumnType | undefined;
 };
 
 function decided(truth: Truth, what: string): boolean {
@@ -100,8 +104,10 @@ export async function evaluatePredicate(pred: Predicate, env: PredicateEnv): Pro
             live: async () => TRUE,
             column: async (column) => ({ status: 'decided', value: subjectRow[column] }),
         },
+        params: env.params,
         context: env.context,
         typeOf: env.typeOf,
+        paramTypeOf: env.paramTypeOf,
     }), 'a predicate');
 }
 
@@ -112,7 +118,13 @@ function truthView(view: RTableView): TruthTableView {
     return {
         rowLiveness: async (rowId) => ({ truth: truthOf(await view.hasRow(rowId)), author: await view.getAuthor(rowId) }),
         columnValue: async (rowId, column) => ({ status: 'decided', value: (await view.getRow(rowId))?.values[column] }),
-        existsMatching: async (where) => truthOf((await view.findRowIds(where)).length > 0),
+        existsMatching: async (where) => {
+            try {
+                return truthOf((await view.findRowIds(where)).length > 0);
+            } catch {
+                return FALSE;
+            }
+        },
     };
 }
 
@@ -131,7 +143,7 @@ export async function evaluatePredicateTruth(pred: Predicate, env: TruthPredicat
                 const l = value(pred.left);
                 const r = value(pred.right);
                 if (l === undefined || r === undefined) return false;
-                const type = env.typeOf !== undefined ? resolveCmpType(pred.left, pred.right, env.typeOf) : undefined;
+                const type = env.typeOf !== undefined ? resolveCmpType(pred.left, pred.right, env.typeOf, env.paramTypeOf) : undefined;
                 return compareOperands(pred.cmp, l, r, type);
             });
 
@@ -154,8 +166,8 @@ async function existsTruth(pred: Extract<Predicate, { p: 'exists' }>, env: Truth
     const [group, table] = splitTableRef(pred.table);
     const terms = pred.where ?? {};
 
-    // resolve $-terms ($author / $row.<col>) in where values; an unresolvable
-    // term makes the atom unprovable
+    // resolve $-terms ($author / $row.<col> / $param.<name>) in where values;
+    // an unresolvable term makes the atom unprovable
     const where: { [field: string]: json.Literal } = {};
     const rowTerms = new Map<string, string>();
     for (const field of Object.keys(terms)) {
@@ -166,6 +178,13 @@ async function existsTruth(pred: Extract<Predicate, { p: 'exists' }>, env: Truth
             if (env.author === undefined) return FALSE;
             where[field] = env.author;
         } else {
+            const param = parseParamTerm(value);
+            if (param !== undefined) {
+                const paramValue = env.params?.[param];
+                if (paramValue === undefined) return FALSE;
+                where[field] = paramValue;
+                continue;
+            }
             const column = parseRowFieldTerm(value);
             if (column === undefined) return FALSE;
             rowTerms.set(field, column);
@@ -187,14 +206,14 @@ async function existsTruth(pred: Extract<Predicate, { p: 'exists' }>, env: Truth
     return allTruth([subject.live, await view.existsMatching(where)]);
 }
 
-function evalPredicateOperand(op: Operand, env: TruthPredicateEnv, lookup: (column: string) => json.Literal | undefined): json.Literal | undefined {
+function evalPredicateOperand(op: RuleOperand, env: TruthPredicateEnv, lookup: (column: string) => json.Literal | undefined): json.Literal | undefined {
     if ('lit' in op && op.lit === '$author') return env.author;
-    return evalOperand(op, lookup);
+    return evalOperand(op, lookup, (param) => env.params?.[param]);
 }
 
 async function valueAtomTruth(
-    operands: Operand[], env: TruthPredicateEnv,
-    atom: (value: (op: Operand) => json.Literal | undefined) => boolean,
+    operands: RuleOperand[], env: TruthPredicateEnv,
+    atom: (value: (op: RuleOperand) => json.Literal | undefined) => boolean,
 ): Promise<Truth> {
     const columns = new Set<string>();
     for (const op of operands) collectColumns(op, columns);
@@ -206,7 +225,7 @@ async function valueAtomTruth(
     return allTruth([subject.live, truthOf(atom((op) => evalPredicateOperand(op, env, lookup)))]);
 }
 
-function collectColumns(op: Operand, into: Set<string>): void {
+function collectColumns(op: RuleOperand, into: Set<string>): void {
     if ('col' in op) into.add(op.col);
     if ('fn' in op) for (const arg of op.args) collectColumns(arg, into);
 }
@@ -289,13 +308,15 @@ export async function evaluateRowOpRestriction(
     authenticated: boolean,
     getTableView: (table: string) => Promise<RTableView>,
     getForeignTableView: (group: string, table: string) => Promise<RTableView | undefined>,
+    params?: { [name: string]: json.Literal },
 ): Promise<boolean> {
     const { truth } = await explainRowOpRestriction(op, table, schemaView, authenticated,
         async (name) => truthView(await getTableView(name)),
         async (group, name) => {
             const view = await getForeignTableView(group, name);
             return view === undefined ? undefined : truthView(view);
-        });
+        },
+        params);
     return decided(truth, 'a row restriction');
 }
 
@@ -314,6 +335,7 @@ export async function explainRowOpRestriction(
     authenticated: boolean,
     getTableView: (table: string) => Promise<TruthTableView>,
     getForeignTableView: (group: string, table: string) => Promise<TruthTableView | undefined>,
+    params?: { [name: string]: json.Literal },
 ): Promise<{ truth: Truth; failure?: RowOpRestrictionFailure }> {
     if (!schemaView.hasTable(table)) {
         return { truth: FALSE, failure: { table, action: op.action, rowId: op.rowId, rule: { p: 'false' } } };
@@ -321,10 +343,15 @@ export async function explainRowOpRestriction(
     const rule = schemaView.getRestriction(table, op.action, authenticated);
     const def = schemaView.getTable(table);
     const typeOf = (column: string): ColumnType | undefined => column === 'rowAuthor' ? 'string' : def?.columns[column]?.type;
+    const paramTypeOf = (param: string): ColumnType | undefined => schemaView.getParam(param)?.type;
 
     const truth = await evaluatePredicateTruth(rule, {
         getTableView, getForeignTableView, author: op.author,
-        subject: opSubject(op, table, def, getTableView), context: 'row', typeOf,
+        subject: opSubject(op, table, def, getTableView),
+        params,
+        context: 'row',
+        typeOf,
+        paramTypeOf,
     });
     return truth.status === 'false' ? { truth, failure: { table, action: op.action, rowId: op.rowId, rule } } : { truth };
 }

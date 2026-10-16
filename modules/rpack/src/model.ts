@@ -10,15 +10,23 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
 import {
     DEFAULT_CONCURRENT_DELETES, defaultRestrictionRule,
-    type CatalogFilesDef, type CatalogGroupDef, type CatalogParamDecl, type ColumnDef, type FKs, type Predicate, type SchemaCreator, type TableDef,
+    type CatalogFilesDef, type CatalogGroupDef, type CatalogParamDecl, type ColumnDef, type FKs, type Predicate, type SchemaCreator, type SchemaParamDecl, type TableDef,
 } from "@hyper-hyper-space/hhs3_rdb";
 import type { SourceFiles, SourceGroup } from "@hyper-hyper-space/hhs3_rdb_lang";
+
+import type { SchemaReleaseStep } from "./format.js";
+
+export type SchemaOrigin =
+    | { kind: 'inline' }
+    | { kind: 'imported'; version: string; steps: SchemaReleaseStep[] };
 
 export type SchemaModel = {
     name: string;
     creators: SchemaCreator[];
     hashAlgorithm?: string;
+    params?: Map<string, SchemaParamDecl>;
     tables: Map<string, TableDef>;
+    origin?: SchemaOrigin;
 };
 
 export type GroupModel = SourceGroup;
@@ -118,17 +126,62 @@ export function tableDifferences(schema: string, a: Map<string, TableDef>, b: Ma
     return out;
 }
 
+export function sameParamDecl(a: SchemaParamDecl, b: SchemaParamDecl): boolean {
+    return literalKey(a as json.Literal) === literalKey(b as json.Literal);
+}
+
+export function paramDifferences(
+    schema: string,
+    a: Map<string, SchemaParamDecl> | undefined,
+    b: Map<string, SchemaParamDecl> | undefined,
+): string[] {
+    const mapA = a ?? new Map<string, SchemaParamDecl>();
+    const mapB = b ?? new Map<string, SchemaParamDecl>();
+    const out: string[] = [];
+    for (const [name, decl] of mapA) {
+        const other = mapB.get(name);
+        if (other === undefined) out.push(`${schema}: param :${name} is only on the first side`);
+        else if (!sameParamDecl(decl, other)) out.push(`${schema}: param :${name} differs`);
+    }
+    for (const name of mapB.keys()) {
+        if (!mapA.has(name)) out.push(`${schema}: param :${name} is only on the second side`);
+    }
+    return out;
+}
+
+export function effectiveGroupParams(
+    group: GroupModel,
+    schema: SchemaModel | undefined,
+): { [name: string]: json.Literal } {
+    const out: { [name: string]: json.Literal } = {};
+    for (const [name, decl] of schema?.params ?? []) {
+        const val = group.params?.[name] ?? decl.default;
+        if (val !== undefined) out[name] = val;
+    }
+    for (const [name, val] of Object.entries(group.params ?? {})) {
+        if (out[name] === undefined) out[name] = val;
+    }
+    return out;
+}
+
 export function creatorsKey(creators: SchemaCreator[]): string {
     return creators.map((c) => c.keyId).sort().join(',');
 }
 
-// A group's definition without its name, for comparing two groups of one name.
+// A group's immutable definition without its name or revisable params, for
+// comparing two groups of one name.
 export function groupKey(group: GroupModel): string {
+    const { name: _name, params: _params, ...rest } = group;
+    return literalKey(rest as unknown as json.Literal);
+}
+
+// A group's full source state (including revisable params), for writeSource.
+export function groupSourceKey(group: GroupModel): string {
     const { name: _name, ...rest } = group;
     return literalKey(rest as unknown as json.Literal);
 }
 
-// The fields in which two groups of one name differ.
+// The fields in which two groups of one name differ in their immutable definition.
 export function groupDifferences(a: GroupModel, b: GroupModel): string[] {
     const fields: string[] = [];
     const field = (label: string, x: unknown, y: unknown) => {
@@ -137,6 +190,7 @@ export function groupDifferences(a: GroupModel, b: GroupModel): string[] {
     };
     field('schema', a.schema, b.schema);
     field('bindings', a.bindings ?? {}, b.bindings ?? {});
+    field('table mappings', a.tableMaps ?? {}, b.tableMaps ?? {});
     field('identity provider', a.idProvider, b.idProvider);
     field('ALLOW DEPLOY', a.canDeploy, b.canDeploy);
     field('ALLOW UPDATE REF', a.canObserve ?? {}, b.canObserve ?? {});
@@ -144,15 +198,20 @@ export function groupDifferences(a: GroupModel, b: GroupModel): string[] {
     return fields;
 }
 
-// A group model from a definition: its schema and bindings by name.
+// A group model from a definition: its schema and bindings by name, with
+// `foldedParams` (defaulting to `def.params`) as its current parameter values.
 export function groupModelOf(
     def: CatalogGroupDef,
     schemaName: string,
     bindingName: (hash: string) => string,
+    foldedParams?: { [name: string]: json.Literal },
 ): GroupModel {
     const group: GroupModel = { name: def.name, schema: schemaName };
     const bindings = Object.entries(def.bindings ?? {});
     if (bindings.length > 0) group.bindings = Object.fromEntries(bindings.map(([alias, hash]) => [alias, bindingName(hash)]));
+    if (def.tableMaps !== undefined && Object.keys(def.tableMaps).length > 0) group.tableMaps = def.tableMaps;
+    const params = foldedParams ?? def.params;
+    if (params !== undefined && Object.keys(params).length > 0) group.params = { ...params };
     if (def.idProvider !== undefined) group.idProvider = def.idProvider;
     if (def.canDeploy !== undefined) group.canDeploy = def.canDeploy;
     if (def.canObserve !== undefined && Object.keys(def.canObserve).length > 0) group.canObserve = def.canObserve;
@@ -203,6 +262,7 @@ export function modelDifferences(a: CatalogModel, b: CatalogModel): string[] {
         if (other === undefined) { out.push(`schema ${name} is only on the first side`); continue; }
         if (creatorsKey(schema.creators) !== creatorsKey(other.creators)) out.push(`the creators of schema ${name} differ`);
         if (schema.hashAlgorithm !== other.hashAlgorithm) out.push(`the hash algorithm of schema ${name} differs`);
+        out.push(...paramDifferences(name, schema.params, other.params));
         out.push(...tableDifferences(name, schema.tables, other.tables));
     }
     for (const name of b.schemas.keys()) if (!a.schemas.has(name)) out.push(`schema ${name} is only on the second side`);
@@ -211,6 +271,9 @@ export function modelDifferences(a: CatalogModel, b: CatalogModel): string[] {
         const other = b.groups.get(name);
         if (other === undefined) { out.push(`group ${name} is only on the first side`); continue; }
         for (const field of groupDifferences(group, other)) out.push(`group ${name}: its ${field} differ`);
+        const effA = effectiveGroupParams(group, a.schemas.get(group.schema));
+        const effB = effectiveGroupParams(other, b.schemas.get(other.schema));
+        if (literalKey(effA) !== literalKey(effB)) out.push(`group ${name}: its params differ`);
     }
     for (const name of b.groups.keys()) if (!a.groups.has(name)) out.push(`group ${name} is only on the second side`);
 

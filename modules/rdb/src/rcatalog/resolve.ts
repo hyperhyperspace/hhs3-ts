@@ -29,9 +29,19 @@ import {
 } from "./payload.js";
 import { compareSemver } from "./semver.js";
 
+export type CatalogParamWrite = {
+    value: json.Literal;
+    releaseHash: B64Hash;
+    ancestors: ReadonlySet<B64Hash>;
+    schemaVersion: B64Hash[];
+    schemaSemver: string;
+};
+
 export type CatalogGroupState = {
     schema: B64Hash;
     version: B64Hash[];   // sorted
+    params?: { [name: string]: json.Literal };
+    paramWrites?: Map<string, CatalogParamWrite[]>;
 };
 
 export type ReleaseState = {
@@ -86,6 +96,54 @@ export function emptyParentFold(): ParentFold {
     };
 }
 
+function outranksCatalogParamWrite(a: CatalogParamWrite, b: CatalogParamWrite): boolean {
+    const bySemver = compareSemver(a.schemaSemver, b.schemaSemver);
+    if (bySemver !== 0) return bySemver > 0;
+    const keyA = versionKey(a.schemaVersion);
+    const keyB = versionKey(b.schemaVersion);
+    if (keyA !== keyB) return keyA > keyB;
+    return a.releaseHash > b.releaseHash;
+}
+
+// Folds the per-parameter writes of a group across one or more release states.
+// Writes causally below another write (`other.ancestors.has(w.releaseHash)`)
+// are dropped; concurrent maxima are ranked by schema semver, then target
+// schema entry hashes, then release hash.
+export function foldGroupParamWrites(states: CatalogGroupState[]): {
+    params: { [name: string]: json.Literal };
+    paramWrites: Map<string, CatalogParamWrite[]>;
+} {
+    const byParam = new Map<string, Map<B64Hash, CatalogParamWrite>>();
+    for (const state of states) {
+        for (const [name, writes] of state.paramWrites ?? []) {
+            let map = byParam.get(name);
+            if (map === undefined) {
+                map = new Map();
+                byParam.set(name, map);
+            }
+            for (const w of writes) map.set(w.releaseHash, w);
+        }
+    }
+
+    const params: { [name: string]: json.Literal } = {};
+    const paramWrites = new Map<string, CatalogParamWrite[]>();
+    for (const [name, map] of [...byParam.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+        const candidates = [...map.values()];
+        const maxima = candidates.filter((w) => !candidates.some((other) => other.releaseHash !== w.releaseHash && other.ancestors.has(w.releaseHash)));
+        let winner = maxima[0];
+        for (const w of maxima) {
+            if (outranksCatalogParamWrite(w, winner)) winner = w;
+        }
+        params[name] = winner.value;
+        paramWrites.set(name, maxima);
+    }
+    return { params, paramWrites };
+}
+
+export function schemaVersionLookupKey(schemaRef: B64Hash, versionHashes: Iterable<B64Hash>): string {
+    return `${schemaRef}:${versionKey(versionHashes)}`;
+}
+
 export class CatalogIndex {
 
     private readonly byHash: Map<B64Hash, Entry> = new Map();
@@ -93,7 +151,11 @@ export class CatalogIndex {
     private readonly genesisHash: B64Hash;
     private readonly genesis: CreateRCatalogPayload;
 
-    constructor(entries: Entry[], private readonly memo: Map<B64Hash, ReleaseState>) {
+    constructor(
+        entries: Entry[],
+        private readonly memo: Map<B64Hash, ReleaseState>,
+        private readonly schemaSemvers: Map<string, string> = new Map(),
+    ) {
         let genesisHash: B64Hash | undefined;
         for (const entry of entries) {
             this.byHash.set(entry.hash, entry);
@@ -203,6 +265,7 @@ export class CatalogIndex {
         const params = new Map<string, CatalogParamDecl>();
         const ancestors = new Set<B64Hash>();
 
+        const allStates = new Map<B64Hash, CatalogGroupState[]>();
         for (const parent of [...parents].sort()) {
             const state = this.releaseState(parent);
             ancestors.add(parent);
@@ -216,18 +279,25 @@ export class CatalogIndex {
                 const list = seen.get(hash) ?? [];
                 if (!list.some((g) => versionKey(g.version) === versionKey(group.version))) list.push(group);
                 seen.set(hash, list);
+                const fullList = allStates.get(hash) ?? [];
+                fullList.push(group);
+                allStates.set(hash, fullList);
             }
         }
 
         const conflicts = new Map<B64Hash, CatalogGroupState[]>();
         for (const [hash, list] of seen) {
+            const foldedParams = foldGroupParamWrites(allStates.get(hash) ?? list);
+            const paramFields = foldedParams.paramWrites.size > 0
+                ? { params: foldedParams.params, paramWrites: foldedParams.paramWrites }
+                : {};
             if (list.length === 1) {
-                groups.set(hash, list[0]);
+                groups.set(hash, { schema: list[0].schema, version: list[0].version, ...paramFields });
             } else {
                 conflicts.set(hash, list);
                 const union = new Set<B64Hash>();
                 for (const g of list) for (const h of g.version) union.add(h);
-                groups.set(hash, { schema: list[0].schema, version: sortedVersion(union) });
+                groups.set(hash, { schema: list[0].schema, version: sortedVersion(union), ...paramFields });
             }
         }
 
@@ -254,7 +324,7 @@ export class CatalogIndex {
 
         const parents = this.parentsOf(this.prevs(hash));
         const fold = this.foldParents(parents);
-        const state = applyReleaseBody(hash, payload, parents, fold);
+        const state = applyReleaseBody(hash, payload, parents, fold, this.schemaSemvers);
         this.memo.set(hash, state);
         return state;
     }
@@ -268,11 +338,16 @@ export function applyReleaseBody(
     body: CatalogReleaseBody,
     parents: B64Hash[],
     fold: ParentFold,
+    schemaSemvers: Map<string, string> = new Map(),
 ): ReleaseState {
     const groups = new Map(fold.groups);
     const defs = new Map(fold.defs);
     const addedIn = new Map(fold.addedIn);
     const params = new Map(fold.params);
+    const ancestors = new Set(fold.ancestors);
+
+    const semverOf = (schemaRef: B64Hash, v: B64Hash[]) =>
+        schemaSemvers.get(schemaVersionLookupKey(schemaRef, v)) ?? '0.0.0';
 
     const added: B64Hash[] = [];
     for (const def of body.add ?? []) {
@@ -280,13 +355,38 @@ export function applyReleaseBody(
         added.push(defHash);
         defs.set(defHash, def);
         addedIn.set(defHash, hash);
-        groups.set(defHash, { schema: def.schemaRef, version: sortedVersion(json.fromSet(def.schemaVersion)) });
+        const v = sortedVersion(json.fromSet(def.schemaVersion));
+        const semver = semverOf(def.schemaRef, v);
+        const groupParams: { [name: string]: json.Literal } = {};
+        const paramWrites = new Map<string, CatalogParamWrite[]>();
+        for (const [name, value] of Object.entries(def.params ?? {})) {
+            groupParams[name] = value;
+            paramWrites.set(name, [{ value, releaseHash: hash, ancestors, schemaVersion: v, schemaSemver: semver }]);
+        }
+        groups.set(defHash, {
+            schema: def.schemaRef,
+            version: v,
+            ...(paramWrites.size > 0 ? { params: groupParams, paramWrites } : {}),
+        });
     }
 
     const changed: B64Hash[] = [];
     for (const [defHash, change] of Object.entries(body.changes ?? {})) {
         changed.push(defHash);
-        groups.set(defHash, { schema: change.schema, version: sortedVersion(json.fromSet(change.version)) });
+        const prior = groups.get(defHash);
+        const v = sortedVersion(json.fromSet(change.version));
+        const semver = semverOf(change.schema, v);
+        const groupParams: { [name: string]: json.Literal } = { ...(prior?.params ?? {}) };
+        const paramWrites = new Map<string, CatalogParamWrite[]>(prior?.paramWrites ?? []);
+        for (const [name, value] of Object.entries(change.params ?? {})) {
+            groupParams[name] = value;
+            paramWrites.set(name, [{ value, releaseHash: hash, ancestors, schemaVersion: v, schemaSemver: semver }]);
+        }
+        groups.set(defHash, {
+            schema: change.schema,
+            version: v,
+            ...(paramWrites.size > 0 ? { params: groupParams, paramWrites } : {}),
+        });
     }
     changed.sort();
 

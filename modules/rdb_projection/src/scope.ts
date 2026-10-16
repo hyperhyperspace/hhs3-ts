@@ -98,11 +98,13 @@ export async function buildScope(groups: RTableGroup[], options: ScopeOptions = 
         return (ref: string): string | undefined => {
             const dot = ref.indexOf('.');
             if (dot < 0) return undefined;                 // not qualified: local
-            const foreignId = bindings[ref.slice(0, dot)];
+            const alias = ref.slice(0, dot);
+            const foreignId = bindings[alias];
             if (foreignId === undefined) return undefined; // unknown binding alias
             const foreignTables = tableNamesById.get(foreignId);
             if (foreignTables === undefined) return undefined;   // not co-projected
-            return foreignTables[ref.slice(dot + 1)];
+            const foreignTable = group.resolveForeignTableName(alias, ref.slice(dot + 1));
+            return foreignTables[foreignTable];
         };
     };
 

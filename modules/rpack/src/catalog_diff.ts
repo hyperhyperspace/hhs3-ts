@@ -13,10 +13,11 @@
 //   - new params are declared; a removed or retyped param is refused.
 
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { filesSchemaReason, versionKey, type CatalogParamDecl } from "@hyper-hyper-space/hhs3_rdb";
+import type { json } from "@hyper-hyper-space/hhs3_json";
+import { collectExistsAtoms, filesSchemaReason, splitTableRef, versionKey, type CatalogParamDecl, type TableDef } from "@hyper-hyper-space/hhs3_rdb";
 
 import {
-    creatorsKey, filesDifferences, filesKey, groupDifferences, orderByBindings, type CatalogModel, type FilesModel, type GroupModel,
+    creatorsKey, filesDifferences, filesKey, groupDifferences, literalKey, orderByBindings, type CatalogModel, type FilesModel, type GroupModel,
 } from "./model.js";
 import { SOURCE_FILE } from "./project.js";
 import type { BaseState } from "./released.js";
@@ -30,7 +31,11 @@ export type Pin =
     | { kind: 'create' }
     | { kind: 'entries'; entries: B64Hash[] };
 
-export type CatalogChange = { group: string; schema: string };
+export type CatalogChange = {
+    group: string;
+    schema: string;
+    params?: { [name: string]: json.Literal };
+};
 
 export type CatalogDiff = {
     add: GroupModel[];
@@ -140,10 +145,83 @@ export function diffCatalog(base: BaseState, desired: CatalogModel, pins: Map<st
         const pin = pins.get(group.model.schema);
         if (pin === undefined) continue;
         const moves = pin.kind !== 'entries' || group.pins.some((p) => versionKey(p.version) !== versionKey(pin.entries));
-        if (moves) changes.push({ group: name, schema: group.model.schema });
+        const wanted = desired.groups.get(name);
+        const wantedSchema = desired.schemas.get(group.model.schema);
+        const baseSchema = base.schemas.get(group.model.schema);
+        const groupAt = at(locate(unitKey.group(name)));
+
+        const changeParams: { [name: string]: json.Literal } = {};
+        if (wanted !== undefined && wantedSchema !== undefined && baseSchema !== undefined) {
+            for (const [paramName, decl] of [...(wantedSchema.params ?? new Map()).entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+                const baseExplicit = group.params[paramName];
+                const baseDefault = baseSchema.params.get(paramName)?.default;
+                const baseEff = baseExplicit ?? baseDefault;
+                const wantedExplicit = wanted.params?.[paramName];
+                const wantedEff = wantedExplicit ?? decl.default;
+
+                if (wantedExplicit === undefined) {
+                    if (baseExplicit !== undefined && (decl.default === undefined || literalKey(baseExplicit) !== literalKey(decl.default))) {
+                        refusals.push({
+                            message: `group ${name}: param :${paramName} is removed from WITH PARAMS; a param value can't be removed`,
+                            hint: "to return to the schema's default, write the default's value",
+                            ...groupAt,
+                        });
+                    }
+                    continue;
+                }
+                if (baseEff === undefined || literalKey(wantedEff!) !== literalKey(baseEff)) {
+                    changeParams[paramName] = wantedExplicit;
+                }
+            }
+        }
+
+        const hasParamChanges = Object.keys(changeParams).length > 0;
+        if (hasParamChanges && !moves) {
+            refusals.push({
+                message: `the params of ${name} changed, but its schema version did not; values only change with a version move`,
+                hint: 'move the group to a schema version that changes something',
+                ...groupAt,
+            });
+            continue;
+        }
+
+        if (moves) {
+            changes.push({
+                group: name,
+                schema: group.model.schema,
+                ...(hasParamChanges ? { params: changeParams } : {}),
+            });
+            if (wanted !== undefined && wantedSchema !== undefined && baseSchema !== undefined) {
+                const priorRefs = qualifiedRefsOf(baseSchema.tables);
+                for (const ref of qualifiedRefsOf(wantedSchema.tables)) {
+                    if (priorRefs.has(ref)) continue;
+                    const [alias, table] = splitTableRef(ref);
+                    if (alias === undefined) continue;
+                    if (wanted.tableMaps?.[alias]?.[table] === undefined) {
+                        const boundGroup = wanted.bindings?.[alias] ?? alias;
+                        warnings.push(`group ${name}: new schema reference ${alias}.${table} binds to ${boundGroup}.${table} by name without a table mapping`);
+                    }
+                }
+            }
+        }
     }
 
     return { add, addFiles, changes, params, warnings, refusals };
+}
+
+function qualifiedRefsOf(tables: Map<string, TableDef>): Set<string> {
+    const out = new Set<string>();
+    for (const def of tables.values()) {
+        for (const target of Object.values(def.fks ?? {})) {
+            if (target.includes('.')) out.add(target);
+        }
+        for (const r of def.restrictions ?? []) {
+            for (const atom of collectExistsAtoms(r.rule)) {
+                if (atom.table.includes('.')) out.add(atom.table);
+            }
+        }
+    }
+    return out;
 }
 
 // Why a FILES doesn't fit its group's schema in `model`, when it doesn't.

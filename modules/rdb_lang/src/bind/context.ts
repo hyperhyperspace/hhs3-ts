@@ -67,8 +67,17 @@ export type ResolvedLogTarget =
     | { kind: 'group'; id: B64Hash; object: RTableGroup & LoggableObject }
     | { kind: 'table'; id: B64Hash; object: RTable & LoggableObject; groupId: B64Hash; group: RTableGroup & LoggableObject; tableName: string };
 
+export type ResolvedImportedSchema = {
+    schemaId: B64Hash;
+    schema?: RSchema;
+    at: Version;
+};
+
 export interface LangBindContext {
     resolveSchema(ref: NameOrHashRef): Promise<ResolvedSchemaRef>;
+    // Source mode (`IMPORT SCHEMA <name> VERSION '<version>'`): resolves an
+    // imported schema and the entry position mirroring that version.
+    resolveImport?(name: string, version: string): Promise<ResolvedImportedSchema | undefined>;
     // A group name is `group` or `db.group` (NameRef parts); a bare name
     // resolves within the default database when one is set.
     resolveGroup(ref: NameOrHashRef): Promise<ResolvedGroupRef>;

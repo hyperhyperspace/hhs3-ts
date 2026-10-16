@@ -146,13 +146,13 @@ export type RContext = {
     // Bootstrap a not-yet-present object from the mesh (used by sync roots that
     // fan out to members / transitive references). Optional: contexts that do
     // not implement it force callers to handle a missing object as an error.
-    fetchObject?(id: B64Hash, opts?: { meshLabel?: string; backendLabel?: string; timeoutMs?: number }): Promise<RObject>;
+    fetchObject?(id: B64Hash, opts?: { meshLabel?: string; backendLabel?: string; timeoutMs?: number; peerTimeoutMs?: number }): Promise<RObject>;
 
     // Fetch (hash-verify) a not-yet-present object's create payload WITHOUT
     // materializing it. Lets a caller inspect the create's genesis deps
     // (factory.extractCreationForeignDeps) and defer createObject until those
     // deps are locally satisfiable. Optional, paired with fetchObject.
-    fetchCreatePayload?(id: B64Hash, opts?: { meshLabel?: string; timeoutMs?: number }): Promise<Payload>;
+    fetchCreatePayload?(id: B64Hash, opts?: { meshLabel?: string; timeoutMs?: number; peerTimeoutMs?: number }): Promise<Payload>;
 
     // Fired on first insertion into the object map (createObject cache miss and
     // registerObject). Optional: contexts that omit it cannot wake waiters when

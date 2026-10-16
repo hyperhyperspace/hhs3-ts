@@ -69,10 +69,11 @@ export function isVoidCheckableTableOp(payload: json.Literal): boolean {
 }
 
 function bindingNameFor(host: OpVerdictHost, refId: B64Hash): string | undefined {
-    for (const [name, id] of Object.entries(host.getBindings())) {
-        if (id === refId) return name;
-    }
-    return undefined;
+    const names = Object.entries(host.getBindings())
+        .filter(([, id]) => id === refId)
+        .map(([name]) => name)
+        .sort();
+    return names.length > 0 ? names.join('/') : undefined;
 }
 
 export function describeGroupEntry(

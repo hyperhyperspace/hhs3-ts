@@ -1,7 +1,7 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
 
-import type { Operand, Predicate, WhereValue } from "./payload.js";
-import { parseRowFieldTerm } from "./payload.js";
+import type { Predicate, RuleOperand, WhereValue } from "./payload.js";
+import { parseParamTerm, parseRowFieldTerm } from "./payload.js";
 import type { RowOpPayload } from "../rtable/payload.js";
 
 // quoteIdent renders a table / column name; C-SQL passes one that quotes
@@ -83,6 +83,8 @@ function formatExistsWhereValue(value: WhereValue, ctx: FormatContext): string {
     if (typeof value === 'string') {
         const col = parseRowFieldTerm(value);
         if (col !== undefined) return formatColumn(col, ctx);
+        const param = parseParamTerm(value);
+        if (param !== undefined) return `:${ctx.ident(param)}`;
     }
     return formatLiteral(value);
 }
@@ -94,13 +96,14 @@ const PREC_PRODUCT = 2;
 const PREC_UNARY = 3;
 const PREC_PRIMARY = 4;
 
-function formatOperand(operand: Operand, ctx: FormatContext, minPrec: number): string {
+function formatOperand(operand: RuleOperand, ctx: FormatContext, minPrec: number): string {
     const [text, prec] = formatOperandPrec(operand, ctx);
     return prec < minPrec ? `(${text})` : text;
 }
 
-function formatOperandPrec(operand: Operand, ctx: FormatContext): [string, number] {
+function formatOperandPrec(operand: RuleOperand, ctx: FormatContext): [string, number] {
     if ('col' in operand) return [formatColumn(operand.col, ctx), PREC_PRIMARY];
+    if ('param' in operand) return [`:${ctx.ident(operand.param)}`, PREC_PRIMARY];
     if ('lit' in operand) {
         const lit = operand.lit;
         // A negative number is unary minus applied to its magnitude.

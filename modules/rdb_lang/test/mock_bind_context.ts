@@ -211,8 +211,7 @@ export function createTestBindContext(ctx: RContext, vars: { [name: string]: Lan
                 return matchRowIdPrefix(prefix, await view.liveRowIds(), tableName);
             }
 
-            const fkGroup = sourceTable.group as CrossGroupFkResolvable;
-            const view = await fkGroup.resolveForeignTableView(groupName, targetTable, at, fromVersion);
+            const view = await sourceTable.group.resolveSchemaForeignTableView(groupName, targetTable, at, fromVersion);
             if (view === undefined) {
                 throw new Error(`Unknown foreign table '${groupName}.${targetTable}' for FK column '${column}'`);
             }

@@ -83,6 +83,7 @@ export function formatTableResult(result: LangExecutionResult, session: ReplSess
                 ? formatRowsVertical(records, result.columns, { ctx: listCtx })
                 : formatRows(records, result.columns, { ctx: listCtx });
         }
+        case 'import-schema': return `imported schema ${result.name} ${result.version} (${ctx.formatString(result.schemaId, { role: 'hash' })})`;
     }
 }
 

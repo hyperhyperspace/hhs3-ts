@@ -57,29 +57,57 @@ export async function produceRelease(
     const base = draft.base;
 
     const schemaIds = new Map<string, B64Hash>();
+    const schemaObjects = new Map<string, RSchemaImpl>();
     const pins = new Map<string, B64Hash[]>();
-    for (const [name, schema] of base?.schemas ?? []) schemaIds.set(name, schema.id);
+    const stepToEntry = new Map<B64Hash, B64Hash>();
+    for (const [name, schema] of base?.schemas ?? []) {
+        schemaIds.set(name, schema.id);
+        schemaObjects.set(name, schema.object);
+        pins.set(name, schema.at);
+    }
     for (const [name, pin] of draft.pins) if (pin.kind === 'entries') pins.set(name, pin.entries);
 
     for (const step of draft.schemas) {
         if (step.kind === 'create') {
+            const params = step.schema.params !== undefined && step.schema.params.size > 0
+                ? [...step.schema.params.values()]
+                : undefined;
             const payload = await RSchemaImpl.create({
                 name: step.schema.name,
                 version: step.version,
                 creators: publicCreators(step.schema.creators),
+                ...(params !== undefined ? { params } : {}),
                 tables: [...step.schema.tables.values()],
                 ...(step.schema.hashAlgorithm !== undefined ? { hashAlgorithm: step.schema.hashAlgorithm } : {}),
             });
-            const object = await ctx.createObject(payload as unknown as json.LiteralMap);
+            const object = (await ctx.createObject(payload as unknown as json.LiteralMap)) as unknown as RSchemaImpl;
             schemaIds.set(step.schema.name, object.getId());
+            schemaObjects.set(step.schema.name, object);
             pins.set(step.schema.name, [object.getId()]);
+            if (step.stepHash !== undefined) stepToEntry.set(step.stepHash, object.getId());
         } else {
-            const schema = base!.schemas.get(step.schema)!;
-            const hash = await schema.object.updateSchema(step.rules.map((r) => r.rule), key, {
+            const schemaObj = schemaObjects.get(step.schema)!;
+            const atHashes: B64Hash[] = [];
+            if (step.at !== undefined) atHashes.push(...step.at);
+            if (step.parentStepHashes !== undefined) {
+                for (const p of step.parentStepHashes) {
+                    const mapped = stepToEntry.get(p);
+                    if (mapped !== undefined) atHashes.push(mapped);
+                }
+            }
+            if (atHashes.length === 0) atHashes.push(...(pins.get(step.schema) ?? base!.schemas.get(step.schema)!.at));
+
+            const hash = await schemaObj.updateSchema(step.rules.map((r) => r.rule), key, {
                 version: step.version,
-                at: versionOf(...schema.at),
+                ...(step.params !== undefined && step.params.length > 0 ? { params: step.params } : {}),
+                ...(step.note !== undefined ? { note: step.note } : {}),
+                at: versionOf(...atHashes),
             });
-            pins.set(step.schema, [hash]);
+            if (step.stepHash !== undefined) stepToEntry.set(step.stepHash, hash);
+            const cover = await (await schemaObj.getScopedDag()).findMinimalCover(
+                versionOf(...(pins.get(step.schema) ?? []), hash),
+            );
+            pins.set(step.schema, [...cover].sort());
         }
     }
 
@@ -94,6 +122,8 @@ export async function produceRelease(
         };
         const bindings = Object.entries(group.bindings ?? {});
         if (bindings.length > 0) def.bindings = Object.fromEntries(bindings.map(([alias, name]) => [alias, defHashes.get(name)!]));
+        if (group.tableMaps !== undefined && Object.keys(group.tableMaps).length > 0) def.tableMaps = group.tableMaps;
+        if (group.params !== undefined && Object.keys(group.params).length > 0) def.params = group.params;
         if (group.idProvider !== undefined) def.idProvider = group.idProvider;
         if (group.canDeploy !== undefined) def.canDeploy = group.canDeploy;
         if (group.canObserve !== undefined) def.canObserve = group.canObserve;
@@ -136,7 +166,11 @@ export async function produceRelease(
         catalogId = base!.catalogId;
         const changes: { [defHash: string]: CatalogGroupChange } = {};
         for (const change of draft.changes) {
-            changes[defHashes.get(change.group)!] = { schema: schemaIds.get(change.schema)!, version: json.toSet(pins.get(change.schema)!) };
+            changes[defHashes.get(change.group)!] = {
+                schema: schemaIds.get(change.schema)!,
+                version: json.toSet(pins.get(change.schema)!),
+                ...(change.params !== undefined && Object.keys(change.params).length > 0 ? { params: change.params } : {}),
+            };
         }
         const spec: CatalogReleaseSpec = { version: draft.version };
         if (Object.keys(changes).length > 0) spec.changes = changes;

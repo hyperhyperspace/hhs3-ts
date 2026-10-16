@@ -5,10 +5,10 @@ import {
     AllowOp, AllowRuleExpr, AlterCatalogStatement, AlterSchemaStatement, AstScript, AstStatement, AuthorExpr,
     BundleStatement, BundleWriteStatement, CatalogChangeExpr, CatalogFilesExpr, CatalogGroupExpr, CatalogParamDeclExpr,
     ColumnDecl, ColumnConstraintsExpr, ColumnTypeName, CreateCatalogStatement, CreateDatabaseStatement, CreateSchemaStatement,
-    DeleteStatement, GetFileStatement, HashRef, InitialRow,
+    DeleteStatement, GetFileStatement, HashRef, ImportSchemaStatement, InitialRow,
     InsertStatement, KeyOwnerExpr, ListFilesStatement, LogStatement, MigrationRuleExpr, NameOrHashRef, NameRef, OperandExpr, ParamAssignment,
     PutFileStatement,
-    PredicateExpr, ReleaseSelector, SelectStatement, SetViewStatement, TableDecl, TableOption, TableRef,
+    PredicateExpr, ReleaseSelector, SchemaParamDeclExpr, SelectStatement, SetViewStatement, TableDecl, TableOption, TableRef,
     UpdateCatalogStatement, UpdateRefStatement, UpdateStatement, ValueExpr, VersionExpr, VersionMember,
 } from "./ast.js";
 import { lex } from "./lexer.js";
@@ -46,6 +46,8 @@ export type ParseOptions = {
 class Parser {
     private pos = 0;
     private readonly diagnostics = new DiagnosticBag();
+    private readonly constants = new Map<string, { value: string | number | boolean; span: TextSpan }>();
+    private readonly declaredParams = new Set<string>();
 
     constructor(
         private readonly source: string,
@@ -60,8 +62,12 @@ class Parser {
         while (!this.isEof()) {
             this.consumeSemicolons();
             if (this.isEof()) break;
-            const stmt = this.parseStatement();
-            if (stmt !== undefined) statements.push(stmt);
+            if (this.checkContextual('CONSTANT')) {
+                this.parseConstant();
+            } else {
+                const stmt = this.parseStatement();
+                if (stmt !== undefined) statements.push(stmt);
+            }
             if (!this.matchPunctuation(';') && !this.isEof()) {
                 this.diagnostics.add('PARSE_EXPECTED_TOKEN', "Expected ';' between statements", this.peek().span);
                 this.synchronizeStatement();
@@ -71,6 +77,47 @@ class Parser {
         const end = statements.length > 0 ? statements[statements.length - 1].span : start;
         const script: AstScript = { kind: 'script', statements, span: combineSpans(start, end) };
         return this.diagnostics.hasErrors() ? err(this.diagnostics.all()) : ok(script);
+    }
+
+    // `CONSTANT :name = <literal>;` (script-scoped compile-time constant).
+    private parseConstant(): void {
+        this.advance();   // CONSTANT
+        const tok = this.expectKind('param', ':constant name');
+        const name = tok.text.substring(1);
+        if (this.constants.has(name)) {
+            this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Constant ':${name}' is declared twice`, tok.span);
+        }
+        if (this.declaredParams.has(name)) {
+            this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Constant ':${name}' cannot share its name with param ':${name}'`, tok.span);
+        }
+        this.expectOperator('=');
+        const valTok = this.peek();
+        let value: string | number | boolean | undefined;
+        let valSpan = valTok.span;
+        if (valTok.kind === 'operator' && valTok.text === '-' && this.peekNext().kind === 'number') {
+            this.advance();
+            const num = this.advance();
+            value = negate(num.value as number);
+            valSpan = combineSpans(valTok.span, num.span);
+        } else if (valTok.kind === 'string' || valTok.kind === 'number') {
+            this.advance();
+            value = valTok.value as string | number;
+        } else if (valTok.kind === 'keyword' && (valTok.upper === 'TRUE' || valTok.upper === 'FALSE')) {
+            this.advance();
+            value = valTok.value as boolean;
+        } else {
+            this.diagnostics.add('PARSE_EXPECTED_TOKEN', `CONSTANT ':${name}' requires a string, number, or boolean literal`, valTok.span);
+            if (!this.checkPunctuation(';') && !this.isEof()) this.advance();
+            return;
+        }
+        if (!this.checkPunctuation(';') && !this.isEof()) {
+            this.diagnostics.add('PARSE_EXPECTED_TOKEN', `CONSTANT ':${name}' requires a string, number, or boolean literal`, this.peek().span);
+            while (!this.checkPunctuation(';') && !this.isEof()) this.advance();
+            return;
+        }
+        if (!this.constants.has(name)) {
+            this.constants.set(name, { value, span: combineSpans(tok.span, valSpan) });
+        }
     }
 
     parseStatement(): AstStatement | undefined {
@@ -136,6 +183,15 @@ class Parser {
         if (this.checkContextual('PUT')) return this.parsePutFile(this.advance().span);
         if (this.checkContextual('GET')) return this.parseGetFile(this.advance().span);
         if (this.checkContextual('LIST')) return this.parseListFiles(this.advance().span);
+        if (this.checkContextual('IMPORT')) {
+            const importSpan = this.advance().span;
+            if (!this.options.catalogVersionOptional) {
+                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', 'IMPORT SCHEMA is only allowed in source mode (target-catalog.sql)', importSpan);
+                this.synchronizeStatement();
+                return undefined;
+            }
+            return this.parseImportSchema(importSpan);
+        }
 
         this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected token '${tok.text}'`, tok.span);
         this.synchronizeStatement();
@@ -251,9 +307,51 @@ class Parser {
         this.expectPunctuation('(');
         while (!this.checkPunctuation(')') && !this.isEof()) {
             const tok = this.expectKind('param', ':param name');
+            const name = tok.text.substring(1);
+            if (this.constants.has(name)) {
+                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Param ':${name}' cannot share its name with constant ':${name}'`, tok.span);
+            }
+            this.declaredParams.add(name);
             const typeTok = this.advance();
             const type = this.columnTypeFromToken(typeTok);
-            params.push({ name: tok.text.substring(1), type, span: combineSpans(tok.span, typeTok.span) });
+            params.push({ name, type, span: combineSpans(tok.span, typeTok.span) });
+            if (!this.matchPunctuation(',')) break;
+        }
+        return { params, end: this.expectPunctuation(')').span };
+    }
+
+    // `(:name type [DEFAULT literal], ...)`
+    private parseSchemaParamDecls(): { params: SchemaParamDeclExpr[]; end: TextSpan } {
+        const params: SchemaParamDeclExpr[] = [];
+        this.expectPunctuation('(');
+        while (!this.checkPunctuation(')') && !this.isEof()) {
+            const tok = this.expectKind('param', ':param name');
+            const name = tok.text.substring(1);
+            if (this.constants.has(name)) {
+                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Param ':${name}' cannot share its name with constant ':${name}'`, tok.span);
+            }
+            this.declaredParams.add(name);
+            const typeTok = this.advance();
+            const type = this.columnTypeFromToken(typeTok);
+            let endSpan = typeTok.span;
+            let defaultValue: ValueExpr | undefined;
+            if (this.matchKeyword('DEFAULT')) {
+                if (this.checkKind('param')) {
+                    const pTok = this.peek();
+                    const c = this.constants.get(pTok.text.substring(1));
+                    if (c === undefined) {
+                        this.diagnostics.add('PARSE_EXPECTED_TOKEN', `DEFAULT for param ':${name}' must be a literal`, pTok.span);
+                    }
+                }
+                defaultValue = this.parseValue();
+                endSpan = defaultValue.span;
+            }
+            params.push({
+                name,
+                type,
+                ...(defaultValue !== undefined ? { defaultValue } : {}),
+                span: combineSpans(tok.span, endSpan),
+            });
             if (!this.matchPunctuation(',')) break;
         }
         return { params, end: this.expectPunctuation(')').span };
@@ -420,7 +518,22 @@ class Parser {
             const version = this.parseVersion();
             this.expectKeyword('ON');
             const group = this.parseNameOrHash();
-            return { kind: 'update-schema', schema, version, group, span: combineSpans(start, group.span) };
+            let end = group.span;
+            let params: ParamAssignment[] | undefined;
+            if (this.matchKeyword('WITH')) {
+                this.expectKeyword('PARAMS');
+                const parsed = this.parseParamAssignments();
+                params = parsed.params;
+                end = parsed.end;
+            }
+            return {
+                kind: 'update-schema',
+                schema,
+                version,
+                group,
+                ...(params !== undefined ? { params } : {}),
+                span: combineSpans(start, end),
+            };
         }
         this.diagnostics.add('PARSE_UNEXPECTED_TOKEN',
             `Expected ADD TABLEGROUP, ADD FILES or UPDATE SCHEMA in ALTER CATALOG, got '${this.peek().text}'`, this.peek().span);
@@ -462,23 +575,42 @@ class Parser {
         return stmt;
     }
 
+    private parseImportSchema(start: TextSpan): ImportSchemaStatement {
+        this.expectKeyword('SCHEMA');
+        const name = this.expectIdentifierText('schema name');
+        const kw = this.expectKeyword('VERSION').span;
+        const vTok = this.expectKind('string', "VERSION '<semver>'");
+        const version = vTok.value as string;
+        return {
+            kind: 'import-schema',
+            name,
+            version,
+            versionSpan: combineSpans(kw, vTok.span),
+            span: combineSpans(start, vTok.span),
+        };
+    }
+
     private parseCreateSchema(start: TextSpan): CreateSchemaStatement {
         const name = this.expectIdentifierText('schema name');
-        const creators: ValueExpr[] = [];
-        if (this.matchKeyword('CREATORS')) {
-            this.expectPunctuation('(');
-            if (!this.checkPunctuation(')')) {
-                do {
-                    creators.push(this.parseValue());
-                } while (this.matchPunctuation(','));
-            }
-            this.expectPunctuation(')');
-        }
+        let creators: ValueExpr[] = [];
         let version: string | undefined;
-        if (this.matchKeyword('VERSION')) {
-            version = this.expectKind('string', "VERSION '<semver>'").value as string;
+        let params: SchemaParamDeclExpr[] | undefined;
+        let hashAlgorithm: string | undefined;
+        while (!this.isEof() && !this.checkPunctuation(';') && !this.checkKeyword('AS')) {
+            const hashTok = this.matchHashAlgorithm();
+            if (hashTok !== undefined) {
+                hashAlgorithm = hashTok.value as string;
+            } else if (this.matchKeyword('CREATORS')) {
+                creators = this.parseCreatorList().creators;
+            } else if (this.matchKeyword('VERSION')) {
+                version = this.expectKind('string', "VERSION '<semver>'").value as string;
+            } else if (this.matchKeyword('PARAMS')) {
+                params = this.parseSchemaParamDecls().params;
+            } else {
+                this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected CREATE SCHEMA clause '${this.peek().text}'`, this.peek().span);
+                this.advance();
+            }
         }
-        const hashAlgorithm = this.matchHashAlgorithm();
         const bodyStart = this.expectKeyword('AS').span;
         this.expectPunctuation('(');
         const tables: TableDecl[] = [];
@@ -491,7 +623,8 @@ class Parser {
             kind: 'create-schema', name, creators, tables, body: combineSpans(bodyStart, close.span), span: combineSpans(start, close.span),
         };
         if (version !== undefined) stmt.version = version;
-        if (hashAlgorithm !== undefined) stmt.hashAlgorithm = hashAlgorithm.value as string;
+        if (params !== undefined) stmt.params = params;
+        if (hashAlgorithm !== undefined) stmt.hashAlgorithm = hashAlgorithm;
         return stmt;
     }
 
@@ -607,6 +740,7 @@ class Parser {
         const schema = this.parseNameOrHash();
         let schemaVersion: VersionExpr | undefined;
         const bindings: CatalogGroupExpr['bindings'] = [];
+        let params: ParamAssignment[] | undefined;
         let idProvider: string | undefined;
         let canDeploy: PredicateExpr | undefined;
         const canObserve: CatalogGroupExpr['canObserve'] = [];
@@ -623,8 +757,27 @@ class Parser {
                     const bindName = this.expectIdentifierText('binding name');
                     this.expectOperator('=>');
                     const group = this.parseNameOrHash();
-                    bindings.push({ name: bindName, group, span: combineSpans(bindStart, group.span) });
-                    end = group.span;
+                    let bindEnd = group.span;
+                    let tables: NonNullable<CatalogGroupExpr['bindings'][number]['tables']> | undefined;
+                    if (this.matchPunctuation('(')) {
+                        tables = [];
+                        while (!this.checkPunctuation(')') && !this.isEof()) {
+                            const mapStart = this.peek().span;
+                            const from = this.expectIdentifierText('schema table name');
+                            this.expectOperator('=>');
+                            const toTok = this.expectIdentifierToken('foreign table name');
+                            tables.push({ from, to: toTok.text, span: combineSpans(mapStart, toTok.span) });
+                            if (!this.matchPunctuation(',')) break;
+                        }
+                        bindEnd = this.expectPunctuation(')').span;
+                    }
+                    bindings.push({
+                        name: bindName,
+                        group,
+                        ...(tables !== undefined ? { tables } : {}),
+                        span: combineSpans(bindStart, bindEnd),
+                    });
+                    end = bindEnd;
                     if (!this.continuesBindList()) break;
                     this.advance();
                 }
@@ -655,15 +808,21 @@ class Parser {
                     this.advance();
                 }
             } else if (this.matchKeyword('WITH')) {
-                this.expectKeyword('ROWS');
-                this.expectPunctuation('(');
-                while (!this.checkPunctuation(')') && !this.isEof()) {
-                    const row = this.parseInitialRow();
-                    initialRows.push(row);
-                    end = row.span;
-                    if (!this.matchPunctuation(',')) break;
+                if (this.matchKeyword('PARAMS')) {
+                    const parsed = this.parseParamAssignments();
+                    params = [...(params ?? []), ...parsed.params];
+                    end = parsed.end;
+                } else {
+                    this.expectKeyword('ROWS');
+                    this.expectPunctuation('(');
+                    while (!this.checkPunctuation(')') && !this.isEof()) {
+                        const row = this.parseInitialRow();
+                        initialRows.push(row);
+                        end = row.span;
+                        if (!this.matchPunctuation(',')) break;
+                    }
+                    end = this.expectPunctuation(')').span;
                 }
-                end = this.expectPunctuation(')').span;
             } else {
                 this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', `Unexpected TABLEGROUP clause '${this.peek().text}'`, this.peek().span);
                 this.advance();
@@ -672,6 +831,7 @@ class Parser {
 
         const group: CatalogGroupExpr = { name, schema, bindings, canObserve, initialRows, span: combineSpans(start, end) };
         if (schemaVersion !== undefined) group.schemaVersion = schemaVersion;
+        if (params !== undefined) group.params = params;
         if (idProvider !== undefined) group.idProvider = idProvider;
         if (canDeploy !== undefined) group.canDeploy = canDeploy;
         return group;
@@ -921,17 +1081,33 @@ class Parser {
         this.expectKeyword('SCHEMA');
         const schema = this.parseNameOrHash();
         let version: string | undefined;
-        if (this.matchKeyword('VERSION')) {
-            version = this.expectKind('string', "VERSION '<semver>'").value as string;
+        let params: SchemaParamDeclExpr[] | undefined;
+        let end = schema.span;
+        while (!this.isEof() && !this.checkPunctuation(';') && !this.checkKeyword('AS')
+            && !this.checkKeyword('NOTE') && !this.checkKeyword('AT') && !this.checkKeyword('BY')) {
+            if (this.matchKeyword('VERSION')) {
+                const tok = this.expectKind('string', "VERSION '<semver>'");
+                version = tok.value as string;
+                end = tok.span;
+            } else if (this.matchKeyword('PARAMS')) {
+                const parsed = this.parseSchemaParamDecls();
+                params = parsed.params;
+                end = parsed.end;
+            } else {
+                break;
+            }
         }
-        this.expectKeyword('AS');
-        this.expectPunctuation('(');
         const rules: MigrationRuleExpr[] = [];
-        while (!this.checkPunctuation(')') && !this.isEof()) {
-            rules.push(this.parseMigrationRule());
-            if (!this.matchPunctuation(',')) break;
+        if (this.matchKeyword('AS')) {
+            this.expectPunctuation('(');
+            while (!this.checkPunctuation(')') && !this.isEof()) {
+                rules.push(this.parseMigrationRule());
+                if (!this.matchPunctuation(',')) break;
+            }
+            end = this.expectPunctuation(')').span;
+        } else if (params === undefined) {
+            this.expectKeyword('AS');
         }
-        let end = this.expectPunctuation(')').span;
         let note: string | undefined;
         let at: VersionExpr | undefined;
         let author: AuthorExpr | undefined;
@@ -953,6 +1129,7 @@ class Parser {
         }
         const stmt: AlterSchemaStatement = { kind: 'alter-schema', schema, rules, span: combineSpans(start, end) };
         if (version !== undefined) stmt.version = version;
+        if (params !== undefined) stmt.params = params;
         if (note !== undefined) stmt.note = note;
         if (author !== undefined) stmt.author = author;
         if (at !== undefined) stmt.at = at;
@@ -1563,7 +1740,12 @@ class Parser {
         }
         if (this.checkKind('param')) {
             const paramTok = this.advance();
-            return { kind: 'param', name: paramTok.text.substring(1), span: paramTok.span };
+            const name = paramTok.text.substring(1);
+            const constant = this.constants.get(name);
+            if (constant !== undefined) {
+                return { kind: 'literal', value: constant.value, constant: name, span: paramTok.span };
+            }
+            return { kind: 'param', name, span: paramTok.span };
         }
         if (this.checkPunctuation('[') || this.checkPunctuation('{')) {
             return this.parseJsonValue();

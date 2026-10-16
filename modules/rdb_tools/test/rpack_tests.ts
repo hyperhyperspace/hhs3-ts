@@ -216,4 +216,121 @@ export const rpackTests = [
             }
         },
     },
+    {
+        name: '[RDB_TOOLS67] rpack init --schema, publish, import, and rhost init --catalog / update --pull via registry',
+        invoke: async () => {
+            const dir = await fs.mkdtemp(join(tmpdir(), 'rpack-comp-'));
+            try {
+                const keystore = join(dir, 'user-keys.json');
+                const keys = await KeyStore.open(keystore, hashSuite);
+                await keys.create('dev', 'pw');
+                await keys.create('me', 'pw');
+
+                const registry = join(dir, 'registry');
+                const schemaRepo = join(dir, 'comments');
+                const catRepo = join(dir, 'blog');
+                await fs.mkdir(schemaRepo);
+                await fs.mkdir(catRepo);
+
+                const rpackSchema = (args: string[], at = schemaRepo) => runBin('rpack', ['-C', at, '--keystore', keystore, ...args]);
+                const rpackCat = (args: string[], input?: string, at = catRepo) => runBin('rpack', ['-C', at, '--keystore', keystore, ...args], input);
+
+                // 1. Schema repo: init --schema, new 1.0.0, stage refusal, release, publish
+                ok(await rpackSchema(['init', '--schema', 'hhs:comments']), 'rpack init --schema');
+                ok(await rpackSchema(['new', '1.0.0']), 'rpack new 1.0.0 in schema repo');
+                const stageRefusal = await rpackSchema(['stage'], join(schemaRepo, 'work', '1.0.0'));
+                assertEquals(stageRefusal.code, 1, 'rpack stage in schema repo fails');
+                assertTrue(stageRefusal.stderr.includes('a schema pack has no catalog'), `stage refusal message (${stageRefusal.stderr})`);
+
+                const comments100 = `CREATE SCHEMA hhs:comments PARAMS (:maxLen integer DEFAULT 200) AS (
+  TABLE comments (
+    targetId string READONLY REFERENCES target.items,
+    body string PUB,
+    len integer READONLY
+  ) ALLOW insert IF comments.len <= :maxLen
+);
+`;
+                await fs.writeFile(join(schemaRepo, 'work', '1.0.0', 'target-schema.sql'), comments100);
+                ok(await rpackSchema(['release'], join(schemaRepo, 'work', '1.0.0')), 'keyless release of schema 1.0.0');
+                ok(await rpackSchema(['publish', '--registry', registry]), 'publish schema 1.0.0');
+
+                // 2. Catalog repo: init, new 1.0.0, import hhs:comments, release, publish
+                ok(await rpackCat(['init', 'blog', '--key', 'dev']), 'rpack init blog');
+                ok(await rpackCat(['new', '1.0.0']), 'rpack new 1.0.0 in blog');
+                ok(await rpackCat(['import', 'hhs:comments', '--registry', registry], undefined, join(catRepo, 'work', '1.0.0')),
+                    'rpack import hhs:comments');
+
+                const blog100 = `IMPORT SCHEMA hhs:comments VERSION '1.0.0';
+
+CREATE SCHEMA blog:user CREATORS ($dev) AS (
+  TABLE identities (
+    keyId string PUB READONLY,
+    publicKey string PUB READONLY,
+    name string NULL PUB
+  ) IDENTITY PROVIDER
+);
+
+CREATE SCHEMA blog:posts CREATORS ($dev) AS (
+  TABLE articles (
+    title string PUB
+  )
+);
+
+CREATE CATALOG blog CREATORS ($dev) PARAMS (:admin identity) AS (
+  TABLEGROUP user USING SCHEMA blog:user
+    USING IDENTITIES identities
+    WITH ROWS (
+      identities (keyId = :admin, publicKey = publicKey(:admin), name = 'Admin')
+    ),
+  TABLEGROUP posts USING SCHEMA blog:posts
+    BIND user => user
+    USING IDENTITIES user.identities,
+  TABLEGROUP post_comments USING SCHEMA hhs:comments
+    BIND user => user, target => posts (items => articles)
+    USING IDENTITIES user.identities
+    WITH PARAMS (:maxLen = 500)
+);
+`;
+                await fs.writeFile(join(catRepo, 'work', '1.0.0', 'target-catalog.sql'), blog100);
+                ok(await rpackCat(['release', '--passphrase-stdin'], 'pw\n', join(catRepo, 'work', '1.0.0')), 'release blog 1.0.0');
+                ok(await rpackCat(['publish', '--registry', registry]), 'publish blog 1.0.0');
+
+                // 3. rhost init --catalog blog --registry <registry>, then rhost create
+                const app = join(dir, 'app');
+                const rhost = (...args: string[]) => runBin('rhost', ['--app', app, ...args]);
+                ok(await rhost('init', '--catalog', 'blog', '--registry', registry, '--param', 'admin=$me'), 'rhost init --catalog blog');
+                const appCfg = JSON.parse(await fs.readFile(join(app, 'app.json'), 'utf8'));
+                await fs.writeFile(join(app, 'app.json'), JSON.stringify({ ...appCfg, keystore: '../user-keys.json' }, undefined, 2) + '\n');
+
+                process.env['RPACK_TEST_PASS'] = 'pw';
+                try {
+                    ok(await rhost('create', '--key', 'me', '--mesh', '{"scope":"localhost"}', '--passphrase-env', 'RPACK_TEST_PASS'),
+                        'rhost create at 1.0.0');
+                    assertTrue((await rhost('status')).stdout.includes('deployed  1.0.0'), 'host deployed 1.0.0');
+
+                    // 4. Release & publish hhs:comments 1.1.0 and blog 1.1.0, then rhost update --pull
+                    ok(await rpackSchema(['new', '1.1.0']), 'new schema 1.1.0');
+                    await fs.writeFile(join(schemaRepo, 'work', '1.1.0', 'target-schema.sql'),
+                        comments100.replace('len integer READONLY\n', 'len integer READONLY,\n    pinned boolean NULL\n'));
+                    ok(await rpackSchema(['release'], join(schemaRepo, 'work', '1.1.0')), 'release schema 1.1.0');
+                    ok(await rpackSchema(['publish', '--registry', registry]), 'publish schema 1.1.0');
+
+                    ok(await rpackCat(['new', '1.1.0']), 'new blog 1.1.0');
+                    ok(await rpackCat(['import', 'hhs:comments', '--registry', registry], undefined, join(catRepo, 'work', '1.1.0')),
+                        'import hhs:comments 1.1.0');
+                    ok(await rpackCat(['release', '--passphrase-stdin'], 'pw\n', join(catRepo, 'work', '1.1.0')), 'release blog 1.1.0');
+                    ok(await rpackCat(['publish', '--registry', registry]), 'publish blog 1.1.0');
+
+                    const upd = await rhost('update', '--pull', '--registry', registry);
+                    ok(upd, 'rhost update --pull');
+                    assertTrue(upd.stdout.includes('pulled blog 1.1.0') && upd.stdout.includes('deployed 1.1.0'),
+                        `rhost update --pull pulled and deployed 1.1.0 (${upd.stdout})`);
+                } finally {
+                    delete process.env['RPACK_TEST_PASS'];
+                }
+            } finally {
+                await fs.rm(dir, { recursive: true, force: true });
+            }
+        },
+    },
 ];

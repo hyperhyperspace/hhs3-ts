@@ -81,7 +81,8 @@ import type { RSchema, RSchemaView } from "../rschema/interfaces.js";
 import type { IncarnationId } from "../rschema/incarnation.js";
 import type { Predicate, SchemaCreator } from "../rschema/payload.js";
 import { splitTableRef } from "../rschema/payload.js";
-import { predicateReferencesAuthor } from "../rschema/validate.js";
+import { columnValueMatchesType, predicateReferencesAuthor } from "../rschema/validate.js";
+import { compareSemver } from "../semver.js";
 import { computeMirrorHashes, deployGateId } from "../rdeploy_gate/mirror.js";
 import { RTableImpl } from "../rtable/rtable.js";
 import { deriveTableId } from "../rtable/hash.js";
@@ -90,7 +91,7 @@ import type { RTableView } from "../rtable/interfaces.js";
 import { RTableViewImpl } from "../rtable/view.js";
 
 import type { RTableGroup as RTableGroupContract, RTableGroupView as RTableGroupViewContract, BundleWrite } from "./interfaces.js";
-import { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload, RTABLE_GROUP_TYPE_ID, deployGateSetFormat } from "./payload.js";
+import { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload, RTABLE_GROUP_TYPE_ID, deployGateSetFormat, type GroupParams, type TableMaps } from "./payload.js";
 import { TableScope, deriveCreateMeta, deriveEnvelopeMeta, deriveBundleMeta, deriveDeployKillMeta } from "./scopes.js";
 import type { DeployKills } from "./scopes.js";
 import { freshVerdictEvaluation, VERDICT_MAX_INFLIGHT } from "./verdict_evaluation.js";
@@ -158,7 +159,7 @@ export const rTableGroupFactory: RObjectFactory = {
             objectId: create.schemaRef,
             requiredHashes: [...json.fromSet(create.schemaVersion)],
         }];
-        for (const target of Object.values(create.bindings ?? {})) {
+        for (const target of new Set(Object.values(create.bindings ?? {}))) {
             deps.push({ objectId: target, requiredHashes: [] });
         }
         return deps;
@@ -174,6 +175,8 @@ export class RTableGroupImpl implements RTableGroupContract {
         schemaVersion: Version;
         initialRows?: { [table: string]: json.Literal[] };
         bindings?: { [name: string]: B64Hash };
+        tableMaps?: TableMaps;
+        params?: GroupParams;
         canDeploy?: Predicate;
         canObserve?: { [binding: string]: Predicate };
         idProvider?: string;
@@ -192,6 +195,8 @@ export class RTableGroupImpl implements RTableGroupContract {
 
         if (options.initialRows !== undefined) createPayload.initialRows = options.initialRows;
         if (options.bindings !== undefined) createPayload.bindings = options.bindings;
+        if (options.tableMaps !== undefined && Object.keys(options.tableMaps).length > 0) createPayload.tableMaps = options.tableMaps;
+        if (options.params !== undefined && Object.keys(options.params).length > 0) createPayload.params = options.params;
         if (options.canDeploy !== undefined) createPayload.canDeploy = options.canDeploy;
         if (options.canObserve !== undefined) createPayload.canObserve = options.canObserve;
         if (options.idProvider !== undefined) createPayload.idProvider = options.idProvider;
@@ -255,10 +260,8 @@ export class RTableGroupImpl implements RTableGroupContract {
     // under concurrency and never affects a verdict.
     private _verdictInflight = 0;
 
-    // Memoized inverse of the (injective) bindings map: group id -> binding
-    // name. Injectivity is enforced at create-validation, so the inverse is a
-    // well-defined function; built lazily on first use.
-    private _bindingNameById: Map<B64Hash, string> | undefined;
+    // Memoized inverse of the bindings map: group id -> sorted binding aliases.
+    private _aliasesById: Map<B64Hash, string[]> | undefined;
 
     private deltaStrategy: RTableGroupDeltaStrategy = 'bounded';
 
@@ -295,6 +298,22 @@ export class RTableGroupImpl implements RTableGroupContract {
         return { ...(this.createOp.bindings ?? {}) };
     }
 
+    getTableMaps(): TableMaps {
+        const out: TableMaps = {};
+        for (const [alias, map] of Object.entries(this.createOp.tableMaps ?? {})) {
+            out[alias] = { ...map };
+        }
+        return out;
+    }
+
+    resolveForeignTableName(alias: string, schemaTable: string): string {
+        return this.createOp.tableMaps?.[alias]?.[schemaTable] ?? schemaTable;
+    }
+
+    getParams(): GroupParams {
+        return { ...(this.createOp.params ?? {}) };
+    }
+
     getCanDeploy(): Predicate | undefined {
         return this.createOp.canDeploy;
     }
@@ -303,24 +322,39 @@ export class RTableGroupImpl implements RTableGroupContract {
         return this.createOp.canObserve;
     }
 
-    // The binding name a bound group id resolves to, via the injective inverse
-    // of getBindings() (undefined if the id is not a bound group).
-    bindingNameForId(refId: B64Hash): string | undefined {
-        if (this._bindingNameById === undefined) {
-            this._bindingNameById = new Map();
-            for (const [name, id] of Object.entries(this.getBindings())) {
-                this._bindingNameById.set(id, name);
+    // Every binding alias a bound group id resolves to, in sorted alias order.
+    aliasesForId(refId: B64Hash): string[] {
+        if (this._aliasesById === undefined) {
+            this._aliasesById = new Map();
+            for (const [name, id] of Object.entries(this.getBindings()).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+                const list = this._aliasesById.get(id);
+                if (list !== undefined) list.push(name);
+                else this._aliasesById.set(id, [name]);
             }
         }
-        return this._bindingNameById.get(refId);
+        return this._aliasesById.get(refId) ?? [];
     }
 
-    // The canObserve gate for an observation of `refId` (a bound group id), or
-    // undefined when the binding is ungated (observation needs no authority).
+    // The binding label for a bound group id (`alias` or `alias1/alias2`), or
+    // undefined if the id is not a bound group.
+    bindingNameForId(refId: B64Hash): string | undefined {
+        const aliases = this.aliasesForId(refId);
+        return aliases.length > 0 ? aliases.join('/') : undefined;
+    }
+
+    // The combined canObserve gate for an observation of `refId` (a bound group
+    // id): the conjunction (`and`) of the gates declared for all aliases bound
+    // to `refId`, or undefined when none declare a gate.
     observeGateFor(refId: B64Hash): Predicate | undefined {
-        const name = this.bindingNameForId(refId);
-        if (name === undefined) return undefined;
-        return this.getCanObserve()?.[name];
+        const canObserve = this.getCanObserve();
+        if (canObserve === undefined) return undefined;
+        const gates: Predicate[] = [];
+        for (const alias of this.aliasesForId(refId)) {
+            const gate = canObserve[alias];
+            if (gate !== undefined) gates.push(gate);
+        }
+        if (gates.length === 0) return undefined;
+        return gates.length === 1 ? gates[0] : { p: 'and', args: gates };
     }
 
     getIdProvider(): string | undefined {
@@ -385,6 +419,113 @@ export class RTableGroupImpl implements RTableGroupContract {
         return schema.getView(resolved, resolved);
     }
 
+    // Per-parameter fold over create.params and param-tagged schema deploys at
+    // (at, from). Among concurrent writes to one parameter, rank by:
+    //   1. highest schema semver among the write's target RSchema entries;
+    //   2. the write's target RSchema entry hashes (sorted comma-joined key);
+    //   3. the deploy entry hash.
+    async resolveGroupParams(at?: Version, from?: Version): Promise<GroupParams> {
+        const scopedDag = await this.getScopedDag();
+        const resolvedAt = at ?? await scopedDag.getFrontier();
+        const resolvedFrom = from ?? resolvedAt;
+
+        const schemaView = await this.resolveSchemaView(resolvedAt, resolvedFrom);
+        const paramNames = new Set<string>([
+            ...schemaView.getParams().map((d) => d.name),
+            ...Object.keys(this.createOp.params ?? {}),
+        ]);
+        if (paramNames.size === 0) return {};
+
+        const schema = await this.getSchemaObject();
+        const schemaRef = this.getSchemaRef();
+        const sameHorizon = resolvedAt.size === resolvedFrom.size && [...resolvedAt].every((h) => resolvedFrom.has(h));
+        const out: GroupParams = {};
+
+        for (const p of [...paramNames].sort()) {
+            const causal = await scopedDag.findCoverWithFilter(
+                resolvedAt,
+                { containsValues: { ref: [schemaRef], param: [p] } },
+            );
+            const concurrent = sameHorizon
+                ? position()
+                : await scopedDag.findConcurrentCoverWithFilter(
+                    resolvedFrom,
+                    resolvedAt,
+                    { containsValues: { ref: [schemaRef], barrier: ['t'], param: [p] } },
+                );
+            const combined = [...new Set([...causal, ...concurrent])];
+            if (combined.length === 0) {
+                const initVal = this.createOp.params?.[p];
+                if (initVal !== undefined) out[p] = initVal;
+                continue;
+            }
+            const maxima = combined.length === 1
+                ? combined
+                : [...await scopedDag.findMinimalCover(position(...combined))];
+
+            let bestValue: json.Literal | undefined;
+            let bestSemver = '0.0.0';
+            let bestTargetKey = '';
+            let bestHash = '';
+
+            for (const h of maxima) {
+                const entry = await scopedDag.loadEntry(h);
+                if (entry === undefined) continue;
+                const payload = entry.payload as json.LiteralMap;
+                const paramsMap = payload['params'] as GroupParams | undefined;
+                const val = paramsMap?.[p];
+                if (val === undefined) continue;
+                const targetHashes = [...extractRefVersion(entry.payload as unknown as RefAdvancePayload)].sort();
+                const targetKey = targetHashes.join(',');
+                const targetView = await schema.getView(version(...this.getPinnedSchemaVersion(), ...targetHashes));
+                const semver = targetView.getVersions()[0] ?? '0.0.0';
+
+                if (bestValue === undefined) {
+                    bestValue = val;
+                    bestSemver = semver;
+                    bestTargetKey = targetKey;
+                    bestHash = h;
+                    continue;
+                }
+                const bySemver = compareSemver(semver, bestSemver);
+                if (bySemver > 0
+                    || (bySemver === 0 && targetKey > bestTargetKey)
+                    || (bySemver === 0 && targetKey === bestTargetKey && h > bestHash)) {
+                    bestValue = val;
+                    bestSemver = semver;
+                    bestTargetKey = targetKey;
+                    bestHash = h;
+                }
+            }
+
+            if (bestValue !== undefined) {
+                out[p] = bestValue;
+            } else if (this.createOp.params?.[p] !== undefined) {
+                out[p] = this.createOp.params[p];
+            }
+        }
+        return out;
+    }
+
+    // Effective parameter values at (at, from) for predicate evaluation: the
+    // group's resolved write, else the schema's default, filtered to values
+    // matching the winning parameter type in the effective schema.
+    async resolveEffectiveParams(at: Version, from?: Version): Promise<GroupParams> {
+        const schemaView = await this.resolveSchemaView(at, from);
+        const decls = schemaView.getParams();
+        if (decls.length === 0) return {};
+        const written = await this.resolveGroupParams(at, from);
+        const out: GroupParams = {};
+        for (const decl of decls) {
+            const val = written[decl.name] ?? decl.default;
+            if (val === undefined) continue;
+            if (!columnValueMatchesType(val, decl.type)) continue;
+            if (typeof val === 'string' && val.startsWith('$')) continue;
+            out[decl.name] = val;
+        }
+        return out;
+    }
+
     // Member access
 
     // Construct (and cache) the nested RTable without an existence check:
@@ -428,6 +569,25 @@ export class RTableGroupImpl implements RTableGroupContract {
         groupName: string, table: string, at: Version, from: Version,
     ): Promise<RTableView | undefined> {
         return this.resolveForeignTableViewIn(freshVerdictEvaluation(), groupName, table, at, from, false);
+    }
+
+    // Schema-originated cross-group table resolution: translates `schemaTable`
+    // through `tableMaps[groupName]` before delegating to the real-name
+    // resolver. Used for schema FKs and schema ALLOW rules; catalog-authored
+    // references (`canDeploy`, `idProvider`, `canObserve`) call
+    // `resolveForeignTableView` directly.
+    async resolveSchemaForeignTableView(
+        groupName: string, schemaTable: string, at: Version, from: Version,
+    ): Promise<RTableView | undefined> {
+        return this.resolveSchemaForeignTableViewIn(freshVerdictEvaluation(), groupName, schemaTable, at, from, false);
+    }
+
+    async resolveSchemaForeignTableViewIn(
+        evaluation: VerdictEvaluation<OpVoidDetail>, groupName: string, schemaTable: string, at: Version, from: Version, filterVoided: boolean,
+    ): Promise<RTableViewImpl | undefined> {
+        return this.resolveForeignTableViewIn(
+            evaluation, groupName, this.resolveForeignTableName(groupName, schemaTable), at, from, filterVoided,
+        );
     }
 
     // Cross-group table resolution threaded with the caller's void evaluation.
@@ -629,8 +789,8 @@ export class RTableGroupImpl implements RTableGroupContract {
     // deploy signature is verified at validation (the group's own provider,
     // then its deployKeys) and the group's canDeploy predicate is evaluated
     // against the verified author.
-    async deploy(refVersion: Version, author?: OwnIdentity, at?: Version): Promise<B64Hash> {
-        const prepared = await this.prepareDeploy(refVersion, author, at);
+    async deploy(refVersion: Version, author?: OwnIdentity, at?: Version, params?: GroupParams): Promise<B64Hash> {
+        const prepared = await this.prepareDeploy(refVersion, author, at, params);
 
         if (this.selfValidate()) {
             const result = await this.validatePayload(prepared.payload, prepared.at);
@@ -657,7 +817,9 @@ export class RTableGroupImpl implements RTableGroupContract {
     // author is given, without appending it: the catalog planner validates it
     // in a dry run first. The meta carries the ref-advance tags only; deploy()
     // derives the full meta when it appends (deriveDeployMeta).
-    async prepareDeploy(refVersion: Version, author?: OwnIdentity, at?: Version): Promise<{ payload: json.LiteralMap; meta: MetaProps; at: Version }> {
+    async prepareDeploy(
+        refVersion: Version, author?: OwnIdentity, at?: Version, params?: GroupParams,
+    ): Promise<{ payload: json.LiteralMap; meta: MetaProps; at: Version }> {
         const scopedDag = await this.getScopedDag();
         at = at ?? await scopedDag.getFrontier();
 
@@ -666,9 +828,12 @@ export class RTableGroupImpl implements RTableGroupContract {
         }
 
         const { payload: refAdvance, meta } = prepareRefAdvance(this.getSchemaRef(), refVersion);
+        const paramKeys = params !== undefined ? Object.keys(params).sort() : [];
+        if (paramKeys.length > 0) meta.param = json.toSet(paramKeys);
         const base: json.LiteralMap = {
             ...(refAdvance as unknown as json.LiteralMap),
             gate: json.toSet(await this.computeGateHashes(refVersion)),
+            ...(paramKeys.length > 0 ? { params } : {}),
         };
         const payload = author !== undefined
             ? await signPayloadHelper(base, author, at)
@@ -685,7 +850,15 @@ export class RTableGroupImpl implements RTableGroupContract {
     // rewritten, so this derivation is protocol: changing it, or the liveness
     // rules it reads at `at`, needs a store migration that re-applies entries.
     async deriveDeployMeta(payload: RefAdvancePayload, at: Version): Promise<MetaProps> {
-        return { ...createRefAdvanceMeta(payload.refId), ...deriveDeployKillMeta(await this.fkAdoptionKills(payload, at)) };
+        const p = payload as unknown as json.LiteralMap;
+        const paramKeys = p['params'] !== undefined && typeof p['params'] === 'object' && p['params'] !== null && !Array.isArray(p['params'])
+            ? Object.keys(p['params']).sort()
+            : [];
+        return {
+            ...createRefAdvanceMeta(payload.refId),
+            ...(paramKeys.length > 0 ? { param: json.toSet(paramKeys) } : {}),
+            ...deriveDeployKillMeta(await this.fkAdoptionKills(payload, at)),
+        };
     }
 
     // The rows a schema deploy at `at` deletes. An FK is adopted when the
@@ -772,7 +945,7 @@ export class RTableGroupImpl implements RTableGroupContract {
     private async adoptedTargetLive(targetRef: string, rowId: B64Hash, at: Version, kept: (table: string) => boolean): Promise<boolean> {
         const [groupName, table] = splitTableRef(targetRef);
         if (groupName !== undefined) {
-            const view = await this.resolveForeignTableView(groupName, table, at, at);
+            const view = await this.resolveSchemaForeignTableView(groupName, table, at, at);
             return view !== undefined && await view.hasRow(rowId);
         }
         return kept(table) && await (await this.makeTable(table).getView(at, at)).hasRow(rowId);
@@ -957,9 +1130,10 @@ export class RTableGroupImpl implements RTableGroupContract {
 
         const opPos = version(entryHash);
         const schemaView = await this.resolveSchemaView(opPos, from);
+        const effectiveParams = await this.resolveEffectiveParams(opPos, from);
         const getTableView = async (table: string) => new RTableViewImpl(this.makeTable(table), opPos, from, evaluation, entryHash);
         const getForeignTableView = (group: string, table: string) =>
-            this.resolveForeignTableViewIn(evaluation, group, table, opPos, from, true);
+            this.resolveSchemaForeignTableViewIn(evaluation, group, table, opPos, from, true);
 
         const selfInserted = new Map<string, Set<B64Hash>>();
         const selfDeleted = new Map<string, Set<B64Hash>>();
@@ -979,7 +1153,7 @@ export class RTableGroupImpl implements RTableGroupContract {
         const undecided: Truth[] = [];
         for (const [index, { table, op }] of ops.entries()) {
             const restriction = await explainRowOpRestriction(
-                op, table, schemaView, authenticated, getTableView, getForeignTableView,
+                op, table, schemaView, authenticated, getTableView, getForeignTableView, effectiveParams,
             );
             if (restriction.failure !== undefined) {
                 // row-not-live is an explain alias for restriction failure when
@@ -1115,7 +1289,7 @@ export class RTableGroupImpl implements RTableGroupContract {
     // their GLB taken; see combineObserverRevisionBounds).
     async getObservedObjects(): Promise<RObject[]> {
         const objects: RObject[] = [await this.getSchemaObject()];
-        for (const groupId of Object.values(this.getBindings())) {
+        for (const groupId of new Set(Object.values(this.getBindings()))) {
             objects.push(await this.loadForeignGroup(groupId));
         }
         return objects;
@@ -1168,7 +1342,7 @@ export class RTableGroupImpl implements RTableGroupContract {
         // op type that reads cross-object state MUST preserve this: pin the hashes
         // it reads, or be causally after an op that did.
         const deps: ForeignDep[] = [{ objectId: this.getSchemaRef(), requiredHashes: [] }];
-        for (const target of Object.values(this.getBindings())) {
+        for (const target of new Set(Object.values(this.getBindings()))) {
             deps.push({ objectId: target, requiredHashes: [] });
         }
         return deps;

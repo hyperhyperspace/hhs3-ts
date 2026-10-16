@@ -17,13 +17,15 @@
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 
-import type { ColumnType, CmpOp, Operand } from "./payload.js";
+import type { ColumnType, CmpOp, Operand, RuleOperand } from "./payload.js";
 import { compareNumericStr, isCanonicalBigint, parseDecimal, bigintArith, decimalArith } from "./canonical.js";
 
 // Evaluate an operand to a concrete literal, or undefined when it cannot be
-// resolved (missing column, non-string len arg, or type-incoherent / unsafe
-// arithmetic). undefined collapses the enclosing atom to false. `lookup`
-// resolves a `{col}` operand to the row's value for that column.
+// resolved (missing column, missing param, non-string len arg, or
+// type-incoherent / unsafe arithmetic). undefined collapses the enclosing atom
+// to false. `lookup` resolves a `{col}` operand to the row's value for that
+// column; `paramLookup` resolves a `{param}` operand to the group's effective
+// value for that schema parameter.
 //
 // Arithmetic (add/sub/mul) is defined on:
 //   - integer operands (JS numbers): exact within the safe-integer range;
@@ -32,17 +34,22 @@ import { compareNumericStr, isCanonicalBigint, parseDecimal, bigintArith, decima
 //     scale read from the operand strings (add/sub align to the larger scale,
 //     mul sums scales).
 // Mixed or non-numeric operands resolve to undefined.
-export function evalOperand(op: Operand, lookup: (column: string) => json.Literal | undefined): json.Literal | undefined {
+export function evalOperand(
+    op: RuleOperand,
+    lookup: (column: string) => json.Literal | undefined,
+    paramLookup?: (param: string) => json.Literal | undefined,
+): json.Literal | undefined {
     if ('lit' in op) return op.lit;
     if ('col' in op) return lookup(op.col);
+    if ('param' in op) return paramLookup?.(op.param);
 
     if (op.fn === 'len') {
-        const v = evalOperand(op.args[0], lookup);
+        const v = evalOperand(op.args[0], lookup, paramLookup);
         return typeof v === 'string' ? v.length : undefined;
     }
 
-    const a = evalOperand(op.args[0], lookup);
-    const b = evalOperand(op.args[1], lookup);
+    const a = evalOperand(op.args[0], lookup, paramLookup);
+    const b = evalOperand(op.args[1], lookup, paramLookup);
     if (a === undefined || b === undefined) return undefined;
 
     if (typeof a === 'number' && typeof b === 'number') {
@@ -96,7 +103,12 @@ export function compareOperands(cmp: CmpOp, l: json.Literal, r: json.Literal, ty
 // literal (which could stand for any string-carried type) toward the expected
 // type of its sibling operand. Arithmetic (add/sub/mul) preserves the shared
 // numeric family (integer / bigint / decimal); len yields an integer.
-export function operandType(op: Operand, typeOf: (column: string) => ColumnType | undefined, hint?: ColumnType): ColumnType | undefined {
+export function operandType(
+    op: RuleOperand,
+    typeOf: (column: string) => ColumnType | undefined,
+    hint?: ColumnType,
+    paramTypeOf?: (param: string) => ColumnType | undefined,
+): ColumnType | undefined {
     if ('lit' in op) {
         const v = op.lit;
         if (typeof v === 'string') {
@@ -109,16 +121,19 @@ export function operandType(op: Operand, typeOf: (column: string) => ColumnType 
     if ('col' in op) {
         return typeOf(op.col);
     }
+    if ('param' in op) {
+        return paramTypeOf?.(op.param);
+    }
     if (op.fn === 'len') {
-        return operandType(op.args[0], typeOf, 'string') === 'string' ? 'integer' : undefined;
+        return operandType(op.args[0], typeOf, 'string', paramTypeOf) === 'string' ? 'integer' : undefined;
     }
     // add / sub / mul: both args must resolve to the same numeric family. A
     // 'string' hint is uninformative here (arithmetic never yields a string),
     // so bare string literals are disambiguated by the sibling argument.
     const h = hint === 'string' ? undefined : hint;
-    const b0 = operandType(op.args[1], typeOf, h);
-    const a = operandType(op.args[0], typeOf, h ?? b0);
-    const b = operandType(op.args[1], typeOf, h ?? a);
+    const b0 = operandType(op.args[1], typeOf, h, paramTypeOf);
+    const a = operandType(op.args[0], typeOf, h ?? b0, paramTypeOf);
+    const b = operandType(op.args[1], typeOf, h ?? a, paramTypeOf);
     const at = a ?? b;
     const bt = b ?? a;
     if (at === undefined || at !== bt) return undefined;
@@ -127,10 +142,15 @@ export function operandType(op: Operand, typeOf: (column: string) => ColumnType 
 
 // Resolve the common type of a cmp atom's two operands, disambiguating string
 // literals against the concrete side, or undefined if incoherent.
-export function resolveCmpType(left: Operand, right: Operand, typeOf: (column: string) => ColumnType | undefined): ColumnType | undefined {
-    const rt0 = operandType(right, typeOf);
-    const lt = operandType(left, typeOf, rt0);
-    const rt = operandType(right, typeOf, lt);
+export function resolveCmpType(
+    left: RuleOperand,
+    right: RuleOperand,
+    typeOf: (column: string) => ColumnType | undefined,
+    paramTypeOf?: (param: string) => ColumnType | undefined,
+): ColumnType | undefined {
+    const rt0 = operandType(right, typeOf, undefined, paramTypeOf);
+    const lt = operandType(left, typeOf, rt0, paramTypeOf);
+    const rt = operandType(right, typeOf, lt, paramTypeOf);
     if (lt === undefined || rt === undefined || lt !== rt) return undefined;
     return lt;
 }
@@ -138,23 +158,34 @@ export function resolveCmpType(left: Operand, right: Operand, typeOf: (column: s
 // Type coherence of a cmp atom's two operands: a common type that supports the
 // operator (eq/ne over any scalar including identity; identity also equals
 // string, for key-hash columns). Ordering excludes boolean, bytes, and identity.
-export function cmpTypesOk(cmp: CmpOp, left: Operand, right: Operand, typeOf: (column: string) => ColumnType | undefined): boolean {
-    const t = resolveCmpType(left, right, typeOf);
+export function cmpTypesOk(
+    cmp: CmpOp,
+    left: RuleOperand,
+    right: RuleOperand,
+    typeOf: (column: string) => ColumnType | undefined,
+    paramTypeOf?: (param: string) => ColumnType | undefined,
+): boolean {
+    const t = resolveCmpType(left, right, typeOf, paramTypeOf);
     if (cmp === 'eq' || cmp === 'ne') {
         if (t !== undefined) {
             return ['integer', 'float', 'string', 'boolean', 'bigint', 'decimal', 'bytes', 'identity'].includes(t);
         }
-        const lt = operandType(left, typeOf);
-        const rt = operandType(right, typeOf);
+        const lt = operandType(left, typeOf, undefined, paramTypeOf);
+        const rt = operandType(right, typeOf, undefined, paramTypeOf);
         return (lt === 'identity' && rt === 'string') || (lt === 'string' && rt === 'identity');
     }
     return t !== undefined && ['integer', 'float', 'string', 'bigint', 'decimal'].includes(t);
 }
 
 // Type coherence of a like atom: value and pattern both resolve to strings.
-export function likeTypesOk(value: Operand, pattern: Operand, typeOf: (column: string) => ColumnType | undefined): boolean {
-    return operandType(value, typeOf, 'string') === 'string'
-        && operandType(pattern, typeOf, 'string') === 'string';
+export function likeTypesOk(
+    value: RuleOperand,
+    pattern: RuleOperand,
+    typeOf: (column: string) => ColumnType | undefined,
+    paramTypeOf?: (param: string) => ColumnType | undefined,
+): boolean {
+    return operandType(value, typeOf, 'string', paramTypeOf) === 'string'
+        && operandType(pattern, typeOf, 'string', paramTypeOf) === 'string';
 }
 
 // LIKE patterns: `%` matches any run of code points (including none), `_`

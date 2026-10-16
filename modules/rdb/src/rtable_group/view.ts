@@ -49,7 +49,7 @@ export class RTableGroupViewImpl implements RTableGroupView {
     // The RDeployGate is deliberately not a reference: it is replica-local, so
     // anything it contributed to a view would differ between replicas.
     async getReferences(): Promise<B64Hash[]> {
-        return [this.target.getSchemaRef(), ...Object.values(this.target.getBindings())];
+        return [this.target.getSchemaRef(), ...new Set(Object.values(this.target.getBindings()))];
     }
 
     async resolveRefVersion(refId: B64Hash): Promise<Version> {

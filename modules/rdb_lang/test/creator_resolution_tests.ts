@@ -184,5 +184,25 @@ export const creatorResolutionTests = {
                 assertTrue(!bad.ok && bad.diagnostics[0].message.includes('not a valid public key'), 'an invalid key is a bind error');
             },
         },
+        {
+            name: '[CREATORS09] CREATE SCHEMA without CREATORS defaults to the selected author, and fails without one',
+            invoke: async () => {
+                const ctx = createMockRContext();
+                const dev = await createIdentity(SIGNING_ED25519, hashSuite);
+                const lang = createTestBindContext(ctx, { dev, me: dev });
+                const bound = await bindCreateSchema(`CREATE SCHEMA s AS (${schemaBody});`, lang);
+                const plan = await compileCreate(bound);
+                if (plan.kind !== 'create-schema') throw new Error('expected create-schema');
+                assertEquals(plan.payload.creators.length, 1, 'one default creator');
+                assertEquals(plan.payload.creators[0].keyId, dev.keyId, 'creator defaults to the current author');
+
+                const noAuthorLang = createTestBindContext(ctx, {});
+                const parsed = parseStatement(`CREATE SCHEMA s AS (${schemaBody});`);
+                if (!parsed.ok) throw new Error('parse should succeed');
+                const failed = await bind(parsed.value, noAuthorLang);
+                assertTrue(!failed.ok && failed.diagnostics[0].message.includes('CREATE SCHEMA requires CREATORS (...) or a selected author'),
+                    'CREATE SCHEMA without CREATORS or a selected author fails bind');
+            },
+        },
     ],
 };

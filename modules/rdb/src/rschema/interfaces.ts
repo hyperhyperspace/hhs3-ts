@@ -4,7 +4,7 @@ import type { B64Hash, KeyId, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto
 import type { RObject, Version, View } from "@hyper-hyper-space/hhs3_mvt";
 
 import type {
-    TableDef, FKs, IdProvider, Predicate, MigrationRule, SchemaCreator,
+    TableDef, FKs, IdProvider, Predicate, MigrationRule, SchemaCreator, SchemaParamDecl,
 } from "./payload.js";
 import type { IncarnationId } from "./incarnation.js";
 
@@ -13,6 +13,7 @@ import type { IncarnationId } from "./incarnation.js";
 // the highest of them. `at` defaults to the current frontier.
 export type SchemaUpdateOptions = {
     version?: string;
+    params?: SchemaParamDecl[];
     note?: string;
     at?: Version;
 };
@@ -53,6 +54,10 @@ export interface RSchemaView extends View {
     // The schema versions of the entries at this view's version (its maxima),
     // highest first. One entry for a single-headed version.
     getVersions(): string[];
+
+    // The effective parameter declarations at this view's version.
+    getParams(): SchemaParamDecl[];
+    getParam(name: string): SchemaParamDecl | undefined;
 
     // The effective table set at this view's version. Dropped tables are
     // absent. getTable returns the resolved def (never a carried payload).

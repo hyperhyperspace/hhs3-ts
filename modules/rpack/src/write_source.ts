@@ -18,15 +18,16 @@
 // Reading the result back must give the target; from empty text the result
 // is the target rendered whole.
 
-import type { CreateCatalogStatement, CreateSchemaStatement, SourceKeyLabels, TextSpan } from "@hyper-hyper-space/hhs3_rdb_lang";
+import type { CreateCatalogStatement, CreateSchemaStatement, ImportSchemaStatement, SourceKeyLabels, TextSpan } from "@hyper-hyper-space/hhs3_rdb_lang";
 import {
-    parseScript, renderColumnDef, renderSourceCatalog, renderSourceFiles, renderSourceGroup, renderSourceParam, renderSourceParams,
+    parseScript, renderColumnDef, renderIdent, renderLiteral, renderSchemaParamDecl, renderSchemaParamDecls, renderSourceCatalog, renderSourceFiles, renderSourceGroup, renderSourceParam, renderSourceParams,
     renderSourceSchema, renderTableDef, renderTableOptions,
 } from "@hyper-hyper-space/hhs3_rdb_lang";
 
+import type { SchemaReleaseFile } from "./format.js";
 import type { KeyDirectory } from "./keys.js";
 import {
-    creatorsKey, filesKey, groupKey, modelDifferences, orderByBindings, sameColumn, sameConcurrentDeletes, sameIdProvider, sameRestrictions,
+    creatorsKey, filesKey, groupSourceKey, modelDifferences, orderByBindings, paramDifferences, sameColumn, sameConcurrentDeletes, sameIdProvider, sameParamDecl, sameRestrictions,
     sameTable, type CatalogModel, type SchemaModel,
 } from "./model.js";
 import { SOURCE_FILE } from "./project.js";
@@ -173,14 +174,22 @@ function sourceSchema(schema: SchemaModel) {
     return {
         name: schema.name,
         creators: schema.creators,
+        ...(schema.params !== undefined && schema.params.size > 0 ? { params: [...schema.params.values()] } : {}),
         ...(schema.hashAlgorithm !== undefined ? { hashAlgorithm: schema.hashAlgorithm } : {}),
         tables: [...schema.tables.values()],
     };
 }
 
+function renderSchemaEntry(schema: SchemaModel, labels?: SourceKeyLabels): string {
+    if (schema.origin?.kind === 'imported') {
+        return `IMPORT SCHEMA ${renderIdent(schema.name)} VERSION ${renderLiteral(schema.origin.version)};`;
+    }
+    return renderSourceSchema(sourceSchema(schema), labels);
+}
+
 // The whole target, rendered.
 export function renderSource(target: CatalogModel, labels?: SourceKeyLabels): string {
-    const parts = [...target.schemas.values()].map((s) => renderSourceSchema(sourceSchema(s), labels));
+    const parts = [...target.schemas.values()].map((s) => renderSchemaEntry(s, labels));
     parts.push(renderSourceCatalog({
         name: target.name,
         creators: target.creators,
@@ -199,11 +208,45 @@ function statementEnd(text: string, span: TextSpan): number {
     return match === null ? span.end : span.end + match[0].length;
 }
 
+function importSchemaEdits(text: string, statement: ImportSchemaStatement, target: SchemaModel, labels: SourceKeyLabels, targetVersion?: string): Edit[] {
+    const ver = target.origin?.kind === 'imported' ? target.origin.version : targetVersion;
+    if (ver !== undefined) {
+        if (statement.version === ver) return [];
+        return [{ start: statement.versionSpan.start, end: statement.versionSpan.end, text: `VERSION ${renderLiteral(ver)}` }];
+    }
+    return [{ start: statement.span.start, end: statementEnd(text, statement.span), text: renderSourceSchema(sourceSchema(target), labels) }];
+}
+
 function schemaEdits(text: string, statement: CreateSchemaStatement, current: SchemaModel, target: SchemaModel, labels: SourceKeyLabels): Edit[] {
     if (creatorsKey(current.creators) !== creatorsKey(target.creators) || current.hashAlgorithm !== target.hashAlgorithm) {
         return [{ start: statement.span.start, end: statementEnd(text, statement.span), text: renderSourceSchema(sourceSchema(target), labels) }];
     }
     const edits: Edit[] = [];
+
+    const currentParams = current.params ?? new Map();
+    const targetParams = target.params ?? new Map();
+    if (paramDifferences(target.name, currentParams, targetParams).length > 0) {
+        const stmtParams = statement.params ?? [];
+        const paramItems: ListItem[] = stmtParams.map((p) => {
+            const wanted = targetParams.get(p.name);
+            if (wanted === undefined) return { span: p.span, remove: true };
+            const cur = currentParams.get(p.name);
+            return cur !== undefined && sameParamDecl(cur, wanted)
+                ? { span: p.span }
+                : { span: p.span, replace: renderSchemaParamDecl(wanted) };
+        });
+        const newParams = [...targetParams.values()].filter((p) => !stmtParams.some((q) => q.name === p.name));
+        if (stmtParams.length === 0 && newParams.length > 0) {
+            edits.push({ start: statement.body.start, end: statement.body.start, text: `${renderSchemaParamDecls(newParams)} ` });
+        } else {
+            edits.push(...listEdits(text, paramItems, newParams.map(renderSchemaParamDecl), {
+                separator: () => ', ',
+                openAt: stmtParams[0]?.span.start ?? statement.body.start,
+                openText: (items) => items.join(', '),
+            }));
+        }
+    }
+
     const tableItems: ListItem[] = [];
     for (const decl of statement.tables) {
         const wanted = target.tables.get(decl.name);
@@ -291,7 +334,7 @@ function catalogEdits(text: string, statement: CreateCatalogStatement, current: 
     const groupItems: ListItem[] = statement.groups.map((group) => {
         const wanted = target.groups.get(group.name);
         if (wanted === undefined) return { span: group.span, remove: true };
-        return groupKey(wanted) === groupKey(current.groups.get(group.name)!)
+        return groupSourceKey(wanted) === groupSourceKey(current.groups.get(group.name)!)
             ? { span: group.span }
             : { span: group.span, replace: renderSourceGroup(wanted, { labels }) };
     });
@@ -340,13 +383,19 @@ export function stripCatalogVersion(text: string, stale: Set<string>): { text: s
 
 // `text` edited to describe `target`. `keys` and `signer` read the text and
 // the result, as target-catalog.sql is read for a release.
-export async function writeSource(text: string, target: CatalogModel, keys: KeyDirectory, signer: string): Promise<string> {
+export async function writeSource(
+    text: string,
+    target: CatalogModel,
+    keys: KeyDirectory,
+    signer: string,
+    options: { imports?: Map<string, SchemaReleaseFile>; importedVersions?: Map<string, string> } = {},
+): Promise<string> {
     const labels = keys.labels();
     let result: string;
     if (isBlankSql(text)) {
         result = renderSource(target, labels);
     } else {
-        const read = await readSource(text, keys, signer);
+        const read = await readSource(text, keys, signer, SOURCE_FILE, { imports: options.imports });
         const current = read.model;
         const edits: Edit[] = [];
         let catalog: CreateCatalogStatement | undefined;
@@ -358,6 +407,15 @@ export async function writeSource(text: string, target: CatalogModel, keys: KeyD
                 } else {
                     edits.push(...schemaEdits(text, statement, current.schemas.get(statement.name)!, wanted, labels));
                 }
+            } else if (statement.kind === 'import-schema') {
+                const wanted = target.schemas.get(statement.name);
+                if (wanted === undefined) {
+                    edits.push(removal(text, removalStart(text, statement.span.start), removalEnd(text, statementEnd(text, statement.span))));
+                } else {
+                    const targetVer = options.importedVersions?.get(statement.name)
+                        ?? (wanted.origin?.kind === 'imported' ? wanted.origin.version : statement.version);
+                    edits.push(...importSchemaEdits(text, statement, wanted, labels, targetVer));
+                }
             } else if (statement.kind === 'create-catalog') {
                 catalog = statement;
                 edits.push(...catalogEdits(text, statement, current, target, labels));
@@ -366,12 +424,12 @@ export async function writeSource(text: string, target: CatalogModel, keys: KeyD
         const newSchemas = [...target.schemas.values()].filter((s) => !current.schemas.has(s.name));
         if (newSchemas.length > 0 && catalog !== undefined) {
             const at = removalStart(text, catalog.span.start);
-            edits.push({ start: at, end: at, text: newSchemas.map((s) => `${renderSourceSchema(sourceSchema(s), labels)}\n\n`).join('') });
+            edits.push({ start: at, end: at, text: newSchemas.map((s) => `${renderSchemaEntry(s, labels)}\n\n`).join('') });
         }
         result = applyEdits(text, edits);
     }
 
-    const check = await readSource(result, keys, signer);
+    const check = await readSource(result, keys, signer, SOURCE_FILE, { imports: options.imports });
     const left = modelDifferences(check.model, target);
     if (left.length > 0) throw new WriteSourceError(`the written ${SOURCE_FILE} doesn't describe the target (a bug in rpack): ${left.join('; ')}`);
     return result;

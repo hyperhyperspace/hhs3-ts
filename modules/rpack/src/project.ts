@@ -15,16 +15,19 @@
 // A folder is named by its version (2.0.4), or by its version and a suffix
 // (2.0.4-b3c1) when two folders prepare the same version.
 
+import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { compareSemver, isValidSemver } from "@hyper-hyper-space/hhs3_rdb";
 
 export const CONFIG_FILE = 'rpack.json';
 export const SOURCE_FILE = 'target-catalog.sql';
+export const SCHEMA_SOURCE_FILE = 'target-schema.sql';
 export const UPGRADE_MANUAL_FILE = 'upgrade-manual.sql';
 export const UPDATE_FILE = 'update.sql';
 export const TEST_DATA_FILE = 'test-data.sql';
 export const STAGING_FILE = 'staging.json';
 export const VERSION_FILE = 'version.json';
 export const RELEASES_DIR = 'releases';
+export const IMPORTS_DIR = 'imports';
 export const WORK_DIR = 'work';
 // Inside a work folder.
 export const RELEASED_DIR = '.released';
@@ -33,10 +36,20 @@ export const STAGE_DIR = 'stage';
 
 // The generated folders, and a stage being built or swapped in.
 export const GITIGNORE = `${WORK_DIR}/*/${BUILD_DIR}/\n${WORK_DIR}/*/${STAGE_DIR}/\n${WORK_DIR}/*/.${STAGE_DIR}.*/\n`;
+export const SCHEMA_GITIGNORE = `${WORK_DIR}/*/${BUILD_DIR}/\n`;
+
+export type RpackKind = 'catalog' | 'schema';
+
+export type RpackImportsLock = {
+    [schemaName: string]: { [version: string]: B64Hash };
+};
 
 export type RpackConfig = {
+    kind?: RpackKind;
     name: string;
     key: string;
+    registry?: string;
+    imports?: RpackImportsLock;
     // Work folder -> the release made from it (editor-2.0.4-8b21d0aa).
     released: Map<string, string>;
 };
@@ -68,6 +81,8 @@ export function releasedPath(folder: string, file?: string): string {
     return workPath(folder, file === undefined ? RELEASED_DIR : `${RELEASED_DIR}/${file}`);
 }
 
+const CONFIG_FIELDS = ['kind', 'name', 'key', 'registry', 'imports', 'released'];
+
 export function parseRpackConfig(text: string): RpackConfig {
     let value: unknown;
     try {
@@ -76,12 +91,52 @@ export function parseRpackConfig(text: string): RpackConfig {
         throw new ConfigError(`${CONFIG_FILE} is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
     }
     if (!isObject(value)) throw new ConfigError(`${CONFIG_FILE} must be a JSON object`);
+    for (const field of Object.keys(value)) {
+        if (!CONFIG_FIELDS.includes(field)) throw new ConfigError(`${CONFIG_FILE}: unknown field '${field}'`);
+    }
     const stringField = (field: string): string => {
         const v = value[field];
         if (typeof v !== 'string' || v.length === 0) throw new ConfigError(`${CONFIG_FILE}: '${field}' must be a non-empty string`);
         return v;
     };
-    const config: RpackConfig = { name: stringField('name'), key: stringField('key'), released: new Map() };
+    const kindVal = value['kind'];
+    if (kindVal !== undefined && kindVal !== 'catalog' && kindVal !== 'schema') {
+        throw new ConfigError(`${CONFIG_FILE}: 'kind' must be 'catalog' or 'schema'`);
+    }
+    const kind: RpackKind = (kindVal as RpackKind | undefined) ?? 'catalog';
+    const keyVal = value['key'];
+    if (kind === 'catalog' || keyVal !== undefined) {
+        if (typeof keyVal !== 'string' || keyVal.length === 0) {
+            throw new ConfigError(`${CONFIG_FILE}: 'key' must be a non-empty string`);
+        }
+    }
+    const config: RpackConfig = {
+        ...(kindVal !== undefined ? { kind } : {}),
+        name: stringField('name'),
+        key: (keyVal as string | undefined) ?? '',
+        released: new Map(),
+    };
+    if (value['registry'] !== undefined) {
+        config.registry = stringField('registry');
+    }
+    if (value['imports'] !== undefined) {
+        const rawImports = value['imports'];
+        if (!isObject(rawImports)) throw new ConfigError(`${CONFIG_FILE}: 'imports' must map schema names to version locks`);
+        const imports: RpackImportsLock = {};
+        for (const [schema, versions] of Object.entries(rawImports)) {
+            if (!isObject(versions)) throw new ConfigError(`${CONFIG_FILE}: 'imports.${schema}' must map versions to step hashes`);
+            const vMap: { [version: string]: B64Hash } = {};
+            for (const [ver, hash] of Object.entries(versions)) {
+                if (!isValidSemver(ver)) throw new ConfigError(`${CONFIG_FILE}: 'imports.${schema}.${ver}' is not a valid semver`);
+                if (typeof hash !== 'string' || hash.length === 0) {
+                    throw new ConfigError(`${CONFIG_FILE}: 'imports.${schema}.${ver}' must be a step hash`);
+                }
+                vMap[ver] = hash;
+            }
+            imports[schema] = vMap;
+        }
+        config.imports = imports;
+    }
     const released = value['released'] ?? {};
     if (!isObject(released)) throw new ConfigError(`${CONFIG_FILE}: 'released' must map work folders to release names`);
     for (const [folder, name] of Object.entries(released)) {
@@ -98,11 +153,29 @@ export function parseRpackConfig(text: string): RpackConfig {
 
 // Released folders in version order, one per line.
 export function formatRpackConfig(config: RpackConfig): string {
+    const fields: string[] = [];
+    if (config.kind === 'schema') fields.push(`  "kind": "schema"`);
+    fields.push(`  "name": ${JSON.stringify(config.name)}`);
+    if (config.kind !== 'schema' || config.key.length > 0) {
+        fields.push(`  "key": ${JSON.stringify(config.key)}`);
+    }
+    if (config.registry !== undefined) {
+        fields.push(`  "registry": ${JSON.stringify(config.registry)}`);
+    }
+    if (config.imports !== undefined && Object.keys(config.imports).length > 0) {
+        const schemaEntries = Object.keys(config.imports).sort().map((schema) => {
+            const vMap = config.imports![schema];
+            const vers = Object.keys(vMap).sort(compareSemver).map((v) => `      ${JSON.stringify(v)}: ${JSON.stringify(vMap[v])}`);
+            return `    ${JSON.stringify(schema)}: {\n${vers.join(',\n')}\n    }`;
+        });
+        fields.push(`  "imports": {\n${schemaEntries.join(',\n')}\n  }`);
+    }
     const folders = [...config.released.keys()].sort(compareFolders);
     const released = folders.length === 0
         ? '{}'
         : `{\n${folders.map((f) => `    ${JSON.stringify(f)}: ${JSON.stringify(config.released.get(f))}`).join(',\n')}\n  }`;
-    return `{\n  "name": ${JSON.stringify(config.name)},\n  "key": ${JSON.stringify(config.key)},\n  "released": ${released}\n}\n`;
+    fields.push(`  "released": ${released}`);
+    return `{\n${fields.join(',\n')}\n}\n`;
 }
 
 // A work folder's version.json: the releases it starts from ([] for the first

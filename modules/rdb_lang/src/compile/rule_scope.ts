@@ -20,6 +20,7 @@ export type RuleScope = {
     gated?: GatedTable;
     columnsOf: ColumnsOf;
     exists?: ExistsScope;
+    params?: Set<string>;
 };
 
 export type ResolvedColumnRole = 'gated' | 'exists';

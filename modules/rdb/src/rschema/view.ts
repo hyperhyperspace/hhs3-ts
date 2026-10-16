@@ -7,7 +7,7 @@ import { B64Hash, KeyId } from "@hyper-hyper-space/hhs3_crypto";
 import { Version } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchema, RSchemaView } from "./interfaces.js";
-import type { SchemaCreator } from "./payload.js";
+import type { SchemaCreator, SchemaParamDecl } from "./payload.js";
 import { SchemaState } from "./resolve.js";
 import type { IncarnationId } from "./incarnation.js";
 import {
@@ -65,6 +65,14 @@ export class RSchemaViewImpl implements RSchemaView {
 
     getVersions(): string[] {
         return [...this.state.versions];
+    }
+
+    getParams(): SchemaParamDecl[] {
+        return [...this.state.params.values()];
+    }
+
+    getParam(name: string): SchemaParamDecl | undefined {
+        return this.state.params.get(name);
     }
 
     // The effective table set

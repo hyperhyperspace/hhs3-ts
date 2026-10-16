@@ -526,5 +526,74 @@ export const rschemaTests = {
                 if (!fk.ok) assertTrue(fk.reason.includes('still has an FK'), 'the reason says why');
             }
         },
+        {
+            name: '[RSCHEMA16] schema params: declarations, defaults, rule operand & exists where validation, and concurrent resolution',
+            invoke: async () => {
+                const ctx = createMockRContext({ selfValidate: true });
+                ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
+                const admin = await createIdentity(SIGNING_ED25519, hashSuite);
+                const creators = [{ keyId: admin.keyId, publicKey: admin.publicKey }];
+
+                const init = await RSchemaImpl.create({
+                    name: 's:params',
+                    version: '1.0.0',
+                    creators,
+                    params: [
+                        { name: 'write_cap', type: 'string' },
+                        { name: 'min_qty', type: 'integer', default: 1 },
+                    ],
+                    tables: [
+                        capsTable(),
+                        {
+                            name: 'orders',
+                            columns: { qty: { type: 'integer', readonly: true }, customer: { type: 'string' } },
+                            restrictions: [{
+                                on: 'insert',
+                                rule: {
+                                    p: 'and',
+                                    args: [
+                                        { p: 'cmp', cmp: 'ge', left: { col: 'qty' }, right: { param: 'min_qty' } },
+                                        { p: 'exists', table: 'caps', where: { label: '$param.write_cap', rowAuthor: '$author' } },
+                                    ],
+                                },
+                            }],
+                        },
+                    ],
+                });
+                const schema = (await ctx.createObject(init)) as RSchemaImpl;
+                const view1 = await schema.getView();
+                assertEquals(view1.getParams().map((p) => `${p.name}:${p.type}:${String(p.default)}`).join(','),
+                    'write_cap:string:undefined,min_qty:integer:1', 'initial params resolve');
+
+                // schema-update requires a default for newly added params and rejects redeclaring existing params
+                let noDefaultFailed = false;
+                try {
+                    await schema.updateSchema([], admin, { version: '1.1.0', params: [{ name: 'max_qty', type: 'integer' }] });
+                } catch { noDefaultFailed = true; }
+                assertTrue(noDefaultFailed, 'schema-update param without default is rejected');
+
+                let redeclareFailed = false;
+                try {
+                    await schema.updateSchema([], admin, { version: '1.1.0', params: [{ name: 'min_qty', type: 'integer', default: 5 }] });
+                } catch { redeclareFailed = true; }
+                assertTrue(redeclareFailed, 'redeclaring an existing param is rejected');
+
+                // Concurrent schema updates declaring the same param name with different types: higher version wins
+                const base = await (await schema.getScopedDag()).getFrontier();
+                await schema.updateSchema([], admin, {
+                    version: '1.1.0',
+                    params: [{ name: 'tag', type: 'string', default: 'a' }],
+                    at: base,
+                });
+                await schema.updateSchema([], admin, {
+                    version: '2.0.0',
+                    params: [{ name: 'tag', type: 'integer', default: 42 }],
+                    at: base,
+                });
+                const merged = await schema.getView();
+                assertEquals(merged.getParam('tag')?.type, 'integer', 'higher schema version wins concurrent param declaration');
+                assertEquals(merged.getParam('tag')?.default, 42, 'winning default is kept');
+            }
+        },
     ],
 };

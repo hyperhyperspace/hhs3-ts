@@ -1,6 +1,6 @@
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { formatValidationFailure, ValidationRejectedError, Version, version } from "@hyper-hyper-space/hhs3_mvt";
-import type { CatalogUpdateResult, RDbImpl, RTableGroup, RTableView } from "@hyper-hyper-space/hhs3_rdb";
+import type { CatalogUpdateResult, RDbImpl, RSchema, RTableGroup, RTableView } from "@hyper-hyper-space/hhs3_rdb";
 import { splitTableRef } from "@hyper-hyper-space/hhs3_rdb";
 import {
     bind,
@@ -10,6 +10,7 @@ import {
     LangDiagnostic,
     LangExecutionResult,
     parseScript,
+    ResolvedImportedSchema,
     ResolvedTableRef,
     TextSpan,
     VersionExpr,
@@ -44,7 +45,13 @@ export type ExecuteTextOptions = AuthInteractionContext & {
     // Source mode (a catalog repository's target-catalog.sql): CREATE CATALOG may omit
     // VERSION, and takes catalogVersion. schemaVersion, when set, is the version
     // a CREATE SCHEMA with no VERSION is created at (the catalog's version).
-    source?: { catalogVersion: string; schemaVersion?: string };
+    // imports resolves IMPORT SCHEMA <name> VERSION '<v>' to an existing
+    // RSchema object and the position to pin it at.
+    source?: {
+        catalogVersion: string;
+        schemaVersion?: string;
+        imports?: (name: string, version: string) => ResolvedImportedSchema | undefined | Promise<ResolvedImportedSchema | undefined>;
+    };
 };
 
 export function createBindContext(session: RdbSession): LangBindContext {
@@ -101,14 +108,52 @@ export async function executeText(
     if (!parsed.ok) throw new LanguageError(parsed.diagnostics);
 
     const results: StatementRunResult[] = [];
+    const baseContext = createBindContext(session);
+    const importedSchemas = new Map<string, { schemaId: B64Hash; schema: RSchema; at: Version }>();
+    const importedPins = new Map<B64Hash, Version>();
+    const declaredSchemas = new Set<string>();
+
     const context: LangBindContext = source !== undefined
         ? {
-            ...createBindContext(session),
+            ...baseContext,
             defaultCatalogVersion: async () => source.catalogVersion,
             ...(source.schemaVersion !== undefined ? { defaultSchemaVersion: async () => source.schemaVersion } : {}),
+            resolveImport: async (name, ver) => {
+                if (declaredSchemas.has(name)) {
+                    throw new Error(`schema ${name} is defined twice`);
+                }
+                const resolved = await source.imports?.(name, ver);
+                if (resolved === undefined) return undefined;
+                const schemaObj = resolved.schema ?? (await session.workspace.replica.getObject(resolved.schemaId)) as unknown as RSchema | undefined;
+                if (schemaObj === undefined) return undefined;
+                declaredSchemas.add(name);
+                importedSchemas.set(name, { schemaId: resolved.schemaId, schema: schemaObj, at: resolved.at });
+                importedPins.set(resolved.schemaId, resolved.at);
+                return { schemaId: resolved.schemaId, schema: schemaObj, at: resolved.at };
+            },
+            resolveSchema: async (ref) => {
+                if (ref.kind === 'name') {
+                    const imp = importedSchemas.get(ref.text);
+                    if (imp !== undefined) return { id: imp.schemaId, schema: imp.schema };
+                }
+                return baseContext.resolveSchema(ref);
+            },
+            resolveVersion: async (expr, scope) => {
+                if (scope.kind === 'schema' && (expr === undefined || expr.kind === 'latest')) {
+                    const pin = importedPins.get(scope.id);
+                    if (pin !== undefined) return pin;
+                }
+                return baseContext.resolveVersion(expr, scope);
+            },
         }
-        : createBindContext(session);
+        : baseContext;
     for (const statement of parsed.value.statements) {
+        if (statement.kind === 'create-schema') {
+            if (declaredSchemas.has(statement.name)) {
+                throw new LanguageError([{ code: 'BIND_UNKNOWN_NAME', message: `schema ${statement.name} is defined twice`, span: statement.span, severity: 'error' }]);
+            }
+            declaredSchemas.add(statement.name);
+        }
         let bound = await bind(statement, context);
         if (!bound.ok) {
             const retried = await tryBindAuthorRetry(session, statement, bound.diagnostics, context, options);
@@ -255,24 +300,13 @@ export async function resolveFkRowId(
         return matchRowIdPrefix(prefix, await view.liveRowIds(), tableName);
     }
 
-    const fkGroup = sourceTable.group as CrossGroupFkResolvable;
-    const view = await fkGroup.resolveForeignTableView(groupName, targetTable, at, fromVersion);
+    const view = await sourceTable.group.resolveSchemaForeignTableView(groupName, targetTable, at, fromVersion);
     if (view === undefined) {
         throw new Error(`Unknown foreign table '${groupName}.${targetTable}' for FK column '${column}'`);
     }
     const tableName = `${sourceTable.groupId}.${groupName}.${targetTable}`;
     return matchRowIdPrefix(prefix, await view.liveRowIds(), tableName);
 }
-
-type CrossGroupFkResolvable = RTableGroup & {
-    resolveForeignTableView(
-        groupName: string,
-        table: string,
-        at: Version,
-        from: Version,
-        filterVoided?: boolean,
-    ): Promise<RTableView | undefined>;
-};
 
 function matchRowIdPrefix(prefix: string, rowIds: B64Hash[], tableName: string): B64Hash {
     const matches = rowIds.filter((rowId) => rowId.startsWith(prefix));

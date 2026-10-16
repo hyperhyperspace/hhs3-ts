@@ -898,7 +898,7 @@ async function testFetchInitHashMismatch() {
 
     let threw = false;
     try {
-        await fetchInit(objectId, [swarm], sha256, 2000);
+        await fetchInit(objectId, [swarm], sha256, { timeoutMs: 2000 });
     } catch (e: any) {
         threw = true;
         testing.assertTrue(
@@ -931,7 +931,7 @@ async function testFetchInitLatePeer() {
     });
 
     const started = Date.now();
-    const pending = fetchInit(objectId, [swarm], sha256, initTimeoutMs, peerTimeoutMs);
+    const pending = fetchInit(objectId, [swarm], sha256, { timeoutMs: initTimeoutMs, peerTimeoutMs });
     // Past the init budget. The old single clock would already have rejected.
     await wait(initTimeoutMs + 100);
     join({ keyId: 'peerB', endpoint: 'mem://peerB', channel: local });
@@ -950,7 +950,7 @@ async function testFetchInitNoPeer() {
     const started = Date.now();
     let threw = false;
     try {
-        await fetchInit('no-peer-object', [swarm], sha256, 5_000, peerTimeoutMs);
+        await fetchInit('no-peer-object', [swarm], sha256, { timeoutMs: 5_000, peerTimeoutMs });
     } catch (e: any) {
         threw = true;
         testing.assertTrue(
@@ -978,7 +978,7 @@ async function testFetchInitAlreadyConnectedTimeout() {
     const started = Date.now();
     let threw = false;
     try {
-        await fetchInit(objectId, [swarm], sha256, initTimeoutMs, 5_000);
+        await fetchInit(objectId, [swarm], sha256, { timeoutMs: initTimeoutMs, peerTimeoutMs: 5_000 });
     } catch (e: any) {
         threw = true;
         testing.assertTrue(

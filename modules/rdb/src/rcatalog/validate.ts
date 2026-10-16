@@ -24,20 +24,56 @@ function isNonEmptySet(set: json.Set): boolean {
     return json.setSize(set) > 0;
 }
 
+function checkGroupParamsFormat(params: { [name: string]: json.Literal }, where: string): string | undefined {
+    const names = Object.keys(params);
+    if (names.length === 0) return `${where} has an empty params map`;
+    for (const name of names) {
+        if (!isValidName(name)) return `${where} has an invalid param name '${name}'`;
+        const val = params[name];
+        if (!json.isLiteral(val)) return `${where} has an invalid literal value for param ':${name}'`;
+        if (typeof val === 'string' && val.startsWith('$')) {
+            return `${where} param ':${name}' string value cannot start with '$'`;
+        }
+    }
+    return undefined;
+}
+
 // Undefined when valid, else a reason.
 export function checkGroupDefFormat(def: CatalogGroupDef): string | undefined {
     if (!isValidName(def.name)) return `invalid group name '${def.name}'`;
     if (!isNonEmptySet(def.schemaVersion)) return `group '${def.name}' pins an empty schema version`;
 
     const bindings = def.bindings ?? {};
-    const seenTargets = new Map<string, string>();
-    for (const [alias, target] of Object.entries(bindings)) {
+    for (const alias of Object.keys(bindings)) {
         if (!isValidName(alias)) return `group '${def.name}' has an invalid binding alias '${alias}'`;
-        const prior = seenTargets.get(target);
-        if (prior !== undefined) {
-            return `group '${def.name}' bindings must be injective: aliases '${prior}' and '${alias}' both bind '${target}'`;
+    }
+
+    if (def.tableMaps !== undefined) {
+        const mapAliases = Object.keys(def.tableMaps);
+        if (mapAliases.length === 0) return `group '${def.name}' has an empty tableMaps`;
+        for (const alias of mapAliases) {
+            if (!Object.prototype.hasOwnProperty.call(bindings, alias)) {
+                return `group '${def.name}' tableMaps names '${alias}', which is not a binding alias`;
+            }
+            const entries = Object.entries(def.tableMaps[alias]);
+            if (entries.length === 0) return `group '${def.name}' has an empty tableMaps for '${alias}'`;
+            for (const [schemaTable, foreignTable] of entries) {
+                if (!isValidName(schemaTable)) {
+                    return `group '${def.name}' has an invalid schema table '${schemaTable}' in tableMaps for '${alias}'`;
+                }
+                if (!isValidName(foreignTable)) {
+                    return `group '${def.name}' has an invalid foreign table '${foreignTable}' in tableMaps for '${alias}'`;
+                }
+                if (schemaTable === foreignTable) {
+                    return `group '${def.name}' tableMaps for '${alias}' maps '${schemaTable}' to itself`;
+                }
+            }
         }
-        seenTargets.set(target, alias);
+    }
+
+    if (def.params !== undefined) {
+        const paramsReason = checkGroupParamsFormat(def.params, `group '${def.name}'`);
+        if (paramsReason !== undefined) return paramsReason;
     }
 
     if (def.canDeploy !== undefined && !validatePredicate(def.canDeploy, 'object')) {
@@ -98,6 +134,10 @@ function checkReleaseBodyFormat(body: CatalogReleaseBody): string | undefined {
     for (const [hash, change] of Object.entries(body.changes ?? {})) {
         if (addHashes.has(hash)) return `group '${hash}' is added and changed in the same release`;
         if (!isNonEmptySet(change.version)) return `change of group '${hash}' names an empty version`;
+        if (change.params !== undefined) {
+            const paramsReason = checkGroupParamsFormat(change.params, `change of group '${hash}'`);
+            if (paramsReason !== undefined) return paramsReason;
+        }
     }
 
     const filesHashes = new Set<string>();

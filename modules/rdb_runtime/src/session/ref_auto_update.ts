@@ -59,6 +59,7 @@ export function findObservers(session: RdbSession, foreignGroupId: B64Hash): Obs
         for (const [bindingName, boundId] of Object.entries(observer.getBindings())) {
             if (boundId === foreignGroupId) {
                 observers.push({ observerId: root.id, observer, bindingName });
+                break;
             }
         }
     }

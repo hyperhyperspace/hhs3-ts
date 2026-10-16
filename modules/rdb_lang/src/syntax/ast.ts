@@ -11,6 +11,7 @@ export type AstScript = {
 export type AstStatement =
     | CreateDatabaseStatement
     | CreateSchemaStatement
+    | ImportSchemaStatement
     | CreateCatalogStatement
     | AlterCatalogStatement
     | UpdateCatalogStatement
@@ -27,6 +28,14 @@ export type AstStatement =
     | PutFileStatement
     | GetFileStatement
     | ListFilesStatement;
+
+export type ImportSchemaStatement = {
+    kind: 'import-schema';
+    name: string;
+    version: string;
+    versionSpan: TextSpan;
+    span: TextSpan;
+};
 
 // The owner of a key section, for GET and LIST: `IN KEY $name` or
 // `IN KEY #prefix`, or the current author for a bare `IN KEY`.
@@ -104,10 +113,11 @@ export type AuthorExpr =
     | { kind: 'variable'; name: string; span: TextSpan }
     | { kind: 'hash'; prefix: string; span: TextSpan };
 
-// `:name` is a deploy-time catalog param; the binder only accepts it in the
-// WITH ROWS values of a catalog group definition.
+// `:name` is a deploy-time catalog param or schema param (or a literal
+// resolved from a script-level CONSTANT declaration, which retains `constant`
+// so the binder can reject name collisions with loaded schema params).
 export type ValueExpr =
-    | { kind: 'literal'; value: json.Literal | null; span: TextSpan }
+    | { kind: 'literal'; value: json.Literal | null; constant?: string; span: TextSpan }
     | { kind: 'variable'; name: string; field?: string; span: TextSpan }
     | { kind: 'hash'; prefix: string; span: TextSpan }
     | { kind: 'param'; name: string; span: TextSpan }
@@ -169,12 +179,20 @@ export type TableDecl = {
     span: TextSpan;
 };
 
+export type SchemaParamDeclExpr = {
+    name: string;
+    type: ColumnTypeName;
+    defaultValue?: ValueExpr;
+    span: TextSpan;
+};
+
 export type CreateSchemaStatement = {
     kind: 'create-schema';
     name: string;
     creators: ValueExpr[];
     // The schema's first version; the binder defaults it.
     version?: string;
+    params?: SchemaParamDeclExpr[];
     tables: TableDecl[];
     hashAlgorithm?: string;
     // `AS ( ... )`, from AS to the closing parenthesis.
@@ -219,6 +237,12 @@ export type CatalogParamDeclExpr = {
     span: TextSpan;
 };
 
+export type CatalogBindingTableMapExpr = {
+    from: string;
+    to: string;
+    span: TextSpan;
+};
+
 // A group definition inside a catalog body (`TABLEGROUP ...` in CREATE
 // CATALOG, `ADD TABLEGROUP ...` in ALTER CATALOG). Bindings and change targets
 // name other definitions of the same catalog, by name or by definition hash
@@ -227,7 +251,8 @@ export type CatalogGroupExpr = {
     name: string;
     schema: NameOrHashRef;
     schemaVersion?: VersionExpr;
-    bindings: { name: string; group: NameOrHashRef; span: TextSpan }[];
+    bindings: { name: string; group: NameOrHashRef; tables?: CatalogBindingTableMapExpr[]; span: TextSpan }[];
+    params?: ParamAssignment[];
     idProvider?: string;
     // `ALLOW DEPLOY IF <predicate>`.
     canDeploy?: PredicateExpr;
@@ -256,7 +281,7 @@ export type CatalogChangeExpr =
     | { kind: 'add-group'; group: CatalogGroupExpr; span: TextSpan }
     | { kind: 'add-files'; files: CatalogFilesExpr; span: TextSpan }
     // Sets a group's version in the release (not a deploy).
-    | { kind: 'update-schema'; schema: NameOrHashRef; version: VersionExpr; group: NameOrHashRef; span: TextSpan };
+    | { kind: 'update-schema'; schema: NameOrHashRef; version: VersionExpr; group: NameOrHashRef; params?: ParamAssignment[]; span: TextSpan };
 
 export type CreateCatalogStatement = {
     kind: 'create-catalog';
@@ -371,6 +396,7 @@ export type AlterSchemaStatement = {
     schema: NameOrHashRef;
     // The update's schema version; absent, the runtime uses the next patch.
     version?: string;
+    params?: SchemaParamDeclExpr[];
     rules: MigrationRuleExpr[];
     note?: string;
     author?: AuthorExpr;

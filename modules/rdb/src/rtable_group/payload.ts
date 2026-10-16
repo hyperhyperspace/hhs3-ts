@@ -27,8 +27,16 @@ import {
 } from "../rschema/payload.js";
 export const MAX_INITIAL_ROWS_PER_TABLE = 1024;
 export const MAX_BINDINGS = 256;
+export const MAX_GROUP_PARAMS = 64;
 export const MAX_BUNDLE_OPS = 1024;
 export const MAX_GATE_WIDTH = 256;
+
+export type GroupParams = { [name: string]: json.Literal };
+
+export const groupParamsFormat: json.Format = [json.Type.BoundedMap,
+    [json.Type.BoundedString, MAX_NAME_LENGTH],
+    json.Type.Something,
+    MAX_GROUP_PARAMS];
 
 // Create a table group:
 
@@ -81,6 +89,18 @@ export const MAX_GATE_WIDTH = 256;
 // that reads $author needs a key source (idProvider or deployKeys), so an
 // unverified author never reaches it.
 
+export type TableMaps = {
+    [alias: string]: { [schemaTable: string]: string };
+};
+
+export const tableMapsFormat: json.Format = [json.Type.BoundedMap,
+    [json.Type.BoundedString, MAX_NAME_LENGTH],
+    [json.Type.BoundedMap,
+        [json.Type.BoundedString, MAX_NAME_LENGTH],
+        [json.Type.BoundedString, MAX_NAME_LENGTH],
+        MAX_TABLES],
+    MAX_BINDINGS];
+
 export const RTABLE_GROUP_TYPE_ID = 'hhs/rtable_group_v1';
 
 export type CreateTableGroupPayload = {
@@ -92,6 +112,8 @@ export type CreateTableGroupPayload = {
     schemaVersion: json.Set;                       // pinned initial RSchema version (set of entry hashes)
     initialRows?: { [table: string]: json.Literal[] };   // genesis fiat rows (insert op shape)
     bindings?: { [name: string]: B64Hash };        // group name -> group object id (fixed v1)
+    tableMaps?: TableMaps;                         // alias -> (schema table -> foreign table) (fixed v1)
+    params?: GroupParams;                          // initial schema parameter values
     canDeploy?: Predicate;                         // gates schema ref-advances ('object' context; fixed v1)
     canObserve?: { [binding: string]: Predicate }; // per-binding gate on foreign-group observations ('object' context; fixed v1)
     idProvider?: string;                           // local table name or 'group.table' (fixed v1)
@@ -114,6 +136,8 @@ export const createTableGroupFormat: json.Format = {
         [json.Type.BoundedString, MAX_NAME_LENGTH],
         [json.Type.BoundedString, MAX_HASH_LENGTH],
         MAX_BINDINGS]],
+    tableMaps: [json.Type.Option, tableMapsFormat],
+    params: [json.Type.Option, groupParamsFormat],
     canDeploy: [json.Type.Option, json.Type.Something],   // checked with validatePredicate('object')
     canObserve: [json.Type.Option, [json.Type.BoundedMap,
         [json.Type.BoundedString, MAX_NAME_LENGTH],

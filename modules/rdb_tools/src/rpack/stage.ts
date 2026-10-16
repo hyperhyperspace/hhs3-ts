@@ -28,7 +28,7 @@ import {
 import { APP_CONFIG_FILE, KeyStore, openApp } from "@hyper-hyper-space/hhs3_rhost_node";
 import {
     CONFIG_FILE, RELEASES_DIR, SOURCE_FILE, STAGE_DIR, STAGING_FILE, TEST_DATA_FILE, VERSION_FILE, WORK_DIR,
-    describeFolder, exportRelease, parseReleaseFile, parseRpackConfig, produceVersion, Released, releaseTag, serializeReleaseFile, sortReleases, workPath,
+    describeFolder, exportRelease, parseReleaseFile, parseRpackConfig, produceVersion, Released, releaseName, releaseTag, serializeReleaseFile, sortReleases, workPath,
     type ReleaseDraft, type ReleaseInfo, type RpackConfig,
 } from "@hyper-hyper-space/hhs3_rpack";
 
@@ -69,7 +69,7 @@ export async function stage(project: NodeProject, devVault: KeyVault, folder: st
         const text = await project.read(`${RELEASES_DIR}/${name}`);
         if (text === undefined) continue;
         const m = parseReleaseFile(text).manifest;
-        files.set(`${m.name}-${m.version}-${releaseTag(m.release)}`, text);
+        files.set(releaseName(m.name, m.version, m.release), text);
     }
     const released = await Released.open([...files.values()].map(parseReleaseFile), config.name);
     const folderDir = join(project.dir, WORK_DIR, folder);

@@ -48,7 +48,7 @@ import { signPayload as signPayloadHelper, serializePublicKeyToBase64 } from "@h
 
 import type { RSchema as RSchemaContract, RSchemaView as RSchemaViewContract, SchemaUpdateOptions } from "./interfaces.js";
 import { CreateRSchemaPayload, SchemaUpdatePayload, RSCHEMA_TYPE_ID, DEFAULT_SCHEMA_VERSION } from "./payload.js";
-import { TableDef, MigrationRule } from "./payload.js";
+import { TableDef, MigrationRule, SchemaParamDecl } from "./payload.js";
 import { compareSemver, nextPatch } from "../semver.js";
 import { validateRSchemaPayload } from "./validate_ops.js";
 import { resolveSchemaState, positionKey, SchemaState } from "./resolve.js";
@@ -93,6 +93,7 @@ export class RSchemaImpl implements RSchemaContract {
         name: string;
         version?: string;
         creators: { keyId: KeyId; publicKey: PublicKey }[];
+        params?: SchemaParamDecl[];
         tables: TableDef[];
         hashAlgorithm?: string;
     }): Promise<CreateRSchemaPayload> => {
@@ -109,6 +110,7 @@ export class RSchemaImpl implements RSchemaContract {
             tables: options.tables,
         };
 
+        if (options.params !== undefined && options.params.length > 0) createPayload.params = options.params;
         if (options.hashAlgorithm !== undefined) createPayload.hashAlgorithm = options.hashAlgorithm;
 
         return createPayload;
@@ -169,6 +171,7 @@ export class RSchemaImpl implements RSchemaContract {
             version,
             migration,
         };
+        if (options.params !== undefined && options.params.length > 0) base.params = options.params;
         if (options.note !== undefined) base.note = options.note;
 
         const signed = await signPayloadHelper(base as unknown as json.LiteralMap, author, at);

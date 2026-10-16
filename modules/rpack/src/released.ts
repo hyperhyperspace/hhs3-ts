@@ -3,15 +3,16 @@
 // parents, which is where the next release starts.
 
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
+import type { json } from "@hyper-hyper-space/hhs3_json";
 import { version, type Version } from "@hyper-hyper-space/hhs3_mvt";
 import {
     compareSemver, filesSchemaReason,
     type CatalogFilesDef, type CatalogGroupDef, type CatalogGroupState, type CreateRCatalogPayload, type ParentFold,
-    type RCatalogImpl, type RSchemaImpl, type RSchemaView, type SchemaCreator, type TableDef,
+    type RCatalogImpl, type RSchemaImpl, type RSchemaView, type SchemaCreator, type SchemaParamDecl, type TableDef,
 } from "@hyper-hyper-space/hhs3_rdb";
 import type { Replica } from "@hyper-hyper-space/hhs3_replica";
 
-import { releaseTag, type ReleaseFile } from "./format.js";
+import { releaseName, releaseTag, sanitizedReleasePrefix, type ReleaseFile } from "./format.js";
 import { installRelease } from "./install.js";
 import { filesModelOf, groupModelOf, type CatalogModel, type FilesModel, type GroupModel, type SchemaModel } from "./model.js";
 import { memoryReplica } from "./verify.js";
@@ -40,6 +41,7 @@ export type BaseSchema = {
     at: B64Hash[];
     object: RSchemaImpl;
     view: RSchemaView;
+    params: Map<string, SchemaParamDecl>;
     tables: Map<string, TableDef>;
     creators: SchemaCreator[];
     hashAlgorithm?: string;
@@ -49,6 +51,8 @@ export type BaseGroup = {
     hash: B64Hash;
     def: CatalogGroupDef;
     model: GroupModel;
+    // Folded explicit parameter values at the parents' merge.
+    params: { [name: string]: json.Literal };
     // The group's version in each parent that has it.
     pins: CatalogGroupState[];
 };
@@ -144,7 +148,7 @@ export class Released {
         for (const hash of index.releasesAt(await (await catalog.getScopedDag()).getFrontier())) {
             const state = index.releaseState(hash);
             const tag = releaseTag(hash);
-            const info: ReleaseInfo = { hash, version: state.version, tag, name: `${name}-${state.version}-${tag}`, parents: state.parents };
+            const info: ReleaseInfo = { hash, version: state.version, tag, name: releaseName(name, state.version, hash), parents: state.parents };
             if (state.note !== undefined) info.note = state.note;
             this.infos.set(hash, info);
         }
@@ -167,7 +171,11 @@ export class Released {
             const matches = this.releases().filter((r) => r.hash.startsWith(text.slice(1)));
             return this.single(selector, matches);
         }
-        if (this.catalogName !== undefined && text.startsWith(`${this.catalogName}-`)) text = text.slice(this.catalogName.length + 1);
+        if (this.catalogName !== undefined) {
+            const sanitized = `${sanitizedReleasePrefix(this.catalogName)}-`;
+            if (text.startsWith(sanitized)) text = text.slice(sanitized.length);
+            else if (text.startsWith(`${this.catalogName}-`)) text = text.slice(this.catalogName.length + 1);
+        }
         const dash = text.indexOf('-');
         const wanted = dash === -1 ? text : text.slice(0, dash);
         const tag = dash === -1 ? '' : text.slice(dash + 1);
@@ -246,8 +254,9 @@ export class Released {
             const view = await object.getView(at, at);
             const tables = new Map<string, TableDef>();
             for (const name of view.getTableNames()) tables.set(name, view.getTable(name)!);
+            const params = new Map<string, SchemaParamDecl>(view.getParams().map((p) => [p.name, p]));
             const schema: BaseSchema = {
-                id, name: object.getName(), at: [...cover].sort(), object, view, tables, creators: view.getCreators(),
+                id, name: object.getName(), at: [...cover].sort(), object, view, params, tables, creators: view.getCreators(),
             };
             const hashAlgorithm = object.hashAlgorithm();
             if (hashAlgorithm !== undefined) schema.hashAlgorithm = hashAlgorithm;
@@ -268,9 +277,10 @@ export class Released {
         const groups = new Map<string, BaseGroup>();
         for (const [hash, def] of fold.defs) {
             if (groups.has(def.name)) { clashes.push(`two group definitions are named ${def.name}`); continue; }
-            const model = groupModelOf(def, schemaById.get(def.schemaRef)!.name, (h) => fold.defs.get(h)!.name);
+            const foldedParams = fold.groups.get(hash)?.params ?? def.params ?? {};
+            const model = groupModelOf(def, schemaById.get(def.schemaRef)!.name, (h) => fold.defs.get(h)!.name, foldedParams);
             const groupPins = parents.map((p) => index.releaseState(p).groups.get(hash)).filter((g): g is CatalogGroupState => g !== undefined);
-            groups.set(def.name, { hash, def, model, pins: groupPins });
+            groups.set(def.name, { hash, def, model, params: foldedParams, pins: groupPins });
         }
 
         const files = new Map<string, BaseFiles>();
@@ -300,7 +310,7 @@ export class Released {
 }
 
 function schemaModelOf(schema: BaseSchema): SchemaModel {
-    const model: SchemaModel = { name: schema.name, creators: schema.creators, tables: schema.tables };
+    const model: SchemaModel = { name: schema.name, creators: schema.creators, params: new Map(schema.params), tables: schema.tables };
     if (schema.hashAlgorithm !== undefined) model.hashAlgorithm = schema.hashAlgorithm;
     return model;
 }

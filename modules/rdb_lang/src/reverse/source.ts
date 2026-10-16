@@ -4,9 +4,9 @@
 // the pins and the signatures.
 
 import type { json } from "@hyper-hyper-space/hhs3_json";
-import type { CatalogParamDecl, CatalogRowTemplate, Predicate, TableDef } from "@hyper-hyper-space/hhs3_rdb";
+import type { CatalogParamDecl, CatalogRowTemplate, Predicate, SchemaParamDecl, TableDef, TableMaps } from "@hyper-hyper-space/hhs3_rdb";
 
-import { renderIdent, renderLiteral, renderPredicate, renderTableDef } from "./render.js";
+import { renderBindingTableMap, renderGroupParams, renderIdent, renderLiteral, renderPredicate, renderSchemaParamDecls, renderTableDef } from "./render.js";
 
 // `$label`s for keys: by key id, and by public key (base64) for
 // `publicKey($label)`. A key without a label renders as a literal.
@@ -20,6 +20,7 @@ export type SourceCreator = { keyId: string; publicKey: string };
 export type SourceSchema = {
     name: string;
     creators: SourceCreator[];
+    params?: SchemaParamDecl[];
     hashAlgorithm?: string;
     tables: TableDef[];
 };
@@ -30,6 +31,8 @@ export type SourceGroup = {
     name: string;
     schema: string;
     bindings?: { [alias: string]: string };
+    tableMaps?: TableMaps;
+    params?: { [name: string]: json.Literal };
     idProvider?: string;
     canDeploy?: Predicate;
     canObserve?: { [binding: string]: Predicate };
@@ -76,6 +79,8 @@ export function renderSourceSchema(schema: SourceSchema, labels?: SourceKeyLabel
     const head = [`CREATE SCHEMA ${renderIdent(schema.name)}`];
     const creators = renderSourceCreators(schema.creators, labels);
     if (creators.length > 0) head.push(creators);
+    const params = renderSchemaParamDecls(schema.params);
+    if (params.length > 0) head.push(params);
     if (schema.hashAlgorithm !== undefined) head.push(`HASH ALGORITHM ${renderLiteral(schema.hashAlgorithm)}`);
     return `${head.join(' ')} AS (\n  ${schema.tables.map(renderSourceTable).join(',\n\n  ')}\n);`;
 }
@@ -97,13 +102,15 @@ export function renderSourceGroup(group: SourceGroup, options?: SourceGroupOptio
     const parts = [`${options?.keyword ?? 'TABLEGROUP'} ${renderIdent(group.name)} USING SCHEMA ${renderIdent(group.schema)}${at}`];
     const bindings = Object.entries(group.bindings ?? {});
     if (bindings.length > 0) {
-        parts.push(`BIND ${bindings.map(([alias, name]) => `${renderIdent(alias)} => ${renderIdent(name)}`).join(', ')}`);
+        parts.push(`BIND ${bindings.map(([alias, name]) => `${renderIdent(alias)} => ${renderIdent(name)}${renderBindingTableMap(group.tableMaps?.[alias])}`).join(', ')}`);
     }
     if (group.idProvider !== undefined) parts.push(`USING IDENTITIES ${renderIdent(group.idProvider)}`);
     if (group.canDeploy !== undefined) parts.push(`ALLOW DEPLOY IF ${renderPredicate(group.canDeploy)}`);
     for (const [binding, pred] of Object.entries(group.canObserve ?? {})) {
         parts.push(`ALLOW UPDATE REF ${renderIdent(binding)} IF ${renderPredicate(pred)}`);
     }
+    const withParams = renderGroupParams(group.params);
+    if (withParams.length > 0) parts.push(withParams);
     const rows: string[] = [];
     for (const [table, templates] of Object.entries(group.initialRows ?? {})) {
         for (const template of templates) rows.push(renderSourceRow(table, template, options?.labels));

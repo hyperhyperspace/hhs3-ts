@@ -4,7 +4,7 @@ import {
     BundlePayload, CatalogDeclarePayload, CatalogFilesDef, CatalogGroupDef, CatalogParamDecl, CatalogReleasePayload, CatalogRowTemplate,
     ColumnDef, CreateRCatalogPayload, CreateRDbPayload, CreateRSchemaPayload,
     CreateTableGroupPayload, InsertRowPayload, MigrationRule, ParamValue, Predicate,
-    RowEnvelopePayload, RowOpPayload, SchemaUpdatePayload, TableDef, UpdateCatalogPayload, UpdateRowPayload,
+    RowEnvelopePayload, RowOpPayload, SchemaParamDecl, SchemaUpdatePayload, TableDef, UpdateCatalogPayload, UpdateRowPayload,
     RCATALOG_TYPE_ID, RDB_TYPE_ID, RSCHEMA_TYPE_ID, RTABLE_GROUP_TYPE_ID,
     catalogGroupHash, formatPredicate, renderStringLiteral, versionKey,
 } from "@hyper-hyper-space/hhs3_rdb";
@@ -201,7 +201,8 @@ export function renderAlterCatalog(payload: CatalogReleasePayload, options?: Ren
         const schemaName = options?.resolveSchemaName?.(change.schema);
         const schema = renderObjectRef('schema', change.schema, schemaName, options);
         const version = renderVersionSet(change.version, { objectId: change.schema, objectName: schemaName ?? 'schema' }, options);
-        body.push(`UPDATE SCHEMA ${schema} TO ${version} ON ${renderDefRef(hash, defs)}`);
+        const withParams = renderGroupParams(change.params);
+        body.push(`UPDATE SCHEMA ${schema} TO ${version} ON ${renderDefRef(hash, defs)}${withParams.length > 0 ? ` ${withParams}` : ''}`);
     }
     for (const def of payload.add ?? []) {
         body.push(renderCatalogGroupDef('ADD TABLEGROUP', def, defs, options));
@@ -231,6 +232,30 @@ function renderDefRef(hash: B64Hash, defs: Map<B64Hash, CatalogGroupDef>): strin
     return clashes === 1 ? renderIdent(def.name) : `#${hash}`;
 }
 
+export function renderSchemaParamDecl(decl: SchemaParamDecl): string {
+    const def = decl.default !== undefined ? ` DEFAULT ${renderLiteral(decl.default)}` : '';
+    return `:${renderIdent(decl.name)} ${decl.type}${def}`;
+}
+
+export function renderSchemaParamDecls(params: SchemaParamDecl[] | undefined): string {
+    if (params === undefined || params.length === 0) return '';
+    return `PARAMS (${params.map(renderSchemaParamDecl).join(', ')})`;
+}
+
+export function renderGroupParams(params: { [name: string]: json.Literal } | undefined): string {
+    if (params === undefined) return '';
+    const entries = Object.entries(params).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    if (entries.length === 0) return '';
+    return `WITH PARAMS (${entries.map(([k, v]) => `:${renderIdent(k)} = ${renderLiteral(v)}`).join(', ')})`;
+}
+
+export function renderBindingTableMap(map: { [schemaTable: string]: string } | undefined): string {
+    if (map === undefined) return '';
+    const entries = Object.entries(map);
+    if (entries.length === 0) return '';
+    return ` (${entries.map(([from, to]) => `${renderIdent(from)} => ${renderIdent(to)}`).join(', ')})`;
+}
+
 function renderCatalogGroupDef(
     keyword: 'TABLEGROUP' | 'ADD TABLEGROUP',
     def: CatalogGroupDef,
@@ -243,13 +268,15 @@ function renderCatalogGroupDef(
     const parts = [`${keyword} ${renderIdent(def.name)} USING SCHEMA ${schema} AT ${pin}`];
     const bindings = Object.entries(def.bindings ?? {});
     if (bindings.length > 0) {
-        parts.push(`BIND ${bindings.map(([alias, hash]) => `${renderIdent(alias)} => ${renderDefRef(hash, defs)}`).join(', ')}`);
+        parts.push(`BIND ${bindings.map(([alias, hash]) => `${renderIdent(alias)} => ${renderDefRef(hash, defs)}${renderBindingTableMap(def.tableMaps?.[alias])}`).join(', ')}`);
     }
     if (def.idProvider !== undefined) parts.push(`USING IDENTITIES ${renderIdent(def.idProvider)}`);
     if (def.canDeploy !== undefined) parts.push(`ALLOW DEPLOY IF ${renderPredicate(def.canDeploy)}`);
     for (const [binding, pred] of Object.entries(def.canObserve ?? {})) {
         parts.push(`ALLOW UPDATE REF ${renderIdent(binding)} IF ${renderPredicate(pred)}`);
     }
+    const withParams = renderGroupParams(def.params);
+    if (withParams.length > 0) parts.push(withParams);
     const rows: string[] = [];
     for (const [table, templates] of Object.entries(def.initialRows ?? {})) {
         for (const template of templates) rows.push(renderRowTemplate(table, template, options));
@@ -291,12 +318,16 @@ export function renderGroupGenesis(payload: CreateTableGroupPayload, options?: R
 
 export function renderCreateSchema(payload: CreateRSchemaPayload, options?: RenderOptions): string {
     const creators = renderCreators(payload.creators, options);
+    const params = renderSchemaParamDecls(payload.params);
+    const paramsClause = params.length > 0 ? ` ${params}` : '';
     const tables = payload.tables.map(renderTableDef).join(',\n  ');
-    return `CREATE SCHEMA ${renderIdent(payload.name)}${creators} VERSION ${renderStringLiteral(payload.version)}${renderHashAlgorithm(payload.hashAlgorithm)} AS (\n  ${tables}\n);`;
+    return `CREATE SCHEMA ${renderIdent(payload.name)}${creators} VERSION ${renderStringLiteral(payload.version)}${paramsClause}${renderHashAlgorithm(payload.hashAlgorithm)} AS (\n  ${tables}\n);`;
 }
 
 export function renderSchemaUpdate(payload: SchemaUpdatePayload, options?: RenderOptions): string {
     const rules = payload.migration.map(renderMigrationRule).join(',\n  ');
+    const params = renderSchemaParamDecls(payload.params);
+    const paramsClause = params.length > 0 ? ` ${params}` : '';
     const schemaRef = options?.schemaRef ?? 'unknown';
     const comment = useComments(options) && options?.schemaName !== undefined ? `-- ${options.schemaName}\n` : '';
     const schemaTarget = schemaRef === 'unknown'
@@ -304,7 +335,8 @@ export function renderSchemaUpdate(payload: SchemaUpdatePayload, options?: Rende
         : (useAliases(options) && isFullProfile(options)
             ? renderObjectRef('schema', schemaRef as B64Hash, options?.schemaName, options)
             : `#${schemaRef}`);
-    return `${comment}ALTER SCHEMA ${schemaTarget} VERSION ${renderStringLiteral(payload.version)} AS (\n  ${rules}\n)${renderNote(payload.note)}${renderBy(payload.author, options)}${renderAt(options)};`;
+    const asBody = payload.migration.length > 0 ? ` AS (\n  ${rules}\n)` : '';
+    return `${comment}ALTER SCHEMA ${schemaTarget} VERSION ${renderStringLiteral(payload.version)}${paramsClause}${asBody}${renderNote(payload.note)}${renderBy(payload.author, options)}${renderAt(options)};`;
 }
 
 export function renderRowOp(payload: RowOpPayload, table?: string, options?: RenderOptions): string {

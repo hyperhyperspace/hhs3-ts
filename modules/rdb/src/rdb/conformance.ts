@@ -21,6 +21,7 @@
 // For each FILES member: its blob store and file map ids, and whether each is
 // present on this replica.
 
+import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { refVersionAtOrAbove } from "@hyper-hyper-space/hhs3_mvt";
 
@@ -50,6 +51,7 @@ export type MemberStatus = {
     target: B64Hash[];
     current?: B64Hash[];
     adopted?: B64Hash[];
+    differingParams?: string[];
     state: MemberState;
 };
 
@@ -146,6 +148,15 @@ export async function catalogStatus(rdb: RDbImpl): Promise<CatalogStatus> {
             else if (below) entry.state = 'behind';
             else if (above) entry.state = 'ahead';
             else entry.state = 'diverged';
+
+            const currentParams = await group.resolveGroupParams(frontier);
+            const differingParams = Object.entries(member.targetParams)
+                .filter(([name, targetVal]) =>
+                    currentParams[name] === undefined
+                    || json.toStringNormalized(currentParams[name]) !== json.toStringNormalized(targetVal))
+                .map(([name]) => name)
+                .sort();
+            if (differingParams.length > 0) entry.differingParams = differingParams;
         }
 
         status.members.push(entry);

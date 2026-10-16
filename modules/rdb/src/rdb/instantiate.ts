@@ -40,7 +40,7 @@ import { RBlobStoreImpl } from "../rblob_store/rblob_store.js";
 import type { CreateBlobStorePayload } from "../rblob_store/payload.js";
 import { RFileMapImpl } from "../rfile_map/rfile_map.js";
 import type { CreateFileMapPayload } from "../rfile_map/payload.js";
-import type { ReleaseState } from "../rcatalog/resolve.js";
+import { foldGroupParamWrites, type CatalogGroupState, type ReleaseState } from "../rcatalog/resolve.js";
 import { compareSemver } from "../semver.js";
 import type { ParamValue } from "./payload.js";
 
@@ -160,6 +160,18 @@ export function instantiateGroup(def: CatalogGroupDef, opts: {
         payload.bindings = bindings;
     }
 
+    if (def.tableMaps !== undefined && Object.keys(def.tableMaps).length > 0) {
+        const tableMaps: { [alias: string]: { [schemaTable: string]: string } } = {};
+        for (const [alias, map] of Object.entries(def.tableMaps)) {
+            tableMaps[alias] = { ...map };
+        }
+        payload.tableMaps = tableMaps;
+    }
+
+    if (def.params !== undefined && Object.keys(def.params).length > 0) {
+        payload.params = { ...def.params };
+    }
+
     if (def.canDeploy !== undefined) {
         payload.canDeploy = def.canDeploy;
     } else {
@@ -187,6 +199,7 @@ export type MemberGroup = {
     id: B64Hash;
     payload: CreateTableGroupPayload;
     target: Version;           // union of the group's versions across the deployed releases
+    targetParams: { [name: string]: json.Literal };   // folded group params across the deployed releases
 };
 
 // A computed FILES member of an RDb: its blob store and file map.
@@ -283,6 +296,7 @@ export function computeMembership(input: {
     const defs = new Map<B64Hash, CatalogGroupDef>();
     const filesDefs = new Map<B64Hash, CatalogFilesDef>();
     const targets = new Map<B64Hash, Set<B64Hash>>();
+    const groupStates = new Map<B64Hash, CatalogGroupState[]>();
     const rank = new Map<B64Hash, string>();
     const raise = (hash: B64Hash, release: ReleaseState) => {
         const current = rank.get(hash);
@@ -296,6 +310,9 @@ export function computeMembership(input: {
             const target = targets.get(hash) ?? new Set<B64Hash>();
             for (const h of group.version) target.add(h);
             targets.set(hash, target);
+            const states = groupStates.get(hash) ?? [];
+            states.push(group);
+            groupStates.set(hash, states);
             raise(hash, release);
         }
         for (const [hash, def] of release.files) {
@@ -323,6 +340,8 @@ export function computeMembership(input: {
         });
         const id = groupIdOf(payload);
         bindingIds[hash] = id;
+        const foldedParams = foldGroupParamWrites(groupStates.get(hash) ?? []).params;
+        const targetParams = Object.keys(foldedParams).length > 0 ? foldedParams : { ...(def.params ?? {}) };
         const member: MemberGroup = {
             catalogGroupHash: hash,
             name: names.get(hash)!,
@@ -330,6 +349,7 @@ export function computeMembership(input: {
             id,
             payload,
             target: new Set([...targets.get(hash)!].sort()),
+            targetParams,
         };
         byHash.set(hash, member);
         byId.set(id, member);

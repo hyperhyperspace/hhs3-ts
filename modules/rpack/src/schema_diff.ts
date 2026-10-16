@@ -20,10 +20,10 @@
 // Everything is added before anything refers to it, and after phase 3 nothing
 // that stays refers to what phases 4 and 5 remove.
 
-import { collectExistsAtoms, splitTableRef, type MigrationRule, type TableDef } from "@hyper-hyper-space/hhs3_rdb";
+import { collectExistsAtoms, splitTableRef, type MigrationRule, type SchemaParamDecl, type TableDef } from "@hyper-hyper-space/hhs3_rdb";
 
 import {
-    effectiveConcurrentDeletes, effectiveFks, sameColumn, sameConcurrentDeletes, sameFks, sameIdProvider, sameRestrictions,
+    effectiveConcurrentDeletes, effectiveFks, sameColumn, sameConcurrentDeletes, sameFks, sameIdProvider, sameParamDecl, sameRestrictions,
 } from "./model.js";
 import { UPGRADE_MANUAL_FILE } from "./project.js";
 import type { Where } from "./source.js";
@@ -225,4 +225,47 @@ function where(w: Where | undefined): { where?: Where } {
 // warning.
 export function isBreaking(rule: MigrationRule): boolean {
     return rule.rule === 'drop-table' || rule.rule === 'drop-column' || rule.rule.startsWith('set-');
+}
+
+export function diffSchemaParams(
+    schema: string,
+    current: Map<string, SchemaParamDecl> | undefined,
+    desired: Map<string, SchemaParamDecl> | undefined,
+    locate?: (param: string) => Where | undefined,
+): { added: SchemaParamDecl[]; refusals: Refusal[] } {
+    const cur = current ?? new Map<string, SchemaParamDecl>();
+    const des = desired ?? new Map<string, SchemaParamDecl>();
+    const refusals: Refusal[] = [];
+    const added: SchemaParamDecl[] = [];
+
+    for (const [name, decl] of [...cur].sort(([a], [b]) => byName(a, b))) {
+        const wanted = des.get(name);
+        if (wanted === undefined) {
+            refusals.push({
+                message: `schema ${schema}: param :${name} is missing; schema params can't be removed`,
+                ...where(locate?.(name)),
+            });
+            continue;
+        }
+        if (!sameParamDecl(decl, wanted)) {
+            refusals.push({
+                message: `schema ${schema}: param :${name} changes definition, and a schema param can't change`,
+                ...where(locate?.(name)),
+            });
+        }
+    }
+
+    for (const [name, decl] of [...des].sort(([a], [b]) => byName(a, b))) {
+        if (cur.has(name)) continue;
+        if (decl.default === undefined) {
+            refusals.push({
+                message: `schema ${schema}: new param :${name} needs a DEFAULT value`,
+                ...where(locate?.(name)),
+            });
+            continue;
+        }
+        added.push(decl);
+    }
+
+    return { added, refusals };
 }

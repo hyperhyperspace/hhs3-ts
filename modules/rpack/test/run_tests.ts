@@ -13,6 +13,7 @@ import {
     canonicalEntryOrder, exportRelease, installRelease, parseReleaseFile, releaseFileName, releaseTag,
     serializeReleaseFile, verifyRelease, type ReleaseEntry, type ReleaseFile,
 } from "../src/index.js";
+import { composabilityTests } from "./composability_tests.js";
 import { diffTests } from "./diff_tests.js";
 import { releaseTests } from "./release_tests.js";
 import { sourceTests } from "./source_tests.js";
@@ -251,7 +252,7 @@ const tests = [
     },
 ];
 
-tests.push(...diffTests, ...sourceTests, ...writeSourceTests, ...releaseTests);
+tests.push(...diffTests, ...sourceTests, ...writeSourceTests, ...releaseTests, ...composabilityTests);
 
 async function main() {
     const filters = process.argv.slice(2);

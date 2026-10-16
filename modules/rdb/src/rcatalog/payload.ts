@@ -34,7 +34,7 @@ import {
     MAX_SEED_LENGTH, MAX_HASH_ALGORITHM_LENGTH, MAX_HASH_LENGTH,
     MAX_KEY_ID_LENGTH, MAX_SIGNATURE_LENGTH, MAX_NOTE_LENGTH, MAX_CREATORS,
 } from "../rschema/payload.js";
-import { MAX_BINDINGS, MAX_INITIAL_ROWS_PER_TABLE } from "../rtable_group/payload.js";
+import { MAX_BINDINGS, MAX_INITIAL_ROWS_PER_TABLE, groupParamsFormat, tableMapsFormat, type GroupParams, type TableMaps } from "../rtable_group/payload.js";
 import { filesAccessFormat } from "../rfiles/access.js";
 import { MAX_SEMVER_LENGTH } from "../semver.js";
 
@@ -96,6 +96,8 @@ export type CatalogGroupDef = {
     schemaRef: B64Hash;
     schemaVersion: json.Set;
     bindings?: { [alias: string]: B64Hash };
+    tableMaps?: TableMaps;
+    params?: GroupParams;
     initialRows?: { [table: string]: CatalogRowTemplate[] };
     canDeploy?: Predicate;
     canObserve?: { [alias: string]: Predicate };
@@ -111,6 +113,8 @@ export const catalogGroupDefFormat: json.Format = {
         [json.Type.BoundedString, MAX_NAME_LENGTH],
         [json.Type.BoundedString, MAX_HASH_LENGTH],
         MAX_BINDINGS]],
+    tableMaps: [json.Type.Option, tableMapsFormat],
+    params: [json.Type.Option, groupParamsFormat],
     initialRows: [json.Type.Option, [json.Type.BoundedMap,
         [json.Type.BoundedString, MAX_NAME_LENGTH],
         [json.Type.BoundedArray, catalogRowTemplateFormat, MAX_INITIAL_ROWS_PER_TABLE],
@@ -152,11 +156,12 @@ export function catalogFilesHash(def: CatalogFilesDef): B64Hash {
 // A version change of an existing group. `schema` repeats the definition's
 // schemaRef so that foreign deps can be extracted from the payload alone.
 
-export type CatalogGroupChange = { schema: B64Hash; version: json.Set };
+export type CatalogGroupChange = { schema: B64Hash; version: json.Set; params?: GroupParams };
 
 export const catalogGroupChangeFormat: json.Format = {
     schema: [json.Type.BoundedString, MAX_HASH_LENGTH],
     version: versionSetFormat,
+    params: [json.Type.Option, groupParamsFormat],
 };
 
 export type CatalogReleaseBody = {

@@ -1,11 +1,11 @@
 import type { RObject } from "@hyper-hyper-space/hhs3_mvt";
 import {
     CatalogUpdateResult, ColumnConstraints, ColumnDef, CreateRCatalogPayload, CreateRDbPayload, CreateRSchemaPayload, FKs,
-    RCatalogImpl, RDbImpl, RSchemaImpl, Restriction, TableDef,
+    RCatalogImpl, RDbImpl, RSchemaImpl, Restriction, SchemaParamDecl, TableDef,
     deployCatalogRelease, normalizeBigint, normalizeDecimal,
 } from "@hyper-hyper-space/hhs3_rdb";
 
-import type { ColumnDecl, ColumnTypeName, TableDecl, ValueExpr } from "../syntax/ast.js";
+import type { ColumnDecl, ColumnTypeName, SchemaParamDeclExpr, TableDecl, ValueExpr } from "../syntax/ast.js";
 import { canonicalEncodeValue } from "../bind/values.js";
 import type { BoundCreateCatalog, BoundCreateDatabase, BoundCreateSchema, BoundCreateStatement } from "../bind/bind.js";
 import {
@@ -71,15 +71,41 @@ async function compileCreateCatalog(bound: BoundCreateCatalog): Promise<CreatePl
     return { kind: 'create-catalog', name: bound.ast.name, payload };
 }
 
+export function compileSchemaParamDecls(exprs: SchemaParamDeclExpr[] | undefined, requireDefault: boolean): SchemaParamDecl[] {
+    if (exprs === undefined || exprs.length === 0) return [];
+    const seen = new Set<string>();
+    return exprs.map((expr) => {
+        if (seen.has(expr.name)) throw new Error(`param ':${expr.name}' is declared twice`);
+        seen.add(expr.name);
+        const decl: SchemaParamDecl = { name: expr.name, type: expr.type };
+        if (expr.defaultValue !== undefined) {
+            if (expr.defaultValue.kind !== 'literal' || expr.defaultValue.value === null) {
+                throw new Error(`DEFAULT for param ':${expr.name}' must be a non-null literal`);
+            }
+            if (typeof expr.defaultValue.value === 'string' && expr.defaultValue.value.startsWith('$')) {
+                throw new Error(`DEFAULT for param ':${expr.name}' cannot start with '$'`);
+            }
+            decl.default = canonicalEncodeValue(expr.defaultValue.value, { type: expr.type } as ColumnDef);
+        } else if (requireDefault) {
+            throw new Error(`ALTER SCHEMA param ':${expr.name}' requires a DEFAULT value`);
+        }
+        return decl;
+    });
+}
+
 async function compileCreateSchema(bound: BoundCreateSchema): Promise<CreatePlan> {
     const columnsOf = columnsOfFromTableDecls(bound.ast.tables);
+    const params = compileSchemaParamDecls(bound.ast.params, false);
+    const paramNames = new Set(params.map((p) => p.name));
     const payload = await RSchemaImpl.create({
         name: bound.ast.name,
         version: bound.version,
         creators: bound.creators,
+        ...(params.length > 0 ? { params } : {}),
         tables: bound.ast.tables.map((table) => compileTable(table, {
             gated: { name: table.name, columns: columnSetFromTableDecl(table) },
             columnsOf,
+            ...(paramNames.size > 0 ? { params: paramNames } : {}),
         })),
         ...(bound.ast.hashAlgorithm !== undefined ? { hashAlgorithm: bound.ast.hashAlgorithm } : {}),
     });

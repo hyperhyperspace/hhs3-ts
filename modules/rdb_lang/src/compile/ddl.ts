@@ -5,13 +5,18 @@ import { columnSetFromTableDecl, type ColumnsOf, type RuleScope } from "./rule_s
 import { compileColumn, compileTable } from "./create.js";
 import { lowerRestrictionPredicate } from "./query.js";
 
-export function compileMigrationRules(rules: MigrationRuleExpr[], columnsOf: ColumnsOf): MigrationRule[] {
+export function compileMigrationRules(
+    rules: MigrationRuleExpr[],
+    columnsOf: ColumnsOf,
+    params?: Set<string>,
+): MigrationRule[] {
     return rules.map((rule) => {
         switch (rule.kind) {
             case 'add-table': {
                 const tableScope: RuleScope = {
                     gated: { name: rule.table.name, columns: columnSetFromTableDecl(rule.table) },
                     columnsOf,
+                    ...(params !== undefined ? { params } : {}),
                 };
                 return { rule: 'add-table', def: compileTable(rule.table, tableScope) };
             }
@@ -32,6 +37,7 @@ export function compileMigrationRules(rules: MigrationRuleExpr[], columnsOf: Col
                         ? { name: rule.table, columns: gatedCols }
                         : undefined,
                     columnsOf,
+                    ...(params !== undefined ? { params } : {}),
                 };
                 return {
                     rule: 'set-restrictions',

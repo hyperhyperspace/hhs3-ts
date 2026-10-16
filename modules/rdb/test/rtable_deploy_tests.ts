@@ -779,5 +779,89 @@ export const rtableDeployTests = {
                 }
             }
         },
+        {
+            name: '[DEPLOY19] schema params on RTableGroup: evaluation, per-param deploy fold, version-move requirement, and barrier voiding',
+            invoke: async () => {
+                const ctx = createMockRContext({ selfValidate: true });
+                ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
+                ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
+
+                const admin = await makeIdentity();
+                const schemaInit = await RSchemaImpl.create({
+                    name: 'dep19:schema',
+                    version: '1.0.0',
+                    creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
+                    params: [
+                        { name: 'max_qty', type: 'integer' },
+                        { name: 'prefix', type: 'string', default: 'ORD-' },
+                    ],
+                    tables: [{
+                        name: 'orders',
+                        columns: { code: { type: 'string', readonly: true }, qty: { type: 'integer', readonly: true } },
+                        restrictions: [{
+                            on: 'insert',
+                            rule: {
+                                p: 'and',
+                                args: [
+                                    { p: 'cmp', cmp: 'le', left: { col: 'qty' }, right: { param: 'max_qty' } },
+                                    { p: 'like', value: { col: 'code' }, pattern: { param: 'prefix' } },
+                                ],
+                            },
+                        }],
+                    }],
+                });
+                const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
+                const v100 = await schemaFrontier(schema);
+
+                const groupInit = await RTableGroupImpl.create({
+                    name: 'orders_group',
+                    seed: 'dep19-group',
+                    schemaRef: schema.getId(),
+                    schemaVersion: v100,
+                    params: { max_qty: 10, prefix: 'ORD-%' },
+                });
+                const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
+                const orders = await group.getTable('orders');
+
+                await orders.insert('o-1', { code: 'ORD-1', qty: 10 });
+                let overRejected = false;
+                try { await orders.insert('o-over', { code: 'ORD-2', qty: 11 }); } catch { overRejected = true; }
+                assertTrue(overRejected, 'qty > :max_qty is rejected');
+
+                // A deploy carrying params that does NOT move the schema version is rejected
+                let sameVerRejected = false;
+                try { await group.deploy(v100, undefined, undefined, { max_qty: 20 }); } catch { sameVerRejected = true; }
+                assertTrue(sameVerRejected, 'a deploy carrying params must advance the schema version');
+
+                // Advance schema to 1.1.0 and deploy with max_qty = 20; then advance to 1.2.0 and deploy without touching max_qty
+                const h110 = await schema.updateSchema([
+                    { rule: 'add-column', table: 'orders', column: 'note', def: { type: 'string', nullable: true } },
+                ], admin, { version: '1.1.0' });
+                await group.deploy(version(h110), undefined, undefined, { max_qty: 20 });
+
+                const h120 = await schema.updateSchema([
+                    { rule: 'add-column', table: 'orders', column: 'tag', def: { type: 'string', nullable: true } },
+                ], admin, { version: '1.2.0' });
+                await group.deploy(version(h120));
+
+                // Per-parameter fold keeps max_qty = 20 from the 1.1.0 deploy even though 1.2.0 didn't write max_qty
+                assertEquals((await group.resolveGroupParams())['max_qty'], 20, 'max_qty from 1.1.0 deploy persists across 1.2.0 deploy');
+                await orders.insert('o-2', { code: 'ORD-2', qty: 18 });
+
+                // Concurrent deploy barrier that lowers max_qty to 5 voids a concurrent insert of qty = 15 at merge
+                const forkAt = await groupFrontier(group);
+                const concurrentOrderId = deriveRowId('o-conc');
+                await orders.insert('o-conc', { code: 'ORD-3', qty: 15 }, undefined, forkAt);
+
+                const h130 = await schema.updateSchema([
+                    { rule: 'add-column', table: 'orders', column: 'extra', def: { type: 'string', nullable: true } },
+                ], admin, { version: '1.3.0' });
+                await group.deploy(version(h130), undefined, forkAt, { max_qty: 5 });
+
+                const merged = await groupFrontier(group);
+                assertFalse(await (await viewAt(group, 'orders', merged, merged)).hasRow(concurrentOrderId),
+                    'concurrent deploy tightening :max_qty to 5 voids the concurrent insert of qty = 15');
+            }
+        },
     ],
 };

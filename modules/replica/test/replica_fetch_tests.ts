@@ -286,10 +286,10 @@ async function testFetchTimeout() {
 
     let threw = false;
     try {
-        await bobReplica.fetchObject(setId, { timeoutMs: 500 });
+        await bobReplica.fetchObject(setId, { peerTimeoutMs: 200 });
     } catch (e: any) {
         threw = true;
-        assertTrue(e.message.includes('timed out'), 'error should mention timeout');
+        assertTrue(e.message.includes('no peer for'), `error should be the peer budget, got: ${e.message}`);
     }
     assertTrue(threw, 'fetchObject should throw on timeout');
 
@@ -331,10 +331,10 @@ async function testFetchPrefixIsNotId() {
 
     let threw = false;
     try {
-        await bobReplica.fetchObject(prefix, { timeoutMs: 500 });
+        await bobReplica.fetchObject(prefix, { peerTimeoutMs: 200 });
     } catch (e: any) {
         threw = true;
-        assertTrue(e.message.includes('timed out'), `error should mention timeout, got: ${e.message}`);
+        assertTrue(e.message.includes('no peer for'), `error should be the peer budget, got: ${e.message}`);
     }
     assertTrue(threw, 'fetchObject of a hash prefix should time out (topics are exact ids)');
 

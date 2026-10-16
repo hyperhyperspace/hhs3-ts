@@ -12,8 +12,8 @@ import {
 import type { RSchemaImpl } from "../src/rschema/rschema.js";
 import type { TableDef } from "../src/rschema/payload.js";
 import type { RTableGroupImpl } from "../src/rtable_group/group.js";
-import type { RCatalogImpl } from "../src/rcatalog/rcatalog.js";
-import type { CatalogGroupDef } from "../src/rcatalog/payload.js";
+import { RCatalogImpl } from "../src/rcatalog/rcatalog.js";
+import { catalogGroupHash, type CatalogGroupDef } from "../src/rcatalog/payload.js";
 import { RDbImpl } from "../src/rdb/rdb.js";
 import type { ParamValue } from "../src/rdb/payload.js";
 import { catalogStatus } from "../src/rdb/conformance.js";
@@ -503,6 +503,126 @@ export const rdbCatalogTests = {
                 const r12 = await catalog.release({ version: '1.2.0', changes: { [userHash]: change(userSchema, await frontierOf(userSchema)) } }, dev);
                 await deployCatalogRelease(rdb, { release: r12, author: admin });
                 await expectReadOnly('a dropped table');
+            }
+        },
+        {
+            name: '[RDBC12] a group binding multiple aliases to the same target group observes it once on deploy',
+            invoke: async () => {
+                const ctx = newCtx();
+                const dev = await makeIdentity();
+                const admin = await makeIdentity();
+                const spec: FixtureSpec = {
+                    dev,
+                    name: 'social',
+                    groups: [
+                        { name: 'people', tables: [openTable('profiles', { handle: { type: 'string' } })] },
+                        {
+                            name: 'follows',
+                            tables: [{
+                                name: 'follows',
+                                columns: { a: { type: 'string' }, b: { type: 'string' } },
+                                fks: { a: 'source.profiles', b: 'target.profiles' },
+                                restrictions: [{ on: 'all', rule: { p: 'true' } }],
+                            }],
+                            bindings: { source: 'people', target: 'people' },
+                        },
+                    ],
+                };
+                const { rdb, groups, schemas, catalog } = await catalogDatabase(ctx, spec, {
+                    seed: 'rdbc12', creators: [admin], author: admin,
+                });
+                const people = groups.get('people')!;
+                const follows = groups.get('follows')!;
+                const peopleHash = (await rdb.getMembership())!.byId.get(people.getId())!.catalogGroupHash;
+                const peopleSchema = schemas.get('people')!;
+
+                await peopleSchema.updateSchema([{ rule: 'add-column', table: 'profiles', column: 'bio', def: { type: 'string', nullable: true } }], dev);
+                const v2 = await frontierOf(peopleSchema);
+                const r11 = await catalog.release({ version: '1.1.0', changes: { [peopleHash]: change(peopleSchema, v2) } }, dev);
+
+                const result = await deployCatalogRelease(rdb, { release: r11, author: admin });
+                assertEquals(result.observed.filter((o) => o.groupId === follows.getId()).length, 1,
+                    'the planner appends only one observe entry when two aliases bind the same group');
+            }
+        },
+        {
+            name: '[RDBC13] schema params in RCatalog and RDb: validation, group id invariance, deploy catch-up, and write-based branch folding',
+            invoke: async () => {
+                const ctx = newCtx();
+                const dev = await makeIdentity();
+                const admin = await makeIdentity();
+                const creators = [{ keyId: dev.keyId, publicKey: dev.publicKey }];
+
+                const commentsSchema = (await ctx.createObject({
+                    action: 'create',
+                    type: 'hhs/rschema_v1',
+                    name: 'hhs:comments',
+                    version: '1.0.0',
+                    creators: creators.map((c) => ({ keyId: c.keyId, publicKey: serializePublicKeyToBase64(c.publicKey) })),
+                    params: [{ name: 'max_len', type: 'integer' }],
+                    tables: [{
+                        name: 'comments',
+                        columns: { body: { type: 'string', readonly: true } },
+                        restrictions: [{
+                            on: 'insert',
+                            rule: { p: 'cmp', cmp: 'le', left: { fn: 'len', args: [{ col: 'body' }] }, right: { param: 'max_len' } },
+                        }],
+                    }],
+                })) as RSchemaImpl;
+                const v100 = await frontierOf(commentsSchema);
+
+                const groupDef: CatalogGroupDef = {
+                    name: 'post_comments',
+                    seedSource: 'rdb',
+                    schemaRef: commentsSchema.getId(),
+                    schemaVersion: json.toSet([...v100]),
+                    params: { max_len: 10 },
+                };
+                const defHash = catalogGroupHash(groupDef);
+                const catalog = (await ctx.createObject(await RCatalogImpl.create({
+                    name: 'blog_app', creators, author: dev, version: '1.0.0', add: [groupDef],
+                }))) as RCatalogImpl;
+
+                const rdb = (await ctx.createObject(await RDbImpl.create({
+                    seed: 'rdbc13', catalog: catalog.getId(), release: catalog.getId(), creators: [admin],
+                }))) as RDbImpl;
+                await deployCatalogRelease(rdb, { release: catalog.getId(), author: admin });
+                const groupIdAt100 = (await rdb.getMemberGroupNames()).get('post_comments')!;
+
+                // Branch B: moves schema to 1.2.0 without touching :max_len
+                const h120 = await commentsSchema.updateSchema([
+                    { rule: 'add-column', table: 'comments', column: 'b', def: { type: 'string', nullable: true } },
+                ], dev, { version: '1.2.0', at: v100 });
+                const rB = await catalog.release({
+                    version: '1.2.0',
+                    changes: { [defHash]: { schema: commentsSchema.getId(), version: json.toSet([h120]) } },
+                }, dev, version(catalog.getId()));
+
+                // Branch C (concurrent from 1.0.0): moves schema to 1.1.0 and sets :max_len = 25
+                const h110 = await commentsSchema.updateSchema([
+                    { rule: 'add-column', table: 'comments', column: 'c', def: { type: 'string', nullable: true } },
+                ], dev, { version: '1.1.0', at: v100 });
+                const rC = await catalog.release({
+                    version: '1.1.0',
+                    changes: { [defHash]: { schema: commentsSchema.getId(), version: json.toSet([h110]), params: { max_len: 25 } } },
+                }, dev, version(catalog.getId()));
+
+                // Merge release 1.3.0: C's write of :max_len = 25 is the only write above 1.0.0, so it wins over B's inherited 10
+                const rMerge = await catalog.release({
+                    version: '1.3.0',
+                    changes: { [defHash]: { schema: commentsSchema.getId(), version: json.toSet([h120, h110]) } },
+                }, dev, version(rB, rC));
+                const mergeState = (await catalog.getView()).getRelease(rMerge)!;
+                assertEquals(mergeState.groups.get(defHash)?.params?.['max_len'], 25,
+                    'merge inherits :max_len = 25 from branch C (write beats inherited value from higher-schema-version branch B)');
+
+                // Deploy 1.3.0 to RDb: groupId is invariant, and planner deploys the updated param to the group
+                await deployCatalogRelease(rdb, { release: rMerge, author: admin });
+                assertEquals((await rdb.getMemberGroupNames()).get('post_comments'), groupIdAt100, 'groupId is invariant across param changes');
+                const group = (await ctx.getObject(groupIdAt100)) as RTableGroupImpl;
+                assertEquals((await group.resolveGroupParams())['max_len'], 25, 'group received :max_len = 25 on deploy');
+                const status = await catalogStatus(rdb);
+                assertEquals(status.members[0].differingParams, undefined, 'catalogStatus reports no differingParams after deploy');
             }
         },
     ],

@@ -4,6 +4,7 @@
 
 import { spawn } from "node:child_process";
 import { closeSync, promises as fs, writeSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { stderr, stdin, stdout } from "node:process";
 import type { Readable } from "node:stream";
@@ -23,16 +24,20 @@ import {
     askParam, checkHostName, chooseKey, chooseScope, hostDir, initApp, nodePlatform, openApp, readAppConfig, readLock,
     type Prompter,
 } from "@hyper-hyper-space/hhs3_rhost_node";
+import { parseReleaseFile, registryPath, releaseTag, resolveCatalogInRegistry } from "@hyper-hyper-space/hhs3_rpack";
 
 import { ttyPrompter } from "../src/host/tty_prompter.js";
+import { NodeProject } from "../src/rpack/node_project.js";
+
+const CATALOGS_DIR = 'catalogs';
 
 const USAGE = [
     'Usage: rhost [--app <dir>] <command>',
-    '  init --release <file>... [--param <name>=<value>]...',
+    '  init (--release <file>... | --catalog <name> [--version <v>] [--registry <dir>]) [--param <name>=<value>]...',
     '  create [<host>] [--catalog <name>] [--name <name>] [<host options>]',
     '  join <database-id> [<host>] [<host options>]',
     '  remove <host>',
-    '  update [<host>] [--yes]',
+    '  update [<host>] [--pull] [--major] [--registry <dir>] [--yes]',
     '  deploy [<host>] [--version <version>|<version>-<tag>|#<hash>] [--param <name>=<value>]...',
     '  status [<host>]',
     '  events [<host>] [--after <id>]',
@@ -166,11 +171,33 @@ function formatMesh(mesh: MeshConfig): string {
 
 // --- init ---
 
+function resolveRegistry(explicitFlag: string | undefined): string {
+    if (explicitFlag !== undefined) return resolve(explicitFlag);
+    const envReg = process.env.HHS_REGISTRY;
+    if (envReg !== undefined && envReg !== '') return resolve(envReg);
+    return join(homedir(), '.hhs', 'registry');
+}
+
 async function initCommand(dir: string, args: string[], prompter: Prompter): Promise<number> {
-    const parsed = parseArgs(args, ['--release', '--param'], []);
+    const parsed = parseArgs(args, ['--release', '--catalog', '--version', '--registry', '--param'], []);
     atMost(parsed, 0);
-    const releases = parsed.values.get('--release') ?? [];
-    if (releases.length === 0) throw new UsageError('init needs at least one --release <file>');
+    const releases = [...(parsed.values.get('--release') ?? [])];
+    const catalogName = single(parsed, '--catalog');
+    const versionSelector = single(parsed, '--version');
+    const registryFlag = single(parsed, '--registry');
+    if (catalogName !== undefined) {
+        const regDir = resolveRegistry(registryFlag);
+        const resolved = await resolveCatalogInRegistry(
+            new NodeProject(regDir),
+            catalogName,
+            versionSelector !== undefined ? { version: versionSelector } : {},
+        );
+        if (resolved === undefined) throw new Error(`catalog '${catalogName}' is not in the registry`);
+        releases.push(join(regDir, registryPath(catalogName), resolved.fileName));
+    } else if (versionSelector !== undefined) {
+        throw new UsageError('--version requires --catalog <name>');
+    }
+    if (releases.length === 0) throw new UsageError('init needs --release <file> or --catalog <name>');
     const result = await initApp(dir, { releases, params: Object.fromEntries(paramFlags(parsed)) }, prompter);
     print(`initialized ${resolve(dir)}`);
     print(`  releases  ${result.releases.join(', ')}`);
@@ -322,29 +349,70 @@ function formatUpdate(report: UpdateReport): string[] {
     return [parts.join('; '), ...(hint !== undefined ? [`  ${hint}`] : [])];
 }
 
-async function updateCommand(app: Rhost, args: string[], prompter: Prompter, here?: string): Promise<number> {
-    const parsed = parseArgs(args, [], ['--yes']);
+async function pullShippedCatalogs(dir: string, registryFlag: string | undefined, allowMajor: boolean): Promise<string[]> {
+    const regDir = resolveRegistry(registryFlag);
+    const registry = new NodeProject(regDir);
+    const catalogsPath = join(dir, CATALOGS_DIR);
+    let files: string[];
+    try {
+        files = (await fs.readdir(catalogsPath)).filter((f) => f.endsWith('.rpack')).sort();
+    } catch {
+        return [];
+    }
+    const pulled: string[] = [];
+    for (const fileName of files) {
+        const fullPath = join(catalogsPath, fileName);
+        const text = await fs.readFile(fullPath, 'utf8');
+        const current = parseReleaseFile(text);
+        const m = current.manifest;
+        const major = Number(m.version.split('.')[0]);
+        const newer = await resolveCatalogInRegistry(registry, m.name, {
+            catalogId: m.catalog,
+            afterRelease: m.release,
+            ...(!allowMajor && Number.isSafeInteger(major) ? { maxMajor: major } : {}),
+        });
+        if (newer === undefined || newer.file.manifest.release === m.release) continue;
+        const newPath = join(catalogsPath, newer.fileName);
+        await fs.writeFile(newPath, newer.text, 'utf8');
+        if (newPath !== fullPath) await fs.unlink(fullPath);
+        pulled.push(`pulled ${m.name} ${newer.file.manifest.version} (${releaseTag(newer.file.manifest.release)}) from registry`);
+    }
+    return pulled;
+}
+
+async function updateCommand(dir: string, args: string[], prompter: Prompter, here?: string): Promise<number> {
+    const parsed = parseArgs(args, ['--registry'], ['--yes', '--pull', '--major']);
     atMost(parsed, 1);
-    const name = parsed.positional[0] ?? here;
-    const names = name !== undefined ? [name] : await app.hosts();
-    if (names.length === 0) {
-        print('(no hosts)');
-        return 0;
+    if (parsed.switches.has('--pull')) {
+        await readAppConfig(dir);
+        const pulled = await pullShippedCatalogs(dir, single(parsed, '--registry'), parsed.switches.has('--major'));
+        for (const line of pulled) print(line);
     }
-    if (!await confirmAll('update', names, parsed.switches.has('--yes'), prompter)) {
-        print('nothing updated');
-        return 0;
-    }
-    let code = 0;
-    for (const n of names) {
-        try {
-            for (const line of formatUpdate((await app.update(n))[0]!)) print(line);
-        } catch (err) {
-            print(`${n}: ${(err as Error).message}`);
-            code = 1;
+    const app = await openApp(dir, { prompter });
+    try {
+        const name = parsed.positional[0] ?? here;
+        const names = name !== undefined ? [name] : await app.hosts();
+        if (names.length === 0) {
+            print('(no hosts)');
+            return 0;
         }
+        if (!await confirmAll('update', names, parsed.switches.has('--yes'), prompter)) {
+            print('nothing updated');
+            return 0;
+        }
+        let code = 0;
+        for (const n of names) {
+            try {
+                for (const line of formatUpdate((await app.update(n))[0]!)) print(line);
+            } catch (err) {
+                print(`${n}: ${(err as Error).message}`);
+                code = 1;
+            }
+        }
+        return code;
+    } finally {
+        await app.close();
     }
-    return code;
 }
 
 function formatStatus(status: HostStatus, pid: number | undefined): string[] {
@@ -691,6 +759,7 @@ async function main(): Promise<number> {
         if (command === 'stop') return await stopCommand(dir, rest, here);
         if (command === 'events') return await eventsCommand(dir, rest, here);
         if (command === 'whoami') return await whoamiCommand(dir, rest, here);
+        if (command === 'update') return await updateCommand(dir, rest, prompter, here);
         const serving = command === 'serve';
         const app = await openApp(dir, {
             prompter,
@@ -702,7 +771,6 @@ async function main(): Promise<number> {
                 case 'create': return await createCommand(app, rest, prompter);
                 case 'join': return await joinCommand(app, rest, prompter);
                 case 'remove': return await removeCommand(dir, app, rest);
-                case 'update': return await updateCommand(app, rest, prompter, here);
                 case 'deploy': return await deployCommand(app, rest, prompter, here);
                 case 'status': return await statusCommand(dir, app, rest, here);
                 case 'serve': return await serveCommand(app, rest, here);

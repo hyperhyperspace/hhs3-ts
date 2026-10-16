@@ -15,19 +15,22 @@
 // SCHEMA statements on schemas of its parents, compiled against the parents'
 // views the way the binder compiles an ALTER SCHEMA.
 
+import { version as versionOf } from "@hyper-hyper-space/hhs3_mvt";
 import {
     catalogGroupHash,
-    type CreateRCatalogPayload, type CreateRSchemaPayload, type MigrationRule, type RSchema, type RSchemaView, type TableDef,
+    type CreateRCatalogPayload, type CreateRSchemaPayload, type MigrationRule, type RSchema, type RSchemaView, type SchemaParamDecl, type TableDef,
 } from "@hyper-hyper-space/hhs3_rdb";
 import {
-    buildAlterColumnsOf, compileMigrationRules, parseScript,
-    type AstScript, type AstStatement, type AuthorExpr, type LangDiagnostic, type MigrationRuleExpr, type TextSpan, type VersionExpr,
+    buildAlterColumnsOf, compileMigrationRules, compileSchemaParamDecls, parseScript,
+    type AstScript, type AstStatement, type AuthorExpr, type LangDiagnostic, type MigrationRuleExpr, type SchemaParamDeclExpr, type TextSpan, type VersionExpr,
 } from "@hyper-hyper-space/hhs3_rdb_lang";
 import { LanguageError, RdbRuntime } from "@hyper-hyper-space/hhs3_rdb_runtime";
 
+import type { SchemaReleaseFile } from "./format.js";
 import { createStandIns, replaceKeys, type KeyDirectory } from "./keys.js";
 import { filesModelOf, groupModelOf, type CatalogModel, type FilesModel, type GroupModel, type SchemaModel } from "./model.js";
 import { SOURCE_FILE, UPGRADE_MANUAL_FILE } from "./project.js";
+import { replaySchemaSteps } from "./verify.js";
 
 export type Where = { file: string; line: number; column: number };
 
@@ -57,6 +60,7 @@ export type Locator = (unit: string) => Where | undefined;
 
 export const unitKey = {
     schema: (schema: string) => `schema ${schema}`,
+    schemaParam: (schema: string, param: string) => `schema-param ${schema} ${param}`,
     table: (schema: string, table: string) => `table ${schema} ${table}`,
     column: (schema: string, table: string, column: string) => `column ${schema} ${table} ${column}`,
     group: (group: string) => `group ${group}`,
@@ -86,6 +90,7 @@ const SOURCE_CATALOG_VERSION = '0.0.1';
 export type SourceExpect = {
     version?: string;
     note?: string;
+    imports?: Map<string, SchemaReleaseFile>;
 };
 
 export async function readSource(
@@ -102,20 +107,58 @@ export async function readSource(
     const standIns = await createStandIns(keys);
     const runtime = await RdbRuntime.openMemory({ keyVault: standIns.vault });
     try {
-        await runtime.session.unlockKey(signer, standIns.passphrase);
+        const standInIdentity = await runtime.session.unlockKey(signer, standIns.passphrase);
         runtime.session.selectAuthor(signer);
+
+        const schemas = new Map<string, SchemaModel>();
+        const replayedImports = new Map<string, { schemaId: string; schema: RSchema; at: ReturnType<typeof versionOf> }>();
+
+        for (const statement of script.statements) {
+            if (statement.kind !== 'import-schema') continue;
+            const key = `${statement.name}@${statement.version}`;
+            const pack = expect.imports?.get(key) ?? expect.imports?.get(statement.name);
+            if (pack === undefined || !pack.steps.some((s) => s.version === statement.version)) {
+                throw new SourceError([{
+                    message: `imported schema '${statement.name}' version '${statement.version}' is not in imports/ (run rpack import ${statement.name} ${statement.version})`,
+                    where: whereOf(file, statement.span),
+                }]);
+            }
+            const replayed = await replaySchemaSteps(
+                runtime.workspace.replica,
+                statement.name,
+                pack.steps,
+                standInIdentity,
+                [{ keyId: standInIdentity.keyId, publicKey: standInIdentity.publicKey }],
+                statement.version,
+            );
+            const entryHash = replayed.versionToEntry.get(statement.version)!;
+            const at = versionOf(entryHash);
+            replayedImports.set(key, { schemaId: replayed.schema.getId(), schema: replayed.schema, at });
+            const view = await replayed.schema.getView(at, at);
+            const includedSteps = pack.steps.filter((s) => replayed.stepToEntry.has(s.hash));
+            schemas.set(statement.name, {
+                name: statement.name,
+                creators: view.getCreators(),
+                params: new Map<string, SchemaParamDecl>(view.getParams().map((p) => [p.name, p])),
+                tables: new Map<string, TableDef>(view.getTableNames().map((t) => [t, view.getTable(t)!])),
+                origin: { kind: 'imported', version: statement.version, steps: includedSteps },
+            });
+        }
 
         const catalogVersion = expect.version ?? SOURCE_CATALOG_VERSION;
         let run;
         try {
             run = await runtime.execute(textForEval(text, script), {
-                source: { catalogVersion, schemaVersion: schemaStampOf(script, catalogVersion) },
+                source: {
+                    catalogVersion,
+                    schemaVersion: schemaStampOf(script, catalogVersion),
+                    imports: (name, ver) => replayedImports.get(`${name}@${ver}`),
+                },
             });
         } catch (err) {
             throw new SourceError(err instanceof LanguageError ? issuesOf(file, err.diagnostics).map(explainLabel) : [{ message: messageOf(err) }]);
         }
 
-        const schemas = new Map<string, SchemaModel>();
         let catalog: CreateRCatalogPayload | undefined;
         for (const item of run.results) {
             const result = item.result;
@@ -166,7 +209,9 @@ function schemaModelOf(payload: CreateRSchemaPayload): SchemaModel {
         name: payload.name,
         creators: payload.creators,
         ...(payload.hashAlgorithm !== undefined ? { hashAlgorithm: payload.hashAlgorithm } : {}),
+        params: new Map<string, SchemaParamDecl>((payload.params ?? []).map((p) => [p.name, p])),
         tables: new Map<string, TableDef>(payload.tables.map((t) => [t.name, t])),
+        origin: { kind: 'inline' },
     };
 }
 
@@ -212,6 +257,7 @@ function statedSchemaVersions(script: AstScript): Map<string, string> {
     const out = new Map<string, string>();
     for (const statement of script.statements) {
         if (statement.kind === 'create-schema' && statement.version !== undefined) out.set(statement.name, statement.version);
+        if (statement.kind === 'import-schema') out.set(statement.name, statement.version);
     }
     return out;
 }
@@ -222,7 +268,7 @@ function checkSourceForms(script: AstScript, file: string, signer: string, keys:
     const names = new Set<string>();
     let catalogs = 0;
     for (const statement of script.statements) {
-        if (statement.kind === 'create-schema') {
+        if (statement.kind === 'create-schema' || statement.kind === 'import-schema') {
             if (catalogs > 0) issues.push({ message: 'schemas come before the CREATE CATALOG', where: at(statement.span) });
             if (names.has(statement.name)) issues.push({ message: `schema ${statement.name} is defined twice`, where: at(statement.span) });
             names.add(statement.name);
@@ -290,6 +336,7 @@ function statementLabel(statement: AstStatement): string {
     switch (statement.kind) {
         case 'create-database': return `CREATE DATABASE ${statement.name}`;
         case 'create-schema': return 'CREATE SCHEMA';
+        case 'import-schema': return 'IMPORT SCHEMA';
         case 'create-catalog': return 'CREATE CATALOG';
         case 'alter-catalog': return 'ALTER CATALOG';
         case 'update-catalog': return 'UPDATE CATALOG';
@@ -314,10 +361,13 @@ function locatorOf(script: AstScript, file: string): Locator {
     for (const statement of script.statements) {
         if (statement.kind === 'create-schema') {
             units.set(unitKey.schema(statement.name), statement.span);
+            for (const p of statement.params ?? []) units.set(unitKey.schemaParam(statement.name, p.name), p.span);
             for (const table of statement.tables) {
                 units.set(unitKey.table(statement.name, table.name), table.span);
                 for (const column of table.columns) units.set(unitKey.column(statement.name, table.name, column.name), column.span);
             }
+        } else if (statement.kind === 'import-schema') {
+            units.set(unitKey.schema(statement.name), statement.span);
         } else if (statement.kind === 'create-catalog') {
             units.set(unitKey.catalog(), statement.span);
             for (const group of statement.groups) units.set(unitKey.group(group.name), group.span);
@@ -337,12 +387,18 @@ export type ReadNext = {
 };
 
 // `views` gives the parents' view of each schema by name.
-export function readNext(text: string, views: (schema: string) => RSchemaView | undefined, file = UPGRADE_MANUAL_FILE): ReadNext {
+export function readNext(
+    text: string,
+    views: (schema: string) => RSchemaView | undefined,
+    file = UPGRADE_MANUAL_FILE,
+    extraParams?: (schema: string) => Set<string> | undefined,
+): ReadNext {
     const parsed = parseScript(text);
     if (!parsed.ok) throw new SourceError(issuesOf(file, parsed.diagnostics));
 
     const issues: SourceIssue[] = [];
     const exprs = new Map<string, MigrationRuleExpr[]>();
+    const declaredParams = new Map<string, SchemaParamDeclExpr[]>();
     for (const statement of parsed.value.statements) {
         const where = whereOf(file, statement.span);
         if (statement.kind !== 'alter-schema') {
@@ -359,15 +415,22 @@ export function readNext(text: string, views: (schema: string) => RSchemaView | 
             issues.push({ message: `schema ${name} is not in the release's parents; a new schema is created from ${SOURCE_FILE} alone`, where });
             continue;
         }
+        if (statement.params !== undefined && statement.params.length > 0) {
+            declaredParams.set(name, [...(declaredParams.get(name) ?? []), ...statement.params]);
+        }
         exprs.set(name, [...(exprs.get(name) ?? []), ...statement.rules]);
     }
     if (issues.length > 0) throw new SourceError(issues);
 
     const rules = new Map<string, HandRule[]>();
     for (const [name, list] of exprs) {
+        const view = views(name)!;
+        const paramSet = new Set<string>(view.getParams().map((p) => p.name));
+        for (const p of extraParams?.(name) ?? []) paramSet.add(p);
+        for (const p of compileSchemaParamDecls(declaredParams.get(name), true)) paramSet.add(p.name);
         let compiled: MigrationRule[];
         try {
-            compiled = compileMigrationRules(list, buildAlterColumnsOf(views(name)!, list));
+            compiled = compileMigrationRules(list, buildAlterColumnsOf(view, list), paramSet.size > 0 ? paramSet : undefined);
         } catch (err) {
             throw new SourceError([{ message: `ALTER SCHEMA ${name}: ${messageOf(err)}`, where: whereOf(file, list[0]?.span) }]);
         }

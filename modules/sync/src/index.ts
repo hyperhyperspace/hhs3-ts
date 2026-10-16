@@ -4,6 +4,7 @@ export { createDagProvider } from './provider.js';
 export { createDagSynchronizer } from './synchronizer.js';
 export { createSyncSession } from './session.js';
 export { fetchInit } from './fetch_init.js';
+export type { FetchInitOptions } from './fetch_init.js';
 export type { DagProvider } from './provider.js';
 export type { DagSynchronizer } from './synchronizer.js';
 export type { SyncSession, SyncTarget, SendResult, SyncSessionOptions, SyncSessionDiagnostics } from './session.js';

@@ -3,7 +3,7 @@
 // states them; the signed release pins exact entries.
 
 import {
-    renderIdent, renderLiteral, renderMigrationRule, renderSourceCreators, renderSourceFiles, renderSourceGroup, renderSourceParams, renderSourceSchema,
+    renderGroupParams, renderIdent, renderLiteral, renderMigrationRule, renderSchemaParamDecls, renderSourceCreators, renderSourceFiles, renderSourceGroup, renderSourceParams, renderSourceSchema,
     type SourceKeyLabels,
 } from "@hyper-hyper-space/hhs3_rdb_lang";
 
@@ -33,12 +33,30 @@ export function formatDraftSql(plan: ReleaseDraft, labels?: SourceKeyLabels): st
     for (const step of plan.schemas) {
         if (lines.length > 0) lines.push('');
         if (step.kind === 'create') {
-            lines.push(...renderSourceSchema({
+            const params = step.schema.params !== undefined && step.schema.params.size > 0
+                ? [...step.schema.params.values()]
+                : undefined;
+            const rendered = renderSourceSchema({
                 name: step.schema.name,
                 creators: step.schema.creators,
+                ...(params !== undefined ? { params } : {}),
                 ...(step.schema.hashAlgorithm !== undefined ? { hashAlgorithm: step.schema.hashAlgorithm } : {}),
                 tables: [...step.schema.tables.values()],
-            }, labels).replace(/ AS \(\n/, ` VERSION ${quote(step.version)} AS (\n`).split('\n'));
+            }, labels);
+            const versionClause = ` VERSION ${quote(step.version)}`;
+            const withVer = rendered.includes(' PARAMS (')
+                ? rendered.replace(' PARAMS (', `${versionClause} PARAMS (`)
+                : rendered.includes(' HASH ALGORITHM ')
+                    ? rendered.replace(' HASH ALGORITHM ', `${versionClause} HASH ALGORITHM `)
+                    : rendered.replace(/ AS \(\n/, `${versionClause} AS (\n`);
+            lines.push(...withVer.split('\n'));
+            continue;
+        }
+        const paramsClause = step.params !== undefined && step.params.length > 0
+            ? ` ${renderSchemaParamDecls(step.params)}`
+            : '';
+        if (step.rules.length === 0) {
+            lines.push(`ALTER SCHEMA ${renderIdent(step.schema)} VERSION ${quote(step.version)}${paramsClause};`);
             continue;
         }
         const rules = step.rules.map((r, i) => {
@@ -46,7 +64,7 @@ export function formatDraftSql(plan: ReleaseDraft, labels?: SourceKeyLabels): st
             const comment = r.where !== undefined ? `    -- ${r.where.file}:${r.where.line}` : '';
             return `  ${renderMigrationRule(r.rule)}${separator}${comment}`;
         });
-        lines.push(`ALTER SCHEMA ${renderIdent(step.schema)} VERSION ${quote(step.version)} AS (`, ...rules.join('\n').split('\n'), ');');
+        lines.push(`ALTER SCHEMA ${renderIdent(step.schema)} VERSION ${quote(step.version)}${paramsClause} AS (`, ...rules.join('\n').split('\n'), ');');
     }
 
     if (lines.length > 0) lines.push('');
@@ -68,7 +86,10 @@ export function formatDraftSql(plan: ReleaseDraft, labels?: SourceKeyLabels): st
         const params = renderSourceParams(plan.params);
         if (params.length > 0) head.push(params);
         const body = [
-            ...plan.changes.map((c) => `UPDATE SCHEMA ${renderIdent(c.schema)} TO LATEST ON ${renderIdent(c.group)}`),
+            ...plan.changes.map((c) => {
+                const withParams = renderGroupParams(c.params);
+                return `UPDATE SCHEMA ${renderIdent(c.schema)} TO LATEST ON ${renderIdent(c.group)}${withParams.length > 0 ? ` ${withParams}` : ''}`;
+            }),
             ...plan.add.map((g) => renderSourceGroup(g, { ...(labels !== undefined ? { labels } : {}), keyword: 'ADD TABLEGROUP', pin: 'LATEST' })),
             ...plan.addFiles.map((f) => renderSourceFiles(f, { keyword: 'ADD FILES' })),
         ];

@@ -36,8 +36,10 @@ export function buildObservedBy(members: { group: RTableGroup }[]): Map<B64Hash,
     for (const m of members) {
         const observer = m.group;
         const observerId = observer.getId();
+        const seenForeignIds = new Set<B64Hash>();
         for (const [bindingName, foreignId] of Object.entries(observer.getBindings())) {
-            if (!memberIds.has(foreignId)) continue;
+            if (!memberIds.has(foreignId) || seenForeignIds.has(foreignId)) continue;
+            seenForeignIds.add(foreignId);
             const list = index.get(foreignId) ?? [];
             list.push({ observer, observerId, bindingName });
             index.set(foreignId, list);

@@ -192,7 +192,7 @@ export class Replica implements RContext {
 
     async fetchObject(
         id: B64Hash,
-        opts?: { meshLabel?: string; backendLabel?: string; timeoutMs?: number },
+        opts?: { meshLabel?: string; backendLabel?: string; timeoutMs?: number; peerTimeoutMs?: number },
     ): Promise<RObject> {
         const backendLabel = opts?.backendLabel ?? 'default';
 
@@ -207,7 +207,7 @@ export class Replica implements RContext {
     // so a caller can inspect its genesis deps before deciding to createObject.
     async fetchCreatePayload(
         id: B64Hash,
-        opts?: { meshLabel?: string; timeoutMs?: number },
+        opts?: { meshLabel?: string; timeoutMs?: number; peerTimeoutMs?: number },
     ): Promise<Payload> {
         const meshLabel = opts?.meshLabel ?? 'default';
         const mesh = this.getMesh(meshLabel) as Mesh;
@@ -215,7 +215,10 @@ export class Replica implements RContext {
 
         try {
             swarm.activate();
-            return await fetchInit(id, [swarm], this.hashSuite, opts?.timeoutMs);
+            return await fetchInit(id, [swarm], this.hashSuite, {
+                timeoutMs: opts?.timeoutMs,
+                peerTimeoutMs: opts?.peerTimeoutMs,
+            });
         } finally {
             swarm.destroy();
         }

@@ -40,6 +40,7 @@ export const MAX_MIGRATION_RULES = 1024;
 export const MAX_NOTE_LENGTH = 4096;
 export const MAX_CREATORS = 64;
 export const MAX_HASH_LENGTH = 128;
+export const MAX_SCHEMA_PARAMS = 64;
 
 // Upper bound on the length of a canonical numeric-string constraint bound
 // (constraints.min / constraints.max). Generous enough for very large bigint /
@@ -201,21 +202,41 @@ export function parseRowFieldTerm(s: string): string | undefined {
     return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(column) ? column : undefined;
 }
 
-// A `where` value is a literal, an identity term ($author), or a
-// subject-row field term ($row.<col>).
-export type WhereValue = json.Literal | IdTerm | RowFieldTerm;
+export const PARAM_TERM_PREFIX = '$param.';
+
+export type ParamTerm = string;   // matches /^\$param\.[a-zA-Z_][a-zA-Z0-9_]*$/
+
+export function parseParamTerm(s: string): string | undefined {
+    if (!s.startsWith(PARAM_TERM_PREFIX)) return undefined;
+    const name = s.substring(PARAM_TERM_PREFIX.length);
+    return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name) ? name : undefined;
+}
+
+// A `where` value is a literal, an identity term ($author), a subject-row
+// field term ($row.<col>), or a schema parameter term ($param.<name>).
+export type WhereValue = json.Literal | IdTerm | RowFieldTerm | ParamTerm;
 
 export type PredicateContext = 'row' | 'object';
 
-// Operand of a value expression (cmp / like atoms). `col` resolves to the
-// subject row's readonly column value ($row.<col>); arithmetic (add/sub/mul)
-// operates on integer, bigint, or decimal operands of the same type family,
-// `len` takes a string and yields an integer.
+// Operand of a query value expression (cmp / like atoms). `col` resolves to the
+// row's column value; arithmetic (add/sub/mul) operates on integer, bigint, or
+// decimal operands of the same type family, `len` takes a string and yields an
+// integer.
 export type Operand =
     | { lit: json.Literal }
     | { col: string }
     | { fn: 'add' | 'sub' | 'mul'; args: [Operand, Operand] }
     | { fn: 'len'; args: [Operand] };
+
+// Operand of a schema restriction rule: extends `Operand` with `{ param }`,
+// which resolves to a schema parameter's value on the group. Kept separate from
+// `Operand` so runtime table queries (`RTableView.query`) never accept `:param`.
+export type RuleOperand =
+    | { lit: json.Literal }
+    | { col: string }
+    | { param: string }
+    | { fn: 'add' | 'sub' | 'mul'; args: [RuleOperand, RuleOperand] }
+    | { fn: 'len'; args: [RuleOperand] };
 
 export const CMP_OPS = ['eq', 'ne', 'lt', 'le', 'gt', 'ge'] as const;
 export type CmpOp = typeof CMP_OPS[number];
@@ -228,8 +249,8 @@ export type Predicate =
     | { p: 'true' }
     | { p: 'false' }
     | { p: 'exists'; table: string; where: { [field: string]: WhereValue } }
-    | { p: 'cmp'; cmp: CmpOp; left: Operand; right: Operand }
-    | { p: 'like'; value: Operand; pattern: Operand }
+    | { p: 'cmp'; cmp: CmpOp; left: RuleOperand; right: RuleOperand }
+    | { p: 'like'; value: RuleOperand; pattern: RuleOperand }
     | { p: 'and'; args: Predicate[] }
     | { p: 'or'; args: Predicate[] };
 
@@ -374,6 +395,18 @@ export const RSCHEMA_TYPE_ID = 'hhs/rschema_v1';
 // wins (see resolve.ts), so the schema's author decides how concurrent lines
 // of one schema merge.
 
+export type SchemaParamDecl = {
+    name: string;
+    type: ColumnType;
+    default?: json.Literal;
+};
+
+export const schemaParamDeclFormat: json.Format = {
+    name: [json.Type.BoundedString, MAX_NAME_LENGTH],
+    type: [json.Type.Union, COLUMN_TYPES.map((t) => [json.Type.Constant, t] as json.Format)],
+    default: [json.Type.Option, json.Type.Something],
+};
+
 export const DEFAULT_SCHEMA_VERSION = '0.0.1';
 
 export type CreateRSchemaPayload = {
@@ -382,6 +415,7 @@ export type CreateRSchemaPayload = {
     name: string;
     version: string;
     creators: SchemaCreator[];             // may sign schema-updates; at least one
+    params?: SchemaParamDecl[];
     tables: TableDef[];
     hashAlgorithm?: string;
 };
@@ -392,6 +426,7 @@ export const createRSchemaFormat: json.Format = {
     name: [json.Type.BoundedString, MAX_NAME_LENGTH],
     version: [json.Type.BoundedString, MAX_SEMVER_LENGTH],
     creators: [json.Type.BoundedArray, schemaCreatorFormat, MAX_CREATORS],
+    params: [json.Type.Option, [json.Type.BoundedArray, schemaParamDeclFormat, MAX_SCHEMA_PARAMS]],
     tables: [json.Type.BoundedArray, tableDefFormat, MAX_TABLES],
     hashAlgorithm: [json.Type.Option, [json.Type.BoundedString, MAX_HASH_ALGORITHM_LENGTH]],
 };
@@ -402,7 +437,8 @@ export const createRSchemaFormat: json.Format = {
 export type SchemaUpdatePayload = {
     action: 'schema-update';
     version: string;
-    migration: MigrationRule[];            // the slot writes; at least one
+    params?: SchemaParamDecl[];
+    migration: MigrationRule[];            // the slot writes
     note?: string;
     author: KeyId;
     signature: string;
@@ -411,6 +447,7 @@ export type SchemaUpdatePayload = {
 export const schemaUpdateFormat: json.Format = {
     action: [json.Type.Constant, 'schema-update'],
     version: [json.Type.BoundedString, MAX_SEMVER_LENGTH],
+    params: [json.Type.Option, [json.Type.BoundedArray, schemaParamDeclFormat, MAX_SCHEMA_PARAMS]],
     migration: [json.Type.BoundedArray, migrationRuleFormat, MAX_MIGRATION_RULES],
     note: [json.Type.Option, [json.Type.BoundedString, MAX_NOTE_LENGTH]],
     author: [json.Type.BoundedString, MAX_KEY_ID_LENGTH],

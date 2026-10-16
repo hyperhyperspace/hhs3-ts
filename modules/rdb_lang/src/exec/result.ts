@@ -1,5 +1,6 @@
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { json } from "@hyper-hyper-space/hhs3_json";
+import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import type { CatalogUpdateResult, Row, RowQuery } from "@hyper-hyper-space/hhs3_rdb";
 
 import type { CreatePlan } from "../compile/create.js";
@@ -170,8 +171,17 @@ export type CreatePlanResult = {
     plan: CreatePlan;
 };
 
+export type ImportSchemaLangResult = {
+    kind: 'import-schema';
+    name: string;
+    version: string;
+    schemaId: B64Hash;
+    at: Version;
+};
+
 export type LangExecutionResult =
     | CreatePlanResult
+    | ImportSchemaLangResult
     | AlterCatalogLangResult
     | UpdateCatalogLangResult
     | UseDatabaseLangResult
