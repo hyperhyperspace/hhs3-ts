@@ -64,7 +64,7 @@ import type { RSchema, RSchemaView } from "../rschema/interfaces.js";
 import type { Predicate, SchemaCreator } from "../rschema/payload.js";
 import { splitTableRef } from "../rschema/payload.js";
 import { formatPredicate, formatRestrictionFailureReason } from "../rschema/format_predicate.js";
-import { collectExistsAtoms, findAuthorRestriction, predicateReferencesAuthor } from "../rschema/validate.js";
+import { collectExistsAtoms, columnValueMatchesType, columnValueValidReason, findAuthorRestriction, predicateReferencesAuthor } from "../rschema/validate.js";
 import { isValidTableRef } from "../rschema/validate.js";
 import type { RTable, RTableView } from "../rtable/interfaces.js";
 import type { InsertRowPayload, RowOpPayload } from "../rtable/payload.js";
@@ -691,9 +691,17 @@ async function validateDeploy(payload: RefAdvancePayload, group: GroupOpHost, at
 
     const deployParams = p['params'] as { [name: string]: json.Literal } | undefined;
     if (deployParams !== undefined) {
-        for (const name of Object.keys(deployParams)) {
-            if (newSchema.getParam(name) === undefined) {
+        for (const [name, value] of Object.entries(deployParams)) {
+            const decl = newSchema.getParam(name);
+            if (decl === undefined) {
                 return validationFailure(`schema deploy sets undeclared parameter ':${name}'`);
+            }
+            if (typeof value === 'string' && value.startsWith('$')) {
+                return validationFailure(`schema deploy: :${name} string value cannot start with '$'`);
+            }
+            if (!columnValueMatchesType(value, decl.type)) {
+                const reason = columnValueValidReason(value, { type: decl.type }) ?? `expected a ${decl.type}`;
+                return validationFailure(`schema deploy: :${name} (${decl.type}): ${reason}`);
             }
         }
         const currentVersion = await group.resolveSchemaVersion(at, at);

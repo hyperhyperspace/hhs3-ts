@@ -45,12 +45,12 @@ export type ExecuteTextOptions = AuthInteractionContext & {
     // Source mode (a catalog repository's target-catalog.sql): CREATE CATALOG may omit
     // VERSION, and takes catalogVersion. schemaVersion, when set, is the version
     // a CREATE SCHEMA with no VERSION is created at (the catalog's version).
-    // imports resolves IMPORT SCHEMA <name> VERSION '<v>' to an existing
-    // RSchema object and the position to pin it at.
+    // imports resolves IMPORT SCHEMA <name> VERSION '<v1>' [, '<v2>', ...]
+    // to an existing RSchema object and the position to pin it at.
     source?: {
         catalogVersion: string;
         schemaVersion?: string;
-        imports?: (name: string, version: string) => ResolvedImportedSchema | undefined | Promise<ResolvedImportedSchema | undefined>;
+        imports?: (name: string, versions: string[]) => ResolvedImportedSchema | undefined | Promise<ResolvedImportedSchema | undefined>;
     };
 };
 
@@ -111,6 +111,7 @@ export async function executeText(
     const baseContext = createBindContext(session);
     const importedSchemas = new Map<string, { schemaId: B64Hash; schema: RSchema; at: Version }>();
     const importedPins = new Map<B64Hash, Version>();
+    const importedPatchCount = new Map<string, number>();
     const declaredSchemas = new Set<string>();
 
     const context: LangBindContext = source !== undefined
@@ -118,11 +119,20 @@ export async function executeText(
             ...baseContext,
             defaultCatalogVersion: async () => source.catalogVersion,
             ...(source.schemaVersion !== undefined ? { defaultSchemaVersion: async () => source.schemaVersion } : {}),
-            resolveImport: async (name, ver) => {
+            defaultAlterSchemaVersion: async (schemaId) => {
+                for (const [name, imp] of importedSchemas) {
+                    if (imp.schemaId !== schemaId) continue;
+                    const n = (importedPatchCount.get(name) ?? 0) + 1;
+                    importedPatchCount.set(name, n);
+                    return `1000.0.${n}`;
+                }
+                return undefined;
+            },
+            resolveImport: async (name, versions) => {
                 if (declaredSchemas.has(name)) {
                     throw new Error(`schema ${name} is defined twice`);
                 }
-                const resolved = await source.imports?.(name, ver);
+                const resolved = await source.imports?.(name, versions);
                 if (resolved === undefined) return undefined;
                 const schemaObj = resolved.schema ?? (await session.workspace.replica.getObject(resolved.schemaId)) as unknown as RSchema | undefined;
                 if (schemaObj === undefined) return undefined;
@@ -182,6 +192,14 @@ export async function executeText(
         }
 
         const item: StatementRunResult = { result };
+        if (result.kind === 'alter-schema') {
+            for (const [name, imp] of importedSchemas) {
+                if (imp.schemaId !== result.schema) continue;
+                const at = version(result.entryHash);
+                importedSchemas.set(name, { ...imp, at });
+                importedPins.set(imp.schemaId, at);
+            }
+        }
         if (result.kind === 'create-plan') {
             const plan = result.plan;
             const object = await rejectedAt(statement.span, () => session.workspace.createRoot(plan));

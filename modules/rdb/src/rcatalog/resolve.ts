@@ -155,6 +155,10 @@ export class CatalogIndex {
         entries: Entry[],
         private readonly memo: Map<B64Hash, ReleaseState>,
         private readonly schemaSemvers: Map<string, string> = new Map(),
+        // Set when `schemaSemvers` is the result of a lookup. A missing key
+        // then throws. Left false for an index built from payloads alone,
+        // which has no schema objects to read a version from.
+        private readonly requireSchemaSemver = false,
     ) {
         let genesisHash: B64Hash | undefined;
         for (const entry of entries) {
@@ -324,7 +328,7 @@ export class CatalogIndex {
 
         const parents = this.parentsOf(this.prevs(hash));
         const fold = this.foldParents(parents);
-        const state = applyReleaseBody(hash, payload, parents, fold, this.schemaSemvers);
+        const state = applyReleaseBody(hash, payload, parents, fold, this.schemaSemvers, this.requireSchemaSemver);
         this.memo.set(hash, state);
         return state;
     }
@@ -339,6 +343,7 @@ export function applyReleaseBody(
     parents: B64Hash[],
     fold: ParentFold,
     schemaSemvers: Map<string, string> = new Map(),
+    requireSchemaSemver = false,
 ): ReleaseState {
     const groups = new Map(fold.groups);
     const defs = new Map(fold.defs);
@@ -346,8 +351,14 @@ export function applyReleaseBody(
     const params = new Map(fold.params);
     const ancestors = new Set(fold.ancestors);
 
-    const semverOf = (schemaRef: B64Hash, v: B64Hash[]) =>
-        schemaSemvers.get(schemaVersionLookupKey(schemaRef, v)) ?? '0.0.0';
+    const semverOf = (schemaRef: B64Hash, v: B64Hash[]) => {
+        const semver = schemaSemvers.get(schemaVersionLookupKey(schemaRef, v));
+        if (semver !== undefined) return semver;
+        if (requireSchemaSemver) {
+            throw new Error(`catalog release references schema ${schemaRef} at ${v.join(',')}, which is not available locally`);
+        }
+        return '0.0.0';
+    };
 
     const added: B64Hash[] = [];
     for (const def of body.add ?? []) {

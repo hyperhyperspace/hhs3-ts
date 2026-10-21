@@ -214,7 +214,8 @@ export async function evaluateRowRestrictionKey(
         schemaView,
         group.getIdProvider() !== undefined,
         (name) => groupView.getTableView(name),
-        (groupName, name) => group.resolveForeignTableView(groupName, name, at, at),
+        (groupName, name) => group.resolveSchemaForeignTableView(groupName, name, at, at),
+        await group.resolveEffectiveParams(at, at),
     );
 }
 

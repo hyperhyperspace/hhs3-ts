@@ -73,8 +73,7 @@ export const sourceTests = [
             const nobody = await issuesOf(() => readSource(`${USER_SCHEMA}\n${DOC_SCHEMA}\n${EDITOR_CATALOG.replace(/;$/, ' BY NOBODY;')}`, keys, 'dev'));
             assertTrue(nobody.includes("BY NOBODY does not match rpack.json's key 'dev'"), `BY NOBODY mismatches: ${nobody}`);
             const alter = await issuesOf(() => readSource(`${EDITOR_SOURCE}\nALTER SCHEMA hhs:doc AS (DROP COLUMN pages.title);`, keys, 'dev'));
-            assertTrue(alter.includes('ALTER SCHEMA does not belong in target-catalog.sql'), `ALTER is named: ${alter}`);
-            assertTrue(alter.includes('holds only CREATE SCHEMA statements and one CREATE CATALOG'), `ALTER still says what the file holds: ${alter}`);
+            assertTrue(alter.includes('schema hhs:doc is defined inline in target-catalog.sql'), `ALTER on an inline schema is named: ${alter}`);
             const database = await issuesOf(() => readSource(`${EDITOR_SOURCE}\nCREATE DATABASE app USING CATALOG editor BY $dev;`, keys, 'dev'));
             assertTrue(database.includes('CREATE DATABASE app does not belong in target-catalog.sql'), `CREATE DATABASE is named: ${database}`);
             const unknown = await issuesOf(() => readSource(EDITOR_SOURCE.replace('CREATE SCHEMA hhs:doc CREATORS ($dev)', 'CREATE SCHEMA hhs:doc CREATORS ($bob)'), keys, 'dev'));

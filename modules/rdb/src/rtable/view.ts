@@ -568,6 +568,7 @@ export class RTableViewImpl implements RTableView, TruthTableView {
         const fields = Object.keys(where);
         if (fields.length === 0) return FALSE;
         const schemaView = await this.schemaView();
+        if (!schemaView.hasTable(this.target.getTableName())) return FALSE;
         const pubColumns = new Set(schemaView.getPubColumns(this.target.getTableName()));
         for (const field of fields) {
             if (field === 'rowAuthor') {

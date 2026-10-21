@@ -186,6 +186,11 @@ export class RCatalogImpl implements RCatalogContract {
         for await (const entry of scopedDag.loadAllEntries()) entries.push(entry);
 
         const schemaSemvers = new Map<string, string>();
+        // A missing schema must not be recorded as 0.0.0 and then memoized.
+        // The index is still returned so callers can list referenced schemas
+        // (sync discovers them from this index), but it is not cached, and
+        // releaseState throws when it needs a semver that was not recorded.
+        let semverComplete = true;
         for (const entry of entries) {
             const payload = entry.payload as json.LiteralMap;
             const action = payload['action'];
@@ -196,19 +201,25 @@ export class RCatalogImpl implements RCatalogContract {
                 const lookupKey = schemaVersionLookupKey(schemaRef, hashes);
                 if (schemaSemvers.has(lookupKey)) return;
                 const obj = await this.ctx.getObject(schemaRef);
-                if (obj !== undefined && obj.getType() === RSCHEMA_TYPE_ID) {
-                    const v = version(...hashes);
-                    const view = await (obj as RSchema).getView(v, v);
-                    const semver = view.getVersions()[0];
-                    if (semver !== undefined) schemaSemvers.set(lookupKey, semver);
+                if (obj === undefined || obj.getType() !== RSCHEMA_TYPE_ID) {
+                    semverComplete = false;
+                    return;
                 }
+                const v = version(...hashes);
+                const view = await (obj as RSchema).getView(v, v);
+                const semver = view.getVersions()[0];
+                if (semver === undefined) {
+                    semverComplete = false;
+                    return;
+                }
+                schemaSemvers.set(lookupKey, semver);
             };
             for (const def of body.add ?? []) await recordSemver(def.schemaRef, def.schemaVersion);
             for (const change of Object.values(body.changes ?? {})) await recordSemver(change.schema, change.version);
         }
 
-        const index = new CatalogIndex(entries, this.releaseMemo, schemaSemvers);
-        this.indexCache = { key, index };
+        const index = new CatalogIndex(entries, this.releaseMemo, schemaSemvers, !semverComplete);
+        if (semverComplete) this.indexCache = { key, index };
         return index;
     }
 

@@ -21,7 +21,7 @@ import {
     type ReleaseEntry, type SchemaReleaseFile, type SchemaReleaseStep,
 } from "./format.js";
 import {
-    paramDifferences, sameColumn, sameConcurrentDeletes, sameIdProvider, sameParamDecl, sameRestrictions, sameTable, tableDifferences,
+    isPatchVersion, paramDifferences, PATCH_VERSION_RESERVED, sameColumn, sameConcurrentDeletes, sameIdProvider, sameParamDecl, sameRestrictions, sameTable, tableDifferences,
     type SchemaModel,
 } from "./model.js";
 import { SCHEMA_SOURCE_FILE, UPGRADE_MANUAL_FILE } from "./project.js";
@@ -92,6 +92,8 @@ export function readSchemaSource(
     if (stmt.version !== undefined) {
         if (!isValidSemver(stmt.version)) {
             issues.push({ message: `VERSION '${stmt.version}' is not a semver (major.minor.patch)`, where: whereOf(file, stmt.span) });
+        } else if (isPatchVersion(stmt.version)) {
+            issues.push({ message: `VERSION '${stmt.version}': ${PATCH_VERSION_RESERVED}`, where: whereOf(file, stmt.span) });
         } else if (expectedVersion !== undefined && stmt.version !== expectedVersion) {
             issues.push({
                 message: `CREATE SCHEMA: VERSION '${stmt.version}' does not match the release version '${expectedVersion}'`,
@@ -372,6 +374,7 @@ export async function draftSchemaRelease(inputs: {
     const refuse = (message: string, extra: { hint?: string; where?: Where } = {}) => plan.refusals.push({ message, ...extra });
 
     if (!isValidSemver(version)) refuse(`'${version}' is not a version (major.minor.patch)`);
+    else if (isPatchVersion(version)) refuse(`'${version}': ${PATCH_VERSION_RESERVED}`);
     for (const parent of parents) {
         if (isValidSemver(version) && compareSemver(version, parent.version) <= 0) {
             refuse(`${version} is not above its parent ${describeRelease(parent)}`);

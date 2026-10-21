@@ -35,7 +35,7 @@ async function executeRuntime(bound: BoundExecutableStatement): Promise<LangExec
             return {
                 kind: 'import-schema',
                 name: bound.name,
-                version: bound.version,
+                versions: bound.versions,
                 schemaId: bound.schemaId,
                 at: bound.at,
             };

@@ -74,6 +74,9 @@ export function compileParamDecls(exprs: CatalogParamDeclExpr[]): CatalogParamDe
     const seen = new Set<string>();
     return exprs.map((expr) => {
         if (seen.has(expr.name)) throw new Error(`param ':${expr.name}' is declared twice`);
+        if (expr.type === 'decimal') {
+            throw new SpannedError(`param ':${expr.name}' cannot be decimal: a param has no scale`, expr.span, 'VALIDATION_REJECTED');
+        }
         seen.add(expr.name);
         return { name: expr.name, type: expr.type };
     });

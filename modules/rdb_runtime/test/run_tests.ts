@@ -1,8 +1,10 @@
 import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519, type OwnIdentity, type SigningName } from "@hyper-hyper-space/hhs3_crypto";
-import { RSchemaImpl, type RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
+import { RSchemaImpl, RTableGroupImpl, type RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
+import { version } from "@hyper-hyper-space/hhs3_mvt";
 import { testing } from "@hyper-hyper-space/hhs3_util";
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import {
+    evaluateRowRestrictionKey,
     executeText,
     LanguageError,
     keyPassphraseRequiredFromError,
@@ -398,6 +400,57 @@ CREATE CATALOG stock_catalog VERSION '1.0.0' PARAMS (:qty integer) AS (
                 'Unknown key',
                 'unknown key rejected',
             );
+        },
+    },
+    {
+        name: '[RDB_RT15] author suggestion evaluates restrictions with the group\'s schema params',
+        invoke: async () => {
+            const runtime = await RdbRuntime.openMemory();
+            try {
+                const admin = await createIdentity(SIGNING_ED25519, createBasicCrypto().hash(HASH_SHA256));
+                const schema = (await runtime.workspace.replica.createObject(await RSchemaImpl.create({
+                    name: 'limited',
+                    version: '1.0.0',
+                    creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
+                    params: [{ name: 'max_qty', type: 'integer', default: 5 }],
+                    tables: [{
+                        name: 'orders',
+                        columns: { qty: { type: 'integer', readonly: true } },
+                        restrictions: [{
+                            on: 'insert',
+                            rule: { p: 'cmp', cmp: 'le', left: { col: 'qty' }, right: { param: 'max_qty' } },
+                        }],
+                    }],
+                }))) as RSchemaImpl;
+                const pin = version(...await (await schema.getScopedDag()).getFrontier());
+                const group = (await runtime.workspace.replica.createObject(await RTableGroupImpl.create({
+                    name: 'orders',
+                    seed: 'rt15',
+                    schemaRef: schema.getId(),
+                    schemaVersion: pin,
+                }))) as RTableGroupImpl;
+                const at = version(...await (await group.getScopedDag()).getFrontier());
+                const allowed = await evaluateRowRestrictionKey({
+                    kind: 'insert',
+                    ast: {} as never,
+                    table: { group, tableName: 'orders' } as never,
+                    values: { qty: 4 },
+                    at,
+                    uuid: 'row-1',
+                }, admin.keyId);
+                assertTrue(allowed, 'qty 4 passes against the schema default :max_qty = 5');
+                const rejected = await evaluateRowRestrictionKey({
+                    kind: 'insert',
+                    ast: {} as never,
+                    table: { group, tableName: 'orders' } as never,
+                    values: { qty: 9 },
+                    at,
+                    uuid: 'row-2',
+                }, admin.keyId);
+                assertTrue(!rejected, 'qty 9 fails against :max_qty = 5');
+            } finally {
+                await runtime.close();
+            }
         },
     },
 ];

@@ -18,7 +18,7 @@ import {
 
 import { exportRelease } from "./export.js";
 import { releaseFileName, serializeReleaseFile, type ReleaseFile } from "./format.js";
-import { modelDifferences, type GroupModel } from "./model.js";
+import { isPatchVersion, modelDifferences, patchVersion, type GroupModel } from "./model.js";
 import type { ReleaseDraft } from "./draft.js";
 import { SOURCE_FILE } from "./project.js";
 import type { Released } from "./released.js";
@@ -65,7 +65,10 @@ export async function produceRelease(
         schemaObjects.set(name, schema.object);
         pins.set(name, schema.at);
     }
-    for (const [name, pin] of draft.pins) if (pin.kind === 'entries') pins.set(name, pin.entries);
+    for (const [name, pin] of draft.pins) {
+        if (pin.kind === 'entries') pins.set(name, pin.entries);
+        else if (pin.kind === 'update' && pin.from !== undefined) pins.set(name, pin.from);
+    }
 
     for (const step of draft.schemas) {
         if (step.kind === 'create') {
@@ -92,16 +95,26 @@ export async function produceRelease(
             if (step.parentStepHashes !== undefined) {
                 for (const p of step.parentStepHashes) {
                     const mapped = stepToEntry.get(p);
-                    if (mapped !== undefined) atHashes.push(mapped);
+                    if (mapped === undefined) {
+                        throw new ProduceError(`schema ${step.schema}: parent step ${p} was not published before ${step.version}`);
+                    }
+                    atHashes.push(mapped);
                 }
             }
-            if (atHashes.length === 0) atHashes.push(...(pins.get(step.schema) ?? base!.schemas.get(step.schema)!.at));
+            if (atHashes.length === 0) {
+                if (step.stepHash !== undefined || step.at !== undefined || step.parentStepHashes !== undefined) {
+                    throw new ProduceError(`schema ${step.schema}: upstream step ${step.version} resolves no parents`);
+                }
+                atHashes.push(...(pins.get(step.schema) ?? base!.schemas.get(step.schema)!.at));
+            }
+            const covered = [...await (await schemaObj.getScopedDag()).findMinimalCover(versionOf(...atHashes))].sort();
+            const note = isPatchVersion(step.version) ? options.note : step.note;
 
             const hash = await schemaObj.updateSchema(step.rules.map((r) => r.rule), key, {
                 version: step.version,
                 ...(step.params !== undefined && step.params.length > 0 ? { params: step.params } : {}),
-                ...(step.note !== undefined ? { note: step.note } : {}),
-                at: versionOf(...atHashes),
+                ...(note !== undefined ? { note } : {}),
+                at: versionOf(...covered),
             });
             if (step.stepHash !== undefined) stepToEntry.set(step.stepHash, hash);
             const cover = await (await schemaObj.getScopedDag()).findMinimalCover(
@@ -191,10 +204,22 @@ export async function produceRelease(
     const after = await released.base([release]);
     const left = modelDifferences(after.model, draft.desired);
     if (left.length > 0) throw new ProduceError(`the release doesn't describe ${SOURCE_FILE} (a bug in rpack): ${left.join('; ')}`);
-    for (const step of draft.schemas) {
-        const name = step.kind === 'create' ? step.schema.name : step.schema;
+    const patch = patchVersion(draft.version);
+    for (const [name, model] of draft.desired.schemas) {
         const versions = after.schemas.get(name)?.view.getVersions() ?? [];
-        if (versions.length !== 1 || versions[0] !== step.version) {
+        if (model.origin?.kind === 'imported') {
+            const allowed = new Set<string>([...model.origin.versions, patch]);
+            for (const version of draft.base?.schemas.get(name)?.view.getVersions() ?? []) {
+                if (isPatchVersion(version)) allowed.add(version);
+            }
+            const stray = versions.filter((v) => !allowed.has(v));
+            if (stray.length > 0) {
+                throw new ProduceError(`schema ${name} is at ${versions.join(', ')}, which is not its import or its local patch (a bug in rpack)`);
+            }
+            continue;
+        }
+        const step = [...draft.schemas].reverse().find((s) => (s.kind === 'create' ? s.schema.name : s.schema) === name);
+        if (step !== undefined && (versions.length !== 1 || versions[0] !== step.version)) {
             throw new ProduceError(`schema ${name} is at ${versions.join(', ') || 'no version'} in the release, not ${step.version} (a bug in rpack)`);
         }
     }

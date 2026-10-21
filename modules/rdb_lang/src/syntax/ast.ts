@@ -32,8 +32,8 @@ export type AstStatement =
 export type ImportSchemaStatement = {
     kind: 'import-schema';
     name: string;
-    version: string;
-    versionSpan: TextSpan;
+    versions: string[];
+    versionsSpan: TextSpan;
     span: TextSpan;
 };
 

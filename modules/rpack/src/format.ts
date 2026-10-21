@@ -21,6 +21,8 @@ import {
     type MigrationRule, type SchemaParamDecl, type TableDef,
 } from "@hyper-hyper-space/hhs3_rdb";
 
+import { isPatchVersion, PATCH_VERSION_RESERVED } from "./model.js";
+
 export const RELEASE_FILE_FORMAT = 1;
 
 export type ReleaseManifest = {
@@ -214,7 +216,16 @@ export function checkSchemaReleaseFile(value: unknown): SchemaReleaseFile {
         }
     });
 
-    return value as unknown as SchemaReleaseFile;
+    const file = value as unknown as SchemaReleaseFile;
+    if (isPatchVersion(file.manifest.version)) {
+        throw new ReleaseFileError(`schema release version '${file.manifest.version}': ${PATCH_VERSION_RESERVED}`);
+    }
+    file.steps.forEach((step, i) => {
+        if (isPatchVersion(step.version)) {
+            throw new ReleaseFileError(`step ${i} version '${step.version}': ${PATCH_VERSION_RESERVED}`);
+        }
+    });
+    return file;
 }
 
 export function checkAnyReleaseFile(value: unknown): AnyReleaseFile {

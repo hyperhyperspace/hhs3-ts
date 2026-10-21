@@ -9,16 +9,40 @@
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import {
-    DEFAULT_CONCURRENT_DELETES, defaultRestrictionRule,
+    DEFAULT_CONCURRENT_DELETES, defaultRestrictionRule, parseSemver,
     type CatalogFilesDef, type CatalogGroupDef, type CatalogParamDecl, type ColumnDef, type FKs, type Predicate, type SchemaCreator, type SchemaParamDecl, type TableDef,
 } from "@hyper-hyper-space/hhs3_rdb";
 import type { SourceFiles, SourceGroup } from "@hyper-hyper-space/hhs3_rdb_lang";
 
 import type { SchemaReleaseStep } from "./format.js";
 
+// Local patches on an imported schema use major >= 1000. A catalog release
+// C = catMajor.catMinor.catPatch (catMajor < 1000) writes its patch as
+// (1000 + catMajor).catMinor.catPatch.
+export const PATCH_MAJOR_BASE = 1000;
+export const PATCH_VERSION_RESERVED = 'major version 1000 and above is reserved for local schema patches';
+
+export function isPatchVersion(version: string): boolean {
+    const parsed = parseSemver(version);
+    return parsed !== undefined && parsed.major >= PATCH_MAJOR_BASE;
+}
+
+export function patchVersion(catalogVersion: string): string {
+    const parsed = parseSemver(catalogVersion);
+    if (parsed === undefined || parsed.major >= PATCH_MAJOR_BASE) {
+        throw new Error(`'${catalogVersion}' is not a catalog version (${PATCH_VERSION_RESERVED})`);
+    }
+    return `${PATCH_MAJOR_BASE + parsed.major}.${parsed.minor}.${parsed.patch}`;
+}
+
 export type SchemaOrigin =
     | { kind: 'inline' }
-    | { kind: 'imported'; version: string; steps: SchemaReleaseStep[] };
+    | {
+        kind: 'imported';
+        versions: string[];
+        steps: SchemaReleaseStep[];
+        upstream: { tables: Map<string, TableDef>; params: Map<string, SchemaParamDecl> };
+    };
 
 export type SchemaModel = {
     name: string;

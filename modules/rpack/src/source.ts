@@ -15,6 +15,7 @@
 // SCHEMA statements on schemas of its parents, compiled against the parents'
 // views the way the binder compiles an ALTER SCHEMA.
 
+import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { version as versionOf } from "@hyper-hyper-space/hhs3_mvt";
 import {
     catalogGroupHash,
@@ -26,9 +27,9 @@ import {
 } from "@hyper-hyper-space/hhs3_rdb_lang";
 import { LanguageError, RdbRuntime } from "@hyper-hyper-space/hhs3_rdb_runtime";
 
-import type { SchemaReleaseFile } from "./format.js";
+import { canonicalEntryOrder, type ReleaseEntry, type SchemaReleaseFile, type SchemaReleaseStep } from "./format.js";
 import { createStandIns, replaceKeys, type KeyDirectory } from "./keys.js";
-import { filesModelOf, groupModelOf, type CatalogModel, type FilesModel, type GroupModel, type SchemaModel } from "./model.js";
+import { filesModelOf, groupModelOf, isPatchVersion, PATCH_VERSION_RESERVED, type CatalogModel, type FilesModel, type GroupModel, type SchemaModel } from "./model.js";
 import { SOURCE_FILE, UPGRADE_MANUAL_FILE } from "./project.js";
 import { replaySchemaSteps } from "./verify.js";
 
@@ -115,33 +116,38 @@ export async function readSource(
 
         for (const statement of script.statements) {
             if (statement.kind !== 'import-schema') continue;
-            const key = `${statement.name}@${statement.version}`;
-            const pack = expect.imports?.get(key) ?? expect.imports?.get(statement.name);
-            if (pack === undefined || !pack.steps.some((s) => s.version === statement.version)) {
-                throw new SourceError([{
-                    message: `imported schema '${statement.name}' version '${statement.version}' is not in imports/ (run rpack import ${statement.name} ${statement.version})`,
-                    where: whereOf(file, statement.span),
-                }]);
-            }
+            const where = whereOf(file, statement.span);
+            const steps = unionImportedSteps(statement.name, statement.versions, expect.imports, where);
             const replayed = await replaySchemaSteps(
                 runtime.workspace.replica,
                 statement.name,
-                pack.steps,
+                steps,
                 standInIdentity,
                 [{ keyId: standInIdentity.keyId, publicKey: standInIdentity.publicKey }],
-                statement.version,
             );
-            const entryHash = replayed.versionToEntry.get(statement.version)!;
-            const at = versionOf(entryHash);
-            replayedImports.set(key, { schemaId: replayed.schema.getId(), schema: replayed.schema, at });
+            const heads = statement.versions.map((v) => {
+                const hash = replayed.versionToEntry.get(v);
+                if (hash === undefined) {
+                    throw new SourceError([{ message: `imported schema '${statement.name}' has no step for version '${v}'`, where }]);
+                }
+                return hash;
+            });
+            const at = versionOf(...heads);
+            replayedImports.set(statement.name, { schemaId: replayed.schema.getId(), schema: replayed.schema, at });
             const view = await replayed.schema.getView(at, at);
-            const includedSteps = pack.steps.filter((s) => replayed.stepToEntry.has(s.hash));
+            const upstreamTables = new Map<string, TableDef>(view.getTableNames().map((t) => [t, view.getTable(t)!]));
+            const upstreamParams = new Map<string, SchemaParamDecl>(view.getParams().map((p) => [p.name, p]));
             schemas.set(statement.name, {
                 name: statement.name,
                 creators: view.getCreators(),
-                params: new Map<string, SchemaParamDecl>(view.getParams().map((p) => [p.name, p])),
-                tables: new Map<string, TableDef>(view.getTableNames().map((t) => [t, view.getTable(t)!])),
-                origin: { kind: 'imported', version: statement.version, steps: includedSteps },
+                params: new Map(upstreamParams),
+                tables: new Map(upstreamTables),
+                origin: {
+                    kind: 'imported',
+                    versions: [...statement.versions],
+                    steps,
+                    upstream: { tables: upstreamTables, params: upstreamParams },
+                },
             });
         }
 
@@ -152,11 +158,14 @@ export async function readSource(
                 source: {
                     catalogVersion,
                     schemaVersion: schemaStampOf(script, catalogVersion),
-                    imports: (name, ver) => replayedImports.get(`${name}@${ver}`),
+                    imports: (name) => replayedImports.get(name),
                 },
             });
         } catch (err) {
-            throw new SourceError(err instanceof LanguageError ? issuesOf(file, err.diagnostics).map(explainLabel) : [{ message: messageOf(err) }]);
+            const issues = err instanceof LanguageError
+                ? issuesOf(file, err.diagnostics).map(explainLabel).map((issue) => columnResetHint(issue, schemas))
+                : [{ message: messageOf(err) }];
+            throw new SourceError(issues);
         }
 
         let catalog: CreateRCatalogPayload | undefined;
@@ -171,6 +180,16 @@ export async function readSource(
             }
         }
         if (catalog === undefined) throw new SourceError([{ message: `${file} has no CREATE CATALOG` }]);
+
+        for (const [name, model] of schemas) {
+            if (model.origin?.kind !== 'imported') continue;
+            const replayed = replayedImports.get(name)!;
+            const frontier = await (await replayed.schema.getScopedDag()).getFrontier();
+            const at = versionOf(...frontier);
+            const view = await replayed.schema.getView(at, at);
+            model.params = new Map(view.getParams().map((p) => [p.name, p]));
+            model.tables = new Map(view.getTableNames().map((t) => [t, view.getTable(t)!]));
+        }
 
         const defNames = new Map((catalog.add ?? []).map((def) => [catalogGroupHash(def), def.name]));
         const groups = new Map<string, GroupModel>();
@@ -215,6 +234,104 @@ function schemaModelOf(payload: CreateRSchemaPayload): SchemaModel {
     };
 }
 
+const COLUMN_EXISTS = /column '([^']+)\.([^']+)' already exists/;
+
+function columnResetHint(issue: SourceIssue, schemas: Map<string, SchemaModel>): SourceIssue {
+    const match = COLUMN_EXISTS.exec(issue.message);
+    if (match === null) return issue;
+    const table = match[1]!;
+    const column = match[2]!;
+    for (const model of schemas.values()) {
+        if (model.origin?.kind !== 'imported') continue;
+        if (model.origin.upstream.tables.get(table)?.columns[column] === undefined) continue;
+        return {
+            ...issue,
+            message: `${issue.message} (precede ADD COLUMN ${table}.${column} with DROP COLUMN ${table}.${column}, or remove the ADD COLUMN if upstream newly adopted a column the local patch already had)`,
+        };
+    }
+    return issue;
+}
+
+function unionImportedSteps(
+    name: string,
+    versions: string[],
+    imports: Map<string, SchemaReleaseFile> | undefined,
+    where: Where | undefined,
+): SchemaReleaseStep[] {
+    const refuse = (message: string): never => { throw new SourceError([{ message, where }]); };
+    const byHash = new Map<B64Hash, SchemaReleaseStep>();
+    const hashOfVersion = new Map<string, B64Hash>();
+    for (const version of versions) {
+        const pack = imports?.get(`${name}@${version}`);
+        if (pack === undefined || !pack.steps.some((s) => s.version === version)) {
+            refuse(`imported schema '${name}' version '${version}' is not in imports/ (run rpack import ${name} ${version})`);
+        }
+        for (const step of pack!.steps) {
+            const prior = hashOfVersion.get(step.version);
+            if (prior !== undefined && prior !== step.hash) {
+                refuse(`imported versions of '${name}' disagree on step version '${step.version}'`);
+            }
+            hashOfVersion.set(step.version, step.hash);
+            byHash.set(step.hash, step);
+        }
+    }
+    const steps = [...byHash.values()];
+    if (steps.filter((s) => s.parents.length === 0).length !== 1) {
+        refuse(`imported versions of '${name}' do not share a common genesis step`);
+    }
+    const ordered = (() => {
+        try {
+            const entries: ReleaseEntry[] = steps.map((s) => ({ hash: s.hash, prevs: [...s.parents], payload: {} }));
+            return canonicalEntryOrder(entries).map((e) => byHash.get(e.hash)!);
+        } catch (err) {
+            return refuse(messageOf(err));
+        }
+    })();
+    const listed = versions.map((v) => byHash.get(hashOfVersion.get(v)!)!);
+    for (const step of listed) {
+        const ancestors = ancestorSteps(ordered, step.hash);
+        for (const other of listed) {
+            if (other.hash !== step.hash && ancestors.has(other.hash)) {
+                refuse(`imported versions of '${name}' are not concurrent: '${other.version}' is in the past of '${step.version}' (keep only '${step.version}')`);
+            }
+        }
+    }
+    const keep = new Set<B64Hash>();
+    for (const step of listed) {
+        keep.add(step.hash);
+        for (const ancestor of ancestorSteps(ordered, step.hash)) keep.add(ancestor);
+    }
+    return ordered.filter((step) => keep.has(step.hash));
+}
+
+// The listed versions with any version in another's causal past removed.
+export function maximalImportedVersions(steps: SchemaReleaseStep[], versions: string[]): string[] {
+    const byVersion = new Map<string, SchemaReleaseStep>();
+    for (const step of steps) byVersion.set(step.version, step);
+    return versions.filter((version) => {
+        const step = byVersion.get(version);
+        if (step === undefined) return true;
+        return !versions.some((other) => {
+            if (other === version) return false;
+            const later = byVersion.get(other);
+            return later !== undefined && ancestorSteps(steps, later.hash).has(step.hash);
+        });
+    });
+}
+
+function ancestorSteps(steps: SchemaReleaseStep[], hash: B64Hash): Set<B64Hash> {
+    const byHash = new Map(steps.map((s) => [s.hash, s]));
+    const out = new Set<B64Hash>();
+    const queue = [...(byHash.get(hash)?.parents ?? [])];
+    while (queue.length > 0) {
+        const next = queue.pop()!;
+        if (out.has(next)) continue;
+        out.add(next);
+        for (const parent of byHash.get(next)?.parents ?? []) queue.push(parent);
+    }
+    return out;
+}
+
 function explainLabel(issue: SourceIssue): SourceIssue {
     const match = /Unknown variable '\$([^']+)'/.exec(issue.message);
     if (match === null) return issue;
@@ -257,7 +374,6 @@ function statedSchemaVersions(script: AstScript): Map<string, string> {
     const out = new Map<string, string>();
     for (const statement of script.statements) {
         if (statement.kind === 'create-schema' && statement.version !== undefined) out.set(statement.name, statement.version);
-        if (statement.kind === 'import-schema') out.set(statement.name, statement.version);
     }
     return out;
 }
@@ -266,15 +382,26 @@ function checkSourceForms(script: AstScript, file: string, signer: string, keys:
     const issues: SourceIssue[] = [];
     const at = (span: TextSpan) => whereOf(file, span);
     const names = new Set<string>();
+    const inlineNames = new Set<string>();
+    const importedNames = new Set<string>();
     let catalogs = 0;
     for (const statement of script.statements) {
         if (statement.kind === 'create-schema' || statement.kind === 'import-schema') {
             if (catalogs > 0) issues.push({ message: 'schemas come before the CREATE CATALOG', where: at(statement.span) });
             if (names.has(statement.name)) issues.push({ message: `schema ${statement.name} is defined twice`, where: at(statement.span) });
             names.add(statement.name);
+            if (statement.kind === 'create-schema') inlineNames.add(statement.name);
+            else importedNames.add(statement.name);
+            const stated = statement.kind === 'create-schema' ? (statement.version !== undefined ? [statement.version] : []) : statement.versions;
+            for (const version of stated) {
+                if (isPatchVersion(version)) issues.push({ message: `VERSION '${version}': ${PATCH_VERSION_RESERVED}`, where: at(statement.span) });
+            }
         } else if (statement.kind === 'create-catalog') {
             catalogs += 1;
             if (catalogs > 1) issues.push({ message: `${file} holds one CREATE CATALOG`, where: at(statement.span) });
+            if (statement.version !== undefined && isPatchVersion(statement.version)) {
+                issues.push({ message: `VERSION '${statement.version}': ${PATCH_VERSION_RESERVED}`, where: at(statement.span) });
+            }
             if (expect.version !== undefined && statement.version !== undefined && statement.version !== expect.version) {
                 issues.push({
                     message: `CREATE CATALOG: VERSION '${statement.version}' does not match the release version '${expect.version}'`,
@@ -301,9 +428,30 @@ function checkSourceForms(script: AstScript, file: string, signer: string, keys:
                     });
                 }
             }
+        } else if (statement.kind === 'alter-schema') {
+            if (catalogs > 0) issues.push({ message: 'schemas come before the CREATE CATALOG', where: at(statement.span) });
+            if (statement.schema.kind !== 'name') {
+                issues.push({ message: 'name the schema, not its hash', where: at(statement.span) });
+            } else if (inlineNames.has(statement.schema.text)) {
+                issues.push({
+                    message: `schema ${statement.schema.text} is defined inline in ${file}; edit its CREATE SCHEMA statement directly (or put migration resets in ${UPGRADE_MANUAL_FILE})`,
+                    where: at(statement.span),
+                });
+            } else if (!importedNames.has(statement.schema.text)) {
+                issues.push({
+                    message: `ALTER SCHEMA ${statement.schema.text} is only permitted on a schema imported earlier in ${file}`,
+                    where: at(statement.span),
+                });
+            } else {
+                if (statement.version !== undefined) issues.push({ message: 'remove VERSION; a local patch is versioned by the catalog release', where: at(statement.span) });
+                if (statement.params !== undefined && statement.params.length > 0) issues.push({ message: 'remove PARAMS; a local patch cannot declare schema parameters', where: at(statement.span) });
+                if (statement.note !== undefined) issues.push({ message: 'remove NOTE; the catalog release supplies it', where: at(statement.span) });
+                if (statement.author !== undefined) issues.push({ message: "remove BY; the release is signed with rpack.json's key", where: at(statement.span) });
+                if (statement.at !== undefined) issues.push({ message: 'remove AT; a local patch applies on the imported schema', where: at(statement.span) });
+            }
         } else {
             issues.push({
-                message: `${statementLabel(statement)} does not belong in ${file}; it holds only CREATE SCHEMA statements and one CREATE CATALOG`,
+                message: `${statementLabel(statement)} does not belong in ${file}; it holds CREATE SCHEMA or IMPORT SCHEMA statements, ALTER SCHEMA on an import, and one CREATE CATALOG`,
                 where: at(statement.span),
             });
         }

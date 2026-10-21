@@ -3,23 +3,26 @@
 // what `rpack build` writes and what `rpack release` signs.
 
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { createBasicCrypto, createIdentity, HASH_SHA256, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
+import type { Entry } from "@hyper-hyper-space/hhs3_dag";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { version as versionOf } from "@hyper-hyper-space/hhs3_mvt";
 import {
-    applyMigrationRules, compareSemver, isValidSemver, parseSemver,
+    applyMigrationRules, compareSemver, isValidSemver, parseSemver, resolveSchemaState, slotsTouchedByRule,
     type CatalogParamDecl, type ColumnType, type MigrationRule, type SchemaParamDecl, type TableDef,
 } from "@hyper-hyper-space/hhs3_rdb";
 
 import { diffCatalog, type CatalogChange, type Pin } from "./catalog_diff.js";
-import type { SchemaReleaseStep } from "./format.js";
+import { canonicalEntryOrder, type SchemaReleaseStep } from "./format.js";
 import type { DevKey } from "./keys.js";
-import { creatorsKey, paramDifferences, tableDifferences, type CatalogModel, type FilesModel, type GroupModel, type SchemaModel } from "./model.js";
+import {
+    creatorsKey, effectiveConcurrentDeletes, effectiveFks, isPatchVersion, paramDifferences, PATCH_VERSION_RESERVED, patchVersion,
+    tableDifferences,
+    type CatalogModel, type FilesModel, type GroupModel, type SchemaModel,
+} from "./model.js";
 import { describeRelease, type BaseSchema, type BaseState, type Released, type ReleaseInfo } from "./released.js";
-import { SOURCE_FILE, UPGRADE_MANUAL_FILE } from "./project.js";
+import { SOURCE_FILE, UPGRADE_MANUAL_FILE, type RpackImportsLock } from "./project.js";
 import { diffSchemaParams, diffTables, isBreaking, type Refusal } from "./schema_diff.js";
 import { isBlankSql, readNext, SourceError, unitKey, type ReadSource, type Where } from "./source.js";
-import { memoryReplica, replaySchemaSteps } from "./verify.js";
 
 export type DraftRule = { rule: MigrationRule; where?: Where };
 
@@ -69,6 +72,7 @@ export type DraftInputs = {
     source: ReadSource;
     nextText: string | undefined;
     signer: DevKey;
+    imports?: RpackImportsLock;
 };
 
 export class DraftError extends Error {
@@ -85,6 +89,13 @@ function copyTables(tables: Map<string, TableDef>): Map<string, TableDef> {
 function appendNewSchemaSteps(plan: ReleaseDraft, schema: SchemaModel, version: string): void {
     if (schema.origin?.kind === 'imported') {
         const steps = schema.origin.steps;
+        const heads = headStepHashes(schema);
+        const diff = diffTables(schema.name, schema.origin.upstream.tables, schema.tables);
+        if (diff.refusals.length > 0) { plan.refusals.push(...diff.refusals); return; }
+        if (paramDifferences(schema.name, schema.origin.upstream.params, schema.params).length > 0) {
+            plan.refusals.push({ message: `schema ${schema.name}: its parameters differ from the imported schema, and a local patch cannot change parameters` });
+            return;
+        }
         const genesis = steps.find((s) => s.parents.length === 0)!;
         const genesisModel: SchemaModel = {
             name: schema.name,
@@ -96,83 +107,374 @@ function appendNewSchemaSteps(plan: ReleaseDraft, schema: SchemaModel, version: 
         plan.schemas.push({ kind: 'create', schema: genesisModel, version: genesis.version, stepHash: genesis.hash });
         for (const step of steps) {
             if (step.hash === genesis.hash) continue;
+            pushUpstreamStep(plan, schema.name, step);
+        }
+        if (diff.rules.length > 0) {
             plan.schemas.push({
                 kind: 'update',
                 schema: schema.name,
-                rules: (step.migration ?? []).map((rule) => ({ rule })),
-                ...(step.params !== undefined && step.params.length > 0 ? { params: step.params } : {}),
-                version: step.version,
-                ...(step.note !== undefined ? { note: step.note } : {}),
-                stepHash: step.hash,
-                parentStepHashes: [...step.parents],
+                rules: diff.rules.map((rule) => ({ rule })),
+                version: patchVersion(version),
+                parentStepHashes: heads,
             });
         }
-        plan.pins.set(schema.name, steps.length === 1 ? { kind: 'create' } : { kind: 'update' });
+        plan.pins.set(schema.name, steps.length === 1 && diff.rules.length === 0 ? { kind: 'create' } : { kind: 'update' });
         return;
     }
     plan.schemas.push({ kind: 'create', schema, version });
     plan.pins.set(schema.name, { kind: 'create' });
 }
 
-// Finds which pack steps are mirrored in `baseSchema.object` by matching the
-// step's unique `version` string and confirming by resolved content (`tables`
-// and `params`).
-async function findMirroredPackSteps(
-    baseSchema: BaseSchema,
+function pushUpstreamStep(plan: ReleaseDraft, name: string, step: SchemaReleaseStep, at?: B64Hash[]): void {
+    plan.schemas.push({
+        kind: 'update',
+        schema: name,
+        rules: (step.migration ?? []).map((rule) => ({ rule })),
+        ...(step.params !== undefined && step.params.length > 0 ? { params: step.params } : {}),
+        version: step.version,
+        ...(step.note !== undefined ? { note: step.note } : {}),
+        stepHash: step.hash,
+        parentStepHashes: [...step.parents],
+        ...(at !== undefined && at.length > 0 ? { at } : {}),
+    });
+}
+
+function headStepHashes(schema: SchemaModel): B64Hash[] {
+    if (schema.origin?.kind !== 'imported') return [];
+    const byVersion = new Map(schema.origin.steps.map((s) => [s.version, s.hash]));
+    return schema.origin.versions.map((v) => byVersion.get(v)!);
+}
+
+async function loadSchemaEntries(schema: BaseSchema): Promise<Entry[]> {
+    const entries: Entry[] = [];
+    for await (const entry of (await schema.object.getScopedDag()).loadAllEntries()) entries.push(entry);
+    return entries;
+}
+
+function isPatchEntry(entry: Entry): boolean {
+    const version = (entry.payload as json.LiteralMap)['version'];
+    return typeof version === 'string' && isPatchVersion(version);
+}
+
+function entryPrevs(entry: Entry): B64Hash[] {
+    return [...json.fromSet(entry.header.prevEntryHashes)];
+}
+
+// Matches each non-patch catalog entry to a pack step by version, parent map
+// and payload. A normal entry's parents are catalog hashes; the step's parents
+// are pack step hashes.
+function causalPast(entries: Entry[], roots: B64Hash[]): Set<B64Hash> {
+    const byHash = new Map(entries.map((e) => [e.hash, e]));
+    const out = new Set<B64Hash>();
+    const queue = [...roots];
+    while (queue.length > 0) {
+        const hash = queue.pop()!;
+        if (out.has(hash) || !byHash.has(hash)) continue;
+        out.add(hash);
+        for (const parent of entryPrevs(byHash.get(hash)!)) queue.push(parent);
+    }
+    return out;
+}
+
+function entryMatchesStep(entry: Entry, step: SchemaReleaseStep, entryToStep: Map<B64Hash, B64Hash>): boolean {
+    const parents = entryPrevs(entry);
+    if (!parents.every((p) => entryToStep.has(p))) return false;
+    const mapped = parents.map((p) => entryToStep.get(p)!).sort();
+    if (mapped.join(',') !== [...step.parents].sort().join(',')) return false;
+    return sameStepPayload(entry.payload as json.LiteralMap, step);
+}
+
+// Matches normal entries to pack steps. Entries at or below `at` (the parents'
+// pin) must match. Entries from other installed releases are mapped when they
+// match and skipped otherwise, and so is anything whose parent was skipped.
+function mapUpstreamEntries(
+    name: string,
+    entries: Entry[],
     steps: SchemaReleaseStep[],
-): Promise<Map<B64Hash, B64Hash[]>> {
-    const replica = memoryReplica();
-    try {
-        const standIn = await createIdentity(SIGNING_ED25519, createBasicCrypto().hash(HASH_SHA256));
-        const replayed = await replaySchemaSteps(replica, baseSchema.name, steps, standIn);
-
-        const entriesByVersion = new Map<string, B64Hash[]>();
-        const dag = await baseSchema.object.getScopedDag();
-        for await (const entry of dag.loadAllEntries()) {
-            const p = entry.payload as json.LiteralMap;
-            const v = p['version'];
-            if (typeof v === 'string') {
-                const list = entriesByVersion.get(v) ?? [];
-                list.push(entry.hash);
-                entriesByVersion.set(v, list);
+    at: B64Hash[],
+    versions: string[],
+): { stepToEntry: Map<B64Hash, B64Hash> } | { error: string } {
+    const byVersion = new Map(steps.map((s) => [s.version, s]));
+    const ordered = canonicalEntryOrder(entries.map((e) => ({ hash: e.hash, prevs: entryPrevs(e), payload: e.payload })));
+    const byHash = new Map(entries.map((e) => [e.hash, e]));
+    const past = causalPast(entries, at);
+    const entryToStep = new Map<B64Hash, B64Hash>();
+    const stepToEntry = new Map<B64Hash, B64Hash>();
+    const skipped = new Set<B64Hash>();
+    for (const item of ordered) {
+        const entry = byHash.get(item.hash)!;
+        if (isPatchEntry(entry)) continue;
+        const parents = entryPrevs(entry);
+        const inPast = past.has(entry.hash);
+        if (!inPast && parents.some((p) => skipped.has(p))) {
+            skipped.add(entry.hash);
+            continue;
+        }
+        const payload = entry.payload as json.LiteralMap;
+        const version = payload['version'];
+        if (typeof version !== 'string') {
+            if (!inPast) { skipped.add(entry.hash); continue; }
+            return { error: `schema ${name} has an entry without a version` };
+        }
+        const step = byVersion.get(version);
+        if (!inPast) {
+            if (step !== undefined && entryMatchesStep(entry, step, entryToStep)) {
+                entryToStep.set(entry.hash, step.hash);
+                stepToEntry.set(step.hash, entry.hash);
+            } else {
+                skipped.add(entry.hash);
+            }
+            continue;
+        }
+        for (const parent of parents) {
+            if (!entryToStep.has(parent)) {
+                return { error: `schema ${name} has an upstream entry whose parent is not an upstream entry` };
             }
         }
-
-        const mirrored = new Map<B64Hash, B64Hash[]>();
-        for (const step of steps) {
-            const candidates = entriesByVersion.get(step.version);
-            if (candidates === undefined || candidates.length === 0) continue;
-            const catView = await baseSchema.object.getView(versionOf(...candidates));
-            const packEntry = replayed.stepToEntry.get(step.hash)!;
-            const packView = await replayed.schema.getView(versionOf(packEntry));
-
-            const catTables = new Map<string, TableDef>(catView.getTableNames().map((t) => [t, catView.getTable(t)!]));
-            const packTables = new Map<string, TableDef>(packView.getTableNames().map((t) => [t, packView.getTable(t)!]));
-            const catParams = new Map<string, SchemaParamDecl>(catView.getParams().map((p) => [p.name, p]));
-            const packParams = new Map<string, SchemaParamDecl>(packView.getParams().map((p) => [p.name, p]));
-
-            if (tableDifferences(baseSchema.name, catTables, packTables).length === 0
-                && paramDifferences(baseSchema.name, catParams, packParams).length === 0) {
-                mirrored.set(step.hash, [...candidates].sort());
+        if (step === undefined) {
+            if (parents.length === 0) {
+                return { error: `schema ${name} was defined inline or has a version '${version}' not in the imported package history` };
             }
+            const listed = versions.map((v) => `'${v}'`).join(', ');
+            return { error: `schema ${name}: imported version(s) ${listed} do not have version '${version}' in their history, and a parent release imported it` };
         }
-        return mirrored;
-    } finally {
-        await replica.destroy();
+        const mappedParents = parents.map((p) => entryToStep.get(p)!).sort();
+        if (mappedParents.join(',') !== [...step.parents].sort().join(',')) {
+            return { error: `schema ${name} version '${version}' does not have the imported step's parents` };
+        }
+        if (!sameStepPayload(payload, step)) {
+            return { error: `schema ${name} version '${version}' does not match the imported step` };
+        }
+        entryToStep.set(entry.hash, step.hash);
+        stepToEntry.set(step.hash, entry.hash);
+    }
+    return { stepToEntry };
+}
+
+function sameStepPayload(payload: json.LiteralMap, step: SchemaReleaseStep): boolean {
+    const params = json.toStringNormalized((payload['params'] ?? []) as json.Literal);
+    const stepParams = json.toStringNormalized((step.params ?? []) as unknown as json.Literal);
+    if (params !== stepParams) return false;
+    if (payload['action'] === 'create') {
+        return json.toStringNormalized(payload['tables'] as json.Literal) === json.toStringNormalized((step.tables ?? []) as unknown as json.Literal);
+    }
+    const migration = json.toStringNormalized((payload['migration'] ?? []) as json.Literal);
+    const stepMigration = json.toStringNormalized((step.migration ?? []) as unknown as json.Literal);
+    return migration === stepMigration && (payload['note'] ?? undefined) === (step.note ?? undefined);
+}
+
+async function planImportedUpdate(
+    plan: ReleaseDraft,
+    name: string,
+    wanted: SchemaModel,
+    baseSchema: BaseSchema,
+    handRules: { rule: MigrationRule; where?: Where }[],
+    catalogVersion: string,
+    signerKeyId: string,
+    signerLabel: string,
+    imports: RpackImportsLock | undefined,
+    where: { where?: Where },
+    refuse: (message: string, extra?: { where?: Where }) => void,
+    breaking: Map<string, string[]>,
+    source: ReadSource,
+): Promise<void> {
+    const origin = wanted.origin;
+    if (origin?.kind !== 'imported') return;
+    if (imports?.[name] === undefined) {
+        refuse(`schema ${name} is imported in ${SOURCE_FILE} but is not locked in rpack.json`, where);
+        return;
+    }
+    const entries = await loadSchemaEntries(baseSchema);
+    const mapped = mapUpstreamEntries(name, entries, origin.steps, baseSchema.at, origin.versions);
+    if ('error' in mapped) { refuse(mapped.error, where); return; }
+    const { stepToEntry } = mapped;
+
+    const queued = origin.steps.filter((step) => step.parents.length > 0 && !stepToEntry.has(step.hash));
+
+    const heads = origin.versions.map((v) => {
+        const step = origin.steps.find((s) => s.version === v)!;
+        return stepToEntry.get(step.hash) ?? step.hash;
+    });
+    const synthetic = queued.map((step) => syntheticUpdate(step, step.parents.map((p) => stepToEntry.get(p) ?? p)));
+    const all = [...entries, ...synthetic];
+    const frontier = minimalCover(all, [...baseSchema.at, ...heads]);
+    const state = resolveSchemaState(all, versionOf(...frontier));
+    const candidateTables = state.tables;
+    const candidateParams = state.params;
+
+    if (paramDifferences(name, candidateParams, wanted.params).length > 0) {
+        refuse(`schema ${name}: its parameters differ from the imported schema, and a local patch cannot change parameters`, where);
+        return;
+    }
+    const paramTypes = new Map<string, ColumnType>();
+    for (const [pName, decl] of candidateParams) paramTypes.set(pName, decl.type);
+    const resolveParam = (pName: string) => paramTypes.get(pName);
+    const working = copyTables(candidateTables);
+    const applied = applyMigrationRules(working, handRules.map((h) => h.rule), resolveParam);
+    if (!applied.ok) {
+        refuse(`ALTER SCHEMA ${name}: ${applied.reason}`, { where: handRules[applied.index]?.where });
+        return;
+    }
+    const diff = diffTables(name, working, wanted.tables, {
+        table: (t) => source.locate(unitKey.table(name, t)),
+        column: (t, c) => source.locate(unitKey.column(name, t, c)),
+    });
+    if (diff.refusals.length > 0) { plan.refusals.push(...diff.refusals); return; }
+    const patchRules = [...handRules.map((h) => h.rule), ...diff.rules];
+    warnOverriddenSlots(plan, name, queued, candidateTables, origin.upstream.tables, wanted.tables);
+
+    const queuedSomething = queued.length > 0 || patchRules.length > 0;
+    if (queuedSomething && !baseSchema.view.isCreator(signerKeyId)) {
+        refuse(`schema ${name}: the release key '${signerLabel}' isn't one of its creators, so it can't update it`, where);
+        return;
+    }
+    for (const step of queued) {
+        const existing = step.parents.filter((p) => stepToEntry.has(p)).map((p) => stepToEntry.get(p)!);
+        const fresh = step.parents.filter((p) => !stepToEntry.has(p));
+        plan.schemas.push({
+            kind: 'update',
+            schema: name,
+            rules: (step.migration ?? []).map((rule) => ({ rule })),
+            ...(step.params !== undefined && step.params.length > 0 ? { params: step.params } : {}),
+            version: step.version,
+            ...(step.note !== undefined ? { note: step.note } : {}),
+            stepHash: step.hash,
+            ...(fresh.length > 0 ? { parentStepHashes: fresh } : {}),
+            ...(existing.length > 0 ? { at: existing } : {}),
+        });
+    }
+    const mappedHeads = heads.filter((h) => entries.some((e) => e.hash === h));
+    const freshHeads = origin.versions.map((v) => origin.steps.find((s) => s.version === v)!.hash).filter((h) => !stepToEntry.has(h));
+    if (patchRules.length > 0) {
+        const simulated = copyTables(candidateTables);
+        const check = applyMigrationRules(simulated, patchRules, resolveParam);
+        const left = check.ok ? tableDifferences(name, simulated, wanted.tables) : [];
+        if (!check.ok || left.length > 0) {
+            throw new DraftError(`the generated rules for ${name} don't reach ${SOURCE_FILE} (a bug in rpack): `
+                + (check.ok ? left.join('; ') : `rule ${check.index + 1} is refused: ${check.reason}`));
+        }
+        plan.schemas.push({
+            kind: 'update',
+            schema: name,
+            rules: patchRules.map((rule) => ({ rule })),
+            version: patchVersion(catalogVersion),
+            at: [...baseSchema.at, ...mappedHeads],
+            ...(freshHeads.length > 0 ? { parentStepHashes: freshHeads } : {}),
+        });
+    }
+    if (!queuedSomething) {
+        plan.pins.set(name, { kind: 'entries', entries: frontier });
+    } else if (patchRules.length === 0) {
+        plan.pins.set(name, { kind: 'update', from: minimalCover(entries, [...baseSchema.at, ...mappedHeads]) });
+    } else {
+        plan.pins.set(name, { kind: 'update' });
+    }
+    const lost = [...queued.flatMap((s) => s.migration ?? []), ...patchRules]
+        .filter((r) => isBreaking(r) && r.rule !== 'add-table' && baseSchema.tables.has(r.table));
+    if (lost.length > 0) breaking.set(name, lost.map((r) => describeBreaking(r)));
+}
+
+function syntheticUpdate(step: SchemaReleaseStep, prevs: B64Hash[]): Entry {
+    const payload: json.LiteralMap = {
+        action: 'schema-update',
+        version: step.version,
+        migration: (step.migration ?? []) as unknown as json.Literal,
+        author: 'planner',
+        signature: 'planner',
+    };
+    if (step.params !== undefined && step.params.length > 0) payload['params'] = step.params as unknown as json.Literal;
+    if (step.note !== undefined) payload['note'] = step.note;
+    return {
+        hash: step.hash,
+        header: { payloadHash: step.hash, prevEntryHashes: json.toSet(prevs) },
+        payload,
+        meta: {},
+    };
+}
+
+function minimalCover(entries: Entry[], hashes: B64Hash[]): B64Hash[] {
+    const byHash = new Map(entries.map((e) => [e.hash, e]));
+    const ancestors = new Map<B64Hash, Set<B64Hash>>();
+    const of = (hash: B64Hash): Set<B64Hash> => {
+        const cached = ancestors.get(hash);
+        if (cached !== undefined) return cached;
+        const out = new Set<B64Hash>();
+        ancestors.set(hash, out);
+        const entry = byHash.get(hash);
+        if (entry === undefined) return out;
+        for (const parent of entryPrevs(entry)) {
+            out.add(parent);
+            for (const older of of(parent)) out.add(older);
+        }
+        return out;
+    };
+    const unique = [...new Set(hashes)];
+    return unique.filter((hash) => !unique.some((other) => other !== hash && of(other).has(hash))).sort();
+}
+
+function warnOverriddenSlots(
+    plan: ReleaseDraft,
+    name: string,
+    queued: SchemaReleaseStep[],
+    candidate: Map<string, TableDef>,
+    upstream: Map<string, TableDef>,
+    wanted: Map<string, TableDef>,
+): void {
+    const touched = new Map<string, string[]>();
+    const note = (slot: string, version: string) => {
+        const versions = touched.get(slot) ?? [];
+        if (!versions.includes(version)) versions.push(version);
+        touched.set(slot, versions);
+    };
+    for (const step of queued) {
+        for (const rule of step.migration ?? []) {
+            for (const slot of slotsOfQueuedRule(rule, candidate, upstream, wanted)) note(slot, step.version);
+        }
+    }
+    for (const [slot, versions] of touched) {
+        if (slotSnapshot(wanted, slot) === slotSnapshot(upstream, slot)) continue;
+        plan.warnings.push(`schema ${name}: imported ${versions.join(', ')} changes ${describeSlot(slot)}, which is overridden by the local ALTER SCHEMA patch`);
     }
 }
 
-function stepAncestorsOf(steps: SchemaReleaseStep[], targetHash: B64Hash): Set<B64Hash> {
-    const byHash = new Map(steps.map((s) => [s.hash, s]));
-    const ancestors = new Set<B64Hash>();
-    const queue = [...(byHash.get(targetHash)?.parents ?? [])];
-    while (queue.length > 0) {
-        const h = queue.pop()!;
-        if (ancestors.has(h)) continue;
-        ancestors.add(h);
-        for (const p of byHash.get(h)?.parents ?? []) queue.push(p);
+function slotsOfQueuedRule(
+    rule: MigrationRule,
+    candidate: Map<string, TableDef>,
+    upstream: Map<string, TableDef>,
+    wanted: Map<string, TableDef>,
+): string[] {
+    if (rule.rule !== 'drop-table' && rule.rule !== 'add-table') return slotsTouchedByRule(rule);
+    const table = rule.rule === 'drop-table' ? rule.table : rule.def.name;
+    const columns = new Set<string>([
+        ...Object.keys(candidate.get(table)?.columns ?? {}),
+        ...Object.keys(upstream.get(table)?.columns ?? {}),
+        ...Object.keys(wanted.get(table)?.columns ?? {}),
+    ]);
+    return [`t:${table}`, `m:${table}`, `f:${table}`, `r:${table}`, ...[...columns].map((column) => `c:${table}:${column}`)];
+}
+
+function slotSnapshot(tables: Map<string, TableDef>, slot: string): string {
+    const [kind, table, column] = slot.split(':');
+    const def = table === undefined ? undefined : tables.get(table);
+    if (kind === 't') return def === undefined ? 'absent' : 'present';
+    if (def === undefined) return 'absent';
+    if (kind === 'm') return String(effectiveConcurrentDeletes(def));
+    if (kind === 'f') return json.toStringNormalized(effectiveFks(def) as unknown as json.Literal);
+    if (kind === 'r') return json.toStringNormalized((def.restrictions ?? []) as unknown as json.Literal);
+        if (kind === 'c' && column !== undefined) {
+        const col = def.columns[column];
+        return col === undefined ? 'absent' : json.toStringNormalized(col as unknown as json.Literal);
     }
-    return ancestors;
+    return '';
+}
+
+function describeSlot(slot: string): string {
+    const [kind, table, column] = slot.split(':');
+    if (kind === 'r') return `restrictions of table ${table}`;
+    if (kind === 'f') return `foreign keys of table ${table}`;
+    if (kind === 'm') return `concurrent deletes of table ${table}`;
+    if (kind === 't') return `table ${table}`;
+    return `column ${table}.${column}`;
 }
 
 export async function draftRelease(inputs: DraftInputs): Promise<ReleaseDraft> {
@@ -199,6 +501,7 @@ export async function draftRelease(inputs: DraftInputs): Promise<ReleaseDraft> {
     const schemaVersion = (name: string) => source.schemaVersions.get(name) ?? version;
 
     if (!isValidSemver(version)) refuse(`'${version}' is not a version (major.minor.patch)`);
+    else if (isPatchVersion(version)) refuse(`'${version}': ${PATCH_VERSION_RESERVED}`);
     for (const parent of parents) {
         if (isValidSemver(version) && compareSemver(version, parent.version) <= 0) {
             refuse(`${version} is not above its parent ${describeRelease(parent)}`);
@@ -271,71 +574,13 @@ export async function draftRelease(inputs: DraftInputs): Promise<ReleaseDraft> {
         const handRules = hand.rules.get(name) ?? [];
 
         if (wanted.origin?.kind === 'imported') {
-            const packSteps = wanted.origin.steps;
-            const targetVersion = wanted.origin.version;
-            const targetStep = packSteps.find((s) => s.version === targetVersion)!;
-            const mirrored = await findMirroredPackSteps(baseSchema, packSteps);
-
-            // Find which pack step(s) mirror baseSchema.at
-            const baseStepHashes: B64Hash[] = [];
-            for (const [stepHash, entryHashes] of mirrored) {
-                if (entryHashes.every((e) => baseSchema.at.includes(e))) baseStepHashes.push(stepHash);
-            }
-            const coveredEntries = new Set(baseStepHashes.flatMap((s) => mirrored.get(s) ?? []));
-            const isBaseMirrored = baseSchema.at.every((e) => coveredEntries.has(e));
-
-            if (isBaseMirrored) {
-                if (handRules.length > 0) {
-                    refuse(`schema ${name} is imported; its migration rules come from its package, not ${UPGRADE_MANUAL_FILE}`,
-                        { ...at(handRules[0]?.where) });
-                    continue;
-                }
-                if (baseStepHashes.length === 1 && baseStepHashes[0] === targetStep.hash
-                    && tableDifferences(name, baseSchema.tables, wanted.tables).length === 0
-                    && paramDifferences(name, baseSchema.params, wanted.params).length === 0) {
-                    plan.pins.set(name, { kind: 'entries', entries: baseSchema.at });
-                    continue;
-                }
-                if (!baseSchema.view.isCreator(signer.keyId)) {
-                    refuse(`schema ${name}: the release key '${signer.label}' isn't one of its creators, so it can't update it`, where);
-                    continue;
-                }
-                const targetAncestors = stepAncestorsOf(packSteps, targetStep.hash);
-                const unbuilt = baseStepHashes.filter((h) => h !== targetStep.hash && !targetAncestors.has(h));
-                if (unbuilt.length > 0) {
-                    refuse(`schema ${name}: imported version '${targetStep.version}' does not build on ${baseSchema.view.getVersions().join(', ')}`, where);
-                    continue;
-                }
-                const neededSteps = packSteps.filter((s) => (s.hash === targetStep.hash || targetAncestors.has(s.hash)) && !mirrored.has(s.hash));
-                if (neededSteps.length === 0) {
-                    plan.pins.set(name, { kind: 'entries', entries: mirrored.get(targetStep.hash) ?? baseSchema.at });
-                    continue;
-                }
-                const allNewRules: MigrationRule[] = [];
-                for (const s of neededSteps) {
-                    const existingParentEntries = s.parents.flatMap((p) => mirrored.get(p) ?? []);
-                    const newParentStepHashes = s.parents.filter((p) => !mirrored.has(p));
-                    plan.schemas.push({
-                        kind: 'update',
-                        schema: name,
-                        rules: (s.migration ?? []).map((rule) => ({ rule })),
-                        ...(s.params !== undefined && s.params.length > 0 ? { params: s.params } : {}),
-                        version: s.version,
-                        ...(s.note !== undefined ? { note: s.note } : {}),
-                        stepHash: s.hash,
-                        ...(newParentStepHashes.length > 0 ? { parentStepHashes: newParentStepHashes } : {}),
-                        ...(existingParentEntries.length > 0 ? { at: existingParentEntries } : {}),
-                    });
-                    allNewRules.push(...(s.migration ?? []));
-                }
-                plan.pins.set(name, { kind: 'update' });
-                const lost = allNewRules.filter((r) => isBreaking(r) && r.rule !== 'add-table' && baseSchema.tables.has(r.table));
-                if (lost.length > 0) breaking.set(name, lost.map((r) => describeBreaking(r)));
-                continue;
-            } else {
-                refuse(`schema ${name}: cannot switch to IMPORT SCHEMA '${targetVersion}' because the schema's history (${baseSchema.view.getVersions().join(', ')}) does not match the imported package's step history`, where);
-                continue;
-            }
+            await planImportedUpdate(plan, name, wanted, baseSchema, handRules, version, signer.keyId, signer.label, inputs.imports, where, refuse, breaking, source);
+            continue;
+        }
+        const entries = await loadSchemaEntries(baseSchema);
+        if (inputs.imports?.[name] !== undefined || entries.some((e) => isPatchEntry(e))) {
+            refuse(`schema ${name} was imported; keep IMPORT SCHEMA and use ALTER SCHEMA ${name} in ${SOURCE_FILE} for local modifications`, where);
+            continue;
         }
 
         const paramDiff = diffSchemaParams(name, baseSchema.params, wanted.params, (p) => source.locate(unitKey.schemaParam(name, p)) ?? where.where);

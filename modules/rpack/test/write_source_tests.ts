@@ -1,9 +1,11 @@
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 
 import type { KeyDirectory } from "../src/keys.js";
-import { modelDifferences, type CatalogModel } from "../src/model.js";
+import type { TableDef } from "@hyper-hyper-space/hhs3_rdb";
+
+import { modelDifferences, type CatalogModel, type SchemaModel } from "../src/model.js";
 import { readSource } from "../src/source.js";
-import { writeSource } from "../src/write_source.js";
+import { renderSource, writeSource } from "../src/write_source.js";
 import { EDITOR_SOURCE, devKeys } from "./fixtures.js";
 
 const COMMENTS = ['-- The editor app.', '-- the pages of a document', '-- :admin becomes the first manager.'];
@@ -99,6 +101,38 @@ export const writeSourceTests = [
             assertTrue(group.indexOf('TABLEGROUP more') > group.indexOf('FILES media'), `a new group goes after the last item, a FILES here:\n${group}`);
             const full = await writeSource('', await modelOf(keys, media), keys, 'dev');
             assertTrue(full.includes('  FILES media\n    USING IDENTITIES user.identities\n    ALLOW WRITE IF true\n);'), `a full render includes the FILES:\n${full}`);
+        },
+    },
+    {
+        name: '[RPACK24] renderSource appends ALTER SCHEMA when an imported schema is patched',
+        invoke: async () => {
+            const upstreamNotes: TableDef = { name: 'notes', columns: { body: { type: 'string' } } };
+            const patchedNotes: TableDef = { name: 'notes', columns: { body: { type: 'string' }, extra: { type: 'string', nullable: true } } };
+            const notes: SchemaModel = {
+                name: 'hhs:notes',
+                creators: [],
+                tables: new Map<string, TableDef>([['notes', patchedNotes]]),
+                origin: {
+                    kind: 'imported',
+                    versions: ['1.0.0'],
+                    steps: [],
+                    upstream: {
+                        tables: new Map<string, TableDef>([['notes', upstreamNotes]]),
+                        params: new Map(),
+                    },
+                },
+            };
+            const model: CatalogModel = {
+                name: 'blog',
+                creators: [],
+                params: new Map(),
+                schemas: new Map([[notes.name, notes]]),
+                groups: new Map(),
+                files: new Map(),
+            };
+            const text = renderSource(model);
+            assertTrue(text.includes("IMPORT SCHEMA hhs:notes VERSION '1.0.0';"), `renders the import:\n${text}`);
+            assertTrue(text.includes('ADD COLUMN notes.extra'), `renders the local patch:\n${text}`);
         },
     },
 ];

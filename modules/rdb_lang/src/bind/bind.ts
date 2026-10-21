@@ -100,7 +100,7 @@ export type BoundImportSchema = {
     kind: 'import-schema';
     ast: ImportSchemaStatement;
     name: string;
-    version: string;
+    versions: string[];
     schemaId: B64Hash;
     schema?: import("@hyper-hyper-space/hhs3_rdb").RSchema;
     at: Version;
@@ -463,18 +463,20 @@ async function bindParamValue(expr: ValueExpr, decl: CatalogParamDecl, context: 
 }
 
 async function bindImportSchema(ast: ImportSchemaStatement, context: LangBindContext): Promise<BoundImportSchema> {
-    if (!isValidSemver(ast.version)) {
-        throw new SpannedError(`VERSION '${ast.version}' is not a semver (major.minor.patch)`, ast.versionSpan, 'BIND_INVALID_SYNTAX');
+    for (const version of ast.versions) {
+        if (!isValidSemver(version)) {
+            throw new SpannedError(`VERSION '${version}' is not a semver (major.minor.patch)`, ast.versionsSpan, 'BIND_INVALID_SYNTAX');
+        }
     }
-    const resolved = await context.resolveImport?.(ast.name, ast.version);
+    const resolved = await context.resolveImport?.(ast.name, ast.versions);
     if (resolved === undefined) {
-        throw new SpannedError(`imported schema '${ast.name}' version '${ast.version}' is not available`, ast.span, 'BIND_UNKNOWN_NAME');
+        throw new SpannedError(`imported schema '${ast.name}' version '${ast.versions.join(', ')}' is not available`, ast.span, 'BIND_UNKNOWN_NAME');
     }
     return {
         kind: 'import-schema',
         ast,
         name: ast.name,
-        version: ast.version,
+        versions: ast.versions,
         schemaId: resolved.schemaId,
         ...(resolved.schema !== undefined ? { schema: resolved.schema } : {}),
         at: resolved.at,
@@ -639,11 +641,12 @@ async function bindAlterSchema(ast: AlterSchemaStatement, context: LangBindConte
     if (author === undefined) throw new Error('ALTER SCHEMA requires an author identity');
     const at = await context.resolveVersion(ast.at, { kind: 'schema', id: schema.id, schema: schema.schema });
     const view = await schema.schema.getView(at, at);
-    if (ast.version !== undefined) {
-        if (!isValidSemver(ast.version)) throw new Error(`VERSION '${ast.version}' is not a semver (major.minor.patch)`);
+    const version = ast.version ?? await context.defaultAlterSchemaVersion?.(schema.id);
+    if (version !== undefined) {
+        if (!isValidSemver(version)) throw new Error(`VERSION '${version}' is not a semver (major.minor.patch)`);
         for (const current of view.getVersions()) {
-            if (compareSemver(ast.version, current) <= 0) {
-                throw new Error(`VERSION '${ast.version}' must be greater than the schema's version '${current}' at AT`);
+            if (compareSemver(version, current) <= 0) {
+                throw new Error(`VERSION '${version}' must be greater than the schema's version '${current}' at AT`);
             }
         }
     }
@@ -662,7 +665,7 @@ async function bindAlterSchema(ast: AlterSchemaStatement, context: LangBindConte
     }
     const bound: BoundAlterSchema = { kind: 'alter-schema', ast, schema, rules, author, at };
     if (addedParams.length > 0) bound.params = addedParams;
-    if (ast.version !== undefined) bound.version = ast.version;
+    if (version !== undefined) bound.version = version;
     if (ast.note !== undefined) bound.note = ast.note;
     return bound;
 }

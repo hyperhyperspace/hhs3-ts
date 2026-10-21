@@ -579,14 +579,21 @@ class Parser {
         this.expectKeyword('SCHEMA');
         const name = this.expectIdentifierText('schema name');
         const kw = this.expectKeyword('VERSION').span;
-        const vTok = this.expectKind('string', "VERSION '<semver>'");
-        const version = vTok.value as string;
+        const versions: string[] = [];
+        const first = this.expectKind('string', "VERSION '<semver>'");
+        versions.push(first.value as string);
+        let end = first.span;
+        while (this.matchPunctuation(',')) {
+            const next = this.expectKind('string', "VERSION '<semver>'");
+            versions.push(next.value as string);
+            end = next.span;
+        }
         return {
             kind: 'import-schema',
             name,
-            version,
-            versionSpan: combineSpans(kw, vTok.span),
-            span: combineSpans(start, vTok.span),
+            versions,
+            versionsSpan: combineSpans(kw, end),
+            span: combineSpans(start, end),
         };
     }
 

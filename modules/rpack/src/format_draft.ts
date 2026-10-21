@@ -8,6 +8,7 @@ import {
 } from "@hyper-hyper-space/hhs3_rdb_lang";
 
 import type { ReleaseDraft } from "./draft.js";
+import { isPatchVersion } from "./model.js";
 import { SOURCE_FILE, UPGRADE_MANUAL_FILE } from "./project.js";
 import { describeRelease, type ReleaseInfo } from "./released.js";
 import { formatWhere } from "./source.js";
@@ -32,6 +33,9 @@ export function formatDraftSql(plan: ReleaseDraft, labels?: SourceKeyLabels): st
     const lines: string[] = [];
     for (const step of plan.schemas) {
         if (lines.length > 0) lines.push('');
+        if (isPatchVersion(step.version)) {
+            lines.push(`-- Local patch for catalog ${plan.version} (major 1000+ is reserved for local patches on imported schemas)`);
+        }
         if (step.kind === 'create') {
             const params = step.schema.params !== undefined && step.schema.params.size > 0
                 ? [...step.schema.params.values()]
@@ -49,14 +53,18 @@ export function formatDraftSql(plan: ReleaseDraft, labels?: SourceKeyLabels): st
                 : rendered.includes(' HASH ALGORITHM ')
                     ? rendered.replace(' HASH ALGORITHM ', `${versionClause} HASH ALGORITHM `)
                     : rendered.replace(/ AS \(\n/, `${versionClause} AS (\n`);
-            lines.push(...withVer.split('\n'));
+            const created = withVer.split('\n');
+            const imported = step.stepHash !== undefined ? ` -- imported from ${step.schema.name} ${step.version}` : '';
+            if (created.length > 0 && imported.length > 0) created[0] = `${created[0]}${imported}`;
+            lines.push(...created);
             continue;
         }
         const paramsClause = step.params !== undefined && step.params.length > 0
             ? ` ${renderSchemaParamDecls(step.params)}`
             : '';
+        const imported = step.stepHash !== undefined && !isPatchVersion(step.version) ? ` -- imported from ${step.schema} ${step.version}` : '';
         if (step.rules.length === 0) {
-            lines.push(`ALTER SCHEMA ${renderIdent(step.schema)} VERSION ${quote(step.version)}${paramsClause};`);
+            lines.push(`ALTER SCHEMA ${renderIdent(step.schema)} VERSION ${quote(step.version)}${paramsClause};${imported}`);
             continue;
         }
         const rules = step.rules.map((r, i) => {
@@ -64,7 +72,7 @@ export function formatDraftSql(plan: ReleaseDraft, labels?: SourceKeyLabels): st
             const comment = r.where !== undefined ? `    -- ${r.where.file}:${r.where.line}` : '';
             return `  ${renderMigrationRule(r.rule)}${separator}${comment}`;
         });
-        lines.push(`ALTER SCHEMA ${renderIdent(step.schema)} VERSION ${quote(step.version)}${paramsClause} AS (`, ...rules.join('\n').split('\n'), ');');
+        lines.push(`ALTER SCHEMA ${renderIdent(step.schema)} VERSION ${quote(step.version)}${paramsClause} AS (${imported}`, ...rules.join('\n').split('\n'), ');');
     }
 
     if (lines.length > 0) lines.push('');

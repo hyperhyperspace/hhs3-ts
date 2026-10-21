@@ -7,6 +7,7 @@ import {
 
 import type { ColumnDecl, ColumnTypeName, SchemaParamDeclExpr, TableDecl, ValueExpr } from "../syntax/ast.js";
 import { canonicalEncodeValue } from "../bind/values.js";
+import { SpannedError } from "../diagnostics.js";
 import type { BoundCreateCatalog, BoundCreateDatabase, BoundCreateSchema, BoundCreateStatement } from "../bind/bind.js";
 import {
     columnSetFromTableDecl,
@@ -76,6 +77,9 @@ export function compileSchemaParamDecls(exprs: SchemaParamDeclExpr[] | undefined
     const seen = new Set<string>();
     return exprs.map((expr) => {
         if (seen.has(expr.name)) throw new Error(`param ':${expr.name}' is declared twice`);
+        if (expr.type === 'decimal') {
+            throw new SpannedError(`param ':${expr.name}' cannot be decimal: a param has no scale`, expr.span, 'VALIDATION_REJECTED');
+        }
         seen.add(expr.name);
         const decl: SchemaParamDecl = { name: expr.name, type: expr.type };
         if (expr.defaultValue !== undefined) {

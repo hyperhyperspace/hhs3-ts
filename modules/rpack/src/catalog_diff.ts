@@ -27,7 +27,7 @@ import { unitKey, type Locator, type SourceIssue, type Where } from "./source.js
 // The version a release gives a schema: its own update, the create of a new
 // schema, or existing entries (the minimal cover of the parents' pins).
 export type Pin =
-    | { kind: 'update' }
+    | { kind: 'update'; from?: B64Hash[] }
     | { kind: 'create' }
     | { kind: 'entries'; entries: B64Hash[] };
 

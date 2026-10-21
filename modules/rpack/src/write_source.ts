@@ -19,8 +19,9 @@
 // is the target rendered whole.
 
 import type { CreateCatalogStatement, CreateSchemaStatement, ImportSchemaStatement, SourceKeyLabels, TextSpan } from "@hyper-hyper-space/hhs3_rdb_lang";
+import type { TableDef } from "@hyper-hyper-space/hhs3_rdb";
 import {
-    parseScript, renderColumnDef, renderIdent, renderLiteral, renderSchemaParamDecl, renderSchemaParamDecls, renderSourceCatalog, renderSourceFiles, renderSourceGroup, renderSourceParam, renderSourceParams,
+    parseScript, renderColumnDef, renderIdent, renderLiteral, renderMigrationRule, renderSchemaParamDecl, renderSchemaParamDecls, renderSourceCatalog, renderSourceFiles, renderSourceGroup, renderSourceParam, renderSourceParams,
     renderSourceSchema, renderTableDef, renderTableOptions,
 } from "@hyper-hyper-space/hhs3_rdb_lang";
 
@@ -28,9 +29,10 @@ import type { SchemaReleaseFile } from "./format.js";
 import type { KeyDirectory } from "./keys.js";
 import {
     creatorsKey, filesKey, groupSourceKey, modelDifferences, orderByBindings, paramDifferences, sameColumn, sameConcurrentDeletes, sameIdProvider, sameParamDecl, sameRestrictions,
-    sameTable, type CatalogModel, type SchemaModel,
+    sameTable, tableDifferences, type CatalogModel, type SchemaModel,
 } from "./model.js";
 import { SOURCE_FILE } from "./project.js";
+import { diffTables } from "./schema_diff.js";
 import { isBlankSql, readSource } from "./source.js";
 
 export class WriteSourceError extends Error {
@@ -180,16 +182,23 @@ function sourceSchema(schema: SchemaModel) {
     };
 }
 
-function renderSchemaEntry(schema: SchemaModel, labels?: SourceKeyLabels): string {
+function renderSchemaEntry(schema: SchemaModel, labels?: SourceKeyLabels, versions?: string[]): string {
+    const listed = versions !== undefined && versions.length > 0
+        ? versions
+        : schema.origin?.kind === 'imported' ? schema.origin.versions : undefined;
+    if (listed === undefined) return renderSourceSchema(sourceSchema(schema), labels);
+    let text = `IMPORT SCHEMA ${renderIdent(schema.name)} VERSION ${listed.map((v) => renderLiteral(v)).join(', ')};`;
     if (schema.origin?.kind === 'imported') {
-        return `IMPORT SCHEMA ${renderIdent(schema.name)} VERSION ${renderLiteral(schema.origin.version)};`;
+        const block = synthesizeImportedPatch(schema.name, schema.origin.upstream.tables, schema.tables);
+        if (block.length > 0) text += `\n\n${block}`;
     }
-    return renderSourceSchema(sourceSchema(schema), labels);
+    return text;
 }
 
-// The whole target, rendered.
-export function renderSource(target: CatalogModel, labels?: SourceKeyLabels): string {
-    const parts = [...target.schemas.values()].map((s) => renderSchemaEntry(s, labels));
+// The whole target, rendered. `importedVersions` names schemas that are imported
+// even when the model carries no origin (a merged release's schema).
+export function renderSource(target: CatalogModel, labels?: SourceKeyLabels, importedVersions?: Map<string, string[]>): string {
+    const parts = [...target.schemas.values()].map((s) => renderSchemaEntry(s, labels, importedVersions?.get(s.name)));
     parts.push(renderSourceCatalog({
         name: target.name,
         creators: target.creators,
@@ -208,11 +217,12 @@ function statementEnd(text: string, span: TextSpan): number {
     return match === null ? span.end : span.end + match[0].length;
 }
 
-function importSchemaEdits(text: string, statement: ImportSchemaStatement, target: SchemaModel, labels: SourceKeyLabels, targetVersion?: string): Edit[] {
-    const ver = target.origin?.kind === 'imported' ? target.origin.version : targetVersion;
-    if (ver !== undefined) {
-        if (statement.version === ver) return [];
-        return [{ start: statement.versionSpan.start, end: statement.versionSpan.end, text: `VERSION ${renderLiteral(ver)}` }];
+function importSchemaEdits(text: string, statement: ImportSchemaStatement, target: SchemaModel, labels: SourceKeyLabels, versions?: string[]): Edit[] {
+    const listed = versions ?? (target.origin?.kind === 'imported' ? target.origin.versions : undefined);
+    if (listed !== undefined && listed.length > 0) {
+        const same = statement.versions.length === listed.length && statement.versions.every((v, i) => v === listed[i]);
+        if (same) return [];
+        return [{ start: statement.versionsSpan.start, end: statement.versionsSpan.end, text: `VERSION ${listed.map((v) => renderLiteral(v)).join(', ')}` }];
     }
     return [{ start: statement.span.start, end: statementEnd(text, statement.span), text: renderSourceSchema(sourceSchema(target), labels) }];
 }
@@ -381,6 +391,102 @@ export function stripCatalogVersion(text: string, stale: Set<string>): { text: s
     return { text };
 }
 
+// After the IMPORT version list is updated, a branch merge may need one ALTER
+// SCHEMA that reproduces the merged tables from the new upstream state.
+async function reconcileImportedPatches(
+    text: string,
+    target: CatalogModel,
+    keys: KeyDirectory,
+    signer: string,
+    imports: Map<string, SchemaReleaseFile> | undefined,
+): Promise<string> {
+    let read;
+    try {
+        read = await readSource(text, keys, signer, SOURCE_FILE, { imports });
+    } catch {
+        return text;
+    }
+    const edits: Edit[] = [];
+    for (const statement of read.script.statements) {
+        if (statement.kind !== 'import-schema') continue;
+        const wanted = target.schemas.get(statement.name);
+        const current = read.model.schemas.get(statement.name);
+        if (wanted === undefined || current?.origin?.kind !== 'imported') continue;
+        if (tableDifferences(statement.name, current.tables, wanted.tables).length === 0
+            && paramDifferences(statement.name, current.params, wanted.params).length === 0) continue;
+        if (paramDifferences(statement.name, current.origin.upstream.params, wanted.params).length > 0) {
+            throw new WriteSourceError(`schema ${statement.name} changes its parameters, which a local ALTER SCHEMA cannot express`);
+        }
+        const block = synthesizeImportedPatch(statement.name, current.origin.upstream.tables, wanted.tables);
+        const alters = read.script.statements.filter((s) => s.kind === 'alter-schema' && s.schema.kind === 'name' && s.schema.text === statement.name);
+        if (block.length === 0) {
+            for (const alter of alters) {
+                edits.push(removal(text, removalStart(text, alter.span.start), removalEnd(text, statementEnd(text, alter.span))));
+            }
+        } else if (alters.length === 0) {
+            const end = statementEnd(text, statement.span);
+            edits.push({ start: end, end, text: `\n\n${block}` });
+        } else {
+            const first = alters[0]!;
+            edits.push({ start: first.span.start, end: statementEnd(text, first.span), text: block });
+            for (const alter of alters.slice(1)) {
+                edits.push(removal(text, removalStart(text, alter.span.start), removalEnd(text, statementEnd(text, alter.span))));
+            }
+        }
+    }
+    return edits.length === 0 ? text : applyEdits(text, edits);
+}
+
+function synthesizeImportedPatch(name: string, upstream: Map<string, TableDef>, target: Map<string, TableDef>): string {
+    for (const [table, def] of upstream) {
+        const wanted = target.get(table);
+        if (wanted !== undefined && !sameIdProvider(def, wanted)) {
+            throw new WriteSourceError(`schema ${name} changes its IDENTITY PROVIDER, which ALTER SCHEMA cannot express`);
+        }
+    }
+    for (const [table, def] of target) {
+        const had = upstream.get(table);
+        if (had !== undefined && !sameIdProvider(had, def)) {
+            throw new WriteSourceError(`schema ${name} changes its IDENTITY PROVIDER, which ALTER SCHEMA cannot express`);
+        }
+    }
+    const working = new Map<string, TableDef>();
+    const desired = new Map<string, TableDef>();
+    const reset: string[] = [];
+    for (const [table, def] of upstream) {
+        const columns = { ...def.columns };
+        const wanted = target.get(table);
+        if (wanted !== undefined) {
+            for (const [column, col] of Object.entries(def.columns)) {
+                const after = wanted.columns[column];
+                if (after !== undefined && !sameColumn(col, after)) {
+                    delete columns[column];
+                    reset.push(`  ${renderMigrationRule({ rule: 'drop-column', table, column })}, -- column ${table}.${column} was reset in a parent release`);
+                    reset.push(`  ${renderMigrationRule({ rule: 'add-column', table, column, def: after })},`);
+                }
+            }
+        }
+        working.set(table, { ...def, columns });
+    }
+    for (const [table, def] of target) {
+        const columns = { ...def.columns };
+        const had = upstream.get(table);
+        if (had !== undefined) {
+            for (const column of Object.keys(def.columns)) {
+                const before = had.columns[column];
+                if (before !== undefined && !sameColumn(before, def.columns[column]!)) delete columns[column];
+            }
+        }
+        desired.set(table, { ...def, columns });
+    }
+    const diff = diffTables(name, working, desired);
+    if (diff.refusals.length > 0) throw new WriteSourceError(diff.refusals.map((r) => r.message).join('; '));
+    const lines = [...reset, ...diff.rules.map((rule) => `  ${renderMigrationRule(rule)},`)];
+    if (lines.length === 0) return '';
+    lines[lines.length - 1] = lines[lines.length - 1]!.replace(/,\s*$/, '');
+    return `ALTER SCHEMA ${renderIdent(name)} AS (\n${lines.join('\n')}\n);`;
+}
+
 // `text` edited to describe `target`. `keys` and `signer` read the text and
 // the result, as target-catalog.sql is read for a release.
 export async function writeSource(
@@ -388,12 +494,12 @@ export async function writeSource(
     target: CatalogModel,
     keys: KeyDirectory,
     signer: string,
-    options: { imports?: Map<string, SchemaReleaseFile>; importedVersions?: Map<string, string> } = {},
+    options: { imports?: Map<string, SchemaReleaseFile>; importedVersions?: Map<string, string[]> } = {},
 ): Promise<string> {
     const labels = keys.labels();
     let result: string;
     if (isBlankSql(text)) {
-        result = renderSource(target, labels);
+        result = renderSource(target, labels, options.importedVersions);
     } else {
         const read = await readSource(text, keys, signer, SOURCE_FILE, { imports: options.imports });
         const current = read.model;
@@ -412,9 +518,7 @@ export async function writeSource(
                 if (wanted === undefined) {
                     edits.push(removal(text, removalStart(text, statement.span.start), removalEnd(text, statementEnd(text, statement.span))));
                 } else {
-                    const targetVer = options.importedVersions?.get(statement.name)
-                        ?? (wanted.origin?.kind === 'imported' ? wanted.origin.version : statement.version);
-                    edits.push(...importSchemaEdits(text, statement, wanted, labels, targetVer));
+                    edits.push(...importSchemaEdits(text, statement, wanted, labels, options.importedVersions?.get(statement.name)));
                 }
             } else if (statement.kind === 'create-catalog') {
                 catalog = statement;
@@ -424,10 +528,11 @@ export async function writeSource(
         const newSchemas = [...target.schemas.values()].filter((s) => !current.schemas.has(s.name));
         if (newSchemas.length > 0 && catalog !== undefined) {
             const at = removalStart(text, catalog.span.start);
-            edits.push({ start: at, end: at, text: newSchemas.map((s) => `${renderSchemaEntry(s, labels)}\n\n`).join('') });
+            edits.push({ start: at, end: at, text: newSchemas.map((s) => `${renderSchemaEntry(s, labels, options.importedVersions?.get(s.name))}\n\n`).join('') });
         }
         result = applyEdits(text, edits);
     }
+    result = await reconcileImportedPatches(result, target, keys, signer, options.imports);
 
     const check = await readSource(result, keys, signer, SOURCE_FILE, { imports: options.imports });
     const left = modelDifferences(check.model, target);

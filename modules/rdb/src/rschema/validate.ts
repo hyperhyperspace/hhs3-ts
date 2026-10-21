@@ -649,6 +649,7 @@ export function validateSchemaParams(params: SchemaParamDecl[], requireDefault: 
     const seen = new Set<string>();
     for (const decl of params) {
         if (!isValidName(decl.name)) return `invalid parameter name '${decl.name}'`;
+        if (decl.type === 'decimal') return `parameter ':${decl.name}' cannot be decimal: a param has no scale`;
         if (seen.has(decl.name)) return `duplicate parameter name ':${decl.name}'`;
         seen.add(decl.name);
         if (requireDefault && decl.default === undefined) {

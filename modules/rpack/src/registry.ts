@@ -15,6 +15,7 @@ import {
     type RpackConfig, type RpackProject,
 } from "./project.js";
 import { Released } from "./released.js";
+import { maximalImportedVersions } from "./source.js";
 import { verifyRelease } from "./verify.js";
 
 export function registryPath(name: string): string {
@@ -216,7 +217,7 @@ export async function importSchemaFromRegistry(
     config.imports[schemaName][schemaFile.manifest.version] = schemaFile.manifest.release;
     await project.write(CONFIG_FILE, formatRpackConfig(config));
 
-    const updatedSource = upsertImportStatement(sourceText, schemaName, schemaFile.manifest.version);
+    const updatedSource = await rewriteImportStatement(project, config, sourceText, schemaName, schemaFile);
     if (updatedSource !== sourceText) {
         await project.write(sourcePath, updatedSource);
     }
@@ -229,13 +230,38 @@ export async function importSchemaFromRegistry(
     };
 }
 
-function upsertImportStatement(text: string, schemaName: string, version: string): string {
-    const stmtText = `IMPORT SCHEMA ${renderIdent(schemaName)} VERSION ${renderLiteral(version)};`;
+async function rewriteImportStatement(
+    project: RpackProject,
+    config: RpackConfig,
+    text: string,
+    schemaName: string,
+    file: SchemaReleaseFile,
+): Promise<string> {
+    const parsed = parseScript(text, { catalogVersionOptional: true });
+    const existing = parsed.ok
+        ? parsed.value.statements.flatMap((stmt) => stmt.kind === 'import-schema' && stmt.name === schemaName ? stmt.versions : [])
+        : [];
+    const versions = [...new Set([...existing, file.manifest.version])];
+    const steps = [...file.steps];
+    for (const version of existing) {
+        if (version === file.manifest.version) continue;
+        const hash = config.imports?.[schemaName]?.[version];
+        if (hash === undefined) continue;
+        const locked = await project.read(`${IMPORTS_DIR}/${releaseFileName(file.manifest.name, version, hash)}`);
+        if (locked === undefined) continue;
+        steps.push(...parseSchemaReleaseFile(locked).steps);
+    }
+    return upsertImportStatement(text, schemaName, maximalImportedVersions(steps, versions));
+}
+
+function upsertImportStatement(text: string, schemaName: string, versions: string[]): string {
+    const listed = `VERSION ${versions.map((v) => renderLiteral(v)).join(', ')}`;
+    const stmtText = `IMPORT SCHEMA ${renderIdent(schemaName)} ${listed};`;
     const parsed = parseScript(text, { catalogVersionOptional: true });
     if (parsed.ok) {
         for (const stmt of parsed.value.statements) {
             if (stmt.kind === 'import-schema' && stmt.name === schemaName) {
-                return text.slice(0, stmt.versionSpan.start) + `VERSION ${renderLiteral(version)}` + text.slice(stmt.versionSpan.end);
+                return text.slice(0, stmt.versionsSpan.start) + listed + text.slice(stmt.versionsSpan.end);
             }
         }
         const firstSchemaOrCatalog = parsed.value.statements.find(

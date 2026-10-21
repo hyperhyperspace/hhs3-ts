@@ -174,7 +174,7 @@ export type CreatePlanResult = {
 export type ImportSchemaLangResult = {
     kind: 'import-schema';
     name: string;
-    version: string;
+    versions: string[];
     schemaId: B64Hash;
     at: Version;
 };

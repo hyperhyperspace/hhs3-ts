@@ -152,6 +152,7 @@ function checkReleaseBodyFormat(body: CatalogReleaseBody): string | undefined {
     const paramNames = new Set<string>();
     for (const decl of body.params ?? []) {
         if (!isValidName(decl.name)) return `invalid param name '${decl.name}'`;
+        if (decl.type === 'decimal') return `param '${decl.name}' cannot be decimal: a param has no scale`;
         if (paramNames.has(decl.name)) return `param '${decl.name}' is declared twice`;
         paramNames.add(decl.name);
     }

@@ -25,7 +25,7 @@ import {
     draftSchemaRelease, formatSchemaDraft, formatSchemaUpgrade, produceSchemaRelease, readSchemaSource, ReleasedSchemas, renderSchemaSource,
     type ProducedSchemaRelease, type SchemaReleaseDraft,
 } from "./schema_pack.js";
-import { formatWhere, isBlankSql, readSource, SourceError } from "./source.js";
+import { formatWhere, isBlankSql, maximalImportedVersions, readSource, SourceError } from "./source.js";
 import { stripCatalogVersion, writeSource } from "./write_source.js";
 import { parseScript } from "@hyper-hyper-space/hhs3_rdb_lang";
 
@@ -263,8 +263,9 @@ async function collectParentImportVersions(
     project: RpackProject,
     config: RpackConfig,
     parents: ReleaseInfo[],
-): Promise<Map<string, string>> {
-    const out = new Map<string, string>();
+    imports: Map<string, SchemaReleaseFile>,
+): Promise<Map<string, string[]>> {
+    const listed = new Map<string, string[]>();
     for (const p of parents) {
         const folder = folderOf(config, p.name);
         if (folder === undefined) continue;
@@ -274,11 +275,15 @@ async function collectParentImportVersions(
         if (!parsed.ok) continue;
         for (const stmt of parsed.value.statements) {
             if (stmt.kind !== 'import-schema') continue;
-            const cur = out.get(stmt.name);
-            if (cur === undefined || compareSemver(stmt.version, cur) > 0) {
-                out.set(stmt.name, stmt.version);
-            }
+            const cur = listed.get(stmt.name) ?? [];
+            for (const version of stmt.versions) if (!cur.includes(version)) cur.push(version);
+            listed.set(stmt.name, cur);
         }
+    }
+    const out = new Map<string, string[]>();
+    for (const [name, versions] of listed) {
+        const steps = versions.flatMap((v) => imports.get(`${name}@${v}`)?.steps ?? []);
+        out.set(name, maximalImportedVersions(steps, versions));
     }
     return out;
 }
@@ -300,7 +305,7 @@ async function writeFresh(project: RpackProject, repo: Repo, folder: string, par
         if (base.clashes.length > 0) throw new RpackError(`The base can't be written as one ${SOURCE_FILE}: ${base.clashes.join('; ')}`);
         const highestFolder = folderOf(config, highestOf(parents).name);
         const text = highestFolder !== undefined ? await project.read(releasedPath(highestFolder, SOURCE_FILE)) : undefined;
-        const importedVersions = await collectParentImportVersions(project, config, parents);
+        const importedVersions = await collectParentImportVersions(project, config, parents, imports);
         const written = await writeSource(text ?? '', base.model, keys, config.key, { imports, importedVersions });
         source = stripCatalogVersion(written, new Set(parents.map((p) => p.version))).text;
     }
@@ -446,7 +451,7 @@ async function draftOn(
         const hinted = hintReadOnlyFiles(err.issues, await released.base(parents.map((p) => p.hash)));
         throw hinted === undefined ? err : new SourceError(hinted);
     }
-    return draftRelease({ catalog: config.name, version, parents, released, source, nextText: inputs.manual, signer: keys.get(config.key)! });
+    return draftRelease({ catalog: config.name, version, parents, released, source, nextText: inputs.manual, signer: keys.get(config.key)!, imports: config.imports });
 }
 
 // A released folder's draft makes the update its release was made with: the

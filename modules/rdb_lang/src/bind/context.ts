@@ -75,9 +75,9 @@ export type ResolvedImportedSchema = {
 
 export interface LangBindContext {
     resolveSchema(ref: NameOrHashRef): Promise<ResolvedSchemaRef>;
-    // Source mode (`IMPORT SCHEMA <name> VERSION '<version>'`): resolves an
-    // imported schema and the entry position mirroring that version.
-    resolveImport?(name: string, version: string): Promise<ResolvedImportedSchema | undefined>;
+    // Source mode (`IMPORT SCHEMA <name> VERSION '<v1>' [, '<v2>', ...]`):
+    // resolves an imported schema and the position pinning those versions.
+    resolveImport?(name: string, versions: string[]): Promise<ResolvedImportedSchema | undefined>;
     // A group name is `group` or `db.group` (NameRef parts); a bare name
     // resolves within the default database when one is set.
     resolveGroup(ref: NameOrHashRef): Promise<ResolvedGroupRef>;
@@ -123,6 +123,10 @@ export interface LangBindContext {
     // The version of a CREATE SCHEMA parsed without VERSION, while target-catalog.sql
     // is evaluated. Absent: the schema defaults to 0.0.1.
     defaultSchemaVersion?(): Promise<string | undefined>;
+    // The version of an ALTER SCHEMA parsed without VERSION. Source mode uses
+    // this to number a local patch on an imported schema. Absent: the engine
+    // picks the next patch of the schema's current version.
+    defaultAlterSchemaVersion?(schemaId: B64Hash): Promise<string | undefined>;
     createUuid(): string;
     createSeed(kind: 'rdb' | 'group', name?: string): string;
 }

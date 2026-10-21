@@ -11,12 +11,14 @@ import { createBasicCrypto, createIdentity, HASH_SHA256, SIGNING_ED25519 } from 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { version, type RContext, type Version } from "@hyper-hyper-space/hhs3_mvt";
 import {
-    compareSemver, isValidSemver,
+    compareSemver, isValidSemver, parseSemver,
     RBLOB_STORE_TYPE_ID, RCATALOG_TYPE_ID, RDB_TYPE_ID, RDEPLOY_GATE_TYPE_ID, RFILE_MAP_TYPE_ID, RSCHEMA_TYPE_ID, RTABLE_GROUP_TYPE_ID,
     rBlobStoreFactory, rCatalogFactory, rDbFactory, rDeployGateFactory, rFileMapFactory, rSchemaFactory, rTableGroupFactory,
     RSchemaImpl, type RSchema,
 } from "@hyper-hyper-space/hhs3_rdb";
 import { MemDagBackend, Replica } from "@hyper-hyper-space/hhs3_replica";
+
+import { isPatchVersion, PATCH_MAJOR_BASE } from "./model.js";
 
 import {
     checkAnyReleaseFile, isSchemaReleaseFile, parseAnyReleaseFile, releaseTag, schemaStepHash,
@@ -287,6 +289,13 @@ async function verifySchemaFile(ctx: RContext, file: SchemaReleaseFile): Promise
     return summary;
 }
 
+function annotateSchemaVersion(version: string): string {
+    if (!isPatchVersion(version)) return version;
+    const parsed = parseSemver(version);
+    if (parsed === undefined) return version;
+    return `${version} (local patch ${parsed.major - PATCH_MAJOR_BASE}.${parsed.minor}.${parsed.patch})`;
+}
+
 // A verify report as text lines, for command-line tools.
 export function formatVerifyReport(report: VerifyReport): string[] {
     if (!report.ok || report.summary === undefined) return report.problems.map((p) => `problem: ${p}`);
@@ -301,7 +310,7 @@ export function formatVerifyReport(report: VerifyReport): string[] {
         lines.push(`catalog  #${s.catalog.id}: ${count(s.catalog.releases, 'release', 'releases')}, ${count(s.catalog.declares, 'declare', 'declares')}`);
     }
     for (const schema of s.schemas) {
-        lines.push(`schema   ${schema.name} ${schema.versions.join(' + ')} #${schema.id}: ${count(schema.entries, 'entry', 'entries')} beyond the create`);
+        lines.push(`schema   ${schema.name} ${schema.versions.map(annotateSchemaVersion).join(' + ')} #${schema.id}: ${count(schema.entries, 'entry', 'entries')} beyond the create`);
     }
     lines.push('ok');
     return lines;
