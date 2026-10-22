@@ -30,7 +30,7 @@ export interface FacadeHost {
     cachedIndexes(table: string): ResolvedIndex[];
     cmp(a: unknown, b: unknown): number;
     isCaptureOn(): boolean;
-    onOutboxCommitted(): void;
+    onOutboxCommitted(records: OutboxRecord[]): void;
 }
 
 class NameList {
@@ -522,7 +522,8 @@ export class FacadeObjectStore {
 
     private queueOutbox(req: FacadeRequest<unknown>, rec: OutboxRecord): void {
         if (!this.transaction.host.isCaptureOn()) return;
-        wire(req, this.transaction.real.objectStore(OUTBOX).add(rec), 'write', () => {});
+        this.transaction.outboxRecords.push(rec);
+        wire(req, this.transaction.real.objectStore(OUTBOX).add(rec), 'write', (key) => { rec.id = key as number; });
         this.transaction.captured = true;
     }
 }
@@ -819,6 +820,7 @@ export class FacadeTransaction {
     readonly mode: IDBTransactionMode;
     readonly db: FacadeDatabase;
     captured = false;
+    outboxRecords: OutboxRecord[] = [];
     error: DOMException | null = null;
     oncomplete: ((ev: Event) => void) | null = null;
     onabort: ((ev: Event) => void) | null = null;
@@ -834,7 +836,7 @@ export class FacadeTransaction {
         );
         this.real.oncomplete = (ev) => {
             this.finished = true;
-            if (this.captured) host.onOutboxCommitted();
+            if (this.captured) host.onOutboxCommitted(this.outboxRecords);
             this.oncomplete?.(ev);
         };
         this.real.onabort = (ev) => {

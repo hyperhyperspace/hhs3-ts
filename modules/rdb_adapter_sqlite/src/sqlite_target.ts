@@ -42,18 +42,21 @@
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
-import type { ColumnDef, ColumnType } from "@hyper-hyper-space/hhs3_rdb";
+import { likeMatch, type ColumnDef, type ColumnType } from "@hyper-hyper-space/hhs3_rdb";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import { watchFile, FileWatchHandle } from "@hyper-hyper-space/hhs3_file_watch";
 import Database from "better-sqlite3";
 
 import {
-    CapturedBatch, CapturedChange, ChangeSignalListener, ChangeSignalSource,
+    BoundWhereExpr, BoundOperand, CapturedBatch, CapturedChange, OrderBySpec, ProjectedRow,
+    QueryableTarget, ReactiveChangeTarget, SingleTableQueryPlan,
+    TargetCommitEvent, TargetCommitListener, TargetRowChange,
     CheckpointMovedError, DEFAULT_KEY_TABLE, IndexDecl, IndexSpec, IndexState, IndexTarget, IngestSettle,
     KeyIndex, MaterializationTarget, MaterializedChangeSource, OpEvent, OpEventQuery, OpEventReason,
     ResolvedIndex, resolveOpEventQuery, RowAction, RowIdentityIndex, SchemaAction, StoredOpEvent, SyncMapping,
     versionsEqual,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
+import { normalizeOrder } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 // Per-table bookkeeping, mirrored in rdb_table_meta. Cached in memory within a
 // process; lazily reloaded from the table after a restart. `fkColumns` maps each
@@ -216,8 +219,8 @@ function toLogical(value: unknown, type: ColumnType): json.Literal | undefined {
     return value as json.Literal;
 }
 
-export class SqliteTarget implements MaterializationTarget, MaterializedChangeSource, ChangeSignalSource,
-    RowIdentityIndex, KeyIndex, IndexTarget {
+export class SqliteTarget implements MaterializationTarget, MaterializedChangeSource,
+    ReactiveChangeTarget, QueryableTarget, RowIdentityIndex, KeyIndex, IndexTarget {
     private db: Database.Database;
     private metaCache = new Map<string, TableMeta>();
     private bookkeepingReady = false;
@@ -242,11 +245,16 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     // Lazily armed on the first listener, disarmed (epoch-bumped) on the last.
     private readonly pollMs: number;
     private readonly walPath: string | undefined;
-    private changeListeners = new Set<ChangeSignalListener>();
+    private commitListeners = new Set<TargetCommitListener>();
+    private emittedOutboxIds = new Set<number>();
+    private watchPending = false;
+    private watchAgain = false;
+    private pendingApply: TargetRowChange[] | undefined;
+    private pendingEvents: StoredOpEvent[] | undefined;
     private monitorTimer: ReturnType<typeof setInterval> | undefined;
     private walHandle: FileWatchHandle | undefined;
     private monitorEpoch = 0;
-    private lastOutboxId = 0;
+    private likeReady = false;
     // Resolves once the armed change monitor is guaranteed live: for the WAL
     // watch, once the kernel file watcher is registered (see FileWatchHandle.
     // ready); for the poll, immediately (the interval is live on arm). Undefined
@@ -355,14 +363,36 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             for (const index of ensures) this.createIndex(index);
             this.persistCheckpoint(groupId, checkpoint);
             // Concurrency void/reinstate flips ride the same checkpoint advance.
-            if (events !== undefined) for (const e of events) this.logOpEvent(e);
+            const logged: StoredOpEvent[] = [];
+            if (events !== undefined) for (const e of events) {
+                const stored = this.logOpEvent(e);
+                if (stored !== undefined) logged.push(stored);
+            }
+            this.pendingEvents = logged;
             if (this.capture) this.setApplying(false);
         });
         // BEGIN IMMEDIATE: this transaction reads (the checkpoint CAS compare)
         // and then writes, so it must take the write lock up front. A deferred
         // transaction would take a read snapshot and fail with SQLITE_BUSY_SNAPSHOT
         // when it later tried to upgrade while another connection had written.
-        run.immediate();
+        this.pendingApply = [];
+        try {
+            run.immediate();
+        } catch (err) {
+            this.pendingApply = undefined;
+            this.pendingEvents = undefined;
+            throw err;
+        }
+        const changes = this.pendingApply;
+        const logged = this.pendingEvents ?? [];
+        this.pendingApply = undefined;
+        this.pendingEvents = undefined;
+        const schemaTables = [...new Set(schemaActions.map((action) =>
+            action.kind === 'ensure-index' ? action.index.table : action.table))];
+        if (changes.length > 0 || logged.length > 0 || schemaTables.length > 0) {
+            const commit: TargetCommitEvent = { source: 'apply', groupId, schemaTables, changes, events: logged };
+            for (const listener of [...this.commitListeners]) listener(commit);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -430,8 +460,8 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     }
 
     // Append one op-event (idempotent by (op_hash, direction)).
-    private logOpEvent(event: OpEvent): void {
-        this.db.prepare(
+    private logOpEvent(event: OpEvent): StoredOpEvent | undefined {
+        const result = this.db.prepare(
             'INSERT OR IGNORE INTO rdb_op_events '
             + '(origin, direction, group_id, op_hash, op_json, kind, "table", row_hash, local_id, author, reason) '
             + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
@@ -441,6 +471,8 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
                 event.kind, event.table ?? null, event.rowId ?? null,
                 event.localId ?? null, event.author ?? null,
                 event.reason === undefined ? null : JSON.stringify(event.reason));
+        if (result.changes === 0) return undefined;
+        return { id: Number(result.lastInsertRowid), event };
     }
 
     // Provision the capture infrastructure (idempotent). The config row holds
@@ -991,6 +1023,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             this.db.prepare(
                 `UPDATE ${quoteId(action.table)} SET ${assignments.join(', ')} `
                 + `WHERE ${quoteId(meta.idColumn)} = ?`).run(...params);
+            this.rememberApply(meta, action.table, id, 'update');
             return;
         }
 
@@ -1008,6 +1041,26 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         this.db.prepare(
             `INSERT INTO ${quoteId(action.table)} (${insertCols.map(quoteId).join(', ')}) `
             + `VALUES (${placeholders})`).run(...insertParams);
+        this.rememberApply(meta, action.table, id, 'insert');
+    }
+
+    private rememberApply(meta: TableMeta, table: string, id: number, kind: 'insert' | 'update'): void {
+        if (this.pendingApply === undefined) return;
+        this.pendingApply.push({ kind, table, localId: id, values: this.readLogicalRow(meta, table, id) });
+    }
+
+    private readLogicalRow(meta: TableMeta, table: string, id: number): { [column: string]: json.Literal | null } {
+        const cols = [meta.idColumn, ...Object.keys(meta.columnTypes)];
+        if (meta.authorColumn !== undefined && !cols.includes(meta.authorColumn)) cols.push(meta.authorColumn);
+        const selected = cols.map((col) => `${quoteId(col)} AS ${quoteId(col)}`).join(', ');
+        const row = this.db.prepare(
+            `SELECT ${selected} FROM ${quoteId(table)} WHERE ${quoteId(meta.idColumn)} = ?`).get(id) as { [column: string]: unknown } | undefined;
+        const values: { [column: string]: json.Literal | null } = {};
+        for (const col of cols) {
+            const logical = row === undefined ? undefined : toLogical(row[col], meta.columnTypes[col] ?? (col === meta.idColumn || col === meta.authorColumn ? 'integer' : 'string'));
+            values[col] = logical === undefined ? null : logical;
+        }
+        return values;
     }
 
     private deleteRow(action: Extract<RowAction, { kind: 'delete-row' }>): void {
@@ -1016,9 +1069,14 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         // later void-flip reinstatement reuses the same serial id. Status ->
         // deleted (the settle overrides to ingestion_failure for a reverted
         // insert orphan).
+        const local = this.db.prepare(`SELECT "id" AS id FROM ${quoteId(meta.syncTable)} WHERE "row_hash" = ?`)
+            .get(action.rowId) as { id: number } | undefined;
         this.db.prepare(
             `DELETE FROM ${quoteId(action.table)} WHERE ${quoteId(meta.idColumn)} = `
             + `(SELECT "id" FROM ${quoteId(meta.syncTable)} WHERE "row_hash" = ?)`).run(action.rowId);
+        if (local !== undefined && this.pendingApply !== undefined) {
+            this.pendingApply.push({ kind: 'delete', table: action.table, localId: local.id });
+        }
         this.db.prepare(`UPDATE ${quoteId(meta.syncTable)} SET "status" = 'deleted' WHERE "row_hash" = ?`)
             .run(action.rowId);
     }
@@ -1027,11 +1085,63 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     // MaterializedChangeSource (inbound). Requires provisioned capture.
     // -----------------------------------------------------------------------
 
+    async executeQuery(plan: SingleTableQueryPlan): Promise<ProjectedRow[]> {
+        this.ensureBookkeeping();
+        this.ensureLike();
+        const meta = this.loadMeta(plan.table);
+        const needsOrder = plan.limit !== undefined || plan.cursor !== undefined;
+        const order = normalizeOrder(plan.orderBy, meta.idColumn, needsOrder);
+        const params: Array<number | string | null> = [];
+        let whereSql = plan.where === undefined ? '1' : compileWhere(plan.where, params);
+        if (plan.cursor !== undefined && order.length > 0) {
+            const anchor = this.anchorValues(meta, plan.table, plan.cursor.id, plan.cursor.cachedValues);
+            if (anchor === undefined) return [];
+            const cols = order.map((item) => quoteId(item.column)).join(', ');
+            const marks = order.map(() => '?').join(', ');
+            whereSql = `(${whereSql}) AND (${cols}) ${plan.cursor.side === 'before' ? '<' : '>'} (${marks})`;
+            for (const item of order) params.push(sqlParam(anchor[item.column] ?? null));
+        }
+        const columns = plan.select ?? [meta.idColumn, ...Object.keys(meta.columnTypes), ...(meta.authorColumn ? [meta.authorColumn] : [])];
+        const select = [...new Set(columns)].map((col) => quoteId(col)).join(', ');
+        const orderSql = order.length === 0 ? '' : ` ORDER BY ${order.map((item) => `${quoteId(item.column)} ${item.direction.toUpperCase()}`).join(', ')}`;
+        const limitSql = plan.limit === undefined ? '' : ` LIMIT ${plan.limit}`;
+        const rows = this.db.prepare(`SELECT ${select} FROM ${quoteId(plan.table)} WHERE ${whereSql}${orderSql}${limitSql}`).all(...params) as Array<{ [column: string]: unknown }>;
+        return rows.map((row) => {
+            const projected: ProjectedRow = { id: Number(row[meta.idColumn]) };
+            for (const col of new Set(columns)) {
+                const logical = toLogical(row[col], meta.columnTypes[col] ?? 'integer');
+                projected[col] = logical === undefined ? null : logical;
+            }
+            return projected;
+        });
+    }
+
+    private ensureLike(): void {
+        if (this.likeReady) return;
+        this.db.function('rdb_like_match', { deterministic: true }, (value: unknown, pattern: unknown) => {
+            if (typeof value !== 'string' || typeof pattern !== 'string') return null;
+            return likeMatch(value, pattern) ? 1 : 0;
+        });
+        this.likeReady = true;
+    }
+
+    private anchorValues(meta: TableMeta, table: string, id: number, cached: { [column: string]: json.Literal | null } | undefined): { [column: string]: json.Literal | null } | undefined {
+        const exists = this.db.prepare(`SELECT 1 FROM ${quoteId(table)} WHERE ${quoteId(meta.idColumn)} = ?`).get(id);
+        if (exists !== undefined) return this.readLogicalRow(meta, table, id);
+        return cached;
+    }
+
     async drainChanges(): Promise<CapturedBatch> {
         this.requireCapture();
         const rows = this.db.prepare(
             'SELECT id, "table" AS tbl, local_id, op, changed FROM rdb_outbox ORDER BY id')
             .all() as { id: number; tbl: string; local_id: number; op: string; changed: string | null }[];
+        const fresh = rows.filter((row) => !this.emittedOutboxIds.has(row.id));
+        this.emittedOutboxIds = new Set(rows.map((row) => row.id));
+        if (fresh.length > 0) {
+            const tables = [...new Set(fresh.map((row) => row.tbl))];
+            for (const listener of [...this.commitListeners]) listener({ source: 'local', tables });
+        }
 
         const changes: CapturedChange[] = [];
         for (const row of rows) {
@@ -1112,13 +1222,28 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
                 this.db.prepare(`UPDATE ${quoteId(meta.syncTable)} SET "status" = ? WHERE "row_hash" = ?`)
                     .run(s.status, s.rowId);
             }
-            for (const e of settle.events ?? []) this.logOpEvent(e);
+            const logged: StoredOpEvent[] = [];
+            for (const e of settle.events ?? []) {
+                const stored = this.logOpEvent(e);
+                if (stored !== undefined) logged.push(stored);
+            }
+            this.pendingEvents = logged;
             this.setApplying(false);
             for (const id of settle.consumed) {
                 this.db.prepare('DELETE FROM rdb_outbox WHERE id = ?').run(id);
             }
         });
         run.immediate();
+        const logged = this.pendingEvents ?? [];
+        this.pendingEvents = undefined;
+        for (const id of settle.consumed) this.emittedOutboxIds.delete(typeof id === 'number' ? id : Number.NaN);
+        if ((settle.reverts?.length ?? 0) > 0 || logged.length > 0) {
+            const revertedTables = [...new Set([
+                ...(settle.reverts ?? []).map((action) => action.table),
+                ...logged.map((stored) => stored.event.table).filter((table): table is string => table !== undefined),
+            ])];
+            for (const listener of [...this.commitListeners]) listener({ source: 'settle', revertedTables, events: logged });
+        }
     }
 
     async drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]> {
@@ -1161,14 +1286,23 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     // are epoch-gated so a disarm/re-arm can never let a stale notification fire.
     // -----------------------------------------------------------------------
 
-    addChangeListener(listener: ChangeSignalListener): void {
-        this.changeListeners.add(listener);
-        if (this.changeListeners.size === 1) this.armMonitor();
+    addCommitListener(listener: TargetCommitListener): void {
+        this.commitListeners.add(listener);
+        if (this.commitListeners.size === 1) this.armMonitor();
     }
 
-    removeChangeListener(listener: ChangeSignalListener): void {
-        this.changeListeners.delete(listener);
-        if (this.changeListeners.size === 0) this.disarmMonitor();
+    removeCommitListener(listener: TargetCommitListener): void {
+        this.commitListeners.delete(listener);
+        if (this.commitListeners.size === 0) this.disarmMonitor();
+    }
+
+    notifyExternalCommit(commit: TargetCommitEvent): void {
+        for (const listener of [...this.commitListeners]) listener(commit);
+    }
+
+    noteLocalCommit(): void {
+        if (this.db.inTransaction) return;
+        this.fireIfOutboxGrew(this.monitorEpoch);
     }
 
     private armMonitor(): void {
@@ -1183,8 +1317,8 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     // outbox primes are silent.
     private armWalWatch(): void {
         const epoch = ++this.monitorEpoch;
-        this.lastOutboxId = 0;   // fire once for any already-pending rows
-        const notify = (): void => { this.fireIfOutboxGrew(epoch); };
+        this.emittedOutboxIds.clear();
+        const notify = (): void => { this.queueWatch(epoch); };
         this.walHandle = watchFile(this.walPath!, notify);
         notify();   // prime: wake an observer for an already-pending outbox promptly
         // Second prime once the kernel watcher is guaranteed registered. This
@@ -1198,8 +1332,8 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
 
     private armPoll(): void {
         const epoch = ++this.monitorEpoch;
-        this.lastOutboxId = 0;   // fire once for any already-pending rows
-        const tick = (): void => { this.fireIfOutboxGrew(epoch); };
+        this.emittedOutboxIds.clear();
+        const tick = (): void => { this.queueWatch(epoch); };
 
         this.monitorTimer = setInterval(tick, this.pollMs);
         (this.monitorTimer as unknown as { unref?: () => void }).unref?.();
@@ -1207,15 +1341,35 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         this.monitorReady = Promise.resolve();   // the interval is live on arm
     }
 
-    // Fire listeners iff the outbox AUTOINCREMENT high-water mark advanced.
-    // Shared by WAL notify and the poll tick. Missing outbox -> silent (0).
+    private queueWatch(epoch: number): void {
+        if (this.watchPending) { this.watchAgain = true; return; }
+        this.watchPending = true;
+        queueMicrotask(() => {
+            this.watchPending = false;
+            this.fireIfOutboxGrew(epoch);
+            if (this.watchAgain) { this.watchAgain = false; this.queueWatch(epoch); }
+        });
+    }
+
+    // Announce outbox rows this process has not announced yet. The remembered
+    // set is only ids still in the outbox, so a burned AUTOINCREMENT id never
+    // stalls the next row and a late commit is still announced.
     private fireIfOutboxGrew(epoch: number): void {
-        if (epoch !== this.monitorEpoch) return;   // disarmed / re-armed: stale
+        if (epoch !== this.monitorEpoch) return;
         if (!this.capture) return;
-        const maxId = this.outboxMaxId();
-        if (maxId > this.lastOutboxId) {
-            this.lastOutboxId = maxId;
-            for (const l of [...this.changeListeners]) l({});
+        const rows = this.readOutboxIds();
+        const fresh = rows.filter((row) => !this.emittedOutboxIds.has(row.id));
+        this.emittedOutboxIds = new Set(rows.map((row) => row.id));
+        if (fresh.length === 0) return;
+        const tables = [...new Set(fresh.map((row) => row.tbl))];
+        for (const listener of [...this.commitListeners]) listener({ source: 'local', tables });
+    }
+
+    private readOutboxIds(): { id: number; tbl: string }[] {
+        try {
+            return this.db.prepare('SELECT id, "table" AS tbl FROM rdb_outbox ORDER BY id').all() as { id: number; tbl: string }[];
+        } catch {
+            return [];
         }
     }
 
@@ -1302,4 +1456,76 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             .get(keyHash) as { id: number } | undefined;
         return row?.id;
     }
+}
+
+function compileWhere(expr: BoundWhereExpr, params: Array<number | string | null>): string {
+    switch (expr.kind) {
+        case 'not': return `(NOT ${compileWhere(expr.arg, params)})`;
+        case 'and': return `(${expr.args.map((arg) => compileWhere(arg, params)).join(' AND ')})`;
+        case 'or': return `(${expr.args.map((arg) => compileWhere(arg, params)).join(' OR ')})`;
+        case 'isNull': return `(${compileOperand(expr.arg, params)} IS ${expr.not ? 'NOT ' : ''}NULL)`;
+        case 'like': return `(rdb_like_match(${compileOperand(expr.arg, params)}, ${compileOperand(expr.pattern, params)}) = 1)`;
+        case 'in': {
+            if (expr.values.length === 0) return expr.not ? '1' : '0';
+            const arg = compileOperand(expr.arg, params);
+            const marks = expr.values.map((value) => { params.push(sqlParam(value)); return '?'; });
+            return `(${arg} ${expr.not ? 'NOT ' : ''}IN (${marks.join(', ')}))`;
+        }
+        case 'cmp': return `(${compileOperand(expr.left, params)} ${expr.op === '!=' ? '<>' : expr.op} ${compileOperand(expr.right, params)})`;
+    }
+}
+
+function sqlParam(value: json.Literal | null): number | string | null {
+    if (value === null) return null;
+    if (typeof value === 'boolean') return value ? 1 : 0;
+    if (typeof value === 'number' || typeof value === 'string') return value;
+    return json.toStringCanonical(value);
+}
+
+function compileOperand(operand: BoundOperand, params: Array<number | string | null>): string {
+    switch (operand.kind) {
+        case 'col': return quoteId(operand.name);
+        case 'lit': {
+            if (operand.value === null) return 'NULL';
+            params.push(sqlParam(operand.value));
+            return '?';
+        }
+        case 'length': return `length(${compileOperand(operand.arg, params)})`;
+        case 'arith': return `(${compileOperand(operand.left, params)} ${operand.op} ${compileOperand(operand.right, params)})`;
+    }
+}
+
+// The commit hook better-sqlite3 does not expose. A successful outermost
+// statement tells the target to look at the outbox. Nested statements and
+// rollbacks leave `inTransaction` set or add no outbox row.
+export function wrapDatabase(db: Database.Database, target: SqliteTarget): Database.Database {
+    const wrapStatement = (statement: Database.Statement): Database.Statement => new Proxy(statement, {
+        get(obj, prop, receiver) {
+            if (prop === 'run') return (...args: unknown[]) => {
+                const result = obj.run(...args);
+                target.noteLocalCommit();
+                return result;
+            };
+            return Reflect.get(obj, prop, receiver);
+        },
+    });
+    return new Proxy(db, {
+        get(obj, prop, receiver) {
+            if (prop === 'prepare') return (sql: string) => wrapStatement(obj.prepare(sql));
+            if (prop === 'exec') return (sql: string) => {
+                const result = obj.exec(sql);
+                target.noteLocalCommit();
+                return result;
+            };
+            if (prop === 'transaction') return (fn: (...args: unknown[]) => unknown) => {
+                const wrapped = obj.transaction(fn);
+                return (...args: unknown[]) => {
+                    const result = wrapped(...args);
+                    target.noteLocalCommit();
+                    return result;
+                };
+            };
+            return Reflect.get(obj, prop, receiver);
+        },
+    });
 }

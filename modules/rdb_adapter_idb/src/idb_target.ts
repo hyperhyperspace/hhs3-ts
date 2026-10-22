@@ -20,12 +20,14 @@ import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import type { ColumnType } from "@hyper-hyper-space/hhs3_rdb";
 import {
-    CapturedBatch, CapturedChange, ChangeSignalListener, ChangeSignalSource,
-    CheckpointMovedError, DEFAULT_KEY_TABLE, IndexDecl, IndexSpec, IndexState, IndexTarget, IngestSettle,
+    CapturedBatch, CapturedChange, CheckpointMovedError, DEFAULT_KEY_TABLE,
+    IndexDecl, IndexSpec, IndexState, IndexTarget, IngestSettle,
+    QueryableTarget, ReactiveChangeTarget, SingleTableQueryPlan, TargetCommitEvent, TargetCommitListener, TargetRowChange,
     KeyIndex, MaterializationTarget, MaterializedChangeSource, OpEvent, OpEventQuery, OpEventReason,
     pageOpEvents, ResolvedIndex, RowAction, RowIdentityIndex, SchemaAction, StoredOpEvent, SyncMapping,
     versionsEqual,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
+import { compareSortTuples, evalWhere, normalizeOrder, projectColumns, rowOnSide } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 import { FacadeDatabase, type FacadeHost } from "./idb_facade.js";
 import {
@@ -53,16 +55,32 @@ type ApplyCtx = {
     meta: Map<string, TableMetaRecord>;
     // Per table, the materialized indexes (read from index_meta inside tx).
     indexes: Map<string, ResolvedIndex[]>;
+    changes: TargetRowChange[];
+    events: StoredOpEvent[];
 };
 
 function newCtx(tx: IDBTransaction): ApplyCtx {
-    return { tx, meta: new Map(), indexes: new Map() };
+    return { tx, meta: new Map(), indexes: new Map(), changes: [], events: [] };
 }
 
 const NO_INDEX_OPTIONS = 'the indexeddb target takes no index options';
 
+function logicalRow(meta: TableMetaRecord, rec: RowRecord): import("@hyper-hyper-space/hhs3_rdb_adapter").ProjectedRow {
+    const values: import("@hyper-hyper-space/hhs3_rdb_adapter").ProjectedRow = { id: rec.id };
+    if (meta.idColumn !== 'id') values[meta.idColumn] = rec.id;
+    for (const column of Object.keys(meta.columnTypes)) {
+        const value = rec[column];
+        values[column] = value === undefined ? null : value as json.Literal;
+    }
+    if (meta.authorColumn !== undefined) {
+        const author = rec[meta.authorColumn];
+        values[meta.authorColumn] = author === undefined ? null : author as json.Literal;
+    }
+    return values;
+}
+
 export class IdbTarget implements MaterializationTarget, MaterializedChangeSource,
-    ChangeSignalSource, RowIdentityIndex, KeyIndex, IndexTarget, FacadeHost {
+    ReactiveChangeTarget, QueryableTarget, RowIdentityIndex, KeyIndex, IndexTarget, FacadeHost {
 
     readonly name: string;
     readonly env: IdbEnv;
@@ -73,7 +91,8 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
     // table -> its indexes, sorted by name. Only feeds the facade's synchronous
     // `indexNames` / `index()`; reads and writes consult index_meta in-tx.
     private indexCache = new Map<string, ResolvedIndex[]>();
-    private changeListeners = new Set<ChangeSignalListener>();
+    private commitListeners = new Set<TargetCommitListener>();
+    private emittedOutboxIds = new Set<number>();
     private observerChannel: BroadcastChannel | undefined;
     private readonly channelName: string;
     private closed = false;
@@ -96,7 +115,12 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
 
     isCaptureOn(): boolean { return this.capture && this.captureEnabled; }
 
-    onOutboxCommitted(): void { this.postChangeSignal(); }
+    onOutboxCommitted(records: OutboxRecord[] = []): void {
+        const fresh = records.filter((row) => row.id !== undefined && !this.emittedOutboxIds.has(row.id));
+        for (const row of fresh) if (row.id !== undefined) this.emittedOutboxIds.add(row.id);
+        if (fresh.length === 0) return;
+        this.deliver({ source: 'local', tables: [...new Set(fresh.map((row) => row.table))] }, true);
+    }
 
     get database(): FacadeDatabase {
         this.ensureOpen();
@@ -165,6 +189,8 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         expectIndexSpec?: string | null,
     ): Promise<void> {
         this.ensureOpen();
+        let ctxChanges: TargetRowChange[] = [];
+        let ctxEvents: StoredOpEvent[] = [];
         await this.env.withReadWrite(async (tx) => {
             const ctx = newCtx(tx);
             // Compare-and-set guard (concurrent projectors): read the stored
@@ -186,8 +212,13 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
                 groupId, version: [...checkpoint],
             } satisfies CheckpointRecord);
             if (events !== undefined) {
-                for (const e of events) await this.logOpEvent(tx, e);
+                for (const e of events) {
+                    const stored = await this.logOpEvent(tx, e);
+                    if (stored !== undefined) ctx.events.push(stored);
+                }
             }
+            ctxChanges = ctx.changes;
+            ctxEvents = ctx.events;
         });
         for (const action of schemaActions) {
             if (action.kind === 'create-table') this.tableNameSet.add(action.table);
@@ -195,6 +226,10 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         }
         if (schemaActions.some((a) => a.kind === 'ensure-index' || a.kind === 'drop-index' || a.kind === 'drop-table')) {
             await this.loadIndexCache();
+        }
+        const schemaTables = [...new Set(schemaActions.map((action) => action.kind === 'ensure-index' ? action.index.table : action.table))];
+        if (ctxChanges.length > 0 || ctxEvents.length > 0 || schemaTables.length > 0) {
+            this.deliver({ source: 'apply', groupId, schemaTables, changes: ctxChanges, events: ctxEvents }, true);
         }
     }
 
@@ -448,6 +483,7 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
             if (setAuthor && meta.authorColumn !== undefined) existing[meta.authorColumn] = authorId;
             await storePut(ctx.tx, ROWS, existing);
             await this.syncIndexEntries(ctx, action.table, id, before, existing);
+            ctx.changes.push({ kind: 'update', table: action.table, localId: id, values: logicalRow(meta, existing) });
             return;
         }
 
@@ -462,6 +498,7 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         if (setAuthor && meta.authorColumn !== undefined) rec[meta.authorColumn] = authorId;
         await storePut(ctx.tx, ROWS, rec);
         await this.syncIndexEntries(ctx, action.table, id, undefined, rec);
+        ctx.changes.push({ kind: 'insert', table: action.table, localId: id, values: logicalRow(meta, rec) });
     }
 
     private async deleteRow(ctx: ApplyCtx, action: Extract<RowAction, { kind: 'delete-row' }>): Promise<void> {
@@ -472,24 +509,48 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
             await this.syncIndexEntries(ctx, action.table, sync.id, old, undefined);
             sync.status = 'deleted';
             await storePut(ctx.tx, SYNC, sync);
+            ctx.changes.push({ kind: 'delete', table: action.table, localId: sync.id });
         }
     }
 
-    private async logOpEvent(tx: IDBTransaction, event: OpEvent): Promise<void> {
+    private async logOpEvent(tx: IDBTransaction, event: OpEvent): Promise<StoredOpEvent | undefined> {
         const existing = await indexGet<OpEventRecord>(tx, OP_EVENTS, 'by_op', [event.opHash, event.direction]);
-        if (existing !== undefined) return;
+        if (existing !== undefined) return undefined;
         const rec: OpEventRecord = { ...event };
-        await storeAdd(tx, OP_EVENTS, rec);
+        const id = Number(await storeAdd(tx, OP_EVENTS, rec));
+        return { id, event };
     }
 
     // -----------------------------------------------------------------------
     // MaterializedChangeSource
     // -----------------------------------------------------------------------
 
+    async executeQuery(plan: SingleTableQueryPlan): Promise<import("@hyper-hyper-space/hhs3_rdb_adapter").ProjectedRow[]> {
+        this.ensureOpen();
+        const meta = await this.env.withRead(TABLE_META, (tx) => storeGet<TableMetaRecord>(tx, TABLE_META, plan.table));
+        if (meta === undefined) return [];
+        const records = await this.env.withRead(ROWS, (tx) => storeGetAllPrefix<RowRecord>(tx, ROWS, [plan.table]));
+        const needsOrder = plan.limit !== undefined || plan.cursor !== undefined;
+        const order = normalizeOrder(plan.orderBy, meta.idColumn, needsOrder);
+        let rows = records.map((rec) => logicalRow(meta, rec));
+        rows = rows.filter((row) => evalWhere(plan.where, row, Number(row.id)));
+        if (plan.cursor !== undefined && order.length > 0) {
+            const anchor = rows.find((row) => row.id === plan.cursor!.id) ?? plan.cursor.cachedValues;
+            if (anchor === undefined) return [];
+            rows = rows.filter((row) => rowOnSide(row, anchor, order, plan.cursor!.side));
+        }
+        if (order.length > 0) rows.sort((a, b) => compareSortTuples(a, b, order));
+        if (plan.limit !== undefined) rows = rows.slice(0, plan.limit);
+        return rows.map((row) => projectColumns(row, plan.select, meta.idColumn));
+    }
+
     async drainChanges(): Promise<CapturedBatch> {
         this.requireCapture();
         const rows = await this.env.withRead(OUTBOX, (tx) => storeGetAll<OutboxRecord>(tx, OUTBOX));
         rows.sort((a, b) => (a.id ?? 0) - (b.id ?? 0));
+        const fresh = rows.filter((row) => row.id !== undefined && !this.emittedOutboxIds.has(row.id));
+        this.emittedOutboxIds = new Set(rows.map((row) => row.id).filter((id): id is number => id !== undefined));
+        if (fresh.length > 0) this.deliver({ source: 'local', tables: [...new Set(fresh.map((row) => row.table))] }, true);
         const changes: CapturedChange[] = [];
         for (const row of rows) {
             if (row.op === 'delete') {
@@ -550,6 +611,7 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
 
     async commitIngest(settle: IngestSettle): Promise<void> {
         this.requireCapture();
+        let logged: StoredOpEvent[] = [];
         await this.env.withReadWrite(async (tx) => {
             const ctx = newCtx(tx);
             for (const m of settle.mappings ?? []) {
@@ -574,11 +636,23 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
                     await storePut(tx, SYNC, rec);
                 }
             }
-            for (const e of settle.events ?? []) await this.logOpEvent(tx, e);
+            for (const e of settle.events ?? []) {
+                const stored = await this.logOpEvent(tx, e);
+                if (stored !== undefined) logged.push(stored);
+            }
             for (const id of settle.consumed) {
                 await storeDelete(tx, OUTBOX, id);
+                if (typeof id === 'number') this.emittedOutboxIds.delete(id);
             }
+            logged = logged.concat(ctx.events);
         });
+        if ((settle.reverts?.length ?? 0) > 0 || logged.length > 0) {
+            const revertedTables = [...new Set([
+                ...(settle.reverts ?? []).map((action) => action.table),
+                ...logged.map((stored) => stored.event.table).filter((table): table is string => table !== undefined),
+            ])];
+            this.deliver({ source: 'settle', revertedTables, events: logged }, true);
+        }
     }
 
     async drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]> {
@@ -621,22 +695,28 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
     // ChangeSignalSource (BroadcastChannel)
     // -----------------------------------------------------------------------
 
-    addChangeListener(listener: ChangeSignalListener): void {
+    addCommitListener(listener: TargetCommitListener): void {
         this.ensureOpen();
-        this.changeListeners.add(listener);
-        if (this.changeListeners.size === 1) this.armChannel();
+        this.commitListeners.add(listener);
+        if (this.commitListeners.size === 1) this.armChannel();
     }
 
-    removeChangeListener(listener: ChangeSignalListener): void {
-        this.changeListeners.delete(listener);
-        if (this.changeListeners.size === 0) this.disarmChannel();
+    removeCommitListener(listener: TargetCommitListener): void {
+        this.commitListeners.delete(listener);
+        if (this.commitListeners.size === 0) this.disarmChannel();
+    }
+
+    notifyExternalCommit(commit: TargetCommitEvent): void {
+        this.deliver(commit, false);
     }
 
     private armChannel(): void {
         const channel = new BroadcastChannel(this.channelName);
-        channel.onmessage = () => this.notifyLocal();
+        channel.onmessage = (ev: MessageEvent) => {
+            const data = ev.data as TargetCommitEvent | undefined;
+            if (data !== undefined && typeof data === 'object' && 'source' in data) this.notifyExternalCommit(data);
+        };
         this.observerChannel = channel;
-        this.notifyLocal();   // prime: already-pending outbox
     }
 
     private disarmChannel(): void {
@@ -646,21 +726,14 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         }
     }
 
-    private notifyLocal(): void {
-        if (!this.capture) return;
-        for (const l of [...this.changeListeners]) l({});
-    }
-
-    private postChangeSignal(): void {
-        if (this.observerChannel !== undefined) {
-            this.observerChannel.postMessage(1);
-            return;
+    private deliver(commit: TargetCommitEvent, broadcast: boolean): void {
+        for (const listener of [...this.commitListeners]) listener(commit);
+        if (!broadcast) return;
+        const channel = this.observerChannel ?? new BroadcastChannel(this.channelName);
+        channel.postMessage(commit);
+        if (this.observerChannel === undefined) {
+            setTimeout(() => { try { channel.close(); } catch { /* ignore */ } }, 0);
         }
-        const channel = new BroadcastChannel(this.channelName);
-        channel.postMessage(1);
-        setTimeout(() => {
-            try { channel.close(); } catch { /* ignore */ }
-        }, 0);
     }
 
     // -----------------------------------------------------------------------

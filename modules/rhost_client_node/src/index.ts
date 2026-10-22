@@ -1,1 +1,1 @@
-export { hostKey, openClient, projectionPath, type HostKey, type OpenClientOptions } from "./client.js";
+export { hostKey, openClient, projectionPath, type HostKey, type NodeRhostClient, type OpenClientOptions } from "./client.js";

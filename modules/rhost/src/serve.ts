@@ -9,7 +9,7 @@ import {
 import type { Host } from "./host.js";
 
 export interface Connection {
-    send(line: string): void;
+    send(line: string): boolean | void;
     onLine(listener: (line: string) => void): void;
     onClose(listener: () => void): void;
 }
@@ -34,10 +34,16 @@ export function serveClient(host: Host, connection: Connection): void {
 
     const send = (message: ServerMessage) => {
         if (closed) return;
+        let ok = false;
         try {
-            connection.send(encodeMessage(message));
+            ok = connection.send(encodeMessage(message)) !== false;
         } catch {
-            // the other end is gone
+            ok = false;
+        }
+        if (!ok) {
+            closed = true;
+            for (const unsubscribe of watches.values()) unsubscribe();
+            watches.clear();
         }
     };
 
@@ -53,6 +59,15 @@ export function serveClient(host: Host, connection: Connection): void {
             case 'status':
                 reply(request.id, host.status());
                 return;
+            case 'watchCommits': {
+                if (watches.has(request.id)) {
+                    send({ id: request.id, error: `request id ${request.id} is already watching` });
+                    return;
+                }
+                watches.set(request.id, host.onCommit((commit) => send({ id: request.id, commit })));
+                send({ id: request.id, result: null });
+                return;
+            }
             case 'watchStatus': {
                 if (watches.has(request.id)) {
                     send({ id: request.id, error: `request id ${request.id} is already watching` });

@@ -148,7 +148,11 @@ function askSocket(path: string): Promise<HostStatus | undefined> {
     });
 }
 
-export function openClient(hostDir: string, options: OpenClientOptions = {}): RhostClient {
+export type NodeRhostClient = RhostClient & {
+    watchCommits(listener: (commit: { source: string }) => void): () => void;
+};
+
+export function openClient(hostDir: string, options: OpenClientOptions = {}): NodeRhostClient {
     const dir = resolve(hostDir);
     const socketPath = socketPathFor(dir, process.platform);
     const ownDb = options.db === undefined;
@@ -258,6 +262,38 @@ export function openClient(hostDir: string, options: OpenClientOptions = {}): Rh
         events,
         async status(): Promise<ClientStatus> {
             return (await askSocket(socketPath)) ?? await stopped();
+        },
+        watchCommits(listener) {
+            let socket: Socket | undefined;
+            let retry: ReturnType<typeof setTimeout> | undefined;
+            let done = false;
+            const attach = () => {
+                if (done) return;
+                const decoder = new LineDecoder();
+                const current = connect(socketPath);
+                socket = current;
+                current.setEncoding('utf8');
+                current.on('connect', () => current.write(encodeMessage({ id: 1, method: 'watchCommits' })));
+                current.on('data', (chunk: string) => {
+                    for (const line of decoder.push(chunk)) {
+                        const message = decodeServerMessage(line);
+                        if (message.id !== 1 || done) continue;
+                        if ('result' in message) listener({ source: 'reconnect' });
+                        if ('commit' in message) listener(message.commit);
+                    }
+                });
+                current.on('error', () => { /* the close handler follows */ });
+                current.on('close', () => {
+                    if (done) return;
+                    retry = setTimeout(attach, RECONNECT_MS);
+                });
+            };
+            attach();
+            return track(() => {
+                done = true;
+                if (retry !== undefined) clearTimeout(retry);
+                socket?.destroy();
+            });
         },
         watchStatus(listener) {
             let socket: Socket | undefined;

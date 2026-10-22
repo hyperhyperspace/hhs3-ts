@@ -244,7 +244,8 @@ export function openClient(appName: string, host: string, options: OpenClientOpt
                 if (message === undefined) resolve(undefined);
                 else if ('error' in message) resolve(undefined);
                 else if ('result' in message) resolve(message.result ?? undefined);
-                else resolve(message.event);
+                else if ('event' in message) resolve(message.event);
+                else resolve(undefined);
             });
             try { post(encodeMessage({ id, method })); }
             catch { clearTimeout(timer); pending.delete(id); resolve(undefined); }

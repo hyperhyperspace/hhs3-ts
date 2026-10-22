@@ -333,7 +333,7 @@ export const sqliteSpecificTests = {
             },
         },
         {
-            name: '[ADPTS-SQL04] ChangeSignalSource fires when a local write lands in the outbox',
+            name: '[ADPTS-SQL04] a local write announces the table',
             invoke: async () => {
                 const { group, admin } = await createGroup();
                 const ledger = await group.getTable('ledger');
@@ -345,19 +345,23 @@ export const sqliteSpecificTests = {
 
                 const signalled = new Promise<void>((resolve, reject) => {
                     const timer = setTimeout(() => reject(new Error('no change signal within timeout')), 2000);
-                    target.addChangeListener(() => { clearTimeout(timer); resolve(); });
+                    target.addCommitListener((commit) => {
+                        if (commit.source !== 'local') return;
+                        clearTimeout(timer);
+                        resolve();
+                    });
                 });
 
                 // A genuine local write on the same handle (as the host app would).
                 db.prepare('INSERT INTO tags (code) VALUES (?)').run('urgent');
 
                 await signalled;
-                target.removeChangeListener(() => undefined);   // disarm path (no-op listener id)
+                target.removeCommitListener(() => undefined);   // disarm path (no-op listener id)
                 db.close();
             },
         },
         {
-            name: '[ADPTS-SQL04b] ChangeSignalSource via WAL watch fires on a local write (file-backed db)',
+            name: '[ADPTS-SQL04b] WAL watch announces a local write (file-backed db)',
             invoke: async () => {
                 const { group, admin } = await createGroup();
                 const ledger = await group.getTable('ledger');
@@ -368,14 +372,14 @@ export const sqliteSpecificTests = {
                 // dbPath -> WAL watching (not polling). The target enables WAL
                 // journal mode itself so the `-wal` file exists to watch.
                 const target = new SqliteTarget(db, { captureChanges: true, dbPath });
-                let listener = (): void => undefined;
+                let listener = (_commit: { source: string }): void => undefined;
                 try {
                     await projectGroup(group, target);
 
                     let fires = 0;
-                    listener = (): void => { fires++; };
-                    target.addChangeListener(listener);
-                    // Empty outbox: arm primes are silent (MAX(id) filter). Await
+                    listener = (commit): void => { if (commit.source === 'local') fires++; };
+                    target.addCommitListener(listener);
+                    // Empty outbox: arm primes are silent. Await
                     // kernel registration so the INSERT below is not lost in the
                     // attach window.
                     await target.whenChangeMonitorReady();
@@ -395,7 +399,7 @@ export const sqliteSpecificTests = {
                     assertTrue(fires > baseline,
                         `a local write should wake the WAL watcher (baseline ${baseline}, got ${fires})`);
                 } finally {
-                    target.removeChangeListener(listener);
+                    target.removeCommitListener(listener);
                     db.close();
                     cleanupDb(dbPath);
                 }
@@ -437,13 +441,13 @@ export const sqliteSpecificTests = {
                 const dbPath = tmpDbPath('waloutbox');
                 const db = new Database(dbPath);
                 const target = new SqliteTarget(db, { captureChanges: true, dbPath });
-                let listener = (): void => undefined;
+                let listener = (_commit: { source: string }): void => undefined;
                 try {
                     await projectGroup(group, target);
 
                     let fires = 0;
-                    listener = (): void => { fires++; };
-                    target.addChangeListener(listener);
+                    listener = (commit): void => { if (commit.source === 'local') fires++; };
+                    target.addCommitListener(listener);
                     await target.whenChangeMonitorReady();
                     assertEquals(fires, 0, 'empty outbox on arm does not signal');
 
@@ -470,7 +474,7 @@ export const sqliteSpecificTests = {
                     }
                     assertTrue(fires > 0, `an app INSERT should signal (got ${fires})`);
                 } finally {
-                    target.removeChangeListener(listener);
+                    target.removeCommitListener(listener);
                     db.close();
                     cleanupDb(dbPath);
                 }

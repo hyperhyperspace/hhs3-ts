@@ -23,6 +23,7 @@ import type { Version, RContext } from "@hyper-hyper-space/hhs3_mvt";
 import type { RBlobStore, RDb, RFileMap, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 import {
     BidirectionalTarget, ChangeSignalListener, ChangeSignalSource, CheckpointMovedError,
+    isQueryableTarget, isReactiveChangeTarget, QueryEngine, TableQuery, TargetCommitListener,
     DEFAULT_KEY_DOMAIN, GroupProjection, IndexReconcileReport, IndexSpec, IngestResult, KeyIndex, OpEvent,
     OpEventQuery, reconcileIndexes, ReconcileIndexesOptions, StoredOpEvent, syncDatabase,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
@@ -104,6 +105,8 @@ export class RdbProjection {
     private groupCallbacks = new Map<B64Hash, { group: RTableGroup; cb: (v: Version) => void }>();
     private rdbCallback: ((v: Version) => void) | undefined;
     private changeListener: ChangeSignalListener | undefined;
+    private commitListener: TargetCommitListener | undefined;
+    private queryEngine: QueryEngine | undefined;
 
     private timer: ReturnType<typeof setTimeout> | undefined;
     private stopped = false;
@@ -389,6 +392,32 @@ export class RdbProjection {
         return this.requireKeys().idForKeyHash(domain, keyHash);
     }
 
+    onCommit(listener: TargetCommitListener): () => void {
+        if (!isReactiveChangeTarget(this.target)) return () => {};
+        this.target.addCommitListener(listener);
+        return () => {
+            if (isReactiveChangeTarget(this.target)) this.target.removeCommitListener(listener);
+        };
+    }
+
+    selectFrom(table: string): TableQuery {
+        return this.queries().selectFrom(table);
+    }
+
+    monitor(query: TableQuery | { [name: string]: TableQuery }) {
+        const engine = this.queries();
+        return query instanceof TableQuery ? engine.monitor(query) : engine.monitor(query);
+    }
+
+    private queries(): QueryEngine {
+        if (this.queryEngine !== undefined) return this.queryEngine;
+        if (!isQueryableTarget(this.target) || !isReactiveChangeTarget(this.target)) {
+            throw new Error('this projection target cannot host queries');
+        }
+        this.queryEngine = new QueryEngine(this.target);
+        return this.queryEngine;
+    }
+
     // Stop the supervisor: no new cycles, wait for any in-flight sync, then
     // close the target if it implements close() (SQLite drops WAL/SHM).
     async stop(): Promise<void> {
@@ -403,7 +432,10 @@ export class RdbProjection {
         for (const { group, cb } of this.groupCallbacks.values()) group.unsubscribe(cb);
         this.groupCallbacks.clear();
         if (this.rdbCallback !== undefined) { this.rdb.unsubscribe(this.rdbCallback); this.rdbCallback = undefined; }
-        if (this.changeListener !== undefined && isChangeSignalSource(this.target)) {
+        if (this.commitListener !== undefined && isReactiveChangeTarget(this.target)) {
+            this.target.removeCommitListener(this.commitListener);
+            this.commitListener = undefined;
+        } else if (this.changeListener !== undefined && isChangeSignalSource(this.target)) {
             this.target.removeChangeListener(this.changeListener);
             this.changeListener = undefined;
         }
@@ -482,7 +514,10 @@ export class RdbProjection {
     private async arm(): Promise<void> {
         this.rdbCallback = (): void => { void this.onMembershipChange(); };
         await this.rdb.subscribe(this.rdbCallback);
-        if (isChangeSignalSource(this.target)) {
+        if (isReactiveChangeTarget(this.target)) {
+            this.commitListener = (commit): void => { if (commit.source === 'local') this.schedule(); };
+            this.target.addCommitListener(this.commitListener);
+        } else if (isChangeSignalSource(this.target)) {
             this.changeListener = (): void => this.schedule();
             this.target.addChangeListener(this.changeListener);
         }

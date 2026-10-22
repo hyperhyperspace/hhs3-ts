@@ -18,6 +18,7 @@ import { rtableBundleTests } from "./rtable_bundle_tests.js";
 import { rtableEnforceTests } from "./rtable_enforce_tests.js";
 import { rtableXGroupTests } from "./rtable_xgroup_tests.js";
 import { rtableObserveGateTests } from "./rtable_observe_gate_tests.js";
+import { observedCutTests } from "./observed_cut_tests.js";
 import { rtablePermTests } from "./rtable_perm_tests.js";
 import { rtableIdentityTests } from "./rtable_identity_tests.js";
 import { rfilesTests } from "./rfiles_tests.js";
@@ -57,6 +58,7 @@ async function main() {
     allTests.set(rtableEnforceTests.title, rtableEnforceTests.tests);
     allTests.set(rtableXGroupTests.title, rtableXGroupTests.tests);
     allTests.set(rtableObserveGateTests.title, rtableObserveGateTests.tests);
+    allTests.set(observedCutTests.title, observedCutTests.tests);
     allTests.set(rtablePermTests.title, rtablePermTests.tests);
     allTests.set(rtableIdentityTests.title, rtableIdentityTests.tests);
     allTests.set(rfilesTests.title, rfilesTests.tests);

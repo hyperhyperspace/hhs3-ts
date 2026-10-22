@@ -33,6 +33,9 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
             const line = encodeMessage({ id: 1, method: 'status' });
             assertTrue(line.endsWith('\n') && !line.slice(0, -1).includes('\n'), 'one line per message');
             assertEquals(decodeRequest(line).method, 'status', 'status round-trips');
+            assertEquals(decodeRequest(encodeMessage({ id: 4, method: 'watchCommits' })).method, 'watchCommits', 'watchCommits round-trips');
+            const commit = decodeServerMessage(encodeMessage({ id: 4, commit: { source: 'local', tables: ['notes'] } }));
+            assertTrue('commit' in commit && commit.commit.source === 'local', 'a commit push is not a status event');
             const unwatch = decodeRequest(encodeMessage({ id: 3, method: 'unwatch', watch: 2 }));
             assertTrue(unwatch.method === 'unwatch' && unwatch.watch === 2, 'unwatch carries the watch id');
 

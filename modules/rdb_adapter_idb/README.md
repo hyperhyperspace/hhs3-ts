@@ -10,7 +10,7 @@ IndexedDB [`MaterializationTarget`](../rdb_adapter) for [rdb_adapter](../rdb_ada
 - Owns the shared `rdb_keys` side table and implements `KeyIndex`.
 - Implements `MaterializedChangeSource` (an outbox of local edits to the projected tables) and `RowIdentityIndex`.
 - Implements `IndexTarget`: projection-local indexes declared in an index spec (see [rdb_adapter](../rdb_adapter#indexes)) become read-only, native-shaped indexes on `target.database` (see [Indexes](#indexes)).
-- Implements `ChangeSignalSource` via [`BroadcastChannel`](https://developer.mozilla.org/en-US/docs/Web/API/BroadcastChannel) (`hhs3-rdb-idb:${dbName}`): an empty, at-least-once ping; observers re-drain. Listeners post on the same channel they subscribed with, so the ping reaches other tabs and other `IdbTarget`s sharing the name.
+- Implements `QueryableTarget` and `ReactiveChangeTarget` (see [rdb_adapter](../rdb_adapter#reactive-queries)): executes `SingleTableQueryPlan` over `rows` and emits `local`, `apply`, and `settle` commit events in-process and across tabs on [`BroadcastChannel`](https://developer.mozilla.org/en-US/docs/Web/API/BroadcastChannel) (`hhs3-rdb-idb:${dbName}`). Receiving tabs deliver those events through `notifyExternalCommit` and do not post them again. The target emits `local`, `apply`, and `settle`. A catch-up re-query is a `{ source: 'reconnect' }` event passed to `notifyExternalCommit` by the caller. The anchor for `before` / `after` is taken from the rows that passed the `WHERE`, or from `cachedValues` when the monitor has one. An anchor excluded by the predicate is not loaded by a separate primary-key read.
 
 ## Reading and writing
 
@@ -203,15 +203,17 @@ cursor.onsuccess = () => {
 
 Entries live in the `index_entries` store, keyed `[table, name, key, id]`, and are maintained in the same transaction as every write that touches the rows: `apply()`, ingest reverts, and `add` / `put` / `delete` / `clear` on `target.database`. Each write reads the table's index records inside its own transaction, so an index installed from another tab is maintained even before this tab's `indexNames` has caught up. A request on an index dropped in the meantime fails with `InvalidStateError`. `apply()` also builds, drops, and moves indexes as the schema changes: a dropped column or table takes its indexes with it, and a declaration waiting for a missing column is built when the column arrives.
 
-### Capture
+### Capture and commit events
 
-With capture provisioned, a `put` / `add` / `delete` on `target.database` writes the row and an outbox record in the same native transaction; `oncomplete` posts `hhs3-rdb-idb:${dbName}`. `apply()` and ingest reverts write the physical stores, and the outbox stays the record of those app mutations.
+With capture provisioned, a `put` / `add` / `delete` on `target.database` writes the row and an outbox record in the same native transaction, keeping the key `outbox.add` returns. When `oncomplete` fires, the target records those outbox ids in `emittedOutboxIds`, delivers `{ source: 'local', tables }` to its commit listeners, and posts the event on `hhs3-rdb-idb:${dbName}`. `drainChanges()` applies the drain rule for any unannounced outbox rows in its batch, and `apply()` and `commitIngest()` likewise broadcast their `apply` and `settle` commit events on the same channel so every tab shares one stream for all three commit kinds.
 
-From there, ingest as usual — `ingestChanges(group, target, { writer })`, or let `RdbProjection` drain on the change signal:
+From there, ingest as usual — `ingestChanges(group, target, { writer })`, or let `RdbProjection` drain when `{ source: 'local' }` arrives:
 
 ```typescript
-target.addChangeListener(() => {
-    void ingestChanges(group, target, { writer });
+target.addCommitListener((commit) => {
+    if (commit.source === 'local') {
+        void ingestChanges(group, target, { writer });
+    }
 });
 ```
 

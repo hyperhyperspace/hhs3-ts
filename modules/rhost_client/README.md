@@ -38,9 +38,14 @@ One JSON object per line. It is read-only: it carries the host's live state, and
 ```
 client -> host   { id, method: 'status' }
                  { id, method: 'watchStatus' }
-                 { id, method: 'unwatch', watch: <id of the watchStatus request> }
-host -> client   { id, result }   { id, error }   { id, event }   (a push on a watch)
+                 { id, method: 'watchCommits' }
+                 { id, method: 'unwatch', watch: <id of the watch request> }
+host -> client   { id, result }   { id, error }
+                 { id, event }    (a status push on watchStatus)
+                 { id, commit }   (a commit push on watchCommits)
 ```
+
+`watchCommits` is used by the Node client to stream the host projection's `local`, `apply`, and `settle` commit events over `run/rhost.sock` (browser tabs receive commit events directly on `IdbTarget`'s `BroadcastChannel`, so `RhostClient` itself stays unchanged).
 
 - `encodeMessage`, `decodeRequest` and `decodeServerMessage` encode and parse messages.
 - `LineDecoder` splits a stream of text chunks into lines.

@@ -11,18 +11,20 @@
 
 import type { HostStatus } from "./types.js";
 
-export type ClientMethod = 'status' | 'watchStatus' | 'unwatch';
+export type ClientMethod = 'status' | 'watchStatus' | 'watchCommits' | 'unwatch';
 
 export type ClientRequest =
     | { id: number; method: 'status' }
     | { id: number; method: 'watchStatus' }
+    | { id: number; method: 'watchCommits' }
     | { id: number; method: 'unwatch'; watch: number };
 
 export type ClientResult = { id: number; result: HostStatus | null };
 export type ClientError = { id: number; error: string };
 export type ClientPush = { id: number; event: HostStatus };
+export type ClientCommitPush = { id: number; commit: { source: string; [key: string]: unknown } };
 
-export type ServerMessage = ClientResult | ClientError | ClientPush;
+export type ServerMessage = ClientResult | ClientError | ClientPush | ClientCommitPush;
 
 export class ProtocolError extends Error {
     constructor(message: string) {
@@ -56,6 +58,7 @@ export function decodeRequest(line: string): ClientRequest {
     switch (o['method']) {
         case 'status': return { id, method: 'status' };
         case 'watchStatus': return { id, method: 'watchStatus' };
+        case 'watchCommits': return { id, method: 'watchCommits' };
         case 'unwatch':
             if (!Number.isSafeInteger(o['watch'])) throw new ProtocolError('unwatch needs the id of a watchStatus request');
             return { id, method: 'unwatch', watch: o['watch'] as number };
@@ -68,6 +71,7 @@ export function decodeServerMessage(line: string): ServerMessage {
     const o = parseObject(line);
     const id = o['id'] as number;
     if ('error' in o) return { id, error: String(o['error']) };
+    if ('commit' in o) return { id, commit: o['commit'] as { source: string; [key: string]: unknown } };
     if ('event' in o) return { id, event: o['event'] as HostStatus };
     if ('result' in o) return { id, result: o['result'] as HostStatus | null };
     throw new ProtocolError('a server message has a result, an error or an event');

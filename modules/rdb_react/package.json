@@ -1,0 +1,31 @@
+{
+  "name": "@hyper-hyper-space/hhs3_rdb_react",
+  "version": "0.1.0",
+  "description": "React bindings for a projected rdb query",
+  "type": "module",
+  "source": "src/index.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "test": "TS_NODE_PROJECT=./tsconfig.test.json node --import ../../register.mjs ./test/run_tests.ts",
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist test-build"
+  },
+  "author": "Santiago Bazerque",
+  "license": "MIT",
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "devDependencies": {
+    "@hyper-hyper-space/hhs3_rdb_adapter": "^0.1.0",
+    "@hyper-hyper-space/hhs3_util": "^0.1.0",
+    "@types/node": "^22.2.0",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "happy-dom": "^17.4.4",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "ts-node": "^10.9.2",
+    "typescript": "6.0.3"
+  }
+}

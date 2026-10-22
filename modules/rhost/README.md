@@ -110,7 +110,9 @@ A host's key is unlocked once per app, by key id: relabeling it in the keystore 
 - `status()` and `watchStatus(listener)` come from the host.
 - `me()` is the key `host.json` records; its `id` and `registerKey(publicKey)` and `events` go through the running projection, and fail while it is stopped.
 
-`serveClient(host, connection)` answers the same protocol over any line-based `Connection`. The platform's `listen` hands it each connection. The protocol is read-only: `status`, `watchStatus` and `unwatch`, and nothing that signs.
+`host.onCommit(listener)` subscribes in-process to the running projection's `TargetCommitEvent`s (`local`, `apply`, `settle`).
+
+`serveClient(host, connection)` answers the same protocol over any line-based `Connection`. The platform's `listen` hands it each connection. The protocol is read-only: `status`, `watchStatus`, `watchCommits`, and `unwatch`, and nothing that signs. If `connection.send` returns `false` or throws, `serveClient` drops the connection's watches so a slow or disconnected client cannot accumulate buffered events.
 
 ## Config
 

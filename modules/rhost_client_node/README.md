@@ -27,11 +27,13 @@ await client.close();
 | `registerKey(publicKey)` | `rdb_keys` in the projection | works |
 | `events.since` / `events.watch` | `rdb_op_events` in the projection; `watch` polls | works |
 | `status()` / `watchStatus()` | `run/rhost.sock` | a `StoppedStatus` from `host.json` |
+| `watchCommits()` | `run/rhost.sock` | reconnects when the host starts |
 
 - `projectionPath(dir)` is the projection file: `projection.path` from `host.json` when it overrides that section, otherwise from the app's `app.json` two folders up, resolved in the host folder. It reads both synchronously. Without `{ db }`, the client opens that file.
 - `registerKey` computes the key id with `keyIdFromPublicKey`, and interns it the way the projection's target does, in an immediate transaction. The same key gets the same id whichever side interns it first.
 - Before the host's first start there is no projection file. Then `events` are empty, and `me` and `registerKey` fail, because the key table doesn't exist yet.
 - `watchStatus` reports a `StoppedStatus` when the socket goes away, and reconnects when the host starts again.
+- `watchCommits(listener)` (on `NodeRhostClient`, over `run/rhost.sock`) delivers each `local`, `apply`, and `settle` commit to `listener`, and calls `listener({ source: 'reconnect' })` when the host acknowledges the watch. Passing those events into a local target is the caller's job: `client.watchCommits((commit) => target.notifyExternalCommit(commit))`. A `SqliteTarget` opened on the same file keeps its own WAL watcher, so a local write is still announced when the socket is down.
 - `hostKey(dir)` is the host's key as `host.json` records it: label, key id and public key. It needs neither the keystore nor a passphrase. `rhost whoami` uses it.
 
 ## Test

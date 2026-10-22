@@ -634,3 +634,79 @@ export interface KeyIndex {
     // The projected key id for a key hash, or undefined when never seen.
     idForKeyHash(domain: string, keyHash: string): Promise<number | undefined>;
 }
+
+// ---------------------------------------------------------------------------
+// Reactive queries. A target that can run a single-table plan and emit commit
+// events. `local` names tables only. `apply` carries full post-images.
+// ---------------------------------------------------------------------------
+
+export type OrderDirection = 'asc' | 'desc';
+export type OrderBySpec = { column: string; direction: OrderDirection };
+
+export type BoundValue = json.Literal | null;
+
+export type BoundOperand =
+    | { kind: 'col'; name: string }
+    | { kind: 'lit'; value: BoundValue }
+    | { kind: 'arith'; op: '+' | '-' | '*'; left: BoundOperand; right: BoundOperand }
+    | { kind: 'length'; arg: BoundOperand };
+
+export type BoundWhereExpr =
+    | { kind: 'cmp'; op: '=' | '!=' | '<' | '<=' | '>' | '>='; left: BoundOperand; right: BoundOperand }
+    | { kind: 'isNull'; arg: BoundOperand; not: boolean }
+    | { kind: 'in'; arg: BoundOperand; values: BoundValue[]; not: boolean }
+    | { kind: 'like'; arg: BoundOperand; pattern: BoundOperand }
+    | { kind: 'not'; arg: BoundWhereExpr }
+    | { kind: 'and'; args: BoundWhereExpr[] }
+    | { kind: 'or'; args: BoundWhereExpr[] };
+
+export type CursorBound = {
+    side: 'before' | 'after';
+    id: number;
+    cachedValues?: { [column: string]: json.Literal | null };
+};
+
+export type SingleTableQueryPlan = {
+    table: string;
+    select?: string[];
+    where?: BoundWhereExpr;
+    orderBy?: OrderBySpec[];
+    cursor?: CursorBound;
+    limit?: number;
+};
+
+export type ProjectedRow = {
+    id: number;
+    [column: string]: json.Literal | null;
+};
+
+export interface QueryableTarget {
+    executeQuery(plan: SingleTableQueryPlan): Promise<ProjectedRow[]>;
+}
+
+export function isQueryableTarget(t: object): t is QueryableTarget {
+    return typeof (t as Partial<QueryableTarget>).executeQuery === 'function';
+}
+
+export type TargetRowChange =
+    | { kind: 'insert' | 'update'; table: string; localId: number; values: { [column: string]: json.Literal | null } }
+    | { kind: 'delete'; table: string; localId: number };
+
+export type TargetCommitEvent =
+    | { source: 'local'; tables: string[] }
+    | { source: 'apply'; groupId: B64Hash; schemaTables: string[]; changes: TargetRowChange[]; events: StoredOpEvent[] }
+    | { source: 'settle'; revertedTables: string[]; events: StoredOpEvent[] }
+    | { source: 'reconnect' };
+
+export type TargetCommitListener = (commit: TargetCommitEvent) => void;
+
+export interface ReactiveChangeTarget {
+    addCommitListener(listener: TargetCommitListener): void;
+    removeCommitListener(listener: TargetCommitListener): void;
+    notifyExternalCommit(commit: TargetCommitEvent): void;
+}
+
+export function isReactiveChangeTarget(t: object): t is ReactiveChangeTarget {
+    return typeof (t as Partial<ReactiveChangeTarget>).addCommitListener === 'function'
+        && typeof (t as Partial<ReactiveChangeTarget>).notifyExternalCommit === 'function';
+}

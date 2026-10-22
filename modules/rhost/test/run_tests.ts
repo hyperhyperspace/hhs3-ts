@@ -22,7 +22,7 @@ function clientPair(host: Host) {
     let onLine: ((line: string) => void) | undefined;
     let onClose: (() => void) | undefined;
     serveClient(host, {
-        send: (line) => { received.push(decodeServerMessage(line)); },
+        send: (line) => { received.push(decodeServerMessage(line)); return true; },
         onLine: (listener) => { onLine = listener; },
         onClose: (listener) => { onClose = listener; },
     });
@@ -441,6 +441,12 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
 
                 pair.request({ id: 2, method: 'watchStatus' });
                 await waitFor(() => pair.find(2, 'result').length === 1, 'the watch reply');
+
+                pair.request({ id: 7, method: 'watchCommits' });
+                await waitFor(() => pair.find(7, 'result').length === 1, 'the commit watch reply');
+                platform.targets.get('default')!.localInsert('doc_pages', { title: 'watched', deleted: false });
+                await waitFor(() => pair.received.some((m) => m.id === 7 && 'commit' in m && m.commit.source === 'local'),
+                    'the local write is pushed on the commit watch');
                 const deployed = await host.deploy();
                 assertEquals(deployed.deployed.version, '1.1.0', 'deploy ignores autoDeploy none');
                 assertEquals(deployed.host, 'default', 'the report names the host');

@@ -26,11 +26,14 @@ import type { B64Hash, KeyId } from "@hyper-hyper-space/hhs3_crypto";
 import type { ColumnType } from "@hyper-hyper-space/hhs3_rdb";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 
+import { compareSortTuples, evalWhere, normalizeOrder, projectColumns, rowOnSide } from "./query_eval.js";
 import {
     CapturedBatch, CapturedChange, ChangeSignalListener, ChangeSignalSource,
     CheckpointMovedError, IndexDecl, IndexSpec, IndexState, IndexTarget, IngestSettle, KeyIndex,
-    MaterializationTarget, MaterializedChangeSource, OpEvent, OpEventQuery, pageOpEvents, ResolvedIndex,
-    RowAction, RowIdentityIndex, SchemaAction, StoredOpEvent, SyncMapping, SyncStatus, versionsEqual,
+    MaterializationTarget, MaterializedChangeSource, OpEvent, OpEventQuery, pageOpEvents,
+    ProjectedRow, QueryableTarget, ReactiveChangeTarget, ResolvedIndex,
+    RowAction, RowIdentityIndex, SchemaAction, SingleTableQueryPlan, StoredOpEvent,
+    SyncMapping, SyncStatus, TargetCommitEvent, TargetCommitListener, TargetRowChange, versionsEqual,
 } from "./types.js";
 
 type RowValues = { [column: string]: json.Literal };
@@ -145,13 +148,15 @@ function cloneStore(store: Store): Store {
 }
 
 export class MemoryTarget implements MaterializationTarget, MaterializedChangeSource, ChangeSignalSource,
-    RowIdentityIndex, KeyIndex, IndexTarget {
+    ReactiveChangeTarget, QueryableTarget, RowIdentityIndex, KeyIndex, IndexTarget {
     private store: Store = {
         tables: new Map(), checkpoints: new Map(),
         keysByHash: new Map(), keysById: new Map(), nextKeyId: 1,
         indexSpec: undefined, indexes: new Map(),
     };
     private changeListeners = new Set<ChangeSignalListener>();
+    private commitListeners = new Set<TargetCommitListener>();
+    private emittedOutboxIds = new Set<number>();
 
     // Two-level capture config (mirrors the SQLite backend):
     //   - provisioning: whether capture exists at all (opt-in, default off);
@@ -177,14 +182,36 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
         this.captureEnabled = this.captureProvisioned;
     }
 
-    private logEvents(events: OpEvent[] | undefined): void {
-        if (events === undefined) return;
+    private logEvents(events: OpEvent[] | undefined): StoredOpEvent[] {
+        const fresh: StoredOpEvent[] = [];
+        if (events === undefined) return fresh;
         for (const event of events) {
             const key = event.opHash + '\u0000' + event.direction;
             if (this.opEventKeys.has(key)) continue;
             this.opEventKeys.add(key);
-            this.opEvents.push({ id: this.opEventNextId++, event });
+            const stored: StoredOpEvent = { id: this.opEventNextId++, event };
+            this.opEvents.push(stored);
+            fresh.push(stored);
         }
+        return fresh;
+    }
+
+    private emit(commit: TargetCommitEvent): void {
+        if (commit.source === 'local') {
+            if (commit.tables.length === 0) return;
+            for (const listener of [...this.changeListeners]) listener({});
+        }
+        for (const listener of [...this.commitListeners]) listener(commit);
+    }
+
+    private announce(ids: number[]): void {
+        const wanted = new Set(ids);
+        const fresh = this.outbox.filter((row) => typeof row.id === 'number' && wanted.has(row.id) && !this.emittedOutboxIds.has(row.id));
+        for (const row of fresh) if (typeof row.id === 'number') this.emittedOutboxIds.add(row.id);
+        const live = new Set(this.outbox.map((row) => row.id).filter((id): id is number => typeof id === 'number'));
+        this.emittedOutboxIds = new Set([...this.emittedOutboxIds].filter((id) => live.has(id)));
+        if (fresh.length === 0) return;
+        this.emit({ source: 'local', tables: [...new Set(fresh.map((row) => row.table))] });
     }
 
     async getCheckpoint(groupId: B64Hash): Promise<Version | undefined> {
@@ -209,11 +236,19 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
         // Atomicity: mutate a clone, swap in only on full success.
         const working = cloneStore(this.store);
         for (const action of schemaActions) applySchemaAction(working, action);
-        for (const action of rowActions) applyRowAction(working, action);
+        const changes: TargetRowChange[] = [];
+        for (const action of rowActions) {
+            const change = applyRowAction(working, action);
+            if (change !== undefined) changes.push(change);
+        }
         working.checkpoints.set(groupId, new Set(checkpoint));
         this.store = working;
         // Concurrency void/reinstate flips ride the same checkpoint advance.
-        this.logEvents(events);
+        const logged = this.logEvents(events);
+        const schemaTables = [...new Set(schemaActions.map(schemaActionTable))];
+        if (changes.length > 0 || logged.length > 0 || schemaTables.length > 0) {
+            this.emit({ source: 'apply', groupId, schemaTables, changes, events: logged });
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -258,8 +293,9 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
         | { kind: 'update'; table: string; localId: number; values: RowValues }
         | { kind: 'delete'; table: string; localId: number }): void {
         if (!this.captureProvisioned || !this.captureEnabled) return;
-        this.outbox.push({ id: this.outboxNextId++, ...change });
-        for (const listener of [...this.changeListeners]) listener({});
+        const id = this.outboxNextId++;
+        this.outbox.push({ id, ...change });
+        this.announce([id]);
     }
 
     // -----------------------------------------------------------------------
@@ -275,12 +311,70 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
         this.changeListeners.delete(listener);
     }
 
+    addCommitListener(listener: TargetCommitListener): void {
+        this.commitListeners.add(listener);
+    }
+
+    removeCommitListener(listener: TargetCommitListener): void {
+        this.commitListeners.delete(listener);
+    }
+
+    // In-memory only. Never writes rows and never forwards the event.
+    notifyExternalCommit(commit: TargetCommitEvent): void {
+        for (const listener of [...this.commitListeners]) listener(commit);
+    }
+
+    async executeQuery(plan: SingleTableQueryPlan): Promise<ProjectedRow[]> {
+        const state = this.store.tables.get(plan.table);
+        if (state === undefined) return [];
+        const needsOrder = plan.limit !== undefined || plan.cursor !== undefined;
+        const orderBy = normalizeOrder(plan.orderBy, state.idColumn, needsOrder);
+        const typeOf = (column: string): ColumnType | undefined =>
+            column === state.idColumn ? 'integer'
+                : column === state.authorColumn ? 'integer'
+                : state.columnTypes[column];
+        let rows = [...state.rows.entries()].map(([id, row]) => this.asView(state, id, row));
+        const direct = directIds(plan.where, state.idColumn);
+        if (direct !== undefined) {
+            const wanted = new Set(direct);
+            rows = rows.filter((row) => wanted.has(row.id));
+        }
+        rows = rows.filter((row) => evalWhere(plan.where, row, row.id));
+        if (plan.cursor !== undefined && orderBy.length > 0) {
+            const anchor = this.anchorView(state, plan.cursor.id, plan.cursor.cachedValues);
+            if (anchor === undefined) return [];
+            rows = rows.filter((row) => rowOnSide(row, anchor, orderBy, plan.cursor!.side, typeOf));
+        }
+        if (orderBy.length > 0) rows.sort((a, b) => compareSortTuples(a, b, orderBy, typeOf));
+        if (plan.limit !== undefined) rows = rows.slice(0, plan.limit);
+        return rows.map((row) => projectColumns(row, plan.select, state.idColumn));
+    }
+
+    private asView(state: TableState, id: number, row: MemoryRow): ProjectedRow {
+        const view: ProjectedRow = { id };
+        if (state.idColumn !== 'id') view[state.idColumn] = id;
+        for (const [column, value] of Object.entries(row.values)) view[column] = value;
+        if (state.authorColumn !== undefined && row.author !== undefined) view[state.authorColumn] = row.author;
+        return view;
+    }
+
+    private anchorView(
+        state: TableState, id: number,
+        cached: { [column: string]: json.Literal | null } | undefined,
+    ): ProjectedRow | undefined {
+        const row = state.rows.get(id);
+        if (row !== undefined) return this.asView(state, id, row);
+        if (cached === undefined) return undefined;
+        return { id, ...cached };
+    }
+
     // -----------------------------------------------------------------------
     // MaterializedChangeSource (inbound). Meaningful only when provisioned.
     // -----------------------------------------------------------------------
 
     async drainChanges(): Promise<CapturedBatch> {
         this.requireCapture();
+        this.announce(this.outbox.map((row) => row.id).filter((id): id is number => typeof id === 'number'));
         return { changes: [...this.outbox] };
     }
 
@@ -364,10 +458,18 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
             if (state !== undefined) state.syncStatus.set(s.rowId, s.status);
         }
         // Op-events (idempotent by (opHash, direction)).
-        this.logEvents(settle.events);
-        // Ack: drop consumed outbox rows.
+        const logged = this.logEvents(settle.events);
+        const revertedTables = [...new Set([
+            ...(settle.reverts ?? []).map((action) => action.table),
+            ...logged.map((stored) => stored.event.table).filter((table): table is string => table !== undefined),
+        ])];
+        if ((settle.reverts?.length ?? 0) > 0 || logged.length > 0) {
+            this.emit({ source: 'settle', revertedTables, events: logged });
+        }
+        // Ack: drop consumed outbox rows. The drain rule announced them first.
         const consumedSet = new Set(settle.consumed);
         this.outbox = this.outbox.filter((c) => !consumedSet.has(c.id));
+        this.emittedOutboxIds = new Set(this.outbox.map((row) => row.id).filter((id): id is number => typeof id === 'number'));
     }
 
     async drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]> {
@@ -611,9 +713,35 @@ function dropColumn(store: Store, action: Extract<SchemaAction, { kind: 'drop-co
 // Row channel
 // ---------------------------------------------------------------------------
 
-function applyRowAction(store: Store, action: RowAction): void {
+function directIds(where: SingleTableQueryPlan['where'], idColumn: string): number[] | undefined {
+    if (where === undefined) return undefined;
+    if (where.kind === 'cmp' && where.op === '=' && where.left.kind === 'col' && where.left.name === idColumn
+        && where.right.kind === 'lit' && typeof where.right.value === 'number') {
+        return [where.right.value];
+    }
+    if (where.kind === 'in' && !where.not && where.arg.kind === 'col' && where.arg.name === idColumn) {
+        const ids = where.values.filter((value): value is number => typeof value === 'number');
+        return ids.length === where.values.length ? ids : undefined;
+    }
+    return undefined;
+}
+
+function schemaActionTable(action: SchemaAction): string {
+    return action.kind === 'ensure-index' ? action.index.table : action.table;
+}
+
+function applyRowAction(store: Store, action: RowAction): TargetRowChange | undefined {
     if (action.kind === 'upsert-row') return upsertRow(store, action);
     return deleteRow(store, action);
+}
+
+function fullImage(state: TableState, id: number, row: MemoryRow): { [column: string]: json.Literal | null } {
+    const values: { [column: string]: json.Literal | null } = { [state.idColumn]: id };
+    for (const column of Object.keys(state.columnTypes)) {
+        values[column] = row.values[column] ?? null;
+    }
+    if (state.authorColumn !== undefined) values[state.authorColumn] = row.author ?? null;
+    return values;
 }
 
 // Allocate (or reuse) the serial id for a rowId in the sync map.
@@ -662,9 +790,10 @@ function valueForColumn(
     return value;
 }
 
-function upsertRow(store: Store, action: Extract<RowAction, { kind: 'upsert-row' }>): void {
+function upsertRow(store: Store, action: Extract<RowAction, { kind: 'upsert-row' }>): TargetRowChange {
     const state = requireTable(store, action.table);
     const id = allocateId(state, action.rowId);
+    const existed = state.rows.has(id);
     // A (re)materialized row is live: active (reinstates a prior deleted /
     // ingestion_failure record for the same rowId).
     state.syncStatus.set(action.rowId, 'active');
@@ -684,7 +813,7 @@ function upsertRow(store: Store, action: Extract<RowAction, { kind: 'upsert-row'
             existing.values[column] = valueForColumn(store, state, column, value, action.keyMaterial);
         }
         if (setAuthor) existing.author = authorId;
-        return;
+        return { kind: 'update', table: action.table, localId: id, values: fullImage(state, id, existing) };
     }
 
     const values: RowValues = {};
@@ -700,9 +829,10 @@ function upsertRow(store: Store, action: Extract<RowAction, { kind: 'upsert-row'
     const row: MemoryRow = { values };
     if (setAuthor) row.author = authorId;
     state.rows.set(id, row);
+    return { kind: existed ? 'update' : 'insert', table: action.table, localId: id, values: fullImage(state, id, row) };
 }
 
-function deleteRow(store: Store, action: Extract<RowAction, { kind: 'delete-row' }>): void {
+function deleteRow(store: Store, action: Extract<RowAction, { kind: 'delete-row' }>): TargetRowChange | undefined {
     const state = requireTable(store, action.table);
     // Remove only the app row; the sync entry is intentionally kept so a later
     // void-flip reinstatement reuses the same serial id. Status -> deleted (the
@@ -710,4 +840,5 @@ function deleteRow(store: Store, action: Extract<RowAction, { kind: 'delete-row'
     const id = state.sync.get(action.rowId);
     if (id !== undefined) state.rows.delete(id);
     if (state.sync.has(action.rowId)) state.syncStatus.set(action.rowId, 'deleted');
+    return id === undefined ? undefined : { kind: 'delete', table: action.table, localId: id };
 }

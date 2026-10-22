@@ -21,6 +21,7 @@ export {
     decodeRequest,
     decodeServerMessage,
     encodeMessage,
+    type ClientCommitPush,
     type ClientError,
     type ClientMethod,
     type ClientPush,

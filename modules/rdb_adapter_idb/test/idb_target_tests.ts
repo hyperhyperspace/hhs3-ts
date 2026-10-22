@@ -173,7 +173,7 @@ export const idbSpecificTests = {
             },
         },
         {
-            name: '[ADPTI-04] ChangeSignalSource fires on another IdbTarget sharing the db (BroadcastChannel)',
+            name: '[ADPTI-04] a local write is announced to another IdbTarget on the same database',
             invoke: async () => {
                 const name = uniqueDbName('chan');
                 const a = await IdbTarget.open(name, { captureChanges: true });
@@ -184,15 +184,16 @@ export const idbSpecificTests = {
                     await projectGroup(group, a);
 
                     let fires = 0;
-                    const listener = (): void => { fires++; };
                     const wrote = new Promise<void>((resolve, reject) => {
-                        const timer = setTimeout(() => reject(new Error('no change signal within timeout')), 2000);
-                        b.addChangeListener(() => {
-                            listener();
-                            if (fires >= 2) { clearTimeout(timer); resolve(); }
+                        const timer = setTimeout(() => reject(new Error('no commit event within timeout')), 2000);
+                        b.addCommitListener((commit) => {
+                            if (commit.source !== 'local') return;
+                            fires++;
+                            clearTimeout(timer);
+                            resolve();
                         });
                     });
-                    assertEquals(fires, 1, 'channel primes one signal on arm');
+                    assertEquals(fires, 0, 'arming does not invent a local write');
 
                     const local = idbLocal(a);
                     await local.insert('tags', { code: 'urgent' });

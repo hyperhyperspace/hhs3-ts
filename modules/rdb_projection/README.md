@@ -10,7 +10,8 @@ An `RDb`'s member table groups are computed from the catalog releases deployed i
 - **resolves cross-group FKs to serial ids** when the referenced group is co-projected (otherwise a `row_hash` passthrough);
 - **ingests local edits in commit order**, advancing co-projected cross-group refs on demand so an observer's cross-group FKs and `exists` reads validate against sibling groups ingested in the same pass; `fkBundling` (a per-member option, default on) bundles consecutive FK-linked inserts atomically;
 - **interns authors and identity keys** into a shared `rdb_keys` table as `author_key_id` / `<col>_key_id` (`registerKey` / `keyHashForId` / `publicKeyForId` on the projection);
-- **stays in sync reactively** — a debounced, coalesced `syncDatabase` fires on three triggers: each member group's `subscribe` (the rdb side advanced), the target's optional `ChangeSignalSource` (local edits are waiting), and the `RDb`'s own `subscribe` (a release was deployed, possibly adding members). An explicit `sync()` and a `nudge()` fallback are also provided.
+- **stays in sync reactively** — a debounced, coalesced `syncDatabase` fires on three triggers: each member group's `subscribe` (the rdb side advanced), the target's `{ source: 'local' }` commit events on `ReactiveChangeTarget` (or `ChangeSignalSource` fallback when local edits are waiting), and the `RDb`'s own `subscribe` (a release was deployed, possibly adding members). An explicit `sync()` and a `nudge()` fallback are also provided.
+- **exposes reactive queries and commit streaming** — `projection.selectFrom(table)`, `projection.monitor(queryOrSet)`, and `projection.onCommit(listener)` delegate to the [query engine](../rdb_adapter#reactive-queries) on the underlying target.
 - **exposes the op-event log** as inspect (`opEvents({ afterId, beforeId, limit, order })`) plus live subscribe (`subscribeOpEvents` / `onOpEvents`). Subscribe does not replay history.
 - **maintains projection-local indexes** declared in an index spec, installed with `reconcileIndexes` (below).
 - **mounts FILES members as folders** with `reconcileFiles` (below). Files have no projection tables; the target is used only for `rdb_keys` ids.
@@ -37,6 +38,24 @@ Known limits (detailed in [rdb_adapter](../rdb_adapter#known-limits)):
 - **Unmanaged indexes block remote column drops (SQLite).** An index the app creates by hand on a projected column makes a remote drop of that column fail, stalling that group's sync until the index is removed. Declare indexes in the spec instead.
 - **A stale spec costs performance, never correctness.** Declarations whose table or column was dropped or renamed upstream show up in `report.pending` and stay inactive until the spec is updated. Check it after each release.
 - **Only reconcile applies spec changes.** Opening a projection does not install a new spec; until `reconcileIndexes` runs, the previously installed indexes stay in place.
+
+
+
+## Reactive queries
+
+`projection.selectFrom(table)` and `projection.monitor(queryOrSet)` run live queries over the shared target (when it implements `QueryableTarget & ReactiveChangeTarget`, as `SqliteTarget`, `IdbTarget`, and `MemoryTarget` do). Table names are the group-qualified target names (`<group>_<table>`), and foreign keys use their `<col>_id` / `<col>_key_id` companions.
+
+```typescript
+const notes = projection
+  .selectFrom('editor_notes')
+  .where('folder_id = :folderId', { folderId })
+  .orderBy('id', 'desc')
+  .limit(50);
+
+const sub = projection.monitor(notes);
+```
+
+`projection.onCommit(listener)` forwards the target's commit events. `SqliteTarget`, `IdbTarget`, and `MemoryTarget` emit `local`, `apply`, and `settle`. [rhost](../rhost) uses it to stream commits to `watchCommits` clients. The query language, `.before(id)` / `.after(id)` keyset seeks, `.col()` query-set DAGs, and the relevance rules are described in [rdb_adapter's Reactive queries section](../rdb_adapter#reactive-queries). For React components, see [hhs3_rdb_react](../rdb_react).
 
 
 
@@ -67,7 +86,7 @@ A mount whose FILES isn't a member yet, or whose objects haven't arrived, is `pe
 ## Layout
 
 - `scope.ts` — resolve members → `GroupProjection`s (member-name-qualified tables + a cross-group resolver).
-- `projection.ts` — `RdbProjection` lifecycle: `open` / `sync` / `nudge` / `status` / `reconcileIndexes` / `reconcileFiles` / `filesStatus` / `stop` (waits for in-flight sync, then `target.close()` if the target implements it).
+- `projection.ts` — `RdbProjection` lifecycle: `open` / `sync` / `nudge` / `status` / `selectFrom` / `monitor` / `onCommit` / `reconcileIndexes` / `reconcileFiles` / `filesStatus` / `stop` (waits for in-flight sync, then `target.close()` if the target implements it).
 - `files/` — `FileDirectory` and `MemoryDirectory` (`directory.ts`), disk names (`names.ts`), the mount state (`state.ts`) and the mount pass (`mount.ts`).
 
 

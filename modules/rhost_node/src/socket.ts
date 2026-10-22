@@ -36,7 +36,12 @@ function connectionFor(socket: Socket): Connection {
         for (const listener of closeListeners) listener();
     });
     return {
-        send: (line) => { if (!socket.destroyed) socket.write(line); },
+        send: (line) => {
+            if (socket.destroyed) return false;
+            const queued = socket.write(line);
+            if (!queued) socket.destroy();
+            return queued;
+        },
         onLine: (listener) => { lineListeners.push(listener); },
         onClose: (listener) => { closeListeners.push(listener); },
     };

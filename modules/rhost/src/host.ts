@@ -748,6 +748,12 @@ export class Host {
 
     // Calls `listener` with a fresh status whenever the database changes, and
     // when the host starts, stops or fails.
+    onCommit(listener: (commit: { source: string }) => void): () => void {
+        const projection = this.services?.projection;
+        if (projection === undefined) return () => {};
+        return projection.onCommit(listener);
+    }
+
     onStatus(listener: (status: HostStatus) => void): () => void {
         const first = this.listeners.size === 0;
         this.listeners.add(listener);
