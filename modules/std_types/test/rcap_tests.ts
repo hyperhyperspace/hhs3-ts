@@ -207,7 +207,7 @@ export const rcapTests = {
             }
         },
         {
-            name: '[CAP08] Concurrent createCap and unrelated delete does not void initial origin',
+            name: '[CAP08] A delete concurrent with the view position removes the capability there',
             invoke: async () => {
                 const { cap, admin } = await createTestEnv();
 
@@ -229,12 +229,12 @@ export const rcapTests = {
 
                 const createView = await cap.getView(createVersion);
                 assertTrue(await createView.capabilityExists('deploy'), 'deploy should exist in its own branch');
-                assertTrue(await createView.capabilityExists('write'),
-                    'write should survive: concurrent delete is not in create origin history');
+                assertFalse(await createView.capabilityExists('write'),
+                    'write is absent here: the delete is concurrent with this position and visible from the frontier');
             }
         },
         {
-            name: '[CAP09] capOrigin voiding: delete and re-create voids old grants',
+            name: '[CAP09] delete turns the slot off; re-create turns it back on with prior grants',
             invoke: async () => {
                 const { cap, admin } = await createTestEnv();
                 const alice = await makeIdentity();
@@ -268,8 +268,8 @@ export const rcapTests = {
 
                 const view3 = await cap.getView();
                 assertTrue(await view3.capabilityExists('write'), 'write should exist after re-create');
-                assertFalse(await view3.hasCapability(alice.keyId, 'write'),
-                    'old grant should be voided: capOrigin points to stale create entry');
+                assertTrue(await view3.hasCapability(alice.keyId, 'write'),
+                    'the re-create turns the same slot back on, so the grant made before the delete holds');
 
                 await cap.grant(
                     alice.keyId, 'write',
@@ -747,7 +747,7 @@ export const rcapTests = {
             }
         },
         {
-            name: '[CAP24] Merged concurrent grant and revoke: grant-anchored B1 voids at the merge',
+            name: '[CAP24] Merged concurrent grant and revoke: the revoke is in the cover, so the slot is clear',
             invoke: async () => {
                 const { cap, admin } = await createTestEnv();
                 const alice = await makeIdentity();
@@ -767,7 +767,7 @@ export const rcapTests = {
 
                 const view = await cap.getView();
                 assertFalse(await view.hasCapability(alice.keyId, 'write'),
-                    'write is voided at the merge: the revoke is concurrent with the grant (grant-anchored B1)');
+                    'write is voided at the merge: the revoke is in the cover of the use point');
             }
         },
         {
@@ -849,7 +849,7 @@ export const rcapTests = {
             }
         },
         {
-            name: '[CAP27] Multi-hash use point: a revoke concurrent with every element voids (collapse-X, B2)',
+            name: '[CAP27] Multi-hash use point: a revoke concurrent with the position voids',
             invoke: async () => {
                 const { cap, admin } = await createTestEnv();
                 const alice = await makeIdentity();
@@ -883,7 +883,7 @@ export const rcapTests = {
             }
         },
         {
-            name: '[CAP28] Multi-hash use point: revoke after one branch, grant concurrent with it -> grant-anchored B1 voids',
+            name: '[CAP28] Multi-hash use point: revoke after one branch, grant on the other -> voided',
             invoke: async () => {
                 const { cap, admin } = await createTestEnv();
                 const alice = await makeIdentity();
@@ -897,17 +897,17 @@ export const rcapTests = {
                 const a2 = await cap.grant(alice.keyId, 'write', admin, b0);
                 const a1 = await cap.addIdentity(d1.keyId, serializePublicKeyToBase64(d1.publicKey), admin, b0);
 
-                // The revoke sits after a1, so it is NOT concurrent with the whole use point
-                // (B2 stays silent), but it IS concurrent with the grant a2.
+                // The revoke sits after a1 and not after the grant a2, so it is concurrent
+                // with the use point {a1, a2}.
                 const u = await cap.revoke(alice.keyId, 'write', admin, version(a1));
 
                 const view = await cap.getView(version(a1, a2), version(a2, u));
                 assertFalse(await view.hasCapability(alice.keyId, 'write'),
-                    'write is voided: B2 defers (revoke is after a1) but the grant a2 is concurrent with the revoke (grant-anchored B1)');
+                    'write is voided: the revoke is not after the grant head, so it is concurrent with the use point');
             }
         },
         {
-            name: '[CAP29] Multi-hash use point: revoke after one branch but later than the grant -> survives (use-before-revoke)',
+            name: '[CAP29] Multi-hash use point: revoke after one branch, the revoker did not see the other head -> voided',
             invoke: async () => {
                 const { cap, admin } = await createTestEnv();
                 const alice = await makeIdentity();
@@ -927,8 +927,8 @@ export const rcapTests = {
                 const u = await cap.revoke(alice.keyId, 'write', admin, version(a1));
 
                 const view = await cap.getView(version(a1, a2), version(a2, u));
-                assertTrue(await view.hasCapability(alice.keyId, 'write'),
-                    'write survives: same fork as CAP28 but the grant precedes the revoke, so the grant-anchored B1 sees no concurrent revoke (use-before-revoke)');
+                assertFalse(await view.hasCapability(alice.keyId, 'write'),
+                    'write is voided: the revoke is after a1 but not after a2, so it is concurrent with the use point');
             }
         },
         {
@@ -1059,6 +1059,167 @@ export const rcapTests = {
                 assertTrue(await view.hasCapability(a.keyId, 'coadmin'),
                     "a holds coadmin again: b's grant rests on a's holding at an earlier position, not on itself");
                 assertTrue(await view.hasCapability(b.keyId, 'coadmin'), 'b still holds coadmin');
+            }
+        },
+        {
+            name: '[CAP37] A delete-cap after one head of the frontier removes the capability',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv();
+                const filler = await makeIdentity();
+                const base = await (await cap.getScopedDag()).getFrontier();
+                const a = await cap.addIdentity(filler.keyId, serializePublicKeyToBase64(filler.publicKey), admin, base);
+                const other = await makeIdentity();
+                const b = await cap.addIdentity(other.keyId, serializePublicKeyToBase64(other.publicKey), admin, base);
+                const deleted = await cap.deleteCap('write', admin, version(a));
+
+                const view = await cap.getView(version(a, b), version(deleted, b));
+                assertFalse(await view.capabilityExists('write'), 'the delete is concurrent with the other head');
+                assertTrue((await view.currentCapCreationVersion('write')).size === 0,
+                    'capabilityExists and currentCapCreationVersion agree the capability is absent');
+            }
+        },
+        {
+            name: '[CAP38] Two concurrent re-creates are both origins, and managedBy is the greater hash',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv();
+                const base = await (await cap.getScopedDag()).getFrontier();
+                await cap.deleteCap('write', admin, base);
+                const deleted = await (await cap.getScopedDag()).getFrontier();
+                const left = await cap.createCap('write', ['admin'], admin, deleted);
+                const right = await cap.createCap('write', ['enroll'], admin, deleted);
+
+                const view = await cap.getView();
+                const origins = await view.currentCapCreationVersion('write');
+                assertTrue(origins.has(left) && origins.has(right), 'both concurrent creates are origins');
+                const greater = left > right ? left : right;
+                const expected = greater === left ? ['admin'] : ['enroll'];
+                const managed = await view.getManagedBy('write');
+                assertTrue(managed.length === expected.length && managed[0] === expected[0],
+                    `managedBy comes from the greater hash, got ${managed.join(',')}`);
+            }
+        },
+        {
+            name: '[CAP39] A live revoke beside a concurrent grant by a revoke-ring member clears the slot',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv({
+                    extraCaps: { coadmin: { managedBy: ['coadmin'] } },
+                });
+                const m1 = await makeIdentity();
+                const m2 = await makeIdentity();
+                const alice = await makeIdentity();
+                for (const id of [m1, m2, alice]) {
+                    await cap.addIdentity(id.keyId, serializePublicKeyToBase64(id.publicKey), admin);
+                }
+                await cap.grant(m1.keyId, 'coadmin', admin);
+                await cap.grant(m2.keyId, 'coadmin', admin);
+                await cap.grant(alice.keyId, 'coadmin', admin);
+
+                const base = await (await cap.getScopedDag()).getFrontier();
+                await cap.revoke(alice.keyId, 'coadmin', admin, base);
+                await cap.grant(alice.keyId, 'coadmin', m1, base);
+                await cap.revoke(m2.keyId, 'coadmin', m1, base);
+                await cap.revoke(m1.keyId, 'coadmin', m2, base);
+
+                const view = await cap.getView();
+                assertFalse(await view.hasCapability(alice.keyId, 'coadmin'),
+                    'the creator revoke is live in the cover and the ring grant does not dominate it');
+            }
+        },
+        {
+            name: '[CAP40] a grant made before a delete-cap holds again after a re-create',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv();
+                const alice = await makeIdentity();
+                await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), admin);
+                await cap.grant(alice.keyId, 'write', admin);
+                await cap.deleteCap('write', admin);
+                await cap.createCap('write', ['admin'], admin);
+
+                const view = await cap.getView();
+                assertTrue(await view.capabilityExists('write'), 'the re-created capability exists');
+                assertTrue(await view.hasCapability(alice.keyId, 'write'),
+                    'the grant is about the slot, so it holds again once the re-create turns the slot on');
+
+                await cap.revoke(alice.keyId, 'write', admin);
+                const revoked = await cap.getView();
+                assertFalse(await revoked.hasCapability(alice.keyId, 'write'),
+                    'a live revoke of that pair is in the cover, so Alice does not hold');
+            }
+        },
+        {
+            name: '[CAP41] a masked delete leaves both creates in the cover, and a grant against the old one still holds',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv();
+                const alice = await makeIdentity();
+                await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), admin);
+                const base = await (await cap.getScopedDag()).getFrontier();
+
+                // The two creates must differ: the same signed op at the same
+                // position is one entry, not two branches.
+                const c1 = await cap.createCap('edit', ['admin'], admin, base);
+                const g = await cap.grant(alice.keyId, 'edit', admin, version(c1));
+                const c0 = await cap.createCap('edit', ['enroll'], admin, base);
+                const d = await cap.deleteCap('edit', admin, version(c0));
+                const c2 = await cap.createCap('edit', ['admin'], admin, version(d));
+
+                const merged = await cap.getView(version(g, c2), version(g, c2));
+                assertTrue(await merged.capabilityExists('edit'), 'the re-create turns the slot back on');
+                const origins = await merged.currentCapCreationVersion('edit');
+                assertTrue(origins.size === 2 && origins.has(c1) && origins.has(c2),
+                    'c1 stays in the cover beside c2; the masked delete does not remove it');
+                assertTrue(await merged.hasCapability(alice.keyId, 'edit'),
+                    'the grant recorded origins {c1} and still holds');
+
+                const r = await cap.revoke(alice.keyId, 'edit', admin, version(g));
+                const revoked = await cap.getView(version(r, c2), version(r, c2));
+                assertFalse(await revoked.hasCapability(alice.keyId, 'edit'),
+                    'the revoke of that grant is live in the cover');
+            }
+        },
+        {
+            name: '[CAP42] a revoke stays authorized when a concurrent delete-cap would hide the capability from a wider from',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv();
+                const alice = await makeIdentity();
+                const mallory = await makeIdentity();
+                await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), admin);
+                await cap.addIdentity(mallory.keyId, serializePublicKeyToBase64(mallory.publicKey), admin);
+                await cap.grant(mallory.keyId, 'admin', admin);
+                const base = await (await cap.getScopedDag()).getFrontier();
+
+                const c1 = await cap.createCap('edit', ['admin'], admin, base);
+                const g = await cap.grant(alice.keyId, 'edit', admin, version(c1));
+                const r = await cap.revoke(alice.keyId, 'edit', mallory, version(g));
+                const c0 = await cap.createCap('edit', ['enroll'], admin, base);
+                const d = await cap.deleteCap('edit', admin, version(c0));
+                const c2 = await cap.createCap('edit', ['admin'], admin, version(d));
+
+                const view = await cap.getView(version(r, c2), version(r, c2));
+                assertFalse(await view.hasCapability(alice.keyId, 'edit'),
+                    'Mallory held admin in the revoke\'s own past, so the revoke stands and Alice does not hold');
+            }
+        },
+        {
+            name: '[CAP43] a concurrent re-create with a different managedBy does not un-authorize an earlier revoke',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv();
+                const alice = await makeIdentity();
+                const mallory = await makeIdentity();
+                await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), admin);
+                await cap.addIdentity(mallory.keyId, serializePublicKeyToBase64(mallory.publicKey), admin);
+                await cap.grant(mallory.keyId, 'admin', admin);
+                const base = await (await cap.getScopedDag()).getFrontier();
+
+                const c1 = await cap.createCap('edit', ['admin'], admin, base);
+                const g = await cap.grant(alice.keyId, 'edit', admin, version(c1));
+                const r = await cap.revoke(alice.keyId, 'edit', mallory, version(g));
+                const c0 = await cap.createCap('edit', ['read'], admin, base);
+                const d = await cap.deleteCap('edit', admin, version(c0));
+                const c2 = await cap.createCap('edit', ['enroll'], admin, version(d));
+
+                const view = await cap.getView(version(r, c2), version(r, c2));
+                assertFalse(await view.hasCapability(alice.keyId, 'edit'),
+                    'the revoke was authorized against admin, and the later enroll-managed re-create does not change that');
             }
         },
     ]

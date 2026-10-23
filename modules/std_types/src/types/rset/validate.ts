@@ -2,7 +2,7 @@ import { B64Hash, KeyId } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import type { NestingParent, Payload, Version } from "@hyper-hyper-space/hhs3_mvt";
 import {
-    isRefAdvancePayload, refAdvanceFormat, extractRefVersion, validateRefAdvanceMonotonicity,
+    isRefAdvancePayload, refAdvanceFormat, extractRefVersion, validateRefAdvanceMonotonicity, validateRefVersionShape,
     validationFailure, validationOk, ValidationResult, wrapValidationFailure,
 } from "@hyper-hyper-space/hhs3_mvt";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
@@ -124,6 +124,7 @@ async function validateDeletePayload(payload: Payload, rset: RSet, at: Version):
 
     const deletePayload = payload as DeleteElmtPayload;
     if (!rset.supportBarrierDelete() && json.hasKey(deletePayload, "barrier")) return validationFailure("barrier delete is not supported");
+    if (rset.supportBarrierDelete() && deletePayload.barrier !== true) return validationFailure("barrier set requires barrier deletes");
     if (!rset.acceptRedundantDelete()) {
         const view = await rset.getView(at, at);
         if (!await view.hasByHash(deletePayload.elementHash)) return validationFailure(`element '${deletePayload.elementHash}' does not exist in set`);
@@ -150,6 +151,8 @@ async function validateRefAdvancePayload(payload: Payload, rset: RSet, at: Versi
     const newRefVersion = extractRefVersion(refPayload);
     const observerDag = await rset.getScopedDag();
     const referencedDag = await rcap.getCausalDag();
+    const shape = await validateRefVersionShape(referencedDag, newRefVersion);
+    if (!shape.valid) return shape;
     if (!await validateRefAdvanceMonotonicity(observerDag, referencedDag, refPayload.refId, newRefVersion, at)) {
         return validationFailure("RSet ref-advance is not monotonic");
     }

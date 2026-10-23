@@ -1,5 +1,6 @@
-import { RContext, RObject, RObjectConfig, TypeRegistryMap, version } from "@hyper-hyper-space/hhs3_mvt";
+import { formatValidationFailure, RContext, RObject, RObjectConfig, TypeRegistryMap, version } from "@hyper-hyper-space/hhs3_mvt";
 import { RSet, rSetFactory } from "../src/types/rset/rset.js";
+import { hashElement } from "../src/types/rset/hash.js";
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { createMockRContext } from "./mock_rcontext.js";
 import { json } from "@hyper-hyper-space/hhs3_json";
@@ -118,6 +119,21 @@ export const simpleSetTests = {
             }
         },
         {
+            name: '[SET02c] A barrier add after one head joins the set at the two-head frontier',
+            invoke: async () => {
+                const { set } = await createTestEnvironment([], { supportBarrierAdd: true });
+
+                const rootHash = await set.add('root');
+                const a = await set.add('left', version(rootHash));
+                const b = await set.add('right', version(rootHash));
+                const added = await set.addWithBarrier('barrier-delta', version(a));
+
+                const view = await set.getView(version(a, b), version(added, b));
+                assertTrue(await view.has('barrier-delta'),
+                    'the barrier add is not after the other head, so it is concurrent with the frontier');
+            }
+        },
+        {
             name: '[SET02b] Test barrier delete across concurrent versions',
             invoke: async () => {
                 const { set } = await createTestEnvironment();
@@ -139,6 +155,35 @@ export const simpleSetTests = {
 
                 const mergedView = await set.getView();
                 assertFalse(await mergedView.has('root'), 'barrier delete should void root once branches merge');
+            }
+        },
+        {
+            name: '[SET02d] A barrier delete after one head removes an add on the other head',
+            invoke: async () => {
+                const { set } = await createTestEnvironment();
+                const added = await set.add('x');
+                const a = await set.add('left', version(added));
+                const b = await set.add('right', version(added));
+                const elementHash = crypto.hash(HASH_SHA256).hashToB64(stringToUint8Array(json.toStringNormalized('x')));
+                const deleted = await set.deleteWithBarrierByHash(elementHash, version(a));
+
+                const view = await set.getView(version(a, b), version(deleted, b));
+                assertFalse(await view.has('x'),
+                    'the delete is after one head and not after the other, so it removes x');
+            }
+        },
+        {
+            name: '[SET02e] A barrier delete concurrent with the frontier and after the add removes the element',
+            invoke: async () => {
+                const { set } = await createTestEnvironment();
+                const added = await set.add('x');
+                const branch = await set.add('y', version(added));
+                const elementHash = crypto.hash(HASH_SHA256).hashToB64(stringToUint8Array(json.toStringNormalized('x')));
+                const deleted = await set.deleteWithBarrierByHash(elementHash, version(added));
+
+                const view = await set.getView(version(branch), version(deleted, branch));
+                assertFalse(await view.has('x'),
+                    'the delete is after the add and concurrent with the frontier, so the element is gone');
             }
         },
         {
@@ -361,6 +406,59 @@ export const simpleSetTests = {
                 await set.add('alpha');
                 const view = await set.getView();
                 assertTrue(await view.has('alpha'), 'set should remain usable after a failed delete');
+            }
+        },
+        {
+            name: '[SET14] a delete after a re-add removes the element at a cut that also holds an earlier add',
+            invoke: async () => {
+                const { set } = await createTestEnvironment();
+                const added = await set.add('a');
+                const fork = version(added);
+                const a = await set.add('a', fork);
+                const d = await set.delete('a', fork);
+                const a2 = await set.add('a', version(d));
+                const nd = await set.delete('a', version(a2));
+
+                const view = await set.getView(version(a, nd), version(a, nd));
+                assertFalse(await view.has('a'),
+                    'the later delete is a barrier and it is in the cover, so the element is absent');
+            }
+        },
+        {
+            name: '[SET15] deleteByHash on a barrier set stores barrier: true',
+            invoke: async () => {
+                const { set } = await createTestEnvironment();
+                await set.add('alpha');
+                const deleted = await set.deleteByHash(hashElement('alpha'));
+                const entry = await (await set.getScopedDag()).loadEntry(deleted);
+                const payload = entry!.payload as { barrier?: boolean };
+                assertTrue(payload.barrier === true, 'a plain delete on a barrier set is stored as a barrier');
+            }
+        },
+        {
+            name: '[SET16] a delete whose barrier bit disagrees with the set is rejected',
+            invoke: async () => {
+                const { set } = await createTestEnvironment();
+                await set.add('alpha');
+                const elementHash = hashElement('alpha');
+                const at = await (await set.getScopedDag()).getFrontier();
+
+                const missing = await set.validatePayload({ action: 'delete', elementHash }, at);
+                assertTrue(!missing.valid && formatValidationFailure(missing.why).includes('barrier set requires barrier deletes'),
+                    'a barrier set rejects a delete with no barrier bit');
+
+                const bitFalse = await set.validatePayload({ action: 'delete', elementHash, barrier: false }, at);
+                assertTrue(!bitFalse.valid && formatValidationFailure(bitFalse.why).includes('barrier set requires barrier deletes'),
+                    'a barrier set rejects a delete with barrier: false');
+
+                const plain = await createTestEnvironment([], { supportBarrierDelete: false });
+                await plain.set.add('alpha');
+                const plainAt = await (await plain.set.getScopedDag()).getFrontier();
+                const bitTrue = await plain.set.validatePayload(
+                    { action: 'delete', elementHash, barrier: true }, plainAt,
+                );
+                assertTrue(!bitTrue.valid && formatValidationFailure(bitTrue.why).includes('barrier delete is not supported'),
+                    'a non-barrier set rejects a delete with barrier: true');
             }
         },
     ],

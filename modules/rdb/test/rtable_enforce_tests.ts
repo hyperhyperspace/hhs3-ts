@@ -209,6 +209,7 @@ export const rtableEnforceTests = {
         {
             name: '[ENF05] Concurrent delete of an FK target (concurrentDeletes) hides the dependent at the merge',
             invoke: async () => {
+                // The line insert is a head of the position the orders table is read at.
                 const { group } = await createEnv([
                     open('orders', { customer: { type: 'string' } }, { concurrentDeletes: true }),
                     open('lines', { order: { type: 'string' }, qty: { type: 'integer' } }, { fks: { order: 'orders' } }),
@@ -328,6 +329,7 @@ export const rtableEnforceTests = {
         {
             name: '[ENF08] Concurrent barrier revoke voids the concurrent use at the merged frontier',
             invoke: async () => {
+                // The item insert is a head of the position the caps table is read at.
                 const { group } = await createEnv([
                     open('caps', { label: { type: 'string', pub: true } }, { concurrentDeletes: true }),
                     {

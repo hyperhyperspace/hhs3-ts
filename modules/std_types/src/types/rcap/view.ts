@@ -2,10 +2,10 @@ import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { KeyId } from "@hyper-hyper-space/hhs3_crypto";
 import { version, Version } from "@hyper-hyper-space/hhs3_mvt";
 import {
-    VerdictEvaluation, TRUE, FALSE, verdictTruth, notTruth, allTruth, anyTruth, someTruth,
+    VerdictEvaluation, TRUE, FALSE, verdictTruth, notTruth, allTruth, anyTruth, someTruth, seeThroughCover,
 } from "@hyper-hyper-space/hhs3_mvt";
-import type { Truth, Verdict } from "@hyper-hyper-space/hhs3_mvt";
-import { EntryPredicate } from "@hyper-hyper-space/hhs3_dag";
+import type { Truth, Undecided, Verdict } from "@hyper-hyper-space/hhs3_mvt";
+import type { Position } from "@hyper-hyper-space/hhs3_dag";
 
 import {
     CreateRCapPayload,
@@ -20,11 +20,16 @@ import type { RCap, RCapView } from "./interfaces.js";
 // a dependency cycle left it undecided (denied).
 type CapVoidReason = 'unauthorized' | 'undecided-cycle';
 
+type DefinitionRead = { origins: Set<B64Hash>; managedBy: string[] };
+
+const ABSENT: DefinitionRead = { origins: new Set(), managedBy: [] };
+
 export class RCapViewImpl implements RCapView {
 
     private target: RCap;
     private at: Version;
     private from: Version;
+    private definitions = new Map<string, Promise<DefinitionRead>>();
 
     constructor(target: RCap, at: Version, from: Version) {
         this.target = target;
@@ -49,35 +54,56 @@ export class RCapViewImpl implements RCapView {
         return cover.size > 0;
     }
 
-    private async getFirstSurvivingCapOrigin(capName: string): Promise<B64Hash | undefined> {
+    // A capability definition is one slot. create-cap (and the genesis create)
+    // turns it on, delete-cap turns it off. Off means nobody holds it. A
+    // re-create turns the same slot back on; it does not start a fresh
+    // generation, and the grants and revokes of the slot stay about that slot.
+    // The slot is off when a live delete-cap is in the cover at `at`, or
+    // concurrent with `at` and visible from `from`. Otherwise the origins are
+    // the live creates in the cover (a grant does not have to name one of
+    // them), and managedBy comes from the greatest of them.
+    private definition(capName: string): Promise<DefinitionRead> {
+        let pending = this.definitions.get(capName);
+        if (pending === undefined) {
+            pending = this.readDefinition(capName);
+            this.definitions.set(capName, pending);
+        }
+        return pending;
+    }
+
+    private async readDefinition(capName: string): Promise<DefinitionRead> {
         const scopedDag = await this.target.getScopedDag();
         const cover = await scopedDag.findCoverWithFilter(this.at, { containsValues: { caps: [capName] } });
+        const concurrent = await scopedDag.findConcurrentCoverWithFilter(
+            this.from, this.at, { containsValues: { caps: [capName], barrier: ['t'] } },
+        );
+        if (concurrent.size > 0) return ABSENT;
 
+        const origins = new Set<B64Hash>();
         for (const hash of cover) {
             const entry = await scopedDag.loadEntry(hash);
             if (entry === undefined) continue;
             const p = entry.payload as CapPayload;
-
-            const isPositiveCandidate =
+            if (p.action === 'delete-cap' && p.capName === capName) return ABSENT;
+            const positive =
                 (p.action === 'create-cap' && p.capName === capName) ||
                 (p.action === 'create' && capName in (p as CreateRCapPayload).initialCaps);
-
-            if (!isPositiveCandidate) continue;
-
-            const concurrentDeleteBarriers = await scopedDag.findConcurrentCoverWithFilter(
-                this.from, version(hash), { containsValues: { caps: [capName], barrier: ['t'] } },
-            );
-
-            if (concurrentDeleteBarriers.size === 0) {
-                return hash;
-            }
+            if (positive) origins.add(hash);
         }
+        if (origins.size === 0) return ABSENT;
 
-        return undefined;
+        let best: B64Hash | undefined;
+        for (const hash of origins) if (best === undefined || hash > best) best = hash;
+        const bestEntry = await scopedDag.loadEntry(best!);
+        const bp = bestEntry?.payload as CapPayload | undefined;
+        const managedBy = bp?.action === 'create'
+            ? (bp as CreateRCapPayload).initialCaps[capName]?.managedBy ?? []
+            : bp?.action === 'create-cap' ? bp.managedBy : [];
+        return { origins, managedBy };
     }
 
     async capabilityExists(capName: string): Promise<boolean> {
-        return (await this.getFirstSurvivingCapOrigin(capName)) !== undefined;
+        return (await this.definition(capName)).origins.size > 0;
     }
 
     // Admissibility check: "would an op appended at `this.at` that requires `grantee` to
@@ -88,26 +114,14 @@ export class RCapViewImpl implements RCapView {
     // VerdictEvaluation (hhs3_mvt), which gives the well-founded verdicts; a revoke
     // ring that nothing outside decides is void, so every holder on it keeps the cap.
     //
-    // Collapsed use point (collapse-X model): when `this.at` is a multi-hash frontier it is
-    // modeled as a single imaginary node X that inherits the union of predecessors AND
-    // successors of its elements. So an external op u is concurrent with X iff it is
-    // concurrent with EVERY element of `this.at`; if u is after even one element it is
-    // "later on that branch", where use-before-revoke applies.
-    //
-    // Two see-through barriers express use-before-revoke and concurrent-void:
-    //   B1 (grant-anchored): a live revoke of the pair concurrent with the grant op.
-    //   B2 (use-anchored):   a live revoke of the pair concurrent with the use point X.
-    // Both observe from `this.from`. Division of labor:
-    //   - B2 is coarse and grant-independent: it fires only for a revoke concurrent with the
-    //     WHOLE use point (concurrent with every element of `this.at`). A revoke that is
-    //     merely after some element of `this.at` is not concurrent with X, so B2 defers it.
-    //   - B1 (with the cover) is grant-specific and handles that deferred case: the grant
-    //     survives unless a revoke is concurrent with the authorizing grant op itself.
-    // B2 is always-on: a barrier visible from `this.from` and concurrent with X would void an
-    // op appended at `this.at`, so the query must return false. It is vacuous when
-    // `from == at` (append/delta) since nothing is concurrent with the whole horizon, and
-    // concurrent-only (a sequential revoke never fires it), so it never breaks
-    // use-before-revoke.
+    // A multi-hash `at` is one position. An external op is concurrent with it when it
+    // is outside the past of `at` and not after every head. Every grant and revoke
+    // of one (capability, grantee) pair is on one plane, including grants written
+    // before a delete-cap. The slot holds when the capability is on and both of
+    // these are true:
+    //   1. the see-through cover of this pair's grants and revokes at `at` holds,
+    //      with a live revoke clearing the slot unless an undecided grant dominates it;
+    //   2. no live revoke of the pair is concurrent with `at` and visible from `from`.
     async hasCapability(grantee: KeyId, capName: string): Promise<boolean> {
         const holding = await this.holdingIn(new VerdictEvaluation<CapVoidReason>('undecided-cycle'), grantee, capName);
         if (holding.status === 'undecided') {
@@ -117,83 +131,93 @@ export class RCapViewImpl implements RCapView {
     }
 
     // Whether `grantee` holds `capName` here, within `evaluation`. It is undecided
-    // only while the walks meet an op of the component being solved: a live
-    // use-anchored revoke still makes it false, an undecided one leaves it undecided
-    // unless no grant holds anyway, and an undecided op in the cover leaves it
-    // undecided. `exclude` is the op whose authorization this holding decides: an op
-    // is not its own barrier.
+    // only while the walks meet an op of the component being solved. `exclude` is
+    // the op whose authorization this holding decides: an op is not its own barrier.
     private async holdingIn(
         evaluation: VerdictEvaluation<CapVoidReason>, grantee: KeyId, capName: string, exclude?: B64Hash,
     ): Promise<Truth> {
         if (this.target.isCreator(grantee)) return TRUE;
-        if (!await this.capabilityExists(capName)) return FALSE;
+        if ((await this.definition(capName)).origins.size === 0) return FALSE;
 
         const scopedDag = await this.target.getScopedDag();
         const grantKey = capName + ':' + grantee;
+        const truthOf = async (hash: B64Hash): Promise<Truth> => {
+            if (hash === exclude) return FALSE;
+            return verdictTruth(await this.opVerdict(evaluation, hash));
+        };
+        const walk = (
+            cover: (accept: (hash: B64Hash) => Promise<boolean>) => Promise<Position>,
+        ) => seeThroughCover((p) => scopedDag.findMinimalCover(p), cover, truthOf);
 
-        // See-through liveness predicate. A grant whose origin no longer survives here
-        // is void. Otherwise an op of this pair is live when its verdict is: its author
-        // was authorized AS OF the op's own version, so a later revoke of the author's
-        // managing cap does not retroactively void it (use-before-revoke). The walks
-        // "see through" a void op to the last live one beneath it, instead of being
-        // masked by a dominating void op; undecided ops are seen through and recorded.
-        const liveRecording = (met: Truth[]): EntryPredicate => async (hash, entry) => {
-            if (hash === exclude) return false;
-            const p = entry.payload as CapPayload;
-            if (p.action === 'grant'
-                && !await this.hasAnySurvivingOriginIn(capName, new Set((p as GrantPayload).capOrigins))) {
-                return false;
-            }
-            const truth = verdictTruth(await this.opVerdict(evaluation, hash));
-            if (truth.status === 'undecided') {
-                met.push(truth);
-                return false;
-            }
-            return truth.status === 'true';
+        const kill2 = await walk((accept) => scopedDag.findConcurrentCoverWithFilter(
+            this.from, this.at, { containsValues: { grants: [grantKey], barrier: ['t'] } },
+            async (hash) => accept(hash),
+        ));
+        if (kill2.live.size > 0) return FALSE;
+
+        const cover = await walk((accept) => scopedDag.findCoverWithFilter(
+            this.at, { containsValues: { grants: [grantKey] } },
+            async (hash) => accept(hash),
+        ));
+        return allTruth([notTruth(anyTruth(kill2.undecided.values())), await this.slotTruth(scopedDag, cover)]);
+    }
+
+    // The cover's contribution to the slot. A live revoke clears it, unless an
+    // undecided grant dominates that revoke (a re-grant not yet decided). An
+    // undecided revoke leaves the slot undecided while any grant could hold.
+    private async slotTruth(
+        scopedDag: { loadEntry(h: B64Hash): Promise<{ payload: unknown } | undefined>; findMinimalCover(p: Position): Promise<Position> },
+        cover: { live: Position; undecided: Map<B64Hash, Undecided> },
+    ): Promise<Truth> {
+        const kindOf = async (hash: B64Hash): Promise<'grant' | 'revoke' | 'other'> => {
+            const entry = await scopedDag.loadEntry(hash);
+            const action = (entry?.payload as CapPayload | undefined)?.action;
+            if (action === 'grant') return 'grant';
+            if (action === 'revoke') return 'revoke';
+            return 'other';
         };
 
-        // B2 (use-anchored): a live revoke of this pair concurrent with the collapsed use
-        // point X -- i.e. concurrent with EVERY element of this.at (findConcurrentCoverWithFilter
-        // excludes any op that is after, or before, any element). A revoke that is after only
-        // some elements of this.at is left to the grant-anchored B1 below. Observed from
-        // this.from; vacuous when from == at.
-        const useUndecided: Truth[] = [];
-        const useRevokes = await scopedDag.findConcurrentCoverWithFilter(
-            this.from, this.at, { containsValues: { grants: [grantKey], barrier: ['t'] } }, liveRecording(useUndecided),
-        );
-        if (useRevokes.size > 0) return FALSE;
-
-        // See-through cover: the last live grant/revoke of this pair in past(at).
-        const coverUndecided: Truth[] = [];
-        const cover = await scopedDag.findCoverWithFilter(
-            this.at, { containsValues: { grants: [grantKey] } }, liveRecording(coverUndecided),
-        );
-        if (coverUndecided.length > 0) return anyTruth([...useUndecided, ...coverUndecided]);
-
-        // A grant in the cover holds unless B1 (grant-anchored) finds a live revoke of
-        // this pair concurrent with the grant op.
-        const grants: B64Hash[] = [];
-        for (const hash of cover) {
-            const entry = await scopedDag.loadEntry(hash);
-            if (entry !== undefined && (entry.payload as CapPayload).action === 'grant') grants.push(hash);
+        const liveRevokes: B64Hash[] = [];
+        let liveGrant = false;
+        for (const hash of cover.live) {
+            const kind = await kindOf(hash);
+            if (kind === 'revoke') liveRevokes.push(hash);
+            if (kind === 'grant') liveGrant = true;
         }
-        const granted = await someTruth(grants, async (hash) => {
-            const revokeUndecided: Truth[] = [];
-            const concurrentRevokes = await scopedDag.findConcurrentCoverWithFilter(
-                this.from, version(hash), { containsValues: { grants: [grantKey], barrier: ['t'] } },
-                liveRecording(revokeUndecided),
-            );
-            if (concurrentRevokes.size > 0) return FALSE;
-            return notTruth(anyTruth(revokeUndecided));
-        });
+        const undecidedGrants: Truth[] = [];
+        const undecidedRevokes: Truth[] = [];
+        for (const [hash, truth] of cover.undecided) {
+            const kind = await kindOf(hash);
+            if (kind === 'grant') undecidedGrants.push(truth);
+            else if (kind === 'revoke') undecidedRevokes.push(truth);
+        }
 
-        return allTruth([notTruth(anyTruth(useUndecided)), granted]);
+        for (const revoke of liveRevokes) {
+            let hidden = false;
+            for (const hash of cover.undecided.keys()) {
+                if ((await kindOf(hash)) !== 'grant') continue;
+                const above = await scopedDag.findMinimalCover(version(revoke, hash));
+                if (above.size === 1 && above.has(hash)) { hidden = true; break; }
+            }
+            if (!hidden) return FALSE;
+        }
+        if (liveRevokes.length > 0) return anyTruth(cover.undecided.values());
+
+        if (undecidedRevokes.length > 0) {
+            return liveGrant || undecidedGrants.length > 0 ? anyTruth([...undecidedRevokes, ...undecidedGrants]) : FALSE;
+        }
+        if (liveGrant) return TRUE;
+        if (undecidedGrants.length > 0) return anyTruth(undecidedGrants);
+        return FALSE;
     }
 
     // The verdict of a grant or revoke observed from this view's `from`: live when its
     // author is a creator or held one of the cap's managing caps at the op's own
-    // position. Keyed by op and `from` only, so every view sharing the evaluation
-    // shares it.
+    // position. The manager list is the definition in the op's own past, read at
+    // (op, op): a delete-cap on another branch has not happened yet, so it must
+    // not empty the list. Whether the author holds that manager still uses the
+    // outer `from`. Keyed by op and `from` only, so every view sharing the
+    // evaluation shares it.
     private opVerdict(evaluation: VerdictEvaluation<CapVoidReason>, hash: B64Hash): Promise<Verdict<CapVoidReason>> {
         const key = hash + '|' + [...this.from].sort().join(',');
         return evaluation.resolve(key, async () => {
@@ -203,8 +227,10 @@ export class RCapViewImpl implements RCapView {
             const author = p.author as KeyId;
             if (this.target.isCreator(author)) return { status: 'live' };
 
-            const opView = new RCapViewImpl(this.target, version(hash), this.from);
-            const managers = (await opView.getManagedBy(p.capName)).filter((mgr) => mgr !== 'creator');
+            const atOp = version(hash);
+            const managers = (await new RCapViewImpl(this.target, atOp, atOp).getManagedBy(p.capName))
+                .filter((mgr) => mgr !== 'creator');
+            const opView = new RCapViewImpl(this.target, atOp, this.from);
             const authorized = await someTruth(managers, (mgr) => opView.holdingIn(evaluation, author, mgr, hash));
             if (authorized.status === 'true') return { status: 'live' };
             if (authorized.status === 'false') return { status: 'void', reason: 'unauthorized' };
@@ -213,81 +239,11 @@ export class RCapViewImpl implements RCapView {
     }
 
     async getManagedBy(capName: string): Promise<string[]> {
-        const initialCaps = this.target.getInitialCaps();
-        if (capName in initialCaps) {
-            return initialCaps[capName].managedBy;
-        }
-
-        const scopedDag = await this.target.getScopedDag();
-        const cover = await scopedDag.findCoverWithFilter(this.at, { containsValues: { caps: [capName] } });
-
-        for (const hash of cover) {
-            const entry = await scopedDag.loadEntry(hash);
-            if (entry === undefined) continue;
-            const p = entry.payload as CapPayload;
-            if (p.action === 'create-cap') {
-                return p.managedBy;
-            }
-        }
-
-        return [];
+        return (await this.definition(capName)).managedBy;
     }
 
     async currentCapCreationVersion(capName: string): Promise<Version> {
-        const scopedDag = await this.target.getScopedDag();
-        const cover = await scopedDag.findCoverWithFilter(this.at, { containsValues: { caps: [capName] } });
-        const surviving = new Set<B64Hash>();
-
-        for (const hash of cover) {
-            const entry = await scopedDag.loadEntry(hash);
-            if (entry === undefined) continue;
-            const p = entry.payload as CapPayload;
-
-            const isPositiveCandidate =
-                (p.action === 'create-cap' && p.capName === capName) ||
-                (p.action === 'create' && capName in (p as CreateRCapPayload).initialCaps);
-
-            if (!isPositiveCandidate) continue;
-
-            const concurrentDeleteBarriers = await scopedDag.findConcurrentCoverWithFilter(
-                this.from, version(hash), { containsValues: { caps: [capName], barrier: ['t'] } },
-            );
-
-            if (concurrentDeleteBarriers.size === 0) {
-                surviving.add(hash);
-            }
-        }
-
-        return surviving;
-    }
-
-    private async hasAnySurvivingOriginIn(capName: string, origins: Set<string>): Promise<boolean> {
-        const scopedDag = await this.target.getScopedDag();
-        const cover = await scopedDag.findCoverWithFilter(this.at, { containsValues: { caps: [capName] } });
-
-        for (const hash of cover) {
-            if (!origins.has(hash)) continue;
-
-            const entry = await scopedDag.loadEntry(hash);
-            if (entry === undefined) continue;
-            const p = entry.payload as CapPayload;
-
-            const isPositiveCandidate =
-                (p.action === 'create-cap' && p.capName === capName) ||
-                (p.action === 'create' && capName in (p as CreateRCapPayload).initialCaps);
-
-            if (!isPositiveCandidate) continue;
-
-            const concurrentDeleteBarriers = await scopedDag.findConcurrentCoverWithFilter(
-                this.from, version(hash), { containsValues: { caps: [capName], barrier: ['t'] } },
-            );
-
-            if (concurrentDeleteBarriers.size === 0) {
-                return true;
-            }
-        }
-
-        return false;
+        return new Set((await this.definition(capName)).origins);
     }
 
     async getCapabilities(): Promise<string[]> {

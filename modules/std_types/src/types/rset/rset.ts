@@ -33,7 +33,7 @@ import {
     formatValidationFailure, validationOk, ValidationRejectedError, ValidationResult,
 } from "@hyper-hyper-space/hhs3_mvt";
 import { DagScope, NestedScopedDag, RootScopedDag, ScopedDag, CausalDag, ScopedDagSubscription } from "@hyper-hyper-space/hhs3_mvt";
-import { isRefAdvancePayload, extractRefVersion, prepareRefAdvance, createRefAdvanceMeta } from "@hyper-hyper-space/hhs3_mvt";
+import { isRefAdvancePayload, extractRefVersion, prepareRefAdvance, createRefAdvanceMeta, canonicalVersion } from "@hyper-hyper-space/hhs3_mvt";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 import { set } from "@hyper-hyper-space/hhs3_util";
 
@@ -277,6 +277,8 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
         return this.deleteByHash(elementHash, at);
     }
 
+    // On a barrier set, deleteByHash and deleteWithBarrierByHash are the same
+    // operation: every delete is a barrier. Both stay so existing callers compile.
     async deleteByHash(elementHash: B64Hash, at?: Version): Promise<B64Hash> {
         if (this.isPermissioned()) throw new Error("Use deleteByHashSigned() for permissioned sets");
         const dag = await this.getScopedDag();
@@ -353,7 +355,10 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
         if (!this.isPermissioned()) throw new Error("refAdvance is only for permissioned sets");
         const d = await this.getScopedDag();
         at = await d.resolvePosition(at);
-        const { payload: base } = prepareRefAdvance(this.capabilityRef()!, refVersion);
+        const rcap = await this.loadRCap();
+        if (rcap === undefined) throw new Error("permissioned set capability object is not available");
+        const published = await canonicalVersion(await rcap.getCausalDag(), refVersion);
+        const { payload: base } = prepareRefAdvance(this.capabilityRef()!, published);
         const signed = await signPayloadHelper(base as unknown as json.LiteralMap, author, at, d.signingScope());
         return this.applyValidatedPayload(signed, at);
     }
@@ -372,8 +377,9 @@ export class RSetImpl<T extends json.Literal = json.Literal> implements RSetCont
             throw new Error("Barrier delete is not supported by this set");
         }
 
+        // The flag means every delete. It is not a permission to set the bit.
         if (this.supportBarrierDelete()) {
-            return {action: 'delete', elementHash, barrier};
+            return {action: 'delete', elementHash, barrier: true};
         } else {
             return {action: 'delete', elementHash};
         }        

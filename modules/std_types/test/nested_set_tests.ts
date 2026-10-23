@@ -457,12 +457,14 @@ export const nestedSetTests = {
                 const viewA_Adelete_Bshared = await setA.getView(versionADelete_BShared);
                 const viewB_Adelete_Bshared = await setB.getView(versionADelete_BShared);
                 assertFalse(await viewA_Adelete_Bshared.has('shared'), 'A@Adelete+Bshared: shared deleted in A');
-                assertTrue(await viewB_Adelete_Bshared.has('shared'), 'B@Adelete+Bshared: shared still present in B');
+                assertFalse(await viewB_Adelete_Bshared.has('shared'),
+                    'B@Adelete+Bshared: B\'s delete has not seen A\'s delete, so it is concurrent with the mixed cut and shared is gone from B');
 
                 const versionBDelete_AShared = version(bHashes.deleteBarrierHash, aHashes.sharedAddHash);
                 const viewA_Bdelete_Ashared = await setA.getView(versionBDelete_AShared);
                 const viewB_Bdelete_Ashared = await setB.getView(versionBDelete_AShared);
-                assertTrue(await viewA_Bdelete_Ashared.has('shared'), 'A@Bdelete+Ashared: shared still present in A');
+                assertFalse(await viewA_Bdelete_Ashared.has('shared'),
+                    'A@Bdelete+Ashared: A\'s delete has not seen B\'s delete, so it is concurrent with the mixed cut and shared is gone from A');
                 assertFalse(await viewB_Bdelete_Ashared.has('shared'), 'B@Bdelete+Ashared: shared deleted in B');
 
                 const versionBothDeletes = version(aHashes.deleteBarrierHash, bHashes.deleteBarrierHash);

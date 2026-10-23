@@ -1,7 +1,7 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { EntryPredicate } from "@hyper-hyper-space/hhs3_dag";
-import { version, Version, RObject, resolveRefVersionAtPosition, resolveRefVersions, ScopedDag } from "@hyper-hyper-space/hhs3_mvt";
+import { version, Version, RObject, resolveRefVersionAtPosition, resolveRefVersions, canonicalVersion, ScopedDag } from "@hyper-hyper-space/hhs3_mvt";
 
 import { isAuthoredPayload, extractAuthor } from "../../authorship.js";
 
@@ -64,23 +64,18 @@ export class RSetViewImpl<T extends json.Literal> implements RSetView<T> {
             predicate,
         );
 
+        const adds: B64Hash[] = [];
+        let barrierDeleteInCover = false;
         for (const hash of cover) {
             const payload = (await dag.loadEntry(hash))!.payload as unknown as SetPayload;
-            if (payload['action'] !== 'add' && payload['action'] !== 'create') continue;
-
-            if (!this.target.supportBarrierDelete()) {
-                return true;
-            }
-
-            const concurrentBarriers = await dag.findConcurrentCoverWithFilter(
-                this.from, version(hash),
-                { containsValues: { barrier: ['t'], elmts: [elementHash] } },
-                predicate,
-            );
-            if (concurrentBarriers.size === 0) return true;
+            if (payload['action'] === 'add' || payload['action'] === 'create') adds.push(hash);
+            // On a barrier set every delete is a barrier. On a set without the
+            // flag the bit is ignored: a delete removes an element only by
+            // coming after its add, which the early return below already does.
+            else if (payload['action'] === 'delete' && this.target.supportBarrierDelete()) barrierDeleteInCover = true;
         }
 
-        if (this.target.supportBarrierAdd()) {
+        if (this.target.supportBarrierAdd() && adds.length === 0) {
             const barrierAdds = await dag.findConcurrentCoverWithFilter(
                 this.from, this.at,
                 { containsValues: { barrier: ['t'], elmts: [elementHash] } },
@@ -92,14 +87,28 @@ export class RSetViewImpl<T extends json.Literal> implements RSetView<T> {
             }
         }
 
-        return false;
+        if (adds.length === 0) return false;
+        if (!this.target.supportBarrierDelete()) return true;
+        if (barrierDeleteInCover) return false;
+
+        const concurrentDeletes = await dag.findConcurrentCoverWithFilter(
+            this.from, this.at,
+            { containsValues: { barrier: ['t'], elmts: [elementHash] } },
+            predicate,
+        );
+        for (const hash of concurrentDeletes) {
+            const payload = (await dag.loadEntry(hash))!.payload as unknown as SetPayload;
+            if (payload['action'] === 'delete') return false;
+        }
+        return true;
     }
 
     private async rcapViewForEntry(
         dag: ScopedDag, rcap: RCap, refId: B64Hash, entryHash: B64Hash,
     ): Promise<RCapView> {
         const { refAt, refFrom } = await resolveRefVersions(dag, refId, entryHash, this.from);
-        return rcap.getView(refAt, refFrom) as Promise<RCapView>;
+        const causal = await rcap.getCausalDag();
+        return rcap.getView(await canonicalVersion(causal, refAt), await canonicalVersion(causal, refFrom)) as Promise<RCapView>;
     }
 
     private async isEntryAuthorized(payload: json.Literal, rcapView: RCapView): Promise<boolean> {
@@ -143,7 +152,10 @@ export class RSetViewImpl<T extends json.Literal> implements RSetView<T> {
         }
 
         const dag = await this.target.getScopedDag();
-        return resolveRefVersionAtPosition(dag, refId, this.at, this.from);
+        const resolved = await resolveRefVersionAtPosition(dag, refId, this.at, this.from);
+        const rcap = await this.target.loadRCap();
+        if (rcap === undefined) throw new Error("Cannot load referenced RCap");
+        return canonicalVersion(await rcap.getCausalDag(), resolved);
     }
 
     async loadRObjectByHash(elementHash: B64Hash): Promise<RObject | undefined> {

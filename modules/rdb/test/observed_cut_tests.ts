@@ -1,12 +1,12 @@
-// Revocation across multi-head observed cuts (OBSERVED_CUT_REVOCATION_CRITIQUE.md).
-// Tests named "gap" pin today's verdict in cases the critique flags; a change to
-// Step 2 or to the observe widening is expected to flip them deliberately.
+// Revocation across multi-head observed cuts. A barrier is concurrent with a
+// cut unless it is after every head (ideal concurrency).
 
 import { assertTrue, assertFalse } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import type { RContext, Version } from "@hyper-hyper-space/hhs3_mvt";
-import { version } from "@hyper-hyper-space/hhs3_mvt";
+import { version, signPayload, createRefAdvancePayload, extractRefVersion, formatValidationFailure } from "@hyper-hyper-space/hhs3_mvt";
+import { json } from "@hyper-hyper-space/hhs3_json";
 
 import { createMockRContext } from "./mock_rcontext.js";
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
@@ -63,7 +63,7 @@ async function makeUsers(ctx: RContext, seed: string, members: OwnIdentity[]): P
 }
 
 // An app group whose observation of `users` requires a live manager cap there.
-async function makeGatedApp(ctx: RContext, seed: string, usersId: B64Hash): Promise<RTableGroupImpl> {
+async function makeGatedApp(ctx: RContext, seed: string, usersId: B64Hash, gated = true): Promise<RTableGroupImpl> {
     const creator = await makeIdentity();
     const schema = (await ctx.createObject(await RSchemaImpl.create({
         name: schemaName(seed),
@@ -75,7 +75,7 @@ async function makeGatedApp(ctx: RContext, seed: string, usersId: B64Hash): Prom
         schemaRef: schema.getId(), schemaVersion: await (await schema.getScopedDag()).getFrontier(),
         bindings: { [USERS_BINDING]: usersId },
         idProvider: USERS_IDENTITIES_PROVIDER,
-        canObserve: { [USERS_BINDING]: MUST_BE_MANAGER },
+        ...(gated ? { canObserve: { [USERS_BINDING]: MUST_BE_MANAGER } } : {}),
     }))) as RTableGroupImpl;
 }
 
@@ -219,6 +219,43 @@ async function itemLaterImport(seed: string, cut: ItemCut): Promise<boolean> {
     return view.hasRow(deriveRowId('i-1'));
 }
 
+// G: g (grant) -> f1, g -> f2, g -> c' (a second caps row, concurrent with f2).
+// The witness delete d is anchored at {f1, c'}. O observes {f2, c'}, inserts
+// the item, then imports {d, w} where w is after f2. c' is the only caps head
+// of the cut; f2 is not. d has seen c' and has not seen f2, so it is
+// concurrent with the cut.
+async function itemAtMixedCapsCut(seed: string): Promise<boolean> {
+    const ctx = newCtx();
+    const G = await makeGroup(ctx, seed + '-g', [
+        open('caps', { label: { type: 'string', pub: true } }, { concurrentDeletes: true }),
+        open('fill', { n: { type: 'string' } }),
+    ]);
+    const O = await makeGroup(ctx, seed + '-o', [{
+        name: 'items', columns: { name: { type: 'string' } },
+        restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'users.caps', where: { label: 'grant' } } }],
+    }], { users: G.getId() });
+
+    const caps = await G.getTable('caps');
+    const fill = await G.getTable('fill');
+    const g = await caps.insert('c-1', { label: 'grant' });
+    const cPrime = await caps.insert('c-2', { label: 'other' }, undefined, version(g));
+    const f1 = await fill.insert('f1', { n: '1' }, undefined, version(g));
+    const f2 = await fill.insert('f2', { n: '2' }, undefined, version(g));
+    const d = await caps.delete(deriveRowId('c-1'), undefined, version(f1, cPrime));
+    // w is after f2, so {d, w} dominates the observed cut {f2, c'} and the
+    // later import stays monotonic. d itself has not seen f2.
+    const w = await fill.insert('w', { n: 'w' }, undefined, version(f2));
+
+    const base = await frontier(O);
+    const y = await O.observe('users', version(f2, cPrime), undefined, base);
+    const item = await (await O.getTable('items')).insert('i-1', { name: 'thing' }, undefined, version(y));
+    await O.observe('users', version(d, w), undefined, version(item));
+
+    const merged = await frontier(O);
+    const view = await (await O.getView(merged, merged)).getTableView('items');
+    return view.hasRow(deriveRowId('i-1'));
+}
+
 export const observedCutTests = {
     title: '[OCUT] Revocation across multi-head observed cuts',
     tests: [
@@ -231,18 +268,18 @@ export const observedCutTests = {
             },
         },
         {
-            name: '[OCUT02] gap: a mixed-cut observe {v1, vAdv} survives a concurrent import of a revoke above v1 (the Mixed-Cut Attack)',
+            name: '[OCUT02] a mixed-cut observe {v1, vAdv} is voided by a concurrent import of a revoke above v1',
             invoke: async () => {
                 const { alice, admin } = await observeAgainstConcurrentImport('ocut02', 'mixed');
-                assertTrue(alice, 'today: {r} does not dominate {v1, vAdv}, and v1 < r defers r in Step 2');
+                assertFalse(alice, 'the revoke is not after vAdv, so it is concurrent with the cut and voids the observe');
                 assertTrue(admin, 'the revoke-import stays live');
             },
         },
         {
-            name: '[OCUT03] gap: an observe whose refVersion carries a dominated ancestor {v1, v2} survives a concurrent revoke-import (void once normalized)',
+            name: '[OCUT03] an observe whose refVersion carries a dominated ancestor {v1, v2} is voided by a concurrent revoke-import',
             invoke: async () => {
                 const { alice, admin } = await observeAgainstConcurrentImport('ocut03', 'dominated');
-                assertTrue(alice, 'today: the un-normalized cut closes v1 upward, so r (concurrent with v2) is missed');
+                assertFalse(alice, 'concurrency depends on the causal past, so the dominated v1 does not hide r');
                 assertTrue(admin, 'the revoke-import stays live');
             },
         },
@@ -254,10 +291,10 @@ export const observedCutTests = {
             },
         },
         {
-            name: '[OCUT05] gap: a benign concurrent observe with a head below the revoke rescues the voided observe of {f2} (void under ANY)',
+            name: '[OCUT05] a benign concurrent observe with a head below the revoke does not rescue the observe of {f2}',
             invoke: async () => {
-                assertTrue(await concurrentObserveLaterImport('ocut05', true),
-                    "today: bob's {w, f1} widens alice's cut, and f1 < r defers r in Step 2");
+                assertFalse(await concurrentObserveLaterImport('ocut05', true),
+                    "bob's head below the revoke does not make the revoke later than the widened cut");
             },
         },
         {
@@ -268,10 +305,10 @@ export const observedCutTests = {
             },
         },
         {
-            name: '[OCUT07] gap: widened to {v1, v2} by a benign observe, an observe of {v1} survives a later import of a revoke concurrent with v2 (void once normalized)',
+            name: '[OCUT07] widened to {v1, v2} by a benign observe, an observe of {v1} is voided by a later import of a revoke concurrent with v2',
             invoke: async () => {
-                assertTrue(await earlierObserveLaterImport('ocut07', true),
-                    'today: the widened cut keeps the dominated v1, whose upward closure hides r');
+                assertFalse(await earlierObserveLaterImport('ocut07', true),
+                    'the widened cut is the head v2, and the revoke is concurrent with v2');
             },
         },
         {
@@ -289,24 +326,62 @@ export const observedCutTests = {
             },
         },
         {
-            name: '[OCUT10] gap: padding the observed cut to {f2, f1} lets the item survive a later import of the delete (void under ANY)',
+            name: '[OCUT10] padding the observed cut to {f2, f1} does not save the item from a later import of the delete',
             invoke: async () => {
-                assertTrue(await itemLaterImport('ocut10', 'padded'),
-                    'today: f1 < d defers the delete in Step 2, though d is concurrent with f2');
+                assertFalse(await itemLaterImport('ocut10', 'padded'),
+                    'the delete is not after f2, so it is concurrent with the padded cut');
             },
         },
         {
-            name: '[OCUT11] gap: a benign concurrent observe of {w, f1} rescues the item at {f2} (void under ANY)',
+            name: '[OCUT11] a benign concurrent observe of {w, f1} does not rescue the item at {f2}',
             invoke: async () => {
-                assertTrue(await itemLaterImport('ocut11', 'bob-widens'),
-                    'today: the Layer 2 union adds f1, and f1 < d defers the delete');
+                assertFalse(await itemLaterImport('ocut11', 'bob-widens'),
+                    'adding f1 below the delete does not make the delete later than the widened cut');
             },
         },
         {
-            name: '[OCUT12] gap: an item at {f1} widened by a concurrent observe of {f3} above f1 survives a later import of a delete concurrent with f3 (void once normalized)',
+            name: '[OCUT13] a refVersion carrying a dominated ancestor is canonicalized on write and rejected on admission',
             invoke: async () => {
-                assertTrue(await itemLaterImport('ocut12', 'dominated'),
-                    'today: the Layer 2 union {f1, f3} keeps the dominated f1, whose upward closure hides d');
+                const ctx = newCtx();
+                const admin = await makeIdentity();
+                const G = await makeUsers(ctx, 'ocut13-g', [admin]);
+                const v0 = await frontier(G);
+                const v1 = await filler(G, v0);
+                const v2 = await filler(G, version(v1));
+
+                const gated = await makeGatedApp(ctx, 'ocut13-gated', G.getId());
+                const at = await frontier(gated);
+                const raw = await signPayload(
+                    createRefAdvancePayload(G.getId(), version(v1, v2)) as unknown as json.LiteralMap, admin, at,
+                );
+                const rejected = await gated.validatePayload(raw, at);
+                assertTrue(!rejected.valid && formatValidationFailure(rejected.why).includes('not an antichain'),
+                    'a gated observe carrying a dominated ancestor is rejected');
+
+                const open = await makeGatedApp(ctx, 'ocut13-open', G.getId(), false);
+                const openAt = await frontier(open);
+                const openRaw = createRefAdvancePayload(G.getId(), version(v1, v2));
+                const openRejected = await open.validatePayload(openRaw as unknown as json.LiteralMap, openAt);
+                assertTrue(!openRejected.valid && formatValidationFailure(openRejected.why).includes('not an antichain'),
+                    'an ungated observe carrying a dominated ancestor is rejected');
+
+                const written = await open.observe(USERS_BINDING, version(v1, v2), undefined, openAt);
+                const stored = extractRefVersion((await (await open.getScopedDag()).loadEntry(written))!.payload as never);
+                assertTrue(stored.size === 1 && stored.has(v2), 'the writer publishes the minimal cover');
+            },
+        },
+        {
+            name: '[OCUT14] an item at {f2, c\'} is voided by a later import of a witness delete that has seen c\' but not f2',
+            invoke: async () => {
+                assertFalse(await itemAtMixedCapsCut('ocut14'),
+                    'the delete is not after f2, so it is concurrent with the cut and voids the item');
+            },
+        },
+        {
+            name: '[OCUT12] an item at {f1} widened by a concurrent observe of {f3} above f1 is voided by a later import of a delete concurrent with f3',
+            invoke: async () => {
+                assertFalse(await itemLaterImport('ocut12', 'dominated'),
+                    'the widened cut is the head f3, and the delete is concurrent with f3');
             },
         },
     ],

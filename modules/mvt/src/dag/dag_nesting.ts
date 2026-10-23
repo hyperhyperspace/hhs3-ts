@@ -41,6 +41,7 @@ export type ScopedDag = {
 
 export type CausalDag = {
     findForkPosition(first: Position, second: Position): Promise<ForkPosition>;
+    findMinimalCover(p: Position): Promise<Position>;
 };
 
 // RootScopedDag: wraps a full Dag exposing only ScopedDag methods at runtime,
@@ -238,8 +239,14 @@ export class NestedScopedDag implements ScopedDag {
         return this.dag.findCoverWithFilter(from, joinFilters(this.scope.baseFilter(), this.scope.wrapFilter(meta)), predicate);
     }
     
+    // Concurrency is decided on the parent DAG. The joined scope filter only
+    // selects which matches may be returned; it does not rewrite the position.
+    // An out-of-scope head is still a head: a barrier that has not seen it has
+    // not seen an op appended at this position.
     findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
-        return this.dag.findConcurrentCoverWithFilter(from, concurrentTo, joinFilters(this.scope.baseFilter(), this.scope.wrapFilter(meta)), predicate);
+        return this.dag.findConcurrentCoverWithFilter(
+            from, concurrentTo, joinFilters(this.scope.baseFilter(), this.scope.wrapFilter(meta)), predicate,
+        );
     }
 
     loadAllEntries(): AsyncIterable<Entry> {
