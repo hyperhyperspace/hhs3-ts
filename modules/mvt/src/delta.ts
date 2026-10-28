@@ -97,7 +97,7 @@ export async function walkDelta(
 // concurrent with it whose effect changed. A referenced object's bound there is taken
 // between the versions observed at `start` and at `end`, not at the meet: a bound driven by
 // what changed is only sound for the exact pair of versions it compared. RTableGroup (rdb)
-// uses it. RSet and RCap still use the helpers here.
+// and RCap (std_types) use it. RSet still uses the helpers here.
 
 // Compute the observer's revision bound when a referenced object can revise state
 // below the fork meet. `observerMeet` is the fork meet on the observer (input, not the

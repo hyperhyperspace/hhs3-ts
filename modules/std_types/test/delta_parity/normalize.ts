@@ -72,6 +72,15 @@ export function assertRCapDeltaParity(
     }
 }
 
+// The bound-only computation agrees with the bounded delta's own bound.
+export function assertRevisionBoundParity(
+    boundOnly: Version,
+    deltaBound: Version,
+    ctx: DeltaParityContext,
+): void {
+    assertVersionParity("computeRevisionBound", boundOnly, deltaBound, ctx);
+}
+
 export function assertRSetDeltaParity(
     bounded: RSetDelta,
     full: RSetDelta,

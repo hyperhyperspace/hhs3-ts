@@ -1319,7 +1319,9 @@ export class RTableGroupImpl implements RTableGroupContract {
     // the delta: what an observer needs to tell a stable observation of this
     // group from an unstable one. Ignores the delta strategy. The memo
     // survives across calls: a version names a fixed history, so the bound
-    // between two versions never changes as the DAG grows.
+    // between two versions never changes as the DAG grows. Whether the memo
+    // pays for itself is unmeasured, and a cache at another layer may serve
+    // better (INCREMENTAL_DELTA_BOUND.md §6.2).
     async computeRevisionBound(start: Version, end: Version): Promise<Version> {
         const causalDag = await this.getCausalDag();
         const canonicalStart = await canonicalVersion(causalDag, start);

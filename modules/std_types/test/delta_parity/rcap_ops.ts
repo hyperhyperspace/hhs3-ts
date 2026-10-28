@@ -3,15 +3,42 @@ import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { dag } from "@hyper-hyper-space/hhs3_dag";
 
 import { RCap } from "../../src/types/rcap/rcap.js";
+import type { RCapView } from "../../src/types/rcap/interfaces.js";
 import { serializePublicKeyToBase64 } from "../../src/authorship.js";
 
 import { makeIdentity } from "./identities.js";
 import { PRNG } from "./prng.js";
 
-export type RCapOp = "addIdentity" | "grant" | "revoke" | "createCap" | "deleteCap";
+export type RCapOp = "addIdentity" | "grant" | "revoke" | "createCap" | "deleteCap" | "recreateCap";
 
 export async function resolveAt(rawDag: dag.Dag, at?: Version): Promise<Version> {
     return at ?? await rawDag.getFrontier();
+}
+
+// The capabilities grants and revokes pick from: `write` and every dynamic
+// capability that exists at `view`.
+async function grantableCaps(view: RCapView, dynamicCaps: string[]): Promise<string[]> {
+    const caps = ["write"];
+    for (const capName of dynamicCaps) {
+        if (await view.capabilityExists(capName)) caps.push(capName);
+    }
+    return caps;
+}
+
+// Every (identity, capability) pair that is not a creator's, whose grantee is an
+// identity at `view`, and whose holding at `view` is `held`.
+async function pairsWithHolding(
+    cap: RCap, view: RCapView, registered: OwnIdentity[], caps: string[], held: boolean,
+): Promise<Array<[OwnIdentity, string]>> {
+    const pairs: Array<[OwnIdentity, string]> = [];
+    for (const identity of registered) {
+        if (cap.isCreator(identity.keyId)) continue;
+        if (!(await view.isIdentity(identity.keyId))) continue;
+        for (const capName of caps) {
+            if (await view.hasCapability(identity.keyId, capName) === held) pairs.push([identity, capName]);
+        }
+    }
+    return pairs;
 }
 
 export async function availableOpsAt(
@@ -22,30 +49,13 @@ export async function availableOpsAt(
 ): Promise<RCapOp[]> {
     const view = await cap.getView(at, at);
     const ops: RCapOp[] = ["addIdentity", "createCap"];
-    let canGrant = false;
-    let canRevoke = false;
+    const caps = await grantableCaps(view, dynamicCaps);
 
-    for (const identity of registered) {
-        if (cap.isCreator(identity.keyId)) {
-            continue;
-        }
-        if (!(await view.isIdentity(identity.keyId))) {
-            continue;
-        }
-        if (await view.hasCapability(identity.keyId, "write")) {
-            canRevoke = true;
-        } else {
-            canGrant = true;
-        }
-    }
-
-    if (canGrant) ops.push("grant");
-    if (canRevoke) ops.push("revoke");
+    if ((await pairsWithHolding(cap, view, registered, caps, false)).length > 0) ops.push("grant");
+    if ((await pairsWithHolding(cap, view, registered, caps, true)).length > 0) ops.push("revoke");
 
     for (const capName of dynamicCaps) {
-        if (await view.capabilityExists(capName)) {
-            ops.push("deleteCap");
-        }
+        ops.push(await view.capabilityExists(capName) ? "deleteCap" : "recreateCap");
     }
 
     return ops;
@@ -99,30 +109,14 @@ export async function executeRCapOp(
             );
             break;
         }
-        case "grant": {
-            const view = await cap.getView(atVersion, atVersion);
-            const grantable = [];
-            for (const identity of state.registered) {
-                if (cap.isCreator(identity.keyId)) continue;
-                if (!(await view.isIdentity(identity.keyId))) continue;
-                if (await view.hasCapability(identity.keyId, "write")) continue;
-                grantable.push(identity);
-            }
-            const grantee = grantable[prng.nextInt(0, grantable.length - 1)];
-            await cap.grant(grantee.keyId, "write", admin, at);
-            break;
-        }
+        case "grant":
         case "revoke": {
             const view = await cap.getView(atVersion, atVersion);
-            const revokable = [];
-            for (const identity of state.registered) {
-                if (cap.isCreator(identity.keyId)) continue;
-                if (await view.hasCapability(identity.keyId, "write")) {
-                    revokable.push(identity);
-                }
-            }
-            const grantee = revokable[prng.nextInt(0, revokable.length - 1)];
-            await cap.revoke(grantee.keyId, "write", admin, at);
+            const caps = await grantableCaps(view, state.dynamicCaps);
+            const pairs = await pairsWithHolding(cap, view, state.registered, caps, op === "revoke");
+            const [grantee, capName] = pairs[prng.nextInt(0, pairs.length - 1)];
+            if (op === "grant") await cap.grant(grantee.keyId, capName, admin, at);
+            else await cap.revoke(grantee.keyId, capName, admin, at);
             break;
         }
         case "createCap": {
@@ -141,6 +135,18 @@ export async function executeRCapOp(
             }
             const capName = deletable[prng.nextInt(0, deletable.length - 1)];
             await cap.deleteCap(capName, admin, at);
+            break;
+        }
+        case "recreateCap": {
+            // Turns a deleted slot back on: the grants written before the
+            // delete hold again.
+            const view = await cap.getView(atVersion, atVersion);
+            const deleted = [];
+            for (const capName of state.dynamicCaps) {
+                if (!(await view.capabilityExists(capName))) deleted.push(capName);
+            }
+            const capName = deleted[prng.nextInt(0, deleted.length - 1)];
+            await cap.createCap(capName, ["admin"], admin, at);
             break;
         }
     }

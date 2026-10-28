@@ -5,7 +5,7 @@ import { dag, MetaProps, position } from "@hyper-hyper-space/hhs3_dag";
 
 import {
     Payload, RObject, RObjectFactory, RContext, LoadObjectOptions, Version, View, ForeignDep,
-    formatValidationFailure, ValidationRejectedError, ValidationResult,
+    formatValidationFailure, ValidationRejectedError, ValidationResult, canonicalVersion,
 } from "@hyper-hyper-space/hhs3_mvt";
 import { RootScopedDag, ScopedDag, CausalDag, ScopedDagSubscription } from "@hyper-hyper-space/hhs3_mvt";
 
@@ -28,7 +28,7 @@ import {
 import type { RCap as RCapContract, RCapView as RCapViewContract } from "./interfaces.js";
 import { validateRCapPayload } from "./validate.js";
 import { RCapViewImpl } from "./view.js";
-import { RCapDelta, RCapDeltaStrategy, RCapDeltaAccumulator, computeRCapDelta } from "./delta.js";
+import { RCapDelta, RCapDeltaStrategy, RCapDeltaAccumulator, computeRCapDelta, computeRCapRevisionBound } from "./delta.js";
 
 const DEFAULT_ENROLL_CAPABILITY = 'enroll';
 
@@ -319,9 +319,31 @@ export class RCapImpl implements RCapContract {
     }
 
     async computeDelta(start: Version, end: Version): Promise<RCapDelta> {
+        return computeRCapDelta(this, await this.getRawDag(), this.deltaStrategy, start, end);
+    }
+
+    // The bounded revision bound between two of this object's versions, without
+    // the delta: what an observer needs to tell a stable observation from an
+    // unstable one. Ignores the delta strategy. No memo: see
+    // rdb/INCREMENTAL_DELTA_BOUND.md §6.2.
+    async computeRevisionBound(start: Version, end: Version): Promise<Version> {
+        const causalDag = await this.getCausalDag();
+        return computeRCapRevisionBound(
+            this, await this.getRawDag(),
+            await canonicalVersion(causalDag, start), await canonicalVersion(causalDag, end),
+        );
+    }
+
+    // Whether the grant, revoke or delete-cap `hash` is void observed from
+    // `from`: the verdict the bounded delta compares at its two horizons.
+    async isEntryVoided(hash: B64Hash, from: Version): Promise<boolean> {
+        return new RCapViewImpl(this, from, from).isOpVoid(hash);
+    }
+
+    private async getRawDag(): Promise<dag.Dag> {
         const rawDag = await this.ctx.getDag(this.createOpId, this.backendLabel);
         if (rawDag === undefined) throw new Error("DAG not found");
-        return computeRCapDelta(this, rawDag, this.deltaStrategy, start, end);
+        return rawDag;
     }
 
     createDeltaAccumulator(start: Version, end: Version): RCapDeltaAccumulator {

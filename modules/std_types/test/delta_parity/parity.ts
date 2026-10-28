@@ -11,6 +11,7 @@ import { PRNG } from "./prng.js";
 import {
     assertRCapDeltaParity,
     assertRSetDeltaParity,
+    assertRevisionBoundParity,
     type DeltaParityContext,
 } from "./normalize.js";
 
@@ -152,6 +153,7 @@ export async function compareRCapDeltaStrategies(
     const bounded = await computeRCapDelta(cap, "bounded", start, end);
     const full = await computeRCapDelta(cap, "full", start, end);
     assertRCapDeltaParity(bounded, full, ctx);
+    assertRevisionBoundParity(await cap.computeRevisionBound(start, end), bounded.revisionBound, ctx);
 }
 
 export async function compareRSetDeltaStrategies(
@@ -179,29 +181,32 @@ export type RSetHistory = {
     seed: number;
 };
 
+// A generator returns one history per seed, or several (one per variant).
 export async function runRCapSeedSweep(
-    generate: (seed: number, ops: number) => Promise<RCapHistory>,
+    generate: (seed: number, ops: number) => Promise<RCapHistory | RCapHistory[]>,
     options: ResolvedFuzzSweepOptions,
 ): Promise<void> {
     for (const seed of options.seeds) {
-        const history = await generate(seed, options.ops);
-        const pairs = subsamplePairs(
-            await collectExtendingPairs(history.rawDag, history.checkpoints),
-            seed,
-            options.maxPairs,
-        );
-
-        for (const [startIdx, endIdx, start, end] of pairs) {
-            await compareRCapDeltaStrategies(history.cap, start, end, {
+        const generated = await generate(seed, options.ops);
+        for (const history of Array.isArray(generated) ? generated : [generated]) {
+            const pairs = subsamplePairs(
+                await collectExtendingPairs(history.rawDag, history.checkpoints),
                 seed,
-                opIndex: endIdx,
-                start,
-                end,
-            });
-            process.stdout.write(".");
-        }
+                options.maxPairs,
+            );
 
-        process.stdout.write(`\n  seed=${seed} pairs=${pairs.length} (max ${options.maxPairs})\n`);
+            for (const [, endIdx, start, end] of pairs) {
+                await compareRCapDeltaStrategies(history.cap, start, end, {
+                    seed,
+                    opIndex: endIdx,
+                    start,
+                    end,
+                });
+                process.stdout.write(".");
+            }
+
+            process.stdout.write(`\n  seed=${seed} pairs=${pairs.length} (max ${options.maxPairs})\n`);
+        }
     }
 }
 

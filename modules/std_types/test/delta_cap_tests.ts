@@ -1,8 +1,9 @@
 import { assertTrue, assertFalse, assertEquals } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { set } from "@hyper-hyper-space/hhs3_util";
 import { HASH_SHA256, createBasicCrypto, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
-import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
+import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { version } from "@hyper-hyper-space/hhs3_mvt";
+import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
 import { RCap, rCapFactory } from "../src/types/rcap/rcap.js";
@@ -41,6 +42,72 @@ async function computeWithStrategy(
 ): Promise<RCapDelta> {
     cap.setDeltaStrategy(strategy);
     return await cap.computeDelta(start, end) as RCapDelta;
+}
+
+// The bounded delta, after checking it against the full one and the bound-only
+// computation.
+async function boundedDelta(cap: RCap, start: Version, end: Version): Promise<RCapDelta> {
+    const full = await computeWithStrategy(cap, 'full', start, end);
+    const bounded = await computeWithStrategy(cap, 'bounded', start, end);
+    assertEquals(
+        JSON.stringify(normalizeRCapDelta(bounded)),
+        JSON.stringify(normalizeRCapDelta(full)),
+        'the bounded delta matches the full one',
+    );
+    assertTrue(set.eq(await cap.computeRevisionBound(start, end), bounded.getRevisionBound()),
+        'computeRevisionBound returns the bounded delta\'s bound');
+    return bounded;
+}
+
+function isExactly(v: Version, ...hashes: B64Hash[]): boolean {
+    return v.size === hashes.length && hashes.every((h) => v.has(h));
+}
+
+async function addIdentities(cap: RCap, author: OwnIdentity, ...identities: OwnIdentity[]): Promise<void> {
+    for (const identity of identities) {
+        await cap.addIdentity(identity.keyId, serializePublicKeyToBase64(identity.publicKey), author);
+    }
+}
+
+// The history of RCAP_INCREMENTAL_BOUND_WALK.md, "Why":
+//
+//   ... gS - gA - G - s1 - N        start = {s1, T}, end = {N, T}
+//             \
+//              T
+//
+// super is managed by the creator, admin by super, write by admin. gS grants S
+// super, gA grants A admin, G is A granting B write, and T is S revoking A's
+// admin, concurrent with G and s1. N follows s1: with `nVoidsT` it revokes S's
+// super, which voids T and so revives G; otherwise it adds an identity.
+async function revokeChainHistory(nVoidsT: boolean) {
+    const R = await makeIdentity();
+    const S = await makeIdentity();
+    const A = await makeIdentity();
+    const B = await makeIdentity();
+    const Z = await makeIdentity();
+    const W = await makeIdentity();
+    const ctx = createMockRContext({ selfValidate: true });
+    ctx.getRegistry().register(RCap.typeId, rCapFactory);
+    const cap = (await ctx.createObject(await RCap.create({
+        seed: 'cap-bound-revoke-chain',
+        creators: [{ keyId: R.keyId, publicKey: R.publicKey }],
+        initialCaps: {
+            'super': { managedBy: ['creator'] },
+            'admin': { managedBy: ['super'] },
+            'write': { managedBy: ['admin'] },
+        },
+    }))) as RCap;
+    await addIdentities(cap, R, S, A, B);
+
+    const gS = await cap.grant(S.keyId, 'super', R);
+    const gA = await cap.grant(A.keyId, 'admin', R, version(gS));
+    const G = await cap.grant(B.keyId, 'write', A, version(gA));
+    const s1 = await cap.addIdentity(Z.keyId, serializePublicKeyToBase64(Z.publicKey), R, version(G));
+    const T = await cap.revoke(A.keyId, 'admin', S, version(gA));
+    const N = nVoidsT
+        ? await cap.revoke(S.keyId, 'super', R, version(s1))
+        : await cap.addIdentity(W.keyId, serializePublicKeyToBase64(W.publicKey), R, version(s1));
+    return { cap, B, gA, s1, T, N, start: version(s1, T), end: version(N, T) };
 }
 
 export const deltaCapTests = {
@@ -515,6 +582,72 @@ export const deltaCapTests = {
                     'CAP_DELTA11 should match reference scan',
                 );
             }
+        },
+        {
+            name: '[CAP_BOUND01] a side-branch revoke voided by a new entry lowers the bound, and the grant it revives is reported',
+            invoke: async () => {
+                const h = await revokeChainHistory(true);
+                const delta = await boundedDelta(h.cap, h.start, h.end);
+                const writeFlip = delta.grantChanges.find(c => c.keyId === h.B.keyId && c.capName === 'write');
+                assertTrue(writeFlip !== undefined && !writeFlip.wasGranted && writeFlip.nowGranted, 'B gains write');
+                assertTrue(isExactly(delta.getRevisionBound(), h.gA), "the bound drops to the revoke's predecessor");
+            },
+        },
+        {
+            name: '[CAP_BOUND02] a side-branch revoke that does not change keeps the bound at the meet',
+            invoke: async () => {
+                const h = await revokeChainHistory(false);
+                const delta = await boundedDelta(h.cap, h.start, h.end);
+                assertTrue(!delta.grantChanges.some(c => c.keyId === h.B.keyId), "B's write does not change");
+                assertTrue(isExactly(delta.getRevisionBound(), h.s1), 'the bound stays at the meet');
+            },
+        },
+        {
+            name: '[CAP_BOUND03] re-creating a deleted capability reports the grants it revives',
+            invoke: async () => {
+                const R = await makeIdentity();
+                const B = await makeIdentity();
+                const { cap } = await createTestCap(R);
+                await addIdentities(cap, R, B);
+                await cap.createCap('dyn', ['admin'], R);
+                await cap.grant(B.keyId, 'dyn', R);
+                await cap.deleteCap('dyn', R);
+                const start = await (await cap.getScopedDag()).getFrontier();
+                await cap.createCap('dyn', ['admin'], R);
+                const end = await (await cap.getScopedDag()).getFrontier();
+
+                const delta = await boundedDelta(cap, start, end);
+                assertTrue(delta.capabilityChanges.some(c => c.capName === 'dyn' && !c.existed && c.exists), 'dyn reappears');
+                const dynFlip = delta.grantChanges.find(c => c.keyId === B.keyId && c.capName === 'dyn');
+                assertTrue(dynFlip !== undefined && !dynFlip.wasGranted && dynFlip.nowGranted, 'B holds dyn again');
+            },
+        },
+        {
+            name: '[CAP_BOUND04] computeRevisionBound returns the delta\'s bound, also for versions with a dominated hash',
+            invoke: async () => {
+                for (const nVoidsT of [true, false]) {
+                    const h = await revokeChainHistory(nVoidsT);
+                    const delta = await boundedDelta(h.cap, h.start, h.end);
+                    const padded = await h.cap.computeRevisionBound(version(...h.start, h.gA), version(...h.end, h.gA));
+                    assertTrue(set.eq(padded, delta.getRevisionBound()), 'a dominated hash does not change the bound');
+                }
+            },
+        },
+        {
+            name: '[CAP_BOUND05] getCapabilities lists a create-cap that has a later capability entry above it',
+            invoke: async () => {
+                const R = await makeIdentity();
+                const { cap } = await createTestCap(R);
+                await cap.createCap('y', ['admin'], R);
+                const afterY = await (await cap.getScopedDag()).getFrontier();
+                await cap.createCap('z', ['admin'], R);
+                await cap.deleteCap('z', R);
+
+                const caps = (await (await cap.getView()).getCapabilities()).sort();
+                assertEquals(JSON.stringify(caps), JSON.stringify(['admin', 'write', 'y']), 'y is listed, z is deleted');
+                const earlier = (await (await cap.getView(afterY, afterY)).getCapabilities()).sort();
+                assertEquals(JSON.stringify(earlier), JSON.stringify(['admin', 'write', 'y']), 'z is not listed before it exists');
+            },
         },
     ]
 };

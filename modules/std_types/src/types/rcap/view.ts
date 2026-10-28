@@ -49,6 +49,9 @@ export class RCapViewImpl implements RCapView {
         throw new Error("RCap does not have outgoing references");
     }
 
+    // An add-identity is permanent: losing the enroll capability concurrently
+    // does not unwind a key that was admitted, so this cover has no liveness
+    // filter.
     async isIdentity(keyId: KeyId): Promise<boolean> {
         if (this.target.isCreator(keyId)) return true;
 
@@ -65,6 +68,14 @@ export class RCapViewImpl implements RCapView {
     // concurrent with `at` and visible from `from`. Otherwise the origins are
     // the live creates in the cover (a grant does not have to name one of
     // them), and managedBy comes from the greatest of them.
+    //
+    // Every create-cap and delete-cap is live: both are creator-only
+    // (validateCreateCap, validateDeleteCap), creators are fixed in the create
+    // payload, and opVerdict returns live for them. So these reads need no
+    // liveness filter, and a delete-cap's effect never changes between horizons.
+    // Letting capability managers delete capabilities would need a liveness
+    // filter here, and the bounded delta's visitor would then see delete-cap
+    // verdicts flip.
     private definition(capName: string): Promise<DefinitionRead> {
         let pending = this.definitions.get(capName);
         if (pending === undefined) {
@@ -241,6 +252,17 @@ export class RCapViewImpl implements RCapView {
         });
     }
 
+    // Whether the grant, revoke or delete-cap `hash` is void observed from this
+    // view's `from`; `at` plays no part. The bounded delta compares it at its two
+    // horizons. One evaluation per call, as in hasCapability.
+    async isOpVoid(hash: B64Hash): Promise<boolean> {
+        const verdict = await this.opVerdict(new VerdictEvaluation<CapVoidReason>('undecided-cycle'), hash);
+        if (verdict.status === 'undecided') {
+            throw new Error(`the verdict of '${hash}' is undecided outside the component being solved`);
+        }
+        return verdict.status === 'void';
+    }
+
     async getManagedBy(capName: string): Promise<string[]> {
         return (await this.definition(capName)).managedBy;
     }
@@ -249,16 +271,17 @@ export class RCapViewImpl implements RCapView {
         return new Set((await this.definition(capName)).origins);
     }
 
+    // Every capability that exists here. The names come from the genesis and from
+    // every create-cap in the DAG: a filtered cover would return only the topmost
+    // capability entries and miss a create-cap below another. A create-cap outside
+    // the past of `at` does not make its capability exist here, so the
+    // capabilityExists filter below keeps the list exact.
     async getCapabilities(): Promise<string[]> {
         const caps: string[] = [];
         const all = new Set(Object.keys(this.target.getInitialCaps()));
 
         const scopedDag = await this.target.getScopedDag();
-        const cover = await scopedDag.findCoverWithFilter(this.at, { containsKeys: ['caps'] });
-        for (const hash of cover) {
-            if (hash === this.target.getId()) continue;
-            const entry = await scopedDag.loadEntry(hash);
-            if (entry === undefined) continue;
+        for await (const entry of scopedDag.loadAllEntries()) {
             const p = entry.payload as CapPayload;
             if (p.action === 'create-cap') all.add(p.capName);
         }

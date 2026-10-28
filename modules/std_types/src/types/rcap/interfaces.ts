@@ -28,6 +28,8 @@ export interface RCap extends RObject, SyncableObject {
     unsubscribe(callback: (version: Version) => void): void;
 
     setDeltaStrategy(strategy: "full" | "bounded"): void;
+    // The bounded delta's revision bound between two versions, without the delta.
+    computeRevisionBound(start: Version, end: Version): Promise<Version>;
     configure(config: { meshLabel?: string }): void;
 }
 
