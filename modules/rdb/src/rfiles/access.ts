@@ -25,7 +25,7 @@ import type { B64Hash, KeyId, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
 import {
     RContext, ScopedDag, Version, ValidationResult, SigningScope, RefAdvancePayload,
     validationFailure, validationOk, verifyPayloadSignature,
-    resolveRefVersionAtPosition, validateRefAdvanceMonotonicity, extractRefVersion,
+    resolveRefVersionAtPosition, canonicalVersion, validateRefAdvanceMonotonicity, validateRefVersionShape, extractRefVersion,
 } from "@hyper-hyper-space/hhs3_mvt";
 
 import {
@@ -170,8 +170,13 @@ export class FilesAccessControl {
         return obj as RTableGroupImpl;
     }
 
+    async resolveObserved(dag: ScopedDag, at: Version, from: Version): Promise<Version> {
+        const group = await this.loadGroup();
+        return canonicalVersion(await group.getCausalDag(), await resolveRefVersionAtPosition(dag, this.groupId, at, from));
+    }
+
     observedVersion(dag: ScopedDag, at: Version): Promise<Version> {
-        return resolveRefVersionAtPosition(dag, this.groupId, at, at);
+        return this.resolveObserved(dag, at, at);
     }
 
     // The key registered for `author` in the provider table at group version `v`.
@@ -229,7 +234,10 @@ export class FilesAccessControl {
             if (await groupDag.loadEntry(h) === undefined) throw new Error(`group entry '${h}' is not present in the replica`);
         }
 
-        if (!await validateRefAdvanceMonotonicity(dag, await group.getCausalDag(), this.groupId, newVersion, at)) {
+        const causal = await group.getCausalDag();
+        const shape = await validateRefVersionShape(causal, newVersion);
+        if (!shape.valid) return shape;
+        if (!await validateRefAdvanceMonotonicity(dag, causal, this.groupId, newVersion, at)) {
             return validationFailure('ref-advance is not monotonic');
         }
 

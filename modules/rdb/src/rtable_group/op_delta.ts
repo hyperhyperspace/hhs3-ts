@@ -140,6 +140,27 @@ export function describeGroupEntry(
     return base;
 }
 
+// The flip record for an entry whose verdict differs between the horizons,
+// with the void reason at the horizon where it is void.
+export async function describeOpVerdictFlip(
+    host: OpVerdictHost,
+    entry: dag.Entry,
+    voidBefore: boolean,
+    voidAfter: boolean,
+    start: Version,
+    end: Version,
+): Promise<OpVerdictChange> {
+    const voidHorizon: OpVoidHorizon = voidAfter ? 'end' : 'start';
+    const horizon = voidAfter ? end : start;
+    const reason = await host.explainEntryVoided(entry.hash, horizon);
+
+    return {
+        ...describeGroupEntry(entry, host, voidBefore, voidAfter),
+        voidHorizon,
+        ...(reason !== undefined ? { reason } : {}),
+    };
+}
+
 export async function computeOpVerdictFlips(
     host: OpVerdictHost,
     entries: dag.Entry[],
@@ -155,15 +176,7 @@ export async function computeOpVerdictFlips(
         const voidAfter = await host.isEntryVoided(entry.hash, end);
         if (voidBefore === voidAfter) continue;
 
-        const voidHorizon: OpVoidHorizon = voidAfter ? 'end' : 'start';
-        const horizon = voidAfter ? end : start;
-        const reason = await host.explainEntryVoided(entry.hash, horizon);
-
-        changes.push({
-            ...describeGroupEntry(entry, host, voidBefore, voidAfter),
-            voidHorizon,
-            ...(reason !== undefined ? { reason } : {}),
-        });
+        changes.push(await describeOpVerdictFlip(host, entry, voidBefore, voidAfter, start, end));
     }
 
     changes.sort((a, b) => a.entry.localeCompare(b.entry));

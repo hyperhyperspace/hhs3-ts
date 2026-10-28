@@ -22,13 +22,16 @@ type CapVoidReason = 'unauthorized' | 'undecided-cycle';
 
 type DefinitionRead = { origins: Set<B64Hash>; managedBy: string[] };
 
-const ABSENT: DefinitionRead = { origins: new Set(), managedBy: [] };
+function absent(): DefinitionRead {
+    return { origins: new Set(), managedBy: [] };
+}
 
 export class RCapViewImpl implements RCapView {
 
     private target: RCap;
     private at: Version;
     private from: Version;
+    // Caches rejected promises too, so a long-lived view would need to evict them.
     private definitions = new Map<string, Promise<DefinitionRead>>();
 
     constructor(target: RCap, at: Version, from: Version) {
@@ -77,20 +80,20 @@ export class RCapViewImpl implements RCapView {
         const concurrent = await scopedDag.findConcurrentCoverWithFilter(
             this.from, this.at, { containsValues: { caps: [capName], barrier: ['t'] } },
         );
-        if (concurrent.size > 0) return ABSENT;
+        if (concurrent.size > 0) return absent();
 
         const origins = new Set<B64Hash>();
         for (const hash of cover) {
             const entry = await scopedDag.loadEntry(hash);
             if (entry === undefined) continue;
             const p = entry.payload as CapPayload;
-            if (p.action === 'delete-cap' && p.capName === capName) return ABSENT;
+            if (p.action === 'delete-cap' && p.capName === capName) return absent();
             const positive =
                 (p.action === 'create-cap' && p.capName === capName) ||
                 (p.action === 'create' && capName in (p as CreateRCapPayload).initialCaps);
             if (positive) origins.add(hash);
         }
-        if (origins.size === 0) return ABSENT;
+        if (origins.size === 0) return absent();
 
         let best: B64Hash | undefined;
         for (const hash of origins) if (best === undefined || hash > best) best = hash;

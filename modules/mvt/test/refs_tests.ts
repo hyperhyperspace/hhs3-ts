@@ -21,6 +21,8 @@ import {
     resolveRefVersions,
     projectForeignBound,
     validateRefAdvanceMonotonicity,
+    canonicalVersion,
+    validateRefVersionShape,
 } from '../src/refs.js';
 
 function createTestDag(): dag.Dag {
@@ -450,6 +452,26 @@ async function testRefAdvanceMonotonicity() {
     );
 }
 
+async function testCanonicalVersionAndShape(): Promise<void> {
+    const raw = createTestDag();
+    const g = await raw.append({ g: 1 }, {});
+    const a = await raw.append({ a: 1 }, {}, version(g));
+    const b = await raw.append({ b: 1 }, {}, version(a));
+    const c = await raw.append({ c: 1 }, {}, version(a));
+
+    testing.assertTrue(setEq(await canonicalVersion(raw, version(b)), version(b)), 'a singleton is already canonical');
+    testing.assertTrue(setEq(await canonicalVersion(raw, version(a, b)), version(b)), 'a dominated ancestor is dropped');
+    testing.assertTrue(setEq(await canonicalVersion(raw, version(b, c)), version(b, c)), 'an antichain is unchanged');
+
+    const dominated = await validateRefVersionShape(raw, version(a, b));
+    testing.assertFalse(dominated.valid, 'a version carrying a dominated ancestor is rejected');
+    testing.assertTrue(!dominated.valid && dominated.why.reason.includes('antichain'), 'the rejection names the antichain');
+    testing.assertTrue((await validateRefVersionShape(raw, version(b, c))).valid, 'an antichain passes');
+    const empty = await validateRefVersionShape(raw, version());
+    testing.assertFalse(empty.valid, 'an empty version is rejected');
+    testing.assertTrue(!empty.valid && empty.why.reason.includes('empty'), 'the rejection names the empty version');
+}
+
 export const refsSuite = {
     title: '[REFS] Building-block helpers',
     tests: [
@@ -466,5 +488,6 @@ export const refsSuite = {
         { name: '[REFS_07c] resolveRefVersionAtPosition sees through a void ref-advance', invoke: testResolveRefVersionAtPositionSeesThrough },
         { name: '[REFS_08] projectForeignBound bound projection', invoke: testProjectForeignBound },
         { name: '[REFS_09] ref-advance monotonicity validation', invoke: testRefAdvanceMonotonicity },
+        { name: '[REFS_10] canonical version and antichain shape', invoke: testCanonicalVersionAndShape },
     ],
 };

@@ -25,6 +25,10 @@
 // Requires ONE sequential traversal per evaluation: the running stack
 // identifies the reader of each resolve.
 
+import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
+import { position } from "@hyper-hyper-space/hhs3_dag";
+import type { Position } from "@hyper-hyper-space/hhs3_dag";
+
 export type Undecided = { status: 'undecided'; support: ReadonlySet<string> };
 export type Truth = { status: 'true' } | { status: 'false' } | Undecided;
 export type Verdict<R> =
@@ -98,6 +102,31 @@ export async function someTruth<T>(items: Iterable<T>, test: (item: T) => Promis
         if (t.status === 'undecided') support = unite(support, t.support);
     }
     return support === undefined ? FALSE : { status: 'undecided', support };
+}
+
+// One see-through cover walk. Void and undecided matches are seen through, so
+// they cannot mask a live match below. An undecided match counts only when no
+// live member of the cover dominates it.
+export async function seeThroughCover(
+    minimalCover: (p: Position) => Promise<Position>,
+    cover: (accept: (hash: B64Hash) => Promise<boolean>) => Promise<Position>,
+    truthOf: (hash: B64Hash) => Promise<Truth>,
+): Promise<{ live: Position; undecided: Map<B64Hash, Undecided> }> {
+    const met = new Map<B64Hash, Undecided>();
+    const live = await cover(async (hash) => {
+        const truth = await truthOf(hash);
+        if (truth.status === 'undecided') {
+            met.set(hash, truth);
+            return false;
+        }
+        return truth.status === 'true';
+    });
+
+    const undecided = new Map<B64Hash, Undecided>();
+    for (const [hash, truth] of met) {
+        if (live.size === 0 || (await minimalCover(position(...live, hash))).has(hash)) undecided.set(hash, truth);
+    }
+    return { live, undecided };
 }
 
 function unite(into: Set<string> | undefined, more: ReadonlySet<string>): Set<string> {

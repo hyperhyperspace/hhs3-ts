@@ -36,6 +36,12 @@ async function frontier(group: RTableGroupImpl): Promise<Version> {
     return (await group.getScopedDag()).getFrontier();
 }
 
+function samePosition(a: Version, b: Version): boolean {
+    if (a.size !== b.size) return false;
+    for (const hash of a) if (!b.has(hash)) return false;
+    return true;
+}
+
 function schemaName(seed: string): string {
     return seed.replace(/[^a-zA-Z0-9_]+/g, '_') + '_schema';
 }
@@ -340,6 +346,13 @@ export const observedCutTests = {
             },
         },
         {
+            name: '[OCUT12] an item at {f1} widened by a concurrent observe of {f3} above f1 is voided by a later import of a delete concurrent with f3',
+            invoke: async () => {
+                assertFalse(await itemLaterImport('ocut12', 'dominated'),
+                    'the widened cut is the head f3, and the delete is concurrent with f3');
+            },
+        },
+        {
             name: '[OCUT13] a refVersion carrying a dominated ancestor is canonicalized on write and rejected on admission',
             invoke: async () => {
                 const ctx = newCtx();
@@ -371,17 +384,84 @@ export const observedCutTests = {
             },
         },
         {
+            name: '[OCUT16] a foreign table view\'s versions are antichains',
+            invoke: async () => {
+                const ctx = newCtx();
+                const admin = await makeIdentity();
+                const G = await makeUsers(ctx, 'ocut16-g', [admin]);
+                const v0 = await frontier(G);
+                const f1 = await filler(G, v0);
+                const f3 = await filler(G, version(f1));
+
+                const O = await makeGatedApp(ctx, 'ocut16-o', G.getId(), false);
+                const base = await frontier(O);
+                await O.observe(USERS_BINDING, version(f1), undefined, base);
+                await O.observe(USERS_BINDING, version(f3), undefined, base);
+                const merged = await frontier(O);
+
+                const foreign = await O.resolveForeignTableView(USERS_BINDING, IDENTITIES_TABLE, merged, merged);
+                const causal = await G.getCausalDag();
+                const at = foreign!.getVersion();
+                const from = foreign!.getFromVersion();
+                assertTrue(samePosition(at, await causal.findMinimalCover(at)), 'getVersion is an antichain');
+                assertTrue(samePosition(from, await causal.findMinimalCover(from)), 'getFromVersion is an antichain');
+                assertFalse(at.has(f1) || from.has(f1), 'the dominated ancestor is not a head of either version');
+            },
+        },
+        {
+            name: '[OCUT17] two folds of one foreign from share a verdict frame',
+            invoke: async () => {
+                const ctx = newCtx();
+                const admin = await makeIdentity();
+                const person = await makeIdentity();
+                const G = await makeUsers(ctx, 'ocut17-g', [admin]);
+                const v0 = await frontier(G);
+                const f1 = await filler(G, v0);
+                const f3 = await registerIdentity(G, person, undefined, version(f1));
+
+                const O = await makeGatedApp(ctx, 'ocut17-o', G.getId(), false);
+                const base = await frontier(O);
+                await O.observe(USERS_BINDING, version(f1), undefined, base);
+                const later = await O.observe(USERS_BINDING, version(f3), undefined, base);
+                const merged = await frontier(O);
+
+                const wide = await O.resolveForeignTableView(USERS_BINDING, IDENTITIES_TABLE, merged, merged);
+                const narrow = await O.resolveForeignTableView(USERS_BINDING, IDENTITIES_TABLE, merged, version(later));
+                assertTrue(samePosition(wide!.getFromVersion(), narrow!.getFromVersion()),
+                    'a fold of {f1, f3} and a fold of {f3} are the same from');
+                assertTrue(samePosition(wide!.getFromVersion(), version(f3)), 'that from is the later head');
+
+                const rowId = deriveRowId('id-' + person.keyId);
+                assertTrue(await wide!.hasRow(rowId) === await narrow!.hasRow(rowId), 'the two frames agree on the row');
+                assertTrue(await wide!.hasRow(rowId), 'the identity registered at f3 is present');
+            },
+        },
+        {
+            name: '[OCUT15] a folded foreign version drops a dominated ancestor',
+            invoke: async () => {
+                const ctx = newCtx();
+                const admin = await makeIdentity();
+                const G = await makeUsers(ctx, 'ocut15-g', [admin]);
+                const v0 = await frontier(G);
+                const f1 = await filler(G, v0);
+                const f3 = await filler(G, version(f1));
+
+                const O = await makeGatedApp(ctx, 'ocut15-o', G.getId(), false);
+                const base = await frontier(O);
+                await O.observe(USERS_BINDING, version(f1), undefined, base);
+                await O.observe(USERS_BINDING, version(f3), undefined, base);
+
+                const merged = await frontier(O);
+                const resolved = await (await O.getView(merged, merged)).resolveRefVersion(G.getId());
+                assertFalse(resolved.has(f1), 'the dominated ancestor is not in the returned version');
+                assertTrue(resolved.size === 1 && resolved.has(f3), 'the returned version is the later head');
+            },
+        },
+        {
             name: '[OCUT14] an item at {f2, c\'} is voided by a later import of a witness delete that has seen c\' but not f2',
             invoke: async () => {
                 assertFalse(await itemAtMixedCapsCut('ocut14'),
                     'the delete is not after f2, so it is concurrent with the cut and voids the item');
-            },
-        },
-        {
-            name: '[OCUT12] an item at {f1} widened by a concurrent observe of {f3} above f1 is voided by a later import of a delete concurrent with f3',
-            invoke: async () => {
-                assertFalse(await itemLaterImport('ocut12', 'dominated'),
-                    'the widened cut is the head f3, and the delete is concurrent with f3');
             },
         },
     ],

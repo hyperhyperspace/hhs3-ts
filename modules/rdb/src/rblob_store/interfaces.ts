@@ -70,6 +70,7 @@ export interface RBlobStoreView extends View {
 export interface RBlobStore extends RObject {
     getName(): string;
     getGroupId(): B64Hash;
+    resolveObservedGroupVersion(at: Version, from: Version): Promise<Version>;
 
     // A signed ref-advance of the bound group to its local frontier (or `to`),
     // on `lane`.

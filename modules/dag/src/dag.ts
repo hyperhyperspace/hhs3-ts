@@ -33,7 +33,12 @@ export type Dag = {
     // This one is for reading a value at a specific version, by finding the last changes on that value
     findCoverWithFilter(from: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position>;
 
-    // This is useful for finding barrier ops that should be applied to concurrent changes
+    // Barrier ops concurrent with `concurrentTo`, visible from `from`.
+    // An entry is concurrent with a position when it is outside that position's
+    // causal past and not after every head of it: the future of a position is
+    // the intersection of its heads' futures. The result depends only on the
+    // causal past, so a dominated element changes nothing. Nothing is
+    // concurrent with the empty position.
     findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position>;
     
     loadAllEntries(): AsyncIterable<Entry>; // in topo order

@@ -454,7 +454,9 @@ to the observes below it, so a void observe cannot hide a live revoke-import
 a candidate that is not stops the walk, since write-time monotonicity puts
 everything below it at or below its own version. The negation we must enforce — a revoke `Rk(author(y))` that voids
 `y` — rides, under **use-before-revoke** (the revoke is causally *after* the
-published `Vy`), a version `Vz ⊋ Vy`. So every negative edge strictly increases
+published `Vy`), a version `Vz ⊋ Vy`. Step 2 uses the same notion: a revoke is
+after a cut only when it is after every head, so "after `Vy`" and "rides a
+strictly dominating version" are the same fact. So every negative edge strictly increases
 the `G`-version. A cycle would require `V₁ ⊋ V₂ ⊋ … ⊋ V₁`, impossible in a
 strict partial order. Hence the dependency graph is **locally stratified by the
 `G`-version**: a single sweep, evaluated implicitly latest-`G`-version-first by

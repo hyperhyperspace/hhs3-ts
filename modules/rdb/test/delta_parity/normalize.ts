@@ -37,6 +37,13 @@ function assertVersionParity(label: string, bounded: Version, full: Version, ctx
     }
 }
 
+// The bound-only computation skips work the delta does (the row channel, the
+// verdicts of entries that cannot lower the bound), so it must land on the
+// same bound.
+export function assertRevisionBoundParity(boundOnly: Version, delta: RTableGroupDelta, ctx: DeltaParityContext): void {
+    assertVersionParity("revisionBound (computeRevisionBound vs bounded delta)", boundOnly, delta.revisionBound, ctx);
+}
+
 export function assertGroupDeltaParity(
     bounded: RTableGroupDelta, full: RTableGroupDelta, ctx: DeltaParityContext,
 ): void {

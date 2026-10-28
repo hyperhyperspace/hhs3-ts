@@ -15,6 +15,8 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import type { ScopedDag, CausalDag } from "./dag/dag_nesting.js";
 import { version } from "./mvt.js";
 import type { Version } from "./mvt.js";
+import { validationFailure, validationOk } from "./validation.js";
+import type { ValidationResult } from "./validation.js";
 
 export const MAX_REF_ID_LENGTH = 256;
 
@@ -272,6 +274,24 @@ export async function projectForeignBound(
     }
 
     return bound.size > 0 ? bound : localAt;
+}
+
+// The minimal cover of `v` in `dag`. A single head is already canonical.
+export async function canonicalVersion(dag: CausalDag, v: Version): Promise<Version> {
+    if (v.size <= 1) return v;
+    return dag.findMinimalCover(v);
+}
+
+// A ref-advance version must be a non-empty antichain. Missing entries are an
+// infrastructure error (the caller throws), not a validation failure.
+export async function validateRefVersionShape(
+    referencedDag: CausalDag,
+    refVersion: Version,
+): Promise<ValidationResult> {
+    if (refVersion.size === 0) return validationFailure("ref-advance version is empty");
+    const cover = await referencedDag.findMinimalCover(refVersion);
+    if (cover.size !== refVersion.size) return validationFailure("ref-advance version is not an antichain");
+    return validationOk();
 }
 
 // Validates that a proposed ref-advance is monotonic at insertion time. For each

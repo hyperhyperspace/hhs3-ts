@@ -45,7 +45,7 @@ view.getValue(...);
 
 To get a view, we must specify not only the version we want to inspect, but also _from what_ (later) version we want to inspect it. The contents of a view may then be adjusted by updates arriving later on (in the form of non-commutative **barrier ops**). This is naturally captured by the _from_ parameter.
 
-We define `concurrent(to: Version, from: Version)` as the operations in `from` that are concurrent (i.e. not comparable under _happens-before_) with _all_ the operations in `to`.
+We define `concurrent(to: Version, from: Version)` as the operations in `from` that are not in `to` and did not happen after _every_ operation in `to`: an operation is concurrent with a version unless its author had seen all of it. [IDEAL_CONCURRENCY.md](./IDEAL_CONCURRENCY.md) explains this choice and the alternative it replaced.
 
 Finally, we define `getView(at: Version, from: Version)` as the version that contains the union of all the operations in the set `at` and the **barrier operations** in `concurrent(at, from)`. Intuitively, to update the version `at` with anything relevant happening up to `from`, we need to add any barrier ops in `from` that happened concurrently with `at`.
 

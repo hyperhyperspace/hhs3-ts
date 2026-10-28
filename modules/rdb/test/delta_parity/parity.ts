@@ -6,7 +6,7 @@ import type { RTableGroupDelta } from "../../src/rtable_group/delta.js";
 
 import { collectExtendingPairs } from "./checkpoints.js";
 import { PRNG } from "./prng.js";
-import { assertGroupDeltaParity, type DeltaParityContext } from "./normalize.js";
+import { assertGroupDeltaParity, assertRevisionBoundParity, type DeltaParityContext } from "./normalize.js";
 
 export type FuzzProfileName = "smoke" | "extended";
 
@@ -86,6 +86,7 @@ export async function compareGroupDeltaStrategies(
     const bounded = await computeGroupDelta(group, "bounded", start, end);
     const full = await computeGroupDelta(group, "full", start, end);
     assertGroupDeltaParity(bounded, full, ctx);
+    assertRevisionBoundParity(await group.computeRevisionBound(start, end), bounded, ctx);
 }
 
 export type GroupHistory = {
@@ -95,22 +96,25 @@ export type GroupHistory = {
     seed: number;
 };
 
+// A generator returns one history per seed, or several (one per shape).
 export async function runGroupSeedSweep(
-    generate: (seed: number, ops: number) => Promise<GroupHistory>,
+    generate: (seed: number, ops: number) => Promise<GroupHistory | GroupHistory[]>,
     options: ResolvedFuzzSweepOptions,
 ): Promise<void> {
     for (const seed of options.seeds) {
-        const history = await generate(seed, options.ops);
-        const pairs = subsamplePairs(
-            await collectExtendingPairs(history.rawDag, history.checkpoints),
-            seed, options.maxPairs,
-        );
+        const generated = await generate(seed, options.ops);
+        for (const history of Array.isArray(generated) ? generated : [generated]) {
+            const pairs = subsamplePairs(
+                await collectExtendingPairs(history.rawDag, history.checkpoints),
+                seed, options.maxPairs,
+            );
 
-        for (const [, endIdx, start, end] of pairs) {
-            await compareGroupDeltaStrategies(history.group, start, end, { seed, opIndex: endIdx, start, end });
-            process.stdout.write(".");
+            for (const [, endIdx, start, end] of pairs) {
+                await compareGroupDeltaStrategies(history.group, start, end, { seed, opIndex: endIdx, start, end });
+                process.stdout.write(".");
+            }
+
+            process.stdout.write(`\n  seed=${seed} pairs=${pairs.length} (max ${options.maxPairs})\n`);
         }
-
-        process.stdout.write(`\n  seed=${seed} pairs=${pairs.length} (max ${options.maxPairs})\n`);
     }
 }

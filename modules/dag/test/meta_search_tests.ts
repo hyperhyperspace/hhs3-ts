@@ -5,6 +5,7 @@ import { assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 
 import { createRandomDag, createD3 } from "./utils/dag_create.js";
 import { B64Hash, sha256 } from "@hyper-hyper-space/hhs3_crypto";
+import { json } from "@hyper-hyper-space/hhs3_json";
 import { set } from "@hyper-hyper-space/hhs3_util";
 import { label } from "./utils/dag_diagram.js";
 
@@ -85,10 +86,14 @@ const runMetaParity = async (constrs: [() => dag.Dag, () => dag.Dag], options?: 
         }
     }
 
+    const frontier = await dagA.getFrontier();
     const concurrentPairs: Array<[Position, Position]> = [
         [new Set([...branchA, ...branchB]), branchA],
         [new Set([...branchA, ...branchB]), branchB],
-        [await dagA.getFrontier(), branchA],
+        [frontier, branchA],
+        // two heads, and a non-antichain (frontier dominates branchA)
+        [frontier, new Set([...branchA, ...branchB])],
+        [frontier, new Set([...frontier, ...branchA])],
     ];
 
     for (let i = 0; i < filters.length; i++) {
@@ -121,6 +126,21 @@ const runMetaParity = async (constrs: [() => dag.Dag, () => dag.Dag], options?: 
         }
     }
 };
+
+function flatDag(): dag.Dag {
+    const store = new dag.store.MemDagStorage();
+    return dag.create(store, dag.idx.flat.createFlatIndex(store, new dag.idx.flat.mem.MemFlatIndexStore()), sha256);
+}
+
+function topoDag(): dag.Dag {
+    const store = new dag.store.MemDagStorage();
+    return dag.create(store, dag.idx.topo.createDagTopoIndex(store, new dag.idx.topo.mem.MemTopoIndexStore()), sha256);
+}
+
+function levelDag(): dag.Dag {
+    const store = new dag.store.MemDagStorage();
+    return dag.create(store, dag.idx.level.createDagLevelIndex(store, new dag.idx.level.mem.MemLevelIndexStore({ levelFactor: 8 })), sha256);
+}
 
 const topoFlatDagPairConstr: [() => dag.Dag, () => dag.Dag] = [
     () => {
@@ -362,6 +382,78 @@ const metaSearchSuite = {
                     acceptAll
                 );
                 assertTrue(set.eq(concNoPred, concWithPred), "accept-all predicate should match no-predicate for findConcurrentCoverWithFilter");
+            }
+        },
+        {
+            // g -> a -> x, g -> b, m merges a and b. x is after one head of {a, b}.
+            name: "[META_08] ideal concurrency: one head, both heads, dominated element, empty position (small DAGs)",
+            invoke: async () => {
+                const filter: EntryMetaFilter = { containsKeys: ["p1"] };
+                for (const make of [flatDag, topoDag, levelDag]) {
+                    const d = make();
+                    const g = await d.append({ g: 1 }, { p1: json.toSet(["1"]) });
+                    const a = await d.append({ a: 1 }, { p1: json.toSet(["1"]) }, position(g));
+                    const b = await d.append({ b: 1 }, { p1: json.toSet(["1"]) }, position(g));
+                    const x = await d.append({ x: 1 }, { p1: json.toSet(["1"]) }, position(a));
+                    const m = await d.append({ m: 1 }, { p1: json.toSet(["1"]) }, position(a, b));
+                    const from = position(x, m);
+
+                    const aboveOne = await d.findConcurrentCoverWithFilter(from, position(a, b), filter);
+                    assertTrue(set.eq(aboveOne, position(x)), "x is concurrent with {a, b}; m is after both heads");
+
+                    const aboveBoth = await d.findConcurrentCoverWithFilter(position(m), position(a, b), filter);
+                    assertTrue(aboveBoth.size === 0, "from {m}, nothing is concurrent with {a, b}");
+
+                    const withDominated = await d.findConcurrentCoverWithFilter(from, position(g, b), filter);
+                    const withoutDominated = await d.findConcurrentCoverWithFilter(from, position(b), filter);
+                    assertTrue(set.eq(withDominated, withoutDominated), "a dominated element must not change the concurrent cover");
+
+                    const empty = await d.findConcurrentCoverWithFilter(from, position(), filter);
+                    assertTrue(empty.size === 0, "nothing is concurrent with the empty position");
+
+                    // x is outside the past of {b}, so it does not put b after the position.
+                    const outside = await d.findConcurrentCoverWithFilter(position(b), position(x), filter);
+                    assertTrue(set.eq(outside, position(b)), "a head outside the past of from leaves b concurrent with it");
+                }
+            }
+        },
+        {
+            name: "[META_09] concurrent cover depends only on the causal past (small random DAGs)",
+            invoke: async () => {
+                const filter: EntryMetaFilter = { containsKeys: ["bucket"] };
+                for (const seed of [1771, 20261023]) {
+                    const flat = flatDag();
+                    await createRandomDag(flat, seed, 40, { addMeta: true });
+                    const topo = topoDag();
+                    const level = levelDag();
+                    await dag.copy(flat, topo);
+                    await dag.copy(flat, level);
+
+                    const hashes: B64Hash[] = [];
+                    for await (const entry of flat.loadAllEntries()) hashes.push(entry.hash);
+                    const frontier = await flat.getFrontier();
+
+                    for (let i = 0; i < hashes.length; i += 3) {
+                        const raw = position(hashes[i]!, hashes[(i + 1) % hashes.length]!, hashes[(i + 5) % hashes.length]!);
+                        const froms = [
+                            frontier,
+                            position(hashes[i]!),
+                            position(hashes[(i + 2) % hashes.length]!, hashes[(i + 7) % hashes.length]!),
+                        ];
+                        for (const from of froms) {
+                            for (const d of [flat, topo, level]) {
+                                const minimal = await d.findMinimalCover(raw);
+                                const onRaw = await d.findConcurrentCoverWithFilter(from, raw, filter);
+                                const onMin = await d.findConcurrentCoverWithFilter(from, minimal, filter);
+                                assertTrue(set.eq(onRaw, onMin), "concurrent cover must ignore dominated elements");
+                            }
+                            const flatCover = await flat.findConcurrentCoverWithFilter(from, raw, filter);
+                            const topoCover = await topo.findConcurrentCoverWithFilter(from, raw, filter);
+                            const levelCover = await level.findConcurrentCoverWithFilter(from, raw, filter);
+                            assertTrue(set.eq(flatCover, topoCover) && set.eq(flatCover, levelCover), "indexes must agree on a non-antichain position");
+                        }
+                    }
+                }
             }
         }
     ]

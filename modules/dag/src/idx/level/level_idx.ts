@@ -4,6 +4,7 @@ import { checkFilter, EntryMetaFilter, EntryPredicate, ForkPosition, Position } 
 import { DagIndex } from "../../idx/dag_idx.js";
 import { position } from "../../dag.js";
 import { DagStore } from "../../store/index.js";
+import { findConcurrentCoverUsing } from "../concurrent_cover.js";
 
 export * as mem from './level_idx_mem_store.js';
 
@@ -785,94 +786,11 @@ export async function findCoverWithMetaUsingLevelIndex(store: DagStore<any>, ind
 }
 
 export async function findConcurrentCoverWithMetaUsingLevelIndex(store: DagStore<any>, index: LevelIndexStore<any>, from: Position, concurrentTo: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
-    // Create a successor map in forwardMap
-
-    const forwardMap = new MultiMap<B64Hash, B64Hash>();
-
-    let pending = new Set<B64Hash>([...from]);
-    let visited = new Set<B64Hash>();
-
-    while (pending.size > 0) {
-        const n = pending.values().next().value!;
-        pending.delete(n);
-
-        for (const pred of await index.getPreds(0, n)) {
-            forwardMap.add(pred, n);
-
-            if (!visited.has(pred)) {
-                pending.add(pred);
-            }
-        }
-
-        visited.add(n);
-    }
-
-    // Use the forward map to close the concurrentTo set upwards
-
-    pending = new Set<B64Hash>([...concurrentTo]);
-    visited = new Set<B64Hash>();
-
-    const notConcurrentTo = new Set<B64Hash>([...concurrentTo]);
-
-    while (pending.size > 0) {
-        const n = pending.values().next().value!;
-        pending.delete(n);
-
-        for (const succ of forwardMap.get(n) || []) {
-            if (!visited.has(succ)) {
-                pending.add(succ);
-                notConcurrentTo.add(succ);
-            }
-        }
-
-        visited.add(n);
-    }
-
-    // And the backwards map to close the concurrentTo set downwards
-
-    pending = new Set<B64Hash>([...concurrentTo]);
-    visited = new Set<B64Hash>();
-
-    while (pending.size > 0) {
-        const n = pending.values().next().value!;
-        pending.delete(n);
-
-        for (const pred of await index.getPreds(0, n)) {
-            if (!visited.has(pred)) {
-                pending.add(pred);
-                notConcurrentTo.add(pred);
-            }
-        }
-
-        visited.add(n);
-    }
-
-    // Do a search for a pre cover, starting at the "from" position backwards, ignoring the nodes in notConcurrentTo
-
-    pending = new Set<B64Hash>([...from]);
-    visited = new Set<B64Hash>();
-
-    const preConcCover = new Set<B64Hash>();
-
-    while (pending.size > 0) {
-        const n = pending.values().next().value!;
-        pending.delete(n);
-
-        const entry = (await store.loadEntry(n))!;
-        if (!notConcurrentTo.has(n) && checkFilter(entry.meta, meta) && (!predicate || await predicate(n, entry))) {
-            preConcCover.add(n);
-        } else {
-            for (const pred of await index.getPreds(0, n)) {
-                if (!visited.has(pred)) {
-                    pending.add(pred);
-                }
-            }
-        }
-
-        visited.add(n);
-    }
-
-    return findMinimalCoverUsingLevelIndex(index, preConcCover);
+    return findConcurrentCoverUsing({
+        getPreds: (n) => index.getPreds(0, n),
+        loadEntry: (n) => store.loadEntry(n),
+        minimalCover: (p) => findMinimalCoverUsingLevelIndex(index, p),
+    }, from, concurrentTo, meta, predicate);
 }
 
 export function createDagLevelIndex<Tx = void>(store: DagStore<Tx>, index: LevelIndexStore<Tx>): DagIndex<Tx> {

@@ -1,5 +1,8 @@
 import { resolveFuzzSweepOptions, runGroupSeedSweep } from "./parity.js";
-import { generateSingleGroupHistory, generateCrossGroupHistory } from "./generate.js";
+import {
+    generateSingleGroupHistory, generateCrossGroupHistory,
+    generateGatedGroupHistory, generateGatedCrossGroupHistory, generateShapedHistories,
+} from "./generate.js";
 
 export const groupDeltaParityTests = {
     title: "[DELTA_PARITY] RTableGroup computeDelta parity (bounded vs full)",
@@ -16,6 +19,27 @@ export const groupDeltaParityTests = {
             invoke: async () => {
                 const options = resolveFuzzSweepOptions(process.argv.slice(2));
                 await runGroupSeedSweep(generateCrossGroupHistory, options);
+            },
+        },
+        {
+            name: "[DELTA_PARITY_GATED] bounded and full computeDelta agree on gated deletes, honor toggles and FK adoption (single group)",
+            invoke: async () => {
+                const options = resolveFuzzSweepOptions(process.argv.slice(2));
+                await runGroupSeedSweep(generateGatedGroupHistory, options);
+            },
+        },
+        {
+            name: "[DELTA_PARITY_GATED_XGROUP] bounded and full computeDelta agree when observing a gated foreign group, including older foreign versions",
+            invoke: async () => {
+                const options = resolveFuzzSweepOptions(process.argv.slice(2));
+                await runGroupSeedSweep(generateGatedCrossGroupHistory, options);
+            },
+        },
+        {
+            name: "[DELTA_PARITY_SHAPED] bounded and full computeDelta agree on the counterexample skeleton with randomized barriers",
+            invoke: async () => {
+                const options = resolveFuzzSweepOptions(process.argv.slice(2));
+                await runGroupSeedSweep(generateShapedHistories, options);
             },
         },
     ],

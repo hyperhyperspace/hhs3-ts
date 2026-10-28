@@ -13,6 +13,15 @@ import type { DeltaAccumulator, DeltaChanges, RObject, Version } from "./mvt.js"
 
 // Greatest lower bound (meet) of fork.common. Folding over common directly (not an
 // antichain) is correct: dominated elements never lower the GLB.
+//
+// FIXME: computeMeet is a left fold, not a meet operation. The binary step is an
+// argument, and the step passed here is findForkPosition with every field but
+// commonFrontier discarded, so the fork is standing in for the meet. The hashes
+// being folded are fork.common from findForkPosition(start, end), which puts the
+// same query on both sides of the call. The result is a different cut from that
+// outer commonFrontier: the frontier of the intersection of the principal histories
+// of the attachment points, not the frontier of H(start). Make this readable. Do not
+// replace it with the outer fork's commonFrontier.
 export async function computeForkMeet(
     rawDag: dag.Dag, forkCommon: Iterable<B64Hash>,
 ): Promise<Version> {
@@ -56,8 +65,7 @@ export async function walkEntriesBackwardsToBound(
 // on the raw causal DAG and feeds each into the root accumulator, then returns the
 // finalized changes tree. Routing to nested children, unwrapping, and assembling the
 // nested subtree all live inside the accumulator, so this helper knows nothing about
-// nesting. `start` is plumbed for a future tight change-driven bound (see note below); it
-// is unused here.
+// nesting. `start` is unused here.
 export async function walkDelta(
     rawDag: dag.Dag,
     start: Version,
@@ -72,32 +80,24 @@ export async function walkDelta(
     return rootAcc.finalize();
 }
 
-// On the reported revision bound, and a deliberately-deferred tightening.
+// On the reported revision bound.
 //
-// We report the geometric meet (fork GLB, via computeForkMeet / computeObserverRevisionBound)
-// as the revision bound. Its appeal is conceptual: "below the fork GLB the two branches are
-// identical, so any resolution agrees" is a single, type-agnostic invariant that needs no
-// knowledge of barriers, authorization, or BFT revision. It is provably safe for any object.
+// These helpers report the geometric meet (fork GLB, via computeForkMeet /
+// computeObserverRevisionBound) as the revision bound: "below the fork GLB the two branches
+// are identical" is a type-agnostic invariant that needs no knowledge of barriers. It is not
+// enough for a type whose verdicts read barriers across branches. An old barrier on a side
+// branch of `start` can be concurrent with an entry below the meet, and a new entry can
+// change that barrier's effect, so the entry's verdict changes without being walked
+// (rdb/INCREMENTAL_DELTA_BOUND.md). Walking from `end` and stopping only at the bound's
+// heads (walkEntriesBackwardsToBound) sometimes reaches such an entry anyway, through the
+// whole past of a side branch's attachment point; that over-walk is not a guarantee.
 //
-// A tighter bound is possible: walk in reverse-topological order and track an antichain of
-// the deepest entries whose ingest reported an actual change at or below `start` (the
-// `changed` boolean ingest already returns is the hook; `start` above is the gate). That
-// "change-driven frontier" generally sits above the meet and falls back to `start` when
-// nothing changed.
-//
-// The hard part is composing it across a reference (observer -> observed, e.g. permissioned
-// RSet -> RCap). computeObserverRevisionBound projects the observed object's bound into the
-// observer DAG; the tight bound is NOT safe to project in general. The reason is BFT
-// concurrent-barrier widening: an observer's per-entry authorization check resolves the
-// observed object at (at = the entry, from = the view horizon), so for the end view a
-// sub-`start` entry E is resolved with from = end. A ref-advance barrier introduced in the
-// observer's (start, end) interval that is concurrent to E can flip E's authorization. Such
-// a "flipped barrier" can void an entry sitting between the meet and the tight frontier, so
-// only the geometric meet is deep enough to be safe to project. Tightening would be safe
-// precisely when there is no flipped barrier in the interval (then resolution is monotone
-// and the tight bound composes); otherwise the safe floor is the meet over just the flipped
-// barriers. We defer all of this: nothing consumes a tighter bound yet, and it would entangle
-// type-specific authorization/barrier semantics into what is currently pure DAG geometry.
+// RTableGroup computes its own bound in rdb (rtable_group/delta.ts): one walk that stops at
+// the exit border of the bound's history and lowers the bound below every barrier of
+// `start` concurrent with it whose effect changed. An observed object's bound there is taken
+// between the versions observed at `start` and at `end`, not at the meet: a bound driven by
+// what changed is only sound for the exact pair of versions it compared. RSet and RCap still
+// use the helpers here.
 
 // Compute the observer's revision bound when a referenced object can revise state
 // below the fork meet. `observerMeet` is the fork meet on the observer (input, not the

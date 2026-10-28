@@ -863,5 +863,58 @@ export const rtableDeployTests = {
                     'concurrent deploy tightening :max_qty to 5 voids the concurrent insert of qty = 15');
             }
         },
+        {
+            name: '[DEPLOY20] a deploy after one head revises the schema at the two-head frontier',
+            invoke: async () => {
+                const { group, schema, admin } = await createEnv([
+                    open('items', { name: { type: 'string' } }),
+                ]);
+                const items = await group.getTable('items');
+                const base = await groupFrontier(group);
+                const a = await items.insert('a-1', { name: 'a' }, undefined, base);
+                const b = await items.insert('b-1', { name: 'b' }, undefined, base);
+
+                await schema.updateSchema([{
+                    rule: 'add-table',
+                    def: open('notes', { body: { type: 'string' } }),
+                }], admin);
+                const d = await group.deploy(await schemaFrontier(schema), undefined, version(a));
+
+                const schemaView = (await group.getView(version(a, b), version(d, b))).getSchemaView();
+                assertTrue(schemaView.hasTable('notes'),
+                    'the deploy is not after the other head, so it revises the schema at the frontier');
+            }
+        },
+        {
+            name: '[DEPLOY21] a deploy carrying a dominated ancestor is rejected, and a written deploy is canonical',
+            invoke: async () => {
+                const { group, schema, admin } = await createEnv([
+                    open('items', { name: { type: 'string' } }),
+                ]);
+                const pinned = await schemaFrontier(schema);
+                await schema.updateSchema([{
+                    rule: 'add-table',
+                    def: open('notes', { body: { type: 'string' } }),
+                }], admin);
+                const head = await schemaFrontier(schema);
+                const at = await groupFrontier(group);
+
+                const dominated = version(...pinned, ...head);
+                const raw = {
+                    ...(createRefAdvancePayload(schema.getId(), dominated) as unknown as json.LiteralMap),
+                    gate: json.toSet(await group.computeGateHashes(dominated)),
+                };
+                const rejected = await group.validatePayload(raw, at);
+                const why = rejected.valid ? 'valid' : formatValidationFailure(rejected.why);
+                assertTrue(!rejected.valid && why.includes('not an antichain'),
+                    `a deploy whose version carries the pinned genesis below its head is rejected, got: ${why}`);
+
+                await group.deploy(version(...pinned, ...head));
+                const resolved = await group.resolveSchemaVersion(await groupFrontier(group));
+                assertTrue(!resolved.has(schema.getId()), 'the canonical schema version drops the genesis below the deploy');
+                const shown = (await group.getView()).getSchemaView().getVersion();
+                assertTrue(!shown.has(schema.getId()), 'the group view reports that canonical version');
+            }
+        },
     ],
 };

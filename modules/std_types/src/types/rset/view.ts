@@ -1,7 +1,7 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { EntryPredicate } from "@hyper-hyper-space/hhs3_dag";
-import { version, Version, RObject, resolveRefVersionAtPosition, resolveRefVersions, canonicalVersion, ScopedDag } from "@hyper-hyper-space/hhs3_mvt";
+import { Version, RObject, resolveRefVersionAtPosition, resolveRefVersions, canonicalVersion, ScopedDag } from "@hyper-hyper-space/hhs3_mvt";
 
 import { isAuthoredPayload, extractAuthor } from "../../authorship.js";
 

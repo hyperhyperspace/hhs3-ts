@@ -10,9 +10,9 @@
 // within the same column incarnation. What is left are effects of row-ops
 // (including the deletes a schema deploy carries for the rows stranded by an
 // FK it adopts, read from its meta like a delete's identity tags) and at-use
-// voiding-verdict flips, which sit above the combined revision bound
-// (at-use semantics make this floor exact: a causal-past schema/target can no
-// longer revise an old row), and writes under a new incarnation. Schema
+// voiding-verdict flips, which the group's bounded walk reaches (its bound
+// drops below every old barrier whose effect changed between the horizons;
+// see ../rtable_group/delta.ts), and writes under a new incarnation. Schema
 // defaults and table/column drops and re-adds are UNIFORM and never enumerated
 // here: liveness and written values are incarnation-scoped, so a drop or reset
 // changes every old row of the table, walked or not. They live in the group's

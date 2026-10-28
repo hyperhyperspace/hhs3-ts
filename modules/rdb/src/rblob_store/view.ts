@@ -2,7 +2,7 @@
 // (RBlobStore.readFile), so the view only resolves the bound group it observes.
 
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { resolveRefVersionAtPosition, Version } from "@hyper-hyper-space/hhs3_mvt";
+import { Version } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RBlobStore, RBlobStoreView } from "./interfaces.js";
 
@@ -20,6 +20,6 @@ export class RBlobStoreViewImpl implements RBlobStoreView {
 
     async resolveRefVersion(refId: B64Hash): Promise<Version> {
         if (refId !== this.target.getGroupId()) throw new Error(`Unknown reference: ${refId}`);
-        return resolveRefVersionAtPosition(await this.target.getScopedDag(), refId, this.at, this.from);
+        return this.target.resolveObservedGroupVersion(this.at, this.from);
     }
 }

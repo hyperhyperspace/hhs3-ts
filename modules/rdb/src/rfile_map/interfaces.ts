@@ -24,6 +24,7 @@ export interface RFileMapView extends View {
 export interface RFileMap extends RObject {
     getName(): string;
     getGroupId(): B64Hash;
+    resolveObservedGroupVersion(at: Version, from: Version): Promise<Version>;
     getBlobStoreId(): B64Hash;
 
     // Signed writes at the frontier. Each first appends a ref-advance when the

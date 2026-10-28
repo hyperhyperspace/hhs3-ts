@@ -55,7 +55,8 @@ import {
     validationFailure, validationOk, ValidationResult, wrapValidationFailure,
 } from "@hyper-hyper-space/hhs3_mvt";
 import {
-    isRefAdvancePayload, extractRefVersion, validateRefAdvanceMonotonicity, refVersionAtOrAbove,
+    isRefAdvancePayload, extractRefVersion, validateRefAdvanceMonotonicity, validateRefVersionShape,
+    canonicalVersion, refVersionAtOrAbove,
     extractAuthor, verifyPayloadSignature, deserializePublicKeyFromBase64, computeKeyId,
 } from "@hyper-hyper-space/hhs3_mvt";
 import type { RefAdvancePayload, SigningScope } from "@hyper-hyper-space/hhs3_mvt";
@@ -570,6 +571,8 @@ async function validateRefAdvance(payload: RefAdvancePayload, group: GroupOpHost
 
     const foreignCausalDag = await group.getForeignGroupCausalDag(payload.refId);
     const newRefVersion = extractRefVersion(payload);
+    const shape = await validateRefVersionShape(foreignCausalDag, newRefVersion);
+    if (!shape.valid) return shape;
     const groupDag = await group.getScopedDag();
     if (!await validateRefAdvanceMonotonicity(groupDag, foreignCausalDag, payload.refId, newRefVersion, at)) {
         return validationFailure(`ref-advance for bound group '${payload.refId}' is not monotonic`);
@@ -675,6 +678,9 @@ async function validateDeploy(payload: RefAdvancePayload, group: GroupOpHost, at
     const schema = await group.getSchemaObject();
     const schemaCausalDag = await schema.getCausalDag();
 
+    const shape = await validateRefVersionShape(schemaCausalDag, newRefVersion);
+    if (!shape.valid) return shape;
+
     // never deploy below the pinned genesis version
     if (!await refVersionAtOrAbove(schemaCausalDag, newRefVersion, group.getPinnedSchemaVersion())) {
         return validationFailure("schema deploy is below the pinned schema version");
@@ -687,7 +693,8 @@ async function validateDeploy(payload: RefAdvancePayload, group: GroupOpHost, at
 
     const newVersion = version(...group.getPinnedSchemaVersion());
     for (const hash of newRefVersion) newVersion.add(hash);
-    const newSchema = await schema.getView(newVersion, newVersion);
+    const canonicalNew = await canonicalVersion(schemaCausalDag, newVersion);
+    const newSchema = await schema.getView(canonicalNew, canonicalNew);
 
     const deployParams = p['params'] as { [name: string]: json.Literal } | undefined;
     if (deployParams !== undefined) {
@@ -705,10 +712,8 @@ async function validateDeploy(payload: RefAdvancePayload, group: GroupOpHost, at
             }
         }
         const currentVersion = await group.resolveSchemaVersion(at, at);
-        const schemaScopedDag = await schema.getScopedDag();
-        const currentCover = await schemaScopedDag.findMinimalCover(currentVersion);
-        const targetCover = await schemaScopedDag.findMinimalCover(newVersion);
-        if ([...currentCover].sort().join(',') === [...targetCover].sort().join(',')) {
+        const same = currentVersion.size === canonicalNew.size && [...currentVersion].every((h) => canonicalNew.has(h));
+        if (same) {
             return validationFailure("a schema deploy carrying params must advance the schema version");
         }
     }

@@ -558,7 +558,7 @@ export const rcapTests = {
             }
         },
         {
-            name: '[CAP18] Candidate-based delete barriers only void concurrent capability origins',
+            name: '[CAP18] a delete-cap concurrent with `at` and visible from `from` makes the capability absent',
             invoke: async () => {
                 const { cap, admin } = await createTestEnv();
 
@@ -1123,6 +1123,33 @@ export const rcapTests = {
                 const view = await cap.getView();
                 assertFalse(await view.hasCapability(alice.keyId, 'coadmin'),
                     'the creator revoke is live in the cover and the ring grant does not dominate it');
+            }
+        },
+        {
+            name: '[CAP44] an undecided grant that dominates a live revoke keeps the slot open until it resolves',
+            invoke: async () => {
+                const { cap, admin } = await createTestEnv({
+                    extraCaps: { coadmin: { managedBy: ['coadmin'] } },
+                });
+                const m1 = await makeIdentity();
+                const m2 = await makeIdentity();
+                const alice = await makeIdentity();
+                for (const id of [m1, m2, alice]) {
+                    await cap.addIdentity(id.keyId, serializePublicKeyToBase64(id.publicKey), admin);
+                }
+                await cap.grant(m1.keyId, 'coadmin', admin);
+                await cap.grant(m2.keyId, 'coadmin', admin);
+                await cap.grant(alice.keyId, 'coadmin', admin);
+
+                const base = await (await cap.getScopedDag()).getFrontier();
+                const revoked = await cap.revoke(alice.keyId, 'coadmin', admin, base);
+                await cap.grant(alice.keyId, 'coadmin', m1, version(revoked));
+                await cap.revoke(m2.keyId, 'coadmin', m1, base);
+                await cap.revoke(m1.keyId, 'coadmin', m2, base);
+
+                const view = await cap.getView();
+                assertTrue(await view.hasCapability(alice.keyId, 'coadmin'),
+                    'the ring is void, so m1 keeps coadmin and the re-grant above the creator revoke holds');
             }
         },
         {

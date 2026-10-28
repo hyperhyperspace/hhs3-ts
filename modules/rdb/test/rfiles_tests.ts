@@ -5,7 +5,8 @@ import {
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import {
-    formatValidationFailure, resolveRefVersionAtPosition, signPayload, ValidationRejectedError, Version, version,
+    formatValidationFailure, resolveRefVersionAtPosition, signPayload, createRefAdvancePayload, extractRefVersion,
+    ValidationRejectedError, Version, version,
 } from "@hyper-hyper-space/hhs3_mvt";
 import type { RContext } from "@hyper-hyper-space/hhs3_mvt";
 
@@ -432,6 +433,22 @@ export const rfilesTests = {
                 await expectRejected(() => f.map.refAdvance(writer, v1), 'not monotonic', 'a map ref-advance may not go back');
                 await f.store.refAdvance(writer, 1, v1);   // lane 1 still observes genesis
 
+                const dominated = version(...v1, ...v2);
+                const storeAt = await frontierOf(f.store);
+                const storePayload = await signPayload(
+                    { ...createRefAdvancePayload(f.group.getId(), dominated), lane: 0 } as json.LiteralMap,
+                    writer, storeAt,
+                );
+                await expectInvalid(f.store, storePayload, storeAt, 'not an antichain', 'a store ref-advance carrying a dominated ancestor');
+                const mapAt = await frontierOf(f.map);
+                const mapPayload = await signPayload(createRefAdvancePayload(f.group.getId(), dominated) as json.LiteralMap, writer, mapAt);
+                await expectInvalid(f.map, mapPayload, mapAt, 'not an antichain', 'a map ref-advance carrying a dominated ancestor');
+
+                const stored = await f.store.refAdvance(writer, 2, dominated);
+                const entry = await (await f.store.getScopedDag()).loadEntry(stored);
+                assertTrue(sameSet(extractRefVersion(entry!.payload as never), v2),
+                    'the writer publishes the minimal cover, not the dominated ancestor');
+
                 const missing = contentHash('missing');
                 const failure = await failureOf(() => f.store.refAdvance(writer, 2, version(missing)));
                 assertTrue(failure !== undefined && failure.includes('is not present in the replica'),
@@ -695,8 +712,58 @@ export const rfilesTests = {
                 assertTrue((await f.store.validatePayload(header, headerAt)).valid, 'a store header by a genesis-admitted key needs no ref-advance');
             }
         },
+        {
+            name: '[FILES15] a blob store view drops a dominated ancestor from the observed group version',
+            invoke: async () => {
+                const f = await setup('files15');
+                const { writer, f1, f3 } = await orderedGroupHeads(f);
+                await f.store.refAdvance(writer, 0, version(f1));
+                await f.store.refAdvance(writer, 1, version(f3));
+                const merged = await frontierOf(f.store);
+                const resolved = await (await f.store.getView(merged, merged)).resolveRefVersion(f.group.getId());
+                assertFalse(resolved.has(f1), 'the dominated ancestor is not in the store view version');
+                assertTrue(resolved.size === 1 && resolved.has(f3), 'the store view version is the later head');
+            }
+        },
+        {
+            name: '[FILES16] a file map view drops a dominated ancestor from the observed group version',
+            invoke: async () => {
+                const f = await setup('files16');
+                const { writer, f1, f3 } = await orderedGroupHeads(f);
+                const at = await frontierOf(f.map);
+                const earlier = await signPayload(createRefAdvancePayload(f.group.getId(), version(f1)) as json.LiteralMap, writer, at);
+                const later = await signPayload(createRefAdvancePayload(f.group.getId(), version(f3)) as json.LiteralMap, writer, at);
+                await f.map.applyPayload(earlier, at);
+                await f.map.applyPayload(later, at);
+                const merged = await frontierOf(f.map);
+                const resolved = await (await f.map.getView(merged, merged)).resolveRefVersion(f.group.getId());
+                assertFalse(resolved.has(f1), 'the dominated ancestor is not in the file map view version');
+                assertTrue(resolved.size === 1 && resolved.has(f3), 'the file map view version is the later head');
+            }
+        },
+        {
+            name: '[FILES17] file access drops a dominated ancestor from the observed group version',
+            invoke: async () => {
+                const f = await setup('files17');
+                const { writer, f1, f3 } = await orderedGroupHeads(f);
+                await f.store.refAdvance(writer, 0, version(f1));
+                await f.store.refAdvance(writer, 1, version(f3));
+                const dag = await f.store.getScopedDag();
+                const merged = await frontierOf(f.store);
+                const resolved = await f.store.access.resolveObserved(dag, merged, merged);
+                assertFalse(resolved.has(f1), 'the dominated ancestor is not in the access version');
+                assertTrue(resolved.size === 1 && resolved.has(f3), 'the access version is the later head');
+            }
+        },
     ],
 };
+
+async function orderedGroupHeads(f: Fixture): Promise<{ writer: OwnIdentity; f1: B64Hash; f3: B64Hash }> {
+    const writer = await addWriter(f);
+    const f1 = await registerIdentity(f.group, await makeIdentity());
+    const f3 = await registerIdentity(f.group, await makeIdentity(), undefined, version(f1));
+    return { writer, f1, f3 };
+}
 
 async function chainHeader(store: RBlobStoreImpl, header: B64Hash): Promise<FileHeaderPayload> {
     return (await (await store.getScopedDag()).loadEntry(header))!.payload as unknown as FileHeaderPayload;

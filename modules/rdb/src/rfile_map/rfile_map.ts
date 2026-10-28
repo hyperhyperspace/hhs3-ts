@@ -20,7 +20,7 @@ import { dag, MetaProps, position } from "@hyper-hyper-space/hhs3_dag";
 import {
     Payload, RObjectFactory, RContext, LoadObjectOptions, Version, version, ForeignDep,
     formatValidationFailure, ValidationRejectedError, ValidationResult,
-    createRefAdvancePayload, createRefAdvanceMeta, signPayload,
+    createRefAdvancePayload, createRefAdvanceMeta, signPayload, canonicalVersion,
 } from "@hyper-hyper-space/hhs3_mvt";
 import { RootScopedDag, ScopedDag, CausalDag, ScopedDagSubscription } from "@hyper-hyper-space/hhs3_mvt";
 
@@ -118,6 +118,10 @@ export class RFileMapImpl implements RFileMapContract {
     getBackendLabel(): string { return this.backendLabel; }
     getName(): string { return this.createOp.name; }
     getGroupId(): B64Hash { return this.access.groupId; }
+
+    async resolveObservedGroupVersion(at: Version, from: Version): Promise<Version> {
+        return this.access.resolveObserved(await this.getScopedDag(), at, from);
+    }
     getBlobStoreId(): B64Hash { return this.createOp.blobStore; }
 
     private selfValidate(): boolean {
@@ -143,7 +147,8 @@ export class RFileMapImpl implements RFileMapContract {
     }
 
     async refAdvance(author: OwnIdentity, to?: Version): Promise<B64Hash> {
-        const target = to ?? await this.groupFrontier();
+        const group = await this.access.loadGroup();
+        const target = await canonicalVersion(await group.getCausalDag(), to ?? await this.groupFrontier());
         const at = await (await this.getScopedDag()).getFrontier();
         const base = createRefAdvancePayload(this.access.groupId, target) as unknown as json.LiteralMap;
         return this.appendValidated(await signPayload(base, author, at), at);

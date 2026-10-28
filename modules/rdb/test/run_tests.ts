@@ -30,6 +30,7 @@ import { rdbSyncTests } from "./rdb_sync_tests.js";
 import { rdbFullSyncTests } from "./rdb_full_sync_tests.js";
 import { usersPeerTests } from "./users_peer_tests.js";
 import { opDeltaTests } from "./op_delta_tests.js";
+import { deltaBoundTests } from "./delta_bound_tests.js";
 import { groupDeltaParityTests } from "./delta_parity/group_parity_tests.js";
 import { phase1RegressionTests } from "./phase1_regressions.js";
 import { parseTestFilters } from "./delta_parity/parity.js";
@@ -70,6 +71,7 @@ async function main() {
     allTests.set(rdbFullSyncTests.title, rdbFullSyncTests.tests);
     allTests.set(usersPeerTests.title, usersPeerTests.tests);
     allTests.set(opDeltaTests.title, opDeltaTests.tests);
+    allTests.set(deltaBoundTests.title, deltaBoundTests.tests);
     allTests.set(groupDeltaParityTests.title, groupDeltaParityTests.tests);
     allTests.set(phase1RegressionTests.title, phase1RegressionTests.tests);
 

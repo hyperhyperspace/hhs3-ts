@@ -63,13 +63,17 @@ decomposition.
 
 ## Why B1 / B2 dissolve
 
-RCap's two see-through barriers disambiguate concurrent grant-vs-revoke **on a
-shared mutable key**:
+RCap decides a `(cap, grantee)` slot with the same two checks as a row. The
+see-through cover at `at` holds no live revoke, and no live revoke is concurrent
+with `at` (outside its past and not after every head) and visible from `from`.
+The old grant-anchored search is gone: under that concurrency rule it fires
+exactly when the use-anchored check already does.
 
-- **B2 (use-anchored):** a revoke concurrent with the whole use point.
-- **B1 (grant-anchored):** the concurrent-conflict tiebreak — when a grant and a
-  revoke of the same key are mutually concurrent, **revoke wins**, even if the
-  revoke is not concurrent with the entire (collapsed) use frontier.
+The checks used to be split:
+
+- **B2 (use-anchored):** a revoke concurrent with the use point.
+- **B1 (grant-anchored):** a revoke concurrent with the authorizing grant, which
+  caught a revoke after only some heads of the use point.
 
 Under the write-once-witness encoding there is no shared key to disambiguate —
 each grant is its own existential witness and "holds" is a disjunction over live
@@ -78,15 +82,15 @@ witnesses — so the cases map to plain liveness:
 | RCap case | Rdb mechanism |
 | --- | --- |
 | B1: revoke concurrent with the grant, but in `past(use)` | the revoke is a **permanent delete in `past(use)`** → the witness is simply dead at the use point. No tiebreak rule. |
-| B2: revoke concurrent with the whole use | **`concurrentDeletes: true`** on the caps table → the barrier delete voids the witness at concurrent uses (proven by `[ENF07/08/09]`). Deletes are always barrier-tagged; this flag is resolved **at-use, at the delete's own position** (observed from the view `from`), and is the sole authority on whether the barrier is honored, so a flip concurrent with the delete still applies and B2 reach can even be enabled by a concurrent deploy (`[DEPLOY06]`). |
+| B2: revoke concurrent with the use (not after every head) | **`concurrentDeletes: true`** on the caps table → the barrier delete voids the witness at concurrent uses (proven by `[ENF07/08/09]`). Deletes are always barrier-tagged; this flag is resolved **at-use, at the delete's own position** (observed from the view `from`), and is the sole authority on whether the barrier is honored, so a flip concurrent with the delete still applies and B2 reach can even be enabled by a concurrent deploy (`[DEPLOY06]`). |
 | re-grant after revoke | a **new witness row** (fresh uuid); "holds" = ∃ any live witness. |
 | revoke the definition cascades to its grants | an **FK** from grant row → definition row → at-use op-voiding: a concurrent revoke of the definition voids the dependent grant at the merge; a causally-later one is inert. |
 | creator roots | genesis `initialRows` (fiat, irrevocable). |
 
-B1 in particular reduces to "a permanent/barrier delete kills that witness,"
-which liveness already does. The B1/B2 distinction exists only to arbitrate
-interleaved ops on a mutable relation; with immutable witnesses there is nothing
-to arbitrate, so it has no Rdb counterpart.
+The grant-anchored walk has no Rdb counterpart. A permanent delete in the past
+of the use kills that witness, and a delete concurrent with the use (not after
+every head) is the barrier. With immutable witnesses there is no shared key to
+arbitrate.
 
 ## Design constraints (not RCap gaps)
 

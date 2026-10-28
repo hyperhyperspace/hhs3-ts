@@ -132,7 +132,7 @@ export async function catalogStatus(rdb: RDbImpl): Promise<CatalogStatus> {
             const group = groupObj as RTableGroupImpl;
             const schema = schemaObj as RSchema;
             const frontier = await (await group.getScopedDag()).getFrontier();
-            const current = [...await (await schema.getScopedDag()).findMinimalCover(await group.resolveSchemaVersion(frontier))].sort();
+            const current = [...await group.resolveSchemaVersion(frontier)].sort();
             entry.present = true;
             entry.current = current;
 

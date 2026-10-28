@@ -2,7 +2,7 @@ import { assertTrue, assertFalse, assertEquals } from "@hyper-hyper-space/hhs3_u
 import { HASH_SHA256, createBasicCrypto, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { formatValidationFailure, version } from "@hyper-hyper-space/hhs3_mvt";
+import { formatValidationFailure, version, createRefAdvancePayload, extractRefVersion, refVersionAtOrAbove } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
 import { RCap, rCapFactory } from "../src/types/rcap/rcap.js";
@@ -758,11 +758,13 @@ export const permissionedSetTests = {
                     assertTrue(revisedRef.has(h), 'revised ref version should contain capV2 hash ' + h);
                 }
 
-                // The revised version should be a strict superset of the unrevised
-                assertTrue(revisedRef.size > unrevisedRef.size, 'revised ref version should be strictly larger than unrevised');
-                for (const h of unrevisedRef) {
-                    assertTrue(revisedRef.has(h), 'revised ref version should contain all unrevised hashes');
-                }
+                // Canonical: the revised cut drops heads the new version dominates, so it
+                // need not have more elements. It is strictly above the unrevised cut.
+                const capDag = await cap.getCausalDag();
+                assertTrue(await refVersionAtOrAbove(capDag, revisedRef, unrevisedRef),
+                    'revised ref version is at or above the unrevised one');
+                assertFalse(await refVersionAtOrAbove(capDag, unrevisedRef, revisedRef),
+                    'revised ref version is strictly above the unrevised one');
             }
         },
         {
@@ -900,6 +902,28 @@ export const permissionedSetTests = {
                 assertFalse(rewrapped.valid, 'the stored add re-wrapped for element B should not validate');
                 assertTrue(!rewrapped.valid && formatValidationFailure(rewrapped.why).includes('signature'),
                     'the re-wrapped add should fail signature verification');
+            }
+        },
+        {
+            name: '[PSET29] a ref-advance version with a dominated ancestor is canonicalized on write and rejected on admission',
+            invoke: async () => {
+                const { cap, rset, admin } = await createTestEnv();
+                const alice = await makeIdentity();
+                const bob = await makeIdentity();
+                const a = await cap.addIdentity(alice.keyId, serializePublicKeyToBase64(alice.publicKey), admin);
+                const b = await cap.addIdentity(bob.keyId, serializePublicKeyToBase64(bob.publicKey), admin, version(a));
+
+                const at = await (await rset.getScopedDag()).getFrontier();
+                const raw = await signPayload(
+                    createRefAdvancePayload(cap.getId(), version(a, b)) as unknown as json.LiteralMap, admin, at,
+                );
+                const rejected = await rset.validatePayload(raw, at);
+                assertTrue(!rejected.valid && formatValidationFailure(rejected.why).includes('not an antichain'),
+                    'a ref-advance carrying a dominated ancestor is rejected');
+
+                const written = await rset.refAdvance(version(a, b), admin, at);
+                const stored = extractRefVersion((await (await rset.getScopedDag()).loadEntry(written))!.payload as never);
+                assertTrue(stored.size === 1 && stored.has(b), 'the writer publishes the minimal cover');
             }
         },
     ]

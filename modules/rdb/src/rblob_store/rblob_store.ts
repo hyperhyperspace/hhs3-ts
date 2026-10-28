@@ -25,7 +25,7 @@ import { dag, MetaProps, position } from "@hyper-hyper-space/hhs3_dag";
 import {
     Payload, RObjectFactory, RContext, LoadObjectOptions, Version, version, ForeignDep,
     formatValidationFailure, ValidationRejectedError, ValidationResult,
-    createRefAdvancePayload, createRefAdvanceMeta, signPayload,
+    createRefAdvancePayload, createRefAdvanceMeta, signPayload, canonicalVersion,
 } from "@hyper-hyper-space/hhs3_mvt";
 import { RootScopedDag, ScopedDag, CausalDag, ScopedDagSubscription } from "@hyper-hyper-space/hhs3_mvt";
 
@@ -151,6 +151,10 @@ export class RBlobStoreImpl implements RBlobStoreContract {
     getName(): string { return this.createOp.name; }
     getGroupId(): B64Hash { return this.access.groupId; }
 
+    async resolveObservedGroupVersion(at: Version, from: Version): Promise<Version> {
+        return this.access.resolveObserved(await this.getScopedDag(), at, from);
+    }
+
     private selfValidate(): boolean {
         return this.ctx.getConfig().selfValidate || false;
     }
@@ -187,7 +191,10 @@ export class RBlobStoreImpl implements RBlobStoreContract {
     async refAdvance(author: OwnIdentity, lane: number, to?: Version): Promise<B64Hash> {
         this.checkLane(lane);
         const group = await this.access.loadGroup();
-        const target = to ?? await (await group.getScopedDag()).getFrontier();
+        const target = await canonicalVersion(
+            await group.getCausalDag(),
+            to ?? await (await group.getScopedDag()).getFrontier(),
+        );
         const at = await this.laneCover(lane);
         const base = { ...createRefAdvancePayload(this.access.groupId, target), lane } as unknown as json.LiteralMap;
         const signed = await signPayload(base, author, at);

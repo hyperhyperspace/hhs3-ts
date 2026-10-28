@@ -63,13 +63,14 @@ import type { MetaProps } from "@hyper-hyper-space/hhs3_dag";
 
 import {
     Payload, RObjectFactory, RContext, LoadObjectOptions, NestingParent,
-    Version, version, ForeignDep, DeltaAccumulator, RObject,
+    Version, version, ForeignDep, DeltaAccumulator,
     formatValidationFailure, validationFailure, ValidationRejectedError, ValidationResult,
 } from "@hyper-hyper-space/hhs3_mvt";
 import { RootScopedDag, NestedScopedDag, ScopedDag, CausalDag, ScopedDagSubscription } from "@hyper-hyper-space/hhs3_mvt";
 import {
     isRefAdvancePayload, extractRefVersion, extractAuthor, prepareRefAdvance, createRefAdvanceMeta,
     createRefAdvancePayload, resolveRefVersionAtPosition, findConcurrentRefAdvanceBarriers,
+    canonicalVersion,
     refVersionAtOrAbove,
 } from "@hyper-hyper-space/hhs3_mvt";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
@@ -101,10 +102,14 @@ import type { OpVoidDetail } from "./op_void.js";
 import { RTableGroupViewImpl } from "./view.js";
 import {
     RTableGroupDelta, RTableGroupDeltaStrategy, RTableGroupDeltaAccumulator,
-    computeRTableGroupDelta,
+    computeRTableGroupDelta, computeRTableGroupRevisionBound,
 } from "./delta.js";
+import type { BoundGroupHost } from "./delta.js";
 
 export { RTABLE_GROUP_TYPE_ID } from "./payload.js";
+
+// Entries of a group's computeRevisionBound memo.
+const REVISION_BOUND_MEMO_SIZE = 256;
 
 export const rTableGroupFactory: RObjectFactory = {
 
@@ -265,6 +270,10 @@ export class RTableGroupImpl implements RTableGroupContract {
 
     private deltaStrategy: RTableGroupDeltaStrategy = 'bounded';
 
+    // computeRevisionBound results keyed by canonical (start, end), least
+    // recently used first.
+    private readonly revisionBoundMemo: Map<string, Version> = new Map();
+
     // The gate id and the schema entry -> mirror hash memo: both are fixed by
     // the group id and its (append-only) schema DAG.
     private _deployGateId: B64Hash | undefined;
@@ -405,10 +414,15 @@ export class RTableGroupImpl implements RTableGroupContract {
     async resolveSchemaVersion(at: Version, from?: Version): Promise<Version> {
         const scopedDag = await this.getScopedDag();
         const advanced = await resolveRefVersionAtPosition(scopedDag, this.getSchemaRef(), at, from ?? at);
+        return this.schemaVersionWith(advanced);
+    }
 
+    // The pinned genesis version unioned with `refVersion`, as an antichain in
+    // the schema DAG. The union makes the create itself an implicit first deploy.
+    private async schemaVersionWith(refVersion: Version): Promise<Version> {
         const resolved = version(...this.getPinnedSchemaVersion());
-        for (const hash of advanced) resolved.add(hash);
-        return resolved;
+        for (const hash of refVersion) resolved.add(hash);
+        return canonicalVersion(await (await this.getSchemaObject()).getCausalDag(), resolved);
     }
 
     // The effective schema at a group position (RSchemaImpl caches the
@@ -610,8 +624,9 @@ export class RTableGroupImpl implements RTableGroupContract {
 
         const dag = await this.getScopedDag();
         const isLive = filterVoided ? (h: B64Hash) => this.isObserveLive(evaluation, groupId, h, from) : undefined;
-        const foreignAt = await resolveRefVersionAtPosition(dag, groupId, at, from, isLive);
-        const foreignFrom = await resolveRefVersionAtPosition(dag, groupId, from, from);
+        const foreignDag = await foreign.getCausalDag();
+        const foreignAt = await canonicalVersion(foreignDag, await resolveRefVersionAtPosition(dag, groupId, at, from, isLive));
+        const foreignFrom = await canonicalVersion(foreignDag, await resolveRefVersionAtPosition(dag, groupId, from, from));
 
         const foreignSchema = await foreign.resolveSchemaView(foreignAt, foreignFrom);
         if (!foreignSchema.hasTable(table)) return undefined;   // missing table
@@ -723,7 +738,7 @@ export class RTableGroupImpl implements RTableGroupContract {
             for (const h of vz) refAt.add(h);
         }
 
-        return refAt;
+        return canonicalVersion(foreignDag, refAt);
     }
 
     private async loadForeignGroup(groupId: B64Hash, groupName?: string): Promise<RTableGroupImpl> {
@@ -741,12 +756,19 @@ export class RTableGroupImpl implements RTableGroupContract {
         return (await this.loadForeignGroup(groupId)).getCausalDag();
     }
 
+    // A bound foreign group, for the bounded delta: its revision bound and its
+    // causal DAG. A missing object throws (infrastructure error).
+    async getBoundGroup(groupId: B64Hash): Promise<BoundGroupHost> {
+        return this.loadForeignGroup(groupId, this.bindingNameForId(groupId));
+    }
+
     // The foreign version this group observes for a bound group at (at, from):
     // the resolved ref-advance version on the group DAG. Used by the group VIEW
     // (resolveRefVersion) and by cross-group resolution.
     async resolveObservedForeignVersion(groupId: B64Hash, at: Version, from: Version): Promise<Version> {
         const dag = await this.getScopedDag();
-        return resolveRefVersionAtPosition(dag, groupId, at, from);
+        const foreignDag = await this.getForeignGroupCausalDag(groupId);
+        return canonicalVersion(foreignDag, await resolveRefVersionAtPosition(dag, groupId, at, from));
     }
 
     // KeyLookup: the publicKey registered for `keyId` through this group's
@@ -827,12 +849,13 @@ export class RTableGroupImpl implements RTableGroupContract {
             throw new Error("deploy must be authored when the group's canDeploy reads $author");
         }
 
-        const { payload: refAdvance, meta } = prepareRefAdvance(this.getSchemaRef(), refVersion);
+        const published = await canonicalVersion(await (await this.getSchemaObject()).getCausalDag(), refVersion);
+        const { payload: refAdvance, meta } = prepareRefAdvance(this.getSchemaRef(), published);
         const paramKeys = params !== undefined ? Object.keys(params).sort() : [];
         if (paramKeys.length > 0) meta.param = json.toSet(paramKeys);
         const base: json.LiteralMap = {
             ...(refAdvance as unknown as json.LiteralMap),
-            gate: json.toSet(await this.computeGateHashes(refVersion)),
+            gate: json.toSet(await this.computeGateHashes(published)),
             ...(paramKeys.length > 0 ? { params } : {}),
         };
         const payload = author !== undefined
@@ -872,8 +895,7 @@ export class RTableGroupImpl implements RTableGroupContract {
     // already held stay, as after any delete.
     private async fkAdoptionKills(payload: RefAdvancePayload, at: Version): Promise<DeployKills> {
         const before = await this.resolveSchemaView(at);
-        const deployed = version(...this.getPinnedSchemaVersion());
-        for (const hash of extractRefVersion(payload)) deployed.add(hash);
+        const deployed = await this.schemaVersionWith(extractRefVersion(payload));
         const after = await (await this.getSchemaObject()).getView(deployed, deployed);
 
         const kept = (table: string): boolean => {
@@ -971,6 +993,7 @@ export class RTableGroupImpl implements RTableGroupContract {
         at = at ?? await scopedDag.getFrontier();
 
         const groupId = this.resolveBoundGroupId(group);
+        refVersion = await canonicalVersion(await this.getForeignGroupCausalDag(groupId), refVersion);
 
         if (author === undefined && this.observeNeedsAuthor(groupId)) {
             throw new Error("observe must be authored when the binding's canObserve reads $author");
@@ -1213,8 +1236,9 @@ export class RTableGroupImpl implements RTableGroupContract {
 
         const dag = await this.getScopedDag();
         const opPos = version(entryHash);
+        const foreignDag = await this.getForeignGroupCausalDag(refId);
         const refAt = await this.resolveObserveGateRefAt(evaluation, refId, opPos, from);
-        const refFrom = await resolveRefVersionAtPosition(dag, refId, from, from);
+        const refFrom = await canonicalVersion(foreignDag, await resolveRefVersionAtPosition(dag, refId, from, from));
         const author = extractAuthor(payload as unknown as json.LiteralMap);
 
         const truth = await this.evaluateObserveGateIn(evaluation, refId, author, refAt, refFrom);
@@ -1277,31 +1301,50 @@ export class RTableGroupImpl implements RTableGroupContract {
         return new RTableGroupViewImpl(this, at, from, schemaVersion, schemaView);
     }
 
-    // Delta strategy (see ./delta.ts): 'bounded' (default; projected-meet walk)
-    // or 'full' (genesis recompute, the reference implementation for parity).
+    // Delta strategy (see ./delta.ts): 'bounded' (default; single-pass walk
+    // that widens its bound as it goes) or 'full' (genesis recompute, the
+    // reference implementation for parity).
     setDeltaStrategy(strategy: RTableGroupDeltaStrategy): void {
         this.deltaStrategy = strategy;
-    }
-
-    // The objects this group OBSERVES — its RSchema plus every bound foreign
-    // group — the referenced floors of the bounded revision bound (each can
-    // revise an at-use verdict below the fork meet, so each is projected and
-    // their GLB taken; see combineObserverRevisionBounds).
-    async getObservedObjects(): Promise<RObject[]> {
-        const objects: RObject[] = [await this.getSchemaObject()];
-        for (const groupId of new Set(Object.values(this.getBindings()))) {
-            objects.push(await this.loadForeignGroup(groupId));
-        }
-        return objects;
     }
 
     // Root-only delta orchestration (bounds analysis + walk + compose). A
     // member table does not lead a delta; it participates via
     // createDeltaAccumulator (see RTableImpl).
     async computeDelta(start: Version, end: Version): Promise<RTableGroupDelta> {
+        return computeRTableGroupDelta(this, await this.getRawDag(), this.deltaStrategy, start, end);
+    }
+
+    // The bounded revision bound between two of this group's versions, without
+    // the delta: what an observer needs to tell a stable observation of this
+    // group from an unstable one. Ignores the delta strategy. The memo
+    // survives across calls: a version names a fixed history, so the bound
+    // between two versions never changes as the DAG grows.
+    async computeRevisionBound(start: Version, end: Version): Promise<Version> {
+        const causalDag = await this.getCausalDag();
+        const canonicalStart = await canonicalVersion(causalDag, start);
+        const canonicalEnd = await canonicalVersion(causalDag, end);
+        const key = [...canonicalStart].sort().join(',') + '|' + [...canonicalEnd].sort().join(',');
+
+        const memoized = this.revisionBoundMemo.get(key);
+        if (memoized !== undefined) {
+            this.revisionBoundMemo.delete(key);   // most recently used last
+            this.revisionBoundMemo.set(key, memoized);
+            return memoized;
+        }
+
+        const bound = await computeRTableGroupRevisionBound(this, await this.getRawDag(), canonicalStart, canonicalEnd);
+        this.revisionBoundMemo.set(key, bound);
+        if (this.revisionBoundMemo.size > REVISION_BOUND_MEMO_SIZE) {
+            this.revisionBoundMemo.delete(this.revisionBoundMemo.keys().next().value!);
+        }
+        return bound;
+    }
+
+    private async getRawDag(): Promise<dag.Dag> {
         const rawDag = await this.ctx.getDag(this.createOpId, this.backendLabel);
         if (rawDag === undefined) throw new Error(`DAG '${this.createOpId}' not found`);
-        return computeRTableGroupDelta(this, rawDag, this.deltaStrategy, start, end);
+        return rawDag;
     }
 
     createDeltaAccumulator(start: Version, end: Version): DeltaAccumulator {
@@ -1416,6 +1459,7 @@ export class RTableGroupImpl implements RTableGroupContract {
             await table.destroy();
         }
         this.tables.clear();
+        this.revisionBoundMemo.clear();
         this._scopedDag = undefined;
         this._causalDag = undefined;
     }

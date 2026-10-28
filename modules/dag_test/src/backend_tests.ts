@@ -162,6 +162,14 @@ async function testConcurrentCoverWithFilter(factory: DagFactory) {
         { containsKeys: ['p1'] }
     );
     assertTrue(set.eq(cc4, position(h['d2'], h['b2'])), 'concurrent (d1) filter on p1 key failed (v2)');
+
+    // d2 is after c1 but not after b2, so it is concurrent with the two-head position.
+    const cc5 = await d.findConcurrentCoverWithFilter(
+        position(h['d1'], h['d2'], h['b2']),
+        position(h['c1'], h['b2']),
+        { containsKeys: ['p1'] }
+    );
+    assertTrue(set.eq(cc5, position(h['d1'], h['d2'])), 'd1 and d2 are concurrent with {c1, b2}; b2 is a head');
 }
 
 async function testDagCopy(factory: DagFactory) {
