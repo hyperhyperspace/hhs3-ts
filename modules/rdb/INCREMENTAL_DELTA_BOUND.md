@@ -94,7 +94,7 @@ Two more questions shape the design.
 
 **Which foreign versions.** An entry below the bound reads a foreign group $F$ through a view whose horizon is the version of $F$ observed at the delta's horizon: `refAtStart` at `start` and `refAtEnd` at `end`. A bound computed by the change-driven rule only promises agreement between the two versions it compared. Between `refAtMeet`, the version observed at the meet, and `refAtEnd`, a barrier of $F$ can be live, void at `refAtStart`, and live again. A bound for (`refAtMeet`, `refAtEnd`) then says nothing about `refAtStart`. So $F$'s bound must be computed between `refAtStart` and `refAtEnd`. Section 5.6 gives a history where the difference matters.
 
-**The schema.** An entry reads the schema at its own position: the deploys in its history plus the deploys concurrent with it. Deploys are never void, the fold has no liveness filter, and the schema object itself has no barriers, so its view at a fixed version does not depend on any horizon. No new deploy is concurrent with an entry below the meet (Lemma 1), so an entry below the bound reads the same schema at both horizons. The schema therefore needs no bound of its own. Treating it as an observed object would make every side-branch deploy look unstable and pull the bound down for nothing.
+**The schema.** An entry reads the schema at its own position: the deploys in its history plus the deploys concurrent with it. Deploys are never void, the fold has no liveness filter, and the schema object itself has no barriers, so its view at a fixed version does not depend on any horizon. No new deploy is concurrent with an entry below the meet (Lemma 1), so an entry below the bound reads the same schema at both horizons. The schema therefore needs no bound of its own, and the group declares it to the walk as a reference read at $(v, v)$ (Section 6.1). Bounding it anyway, with RSchema's own bound between the versions at `start` and at `end`, would be sound but less precise. That bound is the meet of RSchema's fork (`rschema/delta.ts`). When `end` deploys a schema version that merges schema branches forking below a version some deploy of `start` published, that meet drops below it. The deploy would look unstable and pull the bound down for nothing.
 
 ---
 
@@ -309,11 +309,12 @@ The meet-based bound described in Section 2 also took the foreign bound from the
 
 ### 6.1 Where it lives
 
+- **`mvt/src/revision_bound.ts`.** The walk of Section 4 is `walkRevisionBound`, which knows the geometry, the `barrier` tag and references, and nothing about verdicts. Phase A's descent is `lowerBelowUnstableRefAdvances`. The helpers are `computeStopSet`, `isStrictlyAfter`, `computeGLB` and `isUnstableRefAdvance`. `requireExtendingFork` computes the fork the walk takes. Its doc comment states, in terms of views and barriers, what a host and its visitor must guarantee. Those guarantees are the assumptions of Section 5.1 and the effect of Section 3.
 - **`rtable_group/delta.ts`.**
-  - `computeRTableGroupDelta(group, rawDag, strategy, start, end)` computes the delta. Under `'bounded'` it runs the walk of Section 4.
-  - `computeRTableGroupRevisionBound(group, rawDag, start, end)` runs the same walk in bound-only mode.
-  - Both share `walkWideningBound`. Phase A's descent is `lowerBelowUnstableObserves`. The helpers are `computeStopSet`, `isStrictlyAfter`, `computeGLB`, `isUnstableObserve` and `didDeleteHonorFlip`.
-- **`GroupDeltaHost`** is what the computation needs from the group. It adds `resolveSchemaView`, `resolveObservedForeignVersion` and `getBoundGroup` to what the accumulator already used. `getBoundGroup` returns a `BoundGroupHost` (`computeRevisionBound`, `getCausalDag`) and throws if the bound group is missing from the replica.
+  - `computeRTableGroupDelta(group, rawDag, strategy, start, end)` computes the delta. Under `'bounded'` it runs the walk with the delta visitor. That visitor ingests every walked entry, records every verdict flip, and reports a candidate as changed when its verdict or its honor flag (`didDeleteHonorFlip`) flipped. The flips become records after the walk.
+  - `computeRTableGroupRevisionBound(group, rawDag, start, end)` runs the same walk with the bound-only visitor, which reads verdicts and honor flags only for candidates.
+  - `revisionBoundHost` declares the group's references. Each bound group is `'horizon'`, read at the version observed at the horizon. The schema is `'at'`, read at $(v, v)$, and so never bounded.
+- **`GroupDeltaHost`** is what the computation needs from the group. It adds `resolveSchemaView`, `resolveObservedForeignVersion` and `getBoundGroup` to what the accumulator already used. `getBoundGroup` returns a `BoundGroupHost`, an alias of mvt's `ReferencedObject` (`computeRevisionBound`, `getCausalDag`), and throws if the bound group is missing from the replica.
 - **`RTableGroupImpl.computeRevisionBound(start, end)`** is the public bound-only entry point. Observers call it to get $b_F$. It ignores the group's delta strategy.
 - **`op_delta.ts`**: `describeOpVerdictFlip` builds a flip record. The full and bounded paths share it, so they report identical records.
 

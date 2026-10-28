@@ -92,12 +92,12 @@ export async function walkDelta(
 // heads (walkEntriesBackwardsToBound) sometimes reaches such an entry anyway, through the
 // whole past of a side branch's attachment point; that over-walk is not a guarantee.
 //
-// RTableGroup computes its own bound in rdb (rtable_group/delta.ts): one walk that stops at
-// the exit border of the bound's history and lowers the bound below every barrier of
-// `start` concurrent with it whose effect changed. An observed object's bound there is taken
+// walkRevisionBound (revision_bound.ts) computes a sound bound: one walk that stops at the
+// exit border of the bound's history and lowers the bound below every barrier of `start`
+// concurrent with it whose effect changed. A referenced object's bound there is taken
 // between the versions observed at `start` and at `end`, not at the meet: a bound driven by
-// what changed is only sound for the exact pair of versions it compared. RSet and RCap still
-// use the helpers here.
+// what changed is only sound for the exact pair of versions it compared. RTableGroup (rdb)
+// uses it. RSet and RCap still use the helpers here.
 
 // Compute the observer's revision bound when a referenced object can revise state
 // below the fork meet. `observerMeet` is the fork meet on the observer (input, not the

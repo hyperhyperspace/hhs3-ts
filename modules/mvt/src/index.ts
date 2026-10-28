@@ -6,3 +6,4 @@ export * from "./authorship.js";
 export * from "./delta.js";
 export * from "./validation.js";
 export * from "./verdict_evaluation.js";
+export * from "./revision_bound.js";
