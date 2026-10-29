@@ -1,6 +1,6 @@
 # Phase 5: RSet ref-advances as gated observes
 
-**Status:** plan. This supersedes the Phase 5 section of [`DESIGN_AND_PLAN_FOR_ANY.md`](./DESIGN_AND_PLAN_FOR_ANY.md). Phases 1–4 are in, including the follow-up that landed with them: a scoped concurrent cover is decided on the root DAG, a capability is one slot, and on a barrier set every delete is a barrier.
+**Status:** implemented. This supersedes the Phase 5 section of [`DESIGN_AND_PLAN_FOR_ANY.md`](./DESIGN_AND_PLAN_FOR_ANY.md). Phases 1–4 are in, including the follow-up that landed with them: a scoped concurrent cover is decided on the root DAG, a capability is one slot, and on a barrier set every delete is a barrier.
 
 A permissioned set's ref-advance is an observe of its RCap. Rdb can void an observe and, when it folds the referenced version, skip voided observes. RSet still admits the advance against the parent cut and then treats every advance as live. This phase closes that gap with the walk rdb already has. It does not add a second meaning of "concurrent", and it does not put ref-advances on `VerdictEvaluation`.
 
@@ -209,7 +209,7 @@ The strict-dominance back-dated advance (the `[OCUT01]` shape: publish `{v1}`, a
 
 ## What this phase does not change
 
-- The ideal-concurrency primitive, antichain admission, the two-check holding rule, the one-slot capability, barrier-ness of set deletes, and plain delegation in `NestedScopedDag`.
+- The ideal-concurrency primitive, antichain admission, the two-check holding rule, the one-slot capability, barrier-ness of set deletes, and `NestedScopedDag` deciding concurrency on the root DAG.
 - Rdb observe verdicts, apart from `resolveObserveGateRefAt` calling the helper.
 - `RFileMap` presence. That is Phase 6. Its add-anchored remove is a different rule; this phase does not touch `presence.ts`.
 - The public reference version. The delta bound changes in one place, its visitor (§4).

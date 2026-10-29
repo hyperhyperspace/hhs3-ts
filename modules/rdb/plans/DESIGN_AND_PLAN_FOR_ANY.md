@@ -1,7 +1,7 @@
 # Design and Plan: Ideal Concurrency (`ANY`) for Barrier Checks
 
-**Status:** implemented (Phases 1-4). RSet ref-advance gating (Phase 5),
-`rfile_map` presence (Phase 6), and the counter-revocation ring are not done.
+**Status:** implemented (Phases 1-5; Phase 5 as in [`PHASE_5_PLAN.md`](./PHASE_5_PLAN.md)).
+`rfile_map` presence (Phase 6) and the counter-revocation ring are not done.
 A ref-advance version is canonicalized on write and rejected at admission when
 it is not an antichain. A missing referenced entry stays an infrastructure
 throw, not a validation failure.

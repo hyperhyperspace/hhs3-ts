@@ -69,9 +69,9 @@ import {
 import { RootScopedDag, NestedScopedDag, ScopedDag, CausalDag, ScopedDagSubscription } from "@hyper-hyper-space/hhs3_mvt";
 import {
     isRefAdvancePayload, extractRefVersion, extractAuthor, prepareRefAdvance, createRefAdvanceMeta,
-    createRefAdvancePayload, resolveRefVersionAtPosition, findConcurrentRefAdvanceBarriers,
+    createRefAdvancePayload, resolveRefVersionAtPosition,
     canonicalVersion,
-    refVersionAtOrAbove,
+    widenRefAtUpward,
 } from "@hyper-hyper-space/hhs3_mvt";
 import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
 import { signPayload as signPayloadHelper } from "@hyper-hyper-space/hhs3_mvt";
@@ -686,59 +686,14 @@ export class RTableGroupImpl implements RTableGroupContract {
         });
     }
 
-    // G-upward filtered widening of the observed version for the at-use observe
-    // gate (Layer 1). Base is the causal (geometric) version published by the
-    // observe at `opPos`; concurrent observation barriers widen it ONLY when
-    // their published version STRICTLY dominates the base in the foreign DAG
-    // AND they are themselves live. Strict G-domination makes the recursion
-    // ascend the foreign version, so it is acyclic and terminating by
-    // construction (no back-edge: an equal/below or concurrent observe is never
-    // a widening candidate), and benign G-incomparable concurrent observes
-    // never recurse into each other. A negative edge (a revoke of this observe's
-    // author) rides a strictly-dominating version under use-before-revoke, so
-    // restricting to G-upward loses no security-relevant widening.
-    //
-    // The walk sees through void candidates, so a void observe does not hide a
-    // live one below it. Liveness is asked only of candidates strictly above
-    // the base (the recursion keeps ascending). A candidate that is not
-    // strictly above stops the walk and is dropped: an A-predecessor's version
-    // is at or below its successor's (write-time monotonicity), so nothing
-    // below it can be strictly above either.
+    // The observed version an observe's at-use gate reads at (Layer 1):
+    // mvt's widenRefAtUpward, with the observe verdict as the liveness of a
+    // strictly dominating concurrent observe.
     async resolveObserveGateRefAt(evaluation: VerdictEvaluation<OpVoidDetail>, refId: B64Hash, opPos: Version, from: Version): Promise<Version> {
-        const dag = await this.getScopedDag();
-        const base = await resolveRefVersionAtPosition(dag, refId, opPos, opPos);   // causal base (no widening)
-
-        const foreignDag = await this.getForeignGroupCausalDag(refId);
-        const refAt = version(...base);
-
-        const strictlyAbove = new Map<B64Hash, Version | undefined>();
-        const widening = async (z: B64Hash, entry: { payload: json.Literal }): Promise<Version | undefined> => {
-            if (!strictlyAbove.has(z)) {
-                let vz: Version | undefined;
-                if (isRefAdvancePayload(entry.payload)) {
-                    const candidate = extractRefVersion(entry.payload as RefAdvancePayload);
-                    // strictly G-above the base: vz >= base AND base !>= vz
-                    if (await refVersionAtOrAbove(foreignDag, candidate, base)
-                        && !await refVersionAtOrAbove(foreignDag, base, candidate)) {
-                        vz = candidate;
-                    }
-                }
-                strictlyAbove.set(z, vz);
-            }
-            return strictlyAbove.get(z);
-        };
-
-        const concurrent = await findConcurrentRefAdvanceBarriers(dag, refId, opPos, from,
-            async (z, entry) => (await widening(z, entry)) === undefined || await this.observeVerdictLive(evaluation, z, from));
-        for (const z of concurrent) {
-            const entry = await dag.loadEntry(z);
-            if (entry === undefined) continue;
-            const vz = await widening(z, entry);
-            if (vz === undefined) continue;
-            for (const h of vz) refAt.add(h);
-        }
-
-        return canonicalVersion(foreignDag, refAt);
+        return widenRefAtUpward(
+            await this.getScopedDag(), refId, opPos, from, await this.getForeignGroupCausalDag(refId),
+            (z) => this.observeVerdictLive(evaluation, z, from),
+        );
     }
 
     private async loadForeignGroup(groupId: B64Hash, groupName?: string): Promise<RTableGroupImpl> {

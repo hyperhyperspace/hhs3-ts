@@ -18,10 +18,10 @@ import {
     refVersionAtOrAbove,
     refVersionAtOrBelow,
     resolveRefVersionAtPosition,
-    resolveRefVersions,
     validateRefAdvanceMonotonicity,
     canonicalVersion,
     validateRefVersionShape,
+    widenRefAtUpward,
 } from '../src/refs.js';
 
 function createTestDag(): dag.Dag {
@@ -231,30 +231,6 @@ async function testRefVersionAtOrBelow() {
     );
 }
 
-async function testResolveRefVersions() {
-    const refId = 'foreignObj';
-    const foreignDag = createTestDag();
-    const fRoot = await foreignDag.append({ n: 0 }, {});
-    const fV1 = await foreignDag.append({ n: 1 }, {}, version(fRoot));
-
-    const observerRaw = createTestDag();
-    const observer = new RootScopedDag(observerRaw);
-
-    const h0 = await observer.append({ action: 'create' }, {}, undefined);
-    const h1 = await observer.append(
-        createRefAdvancePayload(refId, version(fV1)),
-        createRefAdvanceMeta(refId),
-        version(h0),
-    );
-    const h2 = await observer.append({ action: 'add', element: 'x' }, {}, version(h1));
-
-    const observerFrom = version(h2);
-    const { refAt, refFrom } = await resolveRefVersions(observer, refId, h1, observerFrom);
-
-    testing.assertTrue(setEq(refAt, version(fV1)), 'refAt should resolve foreign version at entry');
-    testing.assertTrue(setEq(refFrom, version(fV1)), 'refFrom should resolve at observer frontier without widening');
-}
-
 async function testResolveRefVersionAtPositionIsLive() {
     const refId = 'foreignObj';
     const foreignDag = createTestDag();
@@ -442,6 +418,54 @@ async function testCanonicalVersionAndShape(): Promise<void> {
     testing.assertTrue(!empty.valid && empty.why.reason.includes('empty'), 'the rejection names the empty version');
 }
 
+// Referenced: root ── v1 ── v2 ── v3, and w concurrent with v1.
+// Observer: Y publishes {v1}. Concurrent with it, L publishes {v2} and D, on
+// top of L, publishes {v3}; I publishes {w} and E publishes {v1}. D and L
+// strictly dominate Y's base, I is incomparable with it, and E equals it.
+async function testWidenRefAtUpward(): Promise<void> {
+    const refId = 'foreignObj';
+    const referenced = createTestDag();
+    const root = await referenced.append({ n: 0 }, {});
+    const v1 = await referenced.append({ n: 1 }, {}, version(root));
+    const v2 = await referenced.append({ n: 2 }, {}, version(v1));
+    const v3 = await referenced.append({ n: 3 }, {}, version(v2));
+    const w = await referenced.append({ n: 'w' }, {}, version(root));
+
+    const observer = new RootScopedDag(createTestDag());
+    // `tag` tells apart two advances of one version at one position.
+    const advance = (v: B64Hash, at: B64Hash, tag?: string) => observer.append(
+        { ...createRefAdvancePayload(refId, version(v)), ...(tag === undefined ? {} : { tag }) },
+        createRefAdvanceMeta(refId), version(at));
+    const h0 = await observer.append({ action: 'create' }, {}, undefined);
+    const Y = await advance(v1, h0);
+    const L = await advance(v2, h0);
+    const D = await advance(v3, L);
+    const I = await advance(w, h0);
+    const E = await advance(v1, h0, 'E');
+    const from = version(Y, D, I, E);
+
+    const widen = async (voids: B64Hash[]) => {
+        const asked: B64Hash[] = [];
+        const refAt = await widenRefAtUpward(observer, refId, version(Y), from, referenced, async (h) => {
+            asked.push(h);
+            return !voids.includes(h);
+        });
+        return { refAt, asked };
+    };
+
+    const allLive = await widen([]);
+    testing.assertTrue(setEq(allLive.refAt, version(v3)), 'a live strictly dominating advance widens the cut');
+    testing.assertTrue(allLive.asked.length === 1 && allLive.asked[0] === D,
+        'liveness is asked of the dominating candidate only, not of the incomparable or the equal one');
+
+    const dVoid = await widen([D]);
+    testing.assertTrue(setEq(dVoid.refAt, version(v2)), 'a void candidate is seen through to the live one below it');
+    testing.assertFalse(dVoid.asked.includes(I) || dVoid.asked.includes(E), 'the incomparable and the equal advances are never asked');
+
+    const bothVoid = await widen([D, L]);
+    testing.assertTrue(setEq(bothVoid.refAt, version(v1)), 'with every dominating candidate void, the cut is the base');
+}
+
 export const refsSuite = {
     title: '[REFS] Building-block helpers',
     tests: [
@@ -453,10 +477,10 @@ export const refsSuite = {
         { name: '[REFS_04] findRefAdvances DAG query', invoke: testFindRefAdvances },
         { name: '[REFS_05] findConcurrentRefAdvanceBarriers DAG query', invoke: testFindConcurrentRefAdvanceBarriers },
         { name: '[REFS_06] refVersionAtOrBelow ordering', invoke: testRefVersionAtOrBelow },
-        { name: '[REFS_07] resolveRefVersions for entry', invoke: testResolveRefVersions },
         { name: '[REFS_07b] resolveRefVersionAtPosition isLive filter', invoke: testResolveRefVersionAtPositionIsLive },
         { name: '[REFS_07c] resolveRefVersionAtPosition sees through a void ref-advance', invoke: testResolveRefVersionAtPositionSeesThrough },
         { name: '[REFS_09] ref-advance monotonicity validation', invoke: testRefAdvanceMonotonicity },
         { name: '[REFS_10] canonical version and antichain shape', invoke: testCanonicalVersionAndShape },
+        { name: '[REFS_11] widenRefAtUpward widens only by live strictly dominating concurrent advances', invoke: testWidenRefAtUpward },
     ],
 };

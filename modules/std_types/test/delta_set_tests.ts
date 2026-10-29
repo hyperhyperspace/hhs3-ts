@@ -916,6 +916,54 @@ export const deltaTests = {
             }
         },
         {
+            name: '[SET_BOUND05] a stable ref-advance that turns void through its widened cut lowers the bound below it',
+            invoke: async () => {
+                const ctx = permissionedContext();
+                const [C, A, B, D] = [await makeIdentity(), await makeIdentity(), await makeIdentity(), await makeIdentity()];
+                const cap = (await ctx.createObject(await RCap.create({
+                    seed: 'set-bound-05-cap',
+                    creators: [{ keyId: C.keyId, publicKey: C.publicKey }],
+                    initialCaps: { admin: { managedBy: ['creator'] }, steward: { managedBy: ['admin'] }, write: { managedBy: ['admin'] } },
+                }))) as RCap;
+                const rset = (await ctx.createObject(await RSet.create({
+                    seed: 'set-bound-05-set',
+                    initialElements: [],
+                    hashAlgorithm: 'sha256',
+                    capabilityRef: cap.getId(),
+                    capRequirements: { add: 'write', delete: 'write', refAdvance: ['steward'] },
+                }))) as RSet;
+                await addIdentities(cap, C, A, B);
+                await cap.grant(A.keyId, 'steward', C);
+
+                // RCap:  c0 ── vY ── vZ      c0 grants Bob write, vY revokes it. vZ is an identity.
+                //               \            rY revokes A's steward, concurrent with vZ only.
+                //                rY
+                const c0 = await cap.grant(B.keyId, 'write', C);
+                const vY = await cap.revoke(B.keyId, 'write', C, version(c0));
+                const vZ = await cap.addIdentity(D.keyId, serializePublicKeyToBase64(D.publicKey), C, version(vY));
+                const rY = await cap.revoke(A.keyId, 'steward', C, version(vY));
+
+                // Set:  R0 ── X ── Z ── N    X is Bob's add. Y is A's advance to {vY}; Z and N
+                //         \                  are the creator's, to {vZ} and to {vZ, rY}.
+                //          Y                 start = {Y, Z}, end = {Y, N}
+                //
+                // At `start`, Y is live and its vY voids X. Y's cut is widened by Z to vZ,
+                // which rY is concurrent with, so at `end` Y is void and X is valid. vY is
+                // stable, and Phase A puts the bound on X: only the flip reaches X.
+                const R0 = await rset.refAdvance(version(c0), C);
+                const X = await rset.addSigned('el-1', B, version(R0));
+                const Y = await rset.refAdvance(version(vY), A, version(R0));
+                const Z = await rset.refAdvance(version(vZ), C, version(X));
+                const N = await rset.refAdvance(version(vZ, rY), C, version(Z));
+
+                const delta = await boundedSetDelta(rset, version(Y, Z), version(Y, N));
+                assertTrue(delta.added.includes(hashElement('el-1')), 'el-1 is added');
+                const change = delta.validityChanges.find((vc) => vc.entryHash === X);
+                assertTrue(change !== undefined && !change.wasValid && change.nowValid, 'X turns valid');
+                assertTrue(isExactly(delta.getRevisionBound(), R0), 'the bound drops below Y, so X is walked');
+            }
+        },
+        {
             name: '[SET_BOUND04] the bounded delta rejects a permissioned nested set, at any depth; the full one does not',
             invoke: async () => {
                 const ctx = permissionedContext();

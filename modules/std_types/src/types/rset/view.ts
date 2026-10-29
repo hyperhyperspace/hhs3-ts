@@ -1,7 +1,7 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { EntryPredicate } from "@hyper-hyper-space/hhs3_dag";
-import { Version, RObject, resolveRefVersionAtPosition, resolveRefVersions, canonicalVersion, ScopedDag } from "@hyper-hyper-space/hhs3_mvt";
+import { Version, version, RObject, resolveRefVersionAtPosition, canonicalVersion, widenRefAtUpward, ScopedDag } from "@hyper-hyper-space/hhs3_mvt";
 
 import { isAuthoredPayload, extractAuthor } from "../../authorship.js";
 
@@ -16,6 +16,11 @@ export class RSetViewImpl<T extends json.Literal> implements RSetView<T> {
     private target: RSet<T>;
     private at: Version;
     private from: Version;
+
+    // Ref-advance verdicts from `from`, one computation per advance however
+    // many reads share it: the promise is stored before its first await.
+    private readonly refAdvanceVerdicts = new Map<B64Hash, Promise<boolean>>();
+    private refFromVersion: Promise<Version> | undefined;
 
     constructor(target: RSet<T>, at: Version, from: Version) {
         this.target = target;
@@ -103,12 +108,77 @@ export class RSetViewImpl<T extends json.Literal> implements RSetView<T> {
         return true;
     }
 
+    // The RCap view an entry's authorization reads. refAt folds the live
+    // ref-advances in the entry's past and the live ref-advance barriers
+    // concurrent with it, seeing through void ones (Layer 2). refFrom counts
+    // every ref-advance.
     private async rcapViewForEntry(
         dag: ScopedDag, rcap: RCap, refId: B64Hash, entryHash: B64Hash,
     ): Promise<RCapView> {
-        const { refAt, refFrom } = await resolveRefVersions(dag, refId, entryHash, this.from);
+        const refAt = await resolveRefVersionAtPosition(
+            dag, refId, version(entryHash), this.from, (hash) => this.isRefAdvanceLive(hash),
+        );
         const causal = await rcap.getCausalDag();
-        return rcap.getView(await canonicalVersion(causal, refAt), await canonicalVersion(causal, refFrom)) as Promise<RCapView>;
+        return rcap.getView(await canonicalVersion(causal, refAt), await this.refFrom(dag, rcap, refId)) as Promise<RCapView>;
+    }
+
+    // The geometric fold at (from, from), canonical in the RCap DAG.
+    private refFrom(dag: ScopedDag, rcap: RCap, refId: B64Hash): Promise<Version> {
+        if (this.refFromVersion === undefined) {
+            this.refFromVersion = (async () => canonicalVersion(
+                await rcap.getCausalDag(), await resolveRefVersionAtPosition(dag, refId, this.from, this.from),
+            ))();
+        }
+        return this.refFromVersion;
+    }
+
+    async isRefAdvanceLive(entryHash: B64Hash): Promise<boolean> {
+        return this.refAdvanceLive(entryHash, []);
+    }
+
+    // `chain` holds the advances whose verdicts wait on this one. Strict
+    // domination rules out a cycle; the check makes one fail instead of
+    // waiting on its own promise.
+    private refAdvanceLive(entryHash: B64Hash, chain: B64Hash[]): Promise<boolean> {
+        if (chain.includes(entryHash)) {
+            return Promise.reject(new Error(`ref-advance '${entryHash}' depends on its own verdict`));
+        }
+        let verdict = this.refAdvanceVerdicts.get(entryHash);
+        if (verdict === undefined) {
+            verdict = this.decideRefAdvance(entryHash, [...chain, entryHash]);
+            this.refAdvanceVerdicts.set(entryHash, verdict);
+        }
+        return verdict;
+    }
+
+    // The set's ref-advance rule, as admission applies it, at the advance's own
+    // cut (Layer 1): the version it publishes, widened by the live concurrent
+    // ref-advances strictly above it, read from the geometric fold at `from`.
+    // A revoke of the author concurrent with that cut and visible from `from`
+    // voids it.
+    private async decideRefAdvance(entryHash: B64Hash, chain: B64Hash[]): Promise<boolean> {
+        const dag = await this.target.getScopedDag();
+        const entry = await dag.loadEntry(entryHash);
+        if (entry === undefined) throw new Error(`ref-advance '${entryHash}' is not in the set`);
+        if (!isAuthoredPayload(entry.payload)) return false;
+
+        const rcap = await this.target.loadRCap();
+        if (rcap === undefined) throw new Error("Cannot load referenced RCap");
+        const author = extractAuthor(entry.payload)!;
+        if (this.target.refAdvanceCreators() && rcap.isCreator(author)) return true;
+        const caps = this.target.refAdvanceCaps();
+        if (caps.length === 0) return false;
+
+        const refId = this.target.capabilityRef()!;
+        const refAt = await widenRefAtUpward(
+            dag, refId, version(entryHash), this.from, await rcap.getCausalDag(),
+            (hash) => this.refAdvanceLive(hash, chain),
+        );
+        const rcapView = await rcap.getView(refAt, await this.refFrom(dag, rcap, refId));
+        for (const cap of caps) {
+            if (await rcapView.hasCapability(author, cap)) return true;
+        }
+        return false;
     }
 
     private async isEntryAuthorized(payload: json.Literal, rcapView: RCapView): Promise<boolean> {

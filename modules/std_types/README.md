@@ -90,12 +90,19 @@ For each DAG entry E in a permissioned `RSet`, view-time authorization queries t
 RCap.getView(rcapAt, rcapFrom)
 ```
 
-- **`rcapAt`**: RCap version at the entry's position in the RSet DAG, computed by `resolveRefVersionAtPosition(entryPosition, rsetView.from)`. Ref-advances in the entry's past are included. Ref-advances are also **barrier** operations in the RSet: if E is **concurrent** to a barrier ref-advance that moves the set to a newer `RCap` version, E must be checked against that newer version, not an older one the peer could still see by forking before the ref-advance. This is BFT protection in the observer.
-- **`rcapFrom`**: RCap version from ref-advances already in the **history of the RSet view's frontier** — `resolveRefVersionAtPosition(rsetView.from, rsetView.from)`. Using the same position for both arguments skips RSet-side concurrent barrier widening (that widening is handled on `rcapAt` per entry). This version is passed as the **`from`** argument to `RCap.getView`, so barriers **inside the RCap** (e.g. a concurrent revoke on another branch of the RCap) can revise authorization at `rcapAt`.
+- **`rcapAt`**: RCap version at the entry's position in the RSet DAG, computed by `resolveRefVersionAtPosition(entryPosition, rsetView.from, isLive)`. The **live** ref-advances in the entry's past are included: a void ref-advance (see *Who may ref-advance* below) contributes no version and does not hide the live ones below it. Ref-advances are also **barrier** operations in the RSet: if E is **concurrent** to a barrier ref-advance that moves the set to a newer `RCap` version, E must be checked against that newer version, not an older one the peer could still see by forking before the ref-advance. This is BFT protection in the observer.
+- **`rcapFrom`**: RCap version from ref-advances already in the **history of the RSet view's frontier** — `resolveRefVersionAtPosition(rsetView.from, rsetView.from)`. Every ref-advance counts here, live or void, as it does in the public `resolveRefVersion`. Using the same position for both arguments skips RSet-side concurrent barrier widening (that widening is handled on `rcapAt` per entry). This version is passed as the **`from`** argument to `RCap.getView`, so barriers **inside the RCap** (e.g. a concurrent revoke on another branch of the RCap) can revise authorization at `rcapAt`.
 
-Insertion-time validation (`validatePayload` / `checkPayloadAuth`) still uses unrevised views (`getView(at, at)` on both objects). View-time membership re-checks use the compositional pair above.
+Insertion-time validation of adds and deletes (`checkPayloadAuth`) still uses unrevised views (`getView(at, at)` on both objects). View-time membership re-checks use the compositional pair above.
 
 See **PSET10** (sequential revoke does not void past adds), **PSET17–18** (concurrent RSet ref-advance), and **PSET20** (sequential RSet ref-advance + concurrent RCap branch).
+
+#### Who may ref-advance
+
+Two fields of `capRequirements` say who may advance the reference: `refAdvance`, a list of `RCap` capabilities (default `[]`), and `refAdvanceCreators` (default `true`). An author may advance when `refAdvanceCreators` is set and they are an `RCap` creator, or when they hold some capability in `refAdvance`. With the defaults, only creators can advance. With the flag off, a creator passes only when the list is non-empty, since a creator holds every capability.
+
+- **At admission** the rule is checked on `RCap.getView(v, v)`, with `v` the version the ref-advance imports. Monotonicity puts `v` at or above every version its parents observe. A revoke in the past of `v` rejects the advance, and a grant in its past admits it (PSET30–32).
+- **At use** each view gives a ref-advance a verdict from its `from`: the same rule on `RCap.getView(cut, rcapFrom)`. The `cut` is the version the advance publishes, folded with the ref-advances in its past and widened by every live concurrent ref-advance whose version is strictly above it (mvt's `widenRefAtUpward`, the walk rdb uses for observes). Advances to incomparable versions never consult each other. A revoke of the author concurrent with the cut and visible from `rcapFrom` makes the advance **void** (PSET33–35). Verdicts are computed once per view, and concurrent reads share them (PSET36).
 
 #### Delta computation
 
@@ -107,8 +114,9 @@ For a **permissioned** set, an entry below the meet can flip too, because the `e
 
 1. **Below every unstable ref-advance.** `RCap`'s own bound is taken between `rcapFrom` at `start` and at `end`, through `RCap.computeRevisionBound`. A ref-advance is *stable* iff its published `RCap` version is at or below that bound. The bound drops below the lowest unstable ref-advance on each branch of the meet's history, and below every unstable ref-advance of `start` the walk reaches, including one on a side branch whose version widens a concurrent entry's `rcapAt`.
 2. **Below every barrier add or delete of `start`** concurrent with it whose authorization differs between `start` and `end`. The delta's own views read nothing concurrent, so this doesn't change the reported changes. It keeps the bound sound for views at an earlier `at`, which do read concurrent barriers.
+3. **Below every ref-advance of `start`** concurrent with it that is live at only one of `start` and `end`. A stable ref-advance can still turn void through its widened cut, and then every entry after it and concurrent with it reads a different fold (SET_BOUND05). The delta doesn't report the ref-advance itself; its effect shows in the adds and deletes whose authorization changes.
 
-Below the bound, every entry's `rcapAt` is at or below `RCap`'s bound, so its authorization reads the same from `start` and from `end`.
+Below the bound, every entry's `rcapAt` is at or below `RCap`'s bound, and every ref-advance keeps its verdict, so an entry's authorization reads the same from `start` and from `end`.
 
 **Nested sets.** `computeDelta` runs on the outermost set; calling it on a nested set throws. A walked entry that carries a nested op goes, unwrapped, to that nested object's accumulator, and the delta reports each nested object's changes in its `nested` map, keyed by the nested object's id (its element hash), at any depth: `delta.nested.get(child)?.nested.get(grandchild)`.
 

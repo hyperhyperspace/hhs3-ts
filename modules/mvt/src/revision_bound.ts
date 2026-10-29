@@ -99,15 +99,26 @@ type ReferencedBound = { dag: CausalDag; bound: Version };
 //   4. The visitor covers a barrier's effect. For a barrier T, every view
 //      anchored at a position concurrent with T reads the same from T at
 //      F = start and at F = end, unless visit(T, true) returns true or T is an
-//      unstable ref-advance of a 'horizon' reference.
+//      unstable ref-advance of a 'horizon' reference. For a ref-advance with a
+//      liveness verdict (6), the same holds for the views anchored after T,
+//      and its verdict is the same at both: an unstable or flipped one lowers
+//      the bound below it, so every entry after it is walked too.
 //   5. Every reference is declared. Every ref id that appears in a ref-advance
 //      of the object is declared exactly once in references(), with the
 //      `from` its views read it at.
 //   6. Referenced versions. A referenced object is read through views whose
 //      `at` folds the ref-advances in the reading entry's past and the
-//      ref-advance barriers concurrent with it. For a 'horizon' reference,
-//      their `from` is resolveVersion(horizon). Ref-advances are monotone and
-//      carry the `ref` meta tag with the ref id.
+//      ref-advance barriers concurrent with it: all of them, or the ones whose
+//      liveness verdict holds. A verdict is itself such a read, at the
+//      ref-advance's position, that may fold only some of the concurrent
+//      barriers (widenRefAtUpward). For a 'horizon' reference, their `from` is
+//      resolveVersion(horizon). Ref-advances are monotone and carry the `ref`
+//      meta tag with the ref id.
+//
+//      Below the bound, a stable ref-advance keeps its verdict: no new entry is
+//      concurrent with it, and each ref-advance of `start` concurrent with it
+//      is below the bound and keeps its own, or is walked and, if unstable or
+//      flipped, lowers the bound below both of them.
 //   7. Sound referenced bounds. For a 'horizon' reference,
 //      ReferencedObject.computeRevisionBound is sound for the exact pair of
 //      versions it is given. References form a DAG.

@@ -26,7 +26,7 @@ import { dag } from "@hyper-hyper-space/hhs3_dag";
 import {
     version, Version, Delta, DeltaChanges, DeltaAccumulator,
     RObject, ScopedDag,
-    walkDelta, requireExtendingFork, walkRevisionBound,
+    walkDelta, requireExtendingFork, walkRevisionBound, isRefAdvancePayload,
 } from "@hyper-hyper-space/hhs3_mvt";
 import type { Reference, RevisionBoundHost, RevisionBoundVisitor } from "@hyper-hyper-space/hhs3_mvt";
 
@@ -174,6 +174,15 @@ export class RSetDeltaAccumulator implements DeltaAccumulator<RSetChanges> {
         return this.authorizationFlips.has(entryHash);
     }
 
+    // Whether `entry` is a ref-advance that is live at only one of `start` and
+    // `end`. The delta does not report it: its effect shows in the adds and
+    // deletes whose authorization it changes.
+    async refAdvanceFlipped(entry: dag.Entry): Promise<boolean> {
+        if (!this.set.isPermissioned() || !isRefAdvancePayload(entry.payload)) return false;
+        const { startView, endView } = await this.views();
+        return await startView.isRefAdvanceLive(entry.hash) !== await endView.isRefAdvanceLive(entry.hash);
+    }
+
     private async ingestNested(childId: B64Hash, rawEntry: dag.Entry): Promise<boolean> {
         let child = this.childAccs.get(childId);
         if (child === undefined) child = await this.spawnChild(childId);
@@ -268,14 +277,16 @@ function revisionBoundHost(set: RSet): RevisionBoundHost {
 // A candidate is a barrier of `start`: a barrier add or delete, or a
 // ref-advance. An add or delete reaches concurrent views only through whether
 // it passes its authorization, so its effect changed exactly when that flipped,
-// which the accumulator has already compared. A ref-advance has no verdict, and
-// the walk finds an unstable one itself. Phase 5 (rdb/plans/PHASE_5_PLAN.md)
-// gives ref-advances a liveness verdict; its flips must then be reported here.
+// which the accumulator has already compared. A ref-advance reaches the entries
+// after it and concurrent with it through the versions it adds to their folds,
+// which it adds only while it is live. The walk finds an unstable one itself;
+// a stable one can still flip through its widened cut, so its liveness is
+// compared here.
 function deltaVisitor(acc: RSetDeltaAccumulator): RevisionBoundVisitor {
     return {
         async visit(entry, candidate) {
             await acc.ingest(entry);
-            return candidate && acc.authorizationFlipped(entry.hash);
+            return candidate && (acc.authorizationFlipped(entry.hash) || await acc.refAdvanceFlipped(entry));
         },
     };
 }

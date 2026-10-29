@@ -175,21 +175,6 @@ function sameSet(a: Version, b: Version): boolean {
     return true;
 }
 
-// Resolve referenced-object versions for checking an observer entry against a foreign
-// object. `entryHash` and `observerFrom` are positions in the observer DAG; the returned
-// `refAt` / `refFrom` are versions in the referenced object's DAG (suitable as args to
-// `referenced.getView(refAt, refFrom)`).
-export async function resolveRefVersions(
-    observerDag: ScopedDag,
-    refId: B64Hash,
-    entryHash: B64Hash,
-    observerFrom: Version,
-): Promise<{ refAt: Version; refFrom: Version }> {
-    const refAt = await resolveRefVersionAtPosition(observerDag, refId, version(entryHash), observerFrom);
-    const refFrom = await resolveRefVersionAtPosition(observerDag, refId, observerFrom, observerFrom);
-    return { refAt, refFrom };
-}
-
 // Returns true iff `newer` is at or above `older` in the referenced object's DAG
 // (older is in newer's causal past, or they denote the same position). Closed on both
 // ends: equal positions pass. This is not negated by refVersionAtOrBelow; concurrent
@@ -218,6 +203,66 @@ export async function refVersionAtOrBelow(
 export async function canonicalVersion(dag: CausalDag, v: Version): Promise<Version> {
     if (v.size <= 1) return v;
     return dag.findMinimalCover(v);
+}
+
+// The cut a ref-advance's own gate reads at, observed from `from` (Layer 1),
+// canonical in the referenced DAG. The base is the version published by the
+// ref-advance at `opPos`, folded with the ref-advances in its causal past.
+// A concurrent ref-advance barrier widens it only when its published version
+// strictly dominates the base in the referenced DAG and `isLive` says it is
+// live. Strict domination makes a recursive `isLive` ascend the referenced
+// version, so it terminates, and ref-advances that publish incomparable
+// versions never consult each other. A revoke of the author rides a strictly
+// dominating version, so restricting to those loses no widening that matters
+// for security.
+//
+// The search sees through a void candidate, so it does not hide a live one
+// below it. A candidate that is not strictly above stops the search there and
+// is dropped: write-time monotonicity puts every ref-advance below it at or
+// below its version, so none of them is strictly above the base either.
+// `isLive` is asked only of candidates strictly above the base. It is not a
+// reader's see-through predicate (resolveRefVersionAtPosition's `isLive`),
+// which is asked of every ref-advance in a fold: passing that one to the
+// concurrent search would ask liveness of incomparable ref-advances.
+export async function widenRefAtUpward(
+    observerDag: ScopedDag,
+    refId: B64Hash,
+    opPos: Version,
+    from: Version,
+    referencedDag: CausalDag,
+    isLive: (entryHash: B64Hash) => Promise<boolean>,
+): Promise<Version> {
+    // Uncanonicalized: the dominance tests read the causal past, which is the same.
+    const base = await resolveRefVersionAtPosition(observerDag, refId, opPos, opPos);
+    const refAt = version(...base);
+
+    // A candidate's published version, when it is strictly above the base.
+    const strictlyAbove = new Map<B64Hash, Version | undefined>();
+    const widening = async (hash: B64Hash, payload: json.Literal): Promise<Version | undefined> => {
+        if (!strictlyAbove.has(hash)) {
+            let widened: Version | undefined;
+            if (isRefAdvancePayload(payload)) {
+                const candidate = extractRefVersion(payload as RefAdvancePayload);
+                if (await refVersionAtOrAbove(referencedDag, candidate, base)
+                    && !await refVersionAtOrAbove(referencedDag, base, candidate)) {
+                    widened = candidate;
+                }
+            }
+            strictlyAbove.set(hash, widened);
+        }
+        return strictlyAbove.get(hash);
+    };
+
+    const concurrent = await findConcurrentRefAdvanceBarriers(observerDag, refId, opPos, from,
+        async (hash, entry) => (await widening(hash, entry.payload)) === undefined || await isLive(hash));
+    for (const hash of concurrent) {
+        const entry = await observerDag.loadEntry(hash);
+        if (entry === undefined) continue;
+        const widened = await widening(hash, entry.payload);
+        if (widened === undefined) continue;
+        for (const h of widened) refAt.add(h);
+    }
+    return canonicalVersion(referencedDag, refAt);
 }
 
 // A ref-advance version must be a non-empty antichain. Missing entries are an

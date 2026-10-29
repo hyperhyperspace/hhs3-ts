@@ -3,6 +3,7 @@ import { HASH_SHA256, createBasicCrypto, createIdentity, SIGNING_ED25519 } from 
 import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { formatValidationFailure, version, createRefAdvancePayload, extractRefVersion, refVersionAtOrAbove } from "@hyper-hyper-space/hhs3_mvt";
+import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
 import { RCap, rCapFactory } from "../src/types/rcap/rcap.js";
@@ -76,6 +77,30 @@ async function registerAndGrant(
         identity.keyId, capName,
         admin,
     );
+}
+
+// A set whose ref-advances need 'steward' (managed by admin), with the
+// attacker, a non-creator who holds it, and Bob, an identity without write.
+// c0 is the RCap frontier after that setup.
+async function stewardEnv() {
+    const env = await createTestEnv({
+        extraCaps: { steward: { managedBy: ['admin'] } },
+        capRequirements: { add: 'write', delete: 'write', refAdvance: ['steward'] },
+    });
+    const [attacker, bob] = [await makeIdentity(), await makeIdentity()];
+    await registerAndGrant(env.cap, attacker, 'steward', env.admin);
+    await env.cap.addIdentity(bob.keyId, serializePublicKeyToBase64(bob.publicKey), env.admin);
+    const c0 = await (await env.cap.getScopedDag()).getFrontier();
+    return { ...env, attacker, bob, c0 };
+}
+
+// A ref-advance of `rset`'s RCap to `refVersion`, signed by `author` at `at`.
+function signedRefAdvance(cap: RCap, refVersion: Version, author: OwnIdentity, at: Version) {
+    return signPayload(createRefAdvancePayload(cap.getId(), refVersion) as unknown as json.LiteralMap, author, at);
+}
+
+async function addIdentityAt(cap: RCap, identity: OwnIdentity, admin: OwnIdentity, at: Version) {
+    return cap.addIdentity(identity.keyId, serializePublicKeyToBase64(identity.publicKey), admin, at);
 }
 
 export const permissionedSetTests = {
@@ -770,13 +795,12 @@ export const permissionedSetTests = {
         {
             name: '[PSET25] A concurrent RCap revoke pulled in by a later sequential ref-advance voids an earlier add (use-anchored barrier)',
             invoke: async () => {
-                // The entry's rcapAt is pinned at `{u}` (the ref-advance it sees), which sits
-                // strictly ABOVE alice's write grant. A revoke concurrent with `{u}` -- a
-                // DESCENDANT of the grant, hence invisible to the grant-anchored barrier B1 --
-                // is folded into rcapFrom by a LATER, sequential-in-the-RSet ref-advance, but
-                // not into the entry's rcapAt. Only the always-on use-anchored barrier (B2),
-                // which checks for revokes concurrent with rcapAt observed from rcapFrom, voids
-                // it. (With B2 gated off at the top level this entry would wrongly survive.)
+                // The entry's rcapAt is `{u}` (the ref-advance it sees), strictly above
+                // alice's write grant. A revoke concurrent with `{u}` is folded into rcapFrom
+                // by a later, sequential-in-the-RSet ref-advance, but not into the entry's
+                // rcapAt. Kill 2 at rcapAt, read from that rcapFrom, voids it. This guards the
+                // geometric rcapFrom: the later ref-advance moves it, whatever the verdicts of
+                // the ref-advances in the entry's past.
                 const { cap, rset, admin } = await createTestEnv();
                 const alice = await makeIdentity();
                 const dave = await makeIdentity();
@@ -803,7 +827,7 @@ export const permissionedSetTests = {
 
                 const view = await rset.getView();
                 assertFalse(await view.has('E'),
-                    'E is voided: the concurrent revoke, observed via the later ref-advance, is concurrent with the entry\'s rcapAt (B2)');
+                    'E is voided: the concurrent revoke, observed via the later ref-advance, is concurrent with the entry\'s rcapAt (Kill 2)');
             }
         },
         {
@@ -924,6 +948,167 @@ export const permissionedSetTests = {
                 const written = await rset.refAdvance(version(a, b), admin, at);
                 const stored = extractRefVersion((await (await rset.getScopedDag()).loadEntry(written))!.payload as never);
                 assertTrue(stored.size === 1 && stored.has(b), 'the writer publishes the minimal cover');
+            }
+        },
+        {
+            name: '[PSET30] ref-advance admission reads the imported version: a revoke in its past rejects an author who holds the cap at the parent cut',
+            invoke: async () => {
+                const { cap, rset, admin, attacker, c0 } = await stewardEnv();
+                const R0 = await rset.refAdvance(c0, admin);
+                const r = await cap.revoke(attacker.keyId, 'steward', admin, c0);
+
+                const at = version(R0);
+                const imported = await rset.validatePayload(await signedRefAdvance(cap, version(r), attacker, at), at);
+                assertFalse(imported.valid, 'the attacker lacks steward at the imported version');
+                const parentCut = await rset.validatePayload(await signedRefAdvance(cap, c0, attacker, at), at);
+                assertTrue(parentCut.valid, 'importing the parent cut, the attacker still holds steward');
+            }
+        },
+        {
+            name: '[PSET31] ref-advance admission reads the imported version: a grant only in its past admits an author who lacks the cap at the parent cut',
+            invoke: async () => {
+                const { cap, rset, admin, bob, c0 } = await stewardEnv();
+                const R0 = await rset.refAdvance(c0, admin);
+                const g = await cap.grant(bob.keyId, 'steward', admin, c0);
+
+                const at = version(R0);
+                const result = await rset.validatePayload(await signedRefAdvance(cap, version(g), bob, at), at);
+                assertTrue(result.valid, 'Bob holds steward at the imported version');
+            }
+        },
+        {
+            name: '[PSET32] a creator ref-advances by default, and a non-creator cannot when no cap is listed',
+            invoke: async () => {
+                {
+                    const { cap, rset, admin } = await createTestEnv();
+                    const bob = await makeIdentity();
+                    await registerAndGrant(cap, bob, 'write', admin);
+                    const v = await (await cap.getScopedDag()).getFrontier();
+                    const at = await (await rset.getScopedDag()).getFrontier();
+                    assertTrue((await rset.validatePayload(await signedRefAdvance(cap, v, admin, at), at)).valid,
+                        'a creator ref-advances when refAdvance is omitted');
+                    assertFalse((await rset.validatePayload(await signedRefAdvance(cap, v, bob, at), at)).valid,
+                        'a non-creator cannot ref-advance when no cap is listed');
+                }
+                {
+                    const { cap, rset, admin, c0 } = await stewardEnv();
+                    const at = await (await rset.getScopedDag()).getFrontier();
+                    assertTrue((await rset.validatePayload(await signedRefAdvance(cap, c0, admin, at), at)).valid,
+                        'a creator ref-advances when caps are listed and refAdvanceCreators is left at its default');
+                }
+            }
+        },
+        {
+            name: '[PSET33] a mixed-cut ref-advance whose author is revoked concurrently is void, and its version drops out of a concurrent fold',
+            invoke: async () => {
+                const { cap, rset, admin, attacker, bob, c0 } = await stewardEnv();
+                const [dave, carol] = [await makeIdentity(), await makeIdentity()];
+
+                // RCap:  c0 ── v1 ── r ── idC ── gC    r revokes the attacker's steward;
+                //          \                           gC grants Carol write.
+                //           vAdv                       vAdv grants Bob write, concurrent with v1 and r.
+                const v1 = await addIdentityAt(cap, dave, admin, c0);
+                const vAdv = await cap.grant(bob.keyId, 'write', admin, c0);
+                const r = await cap.revoke(attacker.keyId, 'steward', admin, version(v1));
+                const idC = await addIdentityAt(cap, carol, admin, version(r));
+                const gC = await cap.grant(carol.keyId, 'write', admin, version(idC));
+
+                // Set:  R0 ── A ── addY      A: the attacker advances to {v1, vAdv}, admitted
+                //         \                       at that version, where r is not in the past.
+                //          Adm ── addZ       Adm: the admin advances to {gC}.
+                const R0 = await rset.refAdvance(c0, admin);
+                const A = await rset.refAdvance(version(v1, vAdv), attacker, version(R0));
+                const Adm = await rset.refAdvance(version(gC), admin, version(R0));
+                await rset.addSigned('Y', bob, version(A));
+                await rset.addSigned('Z', carol, version(Adm));
+
+                // From the frontier, r is concurrent with {v1, vAdv} and visible, so A is
+                // void. Bob's add reads Adm's {gC} and R0's c0, and holds no write there.
+                const view = await rset.getView();
+                assertFalse(await view.has('Y'), "Y is absent: A is void, so vAdv drops out of Bob's add's fold");
+                assertTrue(await view.has('Z'), "Z stays: the admin's advance is live");
+                assertFalse(await view.isRefAdvanceLive(A), "the attacker's advance is void");
+                assertTrue(await view.isRefAdvanceLive(Adm), "the admin's advance is live");
+            }
+        },
+        {
+            name: '[PSET34] an add after a ref-advance that turns void reads the live ref-advance below it',
+            invoke: async () => {
+                const { cap, rset, admin, attacker, bob, c0 } = await stewardEnv();
+
+                // RCap:  c0 ── vAdv    vAdv grants Bob write.
+                //          \
+                //           r          r revokes the attacker's steward, concurrent with vAdv.
+                const vAdv = await cap.grant(bob.keyId, 'write', admin, c0);
+                const r = await cap.revoke(attacker.keyId, 'steward', admin, c0);
+
+                // Set:  L ── Y ── E ── N    L: the admin's advance to c0. Y: the attacker's to
+                //                           {vAdv}. E: Bob's add. N: the admin's to {vAdv, r}.
+                const L = await rset.refAdvance(c0, admin);
+                const Y = await rset.refAdvance(version(vAdv), attacker, version(L));
+                const E = await rset.addSigned('E', bob, version(Y));
+
+                const before = await rset.getView(version(E), version(E));
+                assertTrue(await before.has('E'), 'before N, E stays');
+                assertTrue(await before.isRefAdvanceLive(Y), 'before N, Y is live');
+
+                await rset.refAdvance(version(vAdv, r), admin, version(E));
+
+                // N brings r into refFrom, not into E's refAt. r is concurrent with Y's
+                // cut, so Y is void and E's fold sees through it to L.
+                const view = await rset.getView();
+                assertFalse(await view.has('E'), 'E is absent: Y is void, so E reads L, where Bob lacks write');
+                assertFalse(await view.isRefAdvanceLive(Y), 'Y is void');
+            }
+        },
+        {
+            name: '[PSET35] ref-advances to incomparable versions stay live and do not consult each other',
+            invoke: async () => {
+                const { cap, rset, admin, attacker, bob } = await stewardEnv();
+                const [sam, carol] = [await makeIdentity(), await makeIdentity()];
+                await registerAndGrant(cap, sam, 'steward', admin);
+                await cap.addIdentity(carol.keyId, serializePublicKeyToBase64(carol.publicKey), admin);
+                const c1 = await (await cap.getScopedDag()).getFrontier();
+
+                // va grants Bob write and vb grants Carol write, on incomparable branches.
+                const va = await cap.grant(bob.keyId, 'write', admin, c1);
+                const vb = await cap.grant(carol.keyId, 'write', admin, c1);
+                const R0 = await rset.refAdvance(c1, admin);
+                const A1 = await rset.refAdvance(version(va), attacker, version(R0));
+                const A2 = await rset.refAdvance(version(vb), sam, version(R0));
+                await rset.addSigned('B', bob, version(A1));
+                await rset.addSigned('C', carol, version(A2));
+
+                const view = await rset.getView();
+                assertTrue(await view.has('B'), 'B, authorized only on va, stays');
+                assertTrue(await view.has('C'), 'C, authorized only on vb, stays');
+                assertTrue(await view.isRefAdvanceLive(A1) && await view.isRefAdvanceLive(A2), 'both advances are live');
+            }
+        },
+        {
+            name: '[PSET36] concurrent reads on one view that share a ref-advance verdict agree with reads one at a time',
+            invoke: async () => {
+                const { cap, rset, admin, attacker, bob, c0 } = await stewardEnv();
+                const vAdv = await cap.grant(bob.keyId, 'write', admin, c0);
+                const r = await cap.revoke(attacker.keyId, 'steward', admin, c0);
+
+                // [PSET34]'s shape with several adds after the attacker's advance Y: Bob's
+                // read Y's verdict, the admin's does not need it.
+                const L = await rset.refAdvance(c0, admin);
+                const Y = await rset.refAdvance(version(vAdv), attacker, version(L));
+                const elements = ['E1', 'E2', 'E3', 'K'];
+                for (const element of elements) {
+                    await rset.addSigned(element, element === 'K' ? admin : bob, version(Y));
+                }
+                await rset.refAdvance(version(vAdv, r), admin);
+
+                const shared = await rset.getView();
+                const together = await Promise.all(elements.map((element) => shared.has(element)));
+                const oneAtATime: boolean[] = [];
+                const fresh = await rset.getView();
+                for (const element of elements) oneAtATime.push(await fresh.has(element));
+                assertEquals(JSON.stringify(together), JSON.stringify(oneAtATime), 'concurrent reads agree with reads one at a time');
+                assertEquals(JSON.stringify(together), JSON.stringify([false, false, false, true]), "only the admin's add stays");
             }
         },
     ]

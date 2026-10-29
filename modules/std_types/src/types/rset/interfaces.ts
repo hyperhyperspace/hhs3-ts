@@ -69,6 +69,11 @@ export interface RSetView<T extends json.Literal = json.Literal> extends View {
     has(element: T): Promise<boolean>;
     hasByHash(elementHash: B64Hash): Promise<boolean>;
     checkEntryAuthorization(entryHash: B64Hash): Promise<boolean>;
+    // Whether the ref-advance `entryHash` is live from this view's `from`: its
+    // author passes the set's ref-advance rule at the advance's widened cut. A
+    // void ref-advance contributes no version to the RCap version an entry's
+    // authorization reads.
+    isRefAdvanceLive(entryHash: B64Hash): Promise<boolean>;
     getReferences(): Promise<B64Hash[]>;
     resolveRefVersion(refId: B64Hash): Promise<Version>;
     loadRObjectByHash(elementHash: B64Hash): Promise<RObject | undefined>;

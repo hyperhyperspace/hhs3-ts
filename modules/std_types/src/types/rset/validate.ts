@@ -165,9 +165,10 @@ async function validateRefAdvancePayload(payload: Payload, rset: RSet, at: Versi
 
     if (rset.refAdvanceCreators() && rcap.isCreator(authorId)) return validationOk();
 
-    const rsetView = await rset.getView(at, at);
-    const rcapVersion = await rsetView.resolveRefVersion(rset.capabilityRef()!);
-    const rcapView = await rcap.getView(rcapVersion, rcapVersion);
+    // At the imported version: monotonicity puts it at or above every version
+    // the parents observe. A revoke concurrent with it is caught at use
+    // (RSetViewImpl.isRefAdvanceLive), once the set's horizon observes it.
+    const rcapView = await rcap.getView(newRefVersion, newRefVersion);
     for (const cap of rset.refAdvanceCaps()) {
         if (await rcapView.hasCapability(authorId, cap)) return validationOk();
     }

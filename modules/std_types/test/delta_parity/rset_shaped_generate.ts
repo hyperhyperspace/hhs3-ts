@@ -48,6 +48,7 @@ import { PRNG } from "./prng.js";
 // profile's sample.
 
 const VARIANTS_PER_SEED = 6;
+const VOID_ADVANCE_VARIANTS_PER_SEED = 6;
 
 type Flavor = "plain" | "barrierDelete" | "barrierAdd";
 const FLAVORS: Flavor[] = ["plain", "barrierDelete", "barrierAdd"];
@@ -155,15 +156,107 @@ async function shapedHistory(prng: PRNG, seed: number, variant: number): Promise
     return { rset, rawDag, checkpoints, seed };
 }
 
+// Shaped histories with a ref-advance that turns void ([PSET33]-[PSET34] in
+// permissioned_set_tests.ts). A, a non-creator holding the set's ref-advance
+// cap (steward), advances the set, and RCap revokes A's steward on a branch
+// concurrent with the cut A's advance is judged at:
+//
+//     c0 ── vY ── vZ      vY: A's version: a revoke of B's write, a grant of write to Q, or neutral
+//      \     \            vZ: strictly above vY
+//       rC    rY          rY revokes A's steward, concurrent with vZ only
+//                         rC revokes A's steward, concurrent with vY
+//
+// The set, with every creator ref-advance publishing the fold at its position
+// plus the versions drawn for it:
+//
+//     R0 ── X ── Z ── N        R0 publishes c0. X is B's add of el-1.
+//       \                      Y is A's advance to {vY}, concurrent with X.
+//        Y ── [X2]             X2 is Q's add of el-2, where Q holds write only in vY.
+//                              Z publishes vZ. After X (mostly), it widens Y's cut to vZ
+//                              without entering X's fold, and puts the bound on X.
+//                              N imports rY, rC or both.
+//
+// With vY revoking B's write and only rY imported, Y's version is stable and Y
+// turns void only through its widened cut, so the walk reaches X only if it
+// reports Y's liveness flip. The draws favor that skeleton.
+async function voidAdvanceHistory(prng: PRNG, seed: number, variant: number): Promise<RSetHistory> {
+    const ctx = createMockRContext({ selfValidate: true });
+    ctx.getRegistry().register(RCap.typeId, rCapFactory);
+    ctx.getRegistry().register(RSet.typeId, rSetFactory);
+
+    const [C, A, B, Q] = [await makeIdentity(), await makeIdentity(), await makeIdentity(), await makeIdentity()];
+    const cap = (await ctx.createObject(await RCap.create({
+        seed: `fuzz-rset-void-advance-cap-${seed}-${variant}`,
+        creators: [{ keyId: C.keyId, publicKey: C.publicKey }],
+        initialCaps: { admin: { managedBy: ["creator"] }, steward: { managedBy: ["admin"] }, write: { managedBy: ["admin"] } },
+    }))) as RCap;
+    const rset = (await ctx.createObject(await RSet.create({
+        seed: `fuzz-rset-void-advance-${seed}-${variant}`,
+        initialElements: [],
+        hashAlgorithm: "sha256",
+        capabilityRef: cap.getId(),
+        capRequirements: { add: "write", delete: "write", refAdvance: ["steward"] },
+    }))) as RSet;
+    const rawDag = (await ctx.getDag(rset.getId()))!;
+
+    for (const identity of [A, B, Q]) {
+        await cap.addIdentity(identity.keyId, serializePublicKeyToBase64(identity.publicKey), C);
+    }
+    await cap.grant(A.keyId, "steward", C);
+    const c0 = await cap.grant(B.keyId, "write", C);
+
+    const newIdentity = async (at: B64Hash): Promise<B64Hash> => {
+        const identity = await makeIdentity();
+        return cap.addIdentity(identity.keyId, serializePublicKeyToBase64(identity.publicKey), C, version(at));
+    };
+    const vYDraw = prng.next();
+    const vYKind = vYDraw < 0.6 ? "revokeB" : vYDraw < 0.8 ? "grantQ" : "neutral";
+    const vY = vYKind === "revokeB" ? await cap.revoke(B.keyId, "write", C, version(c0))
+        : vYKind === "grantQ" ? await cap.grant(Q.keyId, "write", C, version(c0))
+        : await newIdentity(c0);
+    const vZ = await newIdentity(vY);
+    const rY = await cap.revoke(A.keyId, "steward", C, version(vY));
+    const rC = await cap.revoke(A.keyId, "steward", C, version(c0));
+
+    const checkpoints: Version[] = [];
+    const record = async (appended: Promise<B64Hash>): Promise<B64Hash> => {
+        const hash = await appended;
+        await recordCheckpoint(checkpoints, await rawDag.getFrontier());
+        return hash;
+    };
+    const creatorAdvance = async (at: Version, imports: B64Hash[]): Promise<B64Hash> => {
+        const fold = await (await rset.getView(at, at)).resolveRefVersion(cap.getId());
+        return record(rset.refAdvance(version(...fold, ...imports), C, at));
+    };
+
+    const R0 = await record(rset.refAdvance(version(c0), C));
+    const X = await record(rset.addSigned("el-1", B, version(R0)));
+    const Y = await record(rset.refAdvance(version(vY), A, version(R0)));
+    if (vYKind === "grantQ" && prng.next() < 0.7) await record(rset.addSigned("el-2", Q, version(Y)));
+
+    const Z = await creatorAdvance(prng.next() < 0.85 ? version(X) : version(R0), [vZ]);
+    const importDraw = prng.next();
+    const imports = importDraw < 0.6 ? [rY] : importDraw < 0.8 ? [rC] : [rY, rC];
+    await creatorAdvance(prng.next() < 0.85 ? version(Z) : await rawDag.getFrontier(), imports);
+
+    return { rset, rawDag, checkpoints, seed };
+}
+
 // Several variants of the skeletons for this seed, cycling through the set
-// flavors. `ops` is unused: the shapes are fixed.
+// flavors, then the void-advance skeleton. `ops` is unused: the shapes are fixed.
 export async function generateShapedRSetHistories(seed: number, _ops: number): Promise<RSetHistory[]> {
     const histories: RSetHistory[] = [];
-    for (let variant = 0; variant < VARIANTS_PER_SEED; variant++) {
-        // Nearby LCG seeds start out nearly equal: scramble, then discard a few.
+    // Nearby LCG seeds start out nearly equal: scramble, then discard a few.
+    const scrambled = (variant: number): PRNG => {
         const prng = new PRNG(Math.imul(seed * 31 + variant, 0x9e3779b1));
         for (let i = 0; i < 4; i++) prng.next();
-        histories.push(await shapedHistory(prng, seed, variant));
+        return prng;
+    };
+    for (let variant = 0; variant < VARIANTS_PER_SEED; variant++) {
+        histories.push(await shapedHistory(scrambled(variant), seed, variant));
+    }
+    for (let variant = VARIANTS_PER_SEED; variant < VARIANTS_PER_SEED + VOID_ADVANCE_VARIANTS_PER_SEED; variant++) {
+        histories.push(await voidAdvanceHistory(scrambled(variant), seed, variant));
     }
     return histories;
 }
