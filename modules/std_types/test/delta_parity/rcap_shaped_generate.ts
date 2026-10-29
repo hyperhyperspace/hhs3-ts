@@ -12,7 +12,7 @@ import type { RCapHistory } from "./parity.js";
 import { PRNG } from "./prng.js";
 
 // Shaped RCap histories: the skeleton of the bounded-delta counterexample
-// (rdb/plans/RCAP_INCREMENTAL_BOUND_WALK.md, "Why"), with randomized barriers on
+// (revokeChainHistory in delta_cap_tests.ts), with randomized barriers on
 // it. The random generators never build it: all their grants and revokes are
 // the creator's, so no verdict ever flips.
 //

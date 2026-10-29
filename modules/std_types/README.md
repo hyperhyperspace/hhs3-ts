@@ -54,9 +54,11 @@ Source: [`src/types/rcap/rcap.ts`](./src/types/rcap/rcap.ts), [`interfaces.ts`](
 
 Why not walk forward from `start`? Because **barriers** (revoke, delete-cap) can void grants that were valid at `start` when observed from `end`, even when the voiding barrier sits on a concurrent branch that forked after `start`. A forward walk from `start` would miss those entries entirely. The walk therefore goes **backward from `end`**, collecting every entry that could still influence what `end` observes — including barriers on branches that diverged after `start`.
 
-The walk stops at the **meet** (greatest lower bound) of the fork points between `start` and `end`. Any entry at or below the meet is in the shared history of both versions; a barrier there is visible from `start` as well as from `end`, so it cannot produce a difference between the two views. Only entries strictly above the meet can change what `end` observes relative to `start`.
+The bounded strategy walks with mvt's `walkRevisionBound`. The bound starts at the **meet** (greatest lower bound) of the fork points between `start` and `end`. Every entry above it is walked. An entry below it can still change without being new: a revoke on a side branch of `start`, concurrent with it, kills it through Kill 2, and a new entry can void that revoke. So the bound also drops below every revoke of `start` that is concurrent with it and whose verdict differs between `start` and `end`, and the walk resumes from there. A revoke reaches concurrent entries only through Kill 2, which reads live revokes, so its effect changed exactly when its verdict did. A delete-cap is creator-only and always live, so it never lowers the bound. RCap references no other object.
 
-`revisionBound` is that meet — the floor below which the type guarantees no `(start, end)` change can reach. A composing consumer (e.g. a permissioned `RSet`) uses it to bound how far back it must re-evaluate references.
+A capability that reappears (re-created after a delete) turns its slot back on, so the grants written before its delete hold again. The delta therefore also compares every grant pair of that capability, walked or not.
+
+`revisionBound` is the floor below which no `(start, end)` change can reach. A composing consumer (a permissioned `RSet`) reads it through `computeRevisionBound(start, end)`, which runs the same walk without building the delta.
 
 **Known limitations / future work:**
 
@@ -69,7 +71,7 @@ A set data type with full MVT support. See the [MVT module documentation](../mvt
 Key features:
 
 - **Simple sets**: add/delete operations over JSON literals, with configurable redundancy acceptance.
-- **Nested object sets**: elements can themselves be `RObject`s, with operations transparently routed through the parent DAG via `NestedScopedDag`.
+- **Nested object sets**: elements can themselves be `RObject`s, with operations transparently routed through the parent DAG via `NestedScopedDag`. A nested set can be permissioned. Its changes are reported by the outermost set's delta, and the bounded delta strategy supports only some nestings (see *Nested sets* under [Delta computation](#delta-computation-1)).
 - **Barrier operations**: optional barrier add/delete for fine-grained concurrency control. A set with `supportBarrierDelete` makes every delete a barrier: the delete removes the element when it is in the cover at `at`, or concurrent with `at` and visible from `from` (not after every head). A set without the flag removes an element only by a delete that dominates the add. A barrier add joins the set when it is concurrent with `at`.
 - **Version-scoped views**: `RSetView` computes set membership at any `(at, from)` version pair, correctly handling concurrent operations and barriers.
 - **Permissioned mode**: when created with a `capabilityRef` and `capRequirements`, the set becomes RCap-gated — add/delete operations require signed payloads from identities holding the appropriate capabilities. See [Permissioned RSet](#permissioned-rset-references-and-compositional-authorization) and [RCap](#rcap--replicable-capability-system) below.
@@ -97,21 +99,29 @@ See **PSET10** (sequential revoke does not void past adds), **PSET17–18** (con
 
 #### Delta computation
 
-`computeDelta(start, end)` reports element membership changes (`added` / `removed`) and, for permissioned sets, per-entry authorization flips (`validityChanges`). Requires `end` to extend `start` (throws otherwise). It walks back from `end` only to a computed **floor**, collects candidate entries above that floor, and returns the floor as `revisionBound`.
+`computeDelta(start, end)` reports element membership changes (`added` / `removed`) and, for permissioned sets, per-entry authorization flips (`validityChanges`). Requires `end` to extend `start` (throws otherwise). It compares, at `(start, start)` and `(end, end)`, every element a walked entry touches and the authorization of every walked add and delete. There are two strategies, chosen with `setDeltaStrategy`: `bounded`, the default, and `full`, which walks the whole history of `end`.
 
-For a **plain** set, the floor is the **meet** of the fork points (`dag.computeMeet` over `findForkPosition(start, end).common`) — identical to the `RCap` pattern. Only entries above the meet can change membership.
+The bounded strategy walks with mvt's `walkRevisionBound`. For a **plain** set the bound is the **meet** of the fork points: a plain set has no verdicts, so only entries above the meet can change membership.
 
-For a **permissioned** set, an entry's membership can also flip below the RSet meet, because the `end`-view observes the referenced `RCap` from a later `from` (`rcapFrom`), pulling in `RCap` barriers (e.g. a revoke concurrent with a grant) that were not visible from `start`. The floor is therefore **woven** with the `RCap` delta:
+For a **permissioned** set, an entry below the meet can flip too, because the `end` view observes the referenced `RCap` from a later `rcapFrom`. The set declares the `RCap` as a reference read at the horizon, and the bound drops further:
 
-1. `rcap_at_meet = resolveRefVersionAtPosition(rset_meet, rset_meet)` and `rcap_at_end = resolveRefVersionAtPosition(end, end)`.
-2. `rcap_bound = rcap.computeDelta(rcap_at_meet, rcap_at_end).getRevisionBound()` — the floor below which no `RCap` change can reach.
-3. Descend to the **lowest unstable ref-advance(s)**. Call a ref-advance *stable* iff its referenced `RCap` version is at or below `rcap_bound` (a `findForkPosition` check on the `RCap` DAG with empty `forkA`), *unstable* otherwise. Starting from the ref-advance cover at `rset_meet`, skip stable ref-advances and descend through unstable ones via their preds; a branch settles when no unstable ref-advance sits below it. The create op is an implicit stable ref-advance to `version(refId)` (the `RCap` root, always at or below `rcap_bound`), so a branch that bottoms out there settles too. The floor is the set of lowest unstable ref-advances — excluded from the walk, since ref-advances carry no element or authorization to re-check. Below the floor the referenced `RCap` version is bounded by `rcap_bound`, so authorization is identical observed from `start` and `end`. If no ref-advance is unstable, the floor is `rset_meet`.
+1. **Below every unstable ref-advance.** `RCap`'s own bound is taken between `rcapFrom` at `start` and at `end`, through `RCap.computeRevisionBound`. A ref-advance is *stable* iff its published `RCap` version is at or below that bound. The bound drops below the lowest unstable ref-advance on each branch of the meet's history, and below every unstable ref-advance of `start` the walk reaches, including one on a side branch whose version widens a concurrent entry's `rcapAt`.
+2. **Below every barrier add or delete of `start`** concurrent with it whose authorization differs between `start` and `end`. The delta's own views read nothing concurrent, so this doesn't change the reported changes. It keeps the bound sound for views at an earlier `at`, which do read concurrent barriers.
+
+Below the bound, every entry's `rcapAt` is at or below `RCap`'s bound, so its authorization reads the same from `start` and from `end`.
+
+**Nested sets.** `computeDelta` runs on the outermost set; calling it on a nested set throws. A walked entry that carries a nested op goes, unwrapped, to that nested object's accumulator, and the delta reports each nested object's changes in its `nested` map, keyed by the nested object's id (its element hash), at any depth: `delta.nested.get(child)?.nested.get(grandchild)`.
+
+The full strategy handles nested sets at any depth, permissioned or not (DELTA11–13). The bounded strategy throws when a walked entry reaches a permissioned nested set, at any depth, or a nested object that isn't an `RSet`. A nested set's entries carry their meta under `inner-<hash>-…`, so the root walk sees neither its barriers nor its ref-advances, and the bound can't account for them. A nested set without a capability ref has no verdicts and needs neither. Since bounded is the default, a set that holds permissioned sets needs `setDeltaStrategy('full')`.
 
 `revisionBound` is the floor below which no `(start, end)` change — membership or authorization — can reach; a sync peer can trust shared state below it without re-checking.
 
 **Known limitations / future work:**
 
 - **Native DAG meet** (performance): shared with `RCap` — `computeMeet` folds `O(k)` `findForkPosition` calls.
+- **Bounded delta over permissioned nested sets**: rejected, see *Nested sets* above. Supporting it needs the walk to see a nested set's barriers and ref-advances, and to take its `RCap`'s bound.
+- **Sync of permissioned nested sets**: `extractForeignDeps` declares only the set's own `capabilityRef`, so the sync layer's dependency gate never sees the `RCap` that a nested set's entries read. Untested: whether such an entry is deferred or rejected when the `RCap` entries it reads are missing.
+- **Delta parity over nesting**: the parity sweeps don't generate nested sets. Nested deltas are covered by DELTA11–13 and SET_BOUND04 only.
 
 ## Authorship helpers
 
@@ -134,7 +144,7 @@ Nine test suites exercise the module:
 - **Permissioned set tests** (`test/permissioned_set_tests.ts`): RCap-gated `RSet` integration covering authorized/unauthorized add and delete, signed convenience methods, ref-advance authorization, predicate-aware peeling for void entries, compositional `RCap.getView(at, from)` for per-entry authorization (PSET20), transitive revocation through `managedBy` chains, and `extractForeignDeps`.
 - **Delta unit tests** (`test/delta_set_tests.ts`, `test/delta_cap_tests.ts`): hand-written scenarios for `computeDelta` semantics and revision-bound behavior.
 - **Subscribe tests** (`test/subscribe_tests.ts`): `RObject.subscribe` reactivity — nested-object notification, lazy activation (the physical DAG is observed only while a subscriber is registered), and the register-then-read consumer contract.
-- **Delta parity tests** (`test/delta_parity/`): deterministic `computeDelta` parity tests that build pseudo-random RCap/RSet histories from a PRNG seed and assert `bounded` and `full` strategies agree on normalized changes (same check as CAP_DELTA05 / DELTA05). Included in `npm run test` using the **smoke** profile (2 seeds, 20 ops, 40 pairs/seed). A heavier **extended** profile (8 seeds, 80 ops, 200 pairs/seed) runs via `npm run test:parity`. Filter with `DELTA_PARITY` (all), `DELTA_PARITY_RCAP`, `DELTA_PARITY_RSET_PLAIN`, `DELTA_PARITY_RSET_PERM`, or branchy variants `DELTA_PARITY_BRANCHY_*` (branchy suites skip unless `--profile extended`). Override size: `npm run test -- DELTA_PARITY --profile extended`, or `--seeds <seed> --ops <n> --max-pairs <k>`.
+- **Delta parity tests** (`test/delta_parity/`): deterministic `computeDelta` parity tests that build pseudo-random RCap/RSet histories from a PRNG seed and assert `bounded` and `full` strategies agree on normalized changes (same check as CAP_DELTA05 / DELTA05). Included in `npm run test` using the **smoke** profile (2 seeds, 20 ops, 40 pairs/seed). A heavier **extended** profile (8 seeds, 80 ops, 200 pairs/seed) runs via `npm run test:parity`. The `_SHAPED` sweeps build the skeletons of known bounded-delta counterexamples with randomized content; the random generators rarely produce them. Filter with `DELTA_PARITY` (all), `DELTA_PARITY_RCAP`, `DELTA_PARITY_RCAP_SHAPED`, `DELTA_PARITY_RSET_PLAIN`, `DELTA_PARITY_RSET_PERM`, `DELTA_PARITY_RSET_SHAPED`, or branchy variants `DELTA_PARITY_BRANCHY_*` (branchy suites skip unless `--profile extended`). Override size: `npm run test -- DELTA_PARITY --profile extended`, or `--seeds <seed> --ops <n> --max-pairs <k>`.
 - **Permissioned sync integration tests** (`replica/test/replica_permissioned_sync_tests.ts`): end-to-end tests through the full Replica + mesh stack — see the [replica module](../replica) for details.
 
 To run the unit tests:

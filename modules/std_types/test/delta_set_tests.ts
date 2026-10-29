@@ -1,14 +1,15 @@
 import { assertTrue, assertFalse, assertEquals } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { set } from "@hyper-hyper-space/hhs3_util";
 import { HASH_SHA256, createBasicCrypto, createIdentity, SIGNING_ED25519, stringToUint8Array } from "@hyper-hyper-space/hhs3_crypto";
-import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
+import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { version } from "@hyper-hyper-space/hhs3_mvt";
+import type { DeltaChanges, Version } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
 import { RCap, rCapFactory } from "../src/types/rcap/rcap.js";
 import { RSet, rSetFactory } from "../src/types/rset/rset.js";
-import type { RSetDelta } from "../src/types/rset/rset.js";
+import type { RSetChanges, RSetDelta } from "../src/types/rset/rset.js";
 import { serializePublicKeyToBase64 } from "../src/authorship.js";
 import { normalizeRSetDelta } from "./delta_parity/normalize.js";
 
@@ -31,6 +32,68 @@ async function computeRSetWithStrategy(
 ): Promise<RSetDelta> {
     rset.setDeltaStrategy(strategy);
     return await rset.computeDelta(start, end) as RSetDelta;
+}
+
+// The bounded delta between `start` and `end`, checked against the full one.
+async function boundedSetDelta(rset: RSet, start: Version, end: Version): Promise<RSetDelta> {
+    const full = await computeRSetWithStrategy(rset, 'full', start, end);
+    const bounded = await computeRSetWithStrategy(rset, 'bounded', start, end);
+    assertEquals(
+        JSON.stringify(normalizeRSetDelta(bounded)),
+        JSON.stringify(normalizeRSetDelta(full)),
+        'the bounded delta matches the full one',
+    );
+    return bounded;
+}
+
+function isExactly(v: Version, ...hashes: B64Hash[]): boolean {
+    return v.size === hashes.length && hashes.every((h) => v.has(h));
+}
+
+function permissionedContext() {
+    const ctx = createMockRContext({ selfValidate: true });
+    ctx.getRegistry().register(RCap.typeId, rCapFactory);
+    ctx.getRegistry().register(RSet.typeId, rSetFactory);
+    return ctx;
+}
+
+async function addIdentities(cap: RCap, author: OwnIdentity, ...identities: OwnIdentity[]): Promise<void> {
+    for (const identity of identities) {
+        await cap.addIdentity(identity.keyId, serializePublicKeyToBase64(identity.publicKey), author);
+    }
+}
+
+// An RCap where admin is managed by the creator and write by admin, and a set
+// over it whose adds and deletes require write. Bob is an identity.
+async function writeCapSet(seed: string, barrierDelete: boolean) {
+    const ctx = permissionedContext();
+    const [admin, bob] = [await makeIdentity(), await makeIdentity()];
+    const cap = (await ctx.createObject(await RCap.create({
+        seed: seed + '-cap',
+        creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
+        initialCaps: { admin: { managedBy: ['creator'] }, write: { managedBy: ['admin'] } },
+    }))) as RCap;
+    const rset = (await ctx.createObject(await RSet.create({
+        seed: seed + '-set',
+        initialElements: [],
+        hashAlgorithm: 'sha256',
+        supportBarrierDelete: barrierDelete,
+        capabilityRef: cap.getId(),
+        capRequirements: { add: 'write', delete: 'write' },
+    }))) as RSet;
+    await addIdentities(cap, admin, bob);
+    return { ctx, cap, rset, admin, bob };
+}
+
+// Bob's grant g, then two entries on branches off it: t1 (an identity) and
+// r, a revoke of Bob's write. r is concurrent with t1, so a view at t1 whose
+// `from` holds r fails Bob's write.
+async function concurrentRevokeOfBob(cap: RCap, admin: OwnIdentity, bob: OwnIdentity) {
+    const g = await cap.grant(bob.keyId, 'write', admin);
+    const dave = await makeIdentity();
+    const t1 = await cap.addIdentity(dave.keyId, serializePublicKeyToBase64(dave.publicKey), admin, version(g));
+    const r = await cap.revoke(bob.keyId, 'write', admin, version(g));
+    return { g, t1, r };
 }
 
 export const deltaTests = {
@@ -252,7 +315,7 @@ export const deltaTests = {
             }
         },
         {
-            name: '[DELTA06] Permissioned RSet: woven floor on concurrent revoke',
+            name: '[DELTA06] Permissioned RSet: the bound drops below an unstable ref-advance on a concurrent revoke',
             invoke: async () => {
                 const ctx = createMockRContext({ selfValidate: true });
                 ctx.getRegistry().register(RCap.typeId, rCapFactory);
@@ -289,7 +352,6 @@ export const deltaTests = {
                 await rset.refAdvance(capV1, admin);
 
                 const setDag = (await ctx.getDag(rset.getId()))!;
-                const afterRa1 = await setDag.getFrontier();
 
                 await rset.addSigned('Y', bob);
 
@@ -310,9 +372,11 @@ export const deltaTests = {
                     JSON.stringify(normalizeRSetDelta(reference)),
                     'default bounded delta should match reference scan across the revoke',
                 );
+                // ra1, the advance to capV1, is unstable, so the bound drops below it,
+                // to the create op, and ra1 is walked.
                 assertTrue(
-                    set.eq(delta.getRevisionBound(), afterRa1),
-                    'floor descent lands at the ref-advance just below the meet (tight floor)',
+                    set.eq(delta.getRevisionBound(), version(rset.getId())),
+                    'the bound drops below the ref-advance just below the meet',
                 );
                 assertTrue(delta.removed.includes(hashElement('Y')), 'Y should be removed');
                 const bobChange = delta.validityChanges.find(vc => vc.author === bob.keyId);
@@ -351,7 +415,7 @@ export const deltaTests = {
             }
         },
         {
-            name: '[DELTA08] Permissioned RSet: woven floor lands at the RSet meet when all ref-advances are stable',
+            name: '[DELTA08] Permissioned RSet: the bound is the RSet meet when all ref-advances are stable',
             invoke: async () => {
                 const ctx = createMockRContext({ selfValidate: true });
                 ctx.getRegistry().register(RCap.typeId, rCapFactory);
@@ -392,9 +456,8 @@ export const deltaTests = {
 
                 // Sequential revoke (after the grant) -> at capV2 the RCap evolves cleanly, so the
                 // RCap revision bound stays at capV1. Every RSet ref-advance is then stable (its
-                // referenced RCap version is at or below the bound), so the descent finds nothing
-                // unstable and the woven floor lands at the RSet meet (use-before-revoke keeps Y,
-                // so the delta is empty).
+                // referenced RCap version is at or below the bound), so the bound stays at the
+                // RSet meet (use-before-revoke keeps Y, so the delta is empty).
                 await cap.revoke(bob.keyId, 'write', admin);
                 const capV2 = await (await cap.getScopedDag()).getFrontier();
                 await rset.refAdvance(capV2, admin);
@@ -413,12 +476,12 @@ export const deltaTests = {
 
                 assertTrue(delta.getRevisionBound().size > 0, 'revision bound should be non-empty');
 
-                // All ref-advances are stable, so the woven floor is the RSet meet, which sits at
+                // All ref-advances are stable, so the bound is the RSet meet, which sits at
                 // or below start (forkA empty against start).
                 const boundVsStart = await setDag.findForkPosition(delta.getRevisionBound(), start);
                 assertEquals(boundVsStart.forkA.size, 0, 'revision bound must be at or below start');
 
-                // ...and strictly above the create op: the meet is a real floor, not the trivial
+                // ...and strictly above the create op: the meet is a real bound, not the trivial
                 // whole-DAG fallback.
                 assertFalse(
                     set.eq(delta.getRevisionBound(), version(rset.getId())),
@@ -487,7 +550,7 @@ export const deltaTests = {
             }
         },
         {
-            name: '[DELTA10] Permissioned RSet: descent passes a higher ref-advance to settle at the lowest unstable one',
+            name: '[DELTA10] Permissioned RSet: the bound passes a higher unstable ref-advance and drops below the lowest one',
             invoke: async () => {
                 const ctx = createMockRContext({ selfValidate: true });
                 ctx.getRegistry().register(RCap.typeId, rCapFactory);
@@ -524,7 +587,6 @@ export const deltaTests = {
                 await rset.refAdvance(capV1, admin);
 
                 const setDag = (await ctx.getDag(rset.getId()))!;
-                const afterRa1 = await setDag.getFrontier();
 
                 await rset.addSigned('X', bob);
 
@@ -555,11 +617,12 @@ export const deltaTests = {
                     'default bounded delta should match reference scan across a multi-level descent',
                 );
 
-                // The floor is the lowest unstable ref-advance (ra1), reached by descending past ra2.
-                // A floor stuck at ra2 would skip addX and drop its validity flip, breaking the match.
+                // The bound drops below the lowest unstable ref-advance (ra1), reached by
+                // descending past ra2, to the create op. A bound stuck below ra2 would skip
+                // addX and drop its validity flip, breaking the match.
                 assertTrue(
-                    set.eq(delta.getRevisionBound(), afterRa1),
-                    'descent settles at the lowest unstable ref-advance (ra1), below addX',
+                    set.eq(delta.getRevisionBound(), version(rset.getId())),
+                    'the bound drops below the lowest unstable ref-advance (ra1), below addX',
                 );
                 assertTrue(delta.removed.includes(hashElement('X')), 'X is voided by the concurrent revoke');
                 assertTrue(delta.removed.includes(hashElement('Y')), 'Y is voided by the concurrent revoke');
@@ -658,6 +721,247 @@ export const deltaTests = {
                 const innerAdded = (innerChanges!.changes as { added: string[] }).added;
                 assertTrue(innerAdded.includes(hashElement('gamma')), 'inner gamma is added');
                 assertFalse(innerAdded.includes(hashElement('alpha')), 'stable inner alpha is not reported');
+            }
+        },
+        {
+            name: '[DELTA13] Nested permissioned RSet: the full delta reports an inner add voided through a side-branch ref-advance, at any depth',
+            invoke: async () => {
+                const ctx = permissionedContext();
+                const [admin, bob] = [await makeIdentity(), await makeIdentity()];
+                const outer = (await ctx.createObject(await RSet.create({
+                    seed: 'delta-13-outer',
+                    contentType: RSet.typeId,
+                    initialElements: [],
+                    hashAlgorithm: 'sha256',
+                }))) as RSet;
+                const dag = (await ctx.getDag(outer.getId()))!;
+
+                // The [SET_BOUND01] shape inside a permissioned set held by
+                // `parent`, over its own RCap: from `end`, Bob's add X of 'Y'
+                // turns void and 'Y' leaves the set.
+                const flipInside = async (parent: RSet, seed: string) => {
+                    const cap = (await ctx.createObject(await RCap.create({
+                        seed: seed + '-cap',
+                        creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
+                        initialCaps: { admin: { managedBy: ['creator'] }, write: { managedBy: ['admin'] } },
+                    }))) as RCap;
+                    await addIdentities(cap, admin, bob);
+                    const { g, t1, r } = await concurrentRevokeOfBob(cap, admin, bob);
+
+                    const hash = await parent.add(await RSet.create({
+                        seed,
+                        initialElements: [],
+                        hashAlgorithm: 'sha256',
+                        capabilityRef: cap.getId(),
+                        capRequirements: { add: 'write', delete: 'write' },
+                    }));
+                    const inner = (await (await parent.getView()).loadRObjectByHash(hash)) as RSet;
+                    const R0 = await inner.refAdvance(version(g), admin);
+                    const X = await inner.addSigned('Y', bob, version(R0));
+                    const T = await inner.refAdvance(version(t1), admin, version(R0));
+                    const N = await inner.refAdvance(version(t1, r), admin, version(X));
+                    const [start, end] = [version(X, T), version(N, T)];
+                    assertTrue(set.eq(await dag.getFrontier(), end), 'end is the outer frontier');
+                    assertTrue(await (await inner.getView(start, start)).has('Y'), 'Y is in the inner set at start');
+                    assertFalse(await (await inner.getView(end, end)).has('Y'), 'Y is not in the inner set at end');
+                    return { hash, X, start, end };
+                };
+                const checkFlip = (changes: DeltaChanges | undefined, X: B64Hash, where: string) => {
+                    assertTrue(changes !== undefined, 'the nested map has an entry for the ' + where);
+                    const { removed, validityChanges } = changes!.changes as RSetChanges;
+                    assertTrue(removed.includes(hashElement('Y')), 'Y is removed from the ' + where);
+                    const change = validityChanges.find((vc) => vc.entryHash === X);
+                    assertTrue(change !== undefined && change.wasValid && !change.nowValid, 'X turns void in the ' + where);
+                };
+
+                const child = await flipInside(outer, 'delta-13-child');
+                const childDelta = await computeRSetWithStrategy(outer, 'full', child.start, child.end);
+                checkFlip(childDelta.nested.get(child.hash), child.X, 'child');
+
+                const middleHash = await outer.add(await RSet.create({
+                    seed: 'delta-13-middle',
+                    contentType: RSet.typeId,
+                    initialElements: [],
+                    hashAlgorithm: 'sha256',
+                }));
+                const middle = (await (await outer.getView()).loadRObjectByHash(middleHash)) as RSet;
+                const grandchild = await flipInside(middle, 'delta-13-grandchild');
+                const grandchildDelta = await computeRSetWithStrategy(outer, 'full', grandchild.start, grandchild.end);
+                checkFlip(grandchildDelta.nested.get(middleHash)?.nested.get(grandchild.hash), grandchild.X, 'grandchild');
+            }
+        },
+        {
+            name: '[SET_BOUND01] an add below the meet, widened by a side-branch ref-advance, flips when a new ref-advance imports a revoke concurrent with that version',
+            invoke: async () => {
+                const { cap, rset, admin, bob } = await writeCapSet('set-bound-01', false);
+                const { g, t1, r } = await concurrentRevokeOfBob(cap, admin, bob);
+
+                // R0 ── X ── N        start = {X, T}, end = {N, T}
+                //   \
+                //    T                T publishes t1, N publishes {t1, r}
+                //
+                // T is concurrent with X, so X's refAt is t1 at both horizons. At
+                // `end`, refFrom also holds r, which is concurrent with t1, so
+                // Bob's write fails. RCap's bound between t1 and {t1, r} is g, so
+                // T is unstable; it is not in the meet's history.
+                const R0 = await rset.refAdvance(version(g), admin);
+                const X = await rset.addSigned('Y', bob, version(R0));
+                const T = await rset.refAdvance(version(t1), admin, version(R0));
+                const N = await rset.refAdvance(version(t1, r), admin, version(X));
+
+                const delta = await boundedSetDelta(rset, version(X, T), version(N, T));
+                assertTrue(delta.removed.includes(hashElement('Y')), 'Y is removed');
+                const change = delta.validityChanges.find((vc) => vc.entryHash === X);
+                assertTrue(change !== undefined && change.wasValid && !change.nowValid, 'X turns void');
+                assertTrue(isExactly(delta.getRevisionBound(), R0), 'the bound drops below T, so X is walked');
+            }
+        },
+        {
+            name: '[SET_BOUND02] the RCap bound is taken between the versions observed at start and at end, not at the meet',
+            invoke: async () => {
+                const ctx = permissionedContext();
+                const [C, Rt, S, A, B, Q] = [
+                    await makeIdentity(), await makeIdentity(), await makeIdentity(),
+                    await makeIdentity(), await makeIdentity(), await makeIdentity(),
+                ];
+                // Q is added at s1, after G.
+                const cap = (await ctx.createObject(await RCap.create({
+                    seed: 'set-bound-02-cap',
+                    creators: [{ keyId: C.keyId, publicKey: C.publicKey }],
+                    initialCaps: {
+                        root: { managedBy: ['creator'] },
+                        super: { managedBy: ['root'] },
+                        admin: { managedBy: ['super'] },
+                        write: { managedBy: ['admin'] },
+                    },
+                }))) as RCap;
+                const rset = (await ctx.createObject(await RSet.create({
+                    seed: 'set-bound-02-set',
+                    initialElements: [],
+                    hashAlgorithm: 'sha256',
+                    capabilityRef: cap.getId(),
+                    capRequirements: { add: 'write', delete: 'write' },
+                }))) as RSet;
+
+                // In RCap:
+                //
+                //     gA ── G ── s1 ── V        T revokes A's admin, concurrent with G
+                //       \          \            V revokes S's super, concurrent with T
+                //        T          W           W revokes Rt's root, concurrent with V
+                //
+                // Bob's grant G is killed by T when T is live. T is live at
+                // {s1, T}, void at {V, T} (V is live), and live again at
+                // {V, W, T} (W voids V).
+                await addIdentities(cap, C, Rt, S, A, B);
+                await cap.grant(Rt.keyId, 'root', C);
+                await cap.grant(S.keyId, 'super', Rt);
+                const gA = await cap.grant(A.keyId, 'admin', S);
+                const G = await cap.grant(B.keyId, 'write', A, version(gA));
+                const T = await cap.revoke(A.keyId, 'admin', S, version(gA));
+                const s1 = await cap.addIdentity(Q.keyId, serializePublicKeyToBase64(Q.publicKey), C, version(G));
+                const V = await cap.revoke(S.keyId, 'super', Rt, version(s1));
+                const W = await cap.revoke(Rt.keyId, 'root', C, version(s1));
+
+                // In the set:
+                //
+                //     RG ── X ── RM ── P ── N       start = {P, RS}, end = {N, RS}
+                //                  \
+                //                   RS              RG: G, RM: {s1, T}, RS: {V, T}, N: {V, W, T}
+                //
+                // X is Bob's add, read at G throughout. It is valid at `start`
+                // (T void) and void at `end` (T live). The meet is P, which
+                // observes {s1, T}; there and at `end` T is live, so a bound
+                // taken from the meet sees no change in RCap below s1.
+                const RG = await rset.refAdvance(version(G), C);
+                const X = await rset.addSigned('Y', B, version(RG));
+                const RM = await rset.refAdvance(version(s1, T), C, version(X));
+                const P = await rset.addSigned('Z', C, version(RM));
+                const RS = await rset.refAdvance(version(V, T), C, version(RM));
+                const N = await rset.refAdvance(version(V, W, T), C, version(P));
+
+                const delta = await boundedSetDelta(rset, version(P, RS), version(N, RS));
+                assertTrue(delta.removed.includes(hashElement('Y')), 'Y is removed');
+                const change = delta.validityChanges.find((vc) => vc.entryHash === X);
+                assertTrue(change !== undefined && change.wasValid && !change.nowValid, 'X turns void');
+                assertTrue(isExactly(delta.getRevisionBound(), rset.getId()), 'the bound drops below RG, so X is walked');
+            }
+        },
+        {
+            name: '[SET_BOUND03] a side-branch barrier delete whose authorization flips lowers the bound below it',
+            invoke: async () => {
+                const { cap, rset, admin, bob } = await writeCapSet('set-bound-03', true);
+                const { g, t1, r } = await concurrentRevokeOfBob(cap, admin, bob);
+
+                //            ┌── D                start = {D, R}, end = {D, N}
+                // R0 ── a ───┤
+                //            └── v ── R ── N      R publishes t1, N publishes {t1, r}
+                //
+                // D is Bob's barrier delete of e. R is concurrent with D, so D's
+                // authorization flips at `end`, when its concurrent fold holds r.
+                // The view at v reads D, a barrier concurrent with it, so it
+                // sees e at `end` and not at `start`: the bound must drop below v.
+                // R alone lowers it only to v.
+                const R0 = await rset.refAdvance(version(g), admin);
+                const a = await rset.addSigned('e', admin, version(R0));
+                const D = await rset.deleteWithBarrierSigned('e', bob, version(a));
+                const v = await rset.addSigned('f', admin, version(a));
+                const R = await rset.refAdvance(version(t1), admin, version(v));
+                const N = await rset.refAdvance(version(t1, r), admin, version(R));
+
+                const delta = await boundedSetDelta(rset, version(D, R), version(D, N));
+                assertTrue(delta.added.includes(hashElement('e')), 'e is back once D turns void');
+                const change = delta.validityChanges.find((vc) => vc.entryHash === D);
+                assertTrue(change !== undefined && change.wasValid && !change.nowValid, 'D turns void');
+                assertTrue(isExactly(delta.getRevisionBound(), a), 'the bound drops below D');
+            }
+        },
+        {
+            name: '[SET_BOUND04] the bounded delta rejects a permissioned nested set, at any depth; the full one does not',
+            invoke: async () => {
+                const ctx = permissionedContext();
+                const admin = await makeIdentity();
+                const cap = (await ctx.createObject(await RCap.create({
+                    seed: 'set-bound-04-cap',
+                    creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
+                    initialCaps: { write: { managedBy: ['creator'] } },
+                }))) as RCap;
+                const nestedSet = (seed: string, permissioned: boolean) => RSet.create({
+                    seed,
+                    initialElements: [],
+                    hashAlgorithm: 'sha256',
+                    ...(permissioned
+                        ? { capabilityRef: cap.getId(), capRequirements: { add: 'write' } }
+                        : { contentType: RSet.typeId }),
+                });
+
+                const outer = (await ctx.createObject(await RSet.create({
+                    seed: 'set-bound-04-outer',
+                    contentType: RSet.typeId,
+                    initialElements: [],
+                    hashAlgorithm: 'sha256',
+                }))) as RSet;
+                const dag = (await ctx.getDag(outer.getId()))!;
+
+                const rejects = async (start: Version, end: Version, what: string) => {
+                    await computeRSetWithStrategy(outer, 'full', start, end);
+                    let threw = false;
+                    try {
+                        await computeRSetWithStrategy(outer, 'bounded', start, end);
+                    } catch (e) {
+                        threw = (e as Error).message.indexOf('permissioned nested set') >= 0;
+                    }
+                    assertTrue(threw, 'the bounded delta rejects ' + what);
+                };
+
+                const beforeChild = await dag.getFrontier();
+                await outer.add(await nestedSet('set-bound-04-child', true));
+                await rejects(beforeChild, await dag.getFrontier(), 'a permissioned child');
+
+                const middleHash = await outer.add(await nestedSet('set-bound-04-middle', false));
+                const middle = (await (await outer.getView()).loadRObjectByHash(middleHash)) as RSet;
+                const beforeGrandchild = await dag.getFrontier();
+                await middle.add(await nestedSet('set-bound-04-grandchild', true));
+                await rejects(beforeGrandchild, await dag.getFrontier(), 'a permissioned grandchild');
             }
         },
     ]

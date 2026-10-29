@@ -211,27 +211,29 @@ export async function runRCapSeedSweep(
 }
 
 export async function runRSetSeedSweep(
-    generate: (seed: number, ops: number) => Promise<RSetHistory>,
+    generate: (seed: number, ops: number) => Promise<RSetHistory | RSetHistory[]>,
     options: ResolvedFuzzSweepOptions,
 ): Promise<void> {
     for (const seed of options.seeds) {
-        const history = await generate(seed, options.ops);
-        const pairs = subsamplePairs(
-            await collectExtendingPairs(history.rawDag, history.checkpoints),
-            seed,
-            options.maxPairs,
-        );
-
-        for (const [startIdx, endIdx, start, end] of pairs) {
-            await compareRSetDeltaStrategies(history.rset, start, end, {
+        const generated = await generate(seed, options.ops);
+        for (const history of Array.isArray(generated) ? generated : [generated]) {
+            const pairs = subsamplePairs(
+                await collectExtendingPairs(history.rawDag, history.checkpoints),
                 seed,
-                opIndex: endIdx,
-                start,
-                end,
-            });
-            process.stdout.write(".");
-        }
+                options.maxPairs,
+            );
 
-        process.stdout.write(`\n  seed=${seed} pairs=${pairs.length} (max ${options.maxPairs})\n`);
+            for (const [, endIdx, start, end] of pairs) {
+                await compareRSetDeltaStrategies(history.rset, start, end, {
+                    seed,
+                    opIndex: endIdx,
+                    start,
+                    end,
+                });
+                process.stdout.write(".");
+            }
+
+            process.stdout.write(`\n  seed=${seed} pairs=${pairs.length} (max ${options.maxPairs})\n`);
+        }
     }
 }

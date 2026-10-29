@@ -17,7 +17,7 @@ Phases 1–4 and the follow-up changed the ground under the old Phase 5 text. Th
 | Canonical folds | `rcapViewForEntry` and `RSetViewImpl.resolveRefVersion` already run `canonicalVersion` on the RCap DAG. A strictly dominating advance already drops the older heads from a fold that contains both. |
 | Element checks | `hasByHash` authorizes through `hasCapability`, which is the two-check holding rule. `[PSET17]` voids an add concurrent with a ref-advance that imports a revoke. `[PSET25]` voids an add whose `refAt` sits under a grant while a later sequential advance pulls a concurrent revoke into `refFrom`. |
 | The walk | `RTableGroupImpl.resolveObserveGateRefAt` (`group.ts`, around lines 699–734) is the finished Layer 1 walk, and it already returns `canonicalVersion`. It is still private to the group. |
-| The delta floor | `computeObserverRevisionBound` calls `resolveRefVersionAtPosition` with no liveness filter (`mvt/src/delta.ts`). It does not go through `RSetViewImpl.resolveRefVersion`. |
+| The delta bound | RSet's bounded delta uses `walkRevisionBound` (`mvt/src/revision_bound.ts`). Its reads of the reference are geometric: `resolveVersion` is `RSetViewImpl.resolveRefVersion`, and the walk descends the ref-advance cover with no liveness filter. |
 | Ref-advances are barriers | `prepareRefAdvance` / `createRefAdvanceMeta` tag `barrier`. `RSet.applyPayload` uses that meta. The concurrent fold already sees them. |
 
 `hasCapability` returns a boolean. A cycle inside RCap collapses in the evaluation `hasCapability` mints, or throws if a result is read outside that evaluation (`rcap/view.ts`, the throw in `hasCapability`). An RSet ref-advance verdict that calls `hasCapability` does not join an RCap component, and it does not need its own `VerdictEvaluation`.
@@ -48,7 +48,7 @@ Rdb keeps them distinct. This phase copies that split. Merging them is what woul
 
 **Layer 2, the fold a reader uses.** Element authorization resolves `refAt` with `isLive` set to the Layer 1 verdict. A void advance contributes no version and does not hide a live advance below it, whether or not its version dominated anything. `refFrom` is the geometric resolution at `(from, from)`. Filtering is a property of which versions participate in `at`.
 
-The public `resolveRefVersion` and the delta floor stay on the geometric fold. `[PSET24]` reads the public method and expects the concurrent barrier's hashes. `[PSET25]` depends on a later advance moving `refFrom` without being reclassified by a filtered floor.
+The public `resolveRefVersion` and the delta bound's reads of the reference stay on the geometric fold. `[PSET24]` reads the public method and expects the concurrent barrier's hashes. `[PSET25]` depends on a later advance moving `refFrom` without being reclassified by a filtered floor.
 
 ---
 
@@ -135,32 +135,22 @@ const rcapView = await rcap.getView(newRefVersion, newRefVersion);
 These stay geometric, with no `isLive`:
 
 - `RSetViewImpl.resolveRefVersion`. `[PSET24]` asserts the widened public version.
-- `computeObserverRevisionBound` and `projectForeignBound`. A void advance is not reclassified as unstable by a second, stricter floor.
+- The delta bound's reads of the reference in `walkRevisionBound`: `resolveVersion` and the ref-advance descent. A void advance is not reclassified as unstable by a second, stricter fold. Its flip reaches the bound through the visitor (below).
 - Admission of adds and deletes.
 - The base inside `widenRefAtUpward`.
 
 `resolveRefVersions` gains no `isLive` parameter. Callers that want a filtered `refAt` call `resolveRefVersionAtPosition`.
 
-### Why the delta floor needs no change
+### The delta bound
 
-A bounded delta walks from `end` down to a floor and skips everything only reachable through it (`walkEntriesBackwardsToBound` in `mvt/src/delta.ts`). For a permissioned set the floor comes from `computeObserverRevisionBound`:
+RSet's bounded delta uses `walkRevisionBound`. The set declares its RCap as a `'horizon'` reference, and the visitor returns true for a barrier add or delete of `start` whose authorization flipped (`std_types/src/types/rset/delta.ts`). The walk already drops below every ref-advance whose published version is above RCap's bound between the versions observed at `start` and at `end`. That includes an unstable side-branch advance of `start` concurrent with an element, which widens the element's concurrent fold. Before RSet adopted the walk, the meet-based projection missed that case. It was the residual case this section used to trace by hand, and `[SET_BOUND01]` reproduces it.
 
-1. Take the RSet fork meet.
-2. Resolve the geometric RCap versions at the meet and at `end`, and compute the RCap delta between them. Its revision bound `b` is `computeForkMeet(fork.common)` on the RCap DAG.
-3. `projectForeignBound` descends from the ref-advance cover at the meet. An advance is stable when its published version is at or below `b`. The descent stops at the first stable advance on each branch, and the floor is the lowest unstable advances.
+This phase adds one case to the visitor: **a ref-advance candidate whose liveness differs between `start` and `end`.** An advance `Y` can flip while its own version is stable, through its widened Layer 1 cut. When it does, an entry `E` concurrent with `Y` gains or loses `vY` from its Layer 2 fold, so `E`'s authorization can flip, and nothing else makes the walk reach `E`. With the visitor reporting the flip, the bound drops below `Y`, and every entry concurrent with `Y` is walked. Read the liveness at the `start` and `end` views, as the accumulator reads authorization; the delta still does not report advance flips (§2).
 
-`fork.common` is not the shared frontier. It is the shared entries that have a successor on only one side (`dag_defs.ts`), so every RCap entry that is new between the two versions has its predecessors in `common`, and `b` is at or below all of them. Two consequences:
+Two things to check while implementing it, against the contract in `walkRevisionBound`'s comment:
 
-- **A new RCap entry is never concurrent with a version at or below `b`.** If `v` is at or below `b`, it is below the predecessors of every new entry, so every new entry is after `v`. Kill 2 at `v` gains nothing between `start` and `end`. The verdicts of the RCap ops inside `v` are stable for the same reason; element checks already rely on this.
-- **So an advance whose verdict reads only its own version cannot flip while it is stable.** If its liveness differs between `start` and `end`, some new RCap entry must be concurrent with its version, and then the version is above `b` and the advance is unstable. The existing version test finds it, with no liveness input. Below a stable advance `Y`, every advance `X` has `vX` at or below `vY` by monotonicity, so `X` is stable in version and in verdict, and the early stop stays safe.
-
-The causal see-through fixture in §5 shows it. Read as a delta from `E` to the later advance `Z`, the set meet is `E`. The new RCap entry is the revoke `r`, which is concurrent with `vAdv`, so `vAdv` is not at or below `b` (that would put `vAdv` below `r`). `Y` is unstable, the descent continues to `L`, and the floor is `Y` whenever `L`'s version is below the point where `r` forks. The walk reaches `E`, and full and bounded agree.
-
-**The residual case is widening.** An advance's verdict reads its widened Layer 1 cut, not only its published version. A live concurrent candidate `C` adds `vC`, which can be above `b` while `vY` is not. A new revoke attached above `b` is then after `vY` and possibly concurrent with `vC`, so `Y` can flip while its own version is stable.
-
-This shape is not new in this phase. For an element `E` above `Y` to be skipped, it must lie below a floor entry `F`. `C` cannot be below `F`, or `F` would not be the lowest unstable advance on its branch; `C` cannot be above `E`, since it is concurrent with `Y`. So `C` is concurrent with `E` too. `E`'s own concurrent fold therefore already contains `vC` today, and the same new revoke can flip `E` without Phase 5. The projection promises that causal folds below the floor stay at or below `b`. It promises nothing about concurrent folds. This is traced by hand, not yet reproduced.
-
-The parity fixture in §5 builds this shape on purpose. If full and bounded disagree there, the fix belongs in `projectForeignBound`, as a follow-on to the floor's guarantee, not to the ref-advance verdict. The candidates are to treat an advance or an element as unstable when its concurrent fold contains an unstable advance, or to stop at the meet when such a fold exists.
+- Condition 6 says a referenced object is read through views whose `at` folds the ref-advances in the reading entry's past and the concurrent ref-advance barriers. The Layer 2 fold is a subset of that geometric fold, the live advances. Its versions are each at or below RCap's bound whenever the geometric fold's are, so the argument for stable folds should carry over; confirm it, and reword the condition if it should name the subset.
+- A stable advance below the bound can flip only through a candidate in its Layer 1 cut. Confirm that such a candidate is unstable or flips itself, and so is walked and lowers the bound below the advance.
 
 ---
 
@@ -206,13 +196,11 @@ The strict-dominance back-dated advance (the `[OCUT01]` shape: publish `{v1}`, a
 
 **Memo under concurrent reads.** On one view, run `has` for several elements with `Promise.all`, where their authorizations share a ref-advance verdict. The reads agree with the same reads run one at a time, and none throws.
 
-**Delta parity.** `rset_generate.ts` and `branchy_generate.ts` ref-advance only as `admin`, the creator, so no generated advance is ever void and parity cannot see this phase. Add to one generator a non-creator ref-advancer, with a `refAdvance` cap in the set's requirements, and an RCap revoke of that cap on a branch concurrent with a version the advancer publishes. Full and bounded deltas must agree on those histories. This checks the argument in §4 that the geometric floor needs no change.
-
-Also generate the residual shape from §4 on purpose: a non-creator advance concurrent with another live advance whose version is above the later RCap fork point, and a new revoke concurrent with that higher version only. A disagreement there is the existing concurrent-fold gap, and it is reported and fixed as described in §4, not by changing the ref-advance verdict.
+**Delta parity.** Every generator ref-advances only as the creator, so no generated advance is ever void and parity cannot see this phase. Extend `rset_shaped_generate.ts` with a non-creator ref-advancer, with a `refAdvance` cap in the set's requirements, and an RCap revoke of that cap on a branch concurrent with a version the advancer publishes. Add the widening shape from §4: a non-creator advance concurrent with another live advance whose version is above the later RCap fork point, and a new revoke concurrent with that higher version only. Full and bounded deltas must agree on those histories. Show first that the extended generator fails with the visitor's ref-advance case removed.
 
 ## 6. Docs
 
-- `std_types/README.md`, the permissioned-set section. `rcapAt` on the enforcement path is the live fold, not every ref-advance in the past and the concurrent cover. `rcapFrom` and the woven floor stay the geometric resolutions the section already describes. Say that a ref-advance whose author lacks the cap at its widened cut is void and contributes no version. Keep the sentence that insertion of ordinary ops uses `(at, at)`.
+- `std_types/README.md`, the permissioned-set section. `rcapAt` on the enforcement path is the live fold, not every ref-advance in the past and the concurrent cover. `rcapFrom` and the delta bound's reads of the reference stay the geometric resolutions the section already describes. Say that a ref-advance whose author lacks the cap at its widened cut is void and contributes no version. Keep the sentence that insertion of ordinary ops uses `(at, at)`.
 - The status line of `DESIGN_AND_PLAN_FOR_ANY.md`: Phase 5 points here. Leave the old Phase 5 bullets in place; this file is the one to implement.
 
 `MODERNIZATION.md` still says `[CAP28]` flips to true and describes this work as future. It is not the spec. Do not rewrite it in this change.
@@ -224,7 +212,7 @@ Also generate the residual shape from §4 on purpose: a non-creator advance conc
 - The ideal-concurrency primitive, antichain admission, the two-check holding rule, the one-slot capability, barrier-ness of set deletes, and plain delegation in `NestedScopedDag`.
 - Rdb observe verdicts, apart from `resolveObserveGateRefAt` calling the helper.
 - `RFileMap` presence. That is Phase 6. Its add-anchored remove is a different rule; this phase does not touch `presence.ts`.
-- The public reference version and the delta floor (§4 explains why the floor already descends through an advance that can turn void).
+- The public reference version. The delta bound changes in one place, its visitor (§4).
 - Ordinary admission of adds, deletes, grants, and revokes.
 
 ## Order
@@ -238,6 +226,6 @@ Ship it as one change. Admission and the at-use fold change together: a replica 
 ## Exit
 
 - `mvt` refs tests, including the new walk test.
-- `permissioned_set_tests`, `delta_set_tests`, the RSet and branchy delta parity, with the generator extended to produce void ref-advances and the residual widening shape (§5). A disagreement on the residual shape alone does not block this phase; record it against the floor (§4).
+- `permissioned_set_tests`, `delta_set_tests`, the RSet and branchy delta parity, with the shaped generator extended to produce void ref-advances and the widening shape (§5).
 - `replica/test/replica_permissioned_sync_tests.ts`.
 - The rdb suite. The lift is the only rdb change; a failure there is a behavior change in the helper.

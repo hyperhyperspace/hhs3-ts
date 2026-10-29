@@ -201,11 +201,11 @@ export class NestedScopedDag implements ScopedDag {
     }
 
     async loadEntry(h: B64Hash): Promise<Entry | undefined> {
-        let entry = await this.dag.loadEntry(h);
-        if (entry === undefined) {
-            return undefined;
-        }
+        const entry = await this.dag.loadEntry(h);
+        return entry === undefined ? undefined : this.unwrapEntry(entry);
+    }
 
+    private unwrapEntry(entry: Entry): Entry {
         const at = position(...json.fromSet(entry.header.prevEntryHashes))
         const unwrappedPayload = this.scope.unwrapPayload(entry.payload, at);
         const unwrappedMeta = this.scope.unwrapMeta(entry.meta, unwrappedPayload, at);
@@ -215,6 +215,11 @@ export class NestedScopedDag implements ScopedDag {
             payload: unwrappedPayload,
             meta: unwrappedMeta,
         };
+    }
+
+    // A predicate sees the entry in this scope, as loadEntry returns it.
+    private unwrapPredicate(predicate?: EntryPredicate): EntryPredicate | undefined {
+        return predicate === undefined ? undefined : (hash, entry) => predicate(hash, this.unwrapEntry(entry));
     }
     
     async getFrontier(): Promise<Position> {
@@ -236,7 +241,7 @@ export class NestedScopedDag implements ScopedDag {
     }
     
     findCoverWithFilter(from: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
-        return this.dag.findCoverWithFilter(from, joinFilters(this.scope.baseFilter(), this.scope.wrapFilter(meta)), predicate);
+        return this.dag.findCoverWithFilter(from, joinFilters(this.scope.baseFilter(), this.scope.wrapFilter(meta)), this.unwrapPredicate(predicate));
     }
     
     // Concurrency is decided on the parent DAG. The joined scope filter only
@@ -245,7 +250,7 @@ export class NestedScopedDag implements ScopedDag {
     // not seen an op appended at this position.
     findConcurrentCoverWithFilter(from: Position, concurrentTo: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position> {
         return this.dag.findConcurrentCoverWithFilter(
-            from, concurrentTo, joinFilters(this.scope.baseFilter(), this.scope.wrapFilter(meta)), predicate,
+            from, concurrentTo, joinFilters(this.scope.baseFilter(), this.scope.wrapFilter(meta)), this.unwrapPredicate(predicate),
         );
     }
 

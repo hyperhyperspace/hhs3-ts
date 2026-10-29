@@ -234,7 +234,7 @@ A concrete `TypeRegistryMap` implementation backed by a `Map` is included.
 
 MVTs support composing objects inside other objects' DAGs through a scoping mechanism. The module provides:
 
-- **`ScopedDag`** — an object's logical history surface, exposing `append`, `loadEntry`, `getFrontier`, `loadAllEntries` (topo order, logical entries), and filtered cover queries. Root objects get a `RootScopedDag` backed by a full DAG; nested objects get a `NestedScopedDag` that wraps/unwraps payloads and metadata transparently and filters iteration to the nested scope.
+- **`ScopedDag`** — an object's logical history surface, exposing `append`, `loadEntry`, `getFrontier`, `loadAllEntries` (topo order, logical entries), and filtered cover queries. Root objects get a `RootScopedDag` backed by a full DAG; nested objects get a `NestedScopedDag` that wraps/unwraps payloads and metadata transparently and filters iteration to the nested scope. A predicate passed to a cover query sees each entry unwrapped, as that scope's `loadEntry` returns it.
 - **`CausalDag`** — read-only access to the broader causal structure (fork position finding), used by objects that need to reason about concurrent branches.
 - **`DagScope`** — the interface a parent object implements to define how a nested object's payloads and metadata are wrapped into the parent DAG and unwrapped on read.
 
@@ -292,28 +292,27 @@ An observer `RObject` can hold versioned references to other `RObject`s and adva
 - **`resolveRefVersionAtPosition(dag, refId, at, from, isLive?)`** — merges causal ref-advances up to `at` with concurrent ref-advance **barriers** reachable from `from` in the **observer** DAG. Observers use this to decide which target version(s) an entry must be checked against. Permissioned `RSet` uses it twice when querying `RCap`: once for the entry position (with barriers) as the referenced `at`, and once at the view frontier with `from === at` as the referenced `from`. The optional `isLive(entryHash)` predicate is the see-through predicate of both folds: an entry it rejects contributes no version and does not hide the ref-advances below it, so a ref-advance voided at-use by the type's own authorization gate falls through to the latest live one. Omitting it is the geometric resolution (every ref-advance counts).
 - **`resolveRefVersions(observerDag, refId, entryHash, observerFrom)`** — compositional helper returning `{ refAt, refFrom }` in the referenced object's DAG for checking an observer entry against a foreign object (see permissioned `RSetView`).
 - **`refVersionAtOrAbove(referencedDag, newer, older)`** / **`refVersionAtOrBelow(referencedDag, v, ceiling)`** — closed `≥` / `≤` comparisons in the referenced DAG (converses, not negations; concurrent positions fail both).
-- **`projectForeignBound(observerDag, refId, referencedDag, localAt, foreignRevisionBound)`** — projects a nested object's revision bound into the observer DAG, lowering the revision bound to the earliest unstable ref-advance(s).
 - **`validateRefAdvanceMonotonicity(observerDag, referencedDag, refId, newRefVersion, at)`** — insertion-time check that a proposed ref-advance does not move a reference backward. For each predecessor in `at`, resolves the current reference in the observer DAG and requires the new version to be at or above it in the referenced DAG. Types call this from `validatePayload` (e.g. permissioned `RSet`).
 
 These are thin, generic utilities. Types still own authorization, barrier semantics, and view-time reference resolution.
 
-## Bounded delta helpers (`delta.ts`)
+## Delta helpers (`delta.ts`, `revision_bound.ts`)
 
-Shared geometry for bounded `computeDelta` between two versions (`start`, `end`):
+Shared pieces for `computeDelta` between two versions (`start`, `end`), where `end` extends `start`:
 
 - **meet** — fork GLB from `fork.common` via `computeForkMeet(rawDag, forkCommon)`.
-- **revisionBound** — walk stop and `Delta.getRevisionBound()`; equals the meet for plain types, or lowered by `computeObserverRevisionBound` when a referenced object can revise authorization below the meet.
-- **`walkEntriesBackwardsToBound(dag, from, bound)`** — BFS backward from `from`, excluding entries in `bound`; returns delta candidate entries strictly above the revision bound.
-- **`computeObserverRevisionBound(observer, observerMeet, observerEnd, referenced)`** — for an observer with a referenced `RObject`: resolve ref versions at meet/end, run `referenced.computeDelta`, project via `projectForeignBound`. Caller sets `setDeltaStrategy('bounded')` on concrete types when needed (not on `RObject`).
+- **`walkEntriesBackwardsToBound(dag, from, bound)`** / **`walkDelta(rawDag, start, end, bound, acc)`** — BFS backward from `from`, excluding entries in `bound`, feeding each entry to an accumulator. With an empty bound this is a type's full strategy.
+- **`walkRevisionBound(rawDag, host, visitor, fork, start, end)`** — the revision bound of a bounded delta, in one backward walk from `end` that passes every walked entry to the type's visitor once. The bound starts at the meet. It drops below every ref-advance in the meet's history whose published version is above its referenced object's own bound, taken between the versions observed at `start` and at `end`. It also drops below every walked barrier of `start` concurrent with it whose effect changed: the visitor says so, or it is an unstable ref-advance. The walk stops at the exit border of the bound's history and resumes from it when the bound drops. The host declares the object's references, each read at the horizon (`'horizon'`) or at `(v, v)` (`'at'`). The comment on `walkRevisionBound` lists what a type must guarantee for the bound to be sound. `requireExtendingFork` returns the fork and throws when `end` does not extend `start`.
+- **revisionBound** — `Delta.getRevisionBound()`, the floor below which no `(start, end)` change can reach. The meet is enough only for a type with no barriers whose effect can change and no references (`RSchema`). `RTableGroup`, `RCap` and `RSet` use `walkRevisionBound`.
 
-Types keep candidate collection and view diffs; these helpers own fork meet, bound projection, and the backward walk.
+Types keep candidate collection and view diffs.
 
 ## Concrete type: `RSet`
 
 `RSet` (Replicable Set) is a fully featured MVT implementation that lives in the [**std_types** module](../std_types). It implements the `RObject` interface and supports:
 
 - **Simple sets**: a set of JSON literals, with add/delete operations and configurable redundancy acceptance.
-- **Nested object sets**: when a `contentType` is specified, each element is a nested `RObject` whose creation payload is stored as the add operation's content. Updates to nested elements are transparently routed through the parent DAG via `NestedScopedDag`.
+- **Nested object sets**: when a `contentType` is specified, each element is a nested `RObject` whose creation payload is stored as the add operation's content. Updates to nested elements are transparently routed through the parent DAG via `NestedScopedDag`. A nested set's changes are reported in the `nested` map of the outermost set's delta. The bounded delta strategy, the default, rejects permissioned nested sets (see RSet's delta computation in [std_types](../std_types)).
 - **Barrier operations**: optional add/delete barriers for fine-grained concurrency control.
 - **Version-scoped views**: `RSetView` computes set membership at any version, correctly handling concurrent adds, deletes, and barriers by querying the causal DAG.
 - **Permissioned mode**: references `RCap`; authorization at view time is compositional (`RCap.getView(rcapAt, rcapFrom)` per entry) with predicate-aware cover queries peeling void entries.

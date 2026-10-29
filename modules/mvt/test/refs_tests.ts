@@ -19,7 +19,6 @@ import {
     refVersionAtOrBelow,
     resolveRefVersionAtPosition,
     resolveRefVersions,
-    projectForeignBound,
     validateRefAdvanceMonotonicity,
     canonicalVersion,
     validateRefVersionShape,
@@ -324,35 +323,6 @@ async function testResolveRefVersionAtPositionSeesThrough() {
     testing.assertTrue(geometric.has(fV2) && geometric.size === 1, 'without isLive the latest ref-advance counts');
 }
 
-async function testProjectForeignBound() {
-    const refId = 'foreignObj';
-    const foreignDag = createTestDag();
-    const fRoot = await foreignDag.append({ n: 0 }, {});
-    const fV1 = await foreignDag.append({ n: 1 }, {}, version(fRoot));
-    const fV2 = await foreignDag.append({ n: 2 }, {}, version(fV1));
-
-    const observerRaw = createTestDag();
-    const observer = new RootScopedDag(observerRaw);
-
-    const h0 = await observer.append({ action: 'create' }, {}, undefined);
-    const prepared = prepareRefAdvance(refId, version(fV2));
-    const hRef = await observer.append(prepared.payload, prepared.meta, version(h0));
-    const h2 = await observer.append({ action: 'add', element: 'x' }, {}, version(hRef));
-
-    const localAt = version(h2);
-
-    const boundStable = await projectForeignBound(
-        observer, refId, foreignDag, localAt, version(fV2),
-    );
-    testing.assertTrue(setEq(boundStable, localAt), 'all ref-advances stable should return localAt');
-
-    const boundUnstable = await projectForeignBound(
-        observer, refId, foreignDag, localAt, version(fV1),
-    );
-    testing.assertTrue(boundUnstable.has(hRef), 'unstable ref-advance should lower bound to its hash');
-    testing.assertFalse(boundUnstable.has(h2), 'bound should sit below localAt');
-}
-
 async function testRefAdvanceMonotonicity() {
     const referencedDag = createTestDag();
     const root = await referencedDag.append({ n: 0 }, {});
@@ -486,7 +456,6 @@ export const refsSuite = {
         { name: '[REFS_07] resolveRefVersions for entry', invoke: testResolveRefVersions },
         { name: '[REFS_07b] resolveRefVersionAtPosition isLive filter', invoke: testResolveRefVersionAtPositionIsLive },
         { name: '[REFS_07c] resolveRefVersionAtPosition sees through a void ref-advance', invoke: testResolveRefVersionAtPositionSeesThrough },
-        { name: '[REFS_08] projectForeignBound bound projection', invoke: testProjectForeignBound },
         { name: '[REFS_09] ref-advance monotonicity validation', invoke: testRefAdvanceMonotonicity },
         { name: '[REFS_10] canonical version and antichain shape', invoke: testCanonicalVersionAndShape },
     ],

@@ -69,7 +69,7 @@ async function addIdentities(cap: RCap, author: OwnIdentity, ...identities: OwnI
     }
 }
 
-// The history of RCAP_INCREMENTAL_BOUND_WALK.md, "Why":
+// The bounded-delta counterexample for RCap's meet-based bound:
 //
 //   ... gS - gA - G - s1 - N        start = {s1, T}, end = {N, T}
 //             \

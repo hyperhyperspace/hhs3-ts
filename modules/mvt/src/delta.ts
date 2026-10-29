@@ -1,15 +1,16 @@
-// Building-block helpers for bounded delta computation between two versions.
+// Building-block helpers for delta computation between two versions.
 //
 // meet — fork GLB from fork.common (geometry only).
-// revisionBound / bound — walk stop and Delta.getRevisionBound() value; may sit below
-// the meet when an observer's referenced object revision requires projection.
+// walkDelta — feeds every entry above a bound to an accumulator.
+//
+// A sound revision bound for a type whose verdicts read barriers or other
+// objects is walkRevisionBound (revision_bound.ts), not the meet.
 
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, Position, position } from "@hyper-hyper-space/hhs3_dag";
 import { json } from "@hyper-hyper-space/hhs3_json";
 
-import { projectForeignBound, resolveRefVersionAtPosition } from "./refs.js";
-import type { DeltaAccumulator, DeltaChanges, RObject, Version } from "./mvt.js";
+import type { DeltaAccumulator, DeltaChanges, Version } from "./mvt.js";
 
 // Greatest lower bound (meet) of fork.common. Folding over common directly (not an
 // antichain) is correct: dominated elements never lower the GLB.
@@ -82,10 +83,9 @@ export async function walkDelta(
 
 // On the reported revision bound.
 //
-// These helpers report the geometric meet (fork GLB, via computeForkMeet /
-// computeObserverRevisionBound) as the revision bound: "below the fork GLB the two branches
-// are identical" is a type-agnostic invariant that needs no knowledge of barriers. It is not
-// enough for a type whose verdicts read barriers across branches. An old barrier on a side
+// The meet is a sound bound only for a type with no barriers whose effect can change and
+// no references: "below the fork GLB the two branches are identical" is type-agnostic. A
+// type whose verdicts read barriers across branches needs more. An old barrier on a side
 // branch of `start` can be concurrent with an entry below the meet, and a new entry can
 // change that barrier's effect, so the entry's verdict changes without being walked
 // (rdb/INCREMENTAL_DELTA_BOUND.md). Walking from `end` and stopping only at the bound's
@@ -96,53 +96,5 @@ export async function walkDelta(
 // exit border of the bound's history and lowers the bound below every barrier of `start`
 // concurrent with it whose effect changed. A referenced object's bound there is taken
 // between the versions observed at `start` and at `end`, not at the meet: a bound driven by
-// what changed is only sound for the exact pair of versions it compared. RTableGroup (rdb)
-// and RCap (std_types) use it. RSet still uses the helpers here.
-
-// Compute the observer's revision bound when a referenced object can revise state
-// below the fork meet. `observerMeet` is the fork meet on the observer (input, not the
-// result). Assumes referenced.getId() is the ref-advance refId in the observer DAG.
-export async function computeObserverRevisionBound(
-    observer: RObject,
-    observerMeet: Version,
-    observerEnd: Version,
-    referenced: RObject,
-): Promise<Version> {
-    const observerDag = await observer.getScopedDag();
-    const refId = referenced.getId();
-
-    const refAtMeet = await resolveRefVersionAtPosition(observerDag, refId, observerMeet, observerMeet);
-    const refAtEnd = await resolveRefVersionAtPosition(observerDag, refId, observerEnd, observerEnd);
-
-    const referencedRevisionBound = (await referenced.computeDelta(refAtMeet, refAtEnd)).revisionBound;
-
-    return projectForeignBound(
-        observerDag, refId, await referenced.getCausalDag(), observerMeet, referencedRevisionBound,
-    );
-}
-
-// Combine the projected revision bounds of SEVERAL referenced objects into a single
-// floor for an observer that watches more than one object (e.g. an Rdb RTableGroup, which
-// observes its RSchema plus every bound foreign group). Each `referenced` object can revise
-// the observer's verdicts below the fork meet, so we project each one into the observer DAG
-// via computeObserverRevisionBound and take their greatest lower bound (along with the meet
-// itself). Below the GLB every referenced object is stable AND the two branches' geometry is
-// common, so it is a safe walk floor. Each projected bound is already at or below the meet,
-// so the GLB is too; an empty `referenced` (or only stable refs) yields the meet unchanged.
-export async function combineObserverRevisionBounds(
-    observer: RObject,
-    observerMeet: Version,
-    observerEnd: Version,
-    referenced: RObject[],
-): Promise<Version> {
-    const bounds: Position[] = [observerMeet];
-    for (const ref of referenced) {
-        bounds.push(await computeObserverRevisionBound(observer, observerMeet, observerEnd, ref));
-    }
-
-    const causalDag = await observer.getCausalDag();
-    return dag.computeMeet(
-        bounds,
-        (a, b) => causalDag.findForkPosition(a, b).then((f) => f.commonFrontier),
-    );
-}
+// what changed is only sound for the exact pair of versions it compared. RTableGroup (rdb),
+// RCap and RSet (std_types) use it. RSchema (rdb) uses the meet.

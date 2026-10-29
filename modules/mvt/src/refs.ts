@@ -8,7 +8,7 @@
 // view-time reference resolution.
 
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
-import type { EntryMetaFilter, EntryPredicate, MetaProps, Position } from "@hyper-hyper-space/hhs3_dag";
+import type { EntryPredicate, MetaProps, Position } from "@hyper-hyper-space/hhs3_dag";
 import { position } from "@hyper-hyper-space/hhs3_dag";
 import { json } from "@hyper-hyper-space/hhs3_json";
 
@@ -204,7 +204,7 @@ export async function refVersionAtOrAbove(
 }
 
 // Converse of refVersionAtOrAbove: true iff `v` is at or below `ceiling` in the
-// referenced object's DAG. Use for ref-advance stability (e.g. projectForeignBound);
+// referenced object's DAG. Use for ref-advance stability (e.g. walkRevisionBound);
 // do not implement as !refVersionAtOrAbove(...).
 export async function refVersionAtOrBelow(
     referencedDag: CausalDag,
@@ -212,68 +212,6 @@ export async function refVersionAtOrBelow(
     ceiling: Version,
 ): Promise<boolean> {
     return refVersionAtOrAbove(referencedDag, ceiling, v);
-}
-
-// Project a foreign revision bound into the observer DAG: find the earliest unstable
-// ref-advance(s) at or below `localAt`. A ref-advance is stable iff its referenced
-// version is at or below `foreignRevisionBound`; unstable otherwise.
-//
-// Starting from the ref-advance cover at `localAt`, descend through unstable ref-advances
-// via their preds; a branch settles when no unstable ref-advance sits below it. The
-// referenced object's create op is an implicit stable ref-advance to version(refId)
-// (always at or below `foreignRevisionBound`), so an empty below-cover settles the
-// branch. Below the returned bound the referenced version is at or below
-// `foreignRevisionBound`. If no ref-advance is unstable, return `localAt`.
-//
-// Assumes monotonic ref-advances: a stable ref-advance has only stable ref-advances
-// below it, so the descent can stop at the first stable ref-advance on each branch.
-export async function projectForeignBound(
-    observerDag: ScopedDag,
-    refId: B64Hash,
-    referencedDag: CausalDag,
-    localAt: Version,
-    foreignRevisionBound: Version,
-): Promise<Version> {
-    const refFilter: EntryMetaFilter = { containsValues: { ref: [refId] } };
-
-    const bound = version();
-    const visited = new Set<B64Hash>();
-    const stabilityCache = new Map<B64Hash, boolean>();
-
-    const isStable = async (hash: B64Hash): Promise<boolean> => {
-        const cached = stabilityCache.get(hash);
-        if (cached !== undefined) return cached;
-        const entry = await observerDag.loadEntry(hash);
-        const refVersion = extractRefVersion(entry!.payload as RefAdvancePayload);
-        const result = await refVersionAtOrBelow(referencedDag, refVersion, foreignRevisionBound);
-        stabilityCache.set(hash, result);
-        return result;
-    };
-
-    const queue: B64Hash[] = [...(await observerDag.findCoverWithFilter(localAt, refFilter))];
-    while (queue.length > 0) {
-        const r = queue.shift()!;
-        if (visited.has(r)) continue;
-        visited.add(r);
-        if (await isStable(r)) continue;
-
-        const entry = await observerDag.loadEntry(r);
-        const preds = position(...json.fromSet(entry!.header.prevEntryHashes));
-        const below = await observerDag.findCoverWithFilter(preds, refFilter);
-
-        const unstableBelow: B64Hash[] = [];
-        for (const b of below) {
-            if (!(await isStable(b))) unstableBelow.push(b);
-        }
-
-        if (unstableBelow.length === 0) {
-            bound.add(r);
-        } else {
-            queue.push(...unstableBelow);
-        }
-    }
-
-    return bound.size > 0 ? bound : localAt;
 }
 
 // The minimal cover of `v` in `dag`. A single head is already canonical.

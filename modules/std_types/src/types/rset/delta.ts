@@ -1,15 +1,38 @@
+// RSet delta: membership changes between two versions, and the authorization
+// flips of adds and deletes in a permissioned set.
+//
+// Strategies (RObject.setDeltaStrategy switch on the object):
+//   - full: walkDelta from genesis, the reference for parity.
+//   - bounded (the default): mvt's walkRevisionBound. A permissioned set
+//     references its RCap at the horizon. The bound starts at the fork meet
+//     and drops below every
+//     ref-advance whose published RCap version is above RCap's own bound
+//     between the versions observed at `start` and at `end`, including a
+//     side-branch ref-advance of `start` that widens a concurrent entry's
+//     refAt. It also drops below every barrier add or delete of `start`
+//     concurrent with it whose authorization flipped. The delta's own views,
+//     at (start, start) and (end, end), read nothing concurrent: that lowering
+//     keeps the bound sound for views at an earlier `at`. A permissioned nested
+//     set is not supported (boundedChildAccumulator).
+//
+// The accumulator compares, at the two horizons, every element a walked entry
+// touches and the authorization of every walked add and delete. An element's
+// membership at a horizon changes only through a new entry for it or an
+// authorization flip of an old one, and the walk reaches both.
+
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, KeyId } from "@hyper-hyper-space/hhs3_crypto";
 import { dag } from "@hyper-hyper-space/hhs3_dag";
 import {
     version, Version, Delta, DeltaChanges, DeltaAccumulator,
     RObject, ScopedDag,
-    walkDelta, computeForkMeet, computeObserverRevisionBound,
+    walkDelta, requireExtendingFork, walkRevisionBound,
 } from "@hyper-hyper-space/hhs3_mvt";
+import type { Reference, RevisionBoundHost, RevisionBoundVisitor } from "@hyper-hyper-space/hhs3_mvt";
 
 import { isAuthoredPayload, extractAuthor } from "../../authorship.js";
 
-import { SetPayload } from "./payload.js";
+import { SetPayload, RSET_TYPE_ID } from "./payload.js";
 
 import type { RSet } from "./interfaces.js";
 
@@ -72,6 +95,7 @@ export class RSetDeltaAccumulator implements DeltaAccumulator<RSetChanges> {
     private readonly added: B64Hash[] = [];
     private readonly removed: B64Hash[] = [];
     private readonly validityChanges: ValidityChange[] = [];
+    private readonly authorizationFlips = new Set<B64Hash>();
 
     private readonly childAccs = new Map<B64Hash, { acc: DeltaAccumulator; scopedDag: ScopedDag }>();
 
@@ -82,6 +106,8 @@ export class RSetDeltaAccumulator implements DeltaAccumulator<RSetChanges> {
         private readonly set: RSet,
         private readonly start: Version,
         private readonly end: Version,
+        // Set for the bounded strategy, which restricts nested sets (spawnChild).
+        private readonly bounded = false,
     ) {}
 
     private async views(): Promise<{ startView: Awaited<ReturnType<RSet['getView']>>; endView: Awaited<ReturnType<RSet['getView']>> }> {
@@ -113,6 +139,7 @@ export class RSetDeltaAccumulator implements DeltaAccumulator<RSetChanges> {
                 const wasValid = await startView.checkEntryAuthorization(entry.hash);
                 const nowValid = await endView.checkEntryAuthorization(entry.hash);
                 if (wasValid !== nowValid) {
+                    this.authorizationFlips.add(entry.hash);
                     const entryElmts = entry.meta['elmts'];
                     if (entryElmts !== undefined) {
                         for (const elementHash of json.fromSet(entryElmts)) {
@@ -142,6 +169,11 @@ export class RSetDeltaAccumulator implements DeltaAccumulator<RSetChanges> {
         return changed;
     }
 
+    // Whether an ingested add or delete is authorized at only one of `start` and `end`.
+    authorizationFlipped(entryHash: B64Hash): boolean {
+        return this.authorizationFlips.has(entryHash);
+    }
+
     private async ingestNested(childId: B64Hash, rawEntry: dag.Entry): Promise<boolean> {
         let child = this.childAccs.get(childId);
         if (child === undefined) child = await this.spawnChild(childId);
@@ -160,7 +192,9 @@ export class RSetDeltaAccumulator implements DeltaAccumulator<RSetChanges> {
         }
         const innerFactory = await this.set.getContext().getRegistry().lookup(contentType);
         const childObj: RObject = await this.set.loadChildObject(innerFactory, childId);
-        const acc = childObj.createDeltaAccumulator(this.start, this.end);
+        const acc = this.bounded
+            ? boundedChildAccumulator(childObj, this.start, this.end)
+            : childObj.createDeltaAccumulator(this.start, this.end);
         const scopedDag = await childObj.getScopedDag();
         const entry = { acc, scopedDag };
         this.childAccs.set(childId, entry);
@@ -201,24 +235,64 @@ async function computeDeltaFull(set: RSet, rawDag: dag.Dag, start: Version, end:
 }
 
 async function computeDeltaBounded(set: RSet, rawDag: dag.Dag, start: Version, end: Version): Promise<RSetDelta> {
-    const fork = await rawDag.findForkPosition(start, end);
-    if (fork.forkA.size > 0) {
-        throw new Error("bounded computeDelta requires END to extend START");
-    }
+    const fork = await requireExtendingFork(rawDag, start, end, "bounded computeDelta");
     if (fork.forkB.size === 0) {
         return new RSetDelta(start, end, fork.commonFrontier, emptyRSetChanges(set.getType()));
     }
 
-    const meet = await computeForkMeet(rawDag, fork.common);
+    const acc = new RSetDeltaAccumulator(set, start, end, true);
+    const bound = await walkRevisionBound(rawDag, revisionBoundHost(set), deltaVisitor(acc), fork, start, end);
+    return new RSetDelta(start, end, bound, await acc.finalize() as DeltaChanges<RSetChanges>);
+}
 
-    let revisionBound = meet;
-    if (set.isPermissioned()) {
-        const rcap = await set.loadRCap();
-        if (rcap === undefined) throw new Error("Cannot load referenced RCap");
-        rcap.setDeltaStrategy('bounded');
-        revisionBound = await computeObserverRevisionBound(set, meet, end, rcap);
+// A permissioned set references its RCap at the horizon: an entry's
+// authorization reads RCap at (refAt, refFrom), and refFrom is the fold of the
+// ref-advances at the horizon (RSetViewImpl.resolveRefVersion).
+function revisionBoundHost(set: RSet): RevisionBoundHost {
+    const refId = set.capabilityRef();
+    return {
+        getScopedDag: () => set.getScopedDag(),
+        references: (): Reference[] => refId === undefined ? [] : [{
+            refId,
+            from: 'horizon',
+            getObject: async () => {
+                const rcap = await set.loadRCap();
+                if (rcap === undefined) throw new Error("Cannot load referenced RCap");
+                return rcap;
+            },
+            resolveVersion: async (horizon) => (await set.getView(horizon, horizon)).resolveRefVersion(refId),
+        }],
+    };
+}
+
+// A candidate is a barrier of `start`: a barrier add or delete, or a
+// ref-advance. An add or delete reaches concurrent views only through whether
+// it passes its authorization, so its effect changed exactly when that flipped,
+// which the accumulator has already compared. A ref-advance has no verdict, and
+// the walk finds an unstable one itself. Phase 5 (rdb/plans/PHASE_5_PLAN.md)
+// gives ref-advances a liveness verdict; its flips must then be reported here.
+function deltaVisitor(acc: RSetDeltaAccumulator): RevisionBoundVisitor {
+    return {
+        async visit(entry, candidate) {
+            await acc.ingest(entry);
+            return candidate && acc.authorizationFlipped(entry.hash);
+        },
+    };
+}
+
+// The bounded walk sees only the root's meta. A nested set's entries carry
+// theirs as inner-<hash>-..., so the walk misses its barriers and its
+// ref-advances. That is harmless for a nested RSet without a capability ref,
+// which has no verdicts, and unsound for a permissioned one, whose
+// authorizations read ref-advances the walk cannot see. A nested set that no
+// walked entry touches gained nothing between `start` and `end`, so rejecting
+// one here, when a walked entry reaches it, is enough.
+function boundedChildAccumulator(child: RObject, start: Version, end: Version): RSetDeltaAccumulator {
+    if (child.getType() !== RSET_TYPE_ID) {
+        throw new Error(`bounded computeDelta supports only nested sets, not a nested '${child.getType()}'`);
     }
-
-    const root = await walkDelta(rawDag, start, end, revisionBound, set.createDeltaAccumulator(start, end));
-    return new RSetDelta(start, end, revisionBound, root as DeltaChanges<RSetChanges>);
+    if ((child as RSet).isPermissioned()) {
+        throw new Error(`bounded computeDelta does not support a permissioned nested set (${child.getId()}); use the full strategy`);
+    }
+    return new RSetDeltaAccumulator(child as RSet, start, end, true);
 }

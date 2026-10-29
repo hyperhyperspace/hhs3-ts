@@ -1,6 +1,6 @@
 import { testing } from '@hyper-hyper-space/hhs3_util';
 import { sha256 } from '@hyper-hyper-space/hhs3_crypto';
-import { dag, EntryMetaFilter, joinFilters, MetaProps, position, Position } from '@hyper-hyper-space/hhs3_dag';
+import { dag, EntryMetaFilter, EntryPredicate, joinFilters, MetaProps, position, Position } from '@hyper-hyper-space/hhs3_dag';
 import { json } from '@hyper-hyper-space/hhs3_json';
 import { Literal } from '@hyper-hyper-space/hhs3_json/dist/literal.js';
 
@@ -318,6 +318,81 @@ async function testRandomizedScopedConcurrentCover() {
     }
 }
 
+// A scope that wraps the payload under its id and tags the meta with a key of
+// its own, so that scopes can be stacked.
+class LayerScope implements DagScope {
+    constructor(private readonly id: string) {}
+
+    private tag(): string {
+        return 'scope-' + this.id;
+    }
+
+    signingContext(): Literal {
+        return { child: this.id };
+    }
+
+    startAt(): Position {
+        return position();
+    }
+
+    startEmpty(): boolean {
+        return true;
+    }
+
+    baseFilter(): EntryMetaFilter {
+        return { containsValues: { [this.tag()]: ['t'] } };
+    }
+
+    wrapPayload(payload: Literal, _at: Position): Literal {
+        return { [this.id]: payload };
+    }
+
+    unwrapPayload(payload: Literal, _at: Position): Literal {
+        return (payload as { [id: string]: Literal })[this.id];
+    }
+
+    wrapMeta(meta: MetaProps, _wrappedPayload: Literal, _at: Position): MetaProps {
+        return { ...meta, [this.tag()]: json.toSet(['t']) };
+    }
+
+    unwrapMeta(meta: MetaProps, _wrappedPayload: Literal, _at: Position): MetaProps {
+        const inner: MetaProps = {};
+        for (const key in meta) {
+            if (key !== this.tag()) inner[key] = meta[key];
+        }
+        return inner;
+    }
+
+    wrapFilter(filter: EntryMetaFilter): EntryMetaFilter {
+        return filter;
+    }
+}
+
+// c and d are concurrent barriers two scopes down. A predicate that rejects c
+// by its payload makes both covers see through it, so it must get the entry
+// as the querying scope's loadEntry returns it, not the wrapped one.
+async function testPredicateSeesScopedEntry() {
+    const root = new RootScopedDag(createTestDag());
+    const inner = new NestedScopedDag(new NestedScopedDag(root, new LayerScope('a')), new LayerScope('b'));
+    const c = await inner.append({ n: 'c' }, BARRIER);
+    const d = await inner.append({ n: 'd' }, BARRIER, position());
+
+    const notC: EntryPredicate = async (hash, entry) => {
+        const scoped = (await inner.loadEntry(hash))!;
+        testing.assertTrue(
+            json.toStringNormalized(entry.payload) === json.toStringNormalized(scoped.payload)
+                && json.toStringNormalized(entry.meta) === json.toStringNormalized(scoped.meta),
+            'the predicate gets the entry loadEntry returns',
+        );
+        return (entry.payload as { n: string })['n'] !== 'c';
+    };
+
+    const cover = await inner.findCoverWithFilter(position(c, d), BARRIER_FILTER, notC);
+    testing.assertTrue(samePosition(cover, position(d)), 'the cover sees through c');
+    const concurrent = await inner.findConcurrentCoverWithFilter(position(c, d), position(d), BARRIER_FILTER, notC);
+    testing.assertTrue(concurrent.size === 0, 'the concurrent cover sees through c');
+}
+
 async function testSigningScope() {
     const rootScoped = new RootScopedDag(createTestDag());
     const childA = new NestedScopedDag(rootScoped, new MockChildScope(position(), 'a'));
@@ -342,5 +417,6 @@ export const dagNestingSuite = {
         { name: '[DNS05] a barrier after only the in-scope head is concurrent with mixed heads', invoke: testMixedHeads },
         { name: '[DNS06] a dominated head does not change the scoped concurrent cover', invoke: testCausalPast },
         { name: '[DNS07] scoped concurrent cover matches the raw call and ignores dominated heads', invoke: testRandomizedScopedConcurrentCover },
+        { name: '[DNS08] a cover-query predicate sees the entry as the scope loads it, through nesting', invoke: testPredicateSeesScopedEntry },
     ],
 };

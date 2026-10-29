@@ -2,7 +2,7 @@
 //
 // Strategies (RObject.setDeltaStrategy switch on the object):
 //   - full: walkDelta from genesis, the reference for parity.
-//   - bounded: mvt's walkRevisionBound (rdb/plans/RCAP_INCREMENTAL_BOUND_WALK.md).
+//   - bounded: mvt's walkRevisionBound (README.md, RCap's delta computation).
 //     RCap references no other object. The bound starts at the fork meet and
 //     drops below every walked revoke or delete-cap of `start` that is
 //     concurrent with it and whose verdict differs between `start` and `end`.
