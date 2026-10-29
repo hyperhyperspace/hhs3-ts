@@ -203,7 +203,7 @@ The strict-dominance back-dated advance (the `[OCUT01]` shape: publish `{v1}`, a
 - `std_types/README.md`, the permissioned-set section. `rcapAt` on the enforcement path is the live fold, not every ref-advance in the past and the concurrent cover. `rcapFrom` and the delta bound's reads of the reference stay the geometric resolutions the section already describes. Say that a ref-advance whose author lacks the cap at its widened cut is void and contributes no version. Keep the sentence that insertion of ordinary ops uses `(at, at)`.
 - The status line of `DESIGN_AND_PLAN_FOR_ANY.md`: Phase 5 points here. Leave the old Phase 5 bullets in place; this file is the one to implement.
 
-`MODERNIZATION.md` still says `[CAP28]` flips to true and describes this work as future. It is not the spec. Do not rewrite it in this change.
+`MODERNIZATION.md` described this work as future and had `[CAP28]` flipping to true. It was not the spec, and it has since been removed; the std_types README describes the rules.
 
 ---
 

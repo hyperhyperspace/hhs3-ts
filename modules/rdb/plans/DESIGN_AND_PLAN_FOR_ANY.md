@@ -1,7 +1,7 @@
 # Design and Plan: Ideal Concurrency (`ANY`) for Barrier Checks
 
-**Status:** implemented (Phases 1-5; Phase 5 as in [`PHASE_5_PLAN.md`](./PHASE_5_PLAN.md)).
-`rfile_map` presence (Phase 6) and the counter-revocation ring are not done.
+**Status:** implemented (Phases 1-6; Phase 5 as in [`PHASE_5_PLAN.md`](./PHASE_5_PLAN.md)).
+`rfile_map` presence takes RSet's rule (Phase 6). The counter-revocation ring is not done.
 A ref-advance version is canonicalized on write and rejected at admission when
 it is not an antichain. A missing referenced entry stays an infrastructure
 throw, not a validation failure.
@@ -9,7 +9,7 @@ throw, not a validation failure.
 **How it relates to the other documents:**
 
 - It replaces Step 2 and the Layer 1 redesign in [`OBSERVED_CUT_REVOCATION.md`](./OBSERVED_CUT_REVOCATION.md). The reasons are in [`OBSERVED_CUT_REVOCATION_CRITIQUE.md`](./OBSERVED_CUT_REVOCATION_CRITIQUE.md).
-- It amends [`MODERNIZATION_v2.md`](../std_types/MODERNIZATION_v2.md), and absorbs the ref-advance section of [`MODERNIZATION.md`](../std_types/MODERNIZATION.md).
+- It amends `MODERNIZATION_v2.md`, and absorbs the ref-advance section of `MODERNIZATION.md`. Both notes have since been folded into the std_types README and removed; the comparisons below are with them as they were.
 - The scenarios it fixes are pinned as `[OCUT01]`–`[OCUT12]` in [`test/observed_cut_tests.ts`](./test/observed_cut_tests.ts).
 
 Notation:

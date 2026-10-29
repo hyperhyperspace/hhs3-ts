@@ -14,6 +14,25 @@ Conflict resolution is delegated to the [DAG module](../dag), which provides thr
 
 Types can also compose via **state references**: an object records which version of another object's DAG it is observing, and queries that object at the pinned version when resolving its own view. This is a general, causally consistent composition mechanism — each type's history stays in its own DAG, but a consumer can depend on another type's state at a specific point in causal time without merging the two histories. Compositional authorization in a permissioned `RSet` (which references an `RCap` via `capabilityRef` and ref-advance) is one instance of this pattern. See [Permissioned RSet](#permissioned-rset-references-and-compositional-authorization) below.
 
+### Admission and use
+
+An op is checked twice. **Admission** validates it causally where it is inserted, at `(at, at)` on its own object and on any object it references. **Use** re-checks it whenever a view reads it, at `(at, from)`, where a barrier concurrent with `at` and visible from `from` can void it. Admission is never moved onto `(at, from)`: what an op may do is fixed when it is written, and what later history makes of it is decided at use. A ref-advance is the one op admitted at another version, the one it imports (see [Who may ref-advance](#who-may-ref-advance)).
+
+A fact — a capability holding, a capability definition, a set element — holds at `(at, from)` when both of these are true:
+
+1. The cover of its ops in the past of `at` has a live positive op and no live negative op. A void op is skipped and does not hide the ops below it.
+2. No live negative op is concurrent with `at` and visible from `from`. A negative op is later than a multi-head `at` only when it is after every head.
+
+This is rdb's row-liveness rule ([CAPABILITIES.md](../rdb/CAPABILITIES.md)) applied to a slot. An rdb delete kills one witness row, and a re-grant inserts a new row. An RCap revoke clears the whole `(capability, grantee)` slot, and a re-grant writes the same slot again. So while a verdict cycle is being solved, an undecided grant that dominates a live revoke leaves the slot undecided rather than revoked: if the grant turns out live, the revoke is no longer in the cover.
+
+Some facts never void, by design:
+
+- **Identities.** An `add-identity` is permanent once admitted. Losing the enroll capability concurrently does not unwind the key, and `lookupKey` reads keys without liveness, so a signature check never depends on a later void. Rdb reads identity-provider keys the same way.
+- **Creators.** An `RCap` creator holds every capability and cannot be revoked, so a creator's grant or revoke is never unauthorized. `create-cap` and `delete-cap` are creator-only, so capability definitions are read with two values and never enter a verdict evaluation.
+- **Genesis.** The initial capabilities, and a set's create entry with its initial elements, which are not authored.
+
+Verdict cycles are solved per read. `hasCapability` mints one `VerdictEvaluation` ([mvt](../mvt)) per top-level call, walks sequentially inside it, and throws if the answer is still undecided outside the component being solved. An evaluation is never shared across parallel walks. Set ops never form a cycle with each other: a delete's authority is an `RCap` fact, not the element's presence, so membership is a boolean read over `RCap` verdicts.
+
 ## Code organization
 
 Each type lives in its own directory under `src/types/<type>/` and is split into a consistent set of files. See [src/types/rcap/](./src/types/rcap/) and [src/types/rset/](./src/types/rset/) for the two types currently provided:

@@ -98,7 +98,7 @@ Take a revocation $r \notin \downarrow V$. There are two natural ways to extend 
 
 Both agree when $V$ is a single head. They differ exactly when $r$ is above some heads of $V$ but not others.
 
-§1.3 argues that `ANY` "breaks use-before-revoke". In its example, $V = \{v_1, v_2\}$ and $r >_G v_1$, but $r$'s author never saw $v_2$. Under the ideal reading, a use at $V$ is **not** before $r$. Neither knew of the other, which is the textbook case for a barrier. "Use-before-revoke" holds at $V$ only if you have already accepted collapse-X. The `rcap/view.ts` header ("an external op u is concurrent with X iff it is concurrent with EVERY element of `this.at`"), [`MODERNIZATION_v2.md`](../std_types/MODERNIZATION_v2.md) ("A revoke downstream of even one element is later than the use point"), and `[CAP29]` all *encode* that choice. None of them *justifies* it. The argument in §1.3 is therefore circular.
+§1.3 argues that `ANY` "breaks use-before-revoke". In its example, $V = \{v_1, v_2\}$ and $r >_G v_1$, but $r$'s author never saw $v_2$. Under the ideal reading, a use at $V$ is **not** before $r$. Neither knew of the other, which is the textbook case for a barrier. "Use-before-revoke" holds at $V$ only if you have already accepted collapse-X. The `rcap/view.ts` header ("an external op u is concurrent with X iff it is concurrent with EVERY element of `this.at`"), `MODERNIZATION_v2.md` ("A revoke downstream of even one element is later than the use point"), and `[CAP29]` all *encode* that choice. None of them *justifies* it. The argument in §1.3 is therefore circular.
 
 ### 3.2 `ALL` makes revocation non-monotone in the cut
 

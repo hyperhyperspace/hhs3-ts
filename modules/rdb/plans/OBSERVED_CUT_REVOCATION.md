@@ -9,7 +9,7 @@
 > the problem record. The ideal-concurrency rule described there is what the
 > code implements.
 
-This document analyzes how capability revocations (and barrier row/set deletes) interact with multi-element versions $V$ produced by forks and inter-object reference advances (`ref-advance` / `observe`). It connects the designs in [`VOID_SEMANTICS.md`](./VOID_SEMANTICS.md), [`MODERNIZATION.md`](../std_types/MODERNIZATION.md), [`MODERNIZATION_v2.md`](../std_types/MODERNIZATION_v2.md), and [`REFERENCE_FRAME.md`](../rpack/REFERENCE_FRAME.md), and evaluates the exact impact of moving gated observation widening (`resolveObserveGateRefAt`) onto the 3-valued well-founded engine (`VerdictEvaluation`).
+This document analyzes how capability revocations (and barrier row/set deletes) interact with multi-element versions $V$ produced by forks and inter-object reference advances (`ref-advance` / `observe`). It connects the designs in [`VOID_SEMANTICS.md`](./VOID_SEMANTICS.md), `MODERNIZATION.md`, `MODERNIZATION_v2.md` (std_types notes, since folded into its README), and [`REFERENCE_FRAME.md`](../rpack/REFERENCE_FRAME.md), and evaluates the exact impact of moving gated observation widening (`resolveObserveGateRefAt`) onto the 3-valued well-founded engine (`VerdictEvaluation`).
 
 ---
 
@@ -49,7 +49,7 @@ Let $G$ be the capability-granting (or witness-holding) DAG. When evaluating whe
 - **Step 2 (Concurrent barriers at $(V, \text{from}_G)$):** Find any live barrier revocation/delete of $C$ in $\downarrow \text{from}_G$ that is **concurrent with $V$** (`findConcurrentCoverWithFilter(from_G, V, ...)`).
   - If there is any such live revocation/delete, **deny**.
 
-In `Rdb` (`RTableViewImpl.rowState` and `killedByConcurrentDelete` in [`modules/rdb/src/rtable/view.ts`](./src/rtable/view.ts)), each witness grant is its own immutable `rowId` and Step 1 + Step 2 are evaluated per witness row (`EXISTS` takes the disjunction over candidate witness rows). In `RCap` and `RSet` (under [`MODERNIZATION_v2.md`](../std_types/MODERNIZATION_v2.md)), `(cap, grantee)` or `elementHash` is a single reusable slot, so a revocation in the causal cover clears all concurrent grants of that slot, while a later grant $G_2 >_G R$ places $R$ below the cover and re-grants the slot.
+In `Rdb` (`RTableViewImpl.rowState` and `killedByConcurrentDelete` in [`modules/rdb/src/rtable/view.ts`](./src/rtable/view.ts)), each witness grant is its own immutable `rowId` and Step 1 + Step 2 are evaluated per witness row (`EXISTS` takes the disjunction over candidate witness rows). In `RCap` and `RSet` (under `MODERNIZATION_v2.md`), `(cap, grantee)` or `elementHash` is a single reusable slot, so a revocation in the causal cover clears all concurrent grants of that slot, while a later grant $G_2 >_G R$ places $R$ below the cover and re-grants the slot.
 
 ### 1.2 What the Codebase Implements Today
 
@@ -378,7 +378,7 @@ What happens when permissions are delegated across a chain of objects — e.g., 
 1. **`modules/dag` (`flat_idx.ts`, `topo_idx.ts`, `level_idx.ts`):**
    - In `findConcurrentCoverWithFilter(from, concurrentTo, meta, predicate)`, normalize `concurrentTo` to its minimal cover (`concurrentTo.size > 1 ? await findMinimalCover(concurrentTo) : concurrentTo`) before closing `concurrentTo` upwards into `notConcurrentTo`.
 2. **`modules/std_types` (`rcap/view.ts`, `rset/view.ts`, `rset/validate.ts`):**
-   - Proceed with [`MODERNIZATION_v2.md`](../std_types/MODERNIZATION_v2.md) (replacing the grant/add-anchored barrier searches with the 2-step `ALL` rule: causal cover at `at` + concurrent cover against `at` from `from`).
+   - Proceed with `MODERNIZATION_v2.md` (replacing the grant/add-anchored barrier searches with the 2-step `ALL` rule: causal cover at `at` + concurrent cover against `at` from `from`).
    - Bring permissioned `RSet` `ref-advance` onto the same admission (`(newRefVersion, newRefVersion)`) and at-use `isLive` filtering as `Rdb` (`MODERNIZATION.md` §"Ref-advances voided through RCap").
 3. **`modules/mvt` & `modules/rdb` (`resolveObserveGateRefAt` / `diagnoseObserve`):**
    - Replace whole-cut dominance ($\downarrow V_y \subsetneq \downarrow V_z$) with **head-advancing dominance** ($V_z \succ_{\exists} \text{minCover}_G(V_y)$): a concurrent barrier `ref-advance` $z$ widens $y$ iff $\exists v \in \text{minCover}_G(V_y) \setminus \text{minCover}_G(V_z)$ such that `refVersionAtOrAbove(foreignDag, Vz, version(v))`.

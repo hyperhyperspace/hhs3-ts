@@ -1,15 +1,18 @@
-// Element presence in an RFileMap, with RSet's barrier-remove rule: at
-// View(at, from), element e is present iff some add of e in the cover of e's
-// ops at `at` has no remove of e in past(from) concurrent to it.
+// Element presence in an RFileMap, with RSet's barrier-delete rule: at
+// View(at, from), element e is present iff the cover of e's ops at `at` holds
+// an add and no remove, and no remove of e in past(from) is concurrent with
+// `at`. A remove is concurrent with a multi-head `at` unless it is after every
+// head. Concurrency is with the point being read, not with an add: a remove
+// in the past of `at` that an add on its branch followed does not kill an add
+// on another branch.
 //
-// For at == from, removes in past(at) are either below that add or concurrent
-// to it, so the check reduces to the cover itself (a remove in the cover kills
-// every add in it) and, when there are several adds, to the maximal removes.
+// For at == from nothing in past(from) is concurrent with `at`, so the cover
+// decides.
 
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { dag } from "@hyper-hyper-space/hhs3_dag";
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { Version, version } from "@hyper-hyper-space/hhs3_mvt";
+import { Version } from "@hyper-hyper-space/hhs3_mvt";
 
 import { sameVersion } from "../rfiles/walk.js";
 import { META_ELEMENT, FileMapElementPayload, elementIdOf, elementOf } from "./payload.js";
@@ -31,41 +34,15 @@ function removesFilter(id: B64Hash): dag.EntryMetaFilter {
     return { containsValues: { [META_ELEMENT]: [id], [BARRIER]: ['t'] } };
 }
 
-async function isBelow(rawDag: dag.Dag, lower: B64Hash, upper: B64Hash): Promise<boolean> {
-    const fork = await rawDag.findForkPosition(version(lower), version(upper));
-    return fork.forkA.size === 0;
-}
-
 export async function isPresent(rawDag: dag.Dag, id: B64Hash, at: Version, from: Version): Promise<boolean> {
     const cover = await rawDag.findCoverWithFilter(at, opsFilter(id));
-    const adds: B64Hash[] = [];
-    let removed = false;
+    if (cover.size === 0) return false;
     for (const h of cover) {
         const entry = await rawDag.loadEntry(h);
-        if ((entry?.payload as json.LiteralMap | undefined)?.['action'] === 'add') adds.push(h);
-        else removed = true;
+        if ((entry?.payload as json.LiteralMap | undefined)?.['action'] !== 'add') return false;
     }
-    if (adds.length === 0) return false;
-
-    if (sameVersion(at, from)) {
-        if (removed) return false;
-        if (adds.length === 1) return true;
-        const removes = await rawDag.findCoverWithFilter(at, removesFilter(id));
-        for (const add of adds) {
-            let alive = true;
-            for (const r of removes) {
-                if (!await isBelow(rawDag, r, add)) { alive = false; break; }
-            }
-            if (alive) return true;
-        }
-        return false;
-    }
-
-    for (const add of adds) {
-        const concurrent = await rawDag.findConcurrentCoverWithFilter(from, version(add), removesFilter(id));
-        if (concurrent.size === 0) return true;
-    }
-    return false;
+    if (sameVersion(at, from)) return true;
+    return (await rawDag.findConcurrentCoverWithFilter(from, at, removesFilter(id))).size === 0;
 }
 
 // Every element present at View(at, from). Elements with no remove in past(at)

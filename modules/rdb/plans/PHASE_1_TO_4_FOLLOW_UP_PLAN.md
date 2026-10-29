@@ -246,7 +246,7 @@ A set with the flag off is unchanged. A delete removes an element only by coming
 These still say otherwise:
 
 - [`DESIGN_AND_PLAN_FOR_ANY.md`](./DESIGN_AND_PLAN_FOR_ANY.md) §1, the §4 comparison table, and §4 reason 5 say `[CAP29]` is the only std_types test that flips. `[CAP08]` is a Phase 3 flip. Add a §3.5 row: a `delete-cap` concurrent with `at` and after the origin makes the capability absent (`[CAP08]`).
-- [`MODERNIZATION_v2.md`](../std_types/MODERNIZATION_v2.md) has a status note, but the body still says `[CAP28]` flips to true, `[CAP29]` stays, and the future of a multi-hash position is the union of its heads' futures (around the `[CAP28]` paragraph, the §5 test list, and the "future is the union" sentence). Rewrite those to the ideal rule and to the outcomes in the design document's §3.5 table.
+- `MODERNIZATION_v2.md` has a status note, but the body still says `[CAP28]` flips to true, `[CAP29]` stays, and the future of a multi-hash position is the union of its heads' futures (around the `[CAP28]` paragraph, the §5 test list, and the "future is the union" sentence). Rewrite those to the ideal rule and to the outcomes in the design document's §3.5 table.
 - The std_types README says a `delete-cap` voids grants tied to the deleted origin. After section 2 it should say the capability is one slot: off means nobody holds it, and a re-create turns the same slot back on without clearing the grants and revokes.
 
 Also record section 1 in the design document: a scoped concurrent cover is decided on the root DAG (plain delegation), and the scope filter only selects matches. State the two `[NES04]` flips and the reason for them, and say that sibling isolation would need a separate query.

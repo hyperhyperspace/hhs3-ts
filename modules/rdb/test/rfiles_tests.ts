@@ -639,7 +639,8 @@ export const rfilesTests = {
                 assertTrue(await has(e2, version(b2, b3)), 'the add after the remove survives');
                 assertTrue(await has(e2, version(b2, b3), version(b2, b3, a3)), 'the same through the general check');
 
-                // two adds in the cover, each concurrent to a remove below the other
+                // two adds in the cover, each concurrent to a remove below the other: the
+                // removes are in the past of `at` and out of the cover, so neither kills
                 const e3: FileElement = { section: 'common', path: 'e3', fileHash: contentHash('e3') };
                 const unrelated = await writeAt(f.map, elementOp('add', { ...e3, path: 'u' }), a, g);
                 const r1 = await writeAt(f.map, elementOp('remove', e3), a, g);
@@ -647,11 +648,27 @@ export const rfilesTests = {
                 const x = await writeAt(f.map, elementOp('add', e3), a, version(r2));
                 const y = await writeAt(f.map, elementOp('add', e3), a, version(r1));
                 assertTrue(await has(e3, version(x)), 'x alone is present');
-                assertFalse(await has(e3, version(x, y)), 'x and y are each removed by the remove below the other');
-                assertFalse(await has(e3, version(x, y), version(x, y, a3)), 'the same through the general check');
+                assertTrue(await has(e3, version(x, y)), 'each remove is followed by an add on its own branch, so x and y keep it');
+                assertTrue(await has(e3, version(x, y), version(x, y, a3)), 'the same through the general check');
+
+                // a remove after the add, concurrent with `at`, removes it once `from` knows it
+                const e4: FileElement = { section: 'common', path: 'e4', fileHash: contentHash('e4') };
+                const c1 = await writeAt(f.map, elementOp('add', e4), a, g);
+                const c2 = await writeAt(f.map, elementOp('add', { ...e4, path: 'v' }), a, version(c1));
+                const rc = await writeAt(f.map, elementOp('remove', e4), a, version(c1));
+                assertTrue(await has(e4, version(c2)), 'present at the use point alone');
+                assertFalse(await has(e4, version(c2), version(c2, rc)), 'a remove concurrent with `at` and known to `from` removes it, though it saw the add');
+
+                // a remove after one head of `at` is concurrent with `at`: it is not after every head
+                const e5: FileElement = { section: 'common', path: 'e5', fileHash: contentHash('e5') };
+                const h1 = await writeAt(f.map, elementOp('add', { ...e5, path: 'w' }), a, g);
+                const d = await writeAt(f.map, elementOp('add', e5), a, g);
+                const rd = await writeAt(f.map, elementOp('remove', e5), a, version(h1));
+                assertTrue(await has(e5, version(h1, d)), 'present at the two heads');
+                assertFalse(await has(e5, version(h1, d), version(rd, d)), 'a remove after one head, known to `from`, removes it');
 
                 const listed = await f.map.list(version(a3, b2, b3, x, y));
-                assertList(listed.map(l => l.path).sort(), ['e', 'e2', 'u'], 'list applies the same rule');
+                assertList(listed.map(l => l.path).sort(), ['e', 'e2', 'e3', 'u'], 'list applies the same rule');
             }
         },
         {
