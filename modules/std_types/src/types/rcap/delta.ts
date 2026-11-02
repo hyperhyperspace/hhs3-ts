@@ -5,8 +5,9 @@
 //   - bounded: mvt's walkRevisionBound (README.md, RCap's delta computation).
 //     RCap references no other object. The bound starts at the fork meet and
 //     drops below every walked revoke or delete-cap of `start` that is
-//     concurrent with it and whose verdict differs between `start` and `end`.
-//     Only a revoke's can: a delete-cap is creator-only and always live.
+//     concurrent with it and whose verdict differs between `start` and `end`,
+//     or that is void by collapse at either. Only a revoke can: a delete-cap is
+//     creator-only and always live.
 //
 // The accumulator collects the identities, capabilities and grant pairs that
 // walked entries touch, and compares each at the two horizons in finalize. A
@@ -25,6 +26,7 @@ import type { RevisionBoundHost, RevisionBoundVisitor } from "@hyper-hyper-space
 import { CapPayload } from "./payload.js";
 
 import type { RCap } from "./interfaces.js";
+import type { CapVoidReason } from "./view.js";
 
 export type RCapDeltaStrategy = 'full' | 'bounded';
 
@@ -196,9 +198,9 @@ export class RCapDeltaAccumulator implements DeltaAccumulator<RCapChanges> {
 }
 
 // What the bounded delta needs from its object (RCapImpl): the verdict of a
-// barrier observed from a horizon.
+// barrier observed from a horizon, with its void reason.
 export type RCapDeltaHost = RCap & {
-    isEntryVoided(hash: B64Hash, from: Version): Promise<boolean>;
+    explainEntryVoided(hash: B64Hash, from: Version): Promise<CapVoidReason | undefined>;
 };
 
 export async function computeRCapDelta(
@@ -244,10 +246,17 @@ function revisionBoundHost(cap: RCap): RevisionBoundHost {
 
 // A candidate is a revoke or a delete-cap of `start`. A revoke reaches
 // concurrent entries only through Kill 2, which reads live revokes, so its
-// effect changed exactly when its verdict did. A delete-cap is creator-only, so
-// it is always live and this reports no change for it.
+// effect changed when its verdict did, or when it is void by collapse
+// (`undecided-cycle`) at either horizon, or at both. A collapsed revoke was
+// undecided for the entries that read it during the solve, and what they
+// decided depends on the core it collapsed in, which no verdict records
+// (rdb/INCREMENTAL_DELTA_BOUND.md, Section 5.7). A delete-cap is creator-only,
+// so it is always live and this reports no change for it.
 async function verdictChanged(cap: RCapDeltaHost, entry: dag.Entry, start: Version, end: Version): Promise<boolean> {
-    return await cap.isEntryVoided(entry.hash, start) !== await cap.isEntryVoided(entry.hash, end);
+    const before = await cap.explainEntryVoided(entry.hash, start);
+    const after = await cap.explainEntryVoided(entry.hash, end);
+    return (before === undefined) !== (after === undefined)
+        || before === 'undecided-cycle' || after === 'undecided-cycle';
 }
 
 // Feeds every walked entry to the accumulator. RCap's delta reports no verdict

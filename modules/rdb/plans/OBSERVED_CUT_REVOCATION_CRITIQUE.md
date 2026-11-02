@@ -194,7 +194,7 @@ Any two observers who have synced different branches of a multi-writer $G$ will 
 - `VOID_SEMANTICS.md` §5.5 ("Observes are never on a cycle") would need revising.
 - The assertion in `observeVerdictLive` would need revising. It throws on `undecided`, and `resolveObserveGateRefAt`'s see-through predicate calls it.
 - That predicate is boolean. It would need a walk-style recorder like `RTableViewImpl.walk`.
-- §4.4 and §4.6 lean on [`REFERENCE_FRAME.md`](../rpack/REFERENCE_FRAME.md)'s gate DAG, which is an unimplemented v2 design note. The v1 argument holds, but those sections should be labeled forward-looking.
+- §4.4 and §4.6 lean on [`REFERENCE_FRAME.md`](./REFERENCE_FRAME.md)'s gate DAG, which is an unimplemented v2 design note. The v1 argument holds, but those sections should be labeled forward-looking.
 
 ### 4.5 §4.1 argues against a strawman
 

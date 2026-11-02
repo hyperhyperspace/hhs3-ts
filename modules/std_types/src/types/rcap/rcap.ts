@@ -28,6 +28,7 @@ import {
 import type { RCap as RCapContract, RCapView as RCapViewContract } from "./interfaces.js";
 import { validateRCapPayload } from "./validate.js";
 import { RCapViewImpl } from "./view.js";
+import type { CapVoidReason } from "./view.js";
 import { RCapDelta, RCapDeltaStrategy, RCapDeltaAccumulator, computeRCapDelta, computeRCapRevisionBound } from "./delta.js";
 
 const DEFAULT_ENROLL_CAPABILITY = 'enroll';
@@ -335,9 +336,16 @@ export class RCapImpl implements RCapContract {
     }
 
     // Whether the grant, revoke or delete-cap `hash` is void observed from
-    // `from`: the verdict the bounded delta compares at its two horizons.
+    // `from`.
     async isEntryVoided(hash: B64Hash, from: Version): Promise<boolean> {
         return new RCapViewImpl(this, from, from).isOpVoid(hash);
+    }
+
+    // Why the grant, revoke or delete-cap `hash` is void observed from `from`,
+    // or undefined when it is live: the verdict the bounded delta compares at
+    // its two horizons.
+    async explainEntryVoided(hash: B64Hash, from: Version): Promise<CapVoidReason | undefined> {
+        return new RCapViewImpl(this, from, from).opVoidReason(hash);
     }
 
     private async getRawDag(): Promise<dag.Dag> {

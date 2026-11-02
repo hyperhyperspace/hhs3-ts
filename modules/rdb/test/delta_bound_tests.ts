@@ -14,7 +14,7 @@ import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
 import { RTableGroupImpl, rTableGroupFactory } from "../src/rtable_group/group.js";
 import type { RTableGroupDelta } from "../src/rtable_group/delta.js";
 import { deriveRowId } from "../src/rtable/hash.js";
-import type { Predicate, TableDef } from "../src/rschema/payload.js";
+import type { Predicate, Restriction, TableDef } from "../src/rschema/payload.js";
 import { assertGroupDeltaParity, assertRevisionBoundParity } from "./delta_parity/normalize.js";
 
 const hashSuite = createBasicCrypto().hash(HASH_SHA256);
@@ -105,6 +105,47 @@ async function localFloorHistory(name: string, nDeletesPerm: boolean) {
         ? await perm.delete(deriveRowId('p-1'), undefined, version(s1))
         : await notes.insert('n-2', { n: 'N' }, undefined, version(s1));
     return { group, x, E, s1, T, start: version(s1, T), end: version(N, T) };
+}
+
+// The delete rules of a two-member ring: deleting a left row needs a right row
+// labelled 'r', and deleting a right row needs a left row labelled 'l' and a
+// key row. Keys are open.
+const RIGHT_ROW: Predicate = { p: 'exists', table: 'right', where: { label: 'r' } };
+const LEFT_ROW: Predicate = { p: 'exists', table: 'left', where: { label: 'l' } };
+const KEY_ROW: Predicate = { p: 'exists', table: 'keys', where: { k: 'k' } };
+
+function gatedRestrictions(rule: Predicate): Restriction[] {
+    return [{ on: 'insert', rule: { p: 'true' } }, { on: 'update', rule: { p: 'true' } }, { on: 'delete', rule }];
+}
+
+// T1 deletes the only left row and T2 the only right row, concurrently, each
+// removing the row the other's rule needs: a ring, void by collapse. The tip
+// T1 is the meet of every delta below, so T1 sits inside the starting bound
+// and is walked only if T2 lowers it.
+async function ringHistory(name: string) {
+    const ctx = newCtx();
+    const admin = await makeAdmin();
+    const { group, schema, pinned } = await createGroup(ctx, admin, name, [
+        gatedDelete('left', { label: { type: 'string', pub: true } }, RIGHT_ROW),
+        gatedDelete('right', { label: { type: 'string', pub: true } }, { p: 'and', args: [LEFT_ROW, KEY_ROW] }),
+        open('keys', { k: { type: 'string', pub: true } }, { concurrentDeletes: true }),
+        open('notes', { n: { type: 'string' } }),
+    ]);
+    const left = await group.getTable('left');
+    const right = await group.getTable('right');
+    const keys = await group.getTable('keys');
+    const notes = await group.getTable('notes');
+
+    const l = await left.insert('a-1', { label: 'l' });
+    const r = await right.insert('b-1', { label: 'r' }, undefined, version(l));
+    const k = await keys.insert('k-1', { k: 'k' }, undefined, version(r));
+    const T1 = await left.delete(deriveRowId('a-1'), undefined, version(k));
+    const T2 = await right.delete(deriveRowId('b-1'), undefined, version(k));
+    return { ctx, admin, group, schema, pinned, keys, notes, k, T1, T2, start: version(T1, T2) };
+}
+
+async function voidKind(group: RTableGroupImpl, entry: B64Hash, from: Version): Promise<string> {
+    return (await group.explainEntryVoided(entry, from))?.kind ?? 'live';
 }
 
 export const deltaBoundTests = {
@@ -283,6 +324,66 @@ export const deltaBoundTests = {
 
                 const delta = await boundedDelta(group, version(s1, D), version(N, D));
                 assertTrue(isExactly(delta.revisionBound, s1), 'the bound stays at the meet');
+            },
+        },
+        {
+            name: '[DBOUND07] a side-branch delete collapsed at start and decided void at end lowers the bound, and its ring partner is reported',
+            invoke: async () => {
+                // C deletes the key row T2 needs, after T1 and concurrent with
+                // T2. At end T2 is void whatever T1 does, so T1 is live.
+                const h = await ringHistory('dbound-ring-decided');
+                const C = await h.keys.delete(deriveRowId('k-1'), undefined, version(h.T1));
+                const end = version(C, h.T2);
+                assertEquals(await voidKind(h.group, h.T1, h.start), 'undecided-cycle', 'T1 collapses at start');
+                assertEquals(await voidKind(h.group, h.T2, h.start), 'undecided-cycle', 'T2 collapses at start');
+                assertEquals(await voidKind(h.group, h.T1, end), 'live', 'T1 is live at end');
+                const t2End = await voidKind(h.group, h.T2, end);
+                assertTrue(t2End !== 'live' && t2End !== 'undecided-cycle', 'T2 is decided void at end');
+
+                const delta = await boundedDelta(h.group, h.start, end);
+                assertTrue(hasFlip(delta, h.T1), 'T1 flips to live');
+                assertTrue(!hasFlip(delta, h.T2), 'T2 is void at both horizons');
+                assertTrue(isExactly(delta.revisionBound, h.k), 'the bound drops to T2\'s predecessor');
+            },
+        },
+        {
+            name: '[DBOUND08] a side-branch delete collapsed at both horizons, in different cores, lowers the bound',
+            invoke: async () => {
+                // D, after T1 and concurrent with T2, makes a right delete need
+                // only a key row and a key delete need a right row. X deletes the
+                // key row after D. At end T2 and X form a ring without T1 and
+                // collapse, and T1, which still reads the original rule, is live.
+                const h = await ringHistory('dbound-ring-regrouped');
+                const update = await h.schema.updateSchema([
+                    { rule: 'set-restrictions', table: 'right', restrictions: gatedRestrictions(KEY_ROW) },
+                    { rule: 'set-restrictions', table: 'keys', restrictions: gatedRestrictions(RIGHT_ROW) },
+                ], h.admin, 'regroup', h.pinned);
+                const D = await h.group.deploy(version(update), undefined, version(h.T1));
+                const X = await h.keys.delete(deriveRowId('k-1'), undefined, version(D));
+                const end = version(X, h.T2);
+                assertEquals(await voidKind(h.group, h.T2, h.start), 'undecided-cycle', 'T2 collapses at start');
+                assertEquals(await voidKind(h.group, h.T2, end), 'undecided-cycle', 'T2 collapses at end');
+                assertEquals(await voidKind(h.group, X, end), 'undecided-cycle', 'X collapses with T2');
+                assertEquals(await voidKind(h.group, h.T1, h.start), 'undecided-cycle', 'T1 collapses at start');
+                assertEquals(await voidKind(h.group, h.T1, end), 'live', 'T1 is live at end');
+
+                const delta = await boundedDelta(h.group, h.start, end);
+                assertTrue(hasFlip(delta, h.T1), 'T1 flips to live');
+                assertTrue(isExactly(delta.revisionBound, h.k), 'the bound drops to T2\'s predecessor');
+            },
+        },
+        {
+            name: '[DBOUND09] a side-branch ring that nothing changes still lowers the bound (conservative)',
+            invoke: async () => {
+                const h = await ringHistory('dbound-ring-unchanged');
+                const N = await h.notes.insert('n-1', { n: 'N' }, undefined, version(h.T1));
+                const end = version(N, h.T2);
+                assertEquals(await voidKind(h.group, h.T2, end), 'undecided-cycle', 'T2 collapses at end');
+                assertEquals(await voidKind(h.group, h.T1, end), 'undecided-cycle', 'T1 collapses at end');
+
+                const delta = await boundedDelta(h.group, h.start, end);
+                assertEquals(delta.opVerdictChanges.length, 0, 'nothing flips');
+                assertTrue(isExactly(delta.revisionBound, h.k), 'the bound drops below the ring');
             },
         },
     ],

@@ -16,6 +16,8 @@ A position $P$ is **at or below** a position $Q$ when $H(P) \subseteq H(Q)$. An 
 
 **Verdicts.** Every row operation, bundle and observe has a **verdict**, live or void, at a **horizon** (a version). The verdict is evaluated at use: at the entry's own position, observed from the horizon. A delete whose rule requires a permission row is void at a horizon where a concurrent delete has removed that row. A voided entry has no effect: a voided insert never makes its row live, a voided delete deletes nothing. Verdicts are a pure function of the entry and the horizon.
 
+**Collapse.** Verdicts that read each other are solved together ([`VOID_SEMANTICS.md`](./VOID_SEMANTICS.md) §4). Two concurrent deletes that each remove the row the other's rule needs form a **ring**: each is live only if the other is void. When nothing outside the ring decides it, the solve leaves its members undecided and then voids them. We say these entries are **void by collapse**, with reason `undecided-cycle`. The other void entries are **decided void**.
+
 **Barriers.** An entry's verdict can read entries on other branches, but only **barriers**. Barriers are tagged `barrier` in the entry meta. There are three kinds:
 
 - **Deletes**, alone or inside a bundle. Whether a delete reaches concurrent branches is decided by the table's `concurrentDeletes` flag, resolved at the delete's own position observed from the horizon. We call this the delete's **honor flag**.
@@ -84,6 +86,8 @@ The **effect** of a barrier $T$ at a horizon is what entries on other branches r
 
 The schema version a deploy publishes is fixed, and deploys are never void, so a deploy's effect can change only through its honor flag.
 
+A verdict stands for the barrier's effect only when it is decided. A barrier that is void by collapse at a horizon may have a different effect there, even when its verdict is the same at both horizons. So a barrier void by collapse at `start`, at `end` or at both counts as changed. Section 5.7 explains why.
+
 There are two ways to satisfy condition 2.
 
 The first works from shape alone. It lowers the bound below every barrier concurrent with it, whether or not its effect changed. That is sound and needs no verdicts, but an old side branch that `start` already contains, and that never merged into the meet, pulls the bound below itself even when the new entries do not touch it. On histories with long-lived branches the bounded delta then costs as much as the full one.
@@ -133,6 +137,7 @@ if void-checkable and (not bound-only or canWiden):
     record a flip if they differ              # not in bound-only mode
 if canWiden and (
        voidBefore != voidAfter
+    or it is void by collapse at start or at end
     or it observes a bound group F and its version is not inside b_F
     or (deployCoverMoved and the honor flag of a table it deletes from
         differs between start and end)):
@@ -159,7 +164,7 @@ Two cases show the walk at work on the history of Section 2.
 These are properties of the group implementation that the argument relies on.
 
 - **A1. One root.** The `create` entry is the only entry without predecessors. It is in $H(\text{start})$ whenever `start` is non-empty.
-- **A2. Determinism.** A verdict is a function of the entry and the horizon. Mutually dependent verdicts are solved together, deterministically.
+- **A2. Determinism.** A verdict is a function of the entry and the horizon. Mutually dependent verdicts are solved together, deterministically. A decided verdict is what its rule gives against the final verdicts it reads, and the solve's last pass checks this. Fixing a decided entry at its verdict changes no other verdict of the solve, because the rules are monotone. A verdict void by collapse has neither property (Section 5.7).
 - **A3. Cross-branch reads see only barriers.** The verdict of an entry $E$ at horizon $H$ reads:
   - entries of $H(E)$;
   - the schema and group parameters at $(\{E\}, H)$;
@@ -210,7 +215,7 @@ The gate cannot be the schema version at the two horizons instead. Say `start` a
 
 *Proof.* By Lemma 1, $T \in H(\text{start})$. By Lemma 2 it was walked, and by Lemma 3 `canWiden` held for it (or the bound was already empty, and then $U$ is empty). Suppose $T$ triggered. If it was not strictly after the bound of the moment, the bound was lowered to a GLB with $\mathrm{preds}(T)$, after which $T$ was strictly after it. Being strictly after a position is preserved when the position drops: $H(B') \subseteq H(B) \subseteq H(\mathrm{preds}(T))$. So $T$ is strictly after the final $B$, a contradiction. Hence $T$ did not trigger. So:
 
-- its verdict is the same at both horizons;
+- its verdict is the same at both horizons, and decided at both: it is not void by collapse at either;
 - if it observes a bound group, it is stable;
 - if it deletes rows, its honor flags agree, either by the explicit check or, when `deployCoverMoved` is false, by Lemma 4.
 
@@ -233,7 +238,9 @@ The operations of a row include the schema deploys that delete it.
 - **Barriers concurrent with positions inside $U$.** A barrier concurrent with a position $P$ inside $U$ is not strictly after $P$, and so not strictly after $B$. It is either in $U$ or, by Lemma 6, outside $U$ with an unchanged effect. By Lemma 1 it is never new.
 - **Foreign views.** Consider a view of $F$ anchored inside $U$. Its `foreignAt` folds observes that are either in $U$, and stable by Lemma 5, or outside $U$, not strictly after $B$, and so stable with an unchanged verdict by Lemma 6. Their verdicts are the same at both horizons (they are inside $U$, or covered by Lemma 6). So `foreignAt` is the same at both horizons and lies inside $H(b_F)$. Its `foreignFrom` is `refAtStart` at `start` and `refAtEnd` at `end`, the pair $b_F$ was computed for. By A6 we may assume the theorem for $F$: part (b) for $F$ says the view of $F$ anchored at `foreignAt` agrees at the two horizons. The observe gate reads $F$ the same way: its version is a widening by concurrent live observes, which are stable with unchanged verdicts, and its horizon version is again `refAtStart` or `refAtEnd`.
 
-Every input the computation takes from outside $U$ is therefore the same at both horizons. By A2 the computation is deterministic, including where verdicts depend on each other, so its outputs agree. That gives (a) and (b).
+A barrier outside $U$ can be solved together with the entries of $U$ that read it. It is then a member of their solve, not an input, and its own reads can include new entries: concurrent with it, but not with any position inside $U$. By Lemma 6 it is decided at both horizons with the same verdict, so by A2 fixing it at that verdict changes no verdict of $U$. That holds even if it is decided only after a core elsewhere collapses. While it is undecided, it is in the support of every entry of $U$ that reads it, so no core containing such an entry can collapse before it is decided, unless the core contains it, and then it would be void by collapse.
+
+Every input the computation takes from outside $U$ is therefore the same at both horizons. By A2 the computation is deterministic, including where verdicts of $U$ depend on each other, so its outputs agree. That gives (a) and (b). Section 5.7 shows how this step fails when a barrier is void by collapse.
 
 For (c), the view of a row at horizon $H$ reads the row's operations, all in $U$ with the same verdicts by (a). It also reads deletes concurrent with the horizon itself, and there are none: nothing in $H$ is concurrent with $H$. Values are compared within the incarnations of the `end` horizon, as the row channel always does. Table- and column-wide schema changes travel in the schema channel. $\square$
 
@@ -255,7 +262,8 @@ The bound is sound. It is not claimed to be the greatest sound bound. Some trigg
 
 - a bundle is checked on every table it touches, not only the ones it deletes from;
 - an unstable observe lowers the bound even if no entry below it reads that binding;
-- a delete lowers it even if no entry below reads its row.
+- a delete lowers it even if no entry below reads its row;
+- a barrier void by collapse lowers it even if nothing about it changed (`[DBOUND09]`). Section 5.7 describes a finer test.
 
 Restricting each trigger to the entries that actually read the barrier would need the schema at each entry, and has not been needed so far.
 
@@ -303,6 +311,43 @@ With $F$'s bound taken from $v_2$:
 
 The meet-based bound described in Section 2 also took the foreign bound from the meet. It reported `E_G` only because its heads-only stop happened to walk into `E_G` through `O2`.
 
+### 5.7 Why a collapsed barrier counts as changed
+
+The proof of Theorem 1 replaces each barrier next to $U$ by its verdict. That is sound for a decided verdict (A2) and unsound for a verdict void by collapse, for two reasons.
+
+**Its readers did not read "void".** Take three tables. Deleting a left row needs the right row of its pair. Deleting a right row needs the left row and the key row of its pair. Deleting a key row is open. Deletes reach concurrent branches.
+
+```text
+l ── r ── k ── T1 ── C        T1 deletes the left row, T2 the right row
+           \                  C  deletes the key row
+            T2                start = {T1, T2}, end = {C, T2}
+```
+
+- At `start`, `T1` and `T2` form a ring, and both are void by collapse.
+- At `end`, `C` removes the key row `T2` needs, whatever `T1` does. So `T2` is decided void, and `T1` is live.
+
+The meet is $\{T_1\}$. The walk visits `C` and `T2`. `T2` is void at both horizons, so a walk that compares verdicts keeps the bound at the meet. It misses `T1`'s flip and the deletion of the left row (`[DBOUND07]`). `C` is not concurrent with any entry of $U$, so Lemma 1 lets it in. It reaches `T1` through `T2`, which `T1` read as undecided at `start` and as void at `end`.
+
+**A collapse at both horizons does not settle it.** In `[DBOUND08]`, a deploy `D` after `T1` changes two rules: deleting a right row needs only the key row of its pair, and deleting a key row needs the right row of its pair. `X`, after `D`, deletes the key row. `D` is concurrent with `T2` and not with `T1`, so it changes `T2`'s rule only.
+
+- At `start`, `T1` and `T2` are void by collapse together.
+- At `end`, `T2` and `X` form a ring without `T1`, and both are void by collapse. `T1` is then solved against `T2` void, and is live.
+
+`T2` is void by collapse at both horizons, and its honor flag does not move, yet `T1` flips. A reader's outcome depends on the core the barrier collapsed in, and no verdict records the core.
+
+So the visitors count a collapse at either horizon as a change, and the bound drops below the barrier. Every entry that reads the barrier is concurrent with it, so it ends up outside the new bound and is walked.
+
+**Cost.** An old ring on a side branch of `start` that is still concurrent with the meet lowers the bound on every delta, even when nothing about it changed (`[DBOUND09]`). Once a later entry merges the ring's branches and the meet moves above that merge, the ring is inside the bound and costs nothing.
+
+**A possible refinement.** A barrier void by collapse at both horizons, in the same core, plausibly has the same effect at both:
+
+- A reader in that core is void by collapse at both horizons.
+- A reader outside the core is decided only after the core collapses, because until then the barrier is in its support. It reads void at both horizons.
+
+The visitors could then count such a barrier as unchanged. That needs the solve to record each member's core in its `undecided-cycle` reason. Cores must be compared as sets of entry hashes, because verdict keys include `from`, which differs between the two horizons. A core that contains a new entry differs from every core at `start`, so it still counts as a change.
+
+This has been neither proved nor implemented. Rings are rare, so the conservative rule stays until its cost shows up. The same refinement would apply to RCap's visitor (`std_types/src/types/rcap/delta.ts`), which counts a collapsed revoke as changed for the same reason (`[CAP_BOUND06]`).
+
 ---
 
 ## 6. Implementation notes
@@ -311,7 +356,7 @@ The meet-based bound described in Section 2 also took the foreign bound from the
 
 - **`mvt/src/revision_bound.ts`.** The walk of Section 4 is `walkRevisionBound`, which knows the geometry, the `barrier` tag and references, and nothing about verdicts. Phase A's descent is `lowerBelowUnstableRefAdvances`. The helpers are `computeStopSet`, `isStrictlyAfter`, `computeGLB` and `isUnstableRefAdvance`. `requireExtendingFork` computes the fork the walk takes. Its doc comment states, in terms of views and barriers, what a host and its visitor must guarantee. Those guarantees are the assumptions of Section 5.1 and the effect of Section 3.
 - **`rtable_group/delta.ts`.**
-  - `computeRTableGroupDelta(group, rawDag, strategy, start, end)` computes the delta. Under `'bounded'` it runs the walk with the delta visitor. That visitor ingests every walked entry, records every verdict flip, and reports a candidate as changed when its verdict or its honor flag (`didDeleteHonorFlip`) flipped. The flips become records after the walk.
+  - `computeRTableGroupDelta(group, rawDag, strategy, start, end)` computes the delta. Under `'bounded'` it runs the walk with the delta visitor. That visitor ingests every walked entry, records every verdict flip, and reports a candidate as changed when its verdict or its honor flag (`didDeleteHonorFlip`) flipped, or when it is void by collapse at either horizon (`horizonVerdicts`). The flips become records after the walk.
   - `computeRTableGroupRevisionBound(group, rawDag, start, end)` runs the same walk with the bound-only visitor, which reads verdicts and honor flags only for candidates.
   - `revisionBoundHost` declares the group's references. Each bound group is `'horizon'`, read at the version observed at the horizon. The schema is `'at'`, read at $(v, v)$, and so never bounded.
 - **`GroupDeltaHost`** is what the computation needs from the group. It adds `resolveSchemaView`, `resolveObservedForeignVersion` and `getBoundGroup` to what the accumulator already used. `getBoundGroup` returns a `BoundGroupHost`, an alias of mvt's `ReferencedObject` (`computeRevisionBound`, `getCausalDag`), and throws if the bound group is missing from the replica.
@@ -323,7 +368,7 @@ The meet-based bound described in Section 2 also took the foreign bound from the
 - **The full strategy stays independent.** `'full'` still walks the whole history with `walkEntriesBackwardsToBound` and computes flips with `computeOpVerdictFlips`. The parity tests compare the bounded delta against it, and a reference that shared the new walk would share its mistakes.
 - **Read the foreign versions the views read.** Phase A gets `refAtStart` and `refAtEnd` from `resolveObservedForeignVersion`, the same canonical fold that `resolveForeignTableViewIn` uses for `foreignFrom` and that the observe gate uses for its horizon. A raw `resolveRefVersionAtPosition` can return a version with dominated hashes. The history would be the same, but the memo key would not.
 - **Deletes can live in the meta.** A deploy that adopts an FK has a plain ref-advance payload. The rows it deletes are tagged in its meta: `tables`, plus one `t-<table>-rows` tag per row. `didDeleteHonorFlip` therefore takes the tables from `entry.meta['tables']`. Reading row deletes from the payload would miss these deploys, which are never void, so the honor flip is the only trigger that can catch them.
-- **Bound-only mode evaluates little.** It skips the row channel and `explainEntryVoided`, and reads verdicts only for old barriers that can still lower the bound.
+- **Bound-only mode evaluates little.** It skips the row channel and the flip records, and reads verdicts only for old barriers that can still lower the bound. Both visitors read verdicts through `explainEntryVoided`, which runs the same evaluation as `isEntryVoided` and also returns the reason, so the collapse check costs nothing extra.
 - **The memo.** `computeRevisionBound` canonicalizes both versions, keys a 256-entry LRU on their sorted hashes, and clears it in `destroy()`. Keeping it across calls is safe: hashes are content addresses, so a version names a fixed history. The bound between two fixed versions depends only on those histories and on the schema and foreign histories they pin. Appending entries never changes it.
 - **The memo's value is unproven.** The review of the single-pass plan suggested it, and nothing has measured it since.
   - **Who calls `computeRevisionBound`:** only Phase A of another group's walk, once per binding, for each delta. The only production caller of a group's `computeDelta` is `projectGroupTo` (`rdb_adapter/src/project.ts`), once per checkpoint advance per target.
@@ -338,7 +383,15 @@ The meet-based bound described in Section 2 also took the foreign bound from the
 - **An over-walk can hide an unsound bound.** `walkEntriesBackwardsToBound` stops only at the bound's heads. When a side branch attaches below a head, it walks the whole past of the attachment point. That reached the affected entry in some histories (Section 5.6) and made the meet-based bound look correct there. The group now stops at the exit border, which is cheaper and hides nothing. `RCap` does too, through the same walk (`std_types/README.md`, RCap's delta computation). Before it did, its meet-based bound missed a grant revived by a new entry that voids a side-branch revoke (`[CAP_BOUND01]`). `RSet` uses it too. Its projection of the RCap bound missed two cases: an add below the meet whose `refAt` a side-branch ref-advance widens (`[SET_BOUND01]`), and an RCap bound taken between the versions observed at the meet and at `end` instead of at `start` and `end` (`[SET_BOUND02]`). Since ref-advances have verdicts, its visitor also reports one that is live at only one end: a stable ref-advance can turn void through its widened cut (`[SET_BOUND05]`). `RSchema` keeps the meet and the bound-head walk; its DAG has no barriers.
 - **Random histories rarely build these shapes.** A failure needs an old barrier on a side branch, concurrent with an entry below the meet, whose effect a new entry changes. Generators with gated deletes, honor toggles, FK adoption and side-branch observes found no failure of the meet-based bound in about 6,300 pairs. A shaped generator found 4 failures in the smoke profile and 21 in the extended one. It builds the skeleton of Section 2 and randomizes which barriers sit on it, plus noise entries. A generator should be shown to catch a known bug before it is trusted to guard against it.
 - **Check one quantity two ways.** Bound-only mode skips work the full walk does. Every parity pair checks that `computeRevisionBound` returns the delta's own bound.
-- **Mutations confirm the tests bite.** Taking the foreign bound from the meet's version makes `[DBOUND04]` fail. Reading deletes only from payloads makes `[DBOUND05]` fail.
+- **A verdict does not always summarize the effect.** The visitors first compared live against void only. A collapsed ring member can be void at both horizons while its effect changes (Section 5.7), and no generator built a ring, so the parity sweeps could not see it.
+  - `[DELTA_PARITY_RING]` builds rings and regroups them with deploys, and passes. With the collapse check removed it still found no failure in the smoke or the extended profile. The failure needs a ring member below the meet and a new entry, on a branch without the other member, that decides it.
+  - The `ring` shape of `[DELTA_PARITY_SHAPED]` builds exactly that, and fails at once without the check.
+  - RCap had the same gap. Its test, `[CAP_BOUND06]`, needs a ring of three revokes. In a ring of two, the entry that decides one revoke touches the grant pair the other revokes, and the grant channel compares that pair anyway.
+- **Mutations confirm the tests bite.**
+  - Taking the foreign bound from the meet's version makes `[DBOUND04]` fail.
+  - Reading deletes only from payloads makes `[DBOUND05]` fail.
+  - Dropping the collapse check makes `[DBOUND07]`, `[DELTA_PARITY_SHAPED]` and `[CAP_BOUND06]` fail.
+  - Counting a collapse only when the reason differs between the horizons makes `[DBOUND08]` fail.
 
 ### 6.4 Tests
 
@@ -349,9 +402,12 @@ The meet-based bound described in Section 2 also took the foreign bound from the
   - `[DBOUND04]`: the history of Section 5.6.
   - `[DBOUND05]`: an FK-adopting deploy on a side branch whose honor flag a new deploy turns off.
   - `[DBOUND06]`: a side-branch schema deploy with no new deploy. The bound stays at the meet.
+  - `[DBOUND07]` and `[DBOUND08]`: the two ring histories of Section 5.7.
+  - `[DBOUND09]`: a side-branch ring that nothing changes. The bound still drops below it.
 - **`test/delta_parity/`** has the full-against-bounded sweeps.
   - `[DELTA_PARITY_GROUP]` and `[DELTA_PARITY_XGROUP]`: random single-group and cross-group histories.
   - `[DELTA_PARITY_GATED]` and `[DELTA_PARITY_GATED_XGROUP]`: gated deletes, honor toggles, FK adoption, and observes of older foreign versions.
-  - `[DELTA_PARITY_SHAPED]`: the counterexample skeleton with randomized barriers.
+  - `[DELTA_PARITY_RING]`: random deletes that form rings, and deploys that regroup them.
+  - `[DELTA_PARITY_SHAPED]`: the counterexample skeletons with randomized barriers, including the rings of Section 5.7.
 
   `npm test` runs them with the smoke profile, and `npm run test:parity` runs them with the extended one.

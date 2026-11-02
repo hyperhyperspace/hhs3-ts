@@ -1,7 +1,7 @@
 import { resolveFuzzSweepOptions, runGroupSeedSweep } from "./parity.js";
 import {
     generateSingleGroupHistory, generateCrossGroupHistory,
-    generateGatedGroupHistory, generateGatedCrossGroupHistory, generateShapedHistories,
+    generateGatedGroupHistory, generateGatedCrossGroupHistory, generateRingGroupHistory, generateShapedHistories,
 } from "./generate.js";
 
 export const groupDeltaParityTests = {
@@ -33,6 +33,13 @@ export const groupDeltaParityTests = {
             invoke: async () => {
                 const options = resolveFuzzSweepOptions(process.argv.slice(2));
                 await runGroupSeedSweep(generateGatedCrossGroupHistory, options);
+            },
+        },
+        {
+            name: "[DELTA_PARITY_RING] bounded and full computeDelta agree on deletes that form rings, collapse and regroup (single group)",
+            invoke: async () => {
+                const options = resolveFuzzSweepOptions(process.argv.slice(2));
+                await runGroupSeedSweep(generateRingGroupHistory, options);
             },
         },
         {

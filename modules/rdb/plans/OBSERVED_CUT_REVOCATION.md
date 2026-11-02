@@ -9,7 +9,7 @@
 > the problem record. The ideal-concurrency rule described there is what the
 > code implements.
 
-This document analyzes how capability revocations (and barrier row/set deletes) interact with multi-element versions $V$ produced by forks and inter-object reference advances (`ref-advance` / `observe`). It connects the designs in [`VOID_SEMANTICS.md`](./VOID_SEMANTICS.md), `MODERNIZATION.md`, `MODERNIZATION_v2.md` (std_types notes, since folded into its README), and [`REFERENCE_FRAME.md`](../rpack/REFERENCE_FRAME.md), and evaluates the exact impact of moving gated observation widening (`resolveObserveGateRefAt`) onto the 3-valued well-founded engine (`VerdictEvaluation`).
+This document analyzes how capability revocations (and barrier row/set deletes) interact with multi-element versions $V$ produced by forks and inter-object reference advances (`ref-advance` / `observe`). It connects the designs in [`VOID_SEMANTICS.md`](./VOID_SEMANTICS.md), `MODERNIZATION.md`, `MODERNIZATION_v2.md` (std_types notes, since folded into its README), and [`REFERENCE_FRAME.md`](./REFERENCE_FRAME.md), and evaluates the exact impact of moving gated observation widening (`resolveObserveGateRefAt`) onto the 3-valued well-founded engine (`VerdictEvaluation`).
 
 ---
 
@@ -338,9 +338,9 @@ If `observe` entries can form a Tarjan component in Layer 1 (when two multi-head
 1. Layer 2 (`resolveForeignTableViewIn`) is called while diagnosing a row/bundle op $R$ in the observer group $O$ (or from a top-level view query).
 2. When `isObserveLive` calls `resolveVerdict(evaluation, h, from)` for an `observe` entry $h \in O$, $h$ is pushed onto the Tarjan stack above $R$.
 3. What can `diagnoseObserve(h)` reach?
-   - Other `observe` entries in $O$ (for the same binding in v1, or lower-ranked bindings in $O$'s acyclic gate dependency DAG in [`REFERENCE_FRAME.md`](../rpack/REFERENCE_FRAME.md) §2.2), and
+   - Other `observe` entries in $O$ (for the same binding in v1, or lower-ranked bindings in $O$'s acyclic gate dependency DAG in [`REFERENCE_FRAME.md`](./REFERENCE_FRAME.md) §2.2), and
    - Entries in bound foreign groups $G$ (which lie strictly lower in the creation-pinned group binding DAG).
-4. Because `canObserve` predicates are forbidden from referencing observer-local tables (`REFERENCE_FRAME.md` §2.1 rule 3) and group bindings form a strict DAG, **no path from `diagnoseObserve(h)` can ever reach a local row/bundle op $R$ in $O$**.
+4. Because `canObserve` predicates cannot reference observer-local tables today (they are read in the observed group's frame; the observer-frame proposal reads them only through gate verdicts, which never reach a local row's ordinary verdict, `REFERENCE_FRAME.md` §2.5 and §3.1) and group bindings form a strict DAG, **no path from `diagnoseObserve(h)` can ever reach a local row/bundle op $R$ in $O$**.
 5. Therefore, the lowlink of the root `observe` frame called by Layer 2 can never drop below its own stack index. Its Tarjan SCC is **guaranteed** to complete inside `resolveVerdict` and return a decided verdict (`'live'` or `'void'`) to Layer 2!
 
 ### 4.5 Fundamental Property 5: Why `refFrom` / `foreignFrom` Must Stay Geometric
@@ -360,7 +360,7 @@ Why must `refFrom` stay geometric (unfiltered by `isLive`)?
 ### 4.6 Fundamental Property 6: Multi-Hop Chains of Rights-Granting Objects ($G_0 \leftarrow G_1 \leftarrow \dots \leftarrow O$) and `REFERENCE_FRAME.md`
 
 What happens when permissions are delegated across a chain of objects — e.g., $G_0$ grants capabilities governing $G_1$ (both ops in $G_1$ and `observe` of $G_0$ in $G_1$), and $G_1$ grants capabilities governing $O$?
-1. **Acyclicity across objects:** Creation-time bindings form a strict DAG ($O \to G_1 \to G_0$), and within a single group $O$ under [`REFERENCE_FRAME.md`](../rpack/REFERENCE_FRAME.md) §2.2, cross-binding `canObserve` gates (`auth` $\neq$ `target`) also form a genesis-validated strict DAG. Every recursive `resolveVerdict` call strictly descends the lexicographic order:
+1. **Acyclicity across objects:** Creation-time bindings form a strict DAG ($O \to G_1 \to G_0$), and within a single group $O$ under [`REFERENCE_FRAME.md`](./REFERENCE_FRAME.md) §2.2, cross-binding `canObserve` gates (`auth` $\neq$ `target`) also form a genesis-validated strict DAG. Every recursive `resolveVerdict` call strictly descends the lexicographic order:
    $$\bigl(\text{group binding DAG rank},\; \text{observer gate DAG rank},\; \text{SCC within one `(group, refId)`}\bigr)$$
 2. **End-to-end defense against multi-hop forks:**
    Suppose Alice is revoked at $r_0 \in G_0$, and tries to fork $G_0$, fork $G_1$ (publishing a mixed-cut `observe` of $G_0$ or inserting a sybil grant in $G_1$), and fork $O$:
@@ -369,7 +369,7 @@ What happens when permissions are delegated across a chain of objects — e.g., 
    - In $G_1$, $A_{\text{honest}}$ widens Alice's mixed-cut `observe` of $G_0$ via $\succ_{\exists}$ (Layer 1) and widens Alice's sybil grant in $G_1$ via Layer 2, placing $r_0 \in \downarrow V_{G_0}$ where Step 1 in $G_0$ voids both!
    - In $G_1$, the see-through walks skip Alice's voided `observe` and voided sybil grant, which in turn voids Alice's dependent `observe` and operations in $O$.
 3. **Why `REFERENCE_FRAME.md` was relevant:**
-   In `REFERENCE_FRAME.md` §2.1, when a gate on `target` ($H$) in $O$ reads a *different* bound capability group `auth` ($K \neq H$), it resolves $K$ via Layer 2 (`resolveSchemaForeignTableViewIn(..., filterVoided = true)`), which unions **all** live concurrent observations of $K$ in $O$ into `authAt`. Thus the $K \neq H$ path already unioned all live concurrent `auth` observations into Step 1, whereas the self-gated $K = H$ path went through `resolveObserveGateRefAt` (Layer 1) and suffered from the whole-cut dominance gap on mixed cuts. Upgrading Layer 1 to $\succ_{\exists}$ + $[V_{\text{min}}, V_{\text{max}}]$ brings the $K = H$ path to the same security level as $K \neq H$.
+   In `REFERENCE_FRAME.md` §2.3, when a gate on `target` ($H$) in $O$ reads a *different* bound capability group `auth` ($K \neq H$), it resolves $K$ via Layer 2 (`resolveSchemaForeignTableViewIn(..., filterVoided = true)`), which unions **all** live concurrent observations of $K$ in $O$ into `authAt`. Thus the $K \neq H$ path already unioned all live concurrent `auth` observations into Step 1, whereas the self-gated $K = H$ path went through `resolveObserveGateRefAt` (Layer 1) and suffered from the whole-cut dominance gap on mixed cuts. Upgrading Layer 1 to $\succ_{\exists}$ + $[V_{\text{min}}, V_{\text{max}}]$ brings the $K = H$ path to the same security level as $K \neq H$.
 
 ---
 

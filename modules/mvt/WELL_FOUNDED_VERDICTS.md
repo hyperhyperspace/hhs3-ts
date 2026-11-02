@@ -197,6 +197,7 @@ For a component of $n$ entries, the fixpoint runs at most $n + 1$ rounds, each s
 - **Good faith does not help a member of a core.** Three admins who revoke each other concurrently, each for a good reason, all fail: every target stays in place.
 - **Reasons follow the final verdicts.** A void entry reports the first check that fails once every verdict is decided, which can be a consequence of its own voidness (`[PERM20b]`). Core members report `undecided-cycle`.
 - **A solve runs diagnoses again**, as often as Section 4.5 allows. Each computation pays it again, since completed components are not kept across computations (Section 6.5).
+- **A collapsed verdict is not a summary.** The collapse keeps a third value out of the answers, but a verdict void by collapse is not a function of the verdicts it reads. The entries solved with it read it as undecided, and their outcome depends on its core. A bounded delta that takes a barrier's unchanged verdict as proof that its effect is unchanged must therefore count a barrier void by collapse at either horizon as changed. rdb's and RCap's visitors do this ([`INCREMENTAL_DELTA_BOUND.md`](../rdb/INCREMENTAL_DELTA_BOUND.md) §5.7).
 
 ### 5.4 The read rules are part of the protocol
 
@@ -283,6 +284,7 @@ A read during the solve can reach an entry not seen yet. It is resolved as a nor
 - **A test for the program of Section 3.3**, named for the choice, that fails on `x`'s verdict under Kripke–Kleene.
 - **A preference order for revoke races** (Section 3.5). The key would be the insert position of the authorizing capability, fixed at grant time, not the revoke's position, so a later attacker cannot grind it. Components stay inside one group today; a type whose cycles can cross objects would need an order between them.
 - **A cache of completed components across computations.** Sound, not implemented.
+- **Recording the core in a collapse.** A bounded delta counts a barrier void by collapse at either horizon as changed, because the verdict does not say which core it collapsed in (Section 5.3). If the `undecided-cycle` reason carried the member's core, as a set of entry hashes, a barrier collapsed in the same core at both horizons could count as unchanged. Plausible, not proved, not implemented: [`rdb/INCREMENTAL_DELTA_BOUND.md`](../rdb/INCREMENTAL_DELTA_BOUND.md) §5.7.
 - **Observes that read each other.** The observer-frame `ALLOW UPDATE REF` design in [`rdb/plans/REFERENCE_FRAME.md`](../rdb/plans/REFERENCE_FRAME.md) would make one observe's verdict depend on the observer's other observes, which could put observes on cycles. rdb throws on an undecided observe verdict today ([`VOID_SEMANTICS.md`](../rdb/VOID_SEMANTICS.md) §5.5).
 - **A proof of Section 4.1.** The argument and the order-sweeping tests are what exists.
 

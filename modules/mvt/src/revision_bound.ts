@@ -103,6 +103,13 @@ type ReferencedBound = { dag: CausalDag; bound: Version };
 //      liveness verdict (6), the same holds for the views anchored after T,
 //      and its verdict is the same at both: an unstable or flipped one lowers
 //      the bound below it, so every entry after it is walked too.
+//
+//      An unchanged verdict covers T's effect only when it is decided at both
+//      horizons. A verdict that VerdictEvaluation voids by collapse is not a
+//      function of the verdicts it reads, and the entries solved together
+//      with T read it as undecided, with an outcome that depends on the core
+//      it collapsed in. So visit(T, true) must return true when T is void by
+//      collapse at either horizon, or at both.
 //   5. Every reference is declared. Every ref id that appears in a ref-advance
 //      of the object is declared exactly once in references(), with the
 //      `from` its views read it at.

@@ -18,7 +18,7 @@ import type { RCap, RCapView } from "./interfaces.js";
 
 // Why a grant or revoke is void: its author held no managing cap at the op, or
 // a dependency cycle left it undecided (denied).
-type CapVoidReason = 'unauthorized' | 'undecided-cycle';
+export type CapVoidReason = 'unauthorized' | 'undecided-cycle';
 
 type DefinitionRead = { origins: Set<B64Hash>; managedBy: string[] };
 
@@ -253,14 +253,20 @@ export class RCapViewImpl implements RCapView {
     }
 
     // Whether the grant, revoke or delete-cap `hash` is void observed from this
-    // view's `from`; `at` plays no part. The bounded delta compares it at its two
-    // horizons. One evaluation per call, as in hasCapability.
+    // view's `from`; `at` plays no part. One evaluation per call, as in
+    // hasCapability.
     async isOpVoid(hash: B64Hash): Promise<boolean> {
+        return (await this.opVoidReason(hash)) !== undefined;
+    }
+
+    // Why the op `hash` is void observed from this view's `from`, or undefined
+    // when it is live. The bounded delta compares it at its two horizons.
+    async opVoidReason(hash: B64Hash): Promise<CapVoidReason | undefined> {
         const verdict = await this.opVerdict(new VerdictEvaluation<CapVoidReason>('undecided-cycle'), hash);
         if (verdict.status === 'undecided') {
             throw new Error(`the verdict of '${hash}' is undecided outside the component being solved`);
         }
-        return verdict.status === 'void';
+        return verdict.status === 'void' ? verdict.reason : undefined;
     }
 
     async getManagedBy(capName: string): Promise<string[]> {

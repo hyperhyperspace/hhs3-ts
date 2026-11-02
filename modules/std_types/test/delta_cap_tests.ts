@@ -7,6 +7,7 @@ import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
 import { RCap, rCapFactory } from "../src/types/rcap/rcap.js";
+import type { RCapImpl } from "../src/types/rcap/rcap.js";
 import type { RCapDelta } from "../src/types/rcap/rcap.js";
 import { serializePublicKeyToBase64 } from "../src/authorship.js";
 import { normalizeRCapDelta } from "./delta_parity/normalize.js";
@@ -647,6 +648,53 @@ export const deltaCapTests = {
                 assertEquals(JSON.stringify(caps), JSON.stringify(['admin', 'write', 'y']), 'y is listed, z is deleted');
                 const earlier = (await (await cap.getView(afterY, afterY)).getCapabilities()).sort();
                 assertEquals(JSON.stringify(earlier), JSON.stringify(['admin', 'write', 'y']), 'z is not listed before it exists');
+            },
+        },
+        {
+            name: '[CAP_BOUND06] a side-branch revoke collapsed at start and decided void at end lowers the bound, and its ring partner\'s grant is reported',
+            invoke: async () => {
+                // z manages x, x manages y, y manages z. A revokes B's x (needs
+                // A's z), B revokes E's y (needs B's x), E revokes A's z (needs
+                // E's y): a ring of three, void by collapse. C, by the creator,
+                // revokes E's y after a and concurrently with b and e, so at end
+                // e is decided void, a is live and b is void. Only a touches B's
+                // x, and a is below the meet.
+                const R = await makeIdentity();
+                const A = await makeIdentity();
+                const B = await makeIdentity();
+                const E = await makeIdentity();
+                const ctx = createMockRContext({ selfValidate: true });
+                ctx.getRegistry().register(RCap.typeId, rCapFactory);
+                const cap = (await ctx.createObject(await RCap.create({
+                    seed: 'cap-bound-ring',
+                    creators: [{ keyId: R.keyId, publicKey: R.publicKey }],
+                    initialCaps: {
+                        'x': { managedBy: ['creator', 'z'] },
+                        'y': { managedBy: ['creator', 'x'] },
+                        'z': { managedBy: ['creator', 'y'] },
+                    },
+                }))) as RCapImpl;
+                await addIdentities(cap, R, A, B, E);
+                await cap.grant(A.keyId, 'z', R);
+                await cap.grant(B.keyId, 'x', R);
+                const base = await cap.grant(E.keyId, 'y', R);
+
+                const a = await cap.revoke(B.keyId, 'x', A, version(base));
+                const b = await cap.revoke(E.keyId, 'y', B, version(base));
+                const e = await cap.revoke(A.keyId, 'z', E, version(base));
+                const C = await cap.revoke(E.keyId, 'y', R, version(a));
+                const start = version(a, b, e);
+                const end = version(C, b, e);
+                for (const op of [a, b, e]) {
+                    assertEquals(await cap.explainEntryVoided(op, start), 'undecided-cycle', 'the ring collapses at start');
+                }
+                assertEquals(await cap.explainEntryVoided(a, end), undefined, 'a is live at end');
+                assertEquals(await cap.explainEntryVoided(e, end), 'unauthorized', 'e is decided void at end');
+
+                const delta = await boundedDelta(cap, start, end);
+                const xFlip = delta.grantChanges.find(c => c.keyId === B.keyId && c.capName === 'x');
+                assertTrue(xFlip !== undefined && xFlip.wasGranted && !xFlip.nowGranted, 'B loses x');
+                assertTrue(isExactly(delta.getRevisionBound(), base), "the bound drops to the ring's predecessor");
             },
         },
     ]

@@ -8,7 +8,7 @@ import { RSchemaImpl, rSchemaFactory } from "../../src/rschema/rschema.js";
 import { RTableGroupImpl, rTableGroupFactory } from "../../src/rtable_group/group.js";
 import type { RTableImpl } from "../../src/rtable/rtable.js";
 import { deriveRowId } from "../../src/rtable/hash.js";
-import type { MigrationRule, Predicate, TableDef } from "../../src/rschema/payload.js";
+import type { MigrationRule, Predicate, Restriction, TableDef } from "../../src/rschema/payload.js";
 
 import { pickConcurrentAt, recordCheckpoint } from "./checkpoints.js";
 import { PRNG } from "./prng.js";
@@ -517,6 +517,89 @@ export async function generateGatedCrossGroupHistory(seed: number, ops: number):
 }
 
 // ---------------------------------------------------------------------------
+// Ring histories: deletes that remove what each other's rule needs, so their
+// verdicts are solved together and can collapse (mvt/WELL_FOUNDED_VERDICTS.md).
+// Every row is in a pair. Deleting a left row needs the right row of its pair.
+// Deleting a right row needs the left row and the key row of its pair.
+// Deleting a key row is open. Concurrent deletes of a pair's left and right
+// rows form a ring, and a delete of its key row concurrent with the right
+// delete decides it. Deploys drop the left arm of the right rule and make a
+// key delete need the right row of its pair, which regroups the rings. The
+// other generators never build one.
+
+const PAIR_OF_ROW = '$row.pair';
+const RING_LEFT_ROW: Predicate = { p: 'exists', table: 'left', where: { pair: PAIR_OF_ROW } };
+const RING_RIGHT_ROW: Predicate = { p: 'exists', table: 'right', where: { pair: PAIR_OF_ROW } };
+const RING_KEY_ROW: Predicate = { p: 'exists', table: 'keys', where: { pair: PAIR_OF_ROW } };
+const RING_RIGHT_RULE: Predicate = { p: 'and', args: [RING_LEFT_ROW, RING_KEY_ROW] };
+const OPEN_RESTRICTIONS: Restriction[] = [{ on: 'all', rule: { p: 'true' } }];
+const PAIR_COLUMNS: TableDef['columns'] = { pair: { type: 'string', pub: true, readonly: true } };
+const RING_PAIRS = 3;
+
+function deleteRestrictions(rule: Predicate): Restriction[] {
+    return [{ on: 'insert', rule: { p: 'true' } }, { on: 'update', rule: { p: 'true' } }, { on: 'delete', rule }];
+}
+
+function ringTables(): TableDef[] {
+    return [
+        gatedDelete('left', PAIR_COLUMNS, RING_RIGHT_ROW),
+        gatedDelete('right', PAIR_COLUMNS, RING_RIGHT_RULE),
+        open('keys', PAIR_COLUMNS, { concurrentDeletes: true }),
+        open('notes', { n: { type: 'string' } }),
+    ];
+}
+
+// One ring group under random ops, at recent checkpoints so that deletes of
+// one pair land concurrently. Row `l-i`, `r-i` or `k-i` is in pair `p-i`.
+// Parity is over its own delta.
+export async function generateRingGroupHistory(seed: number, ops: number): Promise<GroupHistory> {
+    const prng = new PRNG(seed);
+    const ctx = newParityContext();
+    const admin = await makeIdentity();
+    const { group, schema } = await createGroup(ctx, admin, `parity-ring-${seed}`, ringTables());
+    const [left, right, keys, notes] = await Promise.all(['left', 'right', 'keys', 'notes'].map((t) => group.getTable(t)));
+    const checkpoints: Version[] = [version(group.getId())];
+    const state = { rightKeyOnly: false, keysGated: false };
+
+    for (let i = 0; i < ops; i++) {
+        const at = pickRecentAt(prng, checkpoints, 0.6);
+        const roll = prng.nextInt(0, 99);
+        const pair = prng.nextInt(0, RING_PAIRS - 1);
+        try {
+            if (roll < 10) {
+                await left.insert(`l-${pair}`, { pair: `p-${pair}` }, undefined, at);
+            } else if (roll < 20) {
+                await right.insert(`r-${pair}`, { pair: `p-${pair}` }, undefined, at);
+            } else if (roll < 30) {
+                await keys.insert(`k-${pair}`, { pair: `p-${pair}` }, undefined, at);
+            } else if (roll < 48) {
+                await left.delete(deriveRowId(`l-${pair}`), undefined, at);
+            } else if (roll < 66) {
+                await right.delete(deriveRowId(`r-${pair}`), undefined, at);
+            } else if (roll < 80) {
+                await keys.delete(deriveRowId(`k-${pair}`), undefined, at);
+            } else if (roll < 90) {
+                await notes.insert(`n-${prng.nextInt(0, 1_000_000)}`, { n: 'n' }, undefined, at);
+            } else {
+                const regroupRight = prng.next() < 0.5;
+                const rules: MigrationRule[] = regroupRight
+                    ? [{ rule: 'set-restrictions', table: 'right', restrictions: deleteRestrictions(state.rightKeyOnly ? RING_RIGHT_RULE : RING_KEY_ROW) }]
+                    : [{ rule: 'set-restrictions', table: 'keys', restrictions: state.keysGated ? OPEN_RESTRICTIONS : deleteRestrictions(RING_RIGHT_ROW) }];
+                await schema.updateSchema(rules, admin, 'regroup');
+                if (regroupRight) state.rightKeyOnly = !state.rightKeyOnly;
+                else state.keysGated = !state.keysGated;
+                await group.deploy(await (await schema.getScopedDag()).getFrontier(), undefined, at);
+            }
+        } catch {
+            continue;   // rejected write / deploy: not recorded
+        }
+        await recordCheckpoint(checkpoints, await groupFrontier(group));
+    }
+
+    return { group, rawDag: (await ctx.getDag(group.getId()))!, checkpoints, seed };
+}
+
+// ---------------------------------------------------------------------------
 // Shaped histories: the skeleton of the bounded-delta counterexamples, with
 // randomized barriers on it. A random history rarely produces the concurrency
 // these need:
@@ -676,12 +759,44 @@ const intermediateVersionShape: ShapedBuilder = async (prng, ctx, admin, name) =
     return { group, checkpoints };
 };
 
+// T1 and T2 delete the only left and right rows concurrently and collapse as a
+// ring; T1's branch is the main one. N follows T1 and either deletes the key
+// row T2 needs (T2 is decided void, T1 turns live), deploys rules under which
+// T2 rings with a new key delete X instead (T2 collapses at both horizons, in
+// different cores, and T1 turns live), or is a note (nothing changes).
+const ringShape: ShapedBuilder = async (prng, ctx, admin, name) => {
+    const { group, schema } = await createGroup(ctx, admin, name, ringTables());
+    const [left, right, keys, notes] = await Promise.all(['left', 'right', 'keys', 'notes'].map((t) => group.getTable(t)));
+    const pinned = await (await schema.getScopedDag()).getFrontier();
+    const regroup = await schema.updateSchema([
+        { rule: 'set-restrictions', table: 'right', restrictions: deleteRestrictions(RING_KEY_ROW) },
+        { rule: 'set-restrictions', table: 'keys', restrictions: deleteRestrictions(RING_RIGHT_ROW) },
+    ], admin, 'regroup', pinned);
+    const { checkpoints, record, noise } = shapedRecorder(group, notes, prng);
+    const l = await record(left.insert('l-1', { pair: 'p-1' }));
+    const r = await record(right.insert('r-1', { pair: 'p-1' }, undefined, version(l)));
+    const k = await record(keys.insert('k-1', { pair: 'p-1' }, undefined, version(r)));
+    const T1 = await noise(await record(left.delete(deriveRowId('l-1'), undefined, version(k))));
+    await noise(await record(right.delete(deriveRowId('r-1'), undefined, version(k))));
+    const variant = prng.nextInt(0, 2);
+    if (variant === 0) {
+        await record(keys.delete(deriveRowId('k-1'), undefined, version(T1)));
+    } else if (variant === 1) {
+        const D = await record(group.deploy(version(regroup), undefined, version(T1)));
+        await record(keys.delete(deriveRowId('k-1'), undefined, version(D)));
+    } else {
+        await record(notes.insert('n-1', { n: 'N' }, undefined, version(T1)));
+    }
+    return { group, checkpoints };
+};
+
 const SHAPES: [string, ShapedBuilder][] = [
     ['local-gated', localGatedShape],
     ['local-honor', localHonorShape],
     ['deploy-kill', deployKillShape],
     ['observe', observeShape],
     ['intermediate-version', intermediateVersionShape],
+    ['ring', ringShape],
 ];
 
 // One history per shape for this seed. `ops` is unused: the shapes are fixed.

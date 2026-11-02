@@ -28,17 +28,18 @@
 //     history whose published version is above the observed group's own
 //     bound, and then drops below every walked barrier of `start` that is
 //     concurrent with it and whose effect changed between `start` and `end`:
-//     its verdict flipped, it observes a version above the observed group's
-//     bound, or it deletes rows of a table whose concurrentDeletes flag at its
-//     own position moved. Below the final bound every verdict and every row
-//     whose operations all lie there is the same at both horizons. The walk
-//     stops at the exit border of the bound's history and resumes from it when
-//     the bound drops, so no entry is loaded or evaluated twice.
+//     its verdict flipped, it is void by collapse at either horizon, it
+//     observes a version above the observed group's bound, or it deletes rows
+//     of a table whose concurrentDeletes flag at its own position moved. Below
+//     the final bound every verdict and every row whose operations all lie
+//     there is the same at both horizons. The walk stops at the exit border of
+//     the bound's history and resumes from it when the bound drops, so no
+//     entry is loaded or evaluated twice.
 //
 // The walk owns the geometry and the observe stability check. This module
 // gives it the group's references and a visitor that feeds the row channel,
 // records verdict flips, and tells it whether a barrier's verdict or honor
-// flag changed.
+// flag changed or its verdict is a collapse.
 //
 // The schema is declared to the walk as read at (v, v): resolveSchemaView reads
 // the schema at the version a position folds, deploys are never void, and the
@@ -281,8 +282,27 @@ async function hasNewDeploy(group: GroupDeltaHost, start: Version, end: Version)
 
 type VerdictFlip = { entry: dag.Entry; voidBefore: boolean; voidAfter: boolean };
 
+type HorizonVerdicts = { voidBefore: boolean; voidAfter: boolean; collapsed: boolean };
+
+// The entry's verdict at `start` and at `end`, and whether it is void by
+// collapse (`undecided-cycle`) at either. A collapsed verdict cannot stand for
+// the barrier's effect: the entries that read it during the solve saw it
+// undecided, and what they decided depends on the core it collapsed in, which
+// no verdict records. So a barrier collapsed at either horizon, or at both,
+// counts as changed (INCREMENTAL_DELTA_BOUND.md, Section 5.7).
+async function horizonVerdicts(group: GroupDeltaHost, entry: dag.Entry, start: Version, end: Version): Promise<HorizonVerdicts> {
+    const before = await group.explainEntryVoided(entry.hash, start);
+    const after = await group.explainEntryVoided(entry.hash, end);
+    return {
+        voidBefore: before !== undefined,
+        voidAfter: after !== undefined,
+        collapsed: before?.kind === 'undecided-cycle' || after?.kind === 'undecided-cycle',
+    };
+}
+
 // Feeds every walked entry to the row channel and records every verdict flip.
-// A candidate's effect changed when its verdict flipped or its honor flag did.
+// A candidate's effect changed when its verdict flipped, it is void by
+// collapse at either horizon, or its honor flag flipped.
 function deltaVisitor(
     group: GroupDeltaHost, acc: RTableGroupDeltaAccumulator, start: Version, end: Version,
     newDeploy: boolean, flips: VerdictFlip[],
@@ -290,16 +310,13 @@ function deltaVisitor(
     return {
         async visit(entry, candidate) {
             await acc.ingest(entry);
-            let flipped = false;
+            let changed = false;
             if (isVoidCheckable(entry.payload)) {
-                const voidBefore = await group.isEntryVoided(entry.hash, start);
-                const voidAfter = await group.isEntryVoided(entry.hash, end);
-                if (voidBefore !== voidAfter) {
-                    flips.push({ entry, voidBefore, voidAfter });
-                    flipped = true;
-                }
+                const { voidBefore, voidAfter, collapsed } = await horizonVerdicts(group, entry, start, end);
+                if (voidBefore !== voidAfter) flips.push({ entry, voidBefore, voidAfter });
+                changed = voidBefore !== voidAfter || collapsed;
             }
-            return candidate && (flipped || (newDeploy && await didDeleteHonorFlip(group, entry, start, end)));
+            return candidate && (changed || (newDeploy && await didDeleteHonorFlip(group, entry, start, end)));
         },
     };
 }
@@ -309,9 +326,9 @@ function boundVisitor(group: GroupDeltaHost, start: Version, end: Version, newDe
     return {
         async visit(entry, candidate) {
             if (!candidate) return false;
-            if (isVoidCheckable(entry.payload)
-                && await group.isEntryVoided(entry.hash, start) !== await group.isEntryVoided(entry.hash, end)) {
-                return true;
+            if (isVoidCheckable(entry.payload)) {
+                const { voidBefore, voidAfter, collapsed } = await horizonVerdicts(group, entry, start, end);
+                if (voidBefore !== voidAfter || collapsed) return true;
             }
             return newDeploy && await didDeleteHonorFlip(group, entry, start, end);
         },
