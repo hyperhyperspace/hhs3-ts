@@ -1,7 +1,7 @@
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { refVersionAtOrAbove } from "@hyper-hyper-space/hhs3_mvt";
 import type { RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
-import { RTableGroupImpl } from "@hyper-hyper-space/hhs3_rdb";
+import { RTableGroupImpl, gateGraph, gateGraphOrder } from "@hyper-hyper-space/hhs3_rdb";
 import type { BoundStatement } from "@hyper-hyper-space/hhs3_rdb_lang";
 
 import {
@@ -13,8 +13,11 @@ import type { AuthInteractionContext } from "./prompts.js";
 import { KeyUnlockDeclinedError } from "./prompts.js";
 import type { RefAutoUpdateMode, RdbSession } from "./session.js";
 
+// What starts a check: a local statement that writes to a group (a row
+// write, UPDATE REF, UPDATE CATALOG). `written` names the groups it wrote, or
+// 'all' for a catalog update; `author` is the statement's author.
 export type RefUpdateTrigger = {
-    sourceGroupId: B64Hash;
+    written: Set<B64Hash> | 'all';
     author: OwnIdentity | undefined;
 };
 
@@ -38,14 +41,21 @@ export class RefAutoUpdateSkippedError extends Error {
     }
 }
 
+// Statement inspection at execution: the statements that write to a group
+// start a check. ALTER SCHEMA does not: it changes no group until a release is
+// deployed.
 export function extractRefUpdateTrigger(bound: BoundStatement): RefUpdateTrigger | undefined {
     switch (bound.kind) {
         case 'insert':
         case 'update':
         case 'delete':
-            return { sourceGroupId: bound.table.groupId, author: bound.author };
+            return { written: new Set([bound.table.groupId]), author: bound.author };
         case 'bundle':
-            return { sourceGroupId: bound.group.id, author: bound.author };
+            return { written: new Set([bound.group.id]), author: bound.author };
+        case 'update-ref':
+            return { written: new Set([bound.group.id]), author: bound.author };
+        case 'update-catalog':
+            return { written: 'all', author: bound.author };
         default:
             return undefined;
     }
@@ -122,10 +132,6 @@ async function isAlreadyObserved(
     return refVersionAtOrAbove(foreignDag, current, targetVersion);
 }
 
-function pairKey(observerId: B64Hash, foreignId: B64Hash): string {
-    return `${observerId}:${foreignId}`;
-}
-
 async function observeWithResolvedAuthor(
     session: RdbSession,
     observer: RTableGroup,
@@ -136,31 +142,32 @@ async function observeWithResolvedAuthor(
     triggerAuthor: OwnIdentity | undefined,
     mode: RefAutoUpdateMode,
     auth?: AuthInteractionContext,
+    mayPrompt = true,
 ): Promise<B64Hash> {
     const impl = observer as RTableGroupImpl;
-    const refAt = targetVersion;
-    const refFrom = targetVersion;
 
     if (!observer.observeNeedsAuthor(foreignGroupId)) {
         return observer.observe(bindingName, targetVersion);
     }
 
+    // the gate is checked as validation will check the observe, written at
+    // the observer's current frontier
+    const opPos = await (await impl.getScopedDag()).getFrontier();
     const preferred = [triggerAuthor, await session.currentAuthor()];
     const resolution = await resolveObserveAuthor(
         session,
         impl,
         foreignGroupId,
-        refAt,
-        refFrom,
+        { opPos, imported: targetVersion, fold: 'admission' },
         preferred,
         { scanKeystore: mode === 'auto' },
     );
 
     if (resolution.identity !== undefined) {
-        return observer.observe(bindingName, targetVersion, resolution.identity);
+        return observer.observe(bindingName, targetVersion, resolution.identity, opPos);
     }
 
-    if (resolution.locked !== undefined && auth?.canPrompt?.() === true && auth.unlockIdentity !== undefined) {
+    if (resolution.locked !== undefined && mayPrompt && auth?.canPrompt?.() === true && auth.unlockIdentity !== undefined) {
         const label = resolution.locked.label;
         const authorLabel = labelForKeyId(session, resolution.locked.keyId);
         if (auth.confirmRefUpdateUnlock !== undefined) {
@@ -168,7 +175,7 @@ async function observeWithResolvedAuthor(
         }
         const identity = await auth.unlockIdentity(label);
         if (identity === undefined) throw new KeyUnlockDeclinedError(authorLabel);
-        return observer.observe(bindingName, targetVersion, identity);
+        return observer.observe(bindingName, targetVersion, identity, opPos);
     }
 
     if (resolution.locked !== undefined) {
@@ -184,33 +191,72 @@ async function observeWithResolvedAuthor(
     throw new Error('no keystore identity satisfies gate');
 }
 
+// The groups of the workspace that bind another, each after the groups it
+// binds: an observe written for a bound group advances that group's frontier,
+// and the groups that bind it then see the new frontier in the same check.
+function groupsInBindingOrder(session: RdbSession): { id: B64Hash; group: RTableGroup }[] {
+    const groups = new Map<B64Hash, RTableGroup>();
+    for (const root of session.workspace.roots.list('group')) {
+        if (root.object !== undefined) groups.set(root.id, root.object as RTableGroup);
+    }
+    const order: { id: B64Hash; group: RTableGroup }[] = [];
+    const placed = new Set<B64Hash>();
+    const place = (id: B64Hash): void => {
+        if (placed.has(id)) return;
+        placed.add(id);
+        const group = groups.get(id);
+        if (group === undefined) return;
+        for (const bound of [...new Set(Object.values(group.getBindings()))].sort()) place(bound);
+        if (Object.keys(group.getBindings()).length > 0) order.push({ id, group });
+    };
+    for (const id of [...groups.keys()].sort()) place(id);
+    return order;
+}
+
+// Keeps every group's view of its bindings at the bound groups' frontiers,
+// after a local statement that wrote to a group. Every group of the workspace
+// that binds another is checked, bound groups first, and each group's
+// bindings in gate-graph order, so a group a gate reads is observed before
+// the binding the gate guards. A binding is behind when the observer's
+// (geometric) fold at its frontier is below the bound group's frontier; it is
+// then observed with an author who passes the gate. What sync brought is thus
+// caught up at the next local statement; the check never runs on sync.
+//
+// Every observe written is reported. A refusal or failure is reported, and a
+// locked author is offered for unlocking, only for a binding of a group the
+// statement wrote, as before this check covered the whole workspace: the
+// other bindings are caught up quietly, with unlocked authors only, so a
+// binding that stays behind does not prompt after every statement.
 export async function propagateRefUpdates(
     session: RdbSession,
-    sourceGroupId: B64Hash,
-    author: OwnIdentity | undefined,
+    trigger: RefUpdateTrigger,
     auth?: AuthInteractionContext,
 ): Promise<RefUpdateOutcome[]> {
     const mode = session.refAutoUpdate;
     if (mode === 'off') return [];
 
+    const reported = (boundId: B64Hash) => trigger.written === 'all' || trigger.written.has(boundId);
     const events: RefUpdateOutcome[] = [];
-    const visitedPairs = new Set<string>();
-    const queue: B64Hash[] = [sourceGroupId];
 
-    while (queue.length > 0) {
-        const foreignGroupId = queue.shift()!;
-        const foreignGroup = await loadForeignGroup(session, foreignGroupId);
-        const targetVersion = await (await foreignGroup.getScopedDag()).getFrontier();
+    for (const { id: observerId, group: observer } of groupsInBindingOrder(session)) {
+        const bindings = observer.getBindings();
+        const firstAlias = new Map<B64Hash, string>();
+        for (const [alias, boundId] of Object.entries(bindings)) {
+            if (!firstAlias.has(boundId)) firstAlias.set(boundId, alias);
+        }
 
-        for (const { observerId, observer, bindingName } of findObservers(session, foreignGroupId)) {
-            const key = pairKey(observerId, foreignGroupId);
-            if (visitedPairs.has(key)) continue;
+        for (const foreignGroupId of gateGraphOrder(gateGraph(bindings, observer.getCanObserve() ?? {}))) {
+            const bindingName = firstAlias.get(foreignGroupId)!;
+            let foreignGroup: RTableGroupImpl;
+            try {
+                foreignGroup = await loadForeignGroup(session, foreignGroupId);
+            } catch {
+                continue;   // the bound group is not present here: nothing to observe
+            }
 
             try {
-                if (await isAlreadyObserved(observer, foreignGroupId, targetVersion, foreignGroup)) {
-                    visitedPairs.add(key);
-                    continue;
-                }
+                const targetVersion = await (await foreignGroup.getScopedDag()).getFrontier();
+                if (await isAlreadyObserved(observer, foreignGroupId, targetVersion, foreignGroup)) continue;
 
                 const entryHash = await observeWithResolvedAuthor(
                     session,
@@ -219,28 +265,24 @@ export async function propagateRefUpdates(
                     bindingName,
                     foreignGroupId,
                     targetVersion,
-                    author,
+                    trigger.author,
                     mode,
                     auth,
+                    reported(foreignGroupId),
                 );
-                visitedPairs.add(key);
                 const message = formatRefAutoUpdateNotice(session, observerId, entryHash);
-                const event: RefUpdateOutcome = { kind: 'updated', observerGroupId: observerId, message, entryHash };
-                events.push(event);
+                events.push({ kind: 'updated', observerGroupId: observerId, message, entryHash });
                 auth?.onProgress?.(message);
-                queue.push(observerId);
             } catch (e) {
-                visitedPairs.add(key);
+                if (!reported(foreignGroupId)) continue;
                 if (e instanceof RefAutoUpdateSkippedError) {
-                    const event: RefUpdateOutcome = { kind: 'skipped', observerGroupId: observerId, message: e.message };
-                    events.push(event);
+                    events.push({ kind: 'skipped', observerGroupId: observerId, message: e.message });
                     auth?.onProgress?.(e.message);
                     continue;
                 }
                 const errMessage = e instanceof Error ? e.message : String(e);
                 const message = formatRefAutoUpdateFailure(session, observerId, errMessage);
-                const event: RefUpdateOutcome = { kind: 'failed', observerGroupId: observerId, message };
-                events.push(event);
+                events.push({ kind: 'failed', observerGroupId: observerId, message });
                 auth?.onProgress?.(message);
             }
         }

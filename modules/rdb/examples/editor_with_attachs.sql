@@ -60,7 +60,7 @@ AS (
   TABLEGROUP doc USING SCHEMA hhs:doc AT LATEST
     BIND user => user
     USING IDENTITIES user.identities
-    ALLOW UPDATE REF user IF EXISTS caps WHERE caps.grantee = $author,
+    ALLOW UPDATE REF user IF EXISTS user.caps WHERE user.caps.grantee = $author,
   FILES attachs
     USING IDENTITIES user.identities
     ALLOW WRITE IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author

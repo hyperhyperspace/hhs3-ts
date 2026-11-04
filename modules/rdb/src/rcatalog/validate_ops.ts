@@ -500,7 +500,8 @@ export function groupViewReason(
                 if (boundViews !== undefined) {
                     const bound = boundViews(bindings[alias]);
                     if (bound !== undefined) {
-                        const reason = checkExistsAtomAgainstTable('ALLOW DEPLOY IF', atom, targetTable, bound.view.getTable(targetTable), bound.view.getName());
+                        const mappedTable = def.tableMaps?.[alias]?.[targetTable] ?? targetTable;
+                        const reason = checkExistsAtomAgainstTable('ALLOW DEPLOY IF', atom, mappedTable, bound.view.getTable(mappedTable), bound.view.getName());
                         if (reason !== undefined) return reason;
                     }
                 }
@@ -508,28 +509,26 @@ export function groupViewReason(
         }
     }
 
-    if (boundViews !== undefined) {
-        for (const [bindingAlias, gate] of Object.entries(def.canObserve ?? {})) {
-            const observed = boundViews(bindings[bindingAlias]);
-            if (observed === undefined) continue;
-            const clause = `ALLOW UPDATE REF ${bindingAlias} IF`;
-            for (const atom of collectExistsAtoms(gate)) {
-                const [qual, targetTable] = splitTableRef(atom.table);
-                if (qual === undefined) {
-                    const reason = checkExistsAtomAgainstTable(clause, atom, targetTable, observed.view.getTable(targetTable), observed.view.getName());
-                    if (reason !== undefined) return reason;
-                } else {
-                    const observedBindings = observed.def.bindings ?? {};
-                    if (!Object.prototype.hasOwnProperty.call(observedBindings, qual)) {
-                        return `${clause} reads ${atom.table}, and TABLEGROUP ${observed.def.name} doesn't BIND ${qual}`;
-                    }
-                    const further = boundViews(observedBindings[qual]);
-                    if (further !== undefined) {
-                        const reason = checkExistsAtomAgainstTable(clause, atom, targetTable, further.view.getTable(targetTable), further.view.getName());
-                        if (reason !== undefined) return reason;
-                    }
-                }
+    // Gates are read in the group's own scope, like its table rules: an
+    // unqualified table is the group's own, and a qualified one goes through
+    // the group's bindings and table maps.
+    for (const [bindingAlias, gate] of Object.entries(def.canObserve ?? {})) {
+        const clause = `ALLOW UPDATE REF ${bindingAlias} IF`;
+        for (const atom of collectExistsAtoms(gate)) {
+            const [qual, targetTable] = splitTableRef(atom.table);
+            if (qual === undefined) {
+                const reason = checkExistsAtomAgainstTable(clause, atom, targetTable, view.getTable(targetTable), schemaName);
+                if (reason !== undefined) return reason;
+                continue;
             }
+            if (!Object.prototype.hasOwnProperty.call(bindings, qual)) {
+                return `${clause} reads ${atom.table}, and the TABLEGROUP doesn't BIND ${qual}`;
+            }
+            const bound = boundViews?.(bindings[qual]);
+            if (bound === undefined) continue;
+            const mappedTable = def.tableMaps?.[qual]?.[targetTable] ?? targetTable;
+            const reason = checkExistsAtomAgainstTable(clause, atom, mappedTable, bound.view.getTable(mappedTable), bound.view.getName());
+            if (reason !== undefined) return reason;
         }
     }
 
@@ -558,8 +557,9 @@ export function groupIdentityReason(
         } else if (boundViews !== undefined) {
             const bound = boundViews((def.bindings ?? {})[alias]);
             if (bound !== undefined) {
-                if (!bound.view.hasTable(table)) return `USING IDENTITIES ${def.idProvider}: schema ${bound.view.getName()} has no table ${table}`;
-                if (bound.view.getIdProvider(table) === undefined) return `USING IDENTITIES ${def.idProvider}: ${table} isn't an IDENTITY PROVIDER table`;
+                const mapped = def.tableMaps?.[alias]?.[table] ?? table;
+                if (!bound.view.hasTable(mapped)) return `USING IDENTITIES ${def.idProvider}: schema ${bound.view.getName()} has no table ${mapped}`;
+                if (bound.view.getIdProvider(mapped) === undefined) return `USING IDENTITIES ${def.idProvider}: ${mapped} isn't an IDENTITY PROVIDER table`;
             }
         }
         return undefined;

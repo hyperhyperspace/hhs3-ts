@@ -174,6 +174,7 @@ Implement it in all three indexes (`dag/src/idx/flat/flat_idx.ts`, `topo/topo_id
 Consequences:
 
 - **The "observes are never on a cycle" invariant stays,** along with the throw in `observeVerdictLive` (`group.ts`, lines 635–641).
+  > **2026-11-04:** no longer. Observer-frame gates let an observe share a component with the observer's row ops, and the throw went. Observes alone still form no cycle: the widening above keeps the observes of one binding acyclic, and the gate graph orders the bindings ([`REFERENCE_FRAME.md`](./REFERENCE_FRAME.md) §3.1).
 - **The `VOID_SEMANTICS.md` §5.5 premise becomes literally true.** Add one sentence saying so.
 - **Neither part of the earlier proposal is adopted:** not $\succ_\exists$, not the interval rule.
 - **Layer 2 is unchanged.** Its union of live concurrent observes, and the geometric `refFrom`, stay.

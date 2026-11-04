@@ -457,7 +457,7 @@ export const roundTripTests = {
                     ],
                 };
                 const canObserve: { [binding: string]: Predicate } = {
-                    users: { p: 'and', args: [{ p: 'and', args: [{ p: 'exists', table: 'caps', where: { grantee: '$author' } }, { p: 'true' }] }, { p: 'false' }] },
+                    users: { p: 'and', args: [{ p: 'and', args: [{ p: 'exists', table: 'users.caps', where: { grantee: '$author' } }, { p: 'true' }] }, { p: 'false' }] },
                 };
                 const identityDef: CatalogGroupDef = {
                     name: 'identity', seedSource: 'rdb', schemaRef: app.getId(), schemaVersion: json.toSet([app.getId()]),

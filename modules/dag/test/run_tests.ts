@@ -3,6 +3,7 @@ import { metaSearchSuite as meta } from "./meta_search_tests.js";
 import { coverTestSuite as cover } from "./cover_tests.js";
 import { meetTestSuite as meet } from "./meet_tests.js";
 import { growthEventSuite as growth } from "./growth_event_tests.js";
+import { touchCoverSuite as touch } from "./touch_cover_tests.js";
 import { testing } from "@hyper-hyper-space/hhs3_util";
 
 async function main() {
@@ -17,6 +18,7 @@ async function main() {
     allTests.set(cover.title, cover.tests);
     allTests.set(meet.title, meet.tests);
     allTests.set(growth.title, growth.tests);
+    allTests.set(touch.title, touch.tests);
 
     console.log('Running tests for Hyper Hyper Space v3 DAG module' + (filters.length > 0? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');    
 

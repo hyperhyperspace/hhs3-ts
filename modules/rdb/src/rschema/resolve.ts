@@ -83,13 +83,14 @@ type SlotWrite = {
 type WriteOrigin = { entryHash: B64Hash; entryIdx: number; ruleIndex: number; version: SemVer };
 
 // Slot keys. Table and column names cannot contain '/' or ':' (isValidName),
-// so these are collision-free.
+// so these are collision-free. The existence and column slots are exported
+// for readers that compare the slots two schema versions differ in.
 
-function existenceSlot(table: string): string { return `t:${table}`; }
+export function existenceSlot(table: string): string { return `t:${table}`; }
 function modeSlot(table: string): string { return `m:${table}`; }
 function fksSlot(table: string): string { return `f:${table}`; }
 function restrictionsSlot(table: string): string { return `r:${table}`; }
-function columnSlot(table: string, column: string): string { return `c:${table}:${column}`; }
+export function columnSlot(table: string, column: string): string { return `c:${table}:${column}`; }
 function paramSlot(name: string): string { return `p:${name}`; }
 
 // Decompose one migration rule into its slot writes. Exported for the
@@ -257,6 +258,42 @@ function includeAt(entries: Entry[], at: Position): { included: Entry[]; causali
     }
 
     return { included, causality: { indexOf, ancestors } };
+}
+
+// The slots that the migration rules of the schema entries in the history of
+// `newer`, and not in that of `older`, write. This is structural: it says
+// which slots may resolve differently at `newer`, never what they resolve to,
+// so it adds up over versions where resolved values do not. `entries` is the
+// schema DAG's full entry list, as resolveSchemaState takes it.
+export function slotsWrittenBetween(entries: Entry[], older: Position, newer: Position): Set<string> {
+    const byHash = new Map<B64Hash, Entry>();
+    for (const entry of entries) byHash.set(entry.hash, entry);
+
+    const historyOf = (at: Position): Set<B64Hash> => {
+        const seen = new Set<B64Hash>();
+        const pending = [...at];
+        while (pending.length > 0) {
+            const hash = pending.pop()!;
+            if (seen.has(hash)) continue;
+            const entry = byHash.get(hash);
+            if (entry === undefined) throw new Error(`slotsWrittenBetween: entry '${hash}' not found`);
+            seen.add(hash);
+            for (const prev of json.fromSet(entry.header.prevEntryHashes)) pending.push(prev);
+        }
+        return seen;
+    };
+
+    const olderHistory = historyOf(older);
+    const slots = new Set<string>();
+    for (const hash of historyOf(newer)) {
+        if (olderHistory.has(hash)) continue;
+        const payload = byHash.get(hash)!.payload as json.LiteralMap;
+        if (payload['action'] !== 'schema-update') continue;
+        for (const rule of (payload as SchemaUpdatePayload).migration) {
+            for (const slot of slotsTouchedByRule(rule)) slots.add(slot);
+        }
+    }
+    return slots;
 }
 
 // Resolve the effective schema at `at`. `entries` must be the full entry list

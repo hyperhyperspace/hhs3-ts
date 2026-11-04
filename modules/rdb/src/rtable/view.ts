@@ -77,15 +77,17 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, KeyId, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
 import { EntryMetaFilter, EntryPredicate, Position, position } from "@hyper-hyper-space/hhs3_dag";
 import { version, Version, ScopedDag } from "@hyper-hyper-space/hhs3_mvt";
+import type { CausalDag, PendingRefAdvance } from "@hyper-hyper-space/hhs3_mvt";
 import { deserializePublicKeyFromBase64 } from "@hyper-hyper-space/hhs3_mvt";
 import {
-    TRUE, FALSE, truthOf, verdictTruth, notTruth, allTruth, anyTruth, everyTruth, someTruth,
+    TRUE, FALSE, truthOf, verdictTruth, notTruth, allTruth, anyTruth, everyTruth, someTruth, seeThroughCover,
 } from "@hyper-hyper-space/hhs3_mvt";
 import type { Truth, Undecided, Verdict, VerdictEvaluation } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchemaView } from "../rschema/interfaces.js";
 import type { IncarnationId } from "../rschema/incarnation.js";
 import type { ColumnType, Operand } from "../rschema/payload.js";
+import { columnSlot, existenceSlot } from "../rschema/resolve.js";
 import { colTag, rowTag, type RowsSlicePayload } from "../rtable_group/scopes.js";
 import type { OpVoidDetail } from "../rtable_group/op_void.js";
 
@@ -93,6 +95,7 @@ import type { RTable, RTableView, Row, RowValues, DeltaRowState } from "./interf
 import type { InsertRowPayload, RowOpPayload } from "./payload.js";
 import type { ColumnTypes, RowFilter, RowQuery } from "./query.js";
 import { evalRowFilter, orderRows, projectRow, validateRowQuery } from "./query.js";
+import { TouchTest } from "./touch.js";
 
 // What the view needs from its table beyond the public contract. Entry voiding
 // is threaded with the view's VerdictEvaluation (see
@@ -104,6 +107,8 @@ import { evalRowFilter, orderRows, projectRow, validateRowQuery } from "./query.
 export type TableViewTarget = RTable & {
     resolveSchemaView(at: Version, from?: Version): Promise<RSchemaView>;
     entryStatusIn(evaluation: VerdictEvaluation<OpVoidDetail>, entryHash: B64Hash, from: Version): Promise<Verdict<OpVoidDetail>>;
+    getCausalDag(): Promise<CausalDag>;
+    schemaSlotsBetween(at: Version, wider: Version, from: Version): Promise<Set<string>>;
 };
 
 // A column read: the resolved value (undefined when no live write carries the
@@ -183,20 +188,47 @@ export class RTableViewImpl implements RTableView, TruthTableView {
     private from: Version;
     private evaluation: VerdictEvaluation<OpVoidDetail>;
     private exclude: B64Hash | undefined;
+    private pending: readonly PendingRefAdvance[];
 
     private _schemaView: RSchemaView | undefined;
+    private _touch: TouchTest | undefined;
 
     // `evaluation` is mandatory: every view is built inside some void computation
     // (top-level callers mint a fresh one), so entry-voiding recursion always
     // has an evaluation to thread. See verdict_evaluation.ts. `exclude` is the
     // entry being diagnosed through this view: an op is not its own witness or
     // barrier, so its own entry reads as void here.
-    constructor(target: TableViewTarget, at: Version, from: Version, evaluation: VerdictEvaluation<OpVoidDetail>, exclude?: B64Hash) {
+    //
+    // `pending` is non-empty only for a bound group read through the
+    // observer's three-valued fold while some of the observer's observes of it
+    // are undecided: `at` is then D, the version the live observes give, and
+    // each read applies the touch rule (./touch.ts) before answering at D.
+    constructor(
+        target: TableViewTarget, at: Version, from: Version, evaluation: VerdictEvaluation<OpVoidDetail>,
+        exclude?: B64Hash, pending: readonly PendingRefAdvance[] = [],
+    ) {
         this.target = target;
         this.at = at;
         this.from = from;
         this.evaluation = evaluation;
         this.exclude = exclude;
+        this.pending = pending;
+    }
+
+    // The touch test of this view's reads, or undefined when nothing is
+    // pending, where every read is today's read at `at`.
+    private touchTest(): TouchTest | undefined {
+        if (this.pending.length === 0) return undefined;
+        if (this._touch === undefined) {
+            this._touch = new TouchTest(this.target, this.at, this.from, this.pending, this.evaluation, async (hash) => {
+                const truth = await this.entryTruth(hash);
+                if (truth.status === 'undecided') {
+                    throw new Error(`entry '${hash}' of a bound group is undecided while the observer's read is open`);
+                }
+                return truth.status === 'true';
+            });
+        }
+        return this._touch;
     }
 
     getObject(): RTable {
@@ -246,21 +278,11 @@ export class RTableViewImpl implements RTableView, TruthTableView {
     private async walk(
         dag: ScopedDag, cover: (predicate: EntryPredicate) => Promise<Position>,
     ): Promise<{ live: Position; undecided: Map<B64Hash, Undecided> }> {
-        const met = new Map<B64Hash, Undecided>();
-        const live = await cover(async (hash) => {
-            const truth = await this.entryTruth(hash);
-            if (truth.status === 'undecided') {
-                met.set(hash, truth);
-                return false;
-            }
-            return truth.status === 'true';
-        });
-
-        const undecided = new Map<B64Hash, Undecided>();
-        for (const [hash, truth] of met) {
-            if (live.size === 0 || (await dag.findMinimalCover(position(...live, hash))).has(hash)) undecided.set(hash, truth);
-        }
-        return { live, undecided };
+        return seeThroughCover(
+            (p) => dag.findMinimalCover(p),
+            (accept) => cover((hash) => accept(hash)),
+            (hash) => this.entryTruth(hash),
+        );
     }
 
     private async opsAt(dag: ScopedDag, hash: B64Hash, rowId: B64Hash): Promise<RowOpPayload[]> {
@@ -312,6 +334,14 @@ export class RTableViewImpl implements RTableView, TruthTableView {
     private async rowState(rowId: B64Hash): Promise<{ truth: Truth; insert?: InsertRowPayload }> {
         const dag = await this.target.getScopedDag();
         const table = this.target.getTableName();
+        const touch = this.touchTest();
+
+        // With pending observes, the existence slot comes first: it fixes the
+        // incarnation the identity tags carry (the touch rule, ./touch.ts).
+        if (touch !== undefined) {
+            const touched = await touch.slotsTouched([existenceSlot(table)]);
+            if (touched !== undefined) return { truth: touched };
+        }
 
         // liveness is scoped to the CURRENT table incarnation: ops tagged for a
         // prior incarnation (before a drop+re-add, or a losing concurrent-create
@@ -323,10 +353,16 @@ export class RTableViewImpl implements RTableView, TruthTableView {
         // not mask a live insert or delete below it. Updates do not match
         // `rows`, so they are not walked. A delete can only sit above inserts,
         // so the cover holds a delete exactly when some delete is live.
-        const { live, undecided } = await this.walk(dag, (predicate) => dag.findCoverWithFilter(
-            this.at,
-            { containsValues: { rows: [rowTag(incarnation, rowId)] } },
-            predicate));
+        const identity: EntryMetaFilter = { containsValues: { rows: [rowTag(incarnation, rowId)] } };
+        if (touch !== undefined) {
+            const touched = await touch.touched({
+                slots: [],
+                history: [identity],
+                concurrent: [{ containsValues: { barrier: ['t'], rows: [rowTag(incarnation, rowId)] } }],
+            });
+            if (touched !== undefined) return { truth: touched };
+        }
+        const { live, undecided } = await this.walk(dag, (predicate) => dag.findCoverWithFilter(this.at, identity, predicate));
 
         let winner: InsertRowPayload | undefined;
         let winnerHash: B64Hash | undefined;
@@ -383,11 +419,20 @@ export class RTableViewImpl implements RTableView, TruthTableView {
     async columnValue(rowId: B64Hash, column: string): Promise<ColumnValue> {
         const schemaView = await this.schemaView();
         const table = this.target.getTableName();
+        const touch = this.touchTest();
+        if (touch !== undefined) {
+            const touched = await touch.slotsTouched([existenceSlot(table), columnSlot(table, column)]);
+            if (touched !== undefined) return touched;
+        }
         const incarnation = schemaView.getColumnIncarnation(table, column);
         if (incarnation === undefined) return { status: 'decided', value: undefined };
 
         const dag = await this.target.getScopedDag();
         const filter: EntryMetaFilter = { containsValues: { cols: [colTag(rowId, incarnation, column)] } };
+        if (touch !== undefined) {
+            const touched = await touch.touched({ slots: [], history: [filter], concurrent: [] });
+            if (touched !== undefined) return touched;
+        }
         const { live, undecided } = await this.walk(dag, (predicate) => dag.findCoverWithFilter(this.at, filter, predicate));
         if (undecided.size > 0) return anyTruth(undecided.values()) as Undecided;
 
@@ -480,17 +525,23 @@ export class RTableViewImpl implements RTableView, TruthTableView {
         return { live: true, author: insert.author, written };
     }
 
-    // Every live rowId at this horizon: enumerate identity ops (inserts and
-    // deletes now carry `rows`; updates do not; a schema deploy's `kills`
-    // marker carries no insert), collect candidate insert rowIds, then re-check
+    // Every live rowId at this horizon: the inserted rowIds, re-checked for
     // enforced liveness. No pub/author index is available, so this is a full
     // table scan (used once per FK-adopting deploy, see deriveDeployMeta).
     async liveRowIds(): Promise<B64Hash[]> {
-        const dag = await this.target.getScopedDag();
-        const candidates = await findAllWithFilter(dag, this.at, { containsKeys: ['rows'] });
+        const live: B64Hash[] = [];
+        for (const rowId of await this.insertedRowIds(await this.target.getScopedDag(), this.at)) {
+            if ((await this.liveInsert(rowId)) !== undefined) live.push(rowId);
+        }
+        return live.sort();
+    }
 
-        const candidateRowIds = new Set<B64Hash>();
-        for (const hash of candidates) {
+    // Every rowId with an insert at or below `at`, before any verdict is read:
+    // enumerate identity ops (inserts and deletes carry `rows`; updates do not;
+    // a schema deploy's `kills` marker carries no insert).
+    private async insertedRowIds(dag: ScopedDag, at: Version): Promise<Set<B64Hash>> {
+        const rowIds = new Set<B64Hash>();
+        for (const hash of await findAllWithFilter(dag, at, { containsKeys: ['rows'] })) {
             const entry = await dag.loadEntry(hash);
             if (entry === undefined) continue;
             const p = entry.payload as json.LiteralMap;
@@ -498,15 +549,10 @@ export class RTableViewImpl implements RTableView, TruthTableView {
                 ? (p as RowsSlicePayload).ops
                 : [p as RowOpPayload];
             for (const op of ops) {
-                if (op.action === 'insert') candidateRowIds.add(op.rowId);
+                if (op.action === 'insert') rowIds.add(op.rowId);
             }
         }
-
-        const live: B64Hash[] = [];
-        for (const rowId of candidateRowIds) {
-            if ((await this.liveInsert(rowId)) !== undefined) live.push(rowId);
-        }
-        return live.sort();
+        return rowIds;
     }
 
     // Liveness-BYPASSED provider read: the publicKey registered for `keyId`
@@ -564,12 +610,26 @@ export class RTableViewImpl implements RTableView, TruthTableView {
     // findRowIds, stopping at the first that surely matches. A searched field
     // that is missing or not a pub column (or a non-string rowAuthor) at this
     // horizon fails closed to FALSE instead of throwing out of candidateRowIds.
+    //
+    // With pending observes (./touch.ts), the slots of the table and of the
+    // searched columns are checked first, since the early returns below hold
+    // at D only while those slots are untouched. Candidates are then gathered
+    // at D plus every pending version, which holds every completion's
+    // candidates, and each candidate's column reads and liveness are touched
+    // or not on their own.
     async existsMatching(where: { [field: string]: json.Literal }): Promise<Truth> {
         const fields = Object.keys(where);
         if (fields.length === 0) return FALSE;
+        const table = this.target.getTableName();
+        const touch = this.touchTest();
+        if (touch !== undefined) {
+            const slots = [existenceSlot(table), ...fields.filter((f) => f !== 'rowAuthor').map((f) => columnSlot(table, f))];
+            const touched = await touch.slotsTouched(slots);
+            if (touched !== undefined) return touched;
+        }
         const schemaView = await this.schemaView();
-        if (!schemaView.hasTable(this.target.getTableName())) return FALSE;
-        const pubColumns = new Set(schemaView.getPubColumns(this.target.getTableName()));
+        if (!schemaView.hasTable(table)) return FALSE;
+        const pubColumns = new Set(schemaView.getPubColumns(table));
         for (const field of fields) {
             if (field === 'rowAuthor') {
                 if (typeof where[field] !== 'string') return FALSE;
@@ -577,18 +637,24 @@ export class RTableViewImpl implements RTableView, TruthTableView {
                 return FALSE;
             }
         }
-        const candidates = await this.candidateRowIds(where);
+        const gatherAt = touch === undefined ? this.at : await touch.gatherVersion();
+        const candidates = await this.candidateRowIds(where, gatherAt);
         return someTruth(candidates, (rowId) => this.candidateMatch(rowId, where));
     }
 
     // Rows some write of which could make them match, before any verdict is
     // read. Indexed candidates via pub meta, or rowAuthor system meta: pub
-    // values are mutable, so ONE field drives the index query. Every other
-    // field must be carried by some insert or update of the row too, unless the
-    // column's default equals the searched value (a row that never wrote it
-    // still matches). The rowId binds the insert's author, so rowAuthor, which
-    // drives the index whenever it is searched, needs no further check.
-    private async candidateRowIds(where: { [field: string]: json.Literal }): Promise<B64Hash[]> {
+    // values are mutable, so ONE field drives the index query, and every other
+    // field must be carried by some insert or update of the row too. A field
+    // whose column default equals the searched value is the exception: a row
+    // that never wrote it still matches and carries no meta for it, so the
+    // field neither drives the index nor filters. When every searched field is
+    // such a field, every inserted row is a candidate. The rowId binds the
+    // insert's author, so rowAuthor, which drives the index whenever it is
+    // searched, needs no further check. Writes are gathered at `at`, which is
+    // the view's own version unless existsMatching widens it; pub columns and
+    // defaults are this view's.
+    private async candidateRowIds(where: { [field: string]: json.Literal }, at: Version = this.at): Promise<B64Hash[]> {
         const schemaView = await this.schemaView();
         const table = this.target.getTableName();
         const pubColumns = new Set(schemaView.getPubColumns(table));
@@ -603,19 +669,24 @@ export class RTableViewImpl implements RTableView, TruthTableView {
             }
         }
 
-        const indexField = fields.includes('rowAuthor') ? 'rowAuthor' : fields[0];
-        if (indexField === 'rowAuthor' && typeof where[indexField] !== 'string') {
+        if (fields.includes('rowAuthor') && typeof where['rowAuthor'] !== 'string') {
             throw new Error("'rowAuthor' search requires a key-id string");
         }
 
-        const dag = await this.target.getScopedDag();
-        const candidates = await this.carriers(dag, indexField, where[indexField]);
         const def = schemaView.getTable(table);
-        for (const field of fields) {
-            if (field === indexField) continue;
+        const byDefault = (field: string): boolean => {
             const fallback = def?.columns[field]?.default;
-            if (fallback !== undefined && sameValue(fallback, where[field])) continue;
-            const carrying = await this.carriers(dag, field, where[field]);
+            return fallback !== undefined && sameValue(fallback, where[field]);
+        };
+        const indexField = fields.includes('rowAuthor') ? 'rowAuthor' : fields.find((field) => !byDefault(field));
+
+        const dag = await this.target.getScopedDag();
+        const candidates = indexField === undefined
+            ? await this.insertedRowIds(dag, at)
+            : await this.carriers(dag, indexField, where[indexField], at);
+        for (const field of fields) {
+            if (field === indexField || byDefault(field)) continue;
+            const carrying = await this.carriers(dag, field, where[field], at);
             for (const rowId of [...candidates]) {
                 if (!carrying.has(rowId)) candidates.delete(rowId);
             }
@@ -623,9 +694,10 @@ export class RTableViewImpl implements RTableView, TruthTableView {
         return [...candidates].sort();
     }
 
-    // Rows with an insert or update carrying `value` for `field` (rowAuthor:
-    // an insert by that author), found through the meta index.
-    private async carriers(dag: ScopedDag, field: string, value: json.Literal): Promise<Set<B64Hash>> {
+    // Rows with an insert or update at or below `at` carrying `value` for
+    // `field` (rowAuthor: an insert by that author), found through the meta
+    // index.
+    private async carriers(dag: ScopedDag, field: string, value: json.Literal, at: Version): Promise<Set<B64Hash>> {
         const indexValue = field === 'rowAuthor' ? value as string : json.toStringNormalized(value);
         const filter: EntryMetaFilter = { containsValues: {
             // surfaced `rowAuthor` indexes the internal meta key `author`
@@ -633,7 +705,7 @@ export class RTableViewImpl implements RTableView, TruthTableView {
         } };
 
         const rowIds = new Set<B64Hash>();
-        for (const hash of await findAllWithFilter(dag, this.at, filter)) {
+        for (const hash of await findAllWithFilter(dag, at, filter)) {
             const entry = await dag.loadEntry(hash);
             if (entry === undefined) continue;
 

@@ -482,7 +482,7 @@ export const rtableXGroupTests = {
             }
         },
         {
-            name: '[XGROUP13] tableMaps remaps schema FKs, schema EXISTS and FK adoption while leaving catalog references on real names',
+            name: '[XGROUP13] tableMaps remaps schema FKs, schema EXISTS, FK adoption and canDeploy, which names tables the way the schema does',
             invoke: async () => {
                 const ctx = newCtx();
                 const dev = await makeIdentity();
@@ -517,8 +517,8 @@ export const rtableXGroupTests = {
                 }))) as RSchemaImpl;
                 const commentsPin = await (await commentsSchema.getScopedDag()).getFrontier();
 
-                // Group 1 maps subject => posts, gate => flags; Group 2 maps subject => photos, gate => flags
-                // Both also set canDeploy using the real table name target.flags (and mapping flags => posts in group 2 to prove canDeploy is NOT remapped!)
+                // Group 1 maps subject => posts, gate => flags; Group 2 maps subject => photos, gate => flags,
+                // with a canDeploy over target.gate, which translates to blog.flags like the schema's reads.
                 const postComments = (await ctx.createObject(await RTableGroupImpl.create({
                     name: 'post_comments',
                     seed: 'xg13-post-comments',
@@ -530,6 +530,17 @@ export const rtableXGroupTests = {
                 const photoComments = (await ctx.createObject(await RTableGroupImpl.create({
                     name: 'photo_comments',
                     seed: 'xg13-photo-comments',
+                    schemaRef: commentsSchema.getId(),
+                    schemaVersion: commentsPin,
+                    bindings: { target: blogGroup.getId() },
+                    tableMaps: { target: { subject: 'photos', gate: 'flags' } },
+                    canDeploy: { p: 'exists', table: 'target.gate', where: { mode: 'open' } },
+                }))) as RTableGroupImpl;
+                // A map key is translated even where the bound group has a table of that
+                // name: here target.flags reads blog.posts, which has no mode.
+                const shadowed = (await ctx.createObject(await RTableGroupImpl.create({
+                    name: 'shadowed_comments',
+                    seed: 'xg13-shadowed-comments',
                     schemaRef: commentsSchema.getId(),
                     schemaVersion: commentsPin,
                     bindings: { target: blogGroup.getId() },
@@ -548,6 +559,7 @@ export const rtableXGroupTests = {
 
                 await postComments.observe('target', await frontier(blogGroup));
                 await photoComments.observe('target', await frontier(blogGroup));
+                await shadowed.observe('target', await frontier(blogGroup));
 
                 const pcTable = await postComments.getTable('comments');
                 const phcTable = await photoComments.getTable('comments');
@@ -564,7 +576,7 @@ export const rtableXGroupTests = {
                 }
                 assertTrue(crossRejected, 'photo_comments maps target.subject to blog.photos, so a postId is rejected');
 
-                // Deploy on photoComments checks canDeploy against real table target.flags (even though tableMaps maps flags => posts),
+                // Deploy on photoComments checks canDeploy through tableMaps (target.gate -> blog.flags),
                 // and FK adoption on a new FK column resolves through tableMaps
                 const v2 = await commentsSchema.updateSchema([
                     { rule: 'add-column', table: 'comments', column: 'extraItem', def: { type: 'string', nullable: true } },
@@ -572,7 +584,15 @@ export const rtableXGroupTests = {
                 ], dev);
                 await photoComments.deploy(version(v2));
                 assertTrue(await (await tableView(photoComments, 'comments')).hasRow(deriveRowId('c-2')),
-                    'canDeploy resolved real target.flags and FK adoption resolved target.subject -> blog.photos');
+                    'canDeploy resolved target.gate -> blog.flags and FK adoption resolved target.subject -> blog.photos');
+
+                let shadowedRejected = false;
+                try {
+                    await shadowed.deploy(version(v2));
+                } catch (e) {
+                    shadowedRejected = String(e instanceof Error ? e.message : e).includes('canDeploy predicate rejected');
+                }
+                assertTrue(shadowedRejected, 'canDeploy over target.flags reads blog.posts through the map, not blog.flags');
             }
         },
     ],

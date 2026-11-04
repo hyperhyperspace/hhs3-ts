@@ -16,7 +16,7 @@ Types can also compose via **state references**: an object records which version
 
 ### Admission and use
 
-An op is checked twice. **Admission** validates it causally where it is inserted, at `(at, at)` on its own object and on any object it references. **Use** re-checks it whenever a view reads it, at `(at, from)`, where a barrier concurrent with `at` and visible from `from` can void it. Admission is never moved onto `(at, from)`: what an op may do is fixed when it is written, and what later history makes of it is decided at use. A ref-advance is the one op admitted at another version, the one it imports (see [Who may ref-advance](#who-may-ref-advance)).
+An op is checked twice. **Admission** validates it causally where it is inserted, at `(at, at)` on its own object and on any object it references. **Use** re-checks it whenever a view reads it, at `(at, from)`, where a barrier concurrent with `at` and visible from `from` can void it. Admission is never moved onto `(at, from)`: what an op may do is fixed when it is written, and what later history makes of it is decided at use. A ref-advance is the one op admitted at another version, the one it imports (see [Who may ref-advance](#who-may-ref-advance)). In rdb, whose observe gates can read more than the group being advanced, that holds for the advanced group only: the gate reads it at the imported version, and everything else it reads at `(at, at)`, as any op's admission does.
 
 A fact — a capability holding, a capability definition, a set element — holds at `(at, from)` when both of these are true:
 

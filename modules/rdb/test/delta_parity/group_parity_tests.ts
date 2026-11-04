@@ -3,6 +3,7 @@ import {
     generateSingleGroupHistory, generateCrossGroupHistory,
     generateGatedGroupHistory, generateGatedCrossGroupHistory, generateRingGroupHistory, generateShapedHistories,
 } from "./generate.js";
+import { generateObserverGateHistory, generateObserverLocalGateHistory } from "./generate_observer.js";
 
 export const groupDeltaParityTests = {
     title: "[DELTA_PARITY] RTableGroup computeDelta parity (bounded vs full)",
@@ -40,6 +41,20 @@ export const groupDeltaParityTests = {
             invoke: async () => {
                 const options = resolveFuzzSweepOptions(process.argv.slice(2));
                 await runGroupSeedSweep(generateRingGroupHistory, options);
+            },
+        },
+        {
+            name: "[DELTA_PARITY_OBSGATE] bounded and full computeDelta agree when an observe gate reads a second bound group",
+            invoke: async () => {
+                const options = resolveFuzzSweepOptions(process.argv.slice(2));
+                await runGroupSeedSweep(generateObserverGateHistory, options);
+            },
+        },
+        {
+            name: "[DELTA_PARITY_OBSLOCAL] bounded and full computeDelta agree when observe gates read the observer's tables, with cores of observes and row ops",
+            invoke: async () => {
+                const options = resolveFuzzSweepOptions(process.argv.slice(2));
+                await runGroupSeedSweep(generateObserverLocalGateHistory, options);
             },
         },
         {

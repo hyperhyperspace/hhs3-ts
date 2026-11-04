@@ -40,6 +40,7 @@ import { versionKey } from "../rcatalog/resolve.js";
 import type { MemberFiles, MemberGroup } from "./instantiate.js";
 import type { ParamValue } from "./payload.js";
 import type { RDbImpl } from "./rdb.js";
+import { gateGraph, gateGraphOrder } from "../rtable_group/gate_graph.js";
 
 export type PlannedDeploy = {
     member: MemberGroup;
@@ -213,11 +214,17 @@ export async function applyCatalogPlan(plan: CatalogPlan, author?: OwnIdentity):
     for (const member of plan.order) {
         const group = await ctx.getObject(member.id) as RTableGroupImpl;
 
-        // advance this group's refs to the bound groups deployed in this plan
-        const seenBoundIds = new Set<B64Hash>();
-        for (const [binding, boundId] of Object.entries(group.getBindings())) {
-            if (!deployedIds.has(boundId) || seenBoundIds.has(boundId)) continue;
-            seenBoundIds.add(boundId);
+        // advance this group's refs to the bound groups deployed in this plan,
+        // in gate-graph order: a group a gate reads is observed before the
+        // binding that gate guards, so the gate sees its new version
+        const bindings = group.getBindings();
+        const firstAlias = new Map<B64Hash, string>();
+        for (const [alias, boundId] of Object.entries(bindings)) {
+            if (!firstAlias.has(boundId)) firstAlias.set(boundId, alias);
+        }
+        for (const boundId of gateGraphOrder(gateGraph(bindings, group.getCanObserve() ?? {}))) {
+            if (!deployedIds.has(boundId)) continue;
+            const binding = firstAlias.get(boundId)!;
             try {
                 const bound = await ctx.getObject(boundId) as RTableGroupImpl;
                 const frontier = await (await bound.getScopedDag()).getFrontier();

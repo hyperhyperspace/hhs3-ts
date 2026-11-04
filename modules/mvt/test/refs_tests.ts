@@ -22,7 +22,22 @@ import {
     canonicalVersion,
     validateRefVersionShape,
     widenRefAtUpward,
+    resolveRefFoldAtPosition,
+    widenRefAtUpwardFold,
 } from '../src/refs.js';
+import type { RefFold } from '../src/refs.js';
+import { FALSE, TRUE, undecidedOn } from '../src/verdict_evaluation.js';
+import type { Truth } from '../src/verdict_evaluation.js';
+
+// Liveness for a fold: undecided for `undecided`, false for `voids`, true
+// otherwise. An undecided entry's support is its own hash.
+function truths(undecided: B64Hash[], voids: B64Hash[] = []): (h: B64Hash) => Promise<Truth> {
+    return async (h) => undecided.includes(h) ? undecidedOn([h]) : voids.includes(h) ? FALSE : TRUE;
+}
+
+function pendingEntries(fold: RefFold): string {
+    return fold.pending.map((p) => p.entry).sort().join();
+}
 
 function createTestDag(): dag.Dag {
     const store = new dag.store.MemDagStorage();
@@ -466,6 +481,113 @@ async function testWidenRefAtUpward(): Promise<void> {
     testing.assertTrue(setEq(bothVoid.refAt, version(v1)), 'with every dominating candidate void, the cut is the base');
 }
 
+// Referenced: root ── f1 ── f2, and f3 on another branch.
+// Observer: h0 ── A {f1} ── B {f2}; C, a plain entry, on top of A; Z {f3}
+// concurrent with all of them. Read at {B, C}, so A is reached on C's path too.
+async function testResolveRefFoldAtPosition(): Promise<void> {
+    const refId = 'foreignObj';
+    const referenced = createTestDag();
+    const root = await referenced.append({ n: 0 }, {});
+    const f1 = await referenced.append({ n: 1 }, {}, version(root));
+    const f2 = await referenced.append({ n: 2 }, {}, version(f1));
+    const f3 = await referenced.append({ n: 3 }, {}, version(root));
+
+    const observer = new RootScopedDag(createTestDag());
+    const advance = (v: B64Hash, at: B64Hash) => observer.append(
+        createRefAdvancePayload(refId, version(v)), createRefAdvanceMeta(refId), version(at));
+    const h0 = await observer.append({ action: 'create' }, {}, undefined);
+    const A = await advance(f1, h0);
+    const B = await advance(f2, A);
+    const C = await observer.append({ action: 'other' }, {}, version(A));
+    const Z = await advance(f3, h0);
+    const at = version(B, C);
+    const withZ = version(B, C, Z);
+
+    for (const voids of [[], [B], [A, B], [Z], [B, Z]]) {
+        for (const from of [at, withZ]) {
+            const fold = await resolveRefFoldAtPosition(observer, refId, at, from, truths([], voids));
+            const bool = await resolveRefVersionAtPosition(observer, refId, at, from, async (h) => !voids.includes(h));
+            testing.assertTrue(setEq(fold.live, bool), `decided liveness gives the boolean fold (voids: ${voids.length})`);
+            testing.assertTrue(fold.pending.length === 0, 'decided liveness leaves nothing pending');
+        }
+    }
+
+    const top = await resolveRefFoldAtPosition(observer, refId, at, at, truths([B]));
+    testing.assertTrue(setEq(top.live, version(f1)), 'the walk sees through an undecided advance to the live one below');
+    testing.assertTrue(pendingEntries(top) === B && setEq(top.pending[0].version, version(f2)),
+        'the undecided advance is pending, with its published version');
+    testing.assertTrue(top.pending[0].verdict.support.has(B), 'a pending advance carries the verdict the walk read');
+
+    const below = await resolveRefFoldAtPosition(observer, refId, at, at, truths([A]));
+    testing.assertTrue(setEq(below.live, version(f2)), 'the live advance on top contributes');
+    testing.assertTrue(below.pending.length === 0, 'an undecided advance below a live one of the same walk is dropped');
+
+    const underVoid = await resolveRefFoldAtPosition(observer, refId, at, at, truths([A], [B]));
+    testing.assertTrue(setEq(underVoid.live, version(refId)), 'with no live advance the fold is the referenced root');
+    testing.assertTrue(pendingEntries(underVoid) === A, 'a void advance is walked past, and the undecided one below it is kept');
+
+    const concurrent = await resolveRefFoldAtPosition(observer, refId, at, withZ, truths([Z]));
+    testing.assertTrue(setEq(concurrent.live, version(f2)), 'the causal walk is unaffected');
+    testing.assertTrue(pendingEntries(concurrent) === Z && setEq(concurrent.pending[0].version, version(f3)),
+        'an undecided concurrent barrier is pending');
+}
+
+// The fixture of testWidenRefAtUpward: Y publishes {v1}; concurrent with it, L
+// publishes {v2}, D on top of L publishes {v3}, I publishes {w} and E {v1}.
+async function testWidenRefAtUpwardFold(): Promise<void> {
+    const refId = 'foreignObj';
+    const referenced = createTestDag();
+    const root = await referenced.append({ n: 0 }, {});
+    const v1 = await referenced.append({ n: 1 }, {}, version(root));
+    const v2 = await referenced.append({ n: 2 }, {}, version(v1));
+    const v3 = await referenced.append({ n: 3 }, {}, version(v2));
+    const w = await referenced.append({ n: 'w' }, {}, version(root));
+
+    const observer = new RootScopedDag(createTestDag());
+    const advance = (v: B64Hash, at: B64Hash, tag?: string) => observer.append(
+        { ...createRefAdvancePayload(refId, version(v)), ...(tag === undefined ? {} : { tag }) },
+        createRefAdvanceMeta(refId), version(at));
+    const h0 = await observer.append({ action: 'create' }, {}, undefined);
+    const Y = await advance(v1, h0);
+    const L = await advance(v2, h0);
+    const D = await advance(v3, L);
+    const I = await advance(w, h0);
+    const E = await advance(v1, h0, 'E');
+    const from = version(Y, D, I, E);
+
+    const fold = async (undecided: B64Hash[], voids: B64Hash[] = []) => {
+        const asked: B64Hash[] = [];
+        const liveness = truths(undecided, voids);
+        const result = await widenRefAtUpwardFold(observer, refId, version(Y), from, referenced, async (h) => {
+            asked.push(h);
+            return liveness(h);
+        });
+        return { ...result, asked };
+    };
+
+    for (const voids of [[], [D], [D, L]]) {
+        const decided = await fold([], voids);
+        const bool = await widenRefAtUpward(observer, refId, version(Y), from, referenced, async (h) => !voids.includes(h));
+        testing.assertTrue(setEq(decided.live, bool) && decided.pending.length === 0,
+            `decided liveness gives the boolean widening, with nothing pending (voids: ${voids.length})`);
+    }
+
+    const dPending = await fold([D]);
+    testing.assertTrue(setEq(dPending.live, version(v2)), 'the search sees through an undecided candidate to the live one below');
+    testing.assertTrue(pendingEntries(dPending) === D && setEq(dPending.pending[0].version, version(v3)),
+        'the undecided candidate is a pending widening, with its version');
+    testing.assertFalse(dPending.asked.includes(I) || dPending.asked.includes(E),
+        'liveness is asked only of candidates strictly above the base');
+
+    const lUndecided = await fold([L]);
+    testing.assertTrue(setEq(lUndecided.live, version(v3)) && lUndecided.pending.length === 0,
+        'a candidate below a live widening is not pending');
+
+    const both = await fold([D, L]);
+    testing.assertTrue(setEq(both.live, version(v1)), 'with no live widening, refAt is the base');
+    testing.assertTrue(pendingEntries(both) === [D, L].sort().join(), 'each undecided candidate is a pending widening');
+}
+
 export const refsSuite = {
     title: '[REFS] Building-block helpers',
     tests: [
@@ -482,5 +604,7 @@ export const refsSuite = {
         { name: '[REFS_09] ref-advance monotonicity validation', invoke: testRefAdvanceMonotonicity },
         { name: '[REFS_10] canonical version and antichain shape', invoke: testCanonicalVersionAndShape },
         { name: '[REFS_11] widenRefAtUpward widens only by live strictly dominating concurrent advances', invoke: testWidenRefAtUpward },
+        { name: '[REFS_12] resolveRefFoldAtPosition keeps undecided ref-advances as pending', invoke: testResolveRefFoldAtPosition },
+        { name: '[REFS_13] widenRefAtUpwardFold keeps undecided strictly dominating candidates as pending widenings', invoke: testWidenRefAtUpwardFold },
     ],
 };

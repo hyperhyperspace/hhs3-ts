@@ -207,37 +207,30 @@ export async function compileCatalogGroup(
     if (groupParams !== undefined) def.params = groupParams;
 
     const boundViews = await loadScopeGroupViews(scope, context, groupVersion, expr.span);
-    const deployScope: RuleScope = {
+    // ALLOW DEPLOY IF and ALLOW UPDATE REF read in this group's own scope, like
+    // its table rules: an unqualified table is the group's own, and a qualified
+    // one goes through the group's bindings and table maps.
+    const groupScope: RuleScope = {
         columnsOf: (tableRef) => {
             const { group: alias, table } = splitExistsTableRef(tableRef);
-            const targetView = alias === undefined
-                ? view
-                : (def.bindings?.[alias] !== undefined ? boundViews.get(def.bindings[alias])?.view : undefined);
-            const tableDef = targetView?.getTable(table);
+            if (alias === undefined) {
+                const tableDef = view.getTable(table);
+                return tableDef === undefined ? undefined : columnSetFromTableDef(tableDef);
+            }
+            const bound = def.bindings?.[alias];
+            const targetView = bound !== undefined ? boundViews.get(bound)?.view : undefined;
+            const tableDef = targetView?.getTable(def.tableMaps?.[alias]?.[table] ?? table);
             return tableDef === undefined ? undefined : columnSetFromTableDef(tableDef);
         },
     };
-    if (expr.canDeploy !== undefined) def.canDeploy = lowerRestrictionPredicate(expr.canDeploy, deployScope);
+    if (expr.canDeploy !== undefined) def.canDeploy = lowerRestrictionPredicate(expr.canDeploy, groupScope);
     if (expr.canObserve.length > 0) {
         const canObserve: { [binding: string]: Predicate } = {};
         for (const clause of expr.canObserve) {
-            const targetHash = def.bindings?.[clause.binding];
-            if (targetHash === undefined) {
+            if (def.bindings?.[clause.binding] === undefined) {
                 throw new Error(`${label}: ALLOW UPDATE REF names '${clause.binding}', which is not a binding`);
             }
-            const observed = boundViews.get(targetHash);
-            const observeScope: RuleScope = {
-                columnsOf: (tableRef) => {
-                    if (observed === undefined) return undefined;
-                    const { group: qual, table } = splitExistsTableRef(tableRef);
-                    const targetView = qual === undefined
-                        ? observed.view
-                        : (observed.def.bindings?.[qual] !== undefined ? boundViews.get(observed.def.bindings[qual])?.view : undefined);
-                    const tableDef = targetView?.getTable(table);
-                    return tableDef === undefined ? undefined : columnSetFromTableDef(tableDef);
-                },
-            };
-            canObserve[clause.binding] = lowerRestrictionPredicate(clause.predicate, observeScope);
+            canObserve[clause.binding] = lowerRestrictionPredicate(clause.predicate, groupScope);
         }
         def.canObserve = canObserve;
     }

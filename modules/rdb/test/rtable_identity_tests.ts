@@ -165,7 +165,7 @@ export const rtableIdentityTests = {
 
                 const gated = await createGroup(ctx, 'ident03-gated', await createSchema(ctx, '03b', [docsTable], admin), {
                     bindings: { f: foreign.getId() },
-                    canObserve: { f: { p: 'exists', table: 'caps', where: { label: 'open' } } },
+                    canObserve: { f: { p: 'exists', table: 'f.caps', where: { label: 'open' } } },
                 });
                 assertFalse(gated.observeNeedsAuthor('f'), "a gate that doesn't read $author needs no author");
                 await expectRejected(() => gated.observe('f', target, alice), NO_PROVIDER,
@@ -226,7 +226,7 @@ export const rtableIdentityTests = {
                 const ctx = newCtx();
                 const admin = await makeIdentity();
                 const foreign = await createForeignGroup(ctx, admin);
-                const authorGate: Predicate = { p: 'exists', table: 'caps', where: { grantee: '$author' } };
+                const authorGate: Predicate = { p: 'exists', table: 'f.caps', where: { grantee: '$author' } };
                 const ownedDocs: TableDef = { ...docsTable, restrictions: [{ on: 'update', rule: AUTHOR_IS_ROW_AUTHOR }] };
 
                 const plain = await createSchema(ctx, '06a', [docsTable], admin);

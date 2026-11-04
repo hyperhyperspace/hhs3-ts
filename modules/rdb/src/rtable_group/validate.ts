@@ -20,6 +20,7 @@ import {
 import { isValidName, isValidTableRef, validatePredicate } from "../rschema/validate.js";
 import { validateRowOpFormat } from "../rtable/validate.js";
 import { InsertRowPayload } from "../rtable/payload.js";
+import { gateGraphCycleReason } from "./gate_graph.js";
 
 function validateGroupParamsFormat(params: json.Literal, label: string): ValidationResult {
     if (!json.checkFormat(groupParamsFormat, params)) {
@@ -128,6 +129,10 @@ export function validateTableGroupPayloadFormat(payload: json.Literal): Validati
                 return validationFailure(`canObserve predicate for binding '${binding}' is invalid`);
             }
         }
+
+        // the gates read each other's bindings in a DAG (gate_graph.ts)
+        const cycle = gateGraphCycleReason(create.bindings ?? {}, create.canObserve ?? {});
+        if (cycle !== undefined) return validationFailure(cycle);
 
         // idProvider, if present, is a table ref (local name or 'group.table')
         if (create.idProvider !== undefined && !isValidTableRef(create.idProvider)) {

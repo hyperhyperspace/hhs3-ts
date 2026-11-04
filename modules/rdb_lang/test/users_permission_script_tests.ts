@@ -212,8 +212,8 @@ export const usersPermissionScriptTests = {
                 await runScriptFile('create_docs.sql', env);
 
                 // a docs group whose `users` observation is gated on a manager
-                // cap (evaluated in the users frame: `caps` is local there),
-                // next to an ungated one
+                // cap, read through the binding as users.caps, next to an
+                // ungated one
                 await runScriptText(`
                     CREATE SCHEMA docs_gated_schema CREATORS ($admin) AS (
                       TABLE docs ( body string )
@@ -228,7 +228,7 @@ export const usersPermissionScriptTests = {
                       TABLEGROUP docs_gated USING SCHEMA docs_gated_schema
                         BIND users => users
                         USING IDENTITIES users.identities
-                        ALLOW UPDATE REF users IF EXISTS caps WHERE label = 'manager' AND grantee = $author,
+                        ALLOW UPDATE REF users IF EXISTS users.caps WHERE label = 'manager' AND grantee = $author,
                       TABLEGROUP docs_group USING SCHEMA docs_schema
                         BIND users => users
                         USING IDENTITIES users.identities

@@ -16,6 +16,8 @@ import type { RTableGroupDelta } from "../src/rtable_group/delta.js";
 import { deriveRowId } from "../src/rtable/hash.js";
 import type { Predicate, Restriction, TableDef } from "../src/rschema/payload.js";
 import { assertGroupDeltaParity, assertRevisionBoundParity } from "./delta_parity/normalize.js";
+import * as obs from "./observer_frame_tests.js";
+import { registerIdentity, revokeCap, CAPS_TABLE, USERS_MANAGER_LABEL } from "../src/users/users.js";
 
 const hashSuite = createBasicCrypto().hash(HASH_SHA256);
 
@@ -384,6 +386,77 @@ export const deltaBoundTests = {
                 const delta = await boundedDelta(h.group, h.start, end);
                 assertEquals(delta.opVerdictChanges.length, 0, 'nothing flips');
                 assertTrue(isExactly(delta.revisionBound, h.k), 'the bound drops below the ring');
+            },
+        },
+        {
+            name: '[DBOUND10] a side-branch observe of K beside the meet and a new one bring a revoke into the horizon that flips an observe of H gated on K (observer frame)',
+            invoke: async () => {
+                const ctx = obs.newCtx();
+                const admin = await obs.makeIdentity();
+                const alice = await obs.makeIdentity();
+                const K = await obs.makeUsers(ctx, 'dbound10-k', { identities: [admin, alice], managers: [admin, alice] });
+                const grant = await obs.frontier(K);
+                const filled = version(await registerIdentity(K, await obs.makeIdentity(), undefined, grant));
+                const revoke = version((await revokeCap(K, admin, alice.keyId, USERS_MANAGER_LABEL, grant))!);
+                const H = await obs.makeData(ctx, 'dbound10-h', admin);
+                const G = await obs.makeObserver(ctx, 'dbound10-g', {
+                    creator: admin, bindings: { target: H.getId(), auth: K.getId() },
+                    canObserve: { target: { p: 'exists', table: `auth.${CAPS_TABLE}`, where: { label: USERS_MANAGER_LABEL, grantee: '$author' } } },
+                    idProvider: 'auth.identities',
+                });
+                const A = await G.observe('auth', grant, undefined, await obs.frontier(G));
+                const y = await G.observe('target', await obs.frontier(H), alice, version(A));
+                const s1 = await (await G.getTable('notes')).insert('dbound10-s1', { body: 's1' }, undefined, version(y));
+                const W = await G.observe('auth', filled, undefined, version(A));
+                const Z = await G.observe('auth', revoke, undefined, version(s1));
+
+                const start = version(s1, W);
+                const end = version(Z, W);
+                assertTrue(await voidKind(G, y, start) === 'live' && await voidKind(G, y, end) === 'observe-gate',
+                    "the revoke, concurrent with y's version and in the horizon at end, voids y");
+                const delta = await boundedDelta(G, start, end);
+                assertTrue(hasFlip(delta, y), 'the observe of H is reported');
+                assertTrue(!hasFlip(delta, W), 'the side-branch observe stays live');
+            },
+        },
+        {
+            name: '[DBOUND11] a core of an observe and a delete at start, settled at end by a new side-branch import: the import flips to live, the delete stays void',
+            invoke: async () => {
+                const ctx = obs.newCtx();
+                const { G, alice, bob, carol, v1, base } = await obs.loopFixture(ctx, 'dbound11');
+                const d = await (await G.getTable('admins')).delete(await obs.adminRow(G, alice, base), bob, base);
+                const y = await G.observe('auth', v1, alice, base);
+                const yC = await G.observe('auth', v1, carol, base);
+                const start = version(d, y);
+                const end = version(d, y, yC);
+                assertTrue(await voidKind(G, d, start) === 'undecided-cycle' && await voidKind(G, y, start) === 'undecided-cycle',
+                    'the delete and the import collapse at start');
+                assertTrue(await voidKind(G, d, end) === 'restriction' && await voidKind(G, y, end) === 'live',
+                    "carol's import settles them at end");
+                const delta = await boundedDelta(G, start, end);
+                assertTrue(hasFlip(delta, y), 'the import is reported');
+                assertTrue(!hasFlip(delta, d), 'the delete, void at both horizons, is not');
+            },
+        },
+        {
+            name: '[DBOUND12] a side-branch import that stays pending for a delete below the meet: the delete\'s touch test reads K beyond D, and nothing is reported',
+            invoke: async () => {
+                const ctx = obs.newCtx();
+                const { G, K, root, alice, bob, v1, base } = await obs.loopFixture(ctx, 'dbound12');
+                const admins = await G.getTable('admins');
+                const d = await admins.delete(await obs.adminRow(G, alice, base), bob, base);
+                const m = await admins.insert('dbound12-m', { key: root.keyId }, root, version(d));
+                const y = await G.observe('auth', v1, alice, base);
+                const v2 = version(await registerIdentity(K, await obs.makeIdentity(), undefined, v1));
+                const Z = await G.observe('auth', v2, root, version(m, y));
+                const start = version(m, y);
+                const end = version(Z);
+                for (const at of [start, end]) {
+                    assertTrue(await voidKind(G, d, at) === 'undecided-cycle' && await voidKind(G, y, at) === 'undecided-cycle',
+                        'the delete and the side-branch import stay collapsed');
+                }
+                const delta = await boundedDelta(G, start, end);
+                assertTrue(!hasFlip(delta, d) && !hasFlip(delta, y), 'nothing below the meet is reported');
             },
         },
     ],

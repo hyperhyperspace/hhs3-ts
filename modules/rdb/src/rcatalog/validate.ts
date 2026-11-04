@@ -15,6 +15,7 @@ import {
     CatalogGroupDef, CatalogFilesDef, CatalogReleaseBody, catalogGroupHash, catalogFilesHash,
 } from "./payload.js";
 import { isValidSemver } from "./semver.js";
+import { gateGraphCycleReason } from "../rtable_group/gate_graph.js";
 
 export function isValidCatalogName(name: string): boolean {
     return isValidSchemaName(name);
@@ -87,6 +88,8 @@ export function checkGroupDefFormat(def: CatalogGroupDef): string | undefined {
             return `group '${def.name}' has an invalid ALLOW UPDATE REF predicate for '${alias}'`;
         }
     }
+    const gateCycle = gateGraphCycleReason(bindings, def.canObserve ?? {});
+    if (gateCycle !== undefined) return `group '${def.name}': ${gateCycle}`;
 
     if (def.idProvider !== undefined && !isValidTableRef(def.idProvider)) {
         return `group '${def.name}' idProvider '${def.idProvider}' is not a valid table reference`;

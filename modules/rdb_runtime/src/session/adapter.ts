@@ -220,7 +220,7 @@ export async function executeText(
 
         const trigger = extractRefUpdateTrigger(effectiveBound);
         if (session.refAutoUpdate !== 'off' && trigger !== undefined) {
-            item.refUpdates = await propagateRefUpdates(session, trigger.sourceGroupId, trigger.author, options);
+            item.refUpdates = await propagateRefUpdates(session, trigger, options);
         }
 
         results.push(item);

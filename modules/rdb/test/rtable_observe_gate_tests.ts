@@ -48,11 +48,12 @@ async function expectThrow(fn: () => Promise<unknown>, why: string, messageInclu
     }
 }
 
-// The observe gate evaluated in the OBSERVED (Users) group's frame: the
-// observer must hold a live manager cap there. `$author` is the observation's
-// signing identity, resolved through the bound users provider.
+// The observe gate on the `users` binding, read in the observer's frame: the
+// observer must hold a live manager cap in the bound Users group, named
+// through the binding as `users.caps`. `$author` is the observation's signing
+// identity, resolved through the bound users provider.
 const MUST_BE_MANAGER: Predicate = {
-    p: 'exists', table: CAPS_TABLE, where: { label: USERS_MANAGER_LABEL, grantee: '$author' },
+    p: 'exists', table: `${USERS_BINDING}.${CAPS_TABLE}`, where: { label: USERS_MANAGER_LABEL, grantee: '$author' },
 };
 
 // A signed caps-insert row envelope (for direct validatePayload assertions):
@@ -150,7 +151,7 @@ export const rtableObserveGateTests = {
                     'a gated observe with no author is rejected');
                 await expectThrow(() => a.group.observe(USERS_BINDING, v, mallory),
                     'a gated observe by a non-manager is rejected by canObserve',
-                    "canObserve predicate rejected observation of 'users': EXISTS caps WHERE caps.label = 'manager' AND caps.grantee = $author");
+                    "canObserve predicate rejected observation of 'users': EXISTS users.caps WHERE users.caps.label = 'manager' AND users.caps.grantee = $author");
 
                 const hAdmin = await a.group.observe(USERS_BINDING, v, admin);
                 assertTrue(hAdmin.length > 0, 'a gated observe by a manager is admitted');
@@ -326,12 +327,14 @@ export const rtableObserveGateTests = {
                 const capX = await grantCap(b.group, admin, m2.keyId, USERS_MANAGER_LABEL);
                 assertTrue(capX !== undefined, 'admin grants m2 a manager cap');
 
-                // a gated doc group: its canObserve gate reads the users caps in
-                // the users frame, so evaluating it runs void computations on the
-                // SAME cached users instance as the direct caps reads below.
+                // a gated doc group: its canObserve gate reads the users caps
+                // through its `users` binding, so evaluating it runs void
+                // computations on the SAME cached users instance as the direct
+                // caps reads below.
                 const a = await makeApp(ctx, 'og07-a', b.group.getId(), { gated: true });
 
                 const at = await frontier(b.group);
+                const aAt = await frontier(a.group);
                 const usersId = b.group.getId();
 
                 // a signed cap insert authored by m2 (valid only while m2's
@@ -356,7 +359,7 @@ export const rtableObserveGateTests = {
                     })());
                     tasks.push((async () => {
                         await hop((i + 2) % 5);
-                        const ok = await a.group.evaluateObserveGate(usersId, m2.keyId, at, at);
+                        const ok = await a.group.evaluateObserveGate(usersId, m2.keyId, { opPos: aAt, imported: at, fold: 'admission' });
                         assertTrue(ok,
                             `iter ${i}: m2 must pass the manager observe gate (a dropped/shared VerdictEvaluation falsely fails it)`);
                     })());
@@ -482,8 +485,8 @@ export const rtableObserveGateTests = {
                     bindings: { source: b.group.getId(), target: b.group.getId() },
                     idProvider: 'source.identities',
                     canObserve: {
-                        source: { p: 'exists', table: CAPS_TABLE, where: { label: 'source_sync', grantee: '$author' } },
-                        target: { p: 'exists', table: CAPS_TABLE, where: { label: 'target_sync', grantee: '$author' } },
+                        source: { p: 'exists', table: `source.${CAPS_TABLE}`, where: { label: 'source_sync', grantee: '$author' } },
+                        target: { p: 'exists', table: `target.${CAPS_TABLE}`, where: { label: 'target_sync', grantee: '$author' } },
                     },
                 });
                 const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;

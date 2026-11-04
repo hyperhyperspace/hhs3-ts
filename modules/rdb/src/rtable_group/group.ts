@@ -59,7 +59,7 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, HASH_SHA256 } from "@hyper-hyper-space/hhs3_crypto";
 import type { OwnIdentity, KeyId, PublicKey, HashSuite } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, position } from "@hyper-hyper-space/hhs3_dag";
-import type { MetaProps } from "@hyper-hyper-space/hhs3_dag";
+import type { Entry, MetaProps } from "@hyper-hyper-space/hhs3_dag";
 
 import {
     Payload, RObjectFactory, RContext, LoadObjectOptions, NestingParent,
@@ -71,14 +71,16 @@ import {
     isRefAdvancePayload, extractRefVersion, extractAuthor, prepareRefAdvance, createRefAdvanceMeta,
     createRefAdvancePayload, resolveRefVersionAtPosition,
     canonicalVersion,
-    widenRefAtUpward,
+    resolveRefFoldAtPosition, widenRefAtUpwardFold,
 } from "@hyper-hyper-space/hhs3_mvt";
-import type { RefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
+import type { PendingRefAdvance, RefAdvancePayload, RefFold } from "@hyper-hyper-space/hhs3_mvt";
 import { signPayload as signPayloadHelper } from "@hyper-hyper-space/hhs3_mvt";
-import { TRUE, allTruth } from "@hyper-hyper-space/hhs3_mvt";
+import { TRUE, allTruth, verdictTruth } from "@hyper-hyper-space/hhs3_mvt";
 import type { Truth, Verdict, VerdictEvaluation } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchema, RSchemaView } from "../rschema/interfaces.js";
+import { existenceSlot, slotsWrittenBetween } from "../rschema/resolve.js";
+import { TouchTest } from "../rtable/touch.js";
 import type { IncarnationId } from "../rschema/incarnation.js";
 import type { Predicate, SchemaCreator } from "../rschema/payload.js";
 import { splitTableRef } from "../rschema/payload.js";
@@ -90,6 +92,7 @@ import { deriveTableId } from "../rtable/hash.js";
 import type { RowOpPayload } from "../rtable/payload.js";
 import type { RTableView } from "../rtable/interfaces.js";
 import { RTableViewImpl } from "../rtable/view.js";
+import type { TruthTableView } from "../rtable/view.js";
 
 import type { RTableGroup as RTableGroupContract, RTableGroupView as RTableGroupViewContract, BundleWrite } from "./interfaces.js";
 import { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload, RTABLE_GROUP_TYPE_ID, deployGateSetFormat, type GroupParams, type TableMaps } from "./payload.js";
@@ -97,6 +100,7 @@ import { TableScope, deriveCreateMeta, deriveEnvelopeMeta, deriveBundleMeta, der
 import type { DeployKills } from "./scopes.js";
 import { freshVerdictEvaluation, VERDICT_MAX_INFLIGHT } from "./verdict_evaluation.js";
 import { validateTableGroupPayload } from "./validate_ops.js";
+import type { ObserveGateOptions } from "./validate_ops.js";
 import { evaluatePredicateTruth, explainRowOpRestriction, explainRowOpFKReach } from "./predicates.js";
 import type { OpVoidDetail } from "./op_void.js";
 import { RTableGroupViewImpl } from "./view.js";
@@ -107,6 +111,16 @@ import {
 import type { BoundGroupHost } from "./delta.js";
 
 export { RTABLE_GROUP_TYPE_ID } from "./payload.js";
+
+// How an observe gate reads each kind of atom (evaluateObserveGateIn): the
+// gated group at a version (with the widening's pending observes at use),
+// another binding through a fold of this group's observes of it, and this
+// group's own tables.
+export type ObserveGateFrame = {
+    gated: () => Promise<{ at: Version; from: Version; pending: readonly PendingRefAdvance[] }>;
+    foreign: (alias: string, table: string) => Promise<TruthTableView | undefined>;
+    local: (table: string) => Promise<TruthTableView>;
+};
 
 // Entries of a group's computeRevisionBound memo.
 const REVISION_BOUND_MEMO_SIZE = 256;
@@ -417,6 +431,21 @@ export class RTableGroupImpl implements RTableGroupContract {
         return this.schemaVersionWith(advanced);
     }
 
+    // The slots written by the schema entries visible at (wider, from) and not
+    // at (at, from): the slot test of the touch rule (src/rtable/touch.ts).
+    // Structural, through the migration rules, so it never compares resolved
+    // values.
+    async schemaSlotsBetween(at: Version, wider: Version, from: Version): Promise<Set<string>> {
+        const older = await this.resolveSchemaVersion(at, from);
+        const newer = await this.resolveSchemaVersion(wider, from);
+        if (older.size === newer.size && [...older].every((h) => newer.has(h))) return new Set();
+        const entries: Entry[] = [];
+        for await (const entry of (await (await this.getSchemaObject()).getScopedDag()).loadAllEntries()) {
+            entries.push(entry);
+        }
+        return slotsWrittenBetween(entries, older, newer);
+    }
+
     // The pinned genesis version unioned with `refVersion`, as an antichain in
     // the schema DAG. The union makes the create itself an implicit first deploy.
     private async schemaVersionWith(refVersion: Version): Promise<Version> {
@@ -587,9 +616,9 @@ export class RTableGroupImpl implements RTableGroupContract {
 
     // Schema-originated cross-group table resolution: translates `schemaTable`
     // through `tableMaps[groupName]` before delegating to the real-name
-    // resolver. Used for schema FKs and schema ALLOW rules; catalog-authored
-    // references (`canDeploy`, `idProvider`, `canObserve`) call
-    // `resolveForeignTableView` directly.
+    // resolver. Used for schema FKs and schema ALLOW rules, and for the
+    // references written in the catalog beside the schema (`canDeploy`,
+    // `idProvider`, `canObserve`), which name tables the way the schema does.
     async resolveSchemaForeignTableView(
         groupName: string, schemaTable: string, at: Version, from: Version,
     ): Promise<RTableView | undefined> {
@@ -606,14 +635,18 @@ export class RTableGroupImpl implements RTableGroupContract {
 
     // Cross-group table resolution threaded with the caller's void evaluation.
     //
-    // `filterVoided` (view-time enforcement only): see through observations
-    // VOIDED at this `from` in the observed-version fold (Layer 2 of the
-    // observe gate), so a back-dated observation by a former principal
-    // contributes no foreign state. Only the void computation (diagnoseEntry)
-    // enables it; the public wrapper leaves it false (the geometric
-    // resolution). Note the observed `from` stays geometric: voided-observe
-    // filtering is an `at`-fold property (which versions participate), not a
-    // negative-evidence horizon.
+    // `filterVoided` (view-time enforcement only): the observed-version fold
+    // (Layer 2 of the observe gate) is three-valued. It sees through
+    // observations VOIDED at this `from`, so a back-dated observation by a
+    // former principal contributes no foreign state, and it keeps an
+    // observation whose verdict is still being solved as pending: the view
+    // reads at D, the version the live observations give, and tests each
+    // pending one with the touch rule (src/rtable/touch.ts). Only the void
+    // computation (diagnoseEntry) enables it; the public wrapper leaves it
+    // false (the geometric resolution, with nothing pending). The observed
+    // `from` stays geometric: it folds every observation, void or not, since
+    // it is what the observer knows of the bound group at this horizon, not
+    // what it accepted.
     async resolveForeignTableViewIn(
         evaluation: VerdictEvaluation<OpVoidDetail>, groupName: string, table: string, at: Version, from: Version, filterVoided: boolean,
     ): Promise<RTableViewImpl | undefined> {
@@ -623,76 +656,103 @@ export class RTableGroupImpl implements RTableGroupContract {
         const foreign = await this.loadForeignGroup(groupId, groupName);
 
         const dag = await this.getScopedDag();
-        const isLive = filterVoided ? (h: B64Hash) => this.isObserveLive(evaluation, groupId, h, from) : undefined;
+        const fold: RefFold = filterVoided
+            ? await resolveRefFoldAtPosition(dag, groupId, at, from, (h) => this.observeLiveness(evaluation, groupId, h, from))
+            : { live: await resolveRefVersionAtPosition(dag, groupId, at, from), pending: [] };
         const foreignDag = await foreign.getCausalDag();
-        const foreignAt = await canonicalVersion(foreignDag, await resolveRefVersionAtPosition(dag, groupId, at, from, isLive));
+        const foreignAt = await canonicalVersion(foreignDag, fold.live);
         const foreignFrom = await canonicalVersion(foreignDag, await resolveRefVersionAtPosition(dag, groupId, from, from));
 
+        const foreignTable = foreign.makeTable(table);
         const foreignSchema = await foreign.resolveSchemaView(foreignAt, foreignFrom);
-        if (!foreignSchema.hasTable(table)) return undefined;   // missing table
-
-        return new RTableViewImpl(foreign.makeTable(table), foreignAt, foreignFrom, evaluation);
-    }
-
-    // Whether the observation entry `entryHash` (a ref-advance of bound group
-    // `groupId`) is LIVE at this `from` horizon: ungated bindings are always
-    // live; a gated binding consults the at-use observe gate (the observe's
-    // verdict). Used as the `isLive` filter for the Layer 2 observed-version
-    // fold; threaded with the caller's evaluation.
-    private async isObserveLive(evaluation: VerdictEvaluation<OpVoidDetail>, groupId: B64Hash, entryHash: B64Hash, from: Version): Promise<boolean> {
-        if (this.observeGateFor(groupId) === undefined) return true;   // ungated
-        return this.observeVerdictLive(evaluation, entryHash, from);
-    }
-
-    // An observe's verdict never rests on an open component: bindings form a
-    // DAG, so its gate reads only the observed group, and its widening reads
-    // only observes strictly above it (see resolveObserveGateRefAt).
-    private async observeVerdictLive(evaluation: VerdictEvaluation<OpVoidDetail>, entryHash: B64Hash, from: Version): Promise<boolean> {
-        const verdict = await this.resolveVerdict(evaluation, entryHash, from);
-        if (verdict.status === 'undecided') {
-            throw new Error(`observe '${entryHash}' is undecided: an observe is never on a verdict cycle`);
+        if (!foreignSchema.hasTable(table)) {
+            // Absent at D, the table is a missing reference only while no
+            // pending observation touches its existence slot. Otherwise the
+            // view is returned, and its reads report the touched slot.
+            if (fold.pending.length === 0) return undefined;   // missing table
+            const touch = new TouchTest(foreignTable, foreignAt, foreignFrom, fold.pending, evaluation, async () => {
+                throw new Error('the existence slot test reads no verdict');
+            });
+            if (await touch.slotsTouched([existenceSlot(table)]) === undefined) return undefined;   // missing table
         }
-        return verdict.status === 'live';
+
+        return new RTableViewImpl(foreignTable, foreignAt, foreignFrom, evaluation, undefined, fold.pending);
     }
 
-    // Evaluate a binding's canObserve gate in the OBSERVED group's frame
-    // (frame rebasing): the gate's exists / $author atoms read the foreign
-    // group's tables at the observed foreign version (refAt, refFrom). 'object'
-    // context (no subject row). Returns true when the binding is ungated. Both
-    // the validation path and the at-use path call this with their own anchors.
-    // Public entry: mints a fresh void evaluation. The internal, evaluation-threaded
-    // variant is evaluateObserveGateIn.
-    async evaluateObserveGate(
-        refId: B64Hash, author: KeyId | undefined, refAt: Version, refFrom: Version,
-    ): Promise<boolean> {
-        const truth = await this.evaluateObserveGateIn(freshVerdictEvaluation(), refId, author, refAt, refFrom);
+    // The liveness of the observation entry `entryHash` (a ref-advance of
+    // bound group `groupId`) at this `from` horizon, for the Layer 2 fold:
+    // an ungated binding's observations are live; a gated binding's has its
+    // verdict's truth, threaded with the caller's evaluation.
+    private async observeLiveness(evaluation: VerdictEvaluation<OpVoidDetail>, groupId: B64Hash, entryHash: B64Hash, from: Version): Promise<Truth> {
+        if (this.observeGateFor(groupId) === undefined) return TRUE;   // ungated
+        return this.observeVerdictTruth(evaluation, entryHash, from);
+    }
+
+    // An observe's verdict as a truth value. It is undecided while the
+    // observe's component is being solved, and the folds that read it keep it
+    // as pending rather than folding or dropping it.
+    private async observeVerdictTruth(evaluation: VerdictEvaluation<OpVoidDetail>, entryHash: B64Hash, from: Version): Promise<Truth> {
+        return verdictTruth(await this.resolveVerdict(evaluation, entryHash, from));
+    }
+
+    // Evaluate a binding's canObserve gate for `author` importing `imported`,
+    // as an observe at `opPos` (a position of this group) is checked before
+    // it is written. The gate is read in this group's frame: an atom on an
+    // alias bound to the gated group reads it at (imported, imported); an
+    // unqualified atom reads this group's table at (opPos, opPos); an atom on
+    // any other alias reads that binding through the fold at opPos, geometric
+    // with `fold: 'admission'` (what validation reads, as a row op's admission
+    // does) or live with opPos as the horizon with `fold: 'use'` (the
+    // runtime's guard). True when the binding is ungated. Mints a fresh void
+    // evaluation; outside the component being solved a gate is decided.
+    async evaluateObserveGate(refId: B64Hash, author: KeyId | undefined, options: ObserveGateOptions): Promise<boolean> {
+        const { opPos, imported, fold } = options;
+        const evaluation = freshVerdictEvaluation();
+        const truth = await this.evaluateObserveGateIn(evaluation, refId, author, {
+            gated: async () => ({ at: imported, from: imported, pending: [] }),
+            foreign: (alias, table) => this.resolveSchemaForeignTableViewIn(evaluation, alias, table, opPos, opPos, fold === 'use'),
+            local: async (table) => new RTableViewImpl(this.makeTable(table), opPos, opPos, evaluation),
+        });
         if (truth.status === 'undecided') throw new Error('an observe gate is undecided outside the component being solved');
         return truth.status === 'true';
     }
 
+    // The observer frame: how the gate on `refId` reads each kind of atom.
+    // Atoms on any alias bound to the gated group go through that alias's
+    // table map to the gated group, at the version `frame.gated` gives
+    // (computed once, and only when the gate has such an atom). Atoms on other
+    // aliases go to `frame.foreign`, and unqualified atoms to `frame.local`,
+    // this group's own tables.
     async evaluateObserveGateIn(
-        evaluation: VerdictEvaluation<OpVoidDetail>, refId: B64Hash, author: KeyId | undefined, refAt: Version, refFrom: Version,
+        evaluation: VerdictEvaluation<OpVoidDetail>, refId: B64Hash, author: KeyId | undefined, frame: ObserveGateFrame,
     ): Promise<Truth> {
         const gate = this.observeGateFor(refId);
         if (gate === undefined) return TRUE;   // ungated binding
 
-        const foreign = await this.loadForeignGroup(refId, this.bindingNameForId(refId));
+        const gatedGroup = await this.loadForeignGroup(refId, this.bindingNameForId(refId));
+        const bindings = this.getBindings();
+        let gatedVersion: ReturnType<ObserveGateFrame['gated']> | undefined;
         return evaluatePredicateTruth(gate, {
-            getTableView: async (table) => new RTableViewImpl(foreign.makeTable(table), refAt, refFrom, evaluation),
-            getForeignTableView: (groupName, table) =>
-                foreign.resolveForeignTableViewIn(evaluation, groupName, table, refAt, refFrom, false),
+            getTableView: (table) => frame.local(table),
+            getForeignTableView: async (alias, table) => {
+                if (bindings[alias] !== refId) return frame.foreign(alias, table);
+                gatedVersion ??= frame.gated();
+                const { at, from, pending } = await gatedVersion;
+                return new RTableViewImpl(gatedGroup.makeTable(this.resolveForeignTableName(alias, table)), at, from, evaluation, undefined, pending);
+            },
             author,
             context: 'object',
         });
     }
 
     // The observed version an observe's at-use gate reads at (Layer 1):
-    // mvt's widenRefAtUpward, with the observe verdict as the liveness of a
-    // strictly dominating concurrent observe.
-    async resolveObserveGateRefAt(evaluation: VerdictEvaluation<OpVoidDetail>, refId: B64Hash, opPos: Version, from: Version): Promise<Version> {
-        return widenRefAtUpward(
+    // mvt's widenRefAtUpwardFold, with the observe verdict as the liveness of
+    // a strictly dominating concurrent observe. `live` is refAt; `pending`
+    // lists the dominating observes whose verdicts are still being solved.
+    async resolveObserveGateRefAt(evaluation: VerdictEvaluation<OpVoidDetail>, refId: B64Hash, opPos: Version, from: Version): Promise<RefFold> {
+        return widenRefAtUpwardFold(
             await this.getScopedDag(), refId, opPos, from, await this.getForeignGroupCausalDag(refId),
-            (z) => this.observeVerdictLive(evaluation, z, from),
+            (z) => this.observeVerdictTruth(evaluation, z, from),
         );
     }
 
@@ -726,6 +786,20 @@ export class RTableGroupImpl implements RTableGroupContract {
         return canonicalVersion(foreignDag, await resolveRefVersionAtPosition(dag, groupId, at, from));
     }
 
+    // The version this group's LIVE observes of a bound group give at `at`
+    // (the Layer 2 fold, with `at` as the horizon): what entries written at
+    // `at` read of that group. A void observe contributes nothing, unlike in
+    // resolveObservedForeignVersion. Mints a fresh evaluation, so every
+    // observe it reads is decided.
+    async resolveLiveObservedForeignVersion(groupId: B64Hash, at: Version): Promise<Version> {
+        const evaluation = freshVerdictEvaluation();
+        const fold = await resolveRefFoldAtPosition(
+            await this.getScopedDag(), groupId, at, at, (h) => this.observeLiveness(evaluation, groupId, h, at),
+        );
+        if (fold.pending.length > 0) throw new Error('an observe is undecided outside the component being solved');
+        return canonicalVersion(await this.getForeignGroupCausalDag(groupId), fold.live);
+    }
+
     // KeyLookup: the publicKey registered for `keyId` through this group's
     // selected identity provider, anchored at group position `at`, LIVENESS-
     // BYPASSED (a raw provider read; see RTableViewImpl.rawProviderPublicKey).
@@ -748,7 +822,7 @@ export class RTableGroupImpl implements RTableGroupContract {
         if (groupId === undefined) return undefined;   // unbound (create-time validated; defensive)
         const foreign = await this.loadForeignGroup(groupId, groupName);   // missing object -> throw -> defer
         const foreignAt = await this.resolveObservedForeignVersion(groupId, at, at);
-        return foreign.providerPublicKeyAt(table, keyId, foreignAt);
+        return foreign.providerPublicKeyAt(this.resolveForeignTableName(groupName, table), keyId, foreignAt);
     }
 
     // The publicKey registered for `keyId` in this group's provider table
@@ -1189,14 +1263,24 @@ export class RTableGroupImpl implements RTableGroupContract {
         const gate = this.observeGateFor(refId);
         if (gate === undefined) return { status: 'live' };
 
-        const dag = await this.getScopedDag();
+        // At use, from horizon `from`: the gated group at (refAt, refFrom), with
+        // the widening's pending observes; other bindings through the live
+        // fold, read as a row op's guard reads them; this group's tables at
+        // ({y}, from), on the same evaluation (no exclude: an observe carries
+        // no row ops).
         const opPos = version(entryHash);
-        const foreignDag = await this.getForeignGroupCausalDag(refId);
-        const refAt = await this.resolveObserveGateRefAt(evaluation, refId, opPos, from);
-        const refFrom = await canonicalVersion(foreignDag, await resolveRefVersionAtPosition(dag, refId, from, from));
         const author = extractAuthor(payload as unknown as json.LiteralMap);
-
-        const truth = await this.evaluateObserveGateIn(evaluation, refId, author, refAt, refFrom);
+        const truth = await this.evaluateObserveGateIn(evaluation, refId, author, {
+            gated: async () => {
+                const dag = await this.getScopedDag();
+                const foreignDag = await this.getForeignGroupCausalDag(refId);
+                const widened = await this.resolveObserveGateRefAt(evaluation, refId, opPos, from);
+                const refFrom = await canonicalVersion(foreignDag, await resolveRefVersionAtPosition(dag, refId, from, from));
+                return { at: widened.live, from: refFrom, pending: widened.pending };
+            },
+            foreign: (alias, table) => this.resolveSchemaForeignTableViewIn(evaluation, alias, table, opPos, from, true),
+            local: async (table) => new RTableViewImpl(this.makeTable(table), opPos, from, evaluation),
+        });
         if (truth.status === 'true') return { status: 'live' };
         if (truth.status === 'undecided') return truth;
 
@@ -1337,6 +1421,9 @@ export class RTableGroupImpl implements RTableGroupContract {
         // either by this op's own prevs (same-DAG, always gated) or by a causally
         // prior gated op -- the create pins the schema genesis, each deploy pins
         // its new schema version, each observe pins the foreign version it reads.
+        // An observe's gate reads the same way: the gated group at the version
+        // the observe itself pins, other bound groups at the versions earlier
+        // observes pinned, and this group's own tables.
         // So gating on object PRESENCE (schema, bound groups) is sufficient here;
         // re-listing the resolved hashes per op would be redundant work. Any new
         // op type that reads cross-object state MUST preserve this: pin the hashes

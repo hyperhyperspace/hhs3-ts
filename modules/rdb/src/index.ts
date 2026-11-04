@@ -29,6 +29,7 @@ export * from "./rtable_group/scopes.js";
 export * from "./rtable_group/delta.js";
 export * from "./rtable_group/op_delta.js";
 export * from "./rtable_group/op_void.js";
+export * from "./rtable_group/gate_graph.js";
 export * from "./rtable_group/interfaces.js";
 export * from "./rtable_group/group.js";
 export { evaluatePredicate, evaluateRowOpRestriction } from "./rtable_group/predicates.js";

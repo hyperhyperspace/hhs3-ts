@@ -196,7 +196,7 @@ TABLEGROUP post_comments USING SCHEMA hhs:comments
   WITH PARAMS (:write_cap = 'commenter', :mod_cap = 'manager', :max_len = 1000)
 ```
 
-The rename applies to references that were written in the schema: foreign keys, and `EXISTS` in the schema's `ALLOW` rules. Clauses the catalog itself wrote — `USING IDENTITIES`, `ALLOW DEPLOY IF`, `ALLOW UPDATE REF` — use the real table names, because the catalog author knows them. A table left out of the parentheses keeps its name. A schema update that starts mentioning `alias.table` with no mapping binds by that name, and the draft warns.
+The rename applies to references that were written in the schema: foreign keys, and `EXISTS` in the schema's `ALLOW` rules. It applies the same way to the clauses the catalog writes beside the schema, `USING IDENTITIES`, `ALLOW DEPLOY IF` and `ALLOW UPDATE REF`, which name tables as the schema does. A table left out of the parentheses keeps its name, so a real table name still works unless the map renames it: with `posts => articles`, `alias.posts` reads `articles` even if the bound group has a `posts` of its own. A schema update that starts mentioning `alias.table` with no mapping binds by that name, and the draft warns.
 
 Several aliases may bind to the same group. A follows schema has `source` and `target`; both might be the blog. They share one observation of that group. The observed group has one version, and a snapshot of its tables is that one version. Every gate declared on those aliases has to hold. An alias with no gate adds no condition.
 
@@ -277,17 +277,20 @@ The two files have to share one first step, agree on the hash of every version t
 
 ## When a rule mentions another group's table
 
-A reference that fails only when a device tries to use it would put a broken catalog in front of every replica. So a release that adds a group, or moves a group's schema version, is checked against the bound groups as those groups stand in the same release. Foreign keys and `EXISTS` atoms have to land on tables that exist. Columns searched by `EXISTS` have to be `PUB` and of a compatible type. `USING IDENTITIES` and `ALLOW DEPLOY IF` have to name real tables. `ALLOW UPDATE REF` is checked in the observed group's frame, in that group's real table names.
+A reference that fails only when a device tries to use it would put a broken catalog in front of every replica. So a release that adds a group, or moves a group's schema version, is checked against the bound groups as those groups stand in the same release. Foreign keys and `EXISTS` atoms have to land on tables that exist. Columns searched by `EXISTS` have to be `PUB` and of a compatible type. `USING IDENTITIES`, `ALLOW DEPLOY IF` and `ALLOW UPDATE REF` are checked in the group's own scope, through its bindings and table maps.
 
 At runtime an `EXISTS` whose column is missing, or is not `PUB`, is false. A concurrent deploy can drop the column after the rule was written. False keeps the check monotonic: the rule fails closed, and validation does not abort on a schema this replica has only partly combined.
 
 ## Who may advance another group's version
 
-`ALLOW UPDATE REF` gates who may move the observed version of a bound group. Today the gate is read in the observed group's frame. That works when the observed group itself can see the capability table, for example a blog that binds `users`, so a comment group can write its gate in the blog's names.
+`ALLOW UPDATE REF binding IF predicate` gates who may move a group's view of a bound group. The gate is read in the observing group's own scope, like its table rules: `alias.table` reads a group it binds, through that alias's table map, and an unqualified table is its own. So a data group that binds nothing can be gated by a separate users group that the observer binds, and a group created by another application can be gated with this application's capabilities.
 
-Two layouts have no such path. A data group may bind nothing, while the observer binds both that group and a separate users group and wants the users group's capabilities to decide who may advance it. A group created by another application knows nothing about this application's users, and the observer still needs to gate the advance with its own capabilities. Both are cases for reading the gate in the observer's frame, with the observer's aliases and the observer's table renames.
+- The gated binding is read at the version being imported: an author may import a version in which they hold the capability.
+- Other bindings and the observer's own tables are read the way a row's guard reads them, at the observe's position. At admission, other bindings count every import already in the observer's history, so a revoke the author has seen binds them even if the import that brought it was void.
+- Gates may not read each other's bindings in a cycle: a gate on `a` that reads `b.caps` and a gate on `b` that reads `a.caps` are rejected.
+- A gate that reads the observer's own tables can race a delete of the importer's row whose rule reads the group being imported. The two can void each other; an `UPDATE REF` from the merge, which has seen the delete, settles it. The runtime does not repeat an import on its own.
 
-That is a follow-up, specified in [IMPLEMENTATION.md](./IMPLEMENTATION.md#advancing-an-observed-version). The gate text is fixed when the group is created. The same text names different tables in the two frames, so groups created under today's rule keep today's meaning when the follow-up lands.
+Catalogs written before this rule named the observed group's tables without a qualifier, `EXISTS caps WHERE caps.grantee = $author`. Such a gate now reads the observer's own `caps`, and is rejected when the observer has none: write it as `EXISTS user.caps WHERE user.caps.grantee = $author`.
 
 ## The path of one release
 

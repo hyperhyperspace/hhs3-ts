@@ -1,8 +1,9 @@
 import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { Entry } from "@hyper-hyper-space/hhs3_dag";
 import { json } from "@hyper-hyper-space/hhs3_json";
-import type { Version } from "@hyper-hyper-space/hhs3_mvt";
-import type { CreateRDbPayload, RDbImpl } from "@hyper-hyper-space/hhs3_rdb";
+import type { RefAdvancePayload, Version } from "@hyper-hyper-space/hhs3_mvt";
+import { isRefAdvancePayload } from "@hyper-hyper-space/hhs3_mvt";
+import type { CreateRDbPayload, OpVoidContext, RDbImpl } from "@hyper-hyper-space/hhs3_rdb";
 import { formatOpVoidDetail, isVoidCheckable, isVoidCheckableTableOp, versionKey } from "@hyper-hyper-space/hhs3_rdb";
 import type { ResolvedLogTarget } from "../bind/context.js";
 import type { BoundLog } from "../bind/bind.js";
@@ -29,7 +30,7 @@ export async function executeLog(bound: BoundLog): Promise<LogLangResult> {
             row.void = await bound.target.object.isEntryVoided(entry.hash, bound.from);
             if (bound.explain && row.void === true) {
                 const detail = await bound.target.object.explainEntryVoided(entry.hash, bound.from);
-                if (detail !== undefined) row.reason = formatOpVoidDetail(detail);
+                if (detail !== undefined) row.reason = formatOpVoidDetail(detail, observeContext(bound.target, entry.payload));
             }
         }
         rows.push(row);
@@ -44,6 +45,16 @@ export async function executeLog(bound: BoundLog): Promise<LogLangResult> {
         renderContext,
         rows,
     };
+}
+
+// An observe of a bound group (a group ref-advance that is not a schema
+// deploy), named by its binding aliases, for the void reason's notes.
+function observeContext(target: ResolvedLogTarget, payload: json.Literal): OpVoidContext | undefined {
+    if (target.kind !== 'group' || !isRefAdvancePayload(payload)) return undefined;
+    const refId = (payload as RefAdvancePayload).refId;
+    if (refId === target.object.getSchemaRef()) return undefined;
+    const aliases = Object.entries(target.object.getBindings()).filter(([, id]) => id === refId).map(([alias]) => alias).sort();
+    return { observe: aliases.length === 0 ? {} : { binding: aliases.join('/') } };
 }
 
 async function buildLogRenderContext(target: ResolvedLogTarget): Promise<LogRenderContext> {

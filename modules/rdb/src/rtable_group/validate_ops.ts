@@ -76,6 +76,13 @@ import { validateTableGroupPayloadFormat } from "./validate.js";
 import { evaluatePredicate, evaluateRowOpRestriction } from "./predicates.js";
 import { rowTag } from "./scopes.js";
 
+// How a gate is evaluated before an observe is written: the observe's
+// position in the observer, the version it imports, and how the observer's
+// other bindings are folded ('admission': geometric, every observe counts, as
+// validation reads them; 'use': live, with opPos as the horizon, as the
+// runtime's guard reads them).
+export type ObserveGateOptions = { opPos: Version; imported: Version; fold: 'admission' | 'use' };
+
 // What op-mode validation needs from the group (implemented by
 // RTableGroupImpl; a structural type to avoid an import cycle).
 export type GroupOpHost = {
@@ -86,9 +93,10 @@ export type GroupOpHost = {
     // The canObserve gate for an observation of `refId` (a bound group id), or
     // undefined when the binding is ungated.
     observeGateFor(refId: B64Hash): Predicate | undefined;
-    // Evaluate a binding's canObserve gate in the OBSERVED group's frame at
-    // (refAt, refFrom) against `author`. True when ungated.
-    evaluateObserveGate(refId: B64Hash, author: KeyId | undefined, refAt: Version, refFrom: Version): Promise<boolean>;
+    // Evaluate a binding's canObserve gate in the observer's frame for
+    // `author` importing `options.imported` at position `options.opPos`.
+    // True when ungated.
+    evaluateObserveGate(refId: B64Hash, author: KeyId | undefined, options: ObserveGateOptions): Promise<boolean>;
     getBindings(): { [name: string]: B64Hash };
     getIdProvider(): string | undefined;
     // The embedded deploy signature keys (empty when the group declares none).
@@ -218,6 +226,23 @@ async function validateCreate(create: CreateTableGroupPayload, ctx: RContext): P
     for (const groupName of Object.keys(create.canObserve ?? {})) {
         if (!Object.prototype.hasOwnProperty.call(bindings, groupName)) {
             return validationFailure(`canObserve gate names group '${groupName}' which is not bound`);
+        }
+    }
+
+    // gates are read in this group's frame: every atom is qualified with a
+    // binding alias, read through that binding, or names a table of the
+    // pinned schema, read as this group's own table. (A later deploy that
+    // drops the table makes the atom read false, as any missing reference.)
+    for (const [alias, gate] of Object.entries(create.canObserve ?? {})) {
+        for (const atom of collectExistsAtoms(gate)) {
+            const [qualifier, table] = splitTableRef(atom.table);
+            if (qualifier === undefined) {
+                if (!schemaView.hasTable(table)) {
+                    return validationFailure(`canObserve gate on '${alias}' reads table '${table}', which is not in the pinned schema`);
+                }
+            } else if (!Object.prototype.hasOwnProperty.call(bindings, qualifier)) {
+                return validationFailure(`canObserve gate on '${alias}' reads '${atom.table}', and '${qualifier}' is not bound`);
+            }
         }
     }
 
@@ -584,11 +609,15 @@ async function validateRefAdvance(payload: RefAdvancePayload, group: GroupOpHost
 // Observation authorship and the canObserve gate at write-admission (mirrors
 // validateDeploy's canDeploy block). A claimed author is authenticated at the
 // op's own position through the group's OWN provider, gated binding or not. A
-// gate that reads $author requires an author; the gate must hold in the
-// OBSERVED group's frame AT THE IMPORTED VERSION (refAt = refFrom =
-// newRefVersion): "was the author authorized in G at the version they import".
-// At-use voiding (isEntryVoided) then catches a back-dated observation a
-// later concurrent revoke retroactively unauthorizes.
+// gate that reads $author requires an author. The gate is read in the
+// observer's frame, and admission is mixed: the gated binding at the IMPORTED
+// version (refAt = refFrom = newRefVersion), "was the author authorized in
+// the observed group at the version they import", and everything else at the
+// op's own position `at`, as a row op's admission reads it: other bindings
+// through the geometric fold, which counts every observe the author has seen,
+// void ones included, and the observer's tables at (at, at). At-use voiding
+// (isEntryVoided) then catches a back-dated observation a later concurrent
+// revoke retroactively unauthorizes.
 async function validateObserveGate(
     payload: RefAdvancePayload, group: GroupOpHost, at: Version, newRefVersion: Version,
 ): Promise<ValidationResult> {
@@ -604,7 +633,7 @@ async function validateObserveGate(
         return validationFailure(`observation of gated group '${payload.refId}' must be authored`);
     }
 
-    return await group.evaluateObserveGate(payload.refId, author, newRefVersion, newRefVersion)
+    return await group.evaluateObserveGate(payload.refId, author, { opPos: at, imported: newRefVersion, fold: 'admission' })
         ? validationOk()
         : validationFailure(`canObserve predicate rejected observation of '${bindingNameFor(group, payload.refId)}': ${formatPredicate(gate)}`);
 }
@@ -668,7 +697,8 @@ async function validateDeploy(payload: RefAdvancePayload, group: GroupOpHost, at
     if (canDeploy !== undefined) {
         const ok = await evaluatePredicate(canDeploy, {
             getTableView: async (table) => group.makeTable(table).getView(at, at),
-            getForeignTableView: (groupName, table) => group.resolveForeignTableView(groupName, table, at, at),
+            // written in the catalog, beside the schema: translated through the table maps
+            getForeignTableView: (groupName, table) => group.resolveSchemaForeignTableView(groupName, table, at, at),
             author,
             context: 'object',
         });

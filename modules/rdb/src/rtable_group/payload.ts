@@ -64,13 +64,17 @@ export const groupParamsFormat: json.Format = [json.Type.BoundedMap,
 //
 // `canObserve` is an optional per-binding predicate gating foreign-group
 // observations (ref-advances of a bound group id). It is keyed by binding NAME
-// (resolved to id through the injective bindings map) and evaluated in 'object'
-// context ($author only, no subject row) in the OBSERVED group's frame at the
-// observed foreign version. A binding with no canObserve entry is ungated
-// (observation needs no authority, as before). Enforced both at write-admission
-// (validation, against the imported version) and at-use (view-time, against the
-// G-upward stratified observed version), so a back-dated observation by a former
-// principal is voided. Fixed v1 like bindings / canDeploy.
+// and evaluated in 'object' context ($author only, no subject row) in THIS
+// group's frame, like its table rules: an atom qualified with a binding alias
+// reads that bound group through the alias's table map, and an unqualified
+// atom reads this group's own table. Atoms on an alias bound to the gated
+// group read it at the observed version: the imported one at write-admission,
+// the G-upward stratified one at use. Other bindings and this group's tables
+// are read as a row op's guard reads them, at the observe's own position. A
+// binding with no canObserve entry is ungated (observation needs no
+// authority). Enforced both at write-admission and at use, so a back-dated
+// observation by a former principal is voided. The gates over the bound
+// groups form a DAG (gate_graph.ts). Fixed v1 like bindings / canDeploy.
 //
 // `idProvider` selects this group's identity provider for signature
 // verification: a LOCAL table name (must exist in the pinned schema and be

@@ -234,7 +234,7 @@ export const opDeltaTests = {
                     bindings: { [USERS_BINDING]: users.getId() },
                     idProvider: USERS_IDENTITIES_PROVIDER,
                     canObserve: {
-                        [USERS_BINDING]: { p: 'exists', table: CAPS_TABLE, where: { label: USERS_MANAGER_LABEL, grantee: '$author' } },
+                        [USERS_BINDING]: { p: 'exists', table: `${USERS_BINDING}.${CAPS_TABLE}`, where: { label: USERS_MANAGER_LABEL, grantee: '$author' } },
                     },
                 });
                 const app = (await ctx.createObject(appInit)) as RTableGroupImpl;

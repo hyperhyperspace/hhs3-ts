@@ -60,7 +60,7 @@ AS (
   TABLEGROUP doc USING SCHEMA hhs:doc AT LATEST
     BIND user => user
     USING IDENTITIES user.identities
-    ALLOW UPDATE REF user IF EXISTS caps WHERE caps.grantee = $author
+    ALLOW UPDATE REF user IF EXISTS user.caps WHERE user.caps.grantee = $author
 ) NOTE 'initial release' BY $admin;
 
 -- Deploying the release creates the database's user and doc groups. Later

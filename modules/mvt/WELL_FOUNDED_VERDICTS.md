@@ -190,10 +190,14 @@ For a component of $n$ entries, the fixpoint runs at most $n + 1$ rounds, each s
 | A delegation chain that revisits a holder at an earlier position | not a cycle: verdicts are per op | `[CAP36]` |
 | A live revoke beside a concurrent grant by a ring member | slot cleared | `[CAP39]` |
 | An undecided grant that dominates a live revoke | slot open until the grant resolves | `[CAP44]` |
+| An rdb import that revokes a deleter, raced by the deleter's delete of the importer's admin row | both void, `undecided-cycle` | `[OBSFRAME11]` |
+| The importer observes again from the merge | live; the deleter's delete from the merge is refused at admission | `[OBSFRAME12]` |
+| An import that leaves the delete's read untouched | the delete decided live, the import void | `[OBSFRAME14]` |
 
 ### 5.3 Costs
 
 - **Revoke races end in a stalemate.** A peer who manages their revoker's capability can answer a revoke with a counter-revoke that the revoke has not seen. Authors pick their positions, so a revoked peer can always write one, at a position from before the revoke. The two revokes form a ring, both are void, and both peers keep the capability. The revoker is not removed either and can revoke again, but the same answer is always available. Without wall-clock time, no rule can tell this from an honest race, the same limit as the dodge in [`IDEAL_CONCURRENCY.md`](./IDEAL_CONCURRENCY.md) §4.2. Breaking the tie needs an order between peers (Section 3.5). Authority the peer cannot revoke, such as an RCap creator's, is not exposed.
+- **An import can stand in for the counter-revoke.** An rdb observe whose gate reads the observer's own tables can share a core with a concurrent delete whose read the import touches, as when an import that revokes a deleter races the deleter's delete of the importer's row. Both are void, and the removal waits until one side acts again, having seen the other. The core works in both directions: the import contests the delete, and a delete written below the import holds up the import of a revoke already settled in the bound group. Every answer is back-dated, since at a position that has seen the import, admission reads the bound group through every import in the op's past, void ones included, and refuses the delete. The cost is worse than within a group in two ways. An import is all-or-nothing: while the deleter answers each import that reaches past the revoke, the observer's view of that group stays below it. And the revoke was decided elsewhere: only this observer's import of it is held up. Authority the attacker cannot remove is not exposed here either: an importer whose row the deleter cannot delete, or a gate that does not read the observer's tables, gets the import through (`[OBSFRAME20]`).
 - **Good faith does not help a member of a core.** Three admins who revoke each other concurrently, each for a good reason, all fail: every target stays in place.
 - **Reasons follow the final verdicts.** A void entry reports the first check that fails once every verdict is decided, which can be a consequence of its own voidness (`[PERM20b]`). Core members report `undecided-cycle`.
 - **A solve runs diagnoses again**, as often as Section 4.5 allows. Each computation pays it again, since completed components are not kept across computations (Section 6.5).
@@ -214,7 +218,7 @@ A type that binds `VerdictEvaluation` must:
 5. **Run one sequential traversal per evaluation.** The running stack identifies the reader of each `resolve`. Reads that share an evaluation are awaited one at a time; parallel branches each get their own evaluation.
 6. **Never create an evaluation inside a diagnosis.** A fresh evaluation cannot see the open frames, so on a cycle it recurses through fresh evaluations forever. rdb keeps an in-flight counter (`VERDICT_MAX_INFLIGHT`) that turns this bug into an error instead of a hang.
 7. **Keep undecided inside.** Public entry points create an evaluation and treat an undecided result as a bug: `isEntryVoided` and `hasCapability` throw.
-8. **Know where cycles can run.** rdb's bindings are fixed at creation and form a DAG, so every component stays inside one group, and an observe is never on a cycle (rdb throws on an undecided observe verdict). The engine itself does not need either property, but a preference order across objects would need an order between them.
+8. **Know where cycles can run.** rdb's bindings are fixed at creation and form a DAG, so every component stays inside one group. Observes alone form no cycle: an observe reads observes of its own binding only up the observed group's versions, and observes of other bindings only through the bindings its gate names, which creation keeps below its own in the group's gate graph. So a cycle through an observe runs through the group's rows, which its gate can read. The engine itself does not need these properties, but a preference order across objects would need an order between them.
 
 ---
 
@@ -276,16 +280,16 @@ A read during the solve can reach an entry not seen yet. It is resolved as a nor
 
 - **Test every shape the rule is about.** Back-edge denial passed `[PERM12]`, and nothing tested an odd ring, where it kills every capability.
 - **A test named for a choice should fail under the alternative on the verdict.** `[VERDICT03]` is named "well-founded, not Kripke–Kleene", and the Kripke–Kleene variant fails it only on a reason. The tests that separate the two rules on verdicts are `[VERDICT06]` and `[VERDICT07]`, which were written for growth and merge.
+- **Observes joined cycles without an engine change.** rdb used to throw on an undecided observe verdict. Once observe gates could read the observer's own tables, an observe could share a component with the observer's row ops. The fix was in the read rules, not the engine: the fold of observes became three-valued, keeping an undecided observe pending, and a read of the bound group is undecided only when a pending observe touches it ([`VOID_SEMANTICS.md`](../rdb/VOID_SEMANTICS.md) §4 and §5.5; rdb's `test/touch_rule_tests.ts`, `test/observer_frame_tests.ts`).
 - **Conditional answers must not outlive their traversal.** The instance cache, the root-dependent frames of back-edge denial and the interleaving bug fixed in `fd1f60d` are versions of one mistake: state from one traversal read by another. In the last one, two validations on one cached group instance saw each other's in-progress marks and denied a live witness row (`[OBSGATE07]`).
 
 ### 6.5 Still open
 
 - **Can a type produce a loop of positive reads?** Section 2.2 argues that rdb's and RCap's positive reads point into the past. The exception to check is an unhonored concurrent delete that hides an honored one, in `killedByConcurrentDelete` (`rdb/src/rtable/view.ts`). If no loop is possible, Kripke–Kleene and the well-founded model agree on every verdict the system computes. Running the rdb and std_types suites with the Kripke–Kleene variant, as the `ANY` shim did for concurrency, would be a cheap first measurement.
 - **A test for the program of Section 3.3**, named for the choice, that fails on `x`'s verdict under Kripke–Kleene.
-- **A preference order for revoke races** (Section 3.5). The key would be the insert position of the authorizing capability, fixed at grant time, not the revoke's position, so a later attacker cannot grind it. Components stay inside one group today; a type whose cycles can cross objects would need an order between them.
+- **A preference order for revoke races** (Section 3.5). The key would be the insert position of the authorizing capability, fixed at grant time, not the revoke's position, so a later attacker cannot grind it. Components stay inside one group, but rdb cores that hold an observe already need an order across a binding: the importer's authority is a row of the observer, and the deleter's is a cap in the bound group. Ranking the bound group's authority by where the observer first imported it can be ground, since an author can back-date an import of their own grant. A rule fixed at creation cannot: authority a group holds itself outranks authority it reads from a bound group. The import would then win the race of Section 5.3, and an entry could not use its view of a binding to block an update of that binding.
 - **A cache of completed components across computations.** Sound, not implemented.
 - **Recording the core in a collapse.** A bounded delta counts a barrier void by collapse at either horizon as changed, because the verdict does not say which core it collapsed in (Section 5.3). If the `undecided-cycle` reason carried the member's core, as a set of entry hashes, a barrier collapsed in the same core at both horizons could count as unchanged. Plausible, not proved, not implemented: [`rdb/INCREMENTAL_DELTA_BOUND.md`](../rdb/INCREMENTAL_DELTA_BOUND.md) §5.7.
-- **Observes that read each other.** The observer-frame `ALLOW UPDATE REF` design in [`rdb/plans/REFERENCE_FRAME.md`](../rdb/plans/REFERENCE_FRAME.md) would make one observe's verdict depend on the observer's other observes, which could put observes on cycles. rdb throws on an undecided observe verdict today ([`VOID_SEMANTICS.md`](../rdb/VOID_SEMANTICS.md) §5.5).
 - **A proof of Section 4.1.** The argument and the order-sweeping tests are what exists.
 
 ### 6.6 Tests
@@ -296,6 +300,8 @@ A read during the solve can reach an entry not seen yet. It is resolved as a nor
   - `test/rtable_perm_tests.ts`: `[PERM12]`–`[PERM22]` and `[PERM20b]`, the cases of Section 5.2.
   - `test/rtable_void_memo_tests.ts`: `[VOID_MEMO01]`, the memo on a long update chain.
   - `test/rtable_observe_gate_tests.ts`: `[OBSGATE07]`, interleaved computations on one group instance.
+  - `test/touch_rule_tests.ts`: `[TOUCHR01]`–`[TOUCHR06]`, the touch rule checked against the reads at every completion of the pending observes: a decided read holds at each, and deciding an observe never undoes one.
+  - `test/observer_frame_tests.ts`: `[OBSFRAME11]`–`[OBSFRAME20]`, cores through observes, the cases of Section 5.2 and 5.3.
 - **std_types**, `test/rcap_tests.ts`: `[CAP32]`–`[CAP34]`, `[CAP36]`, `[CAP39]`, `[CAP44]`.
 
 ### 6.7 Background

@@ -113,7 +113,8 @@ function formatOp(change: OpVerdictChange, ctx: HashDisplayContext): Record<stri
         rowId: change.rowId === undefined ? '' : ctx.formatString(change.rowId, { role: 'hash', hashPrefix: true }),
         author: change.author === undefined ? '' : ctx.formatString(change.author, { role: 'hash' }),
         binding: change.binding ?? '',
-        reason: change.reason === undefined ? '' : formatOpVoidDetail(change.reason),
+        reason: change.reason === undefined ? ''
+            : formatOpVoidDetail(change.reason, change.kind === 'observe' ? { observe: { binding: change.binding } } : undefined),
     };
 }
 

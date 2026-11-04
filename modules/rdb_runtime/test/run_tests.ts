@@ -453,6 +453,176 @@ CREATE CATALOG stock_catalog VERSION '1.0.0' PARAMS (:qty integer) AS (
             }
         },
     },
+    {
+        name: '[RDB_RT16] a local statement catches up every stale binding of the workspace, not only observers of the group it wrote',
+        invoke: async () => {
+            const runtime = await autoRuntime();
+            try {
+                await runtime.execute(crossGroupSetupScript() + `
+CREATE SCHEMA notes_schema CREATORS ($me) AS (TABLE notes (body string) ALLOW all IF true);
+CREATE CATALOG notes_catalog VERSION '1.0.0' AS (TABLEGROUP notes_g USING SCHEMA notes_schema);
+CREATE DATABASE notes_db USING CATALOG notes_catalog;
+`);
+                const users = groupNamed(runtime, 'users');
+                const shop = groupNamed(runtime, 'shop_prod');
+                // a write to users that no statement inspects, as if it arrived by sync
+                await (await users.getTable('identities')).insert('remote-1', { name: 'remote' });
+                assertTrue(!await observes(shop, users), "shop's view of users is behind");
+
+                const result = await runtime.execute("INSERT INTO notes_g.notes (body) VALUES ('x');");
+                assertTrue(await observes(shop, users), 'an unrelated statement catches it up');
+                assertTrue((result.results[0]?.refUpdates ?? []).some((e) => e.kind === 'updated' && e.observerGroupId === shop.getId()),
+                    'the catch-up is reported');
+            } finally {
+                await runtime.close();
+            }
+        },
+    },
+    {
+        name: '[RDB_RT17] one check observes a group a gate reads before the binding the gate guards',
+        invoke: async () => {
+            const runtime = await autoRuntime();
+            try {
+                await runtime.execute(gateGraphSetupScript());
+                const k = groupNamed(runtime, 'k');
+                const h = groupNamed(runtime, 'h');
+                const g = groupNamed(runtime, 'g');
+                const me = (await runtime.session.currentAuthor())!;
+                // alice's cap arrives in k, and an item in h, with no statement
+                await (await k.getTable('caps')).insert('cap-me', { grantee: me.keyId });
+                await (await h.getTable('items')).insert('item-1', { body: 'x' });
+
+                const result = await runtime.execute("INSERT INTO notes_g.notes (body) VALUES ('y');");
+                const updated = (result.results[0]?.refUpdates ?? []).filter((e) => e.kind === 'updated' && e.observerGroupId === g.getId());
+                assertEquals(updated.length, 2, 'g observes k and h in one check');
+                assertTrue(await observes(g, k) && await observes(g, h),
+                    "h's gate reads k.caps, so k is observed first and the gate sees the new cap");
+            } finally {
+                await runtime.close();
+            }
+        },
+    },
+    {
+        name: '[RDB_RT18] UPDATE REF starts a check: the binding whose gate reads the observed group is observed in the same statement',
+        invoke: async () => {
+            const runtime = await autoRuntime();
+            try {
+                await runtime.execute(gateGraphSetupScript());
+                const k = groupNamed(runtime, 'k');
+                const h = groupNamed(runtime, 'h');
+                const g = groupNamed(runtime, 'g');
+                const me = (await runtime.session.currentAuthor())!;
+                await (await k.getTable('caps')).insert('cap-me', { grantee: me.keyId });
+                await (await h.getTable('items')).insert('item-1', { body: 'x' });
+
+                const result = await runtime.execute('UPDATE REF k TO LATEST ON g;');
+                assertTrue(await observes(g, h), 'after observing k, the check observes h');
+                assertTrue((result.results[0]?.refUpdates ?? []).some((e) => e.kind === 'updated' && e.observerGroupId === g.getId()),
+                    "h's observe is reported in the UPDATE REF's result");
+            } finally {
+                await runtime.close();
+            }
+        },
+    },
+    {
+        name: '[RDB_RT19] a binding no local author can advance is caught up quietly, and reported only when the statement wrote the bound group',
+        invoke: async () => {
+            const runtime = await autoRuntime();
+            try {
+                await runtime.execute(gateGraphSetupScript());
+                const h = groupNamed(runtime, 'h');
+                const g = groupNamed(runtime, 'g');
+                // nobody here holds a cap in k, so g cannot observe h
+                await (await h.getTable('items')).insert('item-1', { body: 'x' });
+
+                const quiet = await runtime.execute("INSERT INTO notes_g.notes (body) VALUES ('y');");
+                assertTrue(!(quiet.results[0]?.refUpdates ?? []).some((e) => e.observerGroupId === g.getId() && e.kind !== 'updated'),
+                    'an unrelated statement reports no failure for g');
+                const written = await runtime.execute("INSERT INTO h.items (body) VALUES ('z');");
+                assertTrue((written.results[0]?.refUpdates ?? []).some((e) => e.observerGroupId === g.getId() && e.kind !== 'updated'),
+                    'a write to h reports that g could not observe it');
+                assertTrue(!await observes(g, h), 'g stays behind');
+            } finally {
+                await runtime.close();
+            }
+        },
+    },
+    {
+        name: '[RDB_RT20] a locked author is offered for unlocking only for a binding of a group the statement wrote',
+        invoke: async () => {
+            const keyVault = new FakeKeyVault();
+            const runtime = await RdbRuntime.openMemory({ keyVault, refAutoUpdate: 'auto' });
+            try {
+                await runtime.session.createKey('alice', 'correct');
+                runtime.session.selectAuthor('alice');
+                const bob = await keyVault.create('bob', 'correct');   // in the keystore, locked in the session
+                await runtime.execute(gateGraphSetupScript().replace(
+                    'WITH ROWS (identities (keyId = $me, publicKey = publicKey($me))),',
+                    'WITH ROWS (identities (keyId = $me, publicKey = publicKey($me)), identities (keyId = $bob, publicKey = publicKey($bob))),',
+                ));
+                const k = groupNamed(runtime, 'k');
+                const h = groupNamed(runtime, 'h');
+                const g = groupNamed(runtime, 'g');
+                // only bob holds a cap, and an item arrives in h with no statement
+                await (await k.getTable('caps')).insert('cap-bob', { grantee: bob.keyId });
+                await (await h.getTable('items')).insert('item-1', { body: 'x' });
+
+                let prompts = 0;
+                const options = {
+                    canPrompt: () => true,
+                    confirmRefUpdateUnlock: async () => {},
+                    unlockIdentity: async () => { prompts++; return bob; },
+                };
+                await runtime.execute("INSERT INTO notes_g.notes (body) VALUES ('y');", options);
+                assertEquals(prompts, 0, 'an unrelated statement does not prompt for the stale binding');
+                assertTrue(await observes(g, k) && !await observes(g, h), 'g catches up k, and h waits for an author');
+
+                const written = await runtime.execute("INSERT INTO h.items (body) VALUES ('z');", options);
+                assertEquals(prompts, 1, 'a write to h offers bob for unlocking');
+                assertTrue(await observes(g, h), "g observes h's frontier as bob");
+                assertTrue((written.results[0]?.refUpdates ?? []).some((e) => e.kind === 'updated' && e.observerGroupId === g.getId()),
+                    'the observe is reported');
+            } finally {
+                await runtime.close();
+            }
+        },
+    },
+    {
+        name: '[RDB_RT21] UPDATE CATALOG observes the deployed groups in gate-graph order',
+        invoke: async () => {
+            // auto-update off: only the catalog update observes
+            const runtime = await RdbRuntime.openMemory({ keyVault: new FakeKeyVault() });
+            try {
+                await runtime.session.createKey('alice', 'correct');
+                runtime.session.selectAuthor('alice');
+                await runtime.execute(gateGraphSetupScript());
+                const g = groupNamed(runtime, 'g');
+                const k = groupNamed(runtime, 'k');
+                const h = groupNamed(runtime, 'h');
+                // the cap reaches k, and g does not observe it
+                await runtime.execute('INSERT INTO k.caps (grantee) VALUES ($me);');
+                assertTrue(!await observes(g, k), "g's view of k lacks the cap");
+
+                await runtime.execute(`
+ALTER SCHEMA k_schema AS (ADD COLUMN caps.note string NULL);
+ALTER SCHEMA h_schema AS (ADD COLUMN items.note string NULL);
+ALTER CATALOG gate_catalog VERSION '1.1.0' AS (UPDATE SCHEMA k_schema TO LATEST ON k, UPDATE SCHEMA h_schema TO LATEST ON h);
+`);
+                const deployed = await runtime.execute("UPDATE CATALOG gate_catalog TO '1.1.0' ON gate_db;");
+                const result = deployed.results[0]!.result;
+                assertTrue(result.kind === 'update-catalog', 'update-catalog result');
+                if (result.kind !== 'update-catalog') return;
+                assertEquals(result.update.deployed.length, 2, 'k and h deployed');
+                assertEquals(result.update.observeFailures.map((f) => f.message).join('; '), '',
+                    "h's gate reads k.caps, so k is observed first and the gate sees the cap");
+                assertEquals(result.update.observed.filter((o) => o.groupId === g.getId()).map((o) => o.binding).join(','), 'k,h',
+                    'g observes k, then h');
+                assertTrue(await observes(g, k) && await observes(g, h), 'g is at both frontiers');
+            } finally {
+                await runtime.close();
+            }
+        },
+    },
 ];
 
 class FakeKeyVault implements KeyVault {
@@ -510,6 +680,50 @@ async function expectError(
         thrown instanceof Error && thrown.message.includes(message),
         description,
     );
+}
+
+async function autoRuntime(): Promise<RdbRuntime> {
+    const runtime = await RdbRuntime.openMemory({ keyVault: new FakeKeyVault(), refAutoUpdate: 'auto' });
+    await runtime.session.createKey('alice', 'correct');
+    runtime.session.selectAuthor('alice');
+    return runtime;
+}
+
+function groupNamed(runtime: RdbRuntime, name: string): RTableGroupImpl {
+    const root = runtime.session.workspace.roots.list('group').find((r) => r.name === name);
+    if (root?.object === undefined) throw new Error(`no group '${name}'`);
+    return root.object as RTableGroupImpl;
+}
+
+// Whether `observer`'s view of `bound` is at the bound group's frontier.
+async function observes(observer: RTableGroupImpl, bound: RTableGroupImpl): Promise<boolean> {
+    const frontier = await (await bound.getScopedDag()).getFrontier();
+    const at = await (await observer.getScopedDag()).getFrontier();
+    const current = await observer.resolveObservedForeignVersion(bound.getId(), at, at);
+    return frontier.size === current.size && [...frontier].every((h) => current.has(h));
+}
+
+// k holds caps and the identities g authenticates with; h holds items; g binds
+// both, and its gate on h reads k.caps. notes_g is an unrelated group.
+function gateGraphSetupScript(): string {
+    return `
+CREATE SCHEMA k_schema CREATORS ($me) AS (
+  TABLE identities (keyId string PUB READONLY, publicKey string PUB READONLY) IDENTITY PROVIDER ALLOW insert IF true,
+  TABLE caps (grantee string PUB) ALLOW all IF true
+);
+CREATE SCHEMA h_schema CREATORS ($me) AS (TABLE items (body string) ALLOW all IF true);
+CREATE SCHEMA g_schema CREATORS ($me) AS (TABLE notes (body string) ALLOW all IF true);
+CREATE SCHEMA notes_schema CREATORS ($me) AS (TABLE notes (body string) ALLOW all IF true);
+CREATE CATALOG gate_catalog VERSION '1.0.0' AS (
+  TABLEGROUP k USING SCHEMA k_schema USING IDENTITIES identities
+    WITH ROWS (identities (keyId = $me, publicKey = publicKey($me))),
+  TABLEGROUP h USING SCHEMA h_schema,
+  TABLEGROUP g USING SCHEMA g_schema BIND k => k, h => h USING IDENTITIES k.identities
+    ALLOW UPDATE REF h IF EXISTS k.caps WHERE grantee = $author,
+  TABLEGROUP notes_g USING SCHEMA notes_schema
+);
+CREATE DATABASE gate_db USING CATALOG gate_catalog;
+`;
 }
 
 function setupScript(): string {

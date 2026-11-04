@@ -1259,6 +1259,20 @@ const tests = [
         },
     },
     {
+        name: '[RDB_TOOLS68] a refused UPDATE REF suggests the keystore author whom the gate admits for the imported version',
+        invoke: async () => {
+            await withSession(async (session) => {
+                // bob holds the manager cap; alice, also a doc member, does not
+                const setup = await runScript(session, gatedBobManagerSetupScript());
+                assertEquals(setup.exitCode, 0, setup.output);
+
+                const refused = await runCommand(session, 'UPDATE REF users TO LATEST ON doc BY $alice;');
+                assertEquals(refused.exitCode, 2, refused.output);
+                assertTrue(refused.output.includes('hint: BY $bob'), refused.output);
+            });
+        },
+    },
+    {
         name: '[RDB_TOOLS38] scanKeystore finds observe-gate satisfying keys',
         invoke: async () => {
             await withSession(async (session) => {
@@ -1271,10 +1285,11 @@ const tests = [
 
                 const doc = docRoot.object as RTableGroupImpl;
                 const users = usersRoot.object as RTableGroupImpl;
-                const at = await (await users.getScopedDag()).getFrontier();
+                const imported = await (await users.getScopedDag()).getFrontier();
+                const opPos = await (await doc.getScopedDag()).getFrontier();
                 const candidates = await scanKeystore(
                     session,
-                    (keyId) => evaluateObserveGateKey(doc, usersRoot.id, at, at, keyId),
+                    (keyId) => evaluateObserveGateKey(doc, usersRoot.id, { opPos, imported, fold: 'admission' }, keyId),
                 );
                 assertEquals(candidates.length, 1, 'one manager-cap key');
                 assertEquals(candidates[0].label, 'alice', 'alice holds manager cap');
@@ -2064,7 +2079,7 @@ CREATE CATALOG doc_catalog VERSION '1.0.0' AS (
   TABLEGROUP doc USING SCHEMA doc_schema
     BIND users => users
     USING IDENTITIES members
-    ALLOW UPDATE REF users IF EXISTS caps WHERE label = 'manager' AND grantee = $author
+    ALLOW UPDATE REF users IF EXISTS users.caps WHERE label = 'manager' AND grantee = $author
     WITH ROWS (
       members (keyId = $alice, publicKey = publicKey($alice))
     )
@@ -2099,7 +2114,7 @@ CREATE CATALOG doc_catalog VERSION '1.0.0' AS (
   TABLEGROUP doc USING SCHEMA doc_schema
     BIND users => users
     USING IDENTITIES members
-    ALLOW UPDATE REF users IF EXISTS caps WHERE label = 'manager' AND grantee = $author
+    ALLOW UPDATE REF users IF EXISTS users.caps WHERE label = 'manager' AND grantee = $author
     WITH ROWS (
       members (keyId = $alice, publicKey = publicKey($alice)),
       members (keyId = $bob, publicKey = publicKey($bob))

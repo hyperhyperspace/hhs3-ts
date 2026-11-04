@@ -46,8 +46,9 @@ function schemaName(seed: string): string {
     return seed.replace(/[^a-zA-Z0-9_]+/g, '_') + '_schema';
 }
 
+// The gate on the `users` binding, read through it in the observer's frame.
 const MUST_BE_MANAGER: Predicate = {
-    p: 'exists', table: CAPS_TABLE, where: { label: USERS_MANAGER_LABEL, grantee: '$author' },
+    p: 'exists', table: `${USERS_BINDING}.${CAPS_TABLE}`, where: { label: USERS_MANAGER_LABEL, grantee: '$author' },
 };
 
 // A Users group with every member as a genesis identity and manager.

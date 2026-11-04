@@ -87,6 +87,7 @@ export type TableGroupHost = {
     getScopedDagForChild(childId: B64Hash): Promise<ScopedDag>;
     getCausalDag(): Promise<CausalDag>;
     resolveSchemaView(at: Version, from?: Version): Promise<RSchemaView>;
+    schemaSlotsBetween(at: Version, wider: Version, from: Version): Promise<Set<string>>;
     selfValidate(): boolean;
     validatePayload(payload: Payload, at: Version): Promise<ValidationResult>;
     makeTable(name: string): RTableImpl;
@@ -123,6 +124,12 @@ export class RTableImpl implements RTableContract {
     // valid group positions.
     async resolveSchemaView(at: Version, from?: Version): Promise<RSchemaView> {
         return this.group.resolveSchemaView(at, from);
+    }
+
+    // The schema slots that reading at `wider` instead of `at` can change (the
+    // touch rule's slot test, ./touch.ts); schema resolution is the group's.
+    schemaSlotsBetween(at: Version, wider: Version, from: Version): Promise<Set<string>> {
+        return this.group.schemaSlotsBetween(at, wider, from);
     }
 
     // Entry voiding is the group's computation (an entry may carry ops for

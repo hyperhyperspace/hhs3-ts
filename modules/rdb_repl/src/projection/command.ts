@@ -76,7 +76,7 @@ function formatRejectWarning(results: Map<B64Hash, IngestResult>): string | unde
 function formatEventReason(event: OpEvent): string {
     if (event.reason === undefined) return '';
     return event.reason.source === 'void'
-        ? formatOpVoidDetail(event.reason.detail)
+        ? formatOpVoidDetail(event.reason.detail, event.kind === 'observe' ? { observe: {} } : undefined)
         : event.reason.failure.reason;
 }
 

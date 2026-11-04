@@ -6,7 +6,7 @@ import {
     evaluateRowOpRestriction,
     RTableGroupImpl,
 } from "@hyper-hyper-space/hhs3_rdb";
-import type { RowOpPayload } from "@hyper-hyper-space/hhs3_rdb";
+import type { ObserveGateOptions, RowOpPayload } from "@hyper-hyper-space/hhs3_rdb";
 import type {
     AlterCatalogStatement,
     AlterSchemaStatement,
@@ -170,14 +170,16 @@ export async function resolveAuthorForGate(
     return { locked, candidates };
 }
 
+// Whether `keyId` passes the gate on the observer's binding of
+// `foreignGroupId`, for an observe at `gate.opPos` (a position of the
+// observer) importing `gate.imported` (a version of the bound group).
 export async function evaluateObserveGateKey(
     observer: RTableGroupImpl,
     foreignGroupId: B64Hash,
-    refAt: Version,
-    refFrom: Version,
+    gate: ObserveGateOptions,
     keyId: KeyId,
 ): Promise<boolean> {
-    return observer.evaluateObserveGate(foreignGroupId, keyId, refAt, refFrom);
+    return observer.evaluateObserveGate(foreignGroupId, keyId, gate);
 }
 
 function rowOpFromBound(bound: BoundInsert | BoundUpdate | BoundDelete, keyId: KeyId): RowOpPayload {
@@ -223,14 +225,13 @@ export async function resolveObserveAuthor(
     session: RdbSession,
     observer: RTableGroupImpl,
     foreignGroupId: B64Hash,
-    refAt: Version,
-    refFrom: Version,
+    gate: ObserveGateOptions,
     preferred: (OwnIdentity | undefined)[],
     options?: ResolveAuthorOptions,
 ): Promise<AuthorResolution> {
     return resolveAuthorForGate(
         session,
-        (keyId) => evaluateObserveGateKey(observer, foreignGroupId, refAt, refFrom, keyId),
+        (keyId) => evaluateObserveGateKey(observer, foreignGroupId, gate, keyId),
         preferred,
         options,
     );
@@ -281,8 +282,8 @@ async function gateTestForBound(bound: AuthRetryBound): Promise<(keyId: KeyId) =
             if (group === undefined) throw new Error('UPDATE REF target group is not loaded');
             const foreignId = resolveForeignGroupId(group, bound.ref);
             if (foreignId === undefined) throw new Error(`Unknown bound group '${bound.ref}'`);
-            const at = bound.at;
-            return (keyId) => evaluateObserveGateKey(group, foreignId, at, at, keyId);
+            const gate: ObserveGateOptions = { opPos: bound.at, imported: bound.version, fold: 'admission' };
+            return (keyId) => evaluateObserveGateKey(group, foreignId, gate, keyId);
         }
     }
 }
@@ -327,9 +328,9 @@ export async function suggestAuthorsForFailure(
             if (group === undefined) break;
             const foreignId = resolveForeignGroupId(group, bound.ref);
             if (foreignId === undefined) break;
-            const at = bound.at;
+            const gate: ObserveGateOptions = { opPos: bound.at, imported: bound.version, fold: 'admission' };
             candidates = await scanKeystore(session, (keyId) =>
-                evaluateObserveGateKey(group, foreignId, at, at, keyId),
+                evaluateObserveGateKey(group, foreignId, gate, keyId),
             );
             break;
         }

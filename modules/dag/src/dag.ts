@@ -28,7 +28,14 @@ export type Dag = {
     findForkPosition(first: Position, second: Position): Promise<ForkPosition>;
     findMinimalCover(p: Position): Promise<Position>;
 
-    // The following two are used for finding entries with specific properties
+    // The following two are used for finding entries with specific properties.
+    //
+    // Contract of both cover queries, which every index must keep: the result
+    // holds every topmost entry of the filtered set and nothing else. With a
+    // predicate, the filtered set is the matches the predicate accepts, and a
+    // match it rejects is seen through: the walk continues below it, so an
+    // accepted match below a rejected one can be topmost. Readers rely on this
+    // to compare two covers as sets (test/touch_cover_tests.ts, [TOUCH_03]).
 
     // This one is for reading a value at a specific version, by finding the last changes on that value
     findCoverWithFilter(from: Position, meta: EntryMetaFilter, predicate?: EntryPredicate): Promise<Position>;

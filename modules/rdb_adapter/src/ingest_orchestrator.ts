@@ -24,6 +24,7 @@ import { ValidationRejectedError, formatValidationFailure } from "@hyper-hyper-s
 import type { ValidationFailure } from "@hyper-hyper-space/hhs3_mvt";
 import type { OwnIdentity, B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { BundleWrite, RSchemaView, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
+import { gateGraph, gateGraphOrder } from "@hyper-hyper-space/hhs3_rdb";
 
 import {
     AdapterConfig, CapturedChange, CapturedChangeId, DEFAULT_KEY_DOMAIN, IngestRejection, IngestResult,
@@ -501,7 +502,11 @@ export async function ingestDatabaseChanges(
         dirty.delete(observerId);
         const observer = groupById.get(observerId)!;
         const writer = writerFor(observerId);
-        for (const [foreignId, version] of pending) {
+        // in gate-graph order: a group an observe gate reads is observed before
+        // the binding that gate guards, so the gate sees its new version
+        const order = gateGraphOrder(gateGraph(observer.getBindings(), observer.getCanObserve() ?? {}));
+        const rank = (id: B64Hash) => { const i = order.indexOf(id); return i < 0 ? order.length : i; };
+        for (const [foreignId, version] of [...pending].sort(([a], [b]) => rank(a) - rank(b))) {
             const pairKey = observerId + '\u0000' + foreignId;
             if (guard !== undefined) {
                 if (guard.has(pairKey)) continue;

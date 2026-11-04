@@ -33,6 +33,8 @@ import { opDeltaTests } from "./op_delta_tests.js";
 import { deltaBoundTests } from "./delta_bound_tests.js";
 import { groupDeltaParityTests } from "./delta_parity/group_parity_tests.js";
 import { phase1RegressionTests } from "./phase1_regressions.js";
+import { touchRuleTests } from "./touch_rule_tests.js";
+import { observerFrameTests } from "./observer_frame_tests.js";
 import { parseTestFilters } from "./delta_parity/parity.js";
 
 async function main() {
@@ -74,6 +76,8 @@ async function main() {
     allTests.set(deltaBoundTests.title, deltaBoundTests.tests);
     allTests.set(groupDeltaParityTests.title, groupDeltaParityTests.tests);
     allTests.set(phase1RegressionTests.title, phase1RegressionTests.tests);
+    allTests.set(touchRuleTests.title, touchRuleTests.tests);
+    allTests.set(observerFrameTests.title, observerFrameTests.tests);
 
     console.log('Running tests for Hyper Hyper Space v3 rdb module' + (filters.length > 0 ? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');
 

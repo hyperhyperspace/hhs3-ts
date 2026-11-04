@@ -141,6 +141,43 @@ export const logVerdictTests = {
             },
         },
         {
+            name: '[LOG08] EXPLAIN LOG notes that a void observe still advanced the horizon of its binding',
+            invoke: async () => {
+                const admin = await newIdentity();
+                const carol = await newIdentity();
+                const env = await createLangEnv({ vars: { admin, carol, me: admin } });
+                await env.run(`
+                    CREATE SCHEMA ids CREATORS ($admin) AS (
+                      TABLE identities (keyId string PUB READONLY, publicKey string PUB READONLY) IDENTITY PROVIDER ALLOW insert IF true
+                    );
+                    CREATE SCHEMA docs CREATORS ($admin) AS (
+                      TABLE admins (key string PUB) CONCURRENT DELETES ALLOW all IF true
+                    );
+                    CREATE CATALOG cat VERSION '1.0.0' AS (
+                      TABLEGROUP users USING SCHEMA ids USING IDENTITIES identities
+                        WITH ROWS (identities (keyId = $admin, publicKey = publicKey($admin)), identities (keyId = $carol, publicKey = publicKey($carol))),
+                      TABLEGROUP doc USING SCHEMA docs BIND users => users USING IDENTITIES users.identities
+                        WITH ROWS (admins (key = $admin), admins (key = $carol))
+                        ALLOW UPDATE REF users IF EXISTS admins WHERE key = $author
+                    );
+                    CREATE DATABASE db USING CATALOG cat;
+                `);
+                const doc = await env.group('doc');
+                const users = await env.group('users');
+                const base = await (await doc.getScopedDag()).getFrontier();
+                const carolRow = (await (await (await doc.getView(base, base)).getTableView('admins')).findRowIds({ key: carol.keyId }))[0]!;
+                const observe = await doc.observe('users', await (await users.getScopedDag()).getFrontier(), carol, base);
+                await (await doc.getTable('admins')).delete(carolRow, admin, base);
+
+                const log = await runLog(env, 'EXPLAIN LOG doc LIMIT 50;');
+                const row = log.rows.find((r) => r.hash === observe);
+                assertTrue(row !== undefined && row.void === true, "carol's observe is void: her admins row is deleted concurrently");
+                assertTrue(row!.reason !== undefined
+                    && row!.reason.startsWith("canObserve predicate rejected observation of 'users'")
+                    && row!.reason.endsWith("its version still advanced the horizon of 'users'"), row!.reason ?? 'no reason');
+            },
+        },
+        {
             name: '[LOG06] EXPLAIN LOG void verdicts stay consistent across concurrent-looking row ops',
             invoke: async () => {
                 const admin = await newIdentity();

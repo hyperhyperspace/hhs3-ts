@@ -62,11 +62,14 @@ are barrier-tagged, but only one is negation:
 An **ungated** observe is monotone (it only widens the observed version). A
 **gated** observe (a binding that declares `canObserve`) is **non-monotone**:
 its own liveness depends on the negation of a concurrent revoke of the
-observation's author in the observed group. That negation is resolved by a
-**local stratification on the observed group's version** (§5.5), so a gated
-observe never joins a component — it is the one place the engine treats an
-observe edge as negative. The polarity still comes from the type (the binding
-declares the gate), never from the `barrier` tag.
+observation's author in the observed group, resolved by a **local
+stratification on the observed group's version** (§5.5), and, since a gate is
+read in the observer's frame, on the other bindings and the observer's own
+rows that its gate reads. So a gated observe is an ordinary member of the
+computation: it can share a component with the observer's row ops, and a read
+that folds it while it is undecided keeps it pending (§4, "The fold of
+observes"). The polarity still comes from the type (the binding declares the
+gate), never from the `barrier` tag.
 
 Equating barrier with negative edge would over-stratify: it would drag the
 monotone deploy/observe revisions into the negation-resolution path, where
@@ -178,6 +181,24 @@ none.
   before liveness. So a row that no write could make match is never read, and
   its verdict never joins a component (`[PERM19]`, `[PERM22]`). An `exists`
   whose where clause uses an undecided `$row` value is undecided.
+- **The fold of observes:** a read of a bound group goes through the fold of
+  the observer's observes of it, one see-through walk like a column read: a
+  live observe contributes its published version, a void one is seen through,
+  and an undecided one is seen through and kept as *pending*, unless a live
+  observe of the same walk dominates it. The read is made at `D`, the version
+  the live observes give, and each pending observe `o` is tested with the
+  *touch rule*: `o` touches the read when adding its version to `D` makes
+  visible a schema entry that writes a slot the read uses (compared through the
+  migration rules, never through resolved values), or changes the cover of
+  one of the read's DAG queries over the entries live in the bound group (for
+  a concurrent query, its history cover too). A touched read is undecided,
+  supported by the touching observes; an untouched one is the read at `D`,
+  whatever the pending observes turn out to be. Covers are compared, not
+  answers: two imports that each leave an answer alone can change it together,
+  while the entries a query matches add up over imports. With nothing pending
+  the fold is the boolean one ([src/rtable/touch.ts](src/rtable/touch.ts);
+  `test/touch_rule_tests.ts` checks it against exact reads at every
+  completion).
 - **Diagnosis:** the `and`, over the entry's ops in bundle order, of
   restriction then FK reach. False is void with the first failing reason in
   data order (bundle order, restriction before FK, schema FK order); an
@@ -429,19 +450,24 @@ authorizes who may advance the observation of a bound foreign group `G`. It is
 enforced in two layers:
 
 - **Layer 1 — the gate (non-monotone).** Decides whether an observe op is a
-  *live ref-advance*. The gate predicate is evaluated in `G`'s frame at the
-  observed version the op resolves to. This is what introduces the negation: a
-  concurrent revoke of the observation's author in `G` can flip the op's
-  liveness.
+  *live ref-advance*. The gate predicate is evaluated in the **observer's**
+  frame, like the observer's table rules: an atom on an alias bound to `G`
+  reads `G` at the observed version the op resolves to; an atom on another
+  alias reads that bound group through the observer's live fold, as a row op's
+  guard does; an unqualified atom reads the observer's own table at the op's
+  position. This is what introduces the negation: a concurrent revoke of the
+  observation's author can flip the op's liveness, through `G` or through
+  another binding the gate reads.
 - **Layer 2 — reference resolution (monotone).** The effective observed foreign
   version is the **union** of the live observes' versions; the cross-group view
   then asks `G` for the target's liveness at that union. At view-time it *sees
-  through voided observes* (`resolveRefVersionAtPosition`'s `isLive`
-  predicate), like a column read sees through voided writes: a voided observe
-  contributes nothing and does not hide the live observes below it
-  (`[OBSGATE08]`). A former principal's authority in `G` is neutralized here,
-  monotonically: once any co-observed forward advance carries the revoke, the
-  union carries it, and a later import of an older `G`-branch cannot remove it.
+  through voided observes* (`resolveRefFoldAtPosition`), like a column read
+  sees through voided writes: a voided observe contributes nothing and does
+  not hide the live observes below it (`[OBSGATE08]`), and an undecided one is
+  kept pending for the touch rule (§4). A former principal's authority in `G`
+  is neutralized here, monotonically: once any co-observed forward advance
+  carries the revoke, the union carries it, and a later import of an older
+  `G`-branch cannot remove it.
 
 ### Why Layer 1's recursion is acyclic (the stratifying coordinate)
 
@@ -466,13 +492,19 @@ in the observer is exactly the coordinate the general delete+barrier case lacks
 direction), which is why a simple stratification exists *here* but not in
 general.
 
-**Observes are never on a cycle.** An observe's verdict reads only `G`, which
-is further down the binding DAG, and observes strictly above it in `G` (the
-Layer 1 widening, a strict order). Neither reaches back to the observe, so when
-a fold asks for an observe's verdict, the observe's frame completes as a
-component of its own, and the folds stay boolean. The engine asserts this: an
-undecided observe verdict throws, because it would mean bindings stopped
-forming a DAG. If bindings ever become mutable, this needs revisiting.
+**Observes on cycles.** Observes alone never form a cycle. An observe reads
+other observes of its own binding only up the `G`-version (the Layer 1
+widening), and observes of other bindings only through the bindings its gate
+names, which are below its own in the observer's gate graph: creation rejects
+gates that read each other in a cycle. But a gate may read the observer's own
+tables, and a row of those tables may read a bound group through the fold of
+observes, so an observe can share a component with the observer's row ops.
+Every such cycle passes through the observer's rows, and the engine solves it
+as it solves loops among rows (§4): a fold that meets an undecided observe
+keeps it pending and applies the touch rule, and a member left undecided
+collapses to void, `undecided-cycle`, observes included. An import that
+revokes the author of a concurrent delete of the importer's admin row, for
+one, collapses with that delete (`test/observer_frame_tests.ts`, `[OBSFRAME11]`).
 
 ### What this buys
 
@@ -503,12 +535,17 @@ revoke (§4). In the entire use-before-revoke regime no such component forms.
 
 ### Where it lives
 
-`diagnoseObserve`, `resolveObserveGateRefAt` (the G-upward
-filtered widening), `evaluateObserveGateIn` (frame rebasing into `G`), and
-the `filterVoided` path of `resolveForeignTableViewIn` in
-[src/rtable_group/group.ts](src/rtable_group/group.ts). The MVT
-`resolveRefVersionAtPosition` `isLive` hook ([modules/mvt/src/refs.ts](../mvt/src/refs.ts))
-is the generic seam for Layer 2.
+`diagnoseObserve`, `resolveObserveGateRefAt` (the G-upward filtered
+widening, with its pending observes), `evaluateObserveGateIn` (the observer
+frame: each atom routed to the gated group, another binding or the observer's
+own table), and the `filterVoided` path of `resolveForeignTableViewIn` (the
+three-valued fold) in [src/rtable_group/group.ts](src/rtable_group/group.ts);
+the touch rule in [src/rtable/touch.ts](src/rtable/touch.ts); the gate graph
+in [src/rtable_group/gate_graph.ts](src/rtable_group/gate_graph.ts). The MVT
+folds `resolveRefFoldAtPosition` and `widenRefAtUpwardFold`
+([modules/mvt/src/refs.ts](../mvt/src/refs.ts)) are the generic seam for both
+layers; the boolean `resolveRefVersionAtPosition` with its `isLive` hook stays
+for types whose ref-advances are never undecided.
 
 ## 6. Future direction (not implemented): a seniority order for negation cores
 

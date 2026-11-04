@@ -216,5 +216,45 @@ export const ingestionTests = {
                     'A was advanced transitively to B\'s (post-observe) frontier by the drain');
             },
         },
+        {
+            name: '[RDBING05] the flush observes a group an observe gate reads before the binding the gate guards',
+            invoke: async () => {
+                const ctx = newCtx();
+                // items binds perm and data; the gate on data reads perm.caps,
+                // and an item's insert needs data's row. The data row is
+                // written before the cap, so in commit order the flush would
+                // observe data first, while items' view of perm lacks the cap.
+                const perms = await makeGroup(ctx, 'perms', [open('caps', { label: { type: 'string', pub: true } })]);
+                const data = await makeGroup(ctx, 'data', [open('rows', { v: { type: 'string', pub: true } })]);
+                const items = await makeGroup(ctx, 'items', [{
+                    name: 'items',
+                    columns: { name: { type: 'string' } },
+                    restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'data.rows', where: { v: 'x' } } }],
+                }], {
+                    bindings: { perm: perms.group.getId(), data: data.group.getId() },
+                    canObserve: { data: { p: 'exists', table: 'perm.caps', where: { label: 'grant' } } },
+                });
+
+                const writer = await makeIdentity();
+                const members = await buildScope([perms.group, data.group, items.group], { writer });
+                const target = new MemoryTarget({ captureChanges: true });
+                await projectDatabase(members, target);
+
+                target.localInsert('data_rows', { v: 'x' });
+                target.localInsert('perms_caps', { label: 'grant' });
+                target.localInsert('items_items', { name: 'thing' });
+
+                const results = await ingestDatabaseChanges(members, target);
+
+                const itemsResult = results.get(items.group.getId())!;
+                assertEquals(itemsResult.rejected.length, 0, 'no observe was refused and the item was not rejected');
+                assertEquals(itemsResult.accepted, 1, 'the item was ingested');
+                const itemsView = await items.group.getView();
+                assertTrue(sameVersion(await itemsView.resolveRefVersion(perms.group.getId()), await frontier(perms.group)),
+                    'items observes the cap');
+                assertTrue(sameVersion(await itemsView.resolveRefVersion(data.group.getId()), await frontier(data.group)),
+                    "items observes data's row, through the gate the cap satisfies");
+            },
+        },
     ],
 };

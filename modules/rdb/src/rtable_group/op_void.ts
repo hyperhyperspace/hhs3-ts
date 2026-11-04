@@ -16,7 +16,25 @@ export type OpVoidDetail =
     | { kind: 'undecided-cycle' }
     | { kind: 'bundle'; index: number; detail: OpVoidDetail };
 
-export function formatOpVoidDetail(detail: OpVoidDetail): string {
+// What a printer knows about the void entry beyond its reason. `observe` is
+// set for an observe of a bound group (a ref-advance that is not a schema
+// deploy), named by its binding when the printer knows it.
+export type OpVoidContext = { observe?: { binding?: string } };
+
+// A void entry's reason, for people. A void observe gets two notes: a collapsed
+// one was contested by an entry it raced and can be observed again from the
+// merge, and any void one still advanced the observer's horizon of the
+// binding, since the horizon folds every observe, so what it imported can
+// still change the observer's reads (a revoke among it, for one).
+export function formatOpVoidDetail(detail: OpVoidDetail, context?: OpVoidContext): string {
+    const reason = formatReason(detail);
+    if (context?.observe === undefined) return reason;
+    const contested = detail.kind === 'undecided-cycle' ? `contested: ${reason}; observe again from the merge` : reason;
+    const binding = context.observe.binding;
+    return `${contested}; its version still advanced the horizon${binding === undefined ? '' : ` of '${binding}'`}`;
+}
+
+function formatReason(detail: OpVoidDetail): string {
     switch (detail.kind) {
         case 'restriction':
             return formatRestrictionFailureReason(detail.table, {
@@ -33,6 +51,6 @@ export function formatOpVoidDetail(detail: OpVoidDetail): string {
         case 'undecided-cycle':
             return 'undecided dependency cycle (denied)';
         case 'bundle':
-            return `bundle write ${detail.index}: ${formatOpVoidDetail(detail.detail)}`;
+            return `bundle write ${detail.index}: ${formatReason(detail.detail)}`;
     }
 }

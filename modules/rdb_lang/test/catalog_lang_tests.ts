@@ -472,7 +472,7 @@ export const catalogLangTests = {
 
                 const gate = await env.fail(`ALTER CATALOG app VERSION '1.1.0' AS (
                     ADD TABLEGROUP notes USING SCHEMA notes_schema BIND users => users
-                      ALLOW UPDATE REF users IF EXISTS caps WHERE grantee = $author
+                      ALLOW UPDATE REF users IF EXISTS users.caps WHERE grantee = $author
                 );`);
                 assertTrue(gate.includes('ALLOW UPDATE REF users IF reads $author, which needs USING IDENTITIES'), gate);
 
@@ -657,23 +657,25 @@ export const catalogLangTests = {
             },
         },
         {
-            name: '[CLANG17] ALLOW UPDATE REF compiles in the observed group frame; cross-group references are checked on ADD and UPDATE SCHEMA',
+            name: '[CLANG17] ALLOW UPDATE REF compiles in the group\'s own scope; cross-group references are checked on ADD and UPDATE SCHEMA',
             invoke: async () => {
                 const a = await actors();
                 const env = await appEnv(a);
                 await env.run(`
                     CREATE SCHEMA notes_schema CREATORS ($dev) AS (
-                      TABLE notes (body string) ALLOW all IF true
+                      TABLE notes (body string) ALLOW all IF true,
+                      TABLE admins (key string PUB) ALLOW all IF true
                     );
                 `);
 
-                // Qualified ALLOW UPDATE REF on docs (which binds users => users) compiles in docs's frame
+                // a gate on docs reads another binding, users.caps; a gate on users reads the group's own admins
                 await env.run(`
                     ALTER CATALOG app VERSION '1.1.0' AS (
                       ADD TABLEGROUP notes USING SCHEMA notes_schema
                         BIND docs => docs, users => users
                         USING IDENTITIES users.identities
                         ALLOW UPDATE REF docs IF EXISTS users.caps WHERE label = 'writer' AND grantee = $author
+                        ALLOW UPDATE REF users IF EXISTS admins WHERE key = $author
                     );
                 `);
 
@@ -682,12 +684,23 @@ export const catalogLangTests = {
                       ADD TABLEGROUP notes2 USING SCHEMA notes_schema
                         BIND users => users
                         USING IDENTITIES users.identities
-                        ALLOW UPDATE REF users IF EXISTS caps WHERE memo = 'secret'
+                        ALLOW UPDATE REF users IF EXISTS users.caps WHERE memo = 'secret'
                     );
                 `);
-                assertTrue(nonPub.includes("ALLOW UPDATE REF users IF reads caps.memo, which isn't PUB in caps"), nonPub);
+                assertTrue(nonPub.includes("ALLOW UPDATE REF users IF reads users.caps.memo, which isn't PUB in caps"), nonPub);
 
-                const unboundOnObserved = await env.fail(`
+                const notOwn = await env.fail(`
+                    ALTER CATALOG app VERSION '1.2.0' AS (
+                      ADD TABLEGROUP notes2 USING SCHEMA notes_schema
+                        BIND users => users
+                        USING IDENTITIES users.identities
+                        ALLOW UPDATE REF users IF EXISTS caps WHERE grantee = $author
+                    );
+                `);
+                assertTrue(notOwn.includes('ALLOW UPDATE REF users IF reads caps: schema notes_schema has no table caps'),
+                    `an unqualified table is the group's own: ${notOwn}`);
+
+                const unbound = await env.fail(`
                     ALTER CATALOG app VERSION '1.2.0' AS (
                       ADD TABLEGROUP notes2 USING SCHEMA notes_schema
                         BIND docs => docs, users => users
@@ -695,7 +708,18 @@ export const catalogLangTests = {
                         ALLOW UPDATE REF docs IF EXISTS other.caps WHERE grantee = $author
                     );
                 `);
-                assertTrue(unboundOnObserved.includes("ALLOW UPDATE REF docs IF reads other.caps, and TABLEGROUP docs doesn't BIND other"), unboundOnObserved);
+                assertTrue(unbound.includes("ALLOW UPDATE REF docs IF reads other.caps, and the TABLEGROUP doesn't BIND other"), unbound);
+
+                const cycle = await env.fail(`
+                    ALTER CATALOG app VERSION '1.2.0' AS (
+                      ADD TABLEGROUP notes2 USING SCHEMA notes_schema
+                        BIND docs => docs, users => users
+                        USING IDENTITIES users.identities
+                        ALLOW UPDATE REF docs IF EXISTS users.caps WHERE grantee = $author
+                        ALLOW UPDATE REF users IF EXISTS docs.docs WHERE rowAuthor = $author
+                    );
+                `);
+                assertTrue(cycle.includes('the ALLOW UPDATE REF gates read each other in a cycle'), cycle);
 
                 // UPDATE SCHEMA checks cross-group references on the updated schema
                 await env.run(`

@@ -80,6 +80,8 @@ What stays inside the helper, unchanged from the group method:
 
 Rdb's callback stays `observeVerdictLive(evaluation, z, from)`. The group's comment on why an observe is never on a cycle stays next to `observeVerdictLive`.
 
+> **2026-11-04:** no longer. Observer-frame gates let an observe share a component with the observer's row ops. `observeVerdictTruth` replaced `observeVerdictLive`, the throw went, and rdb's folds use mvt's three-valued `widenRefAtUpwardFold` and `resolveRefFoldAtPosition` ([`REFERENCE_FRAME.md`](./REFERENCE_FRAME.md)). RSet still uses the boolean helpers.
+
 One mvt test, in `mvt/test/refs_tests.ts`, on a hand-built observer DAG and a hand-built referenced DAG:
 
 - A concurrent advance whose version strictly dominates the base is unioned when `isLive` returns true, and seen through when it returns false, so a live advance below it contributes.

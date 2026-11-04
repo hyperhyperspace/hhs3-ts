@@ -331,6 +331,8 @@ Let us check how this resolves **Attack 2b** ($V_y = \{a_{\text{adv}}, b_0\}$ by
 
 ### 4.4 Fundamental Property 4: Why Layer 2 (`resolveForeignTableViewIn`) Still Always Receives Boolean Verdicts
 
+> **2026-11-04:** no longer. Gates are read in the observer's frame and can read its tables, so an observe can share a component with the observer's row ops (item 4 below). Layer 2 folds through mvt's three-valued `resolveRefFoldAtPosition` and keeps an undecided observe pending ([`REFERENCE_FRAME.md`](./REFERENCE_FRAME.md) §2.5 and §3.1).
+
 In `RTableGroupImpl.resolveForeignTableViewIn` (Layer 2) and `RSetViewImpl`, `resolveRefVersionAtPosition(dag, groupId, at, from, isLive)` requires a **boolean** callback `isLive: (h: B64Hash) => Promise<boolean>`.
 If `observe` entries can form a Tarjan component in Layer 1 (when two multi-head observes cross-advance each other), can `isObserveLive(evaluation, groupId, h, from)` ever receive `'undecided'` when called from Layer 2?
 
@@ -340,7 +342,7 @@ If `observe` entries can form a Tarjan component in Layer 1 (when two multi-head
 3. What can `diagnoseObserve(h)` reach?
    - Other `observe` entries in $O$ (for the same binding in v1, or lower-ranked bindings in $O$'s acyclic gate dependency DAG in [`REFERENCE_FRAME.md`](./REFERENCE_FRAME.md) §2.2), and
    - Entries in bound foreign groups $G$ (which lie strictly lower in the creation-pinned group binding DAG).
-4. Because `canObserve` predicates cannot reference observer-local tables today (they are read in the observed group's frame; the observer-frame proposal reads them only through gate verdicts, which never reach a local row's ordinary verdict, `REFERENCE_FRAME.md` §2.5 and §3.1) and group bindings form a strict DAG, **no path from `diagnoseObserve(h)` can ever reach a local row/bundle op $R$ in $O$**.
+4. Because `canObserve` predicates cannot reference observer-local tables today (they are read in the observed group's frame) and group bindings form a strict DAG, **no path from `diagnoseObserve(h)` can ever reach a local row/bundle op $R$ in $O$**. The observer-frame proposal lets gates read local tables, and then an observe can share a component with local row ops; it makes the fold three-valued for that (`REFERENCE_FRAME.md` §2.5 and §3.1).
 5. Therefore, the lowlink of the root `observe` frame called by Layer 2 can never drop below its own stack index. Its Tarjan SCC is **guaranteed** to complete inside `resolveVerdict` and return a decided verdict (`'live'` or `'void'`) to Layer 2!
 
 ### 4.5 Fundamental Property 5: Why `refFrom` / `foreignFrom` Must Stay Geometric

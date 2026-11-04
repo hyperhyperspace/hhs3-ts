@@ -434,7 +434,9 @@ function verdictLine(flip: OpVerdictChange): string | undefined {
     if (flip.voidBefore === flip.voidAfter) return undefined;
     const what = flip.voidAfter ? 'voided' : 'reinstated';
     const table = flip.table !== undefined ? ` ${flip.table}` : '';
-    const why = flip.reason !== undefined ? `: ${formatOpVoidDetail(flip.reason)}` : '';
+    const why = flip.reason !== undefined
+        ? `: ${formatOpVoidDetail(flip.reason, flip.kind === 'observe' ? { observe: { binding: flip.binding } } : undefined)}`
+        : '';
     return `${what} ${flip.kind}${table}${why}`;
 }
 

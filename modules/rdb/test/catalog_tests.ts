@@ -353,7 +353,7 @@ export const catalogTests = {
                 'an ALLOW DEPLOY IF over $author without a provider is rejected');
                 await rejects(() => publish(docDef(docSchema, docPin, userHash, {
                     idProvider: undefined,
-                    canObserve: { user: { p: 'exists', table: 'caps', where: { grantee: '$author' } } },
+                    canObserve: { user: { p: 'exists', table: 'user.caps', where: { grantee: '$author' } } },
                 }), '1.1.0'), 'TABLEGROUP doc: ALLOW UPDATE REF user IF reads $author, which needs USING IDENTITIES',
                 'an ALLOW UPDATE REF over $author without a provider is rejected');
                 await rejects(() => publish(docDef(docSchema, docPin, userHash, { idProvider: undefined }), '1.1.0'),
@@ -582,16 +582,19 @@ export const catalogTests = {
                 })), "TABLEGROUP d1: ALLOW DEPLOY IF reads user.identities.name, which isn't PUB in identities",
                 'ALLOW DEPLOY IF where column must be PUB');
 
-                // ALLOW UPDATE REF checks (evaluated in the observed group's frame)
+                // ALLOW UPDATE REF checks (read in the observer's frame, like table rules)
+                await rejects(() => publish(docDef(docSchema, docPin, userHash, {
+                    name: 'd1', canObserve: { user: { p: 'exists', table: 'user.identities', where: { name: 'Admin' } } },
+                })), "TABLEGROUP d1: ALLOW UPDATE REF user IF reads user.identities.name, which isn't PUB in identities",
+                'ALLOW UPDATE REF qualified table is checked against the bound group');
                 await rejects(() => publish(docDef(docSchema, docPin, userHash, {
                     name: 'd1', canObserve: { user: { p: 'exists', table: 'identities', where: { name: 'Admin' } } },
-                })), "TABLEGROUP d1: ALLOW UPDATE REF user IF reads identities.name, which isn't PUB in identities",
-                'ALLOW UPDATE REF unqualified table is checked against the observed group');
-                await rejects(() => publish(docDef(docSchema, docPin, docHash, {
-                    name: 'd1', bindings: { doc: docHash, user: userHash },
-                    canObserve: { doc: { p: 'exists', table: 'other.caps', where: { grantee: '$author' } } },
-                })), "TABLEGROUP d1: ALLOW UPDATE REF doc IF reads other.caps, and TABLEGROUP doc doesn't BIND other",
-                'ALLOW UPDATE REF qualified table must be bound on the observed group');
+                })), 'TABLEGROUP d1: ALLOW UPDATE REF user IF reads identities: schema hhs:doc has no table identities',
+                "ALLOW UPDATE REF unqualified table is the group's own");
+                await rejects(() => publish(docDef(docSchema, docPin, userHash, {
+                    name: 'd1', canObserve: { user: { p: 'exists', table: 'other.caps', where: { grantee: '$author' } } },
+                })), "TABLEGROUP d1: ALLOW UPDATE REF user IF reads other.caps, and the TABLEGROUP doesn't BIND other",
+                'ALLOW UPDATE REF qualified table must be bound by the group');
 
                 // Cross-group FK and EXISTS checks on add and on changes
                 const badFkSchema = (await ctx.createObject(await RSchemaImpl.create({

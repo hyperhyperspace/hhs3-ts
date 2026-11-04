@@ -1,6 +1,6 @@
 import { assertTrue, assertFalse, assertEquals } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
-import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
+import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 
 import { createMockRContext } from "./mock_rcontext.js";
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
@@ -8,6 +8,7 @@ import { RTableGroupImpl, rTableGroupFactory } from "../src/rtable_group/group.j
 import { deriveRowId } from "../src/rtable/hash.js";
 import type { TableDef } from "../src/rschema/payload.js";
 import type { Row } from "../src/rtable/interfaces.js";
+import type { TruthTableView } from "../src/rtable/view.js";
 import type { ColumnTypes, RowFilter, RowQuery } from "../src/rtable/query.js";
 import { evalRowFilter, orderRows, projectRow, validateRowQuery } from "../src/rtable/query.js";
 import { likeMatch, isValidLikePattern } from "../src/rschema/expr.js";
@@ -51,6 +52,20 @@ function ledgerTable(): TableDef {
     };
 }
 
+// Tickets whose pub `status` has a default, so a row that never writes it
+// still has it, and no write of the row carries it for the pub index.
+function ticketsTable(): TableDef {
+    return {
+        name: 'tickets',
+        columns: {
+            kind: { type: 'string', pub: true },
+            status: { type: 'string', pub: true, default: 'open' },
+        },
+        concurrentDeletes: false,
+        restrictions: [{ on: 'all', rule: { p: 'true' } }],
+    };
+}
+
 async function createLedgerGroup() {
     const ctx = createMockRContext({ selfValidate: true });
     ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
@@ -67,6 +82,27 @@ async function createLedgerGroup() {
 
     const groupInit = await RTableGroupImpl.create({
         name: 'ledger-test', seed: 'ledger-test', schemaRef: schema.getId(), schemaVersion: pinned,
+    });
+    const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
+    return { ctx, group, admin };
+}
+
+async function createTicketsGroup() {
+    const ctx = createMockRContext({ selfValidate: true });
+    ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
+    ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
+
+    const admin = await makeIdentity();
+    const schemaInit = await RSchemaImpl.create({
+        name: 'tracker',
+        creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
+        tables: [ticketsTable()],
+    });
+    const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
+    const pinned = await (await schema.getScopedDag()).getFrontier();
+
+    const groupInit = await RTableGroupImpl.create({
+        name: 'tickets-test', seed: 'tickets-test', schemaRef: schema.getId(), schemaVersion: pinned,
     });
     const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
     return { ctx, group, admin };
@@ -463,6 +499,39 @@ export const rtableQueryTests = {
                 await expectInsertFailure('bad4', { seq: '1', amount: '1.00', qty: 200 }, 'out-of-range integer rejected',
                     "column 'qty' (integer): integer 200 is out of range [0, 100]");
                 await expectInsertFailure('bad5', { seq: '1', amount: '1.00', qty: -1 }, 'below-min integer rejected');
+            }
+        },
+        {
+            name: '[QRY10] engine: a searched value that is the column default finds rows that never wrote it, whichever field leads',
+            invoke: async () => {
+                const { group } = await createTicketsGroup();
+                const tickets = await group.getTable('tickets');
+                await tickets.insert('t1', { kind: 'bug' });                      // status is the default
+                await tickets.insert('t2', { kind: 'bug', status: 'closed' });
+                await tickets.insert('t3', { kind: 'task', status: 'open' });     // status written
+
+                const view = await tickets.getView();
+                const exists = (view as unknown as TruthTableView).existsMatching.bind(view);
+                // Sequential on purpose: one traversal per view evaluation.
+                const named = async (rowIds: B64Hash[]): Promise<string> => {
+                    const names: string[] = [];
+                    for (const rowId of rowIds) names.push((await view.getRow(rowId))!.uuid);
+                    return names.sort().join(',');
+                };
+
+                // query pushes `status = 'open'` down to the pub index
+                const open = await view.query({ where: { p: 'cmp', cmp: 'eq', left: { col: 'status' }, right: { lit: 'open' } } });
+                assertEquals(uuids(open), 't1,t3', 'pushdown on status finds the row whose status is the default');
+
+                assertEquals(await named(await view.findRowIds({ status: 'open' })), 't1,t3', 'findRowIds on the default alone');
+                assertEquals(await named(await view.findRowIds({ status: 'open', kind: 'bug' })), 't1', 'findRowIds, default field first');
+                assertEquals(await named(await view.findRowIds({ kind: 'bug', status: 'open' })), 't1', 'findRowIds, default field second');
+
+                // EXISTS reads the same candidates. A miss refuses an op whose rule needs
+                // the match; for a delete, the removal silently does not happen.
+                assertEquals((await exists({ status: 'open', kind: 'bug' })).status, 'true', 'EXISTS, default field first');
+                assertEquals((await exists({ kind: 'bug', status: 'open' })).status, 'true', 'EXISTS, default field second');
+                assertEquals((await exists({ status: 'closed', kind: 'task' })).status, 'false', 'EXISTS finds no closed task');
             }
         },
     ],

@@ -120,7 +120,13 @@ type ReferencedBound = { dag: CausalDag; bound: Version };
 //      ref-advance's position, that may fold only some of the concurrent
 //      barriers (widenRefAtUpward). For a 'horizon' reference, their `from` is
 //      resolveVersion(horizon). Ref-advances are monotone and carry the `ref`
-//      meta tag with the ref id.
+//      meta tag with the ref id. A verdict may also read a referenced object at
+//      a version that adds, to the fold of the live ref-advances, the versions
+//      of ref-advances the fold sees through, one at a time or several
+//      together: a three-valued fold keeps an undecided ref-advance pending
+//      while a solve runs (resolveRefFoldAtPosition, widenRefAtUpwardFold).
+//      Those versions lie inside the referenced object's bound when the
+//      ref-advances are stable.
 //
 //      Below the bound, a stable ref-advance keeps its verdict: no new entry is
 //      concurrent with it, and each ref-advance of `start` concurrent with it

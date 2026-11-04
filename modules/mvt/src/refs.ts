@@ -17,6 +17,8 @@ import { version } from "./mvt.js";
 import type { Version } from "./mvt.js";
 import { validationFailure, validationOk } from "./validation.js";
 import type { ValidationResult } from "./validation.js";
+import { TRUE, seeThroughCover } from "./verdict_evaluation.js";
+import type { Truth, Undecided } from "./verdict_evaluation.js";
 
 export const MAX_REF_ID_LENGTH = 256;
 
@@ -168,6 +170,71 @@ export async function resolveRefVersionAtPosition(
     return result.size > 0 ? result : version(refId);
 }
 
+// A ref-advance met by a three-valued fold while its verdict is still being
+// solved. The fold neither folds nor drops it: `version` is what it publishes,
+// and `verdict` is the undecided answer the walk read for it, whose support a
+// reader that depends on it carries.
+export type PendingRefAdvance = { entry: B64Hash; version: Version; verdict: Undecided };
+
+// The result of a three-valued fold. `live` is the version the live
+// ref-advances give, which is the referenced object's root when there are
+// none. `pending` lists the undecided ref-advances the fold kept. Deciding a
+// subset of them live gives `live` plus their versions.
+export type RefFold = { live: Version; pending: PendingRefAdvance[] };
+
+// The three-valued variant of resolveRefVersionAtPosition, for readers whose
+// liveness may be undecided while a verdict cycle is being solved. Each walk,
+// the causal one at `at` and, when from !== at, the concurrent one, is a
+// see-through cover:
+//   - a live ref-advance contributes its published version;
+//   - a void one contributes nothing and does not hide those below it;
+//   - an undecided one does not hide those below it either, and is kept as
+//     pending unless a live member of the same walk dominates it.
+// A dominance across the two walks goes unnoticed. That costs nothing: a
+// pending version that `live` already holds changes no read.
+export async function resolveRefFoldAtPosition(
+    dag: ScopedDag,
+    refId: B64Hash,
+    at: Version,
+    from: Version,
+    liveness: (entryHash: B64Hash) => Promise<Truth>,
+): Promise<RefFold> {
+    const minimalCover = (p: Position) => dag.findMinimalCover(p);
+    const walks = [await seeThroughCover(
+        minimalCover, (accept) => findRefAdvances(dag, refId, at, (hash) => accept(hash)), liveness,
+    )];
+    if (!sameSet(at, from)) {
+        walks.push(await seeThroughCover(
+            minimalCover,
+            (accept) => findConcurrentRefAdvanceBarriers(dag, refId, at, from, (hash) => accept(hash)),
+            liveness,
+        ));
+    }
+
+    const live = version();
+    const pending: PendingRefAdvance[] = [];
+    const seen = new Set<B64Hash>();
+    for (const walk of walks) {
+        for (const hash of walk.live) {
+            if (seen.has(hash)) continue;
+            seen.add(hash);
+            for (const h of await publishedVersion(dag, hash)) live.add(h);
+        }
+        for (const [hash, verdict] of walk.undecided) {
+            if (seen.has(hash)) continue;
+            seen.add(hash);
+            pending.push({ entry: hash, version: await publishedVersion(dag, hash), verdict });
+        }
+    }
+    return { live: live.size > 0 ? live : version(refId), pending };
+}
+
+async function publishedVersion(dag: ScopedDag, hash: B64Hash): Promise<Version> {
+    const entry = await dag.loadEntry(hash);
+    if (entry === undefined || !isRefAdvancePayload(entry.payload)) return version();
+    return extractRefVersion(entry.payload as RefAdvancePayload);
+}
+
 function sameSet(a: Version, b: Version): boolean {
     if (a === b) return true;
     if (a.size !== b.size) return false;
@@ -263,6 +330,64 @@ export async function widenRefAtUpward(
         for (const h of widened) refAt.add(h);
     }
     return canonicalVersion(referencedDag, refAt);
+}
+
+// The three-valued variant of widenRefAtUpward. The base stays geometric, and
+// only candidates strictly above it are asked their liveness, as in the
+// boolean variant. A live candidate widens refAt, a void one is seen through,
+// and an undecided one is seen through and kept as a pending widening unless a
+// live widening dominates it. A candidate that is not strictly above stops the
+// search there, as before: write-time monotonicity puts everything below it at
+// or below its version. `live` is refAt, canonical in the referenced DAG.
+export async function widenRefAtUpwardFold(
+    observerDag: ScopedDag,
+    refId: B64Hash,
+    opPos: Version,
+    from: Version,
+    referencedDag: CausalDag,
+    liveness: (entryHash: B64Hash) => Promise<Truth>,
+): Promise<RefFold> {
+    const base = await resolveRefVersionAtPosition(observerDag, refId, opPos, opPos);
+    const refAt = version(...base);
+
+    // A candidate's published version, when it is strictly above the base.
+    const strictlyAbove = new Map<B64Hash, Version | undefined>();
+    const payloads = new Map<B64Hash, json.Literal>();
+    const widening = async (hash: B64Hash): Promise<Version | undefined> => {
+        if (!strictlyAbove.has(hash)) {
+            let widened: Version | undefined;
+            const payload = payloads.get(hash);
+            if (payload !== undefined && isRefAdvancePayload(payload)) {
+                const candidate = extractRefVersion(payload as RefAdvancePayload);
+                if (await refVersionAtOrAbove(referencedDag, candidate, base)
+                    && !await refVersionAtOrAbove(referencedDag, base, candidate)) {
+                    widened = candidate;
+                }
+            }
+            strictlyAbove.set(hash, widened);
+        }
+        return strictlyAbove.get(hash);
+    };
+
+    const walk = await seeThroughCover(
+        (p) => observerDag.findMinimalCover(p),
+        (accept) => findConcurrentRefAdvanceBarriers(observerDag, refId, opPos, from, async (hash, entry) => {
+            payloads.set(hash, entry.payload);
+            return accept(hash);
+        }),
+        async (hash) => (await widening(hash)) === undefined ? TRUE : liveness(hash),
+    );
+
+    for (const hash of walk.live) {
+        const widened = await widening(hash);
+        if (widened === undefined) continue;
+        for (const h of widened) refAt.add(h);
+    }
+    const pending: PendingRefAdvance[] = [];
+    for (const [hash, verdict] of walk.undecided) {
+        pending.push({ entry: hash, version: (await widening(hash))!, verdict });
+    }
+    return { live: await canonicalVersion(referencedDag, refAt), pending };
 }
 
 // A ref-advance version must be a non-empty antichain. Missing entries are an

@@ -12,6 +12,7 @@ Schema `ALLOW` predicates and catalog group gates (`ALLOW DEPLOY IF`, `ALLOW UPD
 - Use `table.column` (or `group.table.column` for cross-group `EXISTS` targets) when a bare name would be ambiguous.
 - `$author` names the operation author. The old `$row.column` surface syntax is removed; correlate to the gated row with `gatedTable.column` instead (lowered to `$row.column` in the IR).
 - Self-referential `EXISTS` (same table as the gated table) requires `EXISTS table AS alias WHERE alias.column = ...`.
+- A catalog group gate is read in its group's own scope, as the group's schema rules are: `alias.table` names a table of the group bound to `alias`, through that binding's table map, and an unqualified table is the group's own. Each table a gate names must be qualified with one of the group's bindings or be a table of the group's schema at its pin.
 
 ## Quoted identifiers
 
@@ -53,7 +54,7 @@ AS (
                caps (label = 'manager', grantee = :admin)),
   TABLEGROUP shop_prod USING SCHEMA shop AT {#schemaVersion}
     BIND users => users USING IDENTITIES users.identities
-    ALLOW UPDATE REF users IF EXISTS caps WHERE caps.grantee = $author
+    ALLOW UPDATE REF users IF EXISTS users.caps WHERE users.caps.grantee = $author
     ALLOW DEPLOY IF EXISTS users.caps WHERE label = 'deployer' AND grantee = $author
 ) NOTE 'initial' BY $dev;
 
@@ -328,6 +329,8 @@ ALLOW UPDATE REF users IF EXISTS users.caps
 ```
 
 `ALLOW DEPLOY IF ...` is evaluated when a schema version is deployed to the group (by the catalog planner, for `UPDATE CATALOG`). Without it, the group of a database with creators accepts deploys from those creators only, whose keys the group embeds for verification, with or without `USING IDENTITIES`. `ALLOW UPDATE REF <binding> IF ...` gates who may advance the observed version of a bound foreign group via `UPDATE REF`. Both use object context: `$author` is available, but there is no subject row, and a gate that reads it needs `USING IDENTITIES`.
+
+Both gates name tables in the group's scope (see [Allow-rule column references](#allow-rule-column-references)). `ALLOW UPDATE REF users IF EXISTS users.caps ...` reads the version of `users` being imported, so an author may import a version in which they hold the capability. A gate on one binding may also read another binding, or the group's own tables: those it reads as a row's `ALLOW` rule does, at the position of the update. Gates may not read each other's bindings in a cycle: a gate on `a` that reads `b.caps` and a gate on `b` that reads `a.caps` are rejected when the group is created.
 
 A deploy or ref update is signed only when its gate reads `$author`. The planner signs such deploys with the statement's author. `UPDATE REF` without `BY` signs with the default author when the binding's gate reads `$author`, and is unauthored otherwise. A gate that reads `$author` requires an authored `UPDATE REF`; the other bindings accept `BY NOBODY`.
 

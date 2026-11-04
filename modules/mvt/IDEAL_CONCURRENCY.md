@@ -44,7 +44,7 @@ So the meaning of "concurrent with `at`" decides, for every type:
 - whether a delete of a witness row or FK target voids an op that depended on it (rdb, `concurrentDeletes`);
 - whether a barrier delete removes an element, and whether a barrier add makes one appear (RSet);
 - whether a deploy or a schema parameter on another branch revises the schema at a merge (rdb);
-- whether a concurrent observe widens the version of a foreign group that an op reads (`resolveRefVersionAtPosition`, and rdb's observe gate).
+- whether a concurrent observe widens the version of a foreign group that an op reads (`resolveRefVersionAtPosition` and its three-valued variant `resolveRefFoldAtPosition`, and rdb's observe gate).
 
 These answers become verdicts, and verdicts feed other reads. A void revoke revokes nothing, and a void observe contributes no version. A change in the definition therefore runs through the whole verdict computation, including the parts that solve mutually dependent verdicts and bound deltas.
 
@@ -54,7 +54,7 @@ These answers become verdicts, and verdicts feed other reads. A void revoke revo
 | :--- | :--- | :--- |
 | `RTableViewImpl.killedByConcurrentDelete` (rdb `rtable/view.ts`) | row delete | yes: a foreign cut, an observe gate's version, a view at a merged frontier |
 | `RTableGroupImpl.resolveGroupParams` (rdb `rtable_group/group.ts`) | schema parameter | yes |
-| `findConcurrentRefAdvanceBarriers` (`src/refs.ts`), through `resolveRefVersionAtPosition` and rdb's `resolveObserveGateRefAt` | observe, deploy, ref-advance | yes, for a view at a multi-head `at` with `from ≠ at`; at-use checks pass the op's own position |
+| `findConcurrentRefAdvanceBarriers` (`src/refs.ts`), through `resolveRefVersionAtPosition`, `resolveRefFoldAtPosition` and rdb's `resolveObserveGateRefAt` | observe, deploy, ref-advance | yes, for a view at a multi-head `at` with `from ≠ at`; at-use checks pass the op's own position |
 | `RCapViewImpl.readDefinition` (std_types `rcap/view.ts`) | `delete-cap` | yes, the view's `at` |
 | `RCapViewImpl.holdingIn` | revoke | yes, the view's `at` |
 | `RSetViewImpl.hasByHash` (std_types `rset/view.ts`) | barrier delete, barrier add | yes, the view's `at` |
@@ -147,10 +147,10 @@ A dominated head does not change the intersection of futures, because its future
 
 An rdb binding with a `canObserve` gate authorizes who may advance the observation of a foreign group $G$. An observe $y$ that publishes $V_y$ is judged in two layers:
 
-- **Layer 1, the gate.** $y$'s gate is evaluated in $G$ at $V_y$, widened by concurrent observes that are live and publish a version strictly above it ($H(V_y) \subsetneq H(V_z)$). A revoke of $y$'s author voids $y$.
+- **Layer 1, the gate.** $y$'s gate reads $G$ at $V_y$, widened by concurrent observes that are live and publish a version strictly above it ($H(V_y) \subsetneq H(V_z)$). A revoke of $y$'s author voids $y$. Since 2026-11-04 the gate is read in the observer's frame, so it can also read the observer's other bindings and its own tables, which it reads as a guard does.
 - **Layer 2, reference resolution.** An op reads $G$ at the fold of the live observes it can see.
 
-Layer 1 only climbs to strictly larger histories, so observes never form verdict cycles ([`VOID_SEMANTICS.md`](../rdb/VOID_SEMANTICS.md) §5.5). That rule loses nothing only if every revoke that should void $y$ is either concurrent with $V_y$, where the concurrent cover finds it, or carried by an observe that strictly dominates $V_y$.
+Layer 1 only climbs to strictly larger histories, so the observes of one binding never form a verdict cycle among themselves. A gate may read other bindings only below its own in the group's gate graph, so observes alone form no cycle. An observe can still be on a cycle through the observer's rows, which its gate can read, and the engine solves it as it solves cycles among rows ([`VOID_SEMANTICS.md`](../rdb/VOID_SEMANTICS.md) §5.5). That rule loses nothing only if every revoke that should void $y$ is either concurrent with $V_y$, where the concurrent cover finds it, or carried by an observe that strictly dominates $V_y$.
 
 **Claim.** Under `ANY` this holds exactly. Let $r$ be a live revoke visible from the horizon, outside $H(V_y)$.
 
@@ -169,7 +169,7 @@ Keeping `ALL` would have meant widening $y$ by any observe that advances at leas
 | Dominated heads (`[OCUT03]`, `[OCUT07]`, `[OCUT12]`) | open | closed, with normalization | closed |
 | Padding (`[OCUT10]`) | open | open | closed |
 | Rescue (`[OCUT05]`, `[OCUT11]`) | open | open | closed |
-| Observe cycles | none | yes, for benign pairs | none |
+| Cycles among observes | none | yes, for benign pairs | none |
 | Code changed | none | DAG primitive, both gate layers, verdict engine | DAG primitive |
 
 ### 4.5 One meaning everywhere
@@ -289,9 +289,12 @@ return minimalCover(kept)
 
 ### 6.5 Still open
 
-- **RSet ref-advances are not yet judged like gated observes.** Admission checks the parent cut, and every advance counts in the fold. The plan is in [`rdb/plans/PHASE_5_PLAN.md`](../rdb/plans/PHASE_5_PLAN.md). It reuses Layer 1's walk, which under `ANY` needs no variant that widens on a single head.
-- **`rfile_map/presence.ts`** still uses the add-anchored search. It passes a single head, so it agrees with `ANY`, but it does not follow the two-check rule the other types use.
 - **Positive barriers** follow `ANY` uniformly. No positive barrier is known whose meaning is "applies only when after none of the heads".
+
+Closed since, both on 2026-10-29:
+
+- RSet ref-advances are judged like gated observes. Admission reads RCap at the imported version, and each ref-advance has a verdict at the cut that `widenRefAtUpward`, Layer 1's walk, gives ([std_types README, "Admission and use"](../std_types/README.md#admission-and-use)).
+- `rfile_map/presence.ts` follows RSet's two-check rule instead of the add-anchored search: a cover at `at`, and no remove concurrent with `at` from the horizon.
 
 ### 6.6 Tests
 
