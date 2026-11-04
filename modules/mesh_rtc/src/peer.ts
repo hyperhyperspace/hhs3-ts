@@ -50,7 +50,7 @@ export interface SignalSocket {
 }
 
 export const DEFAULT_ICE_SERVERS: RtcIceServer[] = [
-    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun.mypeer.net:3478' },
 ];
 
 export const DATA_CHANNEL_LABEL = 'hhs3';
