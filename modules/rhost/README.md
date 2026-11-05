@@ -50,7 +50,7 @@ In a browser, [rhost_browser](../rhost_browser) is the platform: pass `app.json`
 
 `rhost` plays no part in distributing the application itself: its scope is just the data replicated through `rdb`. 
 
-Hosts one app on one device. The app developer ships database release files (catalog, schemas, see [rpack](../rpack) for details). The app can have one or serveral hosts, each one with an [Rdb](../rdb) database with its own replica, signing key, mesh peer and projection. Hosts share nothing but the app's releases and settings. rhost installs the shipped releases, creates or joins databases, deploys releases where a host's key has the authority, and syncs and projects each host. [DESIGN.md](../rpack/DESIGN.md) describes the tool, and [ARCHITECTURE.md](../rpack/ARCHITECTURE.md) maps it onto the modules.
+Hosts one app on one device. The app developer ships database release files (catalog, schemas, see [rpack](../rpack) for details). The app can have one or serveral hosts, each one with an [Rdb](../rdb) database with its own replica, signing key, mesh peer and projection. Hosts share nothing but the app's releases and settings. rhost installs the shipped releases, creates or joins databases, deploys releases where a host's key has the authority, and syncs and projects each host. [HIP-2](../../hips/0002-rpack-rhost.md#design) describes the tool, and its [*Architecture*](../../hips/0002-rpack-rhost.md#architecture) section maps it onto the modules.
 
 rhost is browser-safe: everything specific to the device comes from a `HostPlatform`.
 
@@ -235,3 +235,5 @@ npm test
 ```
 
 The tests run on the catalog in [`examples/editor.sql`](../rdb/examples/editor.sql), released at 1.0.0, 1.1.0 and 2.0.0, over a memory platform and a shared in-memory mesh. A 1.1.0 that declares `:moderator` drives the param hold, and one that adds `FILES media` drives the two-host mount test, on `MemoryDirectory` folders.
+
+**HIPs:** [2](../../hips/0002-rpack-rhost.md), [5](../../hips/0005-reactive-queries.md)

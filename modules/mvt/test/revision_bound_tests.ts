@@ -1,4 +1,4 @@
-// walkRevisionBound on hand-built histories (rdb/plans/MVT_INCREMENTAL_BOUND_WALK.md §5).
+// walkRevisionBound on hand-built histories (hips/0012-mvt-bound-walk.md §5).
 // The visitor is scripted: an entry's effect changed when it is in the given set,
 // and every (entry, candidate) call is recorded. The objects behind 'horizon'
 // references are stubs that record their calls.
@@ -97,8 +97,8 @@ async function assertThrows(f: () => Promise<unknown>, msg: string): Promise<voi
     testing.assertTrue(threw, msg);
 }
 
-// The history of BOUND_SIMPLIFIED_SUMMARY.md, with a non-barrier T' after the
-// barrier T on the side branch:
+// The history of hips/0011-single-pass-widening-bound.md ("Why"), with a
+// non-barrier T' after the barrier T on the side branch:
 //
 //   c - x - E - s1 - N
 //        \

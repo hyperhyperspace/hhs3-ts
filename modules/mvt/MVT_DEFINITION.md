@@ -148,7 +148,7 @@ With $\mu$ on both sides, (5) is a normal logic program over the entries of $F$.
 
 ### 4.3 Other techniques
 
-[MVT_IDEAS.md](../../MVT_IDEAS.md) proposes alternatives to voiding. They fall in different places:
+[HIP-18](../../hips/0018-mvt-ideas.md) proposes alternatives to voiding. They fall in different places:
 
 | Idea | What it changes | Where |
 | :--- | :--- | :--- |
@@ -200,7 +200,7 @@ The [README](./README.md#introduction) frames MVTs as a monotonic transformation
 
 **That part is cheap.** Indexing answers by the version they were computed from makes any deterministic function of history monotone in this sense. The transformation does not make the problem monotone. It names the input of each answer. What MVTs add is P3–P5: only barriers revise a view, only concurrent ones, and within a bound.
 
-**The view itself is not monotone.** As $F$ grows, a barrier delete removes an element from $V_F(A)$. With voiding the view is not even antitone: an entry received later can void that delete, by revoking its author concurrently, and the element comes back. Finality needs P5's causal stability, and establishing it needs every writer's frontier. That is coordination, as CALM predicts for the non-monotone part. The settlement section of MVT_IDEAS.md is about this cost.
+**The view itself is not monotone.** As $F$ grows, a barrier delete removes an element from $V_F(A)$. With voiding the view is not even antitone: an entry received later can void that delete, by revoking its author concurrently, and the element comes back. Finality needs P5's causal stability, and establishing it needs every writer's frontier. That is coordination, as CALM predicts for the non-monotone part. The settlement section of [HIP-18](../../hips/0018-mvt-ideas.md) is about this cost.
 
 ---
 
@@ -232,7 +232,7 @@ Each is either a clause the definition should state or a change the code should 
 4. **A branch seen from the merge** (Section 3.4) differs from the merge. Replaying the plain entries after a barrier as well would merge the barrier's branch into the read, which is what (2) avoids. Is that difference what applications should see?
 5. **Meanings beyond live and void.** Should $\iota$ stay in the definition before a second technique exists, or should Layer 2 be stated for voiding alone?
 6. **The ref-advance gate** (Section 8, item 1). State its context as an exception, or move it to (4)?
-7. **Finality.** P5 covers honest writers. The settlement certificates in MVT_IDEAS.md are barriers. Do they belong to Layer 1, or are they a technique?
+7. **Finality.** P5 covers honest writers. The settlement certificates in [HIP-18](../../hips/0018-mvt-ideas.md) are barriers. Do they belong to Layer 1, or are they a technique?
 8. **The name.** What is monotone is the context (P2) and the set of observations (Section 6), not the views.
 
 ---

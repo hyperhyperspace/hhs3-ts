@@ -76,6 +76,10 @@ This monorepo is organized as a collection of modules. This is of course WIP.
 - [modules/file_watch](modules/file_watch) Kernel-driven file change watcher (`fs.watch` with rearm)
 - [modules/util](modules/util) Collection of helper utilities used across HHS v3.0
 
+**Proposals**
+
+- [hips](hips) Hyper Improvement Proposals: numbered design, implementation and process changes, each argued for and recorded. [HIP-1](hips/0001-hips.md) is the process, [hips/README.md](hips/README.md) the index
+
 ### Building
 
 To build the system, run

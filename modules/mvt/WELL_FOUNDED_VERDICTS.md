@@ -109,7 +109,7 @@ The same, with the alternating fixpoint in place of Kripke–Kleene. In the prog
 
 ### 3.5 A preference order
 
-Pick a model for each core by a total order over its members: make the most senior member live, propagate, and repeat. With a total order, every even loop gets a unique model and every odd loop a deterministic answer, as in a value-based argumentation framework. It would decide revoke races instead of letting every target survive. It is not implemented. The order must be one no author can grind (Section 6.5, and [`VOID_SEMANTICS.md`](../rdb/VOID_SEMANTICS.md) §6).
+Pick a model for each core by a total order over its members: make the most senior member live, propagate, and repeat. With a total order, every even loop gets a unique model and every odd loop a deterministic answer, as in a value-based argumentation framework. It would decide revoke races instead of letting every target survive. It is not implemented; [HIP-16](../../hips/0016-seniority-order.md) proposes it. The order must be one no author can grind (Section 6.5, and HIP-16's *The value (seniority) order*).
 
 ### 3.6 Leaving undecided visible
 
@@ -271,7 +271,7 @@ A read during the solve can reach an entry not seen yet. It is resolved as a nor
 ### 6.3 Details worth keeping
 
 - **Only completed components are stored.** A frame that finishes without being a root keeps its conditional answer on the stack and never stores it, because that answer depends on where the walk entered. Storing it was the mistake of the instance cache (Section 3.2).
-- **The memo dies with the evaluation.** A completed verdict is a pure function of its key, so a cache across computations would be sound, but none exists. The public `isEntryVoided` creates an evaluation per call, so a per-entry sweep such as the REPL's `LOG` pays $O(n)$ per line.
+- **The memo dies with the evaluation.** A completed verdict is a pure function of its key, so a cache across computations would be sound, but none exists ([HIP-17](../../hips/0017-verdict-cache.md)). The public `isEntryVoided` creates an evaluation per call, so a per-entry sweep such as the REPL's `LOG` pays $O(n)$ per line.
 - **Reasons come from a final pass.** After the collapse, every member is evaluated once more with all values decided. A member that disagrees with its fixpoint value is a bug, and the engine throws.
 - **The engine checks monotonicity.** If the possibly-live set grows during the fixpoint, a rule is not monotone. The engine throws instead of looping or returning an order-dependent answer.
 - **Narrow reads keep components small.** Everything a diagnosis reads can join its component. Before rdb prefiltered `exists` candidates by payload, each member of a revoke ring read every manager cap's liveness, the outsider's included, which pulled `Ro` into the ring's component in `[PERM17]`.
@@ -287,8 +287,8 @@ A read during the solve can reach an entry not seen yet. It is resolved as a nor
 
 - **Can a type produce a loop of positive reads?** Section 2.2 argues that rdb's and RCap's positive reads point into the past. The exception to check is an unhonored concurrent delete that hides an honored one, in `killedByConcurrentDelete` (`rdb/src/rtable/view.ts`). If no loop is possible, Kripke–Kleene and the well-founded model agree on every verdict the system computes. Running the rdb and std_types suites with the Kripke–Kleene variant, as the `ANY` shim did for concurrency, would be a cheap first measurement.
 - **A test for the program of Section 3.3**, named for the choice, that fails on `x`'s verdict under Kripke–Kleene.
-- **A preference order for revoke races** (Section 3.5). The key would be the insert position of the authorizing capability, fixed at grant time, not the revoke's position, so a later attacker cannot grind it. Components stay inside one group, but rdb cores that hold an observe already need an order across a binding: the importer's authority is a row of the observer, and the deleter's is a cap in the bound group. Ranking the bound group's authority by where the observer first imported it can be ground, since an author can back-date an import of their own grant. A rule fixed at creation cannot: authority a group holds itself outranks authority it reads from a bound group. The import would then win the race of Section 5.3, and an entry could not use its view of a binding to block an update of that binding.
-- **A cache of completed components across computations.** Sound, not implemented.
+- **A preference order for revoke races** (Section 3.5, [HIP-16](../../hips/0016-seniority-order.md)). The key would be the insert position of the authorizing capability, fixed at grant time, not the revoke's position, so a later attacker cannot grind it. Components stay inside one group, but rdb cores that hold an observe already need an order across a binding: the importer's authority is a row of the observer, and the deleter's is a cap in the bound group. Ranking the bound group's authority by where the observer first imported it can be ground, since an author can back-date an import of their own grant. A rule fixed at creation cannot: authority a group holds itself outranks authority it reads from a bound group. The import would then win the race of Section 5.3, and an entry could not use its view of a binding to block an update of that binding.
+- **A cache of completed components across computations.** Sound, not implemented: [HIP-17](../../hips/0017-verdict-cache.md).
 - **Recording the core in a collapse.** A bounded delta counts a barrier void by collapse at either horizon as changed, because the verdict does not say which core it collapsed in (Section 5.3). If the `undecided-cycle` reason carried the member's core, as a set of entry hashes, a barrier collapsed in the same core at both horizons could count as unchanged. Plausible, not proved, not implemented: [`rdb/INCREMENTAL_DELTA_BOUND.md`](../rdb/INCREMENTAL_DELTA_BOUND.md) §5.7.
 - **A proof of Section 4.1.** The argument and the order-sweeping tests are what exists.
 
@@ -306,7 +306,7 @@ A read during the solve can reach an entry not seen yet. It is resolved as a nor
 
 ### 6.7 Background
 
-- [`VOID_SEMANTICS.md`](../rdb/VOID_SEMANTICS.md): rdb's read rules, covers and per-computation evaluation, the gated-observe stratification, and the preference order in more detail. Its earlier version (before `a92dfc7`) describes back-edge denial and the caching analysis that went with it.
+- [`VOID_SEMANTICS.md`](../rdb/VOID_SEMANTICS.md): rdb's read rules, covers and per-computation evaluation, the gated-observe stratification. The preference order it sketched is now [HIP-16](../../hips/0016-seniority-order.md). Its earlier version (before `a92dfc7`) describes back-edge denial and the caching analysis that went with it.
 - [`CAPABILITIES.md`](../rdb/CAPABILITIES.md): capabilities as rows and at-use predicates.
 - Van Gelder, Ross, Schlipf, *The well-founded semantics for general logic programs*: the alternating fixpoint and the unique three-valued model.
 - Fitting, *A Kripke–Kleene semantics for logic programs*.

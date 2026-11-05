@@ -469,3 +469,5 @@ Generated scripts never rely on workspace-wide name uniqueness: they select thei
 ## Diagnostics
 
 C-SQL mistakes return `{ ok: false, diagnostics }` where possible. Diagnostics carry a code, message, severity, and source span. Infrastructure errors from underlying RDb/DAG operations are surfaced as execution diagnostics.
+
+**HIPs:** [3](../../hips/0003-schema-composability.md), [4](../../hips/0004-import-patches.md), [14](../../hips/0014-observer-frame-ref.md)

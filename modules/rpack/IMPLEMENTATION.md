@@ -433,14 +433,3 @@ Schema parameters, table maps, and non-injective bindings live in `rdb` (`rschem
 
 After a workspace build, `npm test` in the repository runs the suite. The host tests use the catalog in `modules/rdb/examples/editor.sql`.
 
-## Advancing an observed version
-
-This section is the follow-up named in the README. It is not how gates work today. Today `ALLOW UPDATE REF` is evaluated in the observed group's frame.
-
-The follow-up moves that gate to the observer's frame, so the observer can name its own capability tables. Unqualified `t` in the gate becomes `<binding>.t`, translated through the observer's table map, and read in the observed group at the candidate version. A qualified name uses the observer's bindings. When the alias is the binding being gated, the table is read at the candidate observed version. When it is a different bound group, the table is read at the observer's observed version of that group. The observer's own tables stay out of the gate. A local table's schema moves by deploy, and two concurrent deploys could combine into a path through local rows that neither branch had, which the observation check cannot decide.
-
-Because the bindings and the gates are fixed at group creation, the dependency graph among bound group ids — an edge whenever a gate on one alias reads another alias — has to be a strict DAG. Evaluation then progresses by that order, and an observation cannot cycle.
-
-Groups that already exist keep the observed-group frame. The same gate text means different tables in the two frames: an unqualified name, and a qualified name that walked the observed group's aliases, would silently start reading other tables. The create payload has to record the frame, absent meaning today's frame, and evaluation, the static check, and the compiler branch on it.
-
-Before that can land, the void-semantics argument for observation gates has to be rewritten for a gate that reads a second group, such as a revocation arriving through `auth` while the gate is on `target`. The observation's position has to be passed into gate validation, so the other group is read at the observer's frontier. Automatic observations have to run in the gate DAG's order, so a capability granted in `auth` is visible before `target` is observed. The compiler and `groupViewReason` switch to the observer's frame for groups marked with it.

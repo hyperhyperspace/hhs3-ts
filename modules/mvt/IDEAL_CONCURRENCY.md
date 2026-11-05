@@ -312,4 +312,4 @@ Closed since, both on 2026-10-29:
 
 ### 6.7 Background
 
-The decision record and its reviews are in `rdb/plans/`: [`DESIGN_AND_PLAN_FOR_ANY.md`](../rdb/plans/DESIGN_AND_PLAN_FOR_ANY.md), [`OBSERVED_CUT_REVOCATION.md`](../rdb/plans/OBSERVED_CUT_REVOCATION.md) (which argued for `ALL`), its two critiques, and the Phase 1–4 critique and follow-up plan. This note is the reference. Those documents record how it was reached.
+The decision record is [HIP-7](../../hips/0007-ideal-concurrency.md), with the follow-up plan after Phases 1–4 folded in, and [HIP-6](../../hips/0006-observed-cut-revocation.md), which argued for `ALL`, with the review that superseded it. This note is the reference. Those documents record how it was reached.

@@ -184,3 +184,5 @@ or
 ```
 npm run test cover topo small
 ```
+
+**HIPs:** [7](../../hips/0007-ideal-concurrency.md), [11](../../hips/0011-single-pass-widening-bound.md)

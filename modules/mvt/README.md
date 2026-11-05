@@ -88,9 +88,9 @@ It's interesting to notice how in traditional systems observation is _implicit_ 
 
 The core MVT interfaces and DAG-based nesting mechanism live in this module. The [**dag** module](../dag) provides the fundamental algorithms (see `findForkPosition`, `findMinimalCover`, `findCoverWithFilter` and `findConcurrentCoverWithFilter`) to support MVTs that work by finding filtered minimal covers over the DAG.
 
-As an example, a Monotone View Replicated Set is provided in the [**std_types** module](../std_types/src/types/rset.ts). It supports both plain and barrier additions and deletions, showcasing how non-monotonic behavior can be transformed through the scoped view mechanism.
+As an example, a Monotone View Replicated Set is provided in the [**std_types** module](../std_types/src/types/rset/rset.ts). It supports both plain and barrier additions and deletions, showcasing how non-monotonic behavior can be transformed through the scoped view mechanism.
 
-Nesting at the DAG level is supported for MVTs. Operations for the inner instance are wrapped and inserted into the outer instance's DAG. The Monotone View Replicated Set was extended to support nesting (sets of sets of arbitrary depth). See the [**std_types** implementation](../std_types/src/types/rset.ts) for details.
+Nesting at the DAG level is supported for MVTs. Operations for the inner instance are wrapped and inserted into the outer instance's DAG. The Monotone View Replicated Set was extended to support nesting (sets of sets of arbitrary depth). See the [**std_types** implementation](../std_types/src/types/rset/rset.ts) for details.
 
 ## Core interface: `RObject`
 
@@ -380,3 +380,5 @@ To build, run the following commands at the workspace level (top directory in th
 npm install
 npm run build
 ```
+
+**HIPs:** [7](../../hips/0007-ideal-concurrency.md), [8](../../hips/0008-rset-gated-ref-advances.md), [12](../../hips/0012-mvt-bound-walk.md), [13](../../hips/0013-rcap-rset-bound-walk.md), [14](../../hips/0014-observer-frame-ref.md)

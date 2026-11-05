@@ -52,3 +52,5 @@ function RoomMessages({ roomId, beforeId }: { roomId: number; beforeId?: number 
 ```
 npm test
 ```
+
+**HIPs:** [5](../../hips/0005-reactive-queries.md)

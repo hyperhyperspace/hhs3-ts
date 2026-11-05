@@ -374,8 +374,8 @@ path.
 
 The memo dies with the computation. A completed verdict is a pure function of
 `(group, entry, from)`, so an instance-level map of completed verdicts, kept
-across `getView` / `LOG` lines, would be sound, but it is not implemented. The
-public `isEntryVoided` / `explainEntryVoided` mint a fresh evaluation per call,
+across `getView` / `LOG` lines, would be sound, but it is not implemented
+([HIP-17](../../hips/0017-verdict-cache.md)). The public `isEntryVoided` / `explainEntryVoided` mint a fresh evaluation per call,
 so a per-entry sweep such as the REPL's `LOG` pays \(O(n)\) per line,
 \(O(n^2)\) overall. A cache of anything *uncompleted* — a conditional answer,
 or a member's value inside a solve — would be unsound: it depends on the
@@ -549,41 +549,11 @@ for types whose ref-advances are never undecided.
 
 ## 6. Future direction (not implemented): a seniority order for negation cores
 
-What §4 collapses to void is exactly the residual negation core: entries the
-well-founded model leaves undefined, in cycles that nothing outside them
-decides. Collapsing them is the conservative choice (every cap on a revoke ring
-survives). A more opinionated resolution would instead pick a canonical model
-for each core by a **total value order**: set the most-senior contestant live,
-propagate (its live deletes void the junior caps it targets), repeat. With a
-*total* order this yields a unique extension for even cycles and a
-deterministically *imposed* answer for odd cycles (which have no stable model).
-This is exactly a **value-/preference-based argumentation framework**: a total
-preference order guarantees a unique extension even in the presence of odd
-cycles. It would replace step 2 of the solve; the components, the fixpoint and
-the read rules stay as they are.
-
-### The value (seniority) order
-
-The seniority key must be the **authorizing cap's insert position** (fixed at
-grant time), not the revoke op's position — otherwise an attacker who controls
-how they sequence revokes could grind the result. "Ancestor wins; concurrent
-breaks by entry hash" is the canonical linear extension of the causal order.
-
-Two caveats for a general engine:
-
-- **Cross-DAG totality.** A single DAG's `findForkPosition` totally-orders
-  positions *within* that DAG. Components stay inside one group today (§4), but
-  a type whose cycles can span DAGs would need an explicit inter-DAG tiebreak
-  (e.g. dag-id then hash), and uniqueness for such cycles would rest entirely on
-  it.
-- **Non-grindability is the type's obligation.** A generic engine can guarantee
-  the order is total and deterministic; it cannot guarantee it is non-grindable.
-  That property comes from feeding it the cap-insert position + rowId, both fixed
-  at grant time and neither controlled by the later attacker.
-
-The order would be a `value` oracle passed to the mvt engine next to `diagnose`:
-the mechanism stays type-agnostic, and the *policy* (what the value of a node
-is) stays the type's job.
+Proposed as [HIP-16](../../hips/0016-seniority-order.md): instead of
+collapsing a residual negation core to void, pick a canonical model for it by
+a total seniority order, keyed by the authorizing cap's insert position so a
+later attacker cannot grind it. It would replace step 2 of the solve; the
+components, the fixpoint and the read rules stay as they are.
 
 ## References
 

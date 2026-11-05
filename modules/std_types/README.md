@@ -194,3 +194,5 @@ From the workspace root:
 npm install
 npm run build
 ```
+
+**HIPs:** [7](../../hips/0007-ideal-concurrency.md), [8](../../hips/0008-rset-gated-ref-advances.md), [13](../../hips/0013-rcap-rset-bound-walk.md)

@@ -97,3 +97,4 @@ A mount whose FILES isn't a member yet, or whose objects haven't arrived, is `pe
 npm test
 ```
 
+**HIPs:** [3](../../hips/0003-schema-composability.md), [5](../../hips/0005-reactive-queries.md)

@@ -362,3 +362,4 @@ hash      | prev      | op                                | status
 #R1tDyESK | #0XQ3qXkC | UPDATE REF #p0N+nsa85uTC7o93fh... | OK
 ```
 
+**HIPs:** [2](../../hips/0002-rpack-rhost.md), [3](../../hips/0003-schema-composability.md), [7](../../hips/0007-ideal-concurrency.md), [8](../../hips/0008-rset-gated-ref-advances.md), [11](../../hips/0011-single-pass-widening-bound.md), [12](../../hips/0012-mvt-bound-walk.md), [14](../../hips/0014-observer-frame-ref.md)

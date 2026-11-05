@@ -297,3 +297,5 @@ Catalogs written before this rule named the observed group's tables without a qu
 The developer writes `target-catalog.sql`, runs `rpack release`, and `rpack publish` copies the file into the registry. An application build copies it into `catalogs/`, or `rhost update --pull` fetches a descendant of the release it already has. On the admin's device, `rhost` deploys it into the databases that key may change, supplying any new parameter. Every other device receives the new entries by sync and admits them when they fall below the major its build understands. Updating the application raises that major. Until then the newer release is held, the data stays on the shape the software knows, and `upgradeRequired` is how the application asks the person to update.
 
 [IMPLEMENTATION.md](./IMPLEMENTATION.md) is the rest: the repository fields, the diff, the release-file format, the import and patch procedure, the parameter fold, and the module layout.
+
+**HIPs:** [2](../../hips/0002-rpack-rhost.md), [3](../../hips/0003-schema-composability.md), [4](../../hips/0004-import-patches.md), [14](../../hips/0014-observer-frame-ref.md)

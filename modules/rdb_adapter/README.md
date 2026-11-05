@@ -287,3 +287,5 @@ node --import ../../register.mjs ./test/run_tests.ts --ops 40 --max-pairs 80
 ```
 
 `--profile`, `--seeds`, `--ops`, and `--max-pairs` override the profile's values; the profile itself can also be selected with the `PARITY_PROFILE` env var.
+
+**HIPs:** [3](../../hips/0003-schema-composability.md), [5](../../hips/0005-reactive-queries.md), [14](../../hips/0014-observer-frame-ref.md)
