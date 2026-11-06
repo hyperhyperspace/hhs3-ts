@@ -1,4 +1,4 @@
-import { testing } from '@hyper-hyper-space/hhs3_util';
+import { testing, type IssueReport } from '@hyper-hyper-space/hhs3_util';
 import {
     sha256,
     stringToUint8Array,
@@ -1596,6 +1596,40 @@ async function testAuthorizerFiltersOutbound() {
     provider.close();
 }
 
+// A refusal names the swarm's topic in `dagId`, both for a peer discovery
+// listed and for one that arrived over the pool.
+async function testRefusalsNameTheTopic() {
+    const pool = new ConnectionPool();
+    const topic = sha256.hashToB64(stringToUint8Array('authz-report-topic'));
+    const listed = makeFakePeer('mem://listed');
+    const pooled = makeFakePeer('mem://pooled');
+    const reports: IssueReport[] = [];
+
+    const swarm = createSwarm({ topic, targetPeers: 2, authorizer: { authorize: async () => false } }, {
+        pool,
+        discovery: makeStubDiscovery([{ keyId: listed.keyId, addresses: ['mem://listed'] }]),
+        authenticator: makeStubAuthenticator(new Map()),
+        transports: [],
+        report: (r) => { reports.push(r); },
+    });
+
+    swarm.activate();
+    const { channel } = makeFakeChannel(pooled);
+    pool.add(channel, pooled.endpoint);
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    const refused = reports.filter((r) => r.kind === 'unauthorized');
+    const discovered = refused.find((r) => r.keyId === listed.keyId);
+    const fromPool = refused.find((r) => r.keyId === pooled.keyId);
+    testing.assertTrue(discovered !== undefined, 'a refused discovered peer is reported');
+    testing.assertEquals(discovered?.dagId, topic, 'the discovered refusal names the topic');
+    testing.assertTrue(fromPool !== undefined, 'a refused pool peer is reported');
+    testing.assertEquals(fromPool?.dagId, topic, 'the pool refusal names the topic');
+    testing.assertEquals(swarm.peers().length, 0, 'no refused peer joins');
+
+    swarm.destroy();
+}
+
 async function testMaxPeersCapsInbound() {
     const pool = new ConnectionPool();
     const topic = sha256.hashToB64(stringToUint8Array('cap-topic'));
@@ -2419,6 +2453,7 @@ const authZTests = {
         { name: '[AUTH_Z_04] maxPeers caps inbound adoption', invoke: testMaxPeersCapsInbound },
         { name: '[AUTH_Z_05] maxPeers defaults above targetPeers', invoke: testMaxPeersDefaultsAboveTarget },
         { name: '[AUTH_Z_06] maxPeers must exceed targetPeers', invoke: testMaxPeersMustExceedTarget },
+        { name: '[AUTH_Z_07] refusals name the swarm topic', invoke: testRefusalsNameTheTopic },
     ],
 };
 

@@ -106,7 +106,9 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
         kind: string; severity: 'low' | 'moderate' | 'high';
         keyId?: string; endpoint?: string; message?: string; stack?: string;
     }) {
-        report?.({ source: 'swarm', ...partial });
+        // The swarm's topic, so a reader can tell which object an issue is
+        // about: replicas name each object's swarm by its id.
+        report?.({ source: 'swarm', dagId: topic, ...partial });
     }
 
     // A candidate is "self" when it carries our own keyId at an address we
