@@ -429,7 +429,7 @@ export const restPhaseTests = {
                 } as unknown as CatalogReleasePayload;
                 const renderedRelease = renderAlterCatalog(release, { catalogRef: catalog.getId(), catalogName: catalog.getName(), at: json.toSet([catalog.getId()]) });
                 assertTrue(renderedRelease.includes('USING IDENTITIES users.identities'), 'rendered release uses USING IDENTITIES syntax');
-                assertTrue(renderedRelease.includes('ALLOW DEPLOY IF EXISTS grants WHERE grants.resource = resource AND grants.grantee = $author'),
+                assertTrue(renderedRelease.includes('ALLOW DEPLOY IF EXISTS (grants WHERE grants.resource = resource AND grants.grantee = $author)'),
                     'rendered correlated deploy predicate uses qualified exists columns');
                 assertTrue(renderedRelease.endsWith(`AT {#${catalog.getId()}};`), 'a release renders its insertion point by hash');
                 assertTrue(parseStatement(renderedRelease).ok, 'rendered release parses');
@@ -496,8 +496,8 @@ export const restPhaseTests = {
                         label string PUB READONLY,
                         grantee string PUB READONLY
                       ) CONCURRENT DELETES
-                        ALLOW insert IF EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
-                        ALLOW delete IF grantee = $author OR EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
+                        ALLOW insert IF EXISTS (caps AS c WHERE c.label = 'manager' AND c.grantee = $author)
+                        ALLOW delete IF grantee = $author OR EXISTS (caps AS c WHERE c.label = 'manager' AND c.grantee = $author)
                     );
                 `);
                 const schema = await env.schema('users_schema');
@@ -512,7 +512,7 @@ export const restPhaseTests = {
                     'rendered identities table uses multiline columns');
                 assertTrue(renderedSchema.includes(`TABLE caps (\n    label string PUB READONLY,\n    grantee string PUB READONLY\n  ) CONCURRENT DELETES\n    ALLOW insert IF`),
                     'rendered caps table indents ALLOW rules after CONCURRENT DELETES');
-                assertTrue(renderedSchema.includes('EXISTS caps AS c WHERE c.label'), 'self-referential EXISTS uses first-letter alias');
+                assertTrue(renderedSchema.includes('EXISTS (caps AS c WHERE c.label'), 'self-referential EXISTS uses first-letter alias');
                 assertTrue(renderedSchema.includes('grantee = $author'), 'rendered schema uses unquoted $author');
                 assertTrue(!renderedSchema.includes("grantee = '$author'"), 'rendered schema does not quote $author');
 

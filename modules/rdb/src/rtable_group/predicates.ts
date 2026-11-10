@@ -22,25 +22,27 @@
 // (../rtable/view.ts), so a rule re-checked inside a verdict evaluation is
 // undecided only when the entries it rests on leave it so (VOID_SEMANTICS.md
 // section 4). `and` / `or` stop at the first deciding argument; the grammar has
-// no negation, so every rule is monotone in its reads. An atom over the subject
-// row ($row.<col>) is `and(the row is live, the atom)`. A cmp / like / exists
-// atom whose subject value is undecided is undecided: no value is enumerated.
-// The boolean entry points evaluate over top-level views, whose reads are
-// always decided.
+// no negation, so every rule is monotone in its reads. A cmp / like atom over
+// the subject row ($row.<col>) is `and(the row is live, the atom)`, undecided
+// when a subject value it names is: no value is enumerated. An exists atom
+// reads its `where` tree as written and has the value of the tree's
+// distributed form, the `or` of one single-leaf atom per way of satisfying the
+// tree (see existsTruth). The boolean entry points evaluate over top-level
+// views, whose reads are always decided.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import type { KeyId, B64Hash } from "@hyper-hyper-space/hhs3_crypto";
-import { TRUE, FALSE, truthOf, allTruth, everyTruth, someTruth } from "@hyper-hyper-space/hhs3_mvt";
-import type { Truth } from "@hyper-hyper-space/hhs3_mvt";
+import { TRUE, FALSE, truthOf, allTruth, anyTruth, everyTruth, someTruth } from "@hyper-hyper-space/hhs3_mvt";
+import type { Truth, Undecided } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchemaView } from "../rschema/interfaces.js";
-import type { ColumnType, Predicate, PredicateContext, RuleOperand, TableDef } from "../rschema/payload.js";
-import { splitTableRef, parseParamTerm, parseRowFieldTerm } from "../rschema/payload.js";
+import type { ColumnType, Predicate, PredicateContext, RuleOperand, TableDef, Where } from "../rschema/payload.js";
+import { splitTableRef, parseParamTerm, parseRowFieldTerm, whereGroup } from "../rschema/payload.js";
 import { evalOperand, compareOperands, resolveCmpType, likeMatch } from "../rschema/expr.js";
 import type { RTableView, RowValues } from "../rtable/interfaces.js";
 import type { RowOpPayload } from "../rtable/payload.js";
-import { RTableViewImpl } from "../rtable/view.js";
-import type { ColumnValue, TruthTableView } from "../rtable/view.js";
+import { RTableViewImpl, readLeaves } from "../rtable/view.js";
+import type { ColumnValue, ExistsReads, ReadLeaf, ReadWhere, TruthTableView } from "../rtable/view.js";
 
 export type PredicateEnv = {
     // Anchored table-view supplier: views at the op's position, observed from
@@ -112,18 +114,57 @@ export async function evaluatePredicate(pred: Predicate, env: PredicateEnv): Pro
 }
 
 // A view's three-valued reads. Views of this module have them; any other view
-// answers through its public reads.
+// answers through its public reads: a `where` tree is evaluated over the sets
+// of rows findRowIds returns per leaf, and a leaf whose search throws (a field
+// that is not a pub column) matches no row, as it does in RTableViewImpl.
 function truthView(view: RTableView): TruthTableView {
     if (view instanceof RTableViewImpl) return view;
     return {
         rowLiveness: async (rowId) => ({ truth: truthOf(await view.hasRow(rowId)), author: await view.getAuthor(rowId) }),
         columnValue: async (rowId, column) => ({ status: 'decided', value: (await view.getRow(rowId))?.values[column] }),
         existsMatching: async (where) => {
-            try {
-                return truthOf((await view.findRowIds(where)).length > 0);
-            } catch {
-                return FALSE;
-            }
+            const found = new Map<ReadLeaf, Set<B64Hash>>();
+            const rowsOf = async (leaf: ReadLeaf): Promise<Set<B64Hash>> => {
+                let rows = found.get(leaf);
+                if (rows === undefined) {
+                    try {
+                        rows = leaf.aside !== undefined ? new Set() : new Set(await view.findRowIds(leaf.fields));
+                    } catch {
+                        rows = new Set();
+                    }
+                    found.set(leaf, rows);
+                }
+                return rows;
+            };
+            const intersect = (sets: Set<B64Hash>[]): Set<B64Hash> =>
+                new Set([...sets[0]].filter((rowId) => sets.every((set) => set.has(rowId))));
+            const unite = (sets: Set<B64Hash>[]): Set<B64Hash> => new Set(sets.flatMap((set) => [...set]));
+
+            const matching = async (node: ReadWhere, plain: boolean): Promise<Set<B64Hash>> => {
+                if ('fields' in node) return plain && node.row ? new Set() : rowsOf(node);
+                const sets: Set<B64Hash>[] = [];
+                for (const member of 'and' in node ? node.and : node.or) sets.push(await matching(member, plain));
+                return 'and' in node ? intersect(sets) : unite(sets);
+            };
+            const throughRow = async (node: ReadWhere): Promise<Set<B64Hash>> => {
+                if ('fields' in node) return node.row ? rowsOf(node) : new Set();
+                if ('or' in node) {
+                    const sets: Set<B64Hash>[] = [];
+                    for (const member of node.or) sets.push(await throughRow(member));
+                    return unite(sets);
+                }
+                const whole: Set<B64Hash>[] = [];
+                for (const member of node.and) whole.push(await matching(member, false));
+                const sets: Set<B64Hash>[] = [];
+                for (const [i, member] of node.and.entries()) {
+                    sets.push(intersect([await throughRow(member), ...whole.filter((_, k) => k !== i)]));
+                }
+                return unite(sets);
+            };
+            return {
+                touched: new Map(),
+                read: async (which) => truthOf((which === 'row' ? await throughRow(where) : await matching(where, which === 'plain')).size > 0),
+            };
         },
     };
 }
@@ -162,48 +203,236 @@ export async function evaluatePredicateTruth(pred: Predicate, env: TruthPredicat
     }
 }
 
-async function existsTruth(pred: Extract<Predicate, { p: 'exists' }>, env: TruthPredicateEnv): Promise<Truth> {
-    const [group, table] = splitTableRef(pred.table);
-    const terms = pred.where ?? {};
+// A leaf while its terms are resolved: `rowTerms` are the fields still waiting
+// for a subject value.
+type TermLeaf = ReadLeaf & { rowTerms: [field: string, column: string][] };
 
-    // resolve $-terms ($author / $row.<col> / $param.<name>) in where values;
-    // an unresolvable term makes the atom unprovable
-    const where: { [field: string]: json.Literal } = {};
-    const rowTerms = new Map<string, string>();
-    for (const field of Object.keys(terms)) {
-        const value = terms[field];
+// The tree with the leaves `isFalse` names taken as false: an `and` with a
+// false member is false, and an `or` loses its false members. undefined when
+// nothing is left: the tree is false. Every leaf of the result lies on some
+// way of satisfying it.
+export function simplifyWhere(where: ReadWhere, isFalse: (leaf: ReadLeaf) => boolean): ReadWhere | undefined {
+    if ('fields' in where) return isFalse(where) ? undefined : where;
+    if ('and' in where) {
+        const members: ReadWhere[] = [];
+        for (const member of where.and) {
+            const kept = simplifyWhere(member, isFalse);
+            if (kept === undefined) return undefined;
+            members.push(kept);
+        }
+        return { and: members };
+    }
+    const members = where.or.map((member) => simplifyWhere(member, isFalse)).filter((member) => member !== undefined) as ReadWhere[];
+    return members.length === 0 ? undefined : members.length === 1 ? members[0] : { or: members };
+}
+
+// The three arms below are computed from a tree's structure, in one pass each,
+// and read nothing. They take a tree already simplified for the leaves with no
+// value, and `touched`, the leaves a pending observe touches.
+
+// X: the ways through a leaf set aside. Undecided on the supports of the
+// undecided subject values, when such a leaf is left.
+export function asideArm(where: ReadWhere): Truth {
+    return anyTruth(readLeaves(where).flatMap((leaf) => leaf.aside ?? []));
+}
+
+// T0: the ways through a touched leaf and no leaf that names the subject row.
+// With every such leaf false, undecided on the observes that touch the touched
+// leaves left.
+export function touchedArm(where: ReadWhere, touched: ReadonlyMap<ReadLeaf, Undecided>): Truth {
+    const plain = simplifyWhere(where, (leaf) => leaf.row || leaf.aside !== undefined);
+    if (plain === undefined) return FALSE;
+    return anyTruth(readLeaves(plain).flatMap((leaf) => touched.get(leaf) ?? []));
+}
+
+// T$: the ways through a touched leaf and a leaf that names the subject row,
+// and no leaf set aside. With every leaf set aside false, a touched leaf
+// counts when it names the subject row itself, or when an `and` above it has
+// another member that holds a leaf that does. Undecided on the observes that
+// touch the leaves that count.
+export function touchedRowArm(where: ReadWhere, touched: ReadonlyMap<ReadLeaf, Undecided>): Truth {
+    const kept = simplifyWhere(where, (leaf) => leaf.aside !== undefined);
+    if (kept === undefined) return FALSE;
+
+    const counted: Undecided[] = [];
+    const holdsRow = (node: ReadWhere): boolean => readLeaves(node).some((leaf) => leaf.row);
+    const walk = (node: ReadWhere, joined: boolean): void => {
+        if ('fields' in node) {
+            const touching = touched.get(node);
+            if (touching !== undefined && (joined || node.row)) counted.push(touching);
+        } else if ('or' in node) {
+            for (const member of node.or) walk(member, joined);
+        } else {
+            for (const [i, member] of node.and.entries()) {
+                walk(member, joined || node.and.some((other, k) => k !== i && holdsRow(other)));
+            }
+        }
+    };
+    walk(kept, false);
+    return anyTruth(counted);
+}
+
+// The `where` tree with its $author and $param terms resolved, or undefined
+// when it is false: a leaf with a term that has no value is false ($author of
+// an anonymous op, an absent parameter).
+function resolveWhere(where: Where, env: TruthPredicateEnv): ReadWhere | undefined {
+    const group = whereGroup(where);
+    if (group !== undefined) {
+        const members: ReadWhere[] = [];
+        for (const member of group.members) {
+            const resolved = resolveWhere(member, env);
+            if (resolved !== undefined) {
+                members.push(resolved);
+            } else if (group.op === '$and') {
+                return undefined;
+            }
+        }
+        if (group.op === '$and') return { and: members };
+        return members.length === 0 ? undefined : members.length === 1 ? members[0] : { or: members };
+    }
+
+    const leaf: TermLeaf = { fields: {}, row: false, rowTerms: [] };
+    for (const [field, value] of Object.entries(where)) {
         if (typeof value !== 'string' || !value.startsWith('$')) {
-            where[field] = value;
+            leaf.fields[field] = value;
         } else if (value === '$author') {
-            if (env.author === undefined) return FALSE;
-            where[field] = env.author;
+            if (env.author === undefined) return undefined;
+            leaf.fields[field] = env.author;
         } else {
             const param = parseParamTerm(value);
             if (param !== undefined) {
                 const paramValue = env.params?.[param];
-                if (paramValue === undefined) return FALSE;
-                where[field] = paramValue;
+                if (paramValue === undefined) return undefined;
+                leaf.fields[field] = paramValue;
                 continue;
             }
             const column = parseRowFieldTerm(value);
-            if (column === undefined) return FALSE;
-            rowTerms.set(field, column);
+            if (column === undefined) return undefined;
+            leaf.rowTerms.push([field, column]);
+            leaf.row = true;
         }
     }
+    return leaf;
+}
 
-    const subject = await readSubject([...new Set(rowTerms.values())], env);
-    if ('status' in subject) return subject;
-    for (const [field, column] of rowTerms) where[field] = subject.values.get(column)!;
+// An exists atom: whether some live row of the target table matches `where`.
+//
+// A WAY of satisfying the tree picks one member of every `$or` on its path, so
+// it is a conjunction of leaves, and a single-leaf atom over it fixes its
+// value at the first of these that applies:
+//
+//   1. a term with no value: false;
+//   2. a subject row that is not live, when the way names it: false;
+//   3. an undecided subject value: `and(S, undecided)` on that value's
+//      support, S being the subject row's liveness;
+//   4. a slot the read depends on that a pending observe writes: undecided on
+//      the touching observes, inside `and(S, ...)` when the way names the
+//      subject row;
+//   5. otherwise the read over the candidate rows, inside `and(S, ...)` when
+//      the way names the subject row.
+//
+// The atom has the value of the `or` of those atoms over every way, without
+// listing them. The ways fall into five classes, one arm each:
+//
+//   X    through a leaf set aside (3);
+//   T$   through a touched leaf and a leaf naming the subject row (4);
+//   T0   through a touched leaf and no leaf naming the subject row (4);
+//   R$   through a leaf naming the subject row, none touched or set aside (5);
+//   R0   through plain leaves only (5).
+//
+// X, T$ and T0 come from the tree's structure (asideArm, touchedRowArm,
+// touchedArm). R0 and R$ are reads of the view (ExistsReads 'plain' and
+// 'row'), and R, the read of the whole tree ('all'), stands in for
+// `or(R0, R$)` where S is live. They combine by the subject row's state:
+//
+//   not read (no leaf names it)   or(R, T0)
+//   not live                      or(R0, T0)
+//   live                          or(R, X, T$, T0)
+//   undecided                     or(R0, T0, and(S, or(R$, X, T$)))
+//
+// With one leaf this is the single-leaf atom, in value and in support.
+async function existsTruth(pred: Extract<Predicate, { p: 'exists' }>, env: TruthPredicateEnv): Promise<Truth> {
+    const [group, table] = splitTableRef(pred.table);
+
+    // $author and $param terms: a leaf with a term that has no value is false
+    let tree = resolveWhere(pred.where ?? {}, env);
+    if (tree === undefined) return FALSE;
+
+    // The subject row, when a leaf left names it: its liveness first, then
+    // the values the leaves name. A leaf naming a missing value is false, and
+    // one naming an undecided value is set aside.
+    let live: Truth = TRUE;
+    const rowLeaves = readLeaves(tree).filter((leaf) => leaf.row) as TermLeaf[];
+    if (rowLeaves.length > 0) {
+        const subject = env.subject;
+        live = subject === undefined ? FALSE : await subject.live();
+        if (subject === undefined || live.status === 'false') {
+            tree = simplifyWhere(tree, (leaf) => leaf.row);
+        } else {
+            const columns = new Map<string, ColumnValue>();
+            const noValue = new Set<ReadLeaf>();
+            for (const leaf of rowLeaves) {
+                const undecided: Undecided[] = [];
+                for (const [field, column] of leaf.rowTerms) {
+                    let read = columns.get(column);
+                    if (read === undefined) {
+                        read = await subject.column(column);
+                        columns.set(column, read);
+                    }
+                    if (read.status === 'undecided') {
+                        undecided.push(read);
+                    } else if (read.value === undefined) {
+                        noValue.add(leaf);
+                        break;
+                    } else {
+                        leaf.fields[field] = read.value;
+                    }
+                }
+                if (!noValue.has(leaf) && undecided.length > 0) leaf.aside = anyTruth(undecided) as Undecided;
+            }
+            tree = simplifyWhere(tree, (leaf) => noValue.has(leaf));
+        }
+        if (tree === undefined) return FALSE;
+    }
+
+    const leaves = readLeaves(tree);
+    const namesSubject = leaves.some((leaf) => leaf.row);
+    const aside = asideArm(tree);
 
     // local target resolves on a sibling; a `group.table` target resolves
-    // through the bound foreign group. A missing reference (unbound name or
-    // absent foreign table) makes the atom false.
-    const view = group !== undefined
-        ? await env.getForeignTableView(group, table)
-        : await env.getTableView(table);
-    if (view === undefined) return FALSE;
+    // through the bound foreign group. With a missing reference (unbound name
+    // or absent foreign table) no row matches and no leaf is touched; the
+    // leaves set aside still count. A tree whose leaves are all set aside
+    // reads nothing of the target.
+    let reads: ExistsReads | undefined;
+    if (leaves.some((leaf) => leaf.aside === undefined)) {
+        const view = group !== undefined
+            ? await env.getForeignTableView(group, table)
+            : await env.getTableView(table);
+        if (view !== undefined) reads = await view.existsMatching(tree);
+    }
+    const read = async (which: 'all' | 'plain' | 'row'): Promise<Truth> => reads === undefined ? FALSE : reads.read(which);
+    const touched = reads?.touched ?? new Map<ReadLeaf, Undecided>();
+    const touchedPlain = touchedArm(tree, touched);
 
-    return allTruth([subject.live, await view.existsMatching(where)]);
+    if (!namesSubject) return anyTruth([await read('all'), touchedPlain]);
+
+    const touchedRow = touchedRowArm(tree, touched);
+    if (live.status === 'true') return anyTruth([await read('all'), aside, touchedRow, touchedPlain]);
+
+    const plain = await read('plain');
+    if (plain.status === 'true') return TRUE;
+    return anyTruth([plain, touchedPlain, allTruth([live, anyTruth([await read('row'), aside, touchedRow])])]);
+}
+
+// An exists atom over one view, for a `where` whose values are all literals:
+// the read of the tree, undecided where a pending observe touches it.
+export async function existsOnView(view: TruthTableView, where: Where): Promise<Truth> {
+    return existsTruth({ p: 'exists', table: 'target', where }, {
+        getTableView: async () => view,
+        getForeignTableView: async () => undefined,
+        context: 'object',
+    });
 }
 
 function evalPredicateOperand(op: RuleOperand, env: TruthPredicateEnv, lookup: (column: string) => json.Literal | undefined): json.Literal | undefined {

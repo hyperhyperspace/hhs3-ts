@@ -56,7 +56,7 @@ export const diffTests = [
   TABLE a (x string, y string NULL),
   TABLE gone (z string)`);
             const after = await tablesOf(keys, `
-  TABLE a (x string, w string NULL) NO CONCURRENT DELETES ALLOW insert IF EXISTS b WHERE b.k = 'x',
+  TABLE a (x string, w string NULL) NO CONCURRENT DELETES ALLOW insert IF EXISTS (b WHERE b.k = 'x'),
   TABLE b (k string PUB)`);
             assertEquals(kinds(reach(before, after, 'every kind')),
                 'add-column a.w, add-table b, set-restrictions a, set-concurrent-deletes a, drop-table gone, drop-column a.y',
@@ -87,10 +87,10 @@ export const diffTests = [
 
             const exists = await tablesOf(keys, `
   TABLE caps (label string PUB, grantee string PUB),
-  TABLE docs (body string) ALLOW insert IF EXISTS caps WHERE caps.label = 'writer'`);
+  TABLE docs (body string) ALLOW insert IF EXISTS (caps WHERE caps.label = 'writer')`);
             const narrowed = await tablesOf(keys, `
   TABLE caps (grantee string PUB),
-  TABLE docs (body string) ALLOW insert IF EXISTS caps WHERE caps.grantee = 'alice'`);
+  TABLE docs (body string) ALLOW insert IF EXISTS (caps WHERE caps.grantee = 'alice')`);
             assertEquals(kinds(reach(exists, narrowed, "a column another table's EXISTS uses")),
                 'set-restrictions docs, drop-column caps.label', 'the restriction moves off the column before it goes');
 
@@ -115,8 +115,8 @@ export const diffTests = [
             const docEdit = async (what: string, sql: string) => edits.push([what, 'hhs:doc', await schemaTables(keys, sql, 'hhs:doc')]);
             const userEdit = async (what: string, sql: string) => edits.push([what, 'hhs:user', await schemaTables(keys, sql, 'hhs:user')]);
             await docEdit('a tag column', DOC_SCHEMA.replace('deleted boolean', 'deleted boolean,\n    tag string NULL PUB'));
-            await docEdit('no blocks', DOC_SCHEMA.replace(/,\n\n  TABLE blocks[\s\S]*\$author\n/, '\n'));
-            await docEdit('comments on blocks', DOC_SCHEMA.replace(/\n\);$/, ",\n\n  TABLE comments (\n    blockId string REFERENCES blocks,\n    text string\n  ) ALLOW all IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author\n);"));
+            await docEdit('no blocks', DOC_SCHEMA.replace(/,\n\n  TABLE blocks[\s\S]*\$author\)\n/, '\n'));
+            await docEdit('comments on blocks', DOC_SCHEMA.replace(/\n\);$/, ",\n\n  TABLE comments (\n    blockId string REFERENCES blocks,\n    text string\n  ) ALLOW all IF EXISTS (user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author)\n);"));
             await docEdit('pages deletable', DOC_SCHEMA.replace('ALLOW delete IF false', 'ALLOW delete IF true'));
             await docEdit('blocks without the FK', DOC_SCHEMA.replace('pageId string READONLY REFERENCES pages', 'pageId string READONLY'));
             await userEdit('no concurrent deletes', USER_SCHEMA.replace(') CONCURRENT DELETES', ') NO CONCURRENT DELETES'));
@@ -251,12 +251,12 @@ export const diffTests = [
             const released = await Released.open([]);
             const withFiles = (source: string, item: string) => source.replace(/\n\);\n$/, `,\n  ${item}\n);\n`);
             const media = withFiles(EDITOR_SOURCE,
-                "FILES media\n    USING IDENTITIES user.identities\n    ALLOW WRITE IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author");
+                "FILES media\n    USING IDENTITIES user.identities\n    ALLOW WRITE IF EXISTS (user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author)");
             try {
                 const first = await releaseFor(dev, released, media, '1.0.0', []);
                 assertEquals(first.draft.addFiles.map((f) => f.name).join(','), 'media', 'the first release adds every FILES');
                 const firstText = formatDraft(first.draft, labels).join('\n');
-                assertTrue(firstText.includes('  FILES media\n    USING IDENTITIES user.identities\n    ALLOW WRITE IF EXISTS user.caps'), `the genesis lists it: ${firstText}`);
+                assertTrue(firstText.includes('  FILES media\n    USING IDENTITIES user.identities\n    ALLOW WRITE IF EXISTS (user.caps'), `the genesis lists it: ${firstText}`);
                 assertParses(first.draft, labels);
                 assertTrue((await released.base([first.produced.hash])).files.has('media'), 'the signed release holds the FILES');
                 const r100 = released.resolve('1.0.0');
@@ -273,7 +273,7 @@ export const diffTests = [
                 const r110 = released.resolve('1.1.0');
 
                 const refusals = async (source: string) => (await draftFor(dev, released, source, '1.2.0', [r110])).refusals.map((r) => r.message).join('\n');
-                const changed = await refusals(v110.replace("ALLOW WRITE IF EXISTS user.caps WHERE user.caps.label = 'writer'", "ALLOW WRITE IF EXISTS user.caps WHERE user.caps.label = 'editor'"));
+                const changed = await refusals(v110.replace("ALLOW WRITE IF EXISTS (user.caps WHERE user.caps.label = 'writer'", "ALLOW WRITE IF EXISTS (user.caps WHERE user.caps.label = 'editor'"));
                 assertTrue(changed.includes('FILES media: its ALLOW WRITE change, and FILES definitions are immutable, use a new name'), `a changed FILES is refused: ${changed}`);
                 const rebound = await refusals(v110.replace('FILES attachments USING IDENTITIES user.identities', 'FILES attachments BIND u => user USING IDENTITIES u.identities'));
                 assertTrue(rebound.includes('FILES attachments: its BIND alias, identity table change'), `a new alias is a change: ${rebound}`);
@@ -294,7 +294,7 @@ export const diffTests = [
             const withUploaders = (source: string) => source.replace('  TABLE caps (', '  TABLE uploaders (\n    grantee identity PUB READONLY\n  ),\n\n  TABLE caps (');
             const withMemo = (source: string) => source.replace('grantee identity PUB READONLY\n  ) CONCURRENT DELETES', 'grantee identity PUB READONLY,\n    memo string NULL\n  ) CONCURRENT DELETES');
             const media = withUploaders(withFiles(EDITOR_SOURCE,
-                'FILES media\n    USING IDENTITIES user.identities\n    ALLOW WRITE IF EXISTS user.uploaders WHERE user.uploaders.grantee = $author'));
+                'FILES media\n    USING IDENTITIES user.identities\n    ALLOW WRITE IF EXISTS (user.uploaders WHERE user.uploaders.grantee = $author)'));
             const readOnly = 'FILES media becomes read-only in 1.1.0: ALLOW WRITE IF reads user.uploaders: '
                 + 'schema hhs:user has no table uploaders; it stays in the catalog, and a new FILES can take its place';
             const filesWarnings = (draft: ReleaseDraft) => draft.warnings.filter((w) => w.startsWith('FILES '));

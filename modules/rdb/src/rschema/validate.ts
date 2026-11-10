@@ -15,7 +15,7 @@ import {
     ID_TERMS, CMP_OPS, CmpOp,
 } from "./payload.js";
 
-import { splitTableRef, parseParamTerm, parseRowFieldTerm } from "./payload.js";
+import { splitTableRef, parseParamTerm, parseRowFieldTerm, whereEqualities } from "./payload.js";
 import type { RSchemaView } from "./interfaces.js";
 import { cmpTypesOk, likeTypesOk, isValidLikePattern } from "./expr.js";
 import { isValidSemver } from "../semver.js";
@@ -121,8 +121,8 @@ export function columnValueValidReason(value: json.Literal, def: ColumnDef): Val
             return undefined;
         case 'json':
             if (value === undefined || value === null) return `expected a JSON value, got ${carrierName(value)}`;
-            if (!json.isLiteral(value)) return 'JSON values cannot contain null';
-            return undefined;
+            const problem = json.literalProblem(value);
+            return problem === undefined ? undefined : 'JSON values cannot contain ' + problem;
         case 'bigint':
             if (typeof value !== 'string') return `expected a bigint string, got ${carrierName(value)}`;
             if (!isCanonicalBigint(value)) {
@@ -218,6 +218,51 @@ function validateOperand(op: json.Literal, context: PredicateContext, depth: num
     return false;
 }
 
+// The `where` of an exists atom: a leaf, or a group of leaves and groups.
+//
+//   - A leaf has one or more fields, each a valid name with a valid value.
+//   - A group is an object whose only key is `$and` or `$or`, holding 2 to
+//     MAX_EXPR_ARGS members (a one-member group means the same as its member:
+//     not canonical). Members may be equal, as in predicate groups.
+//   - An `$and` holds at most one leaf: the equalities of one conjunction
+//     share a leaf, so each text has one payload.
+//   - The atom holds at most MAX_WHERE_FIELDS equalities in all, and a group's
+//     members sit one level deeper than the group, counted with the
+//     predicate's own nesting toward MAX_EXPR_DEPTH.
+function validateWhere(where: json.Literal, context: PredicateContext, depth: number, count: { fields: number }): boolean {
+    if (depth > MAX_EXPR_DEPTH) return false;
+    if (typeof where !== 'object' || where === null || Array.isArray(where)) return false;
+
+    const node = where as json.LiteralMap;
+    const keys = Object.keys(node);
+
+    if (keys.some((key) => key.startsWith('$'))) {
+        if (keys.length !== 1 || (keys[0] !== '$and' && keys[0] !== '$or')) return false;
+        const members = node[keys[0]];
+        if (!Array.isArray(members)) return false;
+        if (members.length < 2 || members.length > MAX_EXPR_ARGS) return false;
+        if (keys[0] === '$and' && members.filter(isWhereLeafShape).length > 1) return false;
+        return members.every((member) => validateWhere(member, context, depth + 1, count));
+    }
+
+    if (keys.length === 0) return false;
+    count.fields += keys.length;
+    if (count.fields > MAX_WHERE_FIELDS) return false;
+    for (const field of keys) {
+        if (!isValidName(field)) return false;
+        // strings starting with '$' are reserved for terms
+        // ($author / $row.<col>); others are literals
+        if (!isValidWhereValue(node[field], context)) return false;
+    }
+    return true;
+}
+
+// A `where` member with no '$' key: a leaf, when it is valid at all.
+function isWhereLeafShape(member: json.Literal): boolean {
+    return typeof member === 'object' && member !== null && !Array.isArray(member)
+        && !Object.keys(member).some((key) => key.startsWith('$'));
+}
+
 export function validatePredicate(pred: json.Literal, context: PredicateContext = 'row', depth: number = 0): boolean {
     if (depth > MAX_EXPR_DEPTH) return false;
     if (typeof pred !== 'object' || pred === null || Array.isArray(pred)) return false;
@@ -231,20 +276,10 @@ export function validatePredicate(pred: json.Literal, context: PredicateContext 
             return keys.length === 1;
         case 'exists': {
             if (typeof e['table'] !== 'string' || !isValidTableRef(e['table'])) return false;
-            if (typeof e['where'] !== 'object' || e['where'] === null || Array.isArray(e['where'])) return false;
-            const where = e['where'] as json.LiteralMap;
-            const fields = Object.keys(where);
-            if (fields.length === 0 || fields.length > MAX_WHERE_FIELDS) return false;
-            for (const field of fields) {
-                if (!isValidName(field)) return false;
-                // strings starting with '$' are reserved for terms
-                // ($author / $row.<col>); others are literals
-                if (!isValidWhereValue(where[field], context)) return false;
-            }
             for (const key of keys) {
                 if (!['p', 'table', 'where'].includes(key)) return false;
             }
-            return true;
+            return validateWhere(e['where'], context, depth, { fields: 0 });
         }
         case 'cmp': {
             if (keys.length !== 4) return false;
@@ -288,7 +323,7 @@ export function predicateReferencesAuthor(pred: Predicate): boolean {
         case 'like':
             return operandReferencesAuthor(pred.value) || operandReferencesAuthor(pred.pattern);
         case 'exists':
-            return Object.values(pred.where ?? {}).some((value) => value === '$author');
+            return whereEqualities(pred.where).some(([, value]) => value === '$author');
         case 'and':
         case 'or':
             return pred.args.some(predicateReferencesAuthor);
@@ -353,7 +388,7 @@ export function collectRowFieldRefs(pred: Predicate, out: Set<string> = new Set(
             collectOperandCols(pred.pattern, out);
             break;
         case 'exists':
-            for (const value of Object.values(pred.where ?? {})) {
+            for (const [, value] of whereEqualities(pred.where)) {
                 if (typeof value === 'string') {
                     const col = parseRowFieldTerm(value);
                     if (col !== undefined) out.add(col);
@@ -381,7 +416,7 @@ export function collectParamRefs(pred: Predicate, out: Set<string> = new Set()):
             collectOperandParams(pred.pattern, out);
             break;
         case 'exists':
-            for (const value of Object.values(pred.where ?? {})) {
+            for (const [, value] of whereEqualities(pred.where)) {
                 if (typeof value === 'string') {
                     const param = parseParamTerm(value);
                     if (param !== undefined) out.add(param);
@@ -449,7 +484,7 @@ export function checkPredicateColumns(
         if (group !== undefined) continue;
         const target = resolveLocalTable(table);
         if (target === undefined) return `exists target table '${table}' not found in schema`;
-        for (const [field, value] of Object.entries(atom.where ?? {})) {
+        for (const [field, value] of whereEqualities(atom.where)) {
             if (typeof value !== 'string') continue;
             const col = parseRowFieldTerm(value);
             if (col !== undefined) {
@@ -691,13 +726,11 @@ export function validateSchemaTables(tables: TableDef[], params?: SchemaParamDec
         const target = byName.get(table);
         if (target === undefined) return `exists target table '${table}' not found in schema`;
 
-        if (atom.where !== undefined) {
-            for (const field of Object.keys(atom.where)) {
-                if (field === 'rowAuthor') continue;
-                const column = target.columns[field];
-                if (column === undefined) return `exists where field '${field}' not found in table '${table}'`;
-                if (!(column.pub ?? false)) return `exists where field '${field}' in table '${table}' is not pub`;
-            }
+        for (const [field] of whereEqualities(atom.where)) {
+            if (field === 'rowAuthor') continue;
+            const column = target.columns[field];
+            if (column === undefined) return `exists where field '${field}' not found in table '${table}'`;
+            if (!(column.pub ?? false)) return `exists where field '${field}' in table '${table}' is not pub`;
         }
         return undefined;
     };

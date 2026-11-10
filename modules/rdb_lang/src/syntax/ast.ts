@@ -443,7 +443,12 @@ export type PredicateExpr =
     | { kind: 'false'; span: TextSpan }
     | { kind: 'comparison'; op: '=' | '!=' | '<' | '<=' | '>' | '>='; left: OperandExpr; right: OperandExpr; span: TextSpan }
     | { kind: 'like'; left: OperandExpr; pattern: OperandExpr; escape?: string; span: TextSpan }
+    // `where` is the filter of `EXISTS (table [AS alias] WHERE filter)`. The
+    // parser reads it as a condition, so that anything a filter does not take
+    // is reported where the rule is lowered.
     | { kind: 'exists'; table: string; alias?: string; where: PredicateExpr; span: TextSpan }
+    // `column IN (v1, ..., vn)`: only inside an EXISTS filter.
+    | { kind: 'in'; left: OperandExpr; values: OperandExpr[]; span: TextSpan }
     | { kind: 'not'; arg: PredicateExpr; span: TextSpan }
     | { kind: 'and'; args: PredicateExpr[]; span: TextSpan }
     | { kind: 'or'; args: PredicateExpr[]; span: TextSpan };

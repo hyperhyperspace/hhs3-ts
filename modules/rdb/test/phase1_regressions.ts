@@ -14,6 +14,7 @@ import { applyReleaseBody, emptyParentFold } from "../src/rcatalog/resolve.js";
 import type { CatalogGroupDef } from "../src/rcatalog/payload.js";
 import { RTableGroupImpl, rTableGroupFactory } from "../src/rtable_group/group.js";
 import { RTableViewImpl } from "../src/rtable/view.js";
+import { existsOnView } from "../src/rtable_group/predicates.js";
 
 const hashSuite = createBasicCrypto().hash(HASH_SHA256);
 
@@ -83,7 +84,7 @@ async function testExistsMatchingMissingTable() {
     }))) as RTableGroupImpl;
     const at = version(...await (await group.getScopedDag()).getFrontier());
     const view = await group.makeTable('missing').getView(at, at) as RTableViewImpl;
-    assertEquals((await view.existsMatching({ title: 'x' })).status, 'false',
+    assertEquals((await existsOnView(view, { title: 'x' })).status, 'false',
         'existsMatching on a table the schema does not have fails closed');
 }
 

@@ -5,7 +5,7 @@ import { serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 import {
     RCatalogImpl, RDbImpl, RSchemaImpl, catalogGroupHash, normalizeDecimal, usersSchemaTables, validateRSchemaPayloadFormat,
     type CatalogGroupDef, type CmpOp, type ColumnDef, type ColumnType, type MigrationRule, type Operand, type OpTag, type Predicate,
-    type SchemaUpdatePayload, type TableDef,
+    type SchemaUpdatePayload, type TableDef, type Where, type WhereLeaf,
 } from "@hyper-hyper-space/hhs3_rdb";
 
 import { createMockRContext } from "../../rdb/test/mock_rcontext.js";
@@ -251,21 +251,48 @@ function randomOperand(r: Rng, scope: GenScope, type: ColumnType, depth: number)
     return { lit: randomLiteral(r, type) };
 }
 
+// A value a field of `target` can take in a where leaf: $author, a column of
+// the gated row of the same type, or a literal.
+function randomWhereValue(r: Rng, scope: GenScope, def: ColumnDef): json.Literal {
+    const rowCols = readonlyCols(scope, def.type).filter((c) => c !== 'rowAuthor');
+    const roll = r();
+    if ((def.type === 'string' || def.type === 'identity') && roll < 0.3) return '$author';
+    if (rowCols.length > 0 && roll < 0.6) return `$row.${pick(r, rowCols)}`;
+    return randomLiteral(r, def.type, scaleOf(def));
+}
+
+function randomLeaf(r: Rng, scope: GenScope, target: TableDef): WhereLeaf {
+    const pubCols = Object.entries(target.columns).filter(([, d]) => d.pub).map(([n]) => n);
+    const fields = shuffle(r, pubCols).slice(0, 1 + Math.floor(r() * 2));
+    if (fields.length === 0) return { rowAuthor: '$author' };
+    const leaf: WhereLeaf = {};
+    for (const field of fields) leaf[field] = randomWhereValue(r, scope, target.columns[field]);
+    return leaf;
+}
+
+// A group of a where tree: an `$or` (sometimes the one-column list IN stands
+// for), or an `$and`, which holds at most one leaf.
+function randomWhereGroup(r: Rng, scope: GenScope, target: TableDef, depth: number): Where {
+    const member = (): Where => depth < 2 && r() < 0.3 ? randomWhereGroup(r, scope, target, depth + 1) : randomLeaf(r, scope, target);
+    if (r() < 0.6) {
+        const pubCols = Object.entries(target.columns).filter(([, d]) => d.pub).map(([n]) => n);
+        if (pubCols.length > 0 && r() < 0.5) {
+            const column = pick(r, pubCols);
+            return { $or: Array.from({ length: 2 + Math.floor(r() * 2) }, () => ({ [column]: randomWhereValue(r, scope, target.columns[column]) })) };
+        }
+        return { $or: Array.from({ length: 2 + Math.floor(r() * 2) }, member) };
+    }
+    const groups = Array.from({ length: 1 + Math.floor(r() * 2) }, () => randomWhereGroup(r, scope, target, depth + 1));
+    if (groups.length > 1 && r() < 0.3) return { $and: groups };
+    const members: Where[] = [...groups];
+    members.splice(Math.floor(r() * (members.length + 1)), 0, randomLeaf(r, scope, target));
+    return { $and: members };
+}
+
 function randomExists(r: Rng, scope: GenScope): Predicate {
     if (r() < 0.15) return { p: 'exists', table: 'users.identities', where: { keyId: '$author' } };
     const target = pick(r, scope.tables);
-    const pubCols = Object.entries(target.columns).filter(([, d]) => d.pub).map(([n]) => n);
-    const fields = shuffle(r, pubCols).slice(0, 1 + Math.floor(r() * 2));
-    if (fields.length === 0) return { p: 'exists', table: target.name, where: { rowAuthor: '$author' } };
-    const where: { [field: string]: json.Literal } = {};
-    for (const field of fields) {
-        const def = target.columns[field];
-        const rowCols = readonlyCols(scope, def.type).filter((c) => c !== 'rowAuthor');
-        const roll = r();
-        if ((def.type === 'string' || def.type === 'identity') && roll < 0.3) where[field] = '$author';
-        else if (rowCols.length > 0 && roll < 0.6) where[field] = `$row.${pick(r, rowCols)}`;
-        else where[field] = randomLiteral(r, def.type, scaleOf(def));
-    }
+    const where = r() < 0.35 ? randomWhereGroup(r, scope, target, 0) : randomLeaf(r, scope, target);
     return { p: 'exists', table: target.name, where };
 }
 
@@ -326,7 +353,7 @@ export const roundTripTests = {
                 assertTrue(text.includes('decimal(*, 2)'), 'precision-less decimal renders with *');
                 assertTrue(text.includes(`publicKey('`), 'creators render as public keys');
                 assertTrue(text.includes("HASH ALGORITHM 'sha256'"), 'hash algorithm renders');
-                assertTrue(text.includes('EXISTS users.identities AS i WHERE i.keyId = identities.keyId'), 'same-named cross-group EXISTS is aliased');
+                assertTrue(text.includes('EXISTS (users.identities AS i WHERE i.keyId = identities.keyId)'), 'same-named cross-group EXISTS is aliased');
             },
         },
         {
@@ -345,8 +372,10 @@ export const roundTripTests = {
                 // Each construct must show up in some valid case, or the generator has drifted.
                 const constructs: { [name: string]: RegExp } = {
                     'ALLOW rule': /\bALLOW (insert|update|delete|all) IF /, 'nested group': /\(\(|AND \(|OR \(/,
-                    'arithmetic': / [+*-] /, 'length()': /length\(/, 'LIKE': / LIKE /, 'EXISTS': /EXISTS /,
-                    'EXISTS alias': /EXISTS \S+ AS /, 'cross-group EXISTS': /EXISTS users\.identities/,
+                    'arithmetic': / [+*-] /, 'length()': /length\(/, 'LIKE': / LIKE /, 'EXISTS': /EXISTS \(/,
+                    'EXISTS alias': /EXISTS \(\S+ AS /, 'cross-group EXISTS': /EXISTS \(users\.identities/,
+                    'IN list': /WHERE [^;]* IN \(/, 'OR in a filter': /EXISTS \([^;()]* OR /,
+                    'group in a filter': /EXISTS \([^;()]* (AND|OR) \(/,
                     '$row correlation': /WHERE [^;]*= "?[a-z]+"?\."?[a-z]+"?/, 'quoted identifier': /"[a-z]+"/,
                     'decimal(*, s)': /decimal\(\*, /, 'decimal(p, s)': /decimal\(\d+, /, 'negative literal': /[=<>] -\d/,
                     'FK': /REFERENCES/, 'CONCURRENT DELETES': /CONCURRENT DELETES/,

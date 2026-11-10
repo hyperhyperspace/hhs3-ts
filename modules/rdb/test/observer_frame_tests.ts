@@ -239,7 +239,7 @@ const RESET_ACTIVE: MigrationRule[] = [
     { rule: 'add-column', table: 'allowed', column: 'active', def: { type: 'string', pub: true, default: 'yes' } },
 ];
 
-// `EXISTS auth.allowed WHERE user = $author AND active = yes`
+// `EXISTS (auth.allowed WHERE user = $author AND active = yes)`
 const ALLOWED_ACTIVE: Predicate = { p: 'exists', table: 'auth.allowed', where: { user: '$author', active: 'yes' } };
 
 function namedTable(name: string, rule: Predicate): TableDef {
@@ -543,6 +543,50 @@ export const observerFrameTests = {
                 assertTrue(formatOpVoidDetail({ kind: 'undecided-cycle' }, { observe: {} }).endsWith('its version still advanced the horizon'),
                     'the binding is named only when known');
                 assertTrue(formatOpVoidDetail({ kind: 'undecided-cycle' }) === 'undecided dependency cycle (denied)', 'a row op is unchanged');
+            }
+        },
+        {
+            name: '[OBSFRAME22] a pending deploy that writes the slot of a column only one arm of an exists names leaves the other arm decided, as two atoms do; a leaf that names the column is touched',
+            invoke: async () => {
+                const ctx = newCtx();
+                // caps (grantee, role), role defaulting to member. The deploy drops role
+                // and adds it again with the same default: it writes role's slot alone.
+                const tables = authTables().map((t) => t.name !== CAPS_TABLE ? t : {
+                    ...t, columns: { grantee: { type: 'string' as const, pub: true }, role: { type: 'string' as const, pub: true, default: 'member' } },
+                });
+                const resetRole: MigrationRule[] = [
+                    { rule: 'drop-column', table: CAPS_TABLE, column: 'role' },
+                    { rule: 'add-column', table: CAPS_TABLE, column: 'role', def: { type: 'string', pub: true, default: 'member' } },
+                ];
+                // bob deletes alice's admins row while alice imports the deploy
+                const outcome = async (seed: string, adminsRule: Predicate) => {
+                    const [root, alice, bob] = [await makeIdentity(), await makeIdentity(), await makeIdentity()];
+                    const { K, schema } = await makeAuth(ctx, `${seed}-k`, { creator: root, identities: [root, alice, bob], caps: [root, alice, bob], tables });
+                    const v0 = await frontier(K);
+                    const vD = await deployOn(K, schema, root, resetRole, v0);
+                    const G = await loopObserver(ctx, `${seed}-g`, { creator: root, K, H: await makeData(ctx, `${seed}-h`, root), admins: [root, alice], adminsRule });
+                    const base = version(await G.observe('auth', v0, root, await frontier(G)));
+                    const d = await (await G.getTable('admins')).delete(await adminRow(G, alice, base), bob, base);
+                    const y = await G.observe('auth', vD, alice, base);
+                    return [await verdict(G, d), await verdict(G, y)].join(' ');
+                };
+                const anyCap = { grantee: '$author' };
+                const adminCap = { grantee: '$author', role: 'admin' };
+                const memberCap = { grantee: '$author', role: 'member' };
+                const caps = `auth.${CAPS_TABLE}`;
+
+                // EXISTS (auth.caps WHERE grantee = $author OR (grantee = $author AND role = 'admin'))
+                assertTrue(await outcome('of22-tree', { p: 'exists', table: caps, where: { $or: [anyCap, adminCap] } }) === 'live observe-gate',
+                    'as one EXISTS, the arm that names only grantee decides the delete');
+                assertTrue(await outcome('of22-tree-rev', { p: 'exists', table: caps, where: { $or: [adminCap, anyCap] } }) === 'live observe-gate',
+                    'in either order of the arms');
+                assertTrue(await outcome('of22-atoms', { p: 'or', args: [
+                    { p: 'exists', table: caps, where: anyCap }, { p: 'exists', table: caps, where: adminCap },
+                ] }) === 'live observe-gate', 'as two EXISTS atoms, the same');
+                assertTrue(await outcome('of22-leaf', { p: 'exists', table: caps, where: memberCap }) === 'undecided-cycle undecided-cycle',
+                    'a leaf that names role is touched: the delete and the import collapse');
+                assertTrue(await outcome('of22-both', { p: 'exists', table: caps, where: { $or: [memberCap, adminCap] } }) === 'undecided-cycle undecided-cycle',
+                    'and so is a tree whose every arm names role');
             }
         },
         {

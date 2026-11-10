@@ -35,12 +35,12 @@ export const writeSourceTests = [
             const edited = (what: string, source: string) => ({ what, source });
             const cases = [
                 edited('a new column', EDITOR_SOURCE.replace('deleted boolean', 'deleted boolean,\n    tag string NULL PUB')),
-                edited('a dropped table', EDITOR_SOURCE.replace(/,\n\n  TABLE blocks \([\s\S]*?\$author\n/, '\n')),
+                edited('a dropped table', EDITOR_SOURCE.replace(/,\n\n  TABLE blocks \([\s\S]*?\$author\)\n/, '\n')),
                 edited('a redefined column', EDITOR_SOURCE.replace('    title string,', "    title string(200) DEFAULT '',")),
                 edited('a column without its FK', EDITOR_SOURCE.replace('pageId string READONLY REFERENCES pages', 'pageId string READONLY')),
                 edited('changed options', EDITOR_SOURCE.replace('ALLOW delete IF false', 'ALLOW delete IF true').replace(') CONCURRENT DELETES', ') NO CONCURRENT DELETES')),
                 edited('options on a table without them', EDITOR_SOURCE.replace(/\n  \) IDENTITY PROVIDER,/, '\n  ) IDENTITY PROVIDER NO CONCURRENT DELETES,')),
-                edited('a new table', EDITOR_SOURCE.replace(/\$author\n\);\n\n-- :admin/, "$author,\n\n  TABLE comments (\n    blockId string REFERENCES blocks,\n    text string\n  )\n);\n\n-- :admin")),
+                edited('a new table', EDITOR_SOURCE.replace(/\$author\)\n\);\n\n-- :admin/, "$author),\n\n  TABLE comments (\n    blockId string REFERENCES blocks,\n    text string\n  )\n);\n\n-- :admin")),
                 edited('a new schema and group', EDITOR_SOURCE.replace('-- :admin', `${TAGS}\n\n-- :admin`)
                     .replace(/\n\);\n$/, ',\n  TABLEGROUP tags USING SCHEMA hhs:tags BIND doc => doc\n);\n')),
                 edited('a new param', EDITOR_SOURCE.replace('PARAMS (:admin identity)', 'PARAMS (:admin identity, :moderator identity)')),

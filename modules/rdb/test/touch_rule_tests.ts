@@ -18,8 +18,9 @@
 //   - supports: an undecided read is supported by pending observes only.
 //
 // The rule is also re-implemented here, with switches, to run broken variants
-// (no slot check, no concurrent comparison, candidates gathered at D only)
-// and the sound but coarser variant that compares every entry. Each broken
+// (no slot check, no concurrent comparison, candidates gathered at D only,
+// "carried" judged at D) and the sound but coarser variant that compares
+// every entry. Each broken
 // variant has a pinned configuration where it decides a wrong answer, so a
 // change to the fixture that loses the counterexample fails a test.
 
@@ -29,7 +30,7 @@ import { createBasicCrypto, HASH_SHA256, keyIdFromPublicKey, SIGNING_ED25519 } f
 import type { B64Hash, OwnIdentity, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import type { EntryMetaFilter, EntryPredicate, Position } from "@hyper-hyper-space/hhs3_dag";
-import { version, refVersionAtOrAbove, truthOf, everyTruth, someTruth, FALSE, undecidedOn } from "@hyper-hyper-space/hhs3_mvt";
+import { version, refVersionAtOrAbove, truthOf, allTruth, anyTruth, everyTruth, someTruth, FALSE, undecidedOn } from "@hyper-hyper-space/hhs3_mvt";
 import type { PendingRefAdvance, Truth, Verdict, Version } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
@@ -39,9 +40,11 @@ import type { RTableImpl } from "../src/rtable/rtable.js";
 import { RTableViewImpl } from "../src/rtable/view.js";
 import type { ColumnValue, TableViewTarget } from "../src/rtable/view.js";
 import { deriveRowId } from "../src/rtable/hash.js";
-import type { MigrationRule, TableDef } from "../src/rschema/payload.js";
+import type { MigrationRule, TableDef, Where, WhereLeaf } from "../src/rschema/payload.js";
+import { whereGroup, whereLeaves } from "../src/rschema/payload.js";
 import type { OpVoidDetail } from "../src/rtable_group/op_void.js";
 import { freshVerdictEvaluation } from "../src/rtable_group/verdict_evaluation.js";
+import { existsOnView } from "../src/rtable_group/predicates.js";
 import { rowTag, colTag } from "../src/rtable_group/scopes.js";
 import { columnSlot, existenceSlot, slotsTouchedByRule } from "../src/rschema/resolve.js";
 
@@ -193,7 +196,7 @@ function pendingAdvances(pending: Pending[]): PendingRefAdvance[] {
 type Read =
     | { kind: 'row'; rowId: B64Hash; label: string }
     | { kind: 'column'; rowId: B64Hash; column: string; label: string }
-    | { kind: 'exists'; where: { [field: string]: json.Literal }; label: string };
+    | { kind: 'exists'; where: Where; label: string };
 
 function readsOf(fx: Fixture): Read[] {
     return [
@@ -209,6 +212,13 @@ function readsOf(fx: Fixture): Read[] {
         { kind: 'exists', where: { active: 'yes' }, label: 'exists active=yes' },
         { kind: 'exists', where: { active: 'no' }, label: 'exists active=no' },
         { kind: 'exists', where: { grantee: 'bob', active: 'yes' }, label: 'exists bob, active=yes' },
+        // trees: a leaf on `active`, whose slot Dep1 writes, beside leaves on
+        // `grantee`, which no deploy writes
+        { kind: 'exists', where: { $or: [{ grantee: 'alice' }, { grantee: 'carol' }] }, label: 'exists alice | carol' },
+        { kind: 'exists', where: { $or: [{ grantee: 'bob' }, { active: 'no' }] }, label: 'exists bob | active=no' },
+        { kind: 'exists', where: { $or: [{ grantee: 'alice' }, { grantee: 'bob', active: 'no' }] }, label: 'exists alice | (bob, active=no)' },
+        { kind: 'exists', where: { $and: [{ grantee: 'bob' }, { $or: [{ active: 'yes' }, { active: 'no' }] }] }, label: 'exists bob & (active=yes | active=no)' },
+        { kind: 'exists', where: { $and: [{ $or: [{ grantee: 'bob' }, { grantee: 'carol' }] }, { $or: [{ active: 'no' }, { grantee: 'carol' }] }] }, label: 'exists (bob | carol) & (active=no | carol)' },
     ];
 }
 
@@ -226,7 +236,7 @@ function answerOfColumn(c: ColumnValue): Answer {
 async function viewAnswer(view: RTableViewImpl, read: Read): Promise<Answer> {
     if (read.kind === 'row') return answerOfTruth((await view.rowLiveness(read.rowId)).truth);
     if (read.kind === 'column') return answerOfColumn(await view.columnValue(read.rowId, read.column));
-    return answerOfTruth(await view.existsMatching(read.where));
+    return answerOfTruth(await existsOnView(view, read.where));
 }
 
 // The production rule: a view at D with the pending observes.
@@ -379,13 +389,21 @@ async function sample(fx: Fixture, seed: number, trials: number, tally: Tally): 
 // Used only to run variants of the rule: the broken ones must fail on their
 // pinned configuration, and comparing every entry must be sound but coarser.
 
-type Variant = { name: string; slots: boolean; concurrent: boolean; union: boolean; predicate: boolean };
+// `union`: candidates are gathered at D plus every pending version, not at D.
+// `carried`: whether a candidate carries a field is judged at the version the
+// candidates were gathered at, not at D.
+type Variant = { name: string; slots: boolean; concurrent: boolean; union: boolean; carried: boolean; predicate: boolean };
 
-const RULE: Variant = { name: 'the rule', slots: true, concurrent: true, union: true, predicate: true };
+const RULE: Variant = { name: 'the rule', slots: true, concurrent: true, union: true, carried: true, predicate: true };
 const NO_SLOTS: Variant = { ...RULE, name: 'no slot check', slots: false };
 const NO_CONCURRENT: Variant = { ...RULE, name: 'no concurrent comparison', concurrent: false };
 const AT_D_ONLY: Variant = { ...RULE, name: 'candidates gathered at D only', union: false };
+const CARRIED_AT_D: Variant = { ...RULE, name: 'carried judged at D', carried: false };
 const EVERY_ENTRY: Variant = { ...RULE, name: 'every entry', predicate: false };
+
+// The rows that carry a leaf or satisfy a node on "carried" alone; 'all' is
+// every inserted row (a field at its default).
+type Rows = Set<B64Hash> | 'all';
 
 type Queries = { slots: string[]; history: EntryMetaFilter[]; concurrent: EntryMetaFilter[] };
 
@@ -451,32 +469,76 @@ class VariantRule {
         return (touched as ColumnValue | undefined) ?? (await this.exactView(D)).columnValue(rowId, column);
     }
 
-    async existsMatching(D: Version, pending: Pending[], where: { [field: string]: json.Literal }): Promise<Truth> {
-        const fields = Object.keys(where);
-        const touched = await this.touching(D, pending, {
-            slots: [existenceSlot(TABLE), ...fields.map((f) => columnSlot(TABLE, f))], history: [], concurrent: [],
-        });
-        if (touched !== undefined) return touched;
+    // The tree read with no subject row: each leaf's slots are checked on their
+    // own, a touched leaf is false in the read and undecided beside it, and a
+    // candidate is evaluated on "carried" before anything is read.
+    async existsMatching(D: Version, pending: Pending[], where: Where): Promise<Truth> {
+        const touched = new Map<WhereLeaf, Truth>();
+        for (const leaf of whereLeaves(where)) {
+            const touching = await this.touching(D, pending, {
+                slots: [existenceSlot(TABLE), ...Object.keys(leaf).map((f) => columnSlot(TABLE, f))], history: [], concurrent: [],
+            });
+            if (touching !== undefined) touched.set(leaf, touching);
+        }
         const schema = await this.target.resolveSchemaView(D, this.from);
-        if (!schema.hasTable(TABLE)) return FALSE;
+        if (!schema.hasTable(TABLE)) return anyTruth(touched.values());
         const pub = new Set(schema.getPubColumns(TABLE));
-        if (fields.some((f) => !pub.has(f))) return FALSE;
         const def = schema.getTable(TABLE)!;
 
         const gatherAt = this.variant.union ? union(D, ...pending.map((o) => o.version)) : D;
-        const gatherer = new RTableViewImpl(this.target, D, this.from, freshVerdictEvaluation()) as unknown as {
-            candidateRowIds(w: object, at: Version): Promise<B64Hash[]>;
+        const dag = await this.fx.table.getScopedDag();
+        const index = new RTableViewImpl(this.target, D, this.from, freshVerdictEvaluation()) as unknown as {
+            carriers(dag: object, field: string, value: json.Literal, at: Version): Promise<Set<B64Hash>>;
+            insertedRowIds(dag: object, at: Version): Promise<Set<B64Hash>>;
         };
-        const candidates = await gatherer.candidateRowIds(where, gatherAt);
-        return someTruth(candidates, async (rowId) => everyTruth([
-            ...fields.map((field) => async (): Promise<Truth> => {
+        const carrying = async (leaf: WhereLeaf, at: Version): Promise<Rows> => {
+            if (touched.has(leaf)) return new Set();
+            let rows = 'all' as Rows;
+            for (const [field, value] of Object.entries(leaf)) {
+                if (!pub.has(field)) return new Set();
+                if (sameValue(def.columns[field]?.default, value)) continue;
+                const carriers = await index.carriers(dag, field, value, at);
+                rows = rows === 'all' ? carriers : new Set([...rows].filter((rowId) => carriers.has(rowId)));
+            }
+            return rows;
+        };
+        const rowsOf = async (node: Where): Promise<Rows> => {
+            const group = whereGroup(node);
+            if (group === undefined) return carrying(node as WhereLeaf, gatherAt);
+            const sets: Rows[] = [];
+            for (const member of group.members) sets.push(await rowsOf(member));
+            if (group.op === '$or') return sets.includes('all') ? 'all' : new Set(sets.flatMap((set) => [...set as Set<B64Hash>]));
+            const listed = sets.filter((set) => set !== 'all') as Set<B64Hash>[];
+            return listed.length === 0 ? 'all' : new Set([...listed[0]!].filter((rowId) => listed.every((set) => set.has(rowId))));
+        };
+        const root = await rowsOf(where);
+        const candidates = [...(root === 'all' ? await index.insertedRowIds(dag, gatherAt) : root)].sort();
+
+        const carriedBy = new Map<WhereLeaf, Rows>();
+        for (const leaf of whereLeaves(where)) carriedBy.set(leaf, await carrying(leaf, this.variant.carried ? gatherAt : D));
+
+        const valueOn = async (node: Where, rowId: B64Hash): Promise<Truth> => {
+            const group = whereGroup(node);
+            if (group !== undefined) {
+                const members: Truth[] = [];
+                for (const member of group.members) members.push(await valueOn(member, rowId));
+                return group.op === '$and' ? allTruth(members) : anyTruth(members);
+            }
+            const leaf = node as WhereLeaf;
+            const rows = carriedBy.get(leaf)!;
+            if (rows !== 'all' && !rows.has(rowId)) return FALSE;
+            return everyTruth(Object.keys(leaf), async (field): Promise<Truth> => {
                 const read = await this.columnValue(D, pending, rowId, field);
                 if (read.status === 'undecided') return read;
                 const value = read.value ?? def.columns[field]?.default;
-                return truthOf(value !== undefined && sameValue(value, where[field]));
-            }),
-            async () => this.rowLiveness(D, pending, rowId),
-        ], (check) => check()));
+                return truthOf(value !== undefined && sameValue(value, leaf[field]));
+            });
+        };
+        const read = await someTruth(candidates, async (rowId) => {
+            const tree = await valueOn(where, rowId);
+            return tree.status === 'false' ? FALSE : allTruth([tree, await this.rowLiveness(D, pending, rowId)]);
+        });
+        return anyTruth([read, ...touched.values()]);
     }
 
     async answer(D: Version, pending: Pending[], read: Read): Promise<Answer> {
@@ -510,6 +572,9 @@ const PINNED: Pin[] = [
     { variant: NO_SLOTS, read: 'exists active=no', D: ['G0'], o1: ['G0'], o2: ['Dep1'], from: ['Dep1', 'G0'], voids: [] },
     { variant: NO_CONCURRENT, read: 'live(s)', D: ['Us'], o1: ['U1'], o2: ['I'], from: ['Ds', 'I', 'U1', 'U2', 'Us'], voids: ['I2'] },
     { variant: AT_D_ONLY, read: 'exists alice', D: ['G0'], o1: ['G0'], o2: ['I'], from: ['G0', 'I'], voids: [] },
+    // r is alice at D, and only the pending U1 carries bob: judged at D, the
+    // `bob` arm is false on r with nothing read
+    { variant: CARRIED_AT_D, read: 'exists bob | active=no', D: ['I'], o1: ['G0'], o2: ['U1'], from: ['G0', 'I', 'U1'], voids: [] },
 ];
 
 function pinnedConfig(fx: Fixture, pin: Pin): Config {

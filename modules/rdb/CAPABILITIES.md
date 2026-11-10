@@ -31,12 +31,14 @@ restriction (e.g. `exists manager-caps where owner=$author`).
 
 `exists` is not a shallow check. The `exists` case of predicate evaluation calls
 `view.existsMatching(...)` ([`rtable_group/predicates.ts`](src/rtable_group/predicates.ts)),
-which re-checks every candidate witness through the **fully enforced** row
+whose reads re-check every candidate witness through the **fully enforced** row
 liveness ([`rtable/view.ts`](src/rtable/view.ts)):
 
 ```ts
-const candidates = await this.candidateRowIds(where);   // index field + payload prefilter
-return someTruth(candidates, (rowId) => this.candidateMatch(rowId, where));   // values, then liveness
+// candidates: the where tree over sets of rows, through the index
+const ready = await this.readPlan(where, isRead, at);
+// each candidate: on "carried" alone, then its values, then its liveness
+return someTruth(ready.candidates, (rowId) => this.rowMatch(rowId, where, ready, which, isRead, readsOf(rowId)));
 ```
 
 Row liveness applies (1) permanent-delete liveness, (2) restriction drop-on-void
@@ -135,6 +137,13 @@ fields**, which RCap has no equivalent for:
   "grant X only for resource R, where R is a *field of the row being written*"
   IS expressible: e.g. `exists grants where resource=$row.resource and
   owner=$author` (resource-scoped / attenuated caps; see `[PERM11]`).
+- **Alternatives in one `exists`** — a `where` combines equalities with `$and`
+  and `$or`, so "a grant for this resource or for every resource, held as
+  writer or as manager" is one atom, read at one index lookup per equality:
+  `EXISTS (grants WHERE grantee = $author AND label IN ('writer', 'manager')
+  AND grants.resource IN (docs.resource, '*'))`. It has the verdicts of the
+  `OR` of one atom per combination, without the combinations
+  ([HIP-21](../../hips/0021-exists-where-or.md); see `[PERM23]` to `[PERM26]`).
 
 References are confined to **readonly** columns deliberately: a readonly value
 is fixed at insert, so the witness/operand is merge-stable (never

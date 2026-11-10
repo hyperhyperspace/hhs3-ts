@@ -22,6 +22,14 @@ canonical — these are not hashed) and transmitted as UTF-8 bytes over the
 topic channel. Framing is handled by the mux layer below; the sync
 protocol does not add its own length prefix.
 
+Every message MUST be a Literal (DAG spec §2.1). JSON text can carry
+what a Literal cannot: `null`, and a string with an unpaired surrogate
+written as an escape such as `"\ud800"`. A receiver MUST discard, whole, a
+message that fails to parse as JSON or that contains either of these,
+before it hashes or stores any part of it, and SHOULD report the
+delivering channel. A payload with an unpaired surrogate would otherwise
+hash like a different payload (the one with `U+FFFD` in its place).
+
 ## 3. Messages
 
 ### 3.1 Frontier Gossip

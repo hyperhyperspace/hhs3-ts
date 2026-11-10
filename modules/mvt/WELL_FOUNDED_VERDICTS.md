@@ -183,6 +183,10 @@ For a component of $n$ entries, the fixpoint runs at most $n + 1$ rounds, each s
 | A ring member revokes an outsider | the outsider loses the capability | `[PERM17]`, `[CAP34]` |
 | An `or` with one arm through a ring and a clean arm | the clean arm decides | `[PERM18]` |
 | An `exists` with a clean candidate beside one in a ring | holds | `[PERM19]` |
+| An `exists` over alternatives with a clean candidate through one arm and one in a ring through the other | holds | `[PERM23]` |
+| A ring member revokes an outsider, under a rule with alternatives | the outsider loses the capability: the outsider's cap is no candidate of the ring's rule | `[PERM24]` |
+| An update by a holder of a grant for every resource, concurrent with a delete of its row | live, as one `exists` and as two: only the arm that names the row reads it | `[PERM25]` |
+| Two such holders delete one row concurrently | both live, as one `exists` and as two | `[PERM26]` |
 | A bundle that rests on a ring and has a dead FK target | void for the FK | `[PERM20]` |
 | A revoke that a ring leaves undecided | void, reason `undecided-cycle` | `[PERM21]` |
 | Two concurrent revokes by one admin | independent, no cycle | `[PERM22]` |
@@ -193,6 +197,7 @@ For a component of $n$ entries, the fixpoint runs at most $n + 1$ rounds, each s
 | An rdb import that revokes a deleter, raced by the deleter's delete of the importer's admin row | both void, `undecided-cycle` | `[OBSFRAME11]` |
 | The importer observes again from the merge | live; the deleter's delete from the merge is refused at admission | `[OBSFRAME12]` |
 | An import that leaves the delete's read untouched | the delete decided live, the import void | `[OBSFRAME14]` |
+| An import that writes the slot of a column only one arm of the delete's `exists` names | the delete decided live through the other arm, the import void | `[OBSFRAME22]` |
 
 ### 5.3 Costs
 
@@ -274,7 +279,7 @@ A read during the solve can reach an entry not seen yet. It is resolved as a nor
 - **The memo dies with the evaluation.** A completed verdict is a pure function of its key, so a cache across computations would be sound, but none exists ([HIP-17](../../hips/0017-verdict-cache.md)). The public `isEntryVoided` creates an evaluation per call, so a per-entry sweep such as the REPL's `LOG` pays $O(n)$ per line.
 - **Reasons come from a final pass.** After the collapse, every member is evaluated once more with all values decided. A member that disagrees with its fixpoint value is a bug, and the engine throws.
 - **The engine checks monotonicity.** If the possibly-live set grows during the fixpoint, a rule is not monotone. The engine throws instead of looping or returning an order-dependent answer.
-- **Narrow reads keep components small.** Everything a diagnosis reads can join its component. Before rdb prefiltered `exists` candidates by payload, each member of a revoke ring read every manager cap's liveness, the outsider's included, which pulled `Ro` into the ring's component in `[PERM17]`.
+- **Narrow reads keep components small.** Everything a diagnosis reads can join its component. Before rdb prefiltered `exists` candidates by payload, each member of a revoke ring read every manager cap's liveness, the outsider's included, which pulled `Ro` into the ring's component in `[PERM17]`. An `exists` over a `where` tree keeps the same discipline leaf by leaf: a candidate is evaluated first on what its writes carry, and a leaf or group that no write of the row could satisfy is false with nothing read (`[PERM24]`).
 
 ### 6.4 What we learned
 
@@ -296,12 +301,12 @@ A read during the solve can reach an entry not seen yet. It is resolved as a nor
 
 - **mvt**, `test/verdict_evaluation_tests.ts`: `[VERDICT01]`–`[VERDICT09]`. Synthetic programs, each solved from every entry order: positive loops, even and odd rings, `p ← p; q ← not p`, a dependent of a collapsed core, arm order, growth, merge, a throwing diagnosis, and the Kleene helpers checked exact, sound and monotone.
 - **rdb**:
-  - `test/verdict_reads_tests.ts`: `[VREAD01]`–`[VREAD06]`. `[VREAD06]` checks every read rule exact, sound and monotone over every state of a small DAG.
-  - `test/rtable_perm_tests.ts`: `[PERM12]`–`[PERM22]` and `[PERM20b]`, the cases of Section 5.2.
+  - `test/verdict_reads_tests.ts`: `[VREAD01]`–`[VREAD10]`. `[VREAD06]` checks every read rule exact, sound and monotone over every state of a small DAG, reads of a `where` tree included. `[VREAD07]` checks an `exists` over a `where` tree against its distributed form in every state: the same value, on a support it contains. `[VREAD10]` is a model of that rule over small trees, checked in every state, with the arms the code computes checked against their definitions ([HIP-21](../../hips/0021-exists-where-or.md)).
+  - `test/rtable_perm_tests.ts`: `[PERM12]`–`[PERM26]` and `[PERM20b]`, the cases of Section 5.2.
   - `test/rtable_void_memo_tests.ts`: `[VOID_MEMO01]`, the memo on a long update chain.
   - `test/rtable_observe_gate_tests.ts`: `[OBSGATE07]`, interleaved computations on one group instance.
   - `test/touch_rule_tests.ts`: `[TOUCHR01]`–`[TOUCHR06]`, the touch rule checked against the reads at every completion of the pending observes: a decided read holds at each, and deciding an observe never undoes one.
-  - `test/observer_frame_tests.ts`: `[OBSFRAME11]`–`[OBSFRAME20]`, cores through observes, the cases of Section 5.2 and 5.3.
+  - `test/observer_frame_tests.ts`: `[OBSFRAME11]`–`[OBSFRAME20]` and `[OBSFRAME22]`, cores through observes, the cases of Section 5.2 and 5.3.
 - **std_types**, `test/rcap_tests.ts`: `[CAP32]`–`[CAP34]`, `[CAP36]`, `[CAP39]`, `[CAP44]`.
 
 ### 6.7 Background

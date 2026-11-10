@@ -11,7 +11,8 @@ Schema `ALLOW` predicates and catalog group gates (`ALLOW DEPLOY IF`, `ALLOW UPD
 - Unqualified names are allowed when they refer to exactly one in-scope table.
 - Use `table.column` (or `group.table.column` for cross-group `EXISTS` targets) when a bare name would be ambiguous.
 - `$author` names the operation author. The old `$row.column` surface syntax is removed; correlate to the gated row with `gatedTable.column` instead (lowered to `$row.column` in the IR).
-- Self-referential `EXISTS` (same table as the gated table) requires `EXISTS table AS alias WHERE alias.column = ...`.
+- Inside an `EXISTS` filter the same rule holds over two tables, the `EXISTS` table and the gated table: a bare name must be a column of exactly one of them. A name both have is an error that asks for a qualifier, and a name only the gated table has is a value, not a column to filter on. When the `EXISTS` table is in a bound group its columns are not known where the rule is compiled, so a bare name the gated table has is an error and any other bare name is the `EXISTS` table's. A gate has no gated table, so every bare name in its filters is the `EXISTS` table's.
+- Self-referential `EXISTS` (same table as the gated table) requires an alias, `EXISTS (table AS alias WHERE alias.column = ...)`, and every name in its filter is qualified, since both tables have it.
 - A catalog group gate is read in its group's own scope, as the group's schema rules are: `alias.table` names a table of the group bound to `alias`, through that binding's table map, and an unqualified table is the group's own. Each table a gate names must be qualified with one of the group's bindings or be a table of the group's schema at its pin.
 
 ## Quoted identifiers
@@ -42,7 +43,7 @@ CREATE SCHEMA shop VERSION '1.0.0' AS (
   TABLE products (
     sku string PUB READONLY,
     name string
-  ) ALLOW insert IF EXISTS users.caps WHERE label = 'writer' AND grantee = $author
+  ) ALLOW insert IF EXISTS (users.caps WHERE label = 'writer' AND grantee = $author)
 );
 
 CREATE CATALOG store CREATORS ($dev) VERSION '1.0.0'
@@ -54,8 +55,8 @@ AS (
                caps (label = 'manager', grantee = :admin)),
   TABLEGROUP shop_prod USING SCHEMA shop AT {#schemaVersion}
     BIND users => users USING IDENTITIES users.identities
-    ALLOW UPDATE REF users IF EXISTS users.caps WHERE users.caps.grantee = $author
-    ALLOW DEPLOY IF EXISTS users.caps WHERE label = 'deployer' AND grantee = $author
+    ALLOW UPDATE REF users IF EXISTS (users.caps WHERE users.caps.grantee = $author)
+    ALLOW DEPLOY IF EXISTS (users.caps WHERE label = 'deployer' AND grantee = $author)
 ) NOTE 'initial' BY $dev;
 
 CREATE DATABASE store_prod USING CATALOG store AT '1.0.0'
@@ -106,7 +107,7 @@ ALTER SCHEMA shop VERSION '1.1.0' AS (
   ADD COLUMN products.price integer DEFAULT 0,
   SET CONCURRENT DELETES products true,
   SET ALLOW RULES products (
-    ALLOW insert IF EXISTS users.caps WHERE label = 'writer' AND grantee = $author,
+    ALLOW insert IF EXISTS (users.caps WHERE label = 'writer' AND grantee = $author),
     ALLOW update IF rowAuthor = $author
   )
 );
@@ -149,7 +150,7 @@ CREATE CATALOG editor CREATORS ($admin) VERSION '1.0.0' PARAMS (:admin identity)
   TABLEGROUP user USING SCHEMA hhs:user AT LATEST USING IDENTITIES identities ...,
   FILES media
     USING IDENTITIES user.identities
-    ALLOW WRITE IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author
+    ALLOW WRITE IF EXISTS (user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author)
 ) BY $admin;
 
 ALTER CATALOG editor VERSION '1.1.0' AS (
@@ -226,12 +227,19 @@ sum        = product { ( "+" | "-" ) product } ;
 product    = unary { "*" unary } ;
 unary      = "-" unary | primary ;
 primary    = "(" condition ")"
-           | "EXISTS" table [ "AS" alias ] "WHERE" condition
+           | "EXISTS" "(" table [ "AS" alias ] "WHERE" filter ")"
            | "length" "(" sum ")"
            | column | literal | variable | hash | "publicKey" "(" value ")" | json ;
 column     = [ qualifier "." ] name ;
 literal    = string | number | "TRUE" | "FALSE" | "NULL" ;
 json       = "JSON" string | "[" ... "]" ;
+
+filter     = conj { "OR" conj } ;
+conj       = term { "AND" term } ;
+term       = "(" filter ")"
+           | column "=" value | value "=" column
+           | column "IN" "(" value { "," value } ")" ;
+value      = literal | variable | column ;   (* a column of the gated table *)
 ```
 
 - A string is single-quoted. `''` is a quote, and `\n`, `\r`, `\t` and `\\` are a line feed, carriage return, tab and backslash. A backslash before any other character is kept as it is (`'100\%'` is the five characters `100\%`), and `\'` is not a quote escape. A line break typed inside the quotes is part of the string.
@@ -239,9 +247,12 @@ json       = "JSON" string | "[" ... "]" ;
 - A condition must be a comparison, `LIKE`, `EXISTS`, `TRUE`/`FALSE`, or a `NOT`/`AND`/`OR` of conditions; a bare value (`WHERE name`) is an error, and so is a condition used as a value (`a = (b > 1)`).
 - `+`, `-` and `*` are left-associative; `a - b - c` means `(a - b) - c`. `length(x)` is the string length in UTF-16 code units, like JavaScript's `.length`. In payloads they become the `add`, `sub`, `mul` and `len` operand functions.
 - Unary minus applies only to numeric literals (`-1`, `-(2)`, `-1.5e-3`); for anything else write `0 - x`. Numbers are otherwise unsigned, with an optional fraction and exponent.
-- `EXISTS ... WHERE` takes the rest of the condition, so an `EXISTS` inside `AND` / `OR` needs parentheses: `(EXISTS t WHERE t.a = $author) OR b = 1`.
+- `EXISTS (table WHERE filter)` is true when some live row of `table` matches the filter. The parenthesis that matches `EXISTS (` ends it, and every parenthesis inside it groups, so an `EXISTS` needs no parentheses of its own inside `AND` / `OR`: `EXISTS (t WHERE t.a = $author) OR b = 1`. The form without parentheses, `EXISTS t WHERE ...`, is an error that shows this one.
+- A filter compares columns of the `EXISTS` table for equality and combines the comparisons with `AND`, `OR` and parentheses. The other side of a comparison is a literal, `$author`, a `:param`, or a column of the gated table. `column IN (v1, ..., vn)` stands for `column = v1 OR ... OR column = vn` and takes the same values. Other comparisons, `LIKE`, `NOT` and a nested `EXISTS` are errors: rows are found through the index of the exact values they carry.
+- In the payload a filter is the atom's `where` tree: a conjunction of equalities is one leaf, `{ column: value, ... }`, and `OR` and `IN` are `$or` groups, with `$and` for a conjunction that holds a group. `a = 1 OR a = 2` and `a IN (1, 2)` are the same payload, which renders as `IN`. A column may appear once in a conjunction: `a = x AND a = y` is an error, since it holds only when `x = y`, a comparison that belongs outside the `EXISTS`.
+- A filter is read as written, at one index lookup per equality. A column `DEFAULT` changes what an equality costs: a row that never wrote the column holds the default and is not in the index for it. Beside other equalities in an `AND`, a comparison with the default costs nothing, because the others find the rows. Under an `OR` nothing narrows it, so `role = 'member' OR ...` with `'member'` the default makes the `EXISTS` go through every row of the table until one matches, and it is true as soon as any row still holds the default.
 - An unparenthesized chain like `A AND B AND C` is one group; parenthesized groups keep their nesting, so `(A AND B) AND C` compiles to a group inside a group.
-- `ESCAPE` and `length` are contextual, not reserved: they are ordinary names outside these positions.
+- `ESCAPE`, `length` and `IN` are contextual, not reserved: they are ordinary names outside these positions. `IN` is an operator only inside an `EXISTS` filter.
 - In allow rules a quoted string may not start with `$`: payload strings starting with `$` are terms (`$author`, `$row.<col>`), so write `$author`, not `'$author'`. Queries have no terms, so `WHERE tag = '$x'` is a plain string comparison.
 
 ### LIKE
@@ -303,10 +314,21 @@ Allow rules are positive gates: an operation is permitted only when its predicat
 Row operations on a table:
 
 ```sql
-ALLOW insert IF EXISTS users.caps
+ALLOW insert IF EXISTS (users.caps
   WHERE label = 'writer'
-  AND grantee = $author
+  AND grantee = $author)
 ```
+
+One `EXISTS` can hold alternatives. On a table `docs` with a `resource` column, this rule admits an author who holds a writer or a manager grant, for the doc's resource or for every resource:
+
+```sql
+ALLOW insert IF EXISTS (grants
+  WHERE grantee = $author
+  AND label IN ('writer', 'manager')
+  AND grants.resource IN (docs.resource, '*'))
+```
+
+`grants.resource` is qualified because `docs` has a `resource` column too (see [Allow-rule column references](#allow-rule-column-references)). The rule has the outcome of the `OR` of four `EXISTS`, one per combination, and is read without listing them (see [Expressions](#expressions)).
 
 Each table or `SET ALLOW RULES` block accepts at most one expression per operation. Use `ALLOW all IF ...` for a shared insert/update/delete rule; do not combine it with operation-specific rules in the same block.
 
@@ -319,18 +341,18 @@ A rule that reads `$author` needs `USING IDENTITIES`: a `TABLEGROUP` without it 
 Deploy authority and ref-update authority are gates on a catalog group definition (`TABLEGROUP` / `ADD TABLEGROUP`):
 
 ```sql
-ALLOW DEPLOY IF EXISTS users.caps
+ALLOW DEPLOY IF EXISTS (users.caps
   WHERE label = 'deployer'
-  AND grantee = $author
+  AND grantee = $author)
 
-ALLOW UPDATE REF users IF EXISTS users.caps
+ALLOW UPDATE REF users IF EXISTS (users.caps
   WHERE label = 'manager'
-  AND grantee = $author
+  AND grantee = $author)
 ```
 
 `ALLOW DEPLOY IF ...` is evaluated when a schema version is deployed to the group (by the catalog planner, for `UPDATE CATALOG`). Without it, the group of a database with creators accepts deploys from those creators only, whose keys the group embeds for verification, with or without `USING IDENTITIES`. `ALLOW UPDATE REF <binding> IF ...` gates who may advance the observed version of a bound foreign group via `UPDATE REF`. Both use object context: `$author` is available, but there is no subject row, and a gate that reads it needs `USING IDENTITIES`.
 
-Both gates name tables in the group's scope (see [Allow-rule column references](#allow-rule-column-references)). `ALLOW UPDATE REF users IF EXISTS users.caps ...` reads the version of `users` being imported, so an author may import a version in which they hold the capability. A gate on one binding may also read another binding, or the group's own tables: those it reads as a row's `ALLOW` rule does, at the position of the update. Gates may not read each other's bindings in a cycle: a gate on `a` that reads `b.caps` and a gate on `b` that reads `a.caps` are rejected when the group is created.
+Both gates name tables in the group's scope (see [Allow-rule column references](#allow-rule-column-references)). `ALLOW UPDATE REF users IF EXISTS (users.caps ...)` reads the version of `users` being imported, so an author may import a version in which they hold the capability. A gate on one binding may also read another binding, or the group's own tables: those it reads as a row's `ALLOW` rule does, at the position of the update. Gates may not read each other's bindings in a cycle: a gate on `a` that reads `b.caps` and a gate on `b` that reads `a.caps` are rejected when the group is created.
 
 A deploy or ref update is signed only when its gate reads `$author`. The planner signs such deploys with the statement's author. `UPDATE REF` without `BY` signs with the default author when the binding's gate reads `$author`, and is unauthored otherwise. A gate that reads `$author` requires an authored `UPDATE REF`; the other bindings accept `BY NOBODY`.
 
@@ -394,8 +416,8 @@ CREATE SCHEMA users_schema CREATORS ($admin) AS (
     label string PUB READONLY,
     grantee string PUB READONLY
   ) CONCURRENT DELETES
-    ALLOW insert IF EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
-    ALLOW delete IF grantee = $author OR EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
+    ALLOW insert IF EXISTS (caps AS c WHERE c.label = 'manager' AND c.grantee = $author)
+    ALLOW delete IF grantee = $author OR EXISTS (caps AS c WHERE c.label = 'manager' AND c.grantee = $author)
 );
 
 CREATE CATALOG users_catalog VERSION '1.0.0' PARAMS (:admin identity) AS (
@@ -470,4 +492,4 @@ Generated scripts never rely on workspace-wide name uniqueness: they select thei
 
 C-SQL mistakes return `{ ok: false, diagnostics }` where possible. Diagnostics carry a code, message, severity, and source span. Infrastructure errors from underlying RDb/DAG operations are surfaced as execution diagnostics.
 
-**HIPs:** [3](../../hips/0003-schema-composability.md), [4](../../hips/0004-import-patches.md), [14](../../hips/0014-observer-frame-ref.md)
+**HIPs:** [3](../../hips/0003-schema-composability.md), [4](../../hips/0004-import-patches.md), [14](../../hips/0014-observer-frame-ref.md), [21](../../hips/0021-exists-where-or.md)

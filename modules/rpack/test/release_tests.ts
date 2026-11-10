@@ -20,7 +20,7 @@ export const V110 = withTags(EDITOR_SOURCE.replace('deleted boolean', 'deleted b
 
 export const V200 = V110
     .replace("    title string,\n", "    title string(200) DEFAULT '',\n")
-    .replace(/,\n\n  TABLE blocks \([\s\S]*?\$author\n/, '\n');
+    .replace(/,\n\n  TABLE blocks \([\s\S]*?\$author\)\n/, '\n');
 
 export const RESET = 'ALTER SCHEMA hhs:doc AS (\n  DROP COLUMN pages.title\n);\n';
 
@@ -395,7 +395,7 @@ export const releaseTests = [
             const unlock = (label: string) => dev.vault.unlock(label, PASSPHRASE);
             const media = EDITOR_SOURCE
                 .replace('  TABLE caps (', '  TABLE uploaders (\n    grantee identity PUB READONLY\n  ),\n\n  TABLE caps (')
-                .replace(/\n\);\n$/, ',\n  FILES media\n    USING IDENTITIES user.identities\n    ALLOW WRITE IF EXISTS user.uploaders WHERE user.uploaders.grantee = $author\n);\n');
+                .replace(/\n\);\n$/, ',\n  FILES media\n    USING IDENTITIES user.identities\n    ALLOW WRITE IF EXISTS (user.uploaders WHERE user.uploaders.grantee = $author)\n);\n');
             const stillListed = media.replace('  TABLE uploaders (\n    grantee identity PUB READONLY\n  ),\n\n', '');
 
             await initProject(project, 'editor', 'dev');
@@ -565,6 +565,48 @@ export const releaseTests = [
             const log = (await logReleases(ctx)).join('\n');
             assertTrue(!log.includes('no higher release includes it') && !log.includes('changed since release'), `the chain is whole and as released:\n${log}`);
             assertTrue(/^1\.3\.0 +[0-9a-f]{8}  after 1\.2\.0$/m.test(log), `1.3.0 follows the new 1.2.0:\n${log}`);
+        },
+    },
+    {
+        name: '[RPACK26] a folder released with EXISTS in the grammar before HIP-21: build says its update.sql differs and names --force, and the re-release makes it as released again',
+        invoke: async () => {
+            const dev = await devKeys();
+            const project = new MemoryProject();
+            const ctx: RpackContext = { project, vault: dev.vault };
+            const unlock = (label: string) => dev.vault.unlock(label, PASSPHRASE);
+
+            await initProject(project, 'editor', 'dev');
+            await newVersion(ctx, '1.0.0');
+            await project.write(at('1.0.0', 'target-catalog.sql'), EDITOR_SOURCE);
+            const r100 = (await releaseVersion(ctx, '1.0.0', unlock)).produced.name;
+            const releaseFile = project.files.get(`releases/${r100}.rpack`)!;
+            assertTrue(!releaseFile.includes('EXISTS'), 'a release file holds payloads, no rule text');
+
+            // .released/ as a folder released before the change holds it: the source and
+            // the update.sql with EXISTS written without its parentheses
+            const before = (text: string) => text.replace(/EXISTS \(([^()]*)\)/g, 'EXISTS $1');
+            for (const file of ['target-catalog.sql', 'update.sql']) {
+                const text = project.files.get(at('1.0.0', `.released/${file}`))!;
+                assertTrue(text.includes('EXISTS (caps AS c WHERE'), `.released/${file} holds the rules as text`);
+                await project.write(at('1.0.0', `.released/${file}`), before(text));
+            }
+            assertTrue(project.files.get(at('1.0.0', '.released/update.sql'))!.includes("IF EXISTS caps AS c WHERE c.label = 'manager'"), 'now in the old form');
+
+            const built = await buildVersion(ctx, '1.0.0');
+            assertEquals(built.matches, false, 'the re-rendered update.sql is not the released text');
+            assertEquals(built.lines[1], `It differs from the update.sql ${r100} was released with: rpack release --force re-releases 1.0.0`,
+                `build names the way out:\n${built.lines.join('\n')}`);
+            assertEquals((await statusOf(ctx, '1.0.0')).lines[4], `Released as ${r100}; changed since release`, 'status marks the folder');
+
+            const redone = await releaseVersion(ctx, '1.0.0', unlock, { force: true, confirm: async () => true });
+            const now = redone.produced.name;
+            assertEquals(project.files.get(at('1.0.0', '.released/target-catalog.sql')), EDITOR_SOURCE, '.released/ holds the source as it is written now');
+            assertTrue(!project.files.get(at('1.0.0', '.released/update.sql'))!.includes('EXISTS caps'), 'and an update.sql in the new form');
+            const rebuilt = await buildVersion(ctx, '1.0.0');
+            assertEquals(rebuilt.matches, true, 'the build is the released update.sql again');
+            assertEquals(rebuilt.lines[1], `It is the update.sql ${now} was released with`, `and build says so:\n${rebuilt.lines.join('\n')}`);
+            assertEquals((await statusOf(ctx, '1.0.0')).lines[4], `Released as ${now}`, 'the folder is as released');
+            assertTrue((await verifyRelease(project.files.get(`releases/${now}.rpack`)!)).ok, 'the new file verifies');
         },
     },
 ];

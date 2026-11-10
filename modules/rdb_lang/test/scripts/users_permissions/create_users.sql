@@ -8,6 +8,6 @@ CREATE SCHEMA users_schema CREATORS ($admin) AS (
     label string PUB READONLY,
     grantee string PUB READONLY
   ) CONCURRENT DELETES
-    ALLOW insert IF EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
-    ALLOW delete IF grantee = $author OR EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
+    ALLOW insert IF EXISTS (caps AS c WHERE c.label = 'manager' AND c.grantee = $author)
+    ALLOW delete IF grantee = $author OR EXISTS (caps AS c WHERE c.label = 'manager' AND c.grantee = $author)
 );

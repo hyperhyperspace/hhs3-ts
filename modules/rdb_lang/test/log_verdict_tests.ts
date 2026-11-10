@@ -24,7 +24,7 @@ async function voidedInsertEnv(): Promise<LangEnv> {
           ) ALLOW all IF true,
           TABLE items (
             name string
-          ) ALLOW insert IF EXISTS caps WHERE label = 'grant'
+          ) ALLOW insert IF EXISTS (caps WHERE label = 'grant')
         );
         CREATE CATALOG shop_catalog VERSION '1.0.0' AS (TABLEGROUP shop_prod USING SCHEMA shop);
         CREATE DATABASE shop_db USING CATALOG shop_catalog;
@@ -158,7 +158,7 @@ export const logVerdictTests = {
                         WITH ROWS (identities (keyId = $admin, publicKey = publicKey($admin)), identities (keyId = $carol, publicKey = publicKey($carol))),
                       TABLEGROUP doc USING SCHEMA docs BIND users => users USING IDENTITIES users.identities
                         WITH ROWS (admins (key = $admin), admins (key = $carol))
-                        ALLOW UPDATE REF users IF EXISTS admins WHERE key = $author
+                        ALLOW UPDATE REF users IF EXISTS (admins WHERE key = $author)
                     );
                     CREATE DATABASE db USING CATALOG cat;
                 `);
@@ -194,8 +194,8 @@ export const logVerdictTests = {
                         label string PUB READONLY,
                         grantee string PUB READONLY
                       ) CONCURRENT DELETES
-                        ALLOW insert IF EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
-                        ALLOW delete IF grantee = $author OR EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
+                        ALLOW insert IF EXISTS (caps AS c WHERE c.label = 'manager' AND c.grantee = $author)
+                        ALLOW delete IF grantee = $author OR EXISTS (caps AS c WHERE c.label = 'manager' AND c.grantee = $author)
                     );
                     CREATE CATALOG users_catalog VERSION '1.0.0' AS (
                       TABLEGROUP users USING SCHEMA users_schema

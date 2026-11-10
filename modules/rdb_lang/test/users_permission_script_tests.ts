@@ -228,7 +228,7 @@ export const usersPermissionScriptTests = {
                       TABLEGROUP docs_gated USING SCHEMA docs_gated_schema
                         BIND users => users
                         USING IDENTITIES users.identities
-                        ALLOW UPDATE REF users IF EXISTS users.caps WHERE label = 'manager' AND grantee = $author,
+                        ALLOW UPDATE REF users IF EXISTS (users.caps WHERE label = 'manager' AND grantee = $author),
                       TABLEGROUP docs_group USING SCHEMA docs_schema
                         BIND users => users
                         USING IDENTITIES users.identities

@@ -15,8 +15,8 @@ CREATE SCHEMA hhs:user CREATORS ($admin) VERSION '1.0.0' AS (
     label string PUB READONLY,
     grantee identity PUB READONLY
   ) CONCURRENT DELETES
-    ALLOW insert IF EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
-    ALLOW delete IF caps.grantee = $author OR EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author,
+    ALLOW insert IF EXISTS (caps AS c WHERE c.label = 'manager' AND c.grantee = $author)
+    ALLOW delete IF caps.grantee = $author OR EXISTS (caps AS c WHERE c.label = 'manager' AND c.grantee = $author),
   
   TABLE profiles (
     ownerId string PUB READONLY REFERENCES identities,
@@ -26,7 +26,7 @@ CREATE SCHEMA hhs:user CREATORS ($admin) VERSION '1.0.0' AS (
     avatarUrl string NULL PUB,
     email string NULL
   )
-    ALLOW insert IF EXISTS identities WHERE identities.keyId = profiles.keyId
+    ALLOW insert IF EXISTS (identities WHERE identities.keyId = profiles.keyId)
     ALLOW update IF profiles.keyId = $author
     ALLOW delete IF profiles.keyId = $author
 );
@@ -36,14 +36,14 @@ CREATE SCHEMA hhs:doc CREATORS ($admin) VERSION '1.0.0' AS (
   TABLE pages (
     title string,
     deleted boolean,
-  ) ALLOW insert IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author
-    ALLOW update IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author
+  ) ALLOW insert IF EXISTS (user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author)
+    ALLOW update IF EXISTS (user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author)
     ALLOW delete IF false,
 
   TABLE blocks (
     pageId string READONLY REFERENCES pages,
     content string
-  ) ALLOW all IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author,
+  ) ALLOW all IF EXISTS (user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author),
 );
 
 -- The first release. :admin is supplied by whoever deploys the catalog, and
@@ -60,7 +60,7 @@ AS (
   TABLEGROUP doc USING SCHEMA hhs:doc AT LATEST
     BIND user => user
     USING IDENTITIES user.identities
-    ALLOW UPDATE REF user IF EXISTS user.caps WHERE user.caps.grantee = $author
+    ALLOW UPDATE REF user IF EXISTS (user.caps WHERE user.caps.grantee = $author)
 ) NOTE 'initial release' BY $admin;
 
 -- Deploying the release creates the database's user and doc groups. Later

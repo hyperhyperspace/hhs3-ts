@@ -1,7 +1,7 @@
 import { assertEquals } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 
 import { formatPredicate, formatRestrictionFailureReason, renderStringLiteral } from "../src/rschema/format_predicate.js";
-import type { Operand, Predicate } from "../src/rschema/payload.js";
+import type { Operand, Predicate, Where } from "../src/rschema/payload.js";
 import type { RowOpPayload } from "../src/rtable/payload.js";
 
 export const formatPredicateTests = {
@@ -18,14 +18,14 @@ export const formatPredicateTests = {
                 );
                 assertEquals(
                     formatPredicate({ p: 'exists', table: 'caps', where: { label: 'grant' } }),
-                    "EXISTS caps WHERE caps.label = 'grant'",
+                    "EXISTS (caps WHERE caps.label = 'grant')",
                 );
                 assertEquals(
                     formatPredicate(
                         { p: 'exists', table: 'profiles', where: { keyId: '$row.keyId' } },
                         { gatedTable: 'profiles' },
                     ),
-                    'EXISTS profiles AS p WHERE p.keyId = profiles.keyId',
+                    'EXISTS (profiles AS p WHERE p.keyId = profiles.keyId)',
                 );
                 assertEquals(
                     formatPredicate({
@@ -35,7 +35,7 @@ export const formatPredicateTests = {
                             { p: 'exists', table: 'caps', where: { label: 'manager' } },
                         ],
                     }),
-                    "keyId = $author AND (EXISTS caps WHERE caps.label = 'manager')",
+                    "keyId = $author AND EXISTS (caps WHERE caps.label = 'manager')",
                 );
                 assertEquals(
                     formatPredicate({
@@ -72,8 +72,60 @@ export const formatPredicateTests = {
                 assertEquals(formatPredicate({ p: 'or', args: [{ p: 'and', args: [a, b] }, c] }), 'a = 1 AND b = 2 OR c = 3', 'AND inside OR binds tighter anyway');
                 assertEquals(formatPredicate({ p: 'and', args: [{ p: 'and', args: [a, b] }, c] }), '(a = 1 AND b = 2) AND c = 3', 'a nested AND is kept apart from its parent');
                 assertEquals(formatPredicate({ p: 'or', args: [a, { p: 'or', args: [b, c] }] }), 'a = 1 OR (b = 2 OR c = 3)', 'a nested OR is kept apart from its parent');
-                assertEquals(formatPredicate({ p: 'or', args: [ex, a] }), '(EXISTS caps WHERE caps.grantee = $author) OR a = 1', 'EXISTS inside a group');
-                assertEquals(formatPredicate(ex), 'EXISTS caps WHERE caps.grantee = $author', 'top-level EXISTS needs no parens');
+                assertEquals(formatPredicate({ p: 'or', args: [ex, a] }), 'EXISTS (caps WHERE caps.grantee = $author) OR a = 1', 'EXISTS inside a group brings its own parentheses');
+                assertEquals(formatPredicate({ p: 'and', args: [a, ex, { p: 'or', args: [ex, b] }] }),
+                    'a = 1 AND EXISTS (caps WHERE caps.grantee = $author) AND (EXISTS (caps WHERE caps.grantee = $author) OR b = 2)',
+                    'no parentheses around an EXISTS member, only around the nested OR');
+                assertEquals(formatPredicate(ex), 'EXISTS (caps WHERE caps.grantee = $author)', 'top-level EXISTS');
+            },
+        },
+        {
+            name: '[FORMAT01g] formatPredicate renders a where tree: a leaf as a conjunction, IN for an $or of one-field leaves on one column, and the parentheses the filter needs',
+            invoke: async () => {
+                const exists = (where: Where, gatedTable?: string) => formatPredicate({ p: 'exists', table: 'grants', where }, { gatedTable });
+                const a = { a: 1 };
+                const b = { b: 2 };
+                const c = { c: 3 };
+
+                // leaves and IN
+                assertEquals(exists({ a: 1, b: 'x' }), "EXISTS (grants WHERE grants.a = 1 AND grants.b = 'x')", 'a leaf is its equalities joined by AND');
+                assertEquals(exists({ $or: [{ label: 'writer' }, { label: 'manager' }] }),
+                    "EXISTS (grants WHERE grants.label IN ('writer', 'manager'))", 'an $or of one-field leaves on one column is IN');
+                assertEquals(exists({ $or: [{ label: 'writer' }, { label: 'writer' }] }),
+                    "EXISTS (grants WHERE grants.label IN ('writer', 'writer'))", 'equal members are repeated');
+                assertEquals(exists({ $or: [{ grantee: '$author' }, { grantee: 'public' }, { grantee: '$param.guest' }, { grantee: '$row.owner' }] }, 'docs'),
+                    "EXISTS (grants WHERE grants.grantee IN ($author, 'public', :guest, docs.owner))", 'a list holds every kind of value');
+                assertEquals(exists({ $or: [a, b] }), 'EXISTS (grants WHERE grants.a = 1 OR grants.b = 2)', 'leaves on different columns stay an OR');
+                assertEquals(exists({ $or: [{ a: 1 }, { a: 2, b: 3 }] }), 'EXISTS (grants WHERE grants.a = 1 OR grants.a = 2 AND grants.b = 3)',
+                    'a leaf of two fields keeps the group an OR, and needs no parentheses inside it');
+
+                // the example rule of HIP-21
+                assertEquals(exists({ $and: [
+                    { grantee: '$author' },
+                    { $or: [{ label: 'writer' }, { label: 'manager' }] },
+                    { $or: [{ resource: '$row.resource' }, { resource: '*' }] },
+                ] }, 'docs'),
+                    "EXISTS (grants WHERE grants.grantee = $author AND grants.label IN ('writer', 'manager') AND grants.resource IN (docs.resource, '*'))",
+                    'IN lists beside a leaf, under an $and');
+
+                // parentheses
+                assertEquals(exists({ $and: [a, { $or: [b, c] }] }), 'EXISTS (grants WHERE grants.a = 1 AND (grants.b = 2 OR grants.c = 3))', 'an $or inside an $and');
+                assertEquals(exists({ $or: [a, { $and: [b, { $or: [c, a] }] }] }),
+                    'EXISTS (grants WHERE grants.a = 1 OR grants.b = 2 AND (grants.c = 3 OR grants.a = 1))', 'an $and inside an $or binds tighter anyway');
+                assertEquals(exists({ $or: [a, { $or: [b, c] }] }), 'EXISTS (grants WHERE grants.a = 1 OR (grants.b = 2 OR grants.c = 3))', 'a nested $or is kept apart from its parent');
+                assertEquals(exists({ $and: [{ $and: [a, { $or: [b, c] }] }, { $or: [c, a] }] }),
+                    'EXISTS (grants WHERE (grants.a = 1 AND (grants.b = 2 OR grants.c = 3)) AND (grants.c = 3 OR grants.a = 1))', 'a nested $and is kept apart from its parent');
+                assertEquals(exists({ $or: [{ $or: [{ a: 1 }, { a: 2 }] }, c] }), 'EXISTS (grants WHERE grants.a IN (1, 2) OR grants.c = 3)',
+                    'an IN list is one term: no parentheses inside a group of its kind');
+                assertEquals(exists({ $and: [{ $or: [{ a: 1 }, { a: 2 }] }, { $or: [{ b: 1 }, { b: 2 }] }] }), 'EXISTS (grants WHERE grants.a IN (1, 2) AND grants.b IN (1, 2))',
+                    'nor inside an $and');
+                assertEquals(exists({ $and: [{ $or: [b, c] }, { a: 1, b: 2 }] }), 'EXISTS (grants WHERE (grants.b = 2 OR grants.c = 3) AND grants.a = 1 AND grants.b = 2)',
+                    'a leaf after a group keeps its place');
+
+                // the alias of a self-referential EXISTS qualifies every column of the tree
+                assertEquals(
+                    formatPredicate({ p: 'exists', table: 'docs', where: { $or: [{ owner: '$author' }, { owner: '$row.owner', kind: 'shared' }] } }, { gatedTable: 'docs' }),
+                    "EXISTS (docs AS d WHERE d.owner = $author OR d.owner = docs.owner AND d.kind = 'shared')", 'the alias qualifies every column');
             },
         },
         {
@@ -107,7 +159,7 @@ export const formatPredicateTests = {
                     '"table"."identity" = $author');
                 assertEquals(
                     formatPredicate({ p: 'exists', table: 'users.identity', where: { identity: '$row.identity' } }, { gatedTable: 'endpoints', quoteIdent }),
-                    'EXISTS users."identity" WHERE users."identity"."identity" = endpoints."identity"');
+                    'EXISTS (users."identity" WHERE users."identity"."identity" = endpoints."identity")');
             },
         },
         {
@@ -116,7 +168,7 @@ export const formatPredicateTests = {
                 const long = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
                 assertEquals(
                     formatPredicate({ p: 'exists', table: 'docs', where: { meta: { tags: ["it's", 'a\nb'], n: -0 }, seq: long } }),
-                    `EXISTS docs WHERE docs.meta = JSON '{"n":0,"tags":["it''s","a\\\\nb"]}' AND docs.seq = JSON '[0,1,2,3,4,5,6,7,8,9,10,11]'`,
+                    `EXISTS (docs WHERE docs.meta = JSON '{"n":0,"tags":["it''s","a\\\\nb"]}' AND docs.seq = JSON '[0,1,2,3,4,5,6,7,8,9,10,11]')`,
                     'objects and arrays render as JSON literals, arrays in order');
             },
         },
@@ -167,7 +219,7 @@ export const formatPredicateTests = {
                         rowId: 'abc123=',
                         rule: { p: 'exists', table: 'caps', where: { label: 'grant' } },
                     }),
-                    "items insert on row 'abc123=' does not satisfy ALLOW insert IF EXISTS caps WHERE caps.label = 'grant'",
+                    "items insert on row 'abc123=' does not satisfy ALLOW insert IF EXISTS (caps WHERE caps.label = 'grant')",
                 );
                 assertEquals(
                     formatOpVoidDetail({
@@ -175,7 +227,7 @@ export const formatPredicateTests = {
                         binding: 'users',
                         rule: { p: 'exists', table: 'caps', where: { label: 'manager', grantee: '$author' } },
                     }),
-                    "canObserve predicate rejected observation of 'users': EXISTS caps WHERE caps.label = 'manager' AND caps.grantee = $author",
+                    "canObserve predicate rejected observation of 'users': EXISTS (caps WHERE caps.label = 'manager' AND caps.grantee = $author)",
                 );
             },
         },

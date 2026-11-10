@@ -24,6 +24,7 @@ type Expr =
     | { e: 'not'; arg: Expr; span: TextSpan }
     | { e: 'cmp'; op: CmpOperator; left: Expr; right: Expr; span: TextSpan }
     | { e: 'like'; left: Expr; pattern: Expr; escape?: string; span: TextSpan }
+    | { e: 'in'; left: Expr; values: Expr[]; span: TextSpan }
     | { e: 'arith'; op: '+' | '-' | '*'; left: Expr; right: Expr; span: TextSpan }
     | { e: 'neg'; arg: Expr; span: TextSpan }
     | { e: 'length'; arg: Expr; span: TextSpan }
@@ -48,6 +49,9 @@ class Parser {
     private readonly diagnostics = new DiagnosticBag();
     private readonly constants = new Map<string, { value: string | number | boolean; span: TextSpan }>();
     private readonly declaredParams = new Set<string>();
+    // How many EXISTS filters enclose the expression being parsed: IN is an
+    // operator only inside one, and an EXISTS cannot appear there.
+    private existsFilters = 0;
 
     constructor(
         private readonly source: string,
@@ -1572,6 +1576,16 @@ class Parser {
             }
             return like;
         }
+        // IN is contextual (not reserved): an operator only after an operand
+        // inside an EXISTS filter, and an ordinary name everywhere else.
+        if (this.existsFilters > 0 && this.checkContextual('IN')) {
+            this.advance();
+            this.expectPunctuation('(');
+            const values = [this.parseAddExpr()];
+            while (this.matchPunctuation(',')) values.push(this.parseAddExpr());
+            const end = this.expectPunctuation(')').span;
+            return { e: 'in', left, values, span: combineSpans(left.span, end) };
+        }
         return left;
     }
 
@@ -1630,24 +1644,40 @@ class Parser {
         return { e: 'operand', operand: value, span: value.span };
     }
 
+    // EXISTS (table [AS alias] WHERE filter): the parenthesis that matches
+    // `EXISTS (` ends the atom, and every parenthesis inside it groups.
+    //
+    // The form without parentheses, `EXISTS table [AS alias] WHERE condition`,
+    // is not accepted: its WHERE took the rest of the condition. It is still
+    // read to the end, to report one error that shows the new form.
     private parseExistsRest(start: TextSpan): PredicateExpr {
+        if (this.existsFilters > 0) {
+            this.diagnostics.add('PARSE_UNEXPECTED_TOKEN', 'EXISTS cannot appear inside the filter of another EXISTS', start);
+        }
+        const delimited = this.matchPunctuation('(');
         const table = this.expectIdentifierToken('EXISTS table');
         let alias: string | undefined;
         if (this.matchKeyword('AS')) {
             alias = this.expectIdentifierToken('EXISTS alias').text;
         }
+        if (!delimited) {
+            const shown = alias !== undefined ? `${table.text} AS ${alias}` : table.text;
+            this.diagnostics.add('PARSE_EXPECTED_TOKEN',
+                `EXISTS takes its table and filter in parentheses: write EXISTS (${shown} WHERE ...)`, combineSpans(start, table.span));
+        }
         let where: PredicateExpr | undefined;
         let end = alias !== undefined ? this.previous().span : table.span;
-        // WHERE takes the rest of the expression: an EXISTS inside AND / OR
-        // must be parenthesized to end its WHERE early.
         if (this.matchKeyword('WHERE')) {
+            this.existsFilters++;
             where = this.parsePredicate();
+            this.existsFilters--;
             end = where.span;
         }
         if (where === undefined) {
             this.diagnostics.add('PARSE_EXPECTED_TOKEN', 'EXISTS requires a WHERE clause', table.span);
             where = { kind: 'false', span: table.span };
         }
+        if (delimited) end = this.expectPunctuation(')').span;
         return { kind: 'exists', table: table.text, alias, where, span: combineSpans(start, end) };
     }
 
@@ -1677,6 +1707,8 @@ class Parser {
                 if (expr.escape !== undefined) like.escape = expr.escape;
                 return like;
             }
+            case 'in':
+                return { kind: 'in', left: this.toOperand(expr.left), values: expr.values.map((v) => this.toOperand(v)), span: expr.span };
             case 'pred':
                 return expr.pred;
             case 'operand':

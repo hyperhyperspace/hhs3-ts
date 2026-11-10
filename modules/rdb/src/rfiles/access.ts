@@ -29,7 +29,7 @@ import {
 } from "@hyper-hyper-space/hhs3_mvt";
 
 import {
-    Predicate, TableDef, splitTableRef, MAX_NAME_LENGTH, MAX_QUALIFIED_NAME_LENGTH, MAX_HASH_LENGTH,
+    Predicate, TableDef, splitTableRef, whereEqualities, MAX_NAME_LENGTH, MAX_QUALIFIED_NAME_LENGTH, MAX_HASH_LENGTH,
     MAX_KEY_ID_LENGTH, MAX_SIGNATURE_LENGTH,
 } from "../rschema/payload.js";
 import { isValidName, validatePredicate, collectExistsAtoms, type ExistsAtom } from "../rschema/validate.js";
@@ -103,7 +103,7 @@ export function existsAtomReason(
     const [, table] = splitTableRef(atom.table);
     const def = getTable(table);
     if (def === undefined) return `ALLOW WRITE IF reads ${atom.table}: schema ${schemaName} has no table ${table}`;
-    for (const field of Object.keys(atom.where ?? {})) {
+    for (const [field] of whereEqualities(atom.where)) {
         if (field === 'rowAuthor') continue;
         const column = def.columns[field];
         if (column === undefined) return `ALLOW WRITE IF reads ${atom.table}.${field}, which ${table} doesn't have`;

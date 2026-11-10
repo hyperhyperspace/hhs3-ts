@@ -170,17 +170,64 @@ none.
   (`[VREAD01]`), while an undecided update that does not write `grantee` never
   meets that read (`[VREAD02]`).
 - **`cmp` / `like`:** undecided if an operand is.
-- **`$row` atom:** the `and` of the subject row's liveness and the atom on its
-  value, so a dead subject row still makes every `$row` atom false, and an
-  undecided insert makes them undecided (`[VREAD03]`). The update overlay is
-  static: a column the op itself writes is never undecided.
-- **`exists`:** the `or`, over candidate rows, of "every field matches and the
-  row is live". Candidates come from the index field, then a payload-only
-  prefilter (each other field must be carried by some insert or update of the
-  row, unless its default is the searched value), then values are checked
-  before liveness. So a row that no write could make match is never read, and
-  its verdict never joins a component (`[PERM19]`, `[PERM22]`). An `exists`
-  whose where clause uses an undecided `$row` value is undecided.
+- **`$row` atom (`cmp` / `like`):** the `and` of the subject row's liveness and
+  the atom on its value, so a dead subject row still makes every such atom
+  false, and an undecided insert makes them undecided (`[VREAD03]`). The update
+  overlay is static: a column the op itself writes is never undecided.
+- **`exists`:** whether some live row of the target table matches the atom's
+  `where`. The `where` is a tree: a *leaf* maps columns to the values they must
+  equal (every field holds), and a group is an `$and` or an `$or` of leaves and
+  groups. A *way* of satisfying the tree picks one member of every `$or` on its
+  path, so it is a conjunction of leaves. The atom has the value of the `or` of
+  one single-leaf atom per way (its *distributed form*), on a support that is no
+  larger, and never builds that form
+  ([HIP-21](../../hips/0021-exists-where-or.md)). The read has four parts.
+  - *Terms.* `$author`, `$param.<name>` and `$row.<col>` are resolved first. A
+    leaf with a term that has no value is false (`$author` of an anonymous op,
+    an absent parameter, a subject column with no value), and the tree
+    simplifies: an `$and` with a false member is false, and an `$or` loses its
+    false members. A leaf that names an undecided subject value is *set aside*.
+  - *Touched leaves.* While observes of the target's group are pending (see the
+    fold of observes below), a leaf that is not set aside is *touched* when a
+    pending observe writes the table's existence slot or the slot of a column
+    the leaf names. Slots are checked per leaf, so an observe that writes a
+    column only one arm names leaves the other arms decided (`[OBSFRAME22]`).
+  - *The read of the tree.* A field is *carried* by a row when an insert or
+    update of the row carries its value, or when the value is the column's
+    default, which a row that never wrote the column holds too. Candidates are
+    the tree evaluated over sets of rows, before any verdict is read: a field
+    is its carriers, found through the index; a leaf and an `$and` intersect
+    their members and an `$or` unites them. A field at its default stands for
+    every inserted row, which are listed only when that is the set of the whole
+    tree. Each candidate is then evaluated in two passes: on "carried" alone,
+    where a leaf or group that is false is false on the row with nothing read,
+    and then with the three-valued reads on what is left, values before
+    liveness. So a row that no write could make match is never read, and its
+    verdict never joins a component (`[PERM19]`, `[PERM22]`, `[PERM24]`). The
+    reads take leaves set aside and touched leaves as false. `R` reads the whole
+    tree, `R0` also takes every leaf that names a `$row` term as false, and `R$`
+    counts only the matches through such a leaf.
+  - *The other arms* come from the tree's structure and read nothing. `X` is
+    undecided on the subject values of the leaves set aside. `T0` is undecided
+    on the observes that touch leaves lying on a way with no `$row` leaf and no
+    leaf set aside, and `T$` on those that touch leaves lying on a way with a
+    `$row` leaf and no leaf set aside.
+
+  They combine by the subject row's liveness `S`:
+
+  | The subject row is | The atom is |
+  | :--- | :--- |
+  | not read (no leaf names it) | `or(R, T0)` |
+  | not live | `or(R0, T0)` |
+  | live | `or(R, X, T$, T0)` |
+  | undecided | `or(R0, T0, and(S, or(R$, X, T$)))` |
+
+  With one leaf this is: false on a term with no value or on a subject row that
+  is not live, `and(S, undecided)` on an undecided subject value, undecided on a
+  touched slot, and otherwise `and(S, the read)`. Because supports decide which
+  entries end up in a component together, a stored tree is never rewritten into
+  its distributed form or back (`[VREAD07]` checks the tree against that form
+  in every state, and `[VREAD10]` checks the rule itself on small trees).
 - **The fold of observes:** a read of a bound group goes through the fold of
   the observer's observes of it, one see-through walk like a column read: a
   live observe contributes its published version, a void one is seen through,

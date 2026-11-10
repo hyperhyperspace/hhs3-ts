@@ -1,7 +1,7 @@
 import type { json } from "@hyper-hyper-space/hhs3_json";
-import type { Operand, Predicate, RuleOperand } from "@hyper-hyper-space/hhs3_rdb";
+import type { Operand, Predicate, RuleOperand, Where, WhereLeaf, WhereValue } from "@hyper-hyper-space/hhs3_rdb";
 import type { RowFilter, RowQuery } from "@hyper-hyper-space/hhs3_rdb";
-import { isValidLikePattern } from "@hyper-hyper-space/hhs3_rdb";
+import { isValidLikePattern, parseParamTerm, parseRowFieldTerm, whereGroup } from "@hyper-hyper-space/hhs3_rdb";
 
 import type { OperandExpr, PredicateExpr, SelectStatement, ValueExpr } from "../syntax/ast.js";
 import type { LangBindContext } from "../bind/context.js";
@@ -71,6 +71,8 @@ export async function lowerRowFilter(expr: PredicateExpr, context: LangBindConte
             return { p: 'or', args: await Promise.all(expr.args.map((a) => lowerRowFilter(a, context))) };
         case 'exists':
             throw new Error('EXISTS is only supported in schema allow rules');
+        case 'in':
+            throw new Error('IN is only supported inside an EXISTS filter');
     }
 }
 
@@ -166,6 +168,8 @@ export function lowerRestrictionPredicate(expr: PredicateExpr, scope: RuleScope 
             };
             return { p: 'exists', table: expr.table, where: lowerExistsWhere(expr.where, existsScope) };
         }
+        case 'in':
+            throw new Error('IN is only supported inside an EXISTS filter');
         case 'not':
             throw new Error('NOT is not supported in schema allow rules');
         case 'and':
@@ -175,61 +179,118 @@ export function lowerRestrictionPredicate(expr: PredicateExpr, scope: RuleScope 
     }
 }
 
-function lowerExistsWhere(expr: PredicateExpr, scope: RuleScope): { [field: string]: json.Literal | '$author' | string } {
-    if (expr.kind === 'comparison' && expr.op === '=') {
-        return lowerExistsEquality(expr.left, expr.right, scope);
+// The filter of an EXISTS, lowered to the atom's `where` tree:
+//
+//   - an equality is a one-field leaf;
+//   - an AND lowers its members and merges the leaves among them into one, at
+//     the position of the first; groups stay members, and when only the leaf
+//     is left the result is the leaf. So a conjunction of equalities is always
+//     one leaf, parenthesized or not;
+//   - an OR is an `$or` of its lowered members;
+//   - `c IN (v1, ..., vn)` is the `$or` of the leaves `{ c: v1 }` to
+//     `{ c: vn }`, a group of its own wherever it stands, and the equality
+//     when the list holds one value.
+//
+// A parenthesized group keeps its nesting, as in predicates.
+function lowerExistsWhere(expr: PredicateExpr, scope: RuleScope): Where {
+    switch (expr.kind) {
+        case 'comparison':
+            if (expr.op !== '=') break;
+            return lowerExistsEquality(expr.left, expr.right, scope);
+        case 'in': {
+            const column = lowerExistsFilterColumn(expr.left, scope, 'IN takes a column of the EXISTS table on its left');
+            const leaves = expr.values.map((value): WhereLeaf => ({ [column]: lowerExistsWhereValue(value, scope) }));
+            return leaves.length === 1 ? leaves[0] : { $or: leaves };
+        }
+        case 'and': {
+            const members: Where[] = [];
+            let leaf: WhereLeaf | undefined;
+            for (const arg of expr.args) {
+                const lowered = lowerExistsWhere(arg, scope);
+                if (whereGroup(lowered) !== undefined) {
+                    members.push(lowered);
+                    continue;
+                }
+                if (leaf === undefined) {
+                    leaf = {};
+                    members.push(leaf);
+                }
+                for (const [column, value] of Object.entries(lowered as WhereLeaf)) {
+                    if (column in leaf) throw new Error(columnNamedTwice(column, leaf[column], value, scope));
+                    leaf[column] = value;
+                }
+            }
+            return members.length === 1 ? members[0] : { $and: members };
+        }
+        case 'or':
+            return { $or: expr.args.map((arg) => lowerExistsWhere(arg, scope)) };
+        default:
+            break;
     }
-    if (expr.kind === 'and') {
-        const out: { [field: string]: json.Literal | '$author' | string } = {};
-        for (const arg of expr.args) Object.assign(out, lowerExistsWhere(arg, scope));
-        return out;
-    }
-    throw new Error('EXISTS WHERE only supports equality predicates');
+    throw new Error('EXISTS WHERE supports only = and IN, combined with AND / OR');
 }
 
-function lowerExistsEquality(
-    left: OperandExpr,
-    right: OperandExpr,
-    scope: RuleScope,
-): { [field: string]: json.Literal | '$author' | string } {
-    const leftIsColumn = left.kind === 'column';
-    const rightIsColumn = right.kind === 'column';
-
-    if (leftIsColumn && !rightIsColumn) {
-        const existsCol = resolveExistsFilterColumn(left, scope);
-        return { [existsCol.column]: lowerExistsWhereValue(right, scope) };
-    }
-    if (rightIsColumn && !leftIsColumn) {
-        const existsCol = resolveExistsFilterColumn(right, scope);
-        return { [existsCol.column]: lowerExistsWhereValue(left, scope) };
-    }
-    if (leftIsColumn && rightIsColumn) {
-        const l = resolveColumnReference(left, scope);
-        const r = resolveColumnReference(right, scope);
-        if (l.role === 'exists' && r.role === 'gated') {
-            return { [l.column]: `$row.${r.column}` };
-        }
-        if (r.role === 'exists' && l.role === 'gated') {
-            return { [r.column]: `$row.${l.column}` };
-        }
-        if (l.role === 'exists' && r.role === 'exists') {
-            throw new Error('EXISTS WHERE cannot compare two EXISTS table columns');
-        }
-        throw new Error('EXISTS WHERE correlation must reference the gated table');
-    }
-    throw new Error('EXISTS WHERE only supports equality predicates');
+// One leaf maps each column to one value, so `a = v1 AND a = v2` has no leaf.
+// It holds only when v1 = v2, a comparison that does not involve the EXISTS
+// row and can go outside the EXISTS.
+function columnNamedTwice(column: string, first: WhereValue, second: WhereValue, scope: RuleScope): string {
+    const exists = scope.exists!;
+    const target = exists.alias !== undefined ? `${exists.table} AS ${exists.alias}` : exists.table;
+    const qual = exists.alias ?? exists.table;
+    const [a, b] = [formatFilterValue(first, scope), formatFilterValue(second, scope)];
+    return `EXISTS WHERE compares ${qual}.${column} twice in one AND, to ${a} and to ${b}. `
+        + `A row has one value for a column, so this holds only when the two are equal: `
+        + `keep one comparison and compare the values outside the EXISTS, as in `
+        + `${a} = ${b} AND EXISTS (${target} WHERE ${qual}.${column} = ${a})`;
 }
 
-function resolveExistsFilterColumn(expr: OperandExpr, scope: RuleScope): ResolvedColumn {
-    if (expr.kind !== 'column') throw new Error('EXISTS WHERE filter must be a column');
+// A lowered where-value as it is written in a rule, for messages.
+function formatFilterValue(value: WhereValue, scope: RuleScope): string {
+    if (typeof value === 'string') {
+        if (value === '$author') return value;
+        const column = parseRowFieldTerm(value);
+        if (column !== undefined) return scope.gated !== undefined ? `${scope.gated.name}.${column}` : column;
+        const param = parseParamTerm(value);
+        if (param !== undefined) return `:${param}`;
+        return `'${value.replace(/'/g, "''")}'`;
+    }
+    return typeof value === 'object' ? `JSON '${JSON.stringify(value)}'` : String(value);
+}
+
+// One equality of a filter: a column of the EXISTS table against a value (a
+// literal, $author, a parameter, or a column of the gated row), either way
+// round.
+function lowerExistsEquality(left: OperandExpr, right: OperandExpr, scope: RuleScope): WhereLeaf {
+    const leftColumn = left.kind === 'column' ? resolveColumnReference(left, scope) : undefined;
+    const rightColumn = right.kind === 'column' ? resolveColumnReference(right, scope) : undefined;
+
+    if (leftColumn?.role === 'exists' && rightColumn?.role === 'exists') {
+        throw new Error('EXISTS WHERE cannot compare two EXISTS table columns');
+    }
+    if (leftColumn?.role === 'exists') return { [leftColumn.column]: lowerExistsWhereValue(right, scope) };
+    if (rightColumn?.role === 'exists') return { [rightColumn.column]: lowerExistsWhereValue(left, scope) };
+
+    // no column of the EXISTS table on either side
+    const gated = left.kind === 'column' ? left : right.kind === 'column' ? right : undefined;
+    if (gated !== undefined) throw new Error(notOfExistsTable(gated, scope));
+    throw new Error('EXISTS WHERE filter must reference the EXISTS table');
+}
+
+// The column of the EXISTS table a filter term compares, by the rule for
+// names: a bare name must belong to exactly one of the two tables in scope.
+function lowerExistsFilterColumn(expr: OperandExpr, scope: RuleScope, otherwise: string): string {
+    if (expr.kind !== 'column') throw new Error(`EXISTS WHERE ${otherwise}`);
+    const resolved = resolveColumnReference(expr, scope);
+    if (resolved.role !== 'exists') throw new Error(notOfExistsTable(expr, scope));
+    return resolved.column;
+}
+
+function notOfExistsTable(expr: Extract<OperandExpr, { kind: 'column' }>, scope: RuleScope): string {
     if (expr.table !== undefined) {
-        const resolved = resolveQualifiedColumn(expr.table, expr.name, scope);
-        if (resolved.role !== 'exists') {
-            throw new Error(`EXISTS WHERE filter must reference the EXISTS table, not '${expr.table}.${expr.name}'`);
-        }
-        return resolved;
+        return `EXISTS WHERE filter must reference the EXISTS table, not '${expr.table}.${expr.name}'`;
     }
-    return { role: 'exists', column: expr.name };
+    const target = splitExistsTableRef(scope.exists!.table).bare;
+    return `EXISTS WHERE filter must reference the EXISTS table: '${expr.name}' is a column of '${scope.gated!.name}', not of '${target}'`;
 }
 
 function resolveColumnReference(expr: OperandExpr, scope: RuleScope): ResolvedColumn {

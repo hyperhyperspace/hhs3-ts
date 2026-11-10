@@ -67,11 +67,14 @@
 // Truth; the public reads require a decided result, which every top-level
 // view has.
 //
-// Pub search (findRowIds) resolves: pub meta is exported by inserts AND
-// updates, so stale values in old entries are candidate noise — every
-// candidate row's RESOLVED values are re-checked before it qualifies. A
+// Pub search (findRowIds, existsMatching) resolves: pub meta is exported by
+// inserts AND updates, so stale values in old entries are candidate noise —
+// every candidate row's RESOLVED values are re-checked before it qualifies. A
 // payload-only prefilter drops rows that no write could make match, before
-// any verdict is read.
+// any verdict is read. existsMatching reads the `where` tree of an exists
+// atom, leaves under `and` / `or`, the same way: candidates are the tree over
+// sets of rows, and on each candidate a leaf the row's writes cannot satisfy
+// is false with nothing read.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import { B64Hash, KeyId, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
@@ -86,7 +89,7 @@ import type { Truth, Undecided, Verdict, VerdictEvaluation } from "@hyper-hyper-
 
 import type { RSchemaView } from "../rschema/interfaces.js";
 import type { IncarnationId } from "../rschema/incarnation.js";
-import type { ColumnType, Operand } from "../rschema/payload.js";
+import type { ColumnType, Operand, TableDef } from "../rschema/payload.js";
 import { columnSlot, existenceSlot } from "../rschema/resolve.js";
 import { colTag, rowTag, type RowsSlicePayload } from "../rtable_group/scopes.js";
 import type { OpVoidDetail } from "../rtable_group/op_void.js";
@@ -115,14 +118,96 @@ export type TableViewTarget = RTable & {
 // column; callers fall back to the schema default), or undecided.
 export type ColumnValue = { status: 'decided'; value: json.Literal | undefined } | Undecided;
 
+// The `where` tree of an exists atom as a view reads it, with every term
+// resolved to its value. A leaf holds when every field equals its value.
+// `row` marks a leaf that names a subject-row term. `aside` marks a leaf set
+// aside because a subject value it names is undecided, with that value's
+// support: the reads take the leaf as false and never look at its fields.
+export type ReadLeaf = { fields: { [field: string]: json.Literal }; row: boolean; aside?: Undecided };
+export type ReadWhere = ReadLeaf | { and: ReadWhere[] } | { or: ReadWhere[] };
+
+export function readLeaves(where: ReadWhere, out: ReadLeaf[] = []): ReadLeaf[] {
+    if ('fields' in where) {
+        out.push(where);
+    } else {
+        for (const member of 'and' in where ? where.and : where.or) readLeaves(member, out);
+    }
+    return out;
+}
+
+// What a view answers about a `where` tree (see existsTruth in
+// ../rtable_group/predicates.ts, which combines it with the subject row).
+//
+// `touched` holds the leaves a pending observe touches, each with the touching
+// observes. The reads take a touched leaf as false, like a leaf set aside.
+//
+// `read` is the `or` over the rows that match:
+//   'all'    the whole tree (R);
+//   'plain'  the tree with every `row` leaf false too (R0);
+//   'row'    only the matches through a `row` leaf (R$): a `row` leaf matches
+//            through itself, an `or` when a member does, and an `and` when one
+//            member does and its other members match.
+export type ExistsReads = {
+    touched: Map<ReadLeaf, Undecided>;
+    read(which: 'all' | 'plain' | 'row'): Promise<Truth>;
+};
+
 // The three-valued reads predicates evaluate over (see
 // ../rtable_group/predicates.ts). `author` is the row's insert author, known
 // whenever some insert of the row was met.
 export interface TruthTableView {
     rowLiveness(rowId: B64Hash): Promise<{ truth: Truth; author?: KeyId }>;
     columnValue(rowId: B64Hash, column: string): Promise<ColumnValue>;
-    existsMatching(where: { [field: string]: json.Literal }): Promise<Truth>;
+    existsMatching(where: ReadWhere): Promise<ExistsReads>;
 }
+
+// The rows that carry a field or satisfy a node on "carried" alone. 'all'
+// stands for every inserted row without listing them: a field whose value is
+// the column's default, which a row that never wrote the column holds too.
+type RowSet = ReadonlySet<B64Hash> | 'all';
+
+const NO_ROWS: RowSet = new Set<B64Hash>();
+
+// An intersection ignores 'all'.
+function intersectRows(sets: RowSet[]): RowSet {
+    let rows: RowSet = 'all';
+    for (const set of sets) {
+        if (set === 'all') continue;
+        if (rows === 'all') {
+            rows = set;
+        } else {
+            const both = new Set<B64Hash>();
+            for (const rowId of rows) if (set.has(rowId)) both.add(rowId);
+            rows = both;
+        }
+    }
+    return rows;
+}
+
+// A union with an 'all' member is 'all'.
+function uniteRows(sets: RowSet[]): RowSet {
+    const rows = new Set<B64Hash>();
+    for (const set of sets) {
+        if (set === 'all') return 'all';
+        for (const rowId of set) rows.add(rowId);
+    }
+    return rows;
+}
+
+// What the reads of one `where` tree share: the table at this horizon, the
+// rows that carry each leaf, and the candidates of the whole tree, sorted.
+type ReadPlan = {
+    def: TableDef | undefined;
+    carriedBy: Map<ReadLeaf, RowSet>;
+    candidates: B64Hash[];
+};
+
+// The reads made on one candidate row, kept across the passes of one tree.
+type RowReads = {
+    columns: Map<string, ColumnValue>;
+    leaves: Map<ReadLeaf, Truth>;
+    live?: Truth;
+};
 
 function decided(truth: Truth, read: string): boolean {
     if (truth.status === 'undecided') throw new Error(`${read} is undecided outside the component being solved`);
@@ -597,64 +682,10 @@ export class RTableViewImpl implements RTableView, TruthTableView {
         return undefined;
     }
 
+    // The live rows whose resolved values match `where`, one leaf: every field
+    // equals its value. A field that is not a pub column (or a non-string
+    // rowAuthor) throws.
     async findRowIds(where: { [pubColumn: string]: json.Literal }): Promise<B64Hash[]> {
-        const candidates = await this.candidateRowIds(where);
-        const rowIds: B64Hash[] = [];
-        for (const rowId of candidates) {
-            if (decided(await this.candidateMatch(rowId, where), 'a findRowIds candidate')) rowIds.push(rowId);
-        }
-        return rowIds;
-    }
-
-    // Whether some row matches `where`: the `or` over the candidates of
-    // findRowIds, stopping at the first that surely matches. A searched field
-    // that is missing or not a pub column (or a non-string rowAuthor) at this
-    // horizon fails closed to FALSE instead of throwing out of candidateRowIds.
-    //
-    // With pending observes (./touch.ts), the slots of the table and of the
-    // searched columns are checked first, since the early returns below hold
-    // at D only while those slots are untouched. Candidates are then gathered
-    // at D plus every pending version, which holds every completion's
-    // candidates, and each candidate's column reads and liveness are touched
-    // or not on their own.
-    async existsMatching(where: { [field: string]: json.Literal }): Promise<Truth> {
-        const fields = Object.keys(where);
-        if (fields.length === 0) return FALSE;
-        const table = this.target.getTableName();
-        const touch = this.touchTest();
-        if (touch !== undefined) {
-            const slots = [existenceSlot(table), ...fields.filter((f) => f !== 'rowAuthor').map((f) => columnSlot(table, f))];
-            const touched = await touch.slotsTouched(slots);
-            if (touched !== undefined) return touched;
-        }
-        const schemaView = await this.schemaView();
-        if (!schemaView.hasTable(table)) return FALSE;
-        const pubColumns = new Set(schemaView.getPubColumns(table));
-        for (const field of fields) {
-            if (field === 'rowAuthor') {
-                if (typeof where[field] !== 'string') return FALSE;
-            } else if (!pubColumns.has(field)) {
-                return FALSE;
-            }
-        }
-        const gatherAt = touch === undefined ? this.at : await touch.gatherVersion();
-        const candidates = await this.candidateRowIds(where, gatherAt);
-        return someTruth(candidates, (rowId) => this.candidateMatch(rowId, where));
-    }
-
-    // Rows some write of which could make them match, before any verdict is
-    // read. Indexed candidates via pub meta, or rowAuthor system meta: pub
-    // values are mutable, so ONE field drives the index query, and every other
-    // field must be carried by some insert or update of the row too. A field
-    // whose column default equals the searched value is the exception: a row
-    // that never wrote it still matches and carries no meta for it, so the
-    // field neither drives the index nor filters. When every searched field is
-    // such a field, every inserted row is a candidate. The rowId binds the
-    // insert's author, so rowAuthor, which drives the index whenever it is
-    // searched, needs no further check. Writes are gathered at `at`, which is
-    // the view's own version unless existsMatching widens it; pub columns and
-    // defaults are this view's.
-    private async candidateRowIds(where: { [field: string]: json.Literal }, at: Version = this.at): Promise<B64Hash[]> {
         const schemaView = await this.schemaView();
         const table = this.target.getTableName();
         const pubColumns = new Set(schemaView.getPubColumns(table));
@@ -668,30 +699,149 @@ export class RTableViewImpl implements RTableView, TruthTableView {
                 throw new Error(`'${field}' is not a pub column of table '${table}'`);
             }
         }
-
         if (fields.includes('rowAuthor') && typeof where['rowAuthor'] !== 'string') {
             throw new Error("'rowAuthor' search requires a key-id string");
         }
 
-        const def = schemaView.getTable(table);
-        const byDefault = (field: string): boolean => {
-            const fallback = def?.columns[field]?.default;
-            return fallback !== undefined && sameValue(fallback, where[field]);
-        };
-        const indexField = fields.includes('rowAuthor') ? 'rowAuthor' : fields.find((field) => !byDefault(field));
+        const leaf: ReadLeaf = { fields: where, row: false };
+        const plan = await this.readPlan(leaf, () => true, this.at);
+        const rowIds: B64Hash[] = [];
+        if (plan === undefined) return rowIds;
+        for (const rowId of plan.candidates) {
+            if (decided(await this.rowMatch(rowId, leaf, plan, 'all', () => true, this.rowReads()), 'a findRowIds candidate')) rowIds.push(rowId);
+        }
+        return rowIds;
+    }
 
-        const dag = await this.target.getScopedDag();
-        const candidates = indexField === undefined
-            ? await this.insertedRowIds(dag, at)
-            : await this.carriers(dag, indexField, where[indexField], at);
-        for (const field of fields) {
-            if (field === indexField || byDefault(field)) continue;
-            const carrying = await this.carriers(dag, field, where[field], at);
-            for (const rowId of [...candidates]) {
-                if (!carrying.has(rowId)) candidates.delete(rowId);
+    // The reads of a `where` tree (see ExistsReads): the `or` over the rows
+    // that match it, stopping at the first that surely matches.
+    //
+    // A field is CARRIED by a row when an insert or update of the row carries
+    // its value, or when the value is the column's default: a row that never
+    // wrote the column holds the default and left no meta for it. `rowAuthor`
+    // is carried exactly by the rows that author inserted (the rowId binds the
+    // insert's author). A field that is missing or not a pub column at this
+    // horizon (or a non-string rowAuthor) is carried by no row, so its leaf
+    // fails closed.
+    //
+    // CANDIDATES, the rows some write of which could make them match, are the
+    // tree evaluated over sets of rows before any verdict is read: a field is
+    // its carriers, through the meta index, a leaf intersects its fields, an
+    // `and` intersects its members and an `or` unites them. A field at its
+    // default is every inserted row, kept as a symbol: an intersection ignores
+    // it and a union with it is every inserted row, which are listed only when
+    // that is the root's set.
+    //
+    // Each candidate is then evaluated in two passes (rowMatch): on "carried"
+    // alone, where a leaf or group that is false is false on the row with
+    // nothing read, and then with the three-valued reads on what is left.
+    //
+    // With pending observes (./touch.ts), each leaf's slots are checked first:
+    // the table's existence slot and the slot of every column the leaf names.
+    // A touched leaf is false in the reads and reported in `touched`; a leaf
+    // set aside is not checked. The answers at D hold only while those slots
+    // are untouched, so the reads use untouched columns alone. Candidates are
+    // then gathered at D plus every pending version, which holds every
+    // completion's candidates, "carried" is judged at that same version, and
+    // each candidate's column reads and liveness are touched or not on their
+    // own.
+    async existsMatching(where: ReadWhere): Promise<ExistsReads> {
+        const table = this.target.getTableName();
+        const touch = this.touchTest();
+
+        const touched = new Map<ReadLeaf, Undecided>();
+        if (touch !== undefined) {
+            for (const leaf of readLeaves(where)) {
+                if (leaf.aside !== undefined || Object.keys(leaf.fields).length === 0) continue;
+                const slots = [
+                    existenceSlot(table),
+                    ...Object.keys(leaf.fields).filter((f) => f !== 'rowAuthor').map((f) => columnSlot(table, f)),
+                ];
+                const touching = await touch.slotsTouched(slots);
+                if (touching !== undefined) touched.set(leaf, touching);
             }
         }
-        return [...candidates].sort();
+        const isRead = (leaf: ReadLeaf): boolean => leaf.aside === undefined && !touched.has(leaf);
+
+        let plan: Promise<ReadPlan | undefined> | undefined;
+        const reads = new Map<B64Hash, RowReads>();
+        const readsOf = (rowId: B64Hash): RowReads => {
+            let rowReads = reads.get(rowId);
+            if (rowReads === undefined) {
+                rowReads = this.rowReads();
+                reads.set(rowId, rowReads);
+            }
+            return rowReads;
+        };
+
+        return {
+            touched,
+            read: async (which) => {
+                // nothing to read when every leaf is set aside or touched
+                if (!readLeaves(where).some(isRead)) return FALSE;
+                plan ??= (async () => this.readPlan(where, isRead, touch === undefined ? this.at : await touch.gatherVersion()))();
+                const ready = await plan;
+                if (ready === undefined) return FALSE;
+                return someTruth(ready.candidates, (rowId) => this.rowMatch(rowId, where, ready, which, isRead, readsOf(rowId)));
+            },
+        };
+    }
+
+    private rowReads(): RowReads {
+        return { columns: new Map(), leaves: new Map() };
+    }
+
+    // The table at this horizon, the rows that carry each leaf `isRead` keeps,
+    // and the tree's candidates. Writes are gathered at `at`, which is the
+    // view's own version unless existsMatching widens it; pub columns and
+    // defaults are this view's. undefined when the table does not exist here:
+    // no row matches.
+    private async readPlan(where: ReadWhere, isRead: (leaf: ReadLeaf) => boolean, at: Version): Promise<ReadPlan | undefined> {
+        const schemaView = await this.schemaView();
+        const table = this.target.getTableName();
+        if (!schemaView.hasTable(table)) return undefined;
+        const pubColumns = new Set(schemaView.getPubColumns(table));
+        const def = schemaView.getTable(table);
+        const dag = await this.target.getScopedDag();
+
+        // one index lookup per distinct field and value
+        const carriers = new Map<string, RowSet>();
+        const fieldRows = async (field: string, value: json.Literal): Promise<RowSet> => {
+            if (field === 'rowAuthor') {
+                if (typeof value !== 'string') return NO_ROWS;
+            } else if (!pubColumns.has(field)) {
+                return NO_ROWS;
+            }
+            const fallback = def?.columns[field]?.default;
+            if (fallback !== undefined && sameValue(fallback, value)) return 'all';
+            const key = JSON.stringify([field, json.toStringNormalized(value)]);
+            let rows = carriers.get(key);
+            if (rows === undefined) {
+                rows = await this.carriers(dag, field, value, at);
+                carriers.set(key, rows);
+            }
+            return rows;
+        };
+
+        const carriedBy = new Map<ReadLeaf, RowSet>();
+        const rowsOf = async (node: ReadWhere): Promise<RowSet> => {
+            if ('fields' in node) {
+                const fields = Object.keys(node.fields);
+                if (!isRead(node) || fields.length === 0) return NO_ROWS;
+                const sets: RowSet[] = [];
+                for (const field of fields) sets.push(await fieldRows(field, node.fields[field]));
+                const rows = intersectRows(sets);
+                carriedBy.set(node, rows);
+                return rows;
+            }
+            const sets: RowSet[] = [];
+            for (const member of 'and' in node ? node.and : node.or) sets.push(await rowsOf(member));
+            return 'and' in node ? intersectRows(sets) : uniteRows(sets);
+        };
+
+        const rows = await rowsOf(where);
+        const candidates = rows === 'all' ? await this.insertedRowIds(dag, at) : rows;
+        return { def, carriedBy, candidates: [...candidates].sort() };
     }
 
     // Rows with an insert or update at or below `at` carrying `value` for
@@ -725,23 +875,76 @@ export class RTableViewImpl implements RTableView, TruthTableView {
         return rowIds;
     }
 
-    // A candidate matches when every searched column resolves to the searched
-    // value and the row is live: a Kleene `and`, values first, so a row whose
-    // value already rules it out never has its liveness read.
-    private async candidateMatch(rowId: B64Hash, where: { [field: string]: json.Literal }): Promise<Truth> {
-        const def = (await this.schemaView()).getTable(this.target.getTableName());
-        const checks: (() => Promise<Truth>)[] = [];
-        for (const field of Object.keys(where)) {
-            if (field === 'rowAuthor') continue;
-            checks.push(async () => {
-                const read = await this.columnValue(rowId, field);
-                if (read.status === 'undecided') return read;
-                const value = read.value ?? def?.columns[field]?.default;
-                return truthOf(value !== undefined && sameValue(value, where[field]));
-            });
-        }
-        checks.push(async () => (await this.rowLiveness(rowId)).truth);
-        return everyTruth(checks, (check) => check());
+    // One candidate row against the tree: the `and` of the tree and the row's
+    // liveness, values first, so a row whose values already rule it out never
+    // has its liveness read.
+    //
+    // The tree is evaluated in two passes. First on "carried" alone: a leaf is
+    // possible when the row carries every field of it, and a leaf or group
+    // that is not possible is false with nothing read. Then what is left with
+    // the three-valued reads: a field is the column read compared with its
+    // value, with the schema default when no live write gives the column one
+    // (rowAuthor needs no read). `which` picks the read (see ExistsReads).
+    private async rowMatch(
+        rowId: B64Hash, where: ReadWhere, plan: ReadPlan, which: 'all' | 'plain' | 'row',
+        isRead: (leaf: ReadLeaf) => boolean, reads: RowReads,
+    ): Promise<Truth> {
+        const carried = (leaf: ReadLeaf): boolean => {
+            const rows = plan.carriedBy.get(leaf);
+            return rows !== undefined && (rows === 'all' || rows.has(rowId));
+        };
+        const counted = which === 'plain' ? (leaf: ReadLeaf) => isRead(leaf) && !leaf.row : isRead;
+
+        const possible = (node: ReadWhere): boolean => {
+            if ('fields' in node) return counted(node) && carried(node);
+            return 'and' in node ? node.and.every(possible) : node.or.some(possible);
+        };
+        const possibleThroughRow = (node: ReadWhere): boolean => {
+            if ('fields' in node) return node.row && possible(node);
+            if ('or' in node) return node.or.some(possibleThroughRow);
+            return node.and.every(possible) && node.and.some(possibleThroughRow);
+        };
+
+        const column = async (name: string): Promise<ColumnValue> => {
+            let read = reads.columns.get(name);
+            if (read === undefined) {
+                read = await this.columnValue(rowId, name);
+                reads.columns.set(name, read);
+            }
+            return read;
+        };
+        const leafValue = async (leaf: ReadLeaf): Promise<Truth> => {
+            let truth = reads.leaves.get(leaf);
+            if (truth === undefined) {
+                truth = await everyTruth(Object.keys(leaf.fields).filter((f) => f !== 'rowAuthor'), async (field) => {
+                    const read = await column(field);
+                    if (read.status === 'undecided') return read;
+                    const value = read.value ?? plan.def?.columns[field]?.default;
+                    return truthOf(value !== undefined && sameValue(value, leaf.fields[field]));
+                });
+                reads.leaves.set(leaf, truth);
+            }
+            return truth;
+        };
+
+        const value = async (node: ReadWhere): Promise<Truth> => {
+            if (!possible(node)) return FALSE;
+            if ('fields' in node) return leafValue(node);
+            return 'and' in node ? everyTruth(node.and, value) : someTruth(node.or, value);
+        };
+        const throughRow = async (node: ReadWhere): Promise<Truth> => {
+            if (!possibleThroughRow(node)) return FALSE;
+            if ('fields' in node) return leafValue(node);
+            if ('or' in node) return someTruth(node.or, throughRow);
+            const members = [...node.and.keys()];
+            return someTruth(members, (through) =>
+                everyTruth(members, (i) => i === through ? throughRow(node.and[i]) : value(node.and[i])));
+        };
+
+        const tree = await (which === 'row' ? throughRow(where) : value(where));
+        if (tree.status === 'false') return FALSE;
+        reads.live ??= (await this.rowLiveness(rowId)).truth;
+        return allTruth([tree, reads.live]);
     }
 
     // Single-table query at this horizon (see ./query.ts). A LOCAL read: it

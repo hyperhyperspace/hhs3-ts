@@ -1948,7 +1948,7 @@ CREATE SCHEMA voidtest CREATORS ($me) AS (
   ) CONCURRENT DELETES,
   TABLE items (
     name string
-  ) ALLOW insert IF EXISTS caps WHERE label = 'grant'
+  ) ALLOW insert IF EXISTS (caps WHERE label = 'grant')
 );
 CREATE CATALOG void_catalog VERSION '1.0.0' AS ( TABLEGROUP void_g USING SCHEMA voidtest );
 CREATE DATABASE void_db USING CATALOG void_catalog;
@@ -2038,7 +2038,7 @@ CREATE SCHEMA users_schema CREATORS ($me) AS (
   TABLE caps (
     label string PUB,
     grantee string PUB
-  ) ALLOW insert IF EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
+  ) ALLOW insert IF EXISTS (caps AS c WHERE c.label = 'manager' AND c.grantee = $author)
 );
 CREATE CATALOG user_catalog VERSION '1.0.0' AS (
   TABLEGROUP user USING SCHEMA users_schema
@@ -2079,7 +2079,7 @@ CREATE CATALOG doc_catalog VERSION '1.0.0' AS (
   TABLEGROUP doc USING SCHEMA doc_schema
     BIND users => users
     USING IDENTITIES members
-    ALLOW UPDATE REF users IF EXISTS users.caps WHERE label = 'manager' AND grantee = $author
+    ALLOW UPDATE REF users IF EXISTS (users.caps WHERE label = 'manager' AND grantee = $author)
     WITH ROWS (
       members (keyId = $alice, publicKey = publicKey($alice))
     )
@@ -2114,7 +2114,7 @@ CREATE CATALOG doc_catalog VERSION '1.0.0' AS (
   TABLEGROUP doc USING SCHEMA doc_schema
     BIND users => users
     USING IDENTITIES members
-    ALLOW UPDATE REF users IF EXISTS users.caps WHERE label = 'manager' AND grantee = $author
+    ALLOW UPDATE REF users IF EXISTS (users.caps WHERE label = 'manager' AND grantee = $author)
     WITH ROWS (
       members (keyId = $alice, publicKey = publicKey($alice)),
       members (keyId = $bob, publicKey = publicKey($bob))
@@ -2175,7 +2175,7 @@ CREATE SCHEMA users_schema CREATORS ($me) AS (
 CREATE SCHEMA doc_schema CREATORS ($me) AS (
   TABLE pages (
     title string
-  ) ALLOW insert IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author
+  ) ALLOW insert IF EXISTS (user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author)
 );
 CREATE CATALOG editor VERSION '1.0.0' PARAMS (:manager identity) AS (
   TABLEGROUP user USING SCHEMA users_schema

@@ -273,7 +273,7 @@ export const rtableEnforceTests = {
                 // no witness yet: restrictions are hard validation at `(at, at)`
                 await expectFailure(() => items.insert('i-void', { name: 'thing' }),
                     'the exists-gated insert is rejected with no witness',
-                    "does not satisfy ALLOW insert IF EXISTS caps WHERE caps.label = 'grant'");
+                    "does not satisfy ALLOW insert IF EXISTS (caps WHERE caps.label = 'grant')");
 
                 // a witness present at-or-before the use validates a later use
                 // (at-use semantics: the witness must exist at the op position)
@@ -298,7 +298,7 @@ export const rtableEnforceTests = {
                 const items = await group.getTable('items');
                 await expectFailure(() => items.insert('i-void', { name: 'thing' }),
                     'the public insert API should reject invalid ops even when context selfValidate is off',
-                    "does not satisfy ALLOW insert IF EXISTS caps WHERE caps.label = 'grant'");
+                    "does not satisfy ALLOW insert IF EXISTS (caps WHERE caps.label = 'grant')");
             }
         },
         {
@@ -517,7 +517,7 @@ export const rtableEnforceTests = {
                 }
                 assertTrue(strangerFailed, 'a deploy by a non-admin should fail canDeploy');
                 assertTrue(
-                    strangerMessage.includes('canDeploy predicate rejected schema deploy: EXISTS admins WHERE admins.grantee = $author'),
+                    strangerMessage.includes('canDeploy predicate rejected schema deploy: EXISTS (admins WHERE admins.grantee = $author)'),
                     `canDeploy failure should name the predicate, got: ${strangerMessage}`,
                 );
 

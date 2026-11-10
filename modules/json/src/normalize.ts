@@ -67,13 +67,56 @@ function toStringCanonical(literal: Literal): string {
     throw new Error('Cannot serialize ' + literal + ', its type ' + (typeof literal) + ' is illegal for a literal.');
 }
 
-// Whether a parsed value is a Literal: no null and no non-finite number at any depth.
+// Whether a string is well-formed Unicode: every surrogate is half of a pair.
+// A lone surrogate has no UTF-8 encoding. Encoders replace it with U+FFFD, so
+// strings that differ only in their lone surrogates would share one hash.
+function isWellFormedString(s: string): boolean {
+    for (let i = 0; i < s.length; i++) {
+        const c = s.charCodeAt(i);
+        if (c >= 0xd800 && c <= 0xdbff) {
+            const d = i + 1 < s.length ? s.charCodeAt(i + 1) : 0;
+            if (d < 0xdc00 || d > 0xdfff) return false;
+            i++;
+        } else if (c >= 0xdc00 && c <= 0xdfff) {
+            return false;
+        }
+    }
+    return true;
+}
+
+const ILL_FORMED_STRING = 'a string that is not well-formed Unicode';
+const ILL_FORMED_KEY = 'a key that is not well-formed Unicode';
+
+// undefined when `value` is a Literal, else the first thing found in it that a
+// Literal cannot contain, as a noun phrase: 'null', 'a non-finite number',
+// 'a string that is not well-formed Unicode', and so on.
+function literalProblem(value: unknown): string | undefined {
+    if (typeof value === 'string') return isWellFormedString(value) ? undefined : ILL_FORMED_STRING;
+    if (typeof value === 'boolean') return undefined;
+    if (typeof value === 'number') return Number.isFinite(value) ? undefined : 'a non-finite number';
+    if (value === null) return 'null';
+    if (Array.isArray(value)) {
+        for (const element of value) {
+            const problem = literalProblem(element);
+            if (problem !== undefined) return problem;
+        }
+        return undefined;
+    }
+    if (typeof value === 'object') {
+        for (const key of Object.keys(value)) {
+            if (!isWellFormedString(key)) return ILL_FORMED_KEY;
+            const problem = literalProblem((value as { [key: string]: unknown })[key]);
+            if (problem !== undefined) return problem;
+        }
+        return undefined;
+    }
+    return 'a value of type ' + (typeof value);
+}
+
+// Whether a parsed value is a Literal: at any depth, no null, no non-finite
+// number, and no string or key with a lone surrogate.
 function isLiteral(value: unknown): value is Literal {
-    if (typeof value === 'string' || typeof value === 'boolean') return true;
-    if (typeof value === 'number') return Number.isFinite(value);
-    if (Array.isArray(value)) return value.every(isLiteral);
-    if (typeof value === 'object' && value !== null) return Object.values(value).every(isLiteral);
-    return false;
+    return literalProblem(value) === undefined;
 }
 
 function eq(a: Literal, b: Literal): boolean {
@@ -90,4 +133,4 @@ function strongEq(a?: Literal, b?: Literal): boolean {
     return eq(a, b);
 }
 
-export { toStringNormalized, toStringCanonical, isLiteral, eq, strongEq };
+export { toStringNormalized, toStringCanonical, isLiteral, literalProblem, isWellFormedString, eq, strongEq };

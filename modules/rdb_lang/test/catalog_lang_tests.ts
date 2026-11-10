@@ -25,12 +25,12 @@ CREATE SCHEMA users_schema CREATORS ($dev) AS (
     grantee string PUB READONLY,
     memo string NULL
   ) CONCURRENT DELETES
-    ALLOW insert IF EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
+    ALLOW insert IF EXISTS (caps AS c WHERE c.label = 'manager' AND c.grantee = $author)
 );
 CREATE SCHEMA docs_schema CREATORS ($dev) AS (
   TABLE docs (
     body string
-  ) ALLOW insert IF EXISTS users.caps WHERE label = 'writer' AND grantee = $author
+  ) ALLOW insert IF EXISTS (users.caps WHERE label = 'writer' AND grantee = $author)
 );`;
 
 const APP_CATALOG = `
@@ -57,7 +57,7 @@ CREATE CATALOG app CREATORS ($dev) VERSION '1.0.0' PARAMS (:admin identity) AS (
     BIND users => users USING IDENTITIES users.identities,
   FILES media
     USING IDENTITIES users.identities
-    ALLOW WRITE IF EXISTS users.caps WHERE users.caps.label = 'writer' AND users.caps.grantee = $author
+    ALLOW WRITE IF EXISTS (users.caps WHERE users.caps.label = 'writer' AND users.caps.grantee = $author)
 ) NOTE 'initial' BY $dev;`;
 
 type Actors = { dev: OwnIdentity; admin: OwnIdentity; alice: OwnIdentity };
@@ -261,12 +261,12 @@ export const catalogLangTests = {
                 assertTrue(ok.kind === 'update-catalog' && ok.update.deployed.length === 1, 'a creator deploys');
 
                 const noProvider = await env.fail(`ALTER CATALOG app VERSION '1.2.0' AS (
-                    ADD TABLEGROUP gated USING SCHEMA users_schema ALLOW DEPLOY IF EXISTS caps WHERE grantee = $author
+                    ADD TABLEGROUP gated USING SCHEMA users_schema ALLOW DEPLOY IF EXISTS (caps WHERE grantee = $author)
                 );`);
                 assertTrue(noProvider.includes('needs USING IDENTITIES'), noProvider);
                 await env.run(`ALTER CATALOG app VERSION '1.2.0' AS (
                     ADD TABLEGROUP gated USING SCHEMA users_schema USING IDENTITIES identities
-                      ALLOW DEPLOY IF EXISTS caps WHERE grantee = $author
+                      ALLOW DEPLOY IF EXISTS (caps WHERE grantee = $author)
                 );`);
             },
         },
@@ -472,7 +472,7 @@ export const catalogLangTests = {
 
                 const gate = await env.fail(`ALTER CATALOG app VERSION '1.1.0' AS (
                     ADD TABLEGROUP notes USING SCHEMA notes_schema BIND users => users
-                      ALLOW UPDATE REF users IF EXISTS users.caps WHERE grantee = $author
+                      ALLOW UPDATE REF users IF EXISTS (users.caps WHERE grantee = $author)
                 );`);
                 assertTrue(gate.includes('ALLOW UPDATE REF users IF reads $author, which needs USING IDENTITIES'), gate);
 
@@ -551,18 +551,22 @@ export const catalogLangTests = {
                     'FILES x: USING IDENTITIES users.people: schema users_schema has no table people', 'a missing provider table');
                 await expect('x USING IDENTITIES identities ALLOW WRITE IF true',
                     'FILES x: USING IDENTITIES identities must name <group>.<table>', 'an unqualified identity table');
-                await expect('x USING IDENTITIES users.identities ALLOW WRITE IF EXISTS caps WHERE grantee = $author',
+                await expect('x USING IDENTITIES users.identities ALLOW WRITE IF EXISTS (caps WHERE grantee = $author)',
                     'FILES x: ALLOW WRITE IF reads caps: qualify it as users.caps', 'an unqualified predicate table');
-                await expect('x USING IDENTITIES users.identities ALLOW WRITE IF EXISTS docs.docs WHERE body = $author',
+                await expect('x USING IDENTITIES users.identities ALLOW WRITE IF EXISTS (docs.docs WHERE body = $author)',
                     'FILES x: ALLOW WRITE IF reads docs.docs: tables must be qualified with users', 'a second group in the predicate');
                 await expect('x BIND u => users USING IDENTITIES users.identities ALLOW WRITE IF true',
                     'FILES x: USING IDENTITIES users.identities must be qualified with u', 'the identity table of another alias');
-                await expect('x USING IDENTITIES users.identities ALLOW WRITE IF EXISTS users.pages WHERE title = $author',
+                await expect('x USING IDENTITIES users.identities ALLOW WRITE IF EXISTS (users.pages WHERE title = $author)',
                     'FILES x: ALLOW WRITE IF reads users.pages: schema users_schema has no table pages', 'a missing predicate table');
-                await expect("x USING IDENTITIES users.identities ALLOW WRITE IF EXISTS users.caps WHERE users.caps.colour = 'red'",
+                await expect("x USING IDENTITIES users.identities ALLOW WRITE IF EXISTS (users.caps WHERE users.caps.colour = 'red')",
                     "FILES x: ALLOW WRITE IF reads users.caps.colour, which caps doesn't have", 'an unknown column');
-                await expect("x USING IDENTITIES users.identities ALLOW WRITE IF EXISTS users.caps WHERE users.caps.memo = 'red'",
+                await expect("x USING IDENTITIES users.identities ALLOW WRITE IF EXISTS (users.caps WHERE users.caps.memo = 'red')",
                     "FILES x: ALLOW WRITE IF reads users.caps.memo, which isn't PUB in caps", 'a non-PUB column');
+                await expect("x USING IDENTITIES users.identities ALLOW WRITE IF EXISTS (users.caps WHERE users.caps.grantee = $author OR users.caps.colour = 'red')",
+                    "FILES x: ALLOW WRITE IF reads users.caps.colour, which caps doesn't have", 'an unknown column in one arm of an OR');
+                await expect("x USING IDENTITIES users.identities ALLOW WRITE IF EXISTS (users.caps WHERE users.caps.grantee = $author AND users.caps.memo IN ('red', 'blue'))",
+                    "FILES x: ALLOW WRITE IF reads users.caps.memo, which isn't PUB in caps", 'a non-PUB column in an IN list');
                 await expect('media USING IDENTITIES users.identities ALLOW WRITE IF true',
                     "FILES media: name 'media' is already used by a TABLEGROUP or FILES", 'a FILES name taken by a FILES');
                 await expect('docs USING IDENTITIES users.identities ALLOW WRITE IF true',
@@ -674,8 +678,8 @@ export const catalogLangTests = {
                       ADD TABLEGROUP notes USING SCHEMA notes_schema
                         BIND docs => docs, users => users
                         USING IDENTITIES users.identities
-                        ALLOW UPDATE REF docs IF EXISTS users.caps WHERE label = 'writer' AND grantee = $author
-                        ALLOW UPDATE REF users IF EXISTS admins WHERE key = $author
+                        ALLOW UPDATE REF docs IF EXISTS (users.caps WHERE label = 'writer' AND grantee = $author)
+                        ALLOW UPDATE REF users IF EXISTS (admins WHERE key = $author)
                     );
                 `);
 
@@ -684,7 +688,7 @@ export const catalogLangTests = {
                       ADD TABLEGROUP notes2 USING SCHEMA notes_schema
                         BIND users => users
                         USING IDENTITIES users.identities
-                        ALLOW UPDATE REF users IF EXISTS users.caps WHERE memo = 'secret'
+                        ALLOW UPDATE REF users IF EXISTS (users.caps WHERE memo = 'secret')
                     );
                 `);
                 assertTrue(nonPub.includes("ALLOW UPDATE REF users IF reads users.caps.memo, which isn't PUB in caps"), nonPub);
@@ -694,7 +698,7 @@ export const catalogLangTests = {
                       ADD TABLEGROUP notes2 USING SCHEMA notes_schema
                         BIND users => users
                         USING IDENTITIES users.identities
-                        ALLOW UPDATE REF users IF EXISTS caps WHERE grantee = $author
+                        ALLOW UPDATE REF users IF EXISTS (caps WHERE grantee = $author)
                     );
                 `);
                 assertTrue(notOwn.includes('ALLOW UPDATE REF users IF reads caps: schema notes_schema has no table caps'),
@@ -705,7 +709,7 @@ export const catalogLangTests = {
                       ADD TABLEGROUP notes2 USING SCHEMA notes_schema
                         BIND docs => docs, users => users
                         USING IDENTITIES users.identities
-                        ALLOW UPDATE REF docs IF EXISTS other.caps WHERE grantee = $author
+                        ALLOW UPDATE REF docs IF EXISTS (other.caps WHERE grantee = $author)
                     );
                 `);
                 assertTrue(unbound.includes("ALLOW UPDATE REF docs IF reads other.caps, and the TABLEGROUP doesn't BIND other"), unbound);
@@ -715,8 +719,8 @@ export const catalogLangTests = {
                       ADD TABLEGROUP notes2 USING SCHEMA notes_schema
                         BIND docs => docs, users => users
                         USING IDENTITIES users.identities
-                        ALLOW UPDATE REF docs IF EXISTS users.caps WHERE grantee = $author
-                        ALLOW UPDATE REF users IF EXISTS docs.docs WHERE rowAuthor = $author
+                        ALLOW UPDATE REF docs IF EXISTS (users.caps WHERE grantee = $author)
+                        ALLOW UPDATE REF users IF EXISTS (docs.docs WHERE rowAuthor = $author)
                     );
                 `);
                 assertTrue(cycle.includes('the ALLOW UPDATE REF gates read each other in a cycle'), cycle);
@@ -724,7 +728,7 @@ export const catalogLangTests = {
                 // UPDATE SCHEMA checks cross-group references on the updated schema
                 await env.run(`
                     ALTER SCHEMA notes_schema AS (
-                      SET ALLOW RULES notes (ALLOW insert IF EXISTS ghost.caps WHERE grantee = $author)
+                      SET ALLOW RULES notes (ALLOW insert IF EXISTS (ghost.caps WHERE grantee = $author))
                     );
                 `);
                 const badUpdate = await env.fail(`
@@ -749,7 +753,7 @@ export const catalogLangTests = {
                       TABLE comments (
                         item string READONLY REFERENCES target.subject,
                         body string
-                      ) ALLOW insert IF EXISTS auth.perms WHERE label = 'writer' AND grantee = $author
+                      ) ALLOW insert IF EXISTS (auth.perms WHERE label = 'writer' AND grantee = $author)
                     );
                 `);
 
@@ -855,7 +859,7 @@ export const catalogLangTests = {
                       TABLE comments (
                         body string READONLY
                       ) ALLOW insert IF length(body) <= :max_len
-                                    AND EXISTS auth.caps WHERE label = :write_cap AND grantee = $author
+                                    AND EXISTS (auth.caps WHERE label = :write_cap AND grantee = $author)
                     );
 
                     CREATE CATALOG app VERSION '1.0.0' PARAMS (:admin identity) AS (
@@ -919,7 +923,7 @@ export const catalogLangTests = {
                       SET ALLOW RULES comments (
                         ALLOW insert IF length(body) <= :max_len
                                     AND body LIKE :prefix
-                                    AND EXISTS auth.caps WHERE label = :write_cap AND grantee = $author
+                                    AND EXISTS (auth.caps WHERE label = :write_cap AND grantee = $author)
                       )
                     );
                     ALTER CATALOG app VERSION '1.1.0' AS (
@@ -944,6 +948,71 @@ export const catalogLangTests = {
                 await replay.run(dump);
                 assertEquals(await frontierKey(await replay.group('prod.short_comments')), await frontierKey(await env.group('prod.short_comments')),
                     'the short_comments group replays to the identical DAG');
+            },
+        },
+        {
+            name: '[CLANG20] a rule with AND, OR and IN in one EXISTS gates writes end to end, and the dump replays to identical DAGs',
+            invoke: async () => {
+                const a = await actors();
+                const [bob, carol] = [await newIdentity(), await newIdentity()];
+                const env = await createLangEnv({ vars: { ...a, bob, carol, me: a.dev } });
+                // a doc may be written by a writer or a manager of its resource, or of every resource
+                await env.run(`
+                    CREATE SCHEMA grants_schema CREATORS ($dev) AS (
+                      TABLE identities (keyId string PUB READONLY, publicKey string PUB READONLY) IDENTITY PROVIDER ALLOW insert IF true,
+                      TABLE grants (grantee string PUB READONLY, label string PUB READONLY, resource string PUB READONLY)
+                        ALLOW all IF true,
+                      TABLE docs (body string, resource string READONLY)
+                        ALLOW insert IF EXISTS (grants WHERE grantee = $author
+                                                         AND label IN ('writer', 'manager')
+                                                         AND grants.resource IN (docs.resource, '*'))
+                        ALLOW delete IF rowAuthor = $author
+                                     OR EXISTS (grants WHERE grantee = $author AND label = 'manager' AND (grants.resource = docs.resource OR grants.resource = '*'))
+                    );
+                    CREATE CATALOG app CREATORS ($dev) VERSION '1.0.0' AS (
+                      TABLEGROUP g USING SCHEMA grants_schema USING IDENTITIES identities
+                        WITH ROWS (
+                          identities (keyId = $alice, publicKey = publicKey($alice)),
+                          identities (keyId = $bob, publicKey = publicKey($bob)),
+                          identities (keyId = $carol, publicKey = publicKey($carol)),
+                          grants (grantee = $alice, label = 'writer', resource = 'r1'),
+                          grants (grantee = $bob, label = 'manager', resource = '*'),
+                          grants (grantee = $carol, label = 'reader', resource = 'r1')
+                        )
+                    ) BY $dev;
+                    CREATE DATABASE prod USING CATALOG app AT '1.0.0' CREATORS ($admin) BY $admin;
+                `);
+
+                const insert = async (who: OwnIdentity, resource: string): Promise<boolean> => {
+                    env.vars['me'] = who;
+                    try {
+                        await env.run(`INSERT INTO g.docs (body, resource) VALUES ('x', '${resource}');`);
+                        return true;
+                    } catch {
+                        return false;
+                    }
+                };
+                assertTrue(await insert(a.alice, 'r1'), 'a writer of r1 writes a doc of r1');
+                assertTrue(!await insert(a.alice, 'r2'), 'and not a doc of r2');
+                assertTrue(await insert(bob, 'r2'), 'a manager of every resource writes a doc of r2');
+                assertTrue(!await insert(carol, 'r1'), 'a reader of r1 writes nothing: the label is in neither arm');
+
+                const group = await env.group('prod.g');
+                const rule = (await group.getView()).getSchemaView().getTable('docs')!.restrictions!.find((r) => r.on === 'insert')!.rule;
+                assertEquals(JSON.stringify(rule), JSON.stringify({ p: 'exists', table: 'grants', where: { $and: [
+                    { grantee: '$author' },
+                    { $or: [{ label: 'writer' }, { label: 'manager' }] },
+                    { $or: [{ resource: '$row.resource' }, { resource: '*' }] },
+                ] } }), 'the rule is stored as one atom with a where tree');
+
+                const db = await env.database('prod');
+                const dump = await dumpDatabase(db, loaders(env));
+                assertTrue(dump.includes("EXISTS (grants WHERE grants.grantee = $author AND grants.label IN ('writer', 'manager') AND grants.resource IN (docs.resource, '*'))"),
+                    'the dump renders the rule with IN lists');
+                const replay = await createLangEnv({ vars: { ...a, bob, carol, me: a.dev } });
+                await replay.run(dump);
+                assertEquals((await replay.database('prod')).getId(), db.getId(), 'same database id');
+                assertEquals(await frontierKey(await replay.group('prod.g')), await frontierKey(group), 'the group replays to the identical DAG');
             },
         },
     ],

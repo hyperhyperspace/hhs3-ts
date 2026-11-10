@@ -59,7 +59,14 @@ export type Dag = {
     getIndex(): DagIndex<any>;
 };
 
+// Throws unless the payload is a Literal. The check belongs here and not in
+// the hash: a string with a lone surrogate hashes like the same string with
+// U+FFFD in its place, so admitting one would put two payloads under one hash.
 export function createHeader(payload: json.Literal, after: Position | undefined, hash: HashSuite): Header {
+    const problem = json.literalProblem(payload);
+    if (problem !== undefined) {
+        throw new Error('Cannot create an entry: its payload contains ' + problem + '.');
+    }
     const payloadHash: B64Hash = hash.hashToB64(stringToUint8Array(json.toStringNormalized(payload)));
     const prevEntryHashes = json.toSet(after ?? new Set<B64Hash>());
     const header: Header = { payloadHash, prevEntryHashes};

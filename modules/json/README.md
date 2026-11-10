@@ -17,6 +17,16 @@ type LiteralMap = { [key: string]: Literal };
 
 `Literal` is a recursive type covering the JSON value space. All DAG payloads and metadata are expressed as `Literal` values.
 
+A Literal is narrower than what JSON text or a JavaScript value can hold. At any depth it contains no `null`, no non-finite number, and no string or object key with a lone surrogate. A lone surrogate has no UTF-8 encoding: encoders write U+FFFD in its place, so two strings that differ only in their lone surrogates would produce the same hash.
+
+```typescript
+isLiteral(value: unknown): value is Literal;
+literalProblem(value: unknown): string | undefined;
+isWellFormedString(s: string): boolean;
+```
+
+`isLiteral` is the check to run on any value that comes from outside (parsed JSON text, a message from a peer) before it is hashed or stored. `literalProblem` returns `undefined` for a Literal, and otherwise names the first thing found that a Literal cannot contain (`'null'`, `'a string that is not well-formed Unicode'`, ...), for use in an error message. `isWellFormedString` tells whether a string has no lone surrogate. The hashing functions do not run these checks; `dag` runs them when it creates an entry, and `sync` when it decodes a message.
+
 ## Normalization
 
 ```typescript

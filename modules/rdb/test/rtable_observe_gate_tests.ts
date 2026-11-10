@@ -151,7 +151,7 @@ export const rtableObserveGateTests = {
                     'a gated observe with no author is rejected');
                 await expectThrow(() => a.group.observe(USERS_BINDING, v, mallory),
                     'a gated observe by a non-manager is rejected by canObserve',
-                    "canObserve predicate rejected observation of 'users': EXISTS users.caps WHERE users.caps.label = 'manager' AND users.caps.grantee = $author");
+                    "canObserve predicate rejected observation of 'users': EXISTS (users.caps WHERE users.caps.label = 'manager' AND users.caps.grantee = $author)");
 
                 const hAdmin = await a.group.observe(USERS_BINDING, v, admin);
                 assertTrue(hAdmin.length > 0, 'a gated observe by a manager is admitted');

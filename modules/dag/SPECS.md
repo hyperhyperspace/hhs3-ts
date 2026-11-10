@@ -26,11 +26,23 @@ A **Literal** is one of:
 
 - `boolean` (`true` or `false`)
 - `number` (IEEE 754 float64, finite only — see §2.2)
-- `string` (Unicode)
+- `string` (well-formed Unicode, see below)
 - `array` of Literals
 - `object` mapping string keys to Literals
 
 `null` and `undefined` are not valid Literals.
+
+A string, whether a value or an object key, MUST be well-formed Unicode: a
+sequence of Unicode scalar values. A string with an unpaired surrogate
+(a code unit in `U+D800`–`U+DFFF` that is not half of a surrogate pair) is
+not a valid Literal and MUST be rejected. Such a string has no UTF-8
+encoding (§3.2). Encoders that substitute `U+FFFD` for it would give two
+different values the same hash. Languages whose strings are sequences of
+UTF-16 code units, and JSON text through escapes such as `"\ud800"`, can
+both carry an unpaired surrogate, so an implementation MUST check for one
+wherever a value enters from outside: when it creates an entry and when it
+decodes a message from a peer. `U+FFFD` itself is an ordinary character
+and is valid.
 
 ### 2.2 Serialization Rules
 

@@ -16,7 +16,7 @@ CREATE SCHEMA users_schema CREATORS ($dev) AS (
   TABLE caps (
     label string PUB READONLY,
     grantee string PUB READONLY
-  ) ALLOW insert IF EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
+  ) ALLOW insert IF EXISTS (caps AS c WHERE c.label = 'manager' AND c.grantee = $author)
 );
 CREATE CATALOG app CREATORS ($dev) VERSION '1.0.0' PARAMS (:admin identity) AS (
   TABLEGROUP users USING SCHEMA users_schema AT LATEST
@@ -27,7 +27,7 @@ CREATE CATALOG app CREATORS ($dev) VERSION '1.0.0' PARAMS (:admin identity) AS (
     ),
   FILES media
     USING IDENTITIES users.identities
-    ALLOW WRITE IF EXISTS users.caps WHERE users.caps.label = 'writer' AND users.caps.grantee = $author
+    ALLOW WRITE IF EXISTS (users.caps WHERE users.caps.label = 'writer' AND users.caps.grantee = $author)
 ) BY $dev;`;
 
 type Actors = { dev: OwnIdentity; admin: OwnIdentity; alice: OwnIdentity };

@@ -21,8 +21,8 @@ export const USER_SCHEMA = `CREATE SCHEMA hhs:user CREATORS ($dev) AS (
     label string PUB READONLY,
     grantee identity PUB READONLY
   ) CONCURRENT DELETES
-    ALLOW insert IF EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
-    ALLOW delete IF caps.grantee = $author OR EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
+    ALLOW insert IF EXISTS (caps AS c WHERE c.label = 'manager' AND c.grantee = $author)
+    ALLOW delete IF caps.grantee = $author OR EXISTS (caps AS c WHERE c.label = 'manager' AND c.grantee = $author)
 );`;
 
 export const DOC_SCHEMA = `CREATE SCHEMA hhs:doc CREATORS ($dev) AS (
@@ -30,14 +30,14 @@ export const DOC_SCHEMA = `CREATE SCHEMA hhs:doc CREATORS ($dev) AS (
   TABLE pages (
     title string,
     deleted boolean
-  ) ALLOW insert IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author
-    ALLOW update IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author
+  ) ALLOW insert IF EXISTS (user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author)
+    ALLOW update IF EXISTS (user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author)
     ALLOW delete IF false,
 
   TABLE blocks (
     pageId string READONLY REFERENCES pages,
     content string
-  ) ALLOW all IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author
+  ) ALLOW all IF EXISTS (user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author)
 );`;
 
 export const EDITOR_CATALOG = `-- :admin becomes the first manager.

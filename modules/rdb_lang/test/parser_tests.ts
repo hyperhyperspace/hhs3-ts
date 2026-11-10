@@ -6,6 +6,8 @@ import { columnSetFromTableDecl, columnsOfFromTableDecls } from "../src/compile/
 import { parseStatement } from "../src/syntax/parser.js";
 import { createTestBindContext } from "./mock_bind_context.js";
 import type { CatalogGroupExpr } from "../src/syntax/ast.js";
+import { formatPredicate } from "@hyper-hyper-space/hhs3_rdb";
+import type { Where, WhereLeaf } from "@hyper-hyper-space/hhs3_rdb";
 
 // The single group of `CREATE CATALOG c VERSION '1.0.0' AS (<body>)`.
 function catalogGroup(body: string): CatalogGroupExpr {
@@ -74,7 +76,7 @@ export const parserTests = {
                     CREATE SCHEMA shop AS (
                       TABLE orders (
                         buyer string
-                      ) ALLOW insert IF EXISTS users.caps WHERE label = 'buyer' AND grantee = $author
+                      ) ALLOW insert IF EXISTS (users.caps WHERE label = 'buyer' AND grantee = $author)
                     );
                 `);
                 assertTrue(result.ok, 'parse should succeed');
@@ -200,7 +202,7 @@ export const parserTests = {
             invoke: async () => {
                 const group = catalogGroup(`
                     TABLEGROUP shop_prod USING SCHEMA shop
-                      ALLOW DEPLOY IF EXISTS users.caps WHERE label = 'deployer' AND grantee = $author
+                      ALLOW DEPLOY IF EXISTS (users.caps WHERE label = 'deployer' AND grantee = $author)
                 `);
                 assertTrue(group.canDeploy !== undefined, 'canDeploy predicate is present');
             },
@@ -211,7 +213,7 @@ export const parserTests = {
                 const group = catalogGroup(`
                     TABLEGROUP docs_gated USING SCHEMA shop
                       BIND users => users
-                      ALLOW UPDATE REF users IF EXISTS users.caps WHERE label = 'manager' AND grantee = $author
+                      ALLOW UPDATE REF users IF EXISTS (users.caps WHERE label = 'manager' AND grantee = $author)
                 `);
                 assertEquals(group.canObserve.length, 1, 'one canObserve gate');
                 assertEquals(group.canObserve[0].binding, 'users', 'gate binds users');
@@ -351,7 +353,7 @@ export const parserTests = {
                     'INSERT OWNED BY should fail');
                 assertTrue(!parseStatement("CREATE SCHEMA s AS (TABLE t (v string) ALLOW update IF OWNER IS $author);").ok,
                     'OWNER IS should fail');
-                assertTrue(!parseStatement("CREATE SCHEMA s AS (TABLE t (v string) ALLOW insert IF EXISTS caps WHERE label = 'x' OWNED BY $author);").ok,
+                assertTrue(!parseStatement("CREATE SCHEMA s AS (TABLE t (v string) ALLOW insert IF EXISTS (caps WHERE label = 'x') OWNED BY $author);").ok,
                     'EXISTS OWNED BY should fail');
             },
         },
@@ -421,7 +423,7 @@ export const parserTests = {
                     CREATE SCHEMA users AS (
                       TABLE profiles (
                         keyId string PUB READONLY
-                      ) ALLOW insert IF keyId = $author AND EXISTS users.identities WHERE users.identities.keyId = profiles.keyId
+                      ) ALLOW insert IF keyId = $author AND EXISTS (users.identities WHERE users.identities.keyId = profiles.keyId)
                     );
                 `);
                 assertTrue(result.ok, 'parse should succeed');
@@ -442,7 +444,7 @@ export const parserTests = {
                 const exists = lowered.args[1];
                 assertEquals(exists.p, 'exists', 'second arm is EXISTS');
                 if (exists.p !== 'exists') return;
-                assertEquals(exists.where.keyId, '$row.keyId', 'EXISTS WHERE correlates via gated table column');
+                assertEquals((exists.where as WhereLeaf).keyId, '$row.keyId', 'EXISTS WHERE correlates via gated table column');
             },
         },
         {
@@ -451,7 +453,7 @@ export const parserTests = {
                 const result = parseStatement(`
                     CREATE SCHEMA s AS (
                       TABLE t (v string PUB READONLY)
-                        ALLOW insert IF EXISTS u WHERE v = $row.v
+                        ALLOW insert IF EXISTS (u WHERE v = $row.v)
                     );
                 `);
                 assertTrue(result.ok, 'parse should succeed');
@@ -502,7 +504,7 @@ export const parserTests = {
                 const result = parseStatement(`
                     CREATE SCHEMA s AS (
                       TABLE profiles (keyId string PUB READONLY)
-                        ALLOW insert IF EXISTS identities WHERE keyId = keyId,
+                        ALLOW insert IF EXISTS (identities WHERE keyId = keyId),
                       TABLE identities (keyId string PUB READONLY)
                     );
                 `);
@@ -532,7 +534,7 @@ export const parserTests = {
                 const result = parseStatement(`
                     CREATE SCHEMA s AS (
                       TABLE caps (label string PUB READONLY, grantee string PUB READONLY)
-                        ALLOW insert IF EXISTS caps WHERE label = 'manager'
+                        ALLOW insert IF EXISTS (caps WHERE label = 'manager')
                     );
                 `);
                 assertTrue(result.ok, 'parse should succeed');
@@ -729,7 +731,7 @@ export const parserTests = {
                 expectParseError('ALLOW insert IF name', 'Expected a condition', 'a bare value is not a condition');
                 expectParseError('ALLOW insert IF n = (m > 1)', 'Expected a value', 'a condition is not a value');
                 expectLowerThrows("name = '$author'", 'reserved', "quoted '$author' is rejected");
-                expectLowerThrows("EXISTS t AS t2 WHERE t2.name = '$row.name'", 'reserved', "quoted '$row' term in EXISTS WHERE is rejected");
+                expectLowerThrows("EXISTS (t AS t2 WHERE t2.name = '$row.name')", 'reserved', "quoted '$row' term in EXISTS WHERE is rejected");
 
                 const where = await lowerWhere('qty * 2 > price - 1');
                 assertEquals(json(where),
@@ -761,8 +763,8 @@ export const parserTests = {
                 assertEquals(json(lowerAllow('TRUE')), json({ p: 'true' }), 'TRUE as a condition');
                 assertEquals(json(lowerAllow('flag = TRUE')),
                     json({ p: 'cmp', cmp: 'eq', left: { col: 'flag' }, right: { lit: true } }), 'TRUE as a value');
-                assertEquals(json(lowerAllow("(EXISTS t AS t2 WHERE t2.name = 'x') OR n = 1")),
-                    json({ p: 'or', args: [{ p: 'exists', table: 't', where: { name: 'x' } }, eq('n', 1)] }), 'a parenthesized EXISTS ends its WHERE');
+                assertEquals(json(lowerAllow("EXISTS (t AS t2 WHERE t2.name = 'x') OR n = 1")),
+                    json({ p: 'or', args: [{ p: 'exists', table: 't', where: { name: 'x' } }, eq('n', 1)] }), 'an EXISTS ends at its closing parenthesis');
 
                 const not = await lowerWhere('NOT qty = 1 AND qty = 2');
                 assertEquals(json(not),
@@ -804,7 +806,7 @@ export const parserTests = {
                     CREATE SCHEMA s AS (
                       TABLE "table" ("identity" identity READONLY, "length" integer READONLY, "escape" string READONLY, "string" string)
                         ALLOW insert IF "table"."identity" = $author AND length("table"."escape") < "table"."length"
-                          AND "table"."escape" LIKE 'x%' AND (EXISTS "table" AS t WHERE t."identity" = "table"."identity")
+                          AND "table"."escape" LIKE 'x%' AND EXISTS ("table" AS t WHERE t."identity" = "table"."identity")
                     );
                 `);
                 assertTrue(result.ok, `parse should succeed: ${JSON.stringify(result.ok ? '' : result.diagnostics.map((d) => d.message))}`);
@@ -839,14 +841,14 @@ export const parserTests = {
 
                 const schema = parseStatement(`CREATE SCHEMA s AS (
                     TABLE docs ("json" json PUB READONLY DEFAULT ${text})
-                      ALLOW insert IF EXISTS docs AS d WHERE d."json" = ${text}
+                      ALLOW insert IF EXISTS (docs AS d WHERE d."json" = ${text})
                 );`);
                 assertTrue(schema.ok, `schema parses: ${JSON.stringify(schema.ok ? '' : schema.diagnostics.map((d) => d.message))}`);
                 if (!schema.ok || schema.value.kind !== 'create-schema') return;
                 const def = compileTable(schema.value.tables[0]);
                 same(def.columns['json'].default, 'DEFAULT JSON literal');
                 const rule = def.restrictions?.[0].rule;
-                same(rule?.p === 'exists' ? rule.where['json'] : undefined, 'EXISTS where-value JSON literal');
+                same(rule?.p === 'exists' ? (rule.where as WhereLeaf)['json'] : undefined, 'EXISTS where-value JSON literal');
 
                 const insert = parseStatement(`INSERT INTO docs ("json") VALUES (${text});`);
                 assertTrue(insert.ok && insert.value.kind === 'insert', 'INSERT parses');
@@ -885,8 +887,8 @@ export const parserTests = {
                                    caps (label = 'manager', grantee = :admin)),
                       TABLEGROUP doc USING SCHEMA hhs:doc AT LATEST
                         BIND user => user, other => #abc USING IDENTITIES user.identities
-                        ALLOW UPDATE REF user IF EXISTS caps WHERE caps.grantee = $author
-                        ALLOW DEPLOY IF EXISTS user.caps WHERE caps.grantee = $author
+                        ALLOW UPDATE REF user IF EXISTS (caps WHERE caps.grantee = $author)
+                        ALLOW DEPLOY IF EXISTS (user.caps WHERE caps.grantee = $author)
                     ) NOTE 'initial' BY $dev;
                 `);
                 assertTrue(result.ok, `parse should succeed: ${JSON.stringify(result.ok ? '' : result.diagnostics.map((d) => d.message))}`);
@@ -1072,7 +1074,7 @@ export const parserTests = {
                 const created = parseStatement(`CREATE CATALOG c VERSION '1.0.0' AS (
                     TABLEGROUP user USING SCHEMA s USING IDENTITIES identities,
                     FILES media USING IDENTITIES user.identities
-                      ALLOW WRITE IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author,
+                      ALLOW WRITE IF EXISTS (user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author),
                     FILES files BIND u => #ab12cd34 USING IDENTITIES u.identities ALLOW WRITE IF true
                 );`);
                 assertTrue(created.ok, `CREATE CATALOG with FILES parses: ${created.ok ? '' : created.diagnostics.map((d) => d.message).join('; ')}`);
@@ -1152,8 +1154,256 @@ export const parserTests = {
                 assertTrue(parseStatement('SELECT get, list FROM g.put WHERE key = common;').ok, 'and valid in queries');
             },
         },
+        {
+            name: '[PARSE52] EXISTS is delimited: the form without parentheses is a parse error that shows the new one, and a nested EXISTS is a syntax error',
+            invoke: async () => {
+                const sql = (predicate: string) =>
+                    `CREATE SCHEMA s AS (TABLE t (name string READONLY) ALLOW insert IF ${predicate}, TABLE caps (label string PUB, grantee string PUB));`;
+                const rule = (predicate: string) => parseMessages(sql(predicate));
+                const ruleOk = (predicate: string) => parseStatement(sql(predicate)).ok;
+
+                assertTrue(ruleOk("EXISTS (caps WHERE label = 'writer' AND grantee = $author)"), 'the delimited form parses');
+                assertTrue(ruleOk("EXISTS (caps AS c WHERE c.label = 'writer') OR EXISTS (caps AS c WHERE c.label = 'manager')"),
+                    'the parenthesis that matches EXISTS ( ends the atom: no outer parentheses are needed in a group');
+                assertTrue(ruleOk("EXISTS (caps WHERE (label = 'writer') AND (grantee = $author))"), 'a parenthesis inside the atom groups');
+                assertTrue(ruleOk("name = 'x' AND EXISTS (caps WHERE label = 'writer') AND name = 'y'"), 'the condition goes on after the atom');
+
+                const old = rule("EXISTS caps WHERE label = 'writer' AND grantee = $author");
+                assertTrue(old.some((m) => m === 'EXISTS takes its table and filter in parentheses: write EXISTS (caps WHERE ...)'),
+                    `today's form is an error that shows the new one, got ${JSON.stringify(old)}`);
+                assertEquals(old.length, 1, 'and it is the only error: the old form is still read to its end');
+                const oldAlias = rule("EXISTS caps AS c WHERE c.label = 'writer'");
+                assertTrue(oldAlias.some((m) => m.includes('write EXISTS (caps AS c WHERE ...)')), `the alias is shown too, got ${JSON.stringify(oldAlias)}`);
+                assertTrue(rule("(EXISTS caps WHERE label = 'writer') OR name = 'x'").some((m) => m.includes('write EXISTS (caps WHERE ...)')),
+                    'also inside parentheses');
+
+                assertTrue(rule("EXISTS (caps WHERE label = 'writer' AND EXISTS (caps WHERE grantee = $author))")
+                    .some((m) => m === 'EXISTS cannot appear inside the filter of another EXISTS'), 'a nested EXISTS is a syntax error');
+                assertTrue(rule("EXISTS (caps WHERE label = 'writer'").length > 0, 'an unclosed EXISTS is an error');
+                assertTrue(rule('EXISTS (caps)').some((m) => m.includes('EXISTS requires a WHERE clause')), 'an EXISTS with no filter is an error');
+
+                // IN is an operator only inside an EXISTS filter
+                assertTrue(ruleOk("EXISTS (caps WHERE label IN ('writer', 'manager'))"), 'IN parses inside a filter');
+                assertTrue(rule("name IN ('a', 'b')").length > 0, 'IN outside an EXISTS is not an operator');
+                assertTrue(parseStatement('CREATE SCHEMA s AS (TABLE "in" (in string PUB, x string) ALLOW insert IF EXISTS (u.t WHERE in = x));').ok,
+                    '`in` stays a valid name, also as the first word of a filter term');
+                assertTrue(parseStatement("SELECT in FROM g.t WHERE in = 'x';").ok, 'and valid in queries');
+                assertTrue(parseMessages("SELECT * FROM g.t WHERE name IN ('a', 'b');").length > 0, 'a query does not take IN');
+            },
+        },
+        {
+            name: '[PARSE53] an EXISTS filter lowers to a where tree: a conjunction is one leaf, OR and IN are groups, and parentheses keep their nesting',
+            invoke: async () => {
+                const where = (filter: string) => {
+                    const lowered = lowerGated(`EXISTS (grants WHERE ${filter})`);
+                    if (lowered.p !== 'exists') throw new Error('expected an exists atom');
+                    return JSON.stringify(lowered.where);
+                };
+                const same = (filter: string, expected: Where, what: string) => assertEquals(where(filter), JSON.stringify(expected), what);
+
+                same("label = 'writer'", { label: 'writer' }, 'an equality is a one-field leaf');
+                same("'writer' = label", { label: 'writer' }, 'either way round');
+                same("label = 'writer' AND grantee = $author", { label: 'writer', grantee: '$author' }, 'a conjunction of equalities is one leaf');
+                same("(label = 'writer' AND grantee = $author)", { label: 'writer', grantee: '$author' }, 'also in parentheses');
+                same("label = 'writer' AND (grantee = $author AND scope = docs.area)", { label: 'writer', grantee: '$author', scope: '$row.area' },
+                    'and when part of it is parenthesized: it is still one leaf');
+                same("label = 'writer' OR label = 'manager'", { $or: [{ label: 'writer' }, { label: 'manager' }] }, 'an OR is an $or of its members');
+                same("label = 'writer' AND grantee = $author OR label = 'manager'",
+                    { $or: [{ label: 'writer', grantee: '$author' }, { label: 'manager' }] }, 'AND binds tighter than OR');
+                same("grantee = $author AND (label = 'writer' OR scope = 'all')",
+                    { $and: [{ grantee: '$author' }, { $or: [{ label: 'writer' }, { scope: 'all' }] }] }, 'a group beside a leaf, under an AND');
+                same("(label = 'writer' OR scope = 'all') AND grantee = $author AND grants.resource = docs.resource",
+                    { $and: [{ $or: [{ label: 'writer' }, { scope: 'all' }] }, { grantee: '$author', resource: '$row.resource' }] },
+                    'the leaf of an AND sits where its first equality is');
+                same("grantee = $author AND (label = 'writer' OR scope = 'all') AND grants.resource = docs.resource",
+                    { $and: [{ grantee: '$author', resource: '$row.resource' }, { $or: [{ label: 'writer' }, { scope: 'all' }] }] },
+                    'equalities on both sides of a group share the one leaf');
+                same("(label = 'a' OR label = 'b') AND (scope = 'x' OR scope = 'y')",
+                    { $and: [{ $or: [{ label: 'a' }, { label: 'b' }] }, { $or: [{ scope: 'x' }, { scope: 'y' }] }] }, 'an AND of two groups has no leaf');
+                same("(label = 'a' OR label = 'b') OR scope = 'x'",
+                    { $or: [{ $or: [{ label: 'a' }, { label: 'b' }] }, { scope: 'x' }] }, 'a parenthesized OR keeps its nesting');
+                same("label = 'a' OR label = 'b' OR scope = 'x'",
+                    { $or: [{ label: 'a' }, { label: 'b' }, { scope: 'x' }] }, 'an unparenthesized chain is one group');
+                same("(grantee = $author AND (label = 'a' OR label = 'b')) AND (scope = 'x' OR scope = 'y')",
+                    { $and: [{ $and: [{ grantee: '$author' }, { $or: [{ label: 'a' }, { label: 'b' }] }] }, { $or: [{ scope: 'x' }, { scope: 'y' }] }] },
+                    'a parenthesized AND that holds a group keeps its nesting');
+
+                // the example rule of HIP-21
+                same("grantee = $author AND label IN ('writer', 'manager') AND grants.resource IN (docs.resource, '*')",
+                    { $and: [
+                        { grantee: '$author' },
+                        { $or: [{ label: 'writer' }, { label: 'manager' }] },
+                        { $or: [{ resource: '$row.resource' }, { resource: '*' }] },
+                    ] }, 'IN lists are groups beside the leaf');
+
+                // what a filter does not take
+                for (const filter of ["label != 'x'", "scope < 'x'", "label LIKE 'x%'", "NOT label = 'x'", 'true', "label = 'x' AND scope > 'a'"]) {
+                    expectThrowsWith(() => where(filter), 'EXISTS WHERE supports only = and IN, combined with AND / OR', `${filter} is not a filter term`);
+                }
+                expectThrowsWith(() => where("label = 'a' + 'b'"), 'EXISTS WHERE value must be a literal', 'a value is not an expression');
+                expectThrowsWith(() => where("docs.kind = 'x'"), "EXISTS WHERE filter must reference the EXISTS table, not 'docs.kind'",
+                    'a comparison with no column of the EXISTS table');
+                expectThrowsWith(() => where("'x' = 'y'"), 'EXISTS WHERE filter must reference the EXISTS table', 'two values');
+                expectThrowsWith(() => where('grants.label = grants.scope'), 'EXISTS WHERE cannot compare two EXISTS table columns', 'two columns of the EXISTS table');
+            },
+        },
+        {
+            name: '[PARSE54] IN in an EXISTS filter: one value is the equality, a repeated value gives equal members, a list holds every kind of value, and each renders back as IN',
+            invoke: async () => {
+                const lower = (filter: string) => {
+                    const lowered = lowerGated(`EXISTS (grants WHERE ${filter})`, [':tier']);
+                    if (lowered.p !== 'exists') throw new Error('expected an exists atom');
+                    return lowered;
+                };
+                const check = (filter: string, expected: Where, rendered: string, what: string) => {
+                    const lowered = lower(filter);
+                    assertEquals(JSON.stringify(lowered.where), JSON.stringify(expected), what);
+                    const text = formatPredicate(lowered, { gatedTable: 'docs' });
+                    assertEquals(text, `EXISTS (grants WHERE ${rendered})`, `${what}: rendered`);
+                    const back = lowerGated(text, [':tier']);
+                    assertEquals(JSON.stringify(back), JSON.stringify(lowered), `${what}: the rendered text lowers back to the same payload`);
+                };
+
+                check("label IN ('writer')", { label: 'writer' }, "grants.label = 'writer'", 'a list of one value is the equality');
+                check("label IN ('writer', 'manager')", { $or: [{ label: 'writer' }, { label: 'manager' }] },
+                    "grants.label IN ('writer', 'manager')", 'a list is an $or of one-field leaves');
+                check("label IN ('writer', 'writer')", { $or: [{ label: 'writer' }, { label: 'writer' }] },
+                    "grants.label IN ('writer', 'writer')", 'a repeated value gives two equal members');
+                check("grantee IN ($author, 'public', :tier, docs.owner)",
+                    { $or: [{ grantee: '$author' }, { grantee: 'public' }, { grantee: '$param.tier' }, { grantee: '$row.owner' }] },
+                    "grants.grantee IN ($author, 'public', :tier, docs.owner)", 'a list holds a value of each kind');
+                check("level IN (1, -2, 3)", { $or: [{ level: 1 }, { level: -2 }, { level: 3 }] }, 'grants.level IN (1, -2, 3)', 'numbers, a negative one included');
+                check("label IN ('a', 'b') OR scope = 'x'", { $or: [{ $or: [{ label: 'a' }, { label: 'b' }] }, { scope: 'x' }] },
+                    "grants.label IN ('a', 'b') OR grants.scope = 'x'", 'under an OR, IN is a group of its own');
+                check("label = 'a' OR label = 'b' OR scope = 'x'", { $or: [{ label: 'a' }, { label: 'b' }, { scope: 'x' }] },
+                    "grants.label = 'a' OR grants.label = 'b' OR grants.scope = 'x'", 'which the plain chain is not');
+                check("label = 'a' OR label = 'b'", { $or: [{ label: 'a' }, { label: 'b' }] },
+                    "grants.label IN ('a', 'b')", 'an OR of equalities on one column is the same payload as IN, and renders as IN');
+                check("grantee = $author AND label IN ('a', 'b')", { $and: [{ grantee: '$author' }, { $or: [{ label: 'a' }, { label: 'b' }] }] },
+                    "grants.grantee = $author AND grants.label IN ('a', 'b')", 'under an AND, IN is a group beside the leaf');
+                check("grantee = $author AND label IN ('a')", { grantee: '$author', label: 'a' },
+                    "grants.grantee = $author AND grants.label = 'a'", 'and a one-value IN joins the leaf');
+                check("label IN ('a', 'b') AND scope IN ('x', 'y')", { $and: [{ $or: [{ label: 'a' }, { label: 'b' }] }, { $or: [{ scope: 'x' }, { scope: 'y' }] }] },
+                    "grants.label IN ('a', 'b') AND grants.scope IN ('x', 'y')", 'two lists under an AND');
+                check("label = 'a' AND label IN ('b', 'c')", { $and: [{ label: 'a' }, { $or: [{ label: 'b' }, { label: 'c' }] }] },
+                    "grants.label = 'a' AND grants.label IN ('b', 'c')", 'a list on a column the leaf names is a group, not a second value of the leaf');
+
+                expectThrowsWith(() => lower("$author IN (grantee, scope)"), 'EXISTS WHERE IN takes a column of the EXISTS table on its left', 'a value on the left');
+                expectThrowsWith(() => lower("docs.owner IN ('a', 'b')"), "EXISTS WHERE filter must reference the EXISTS table, not 'docs.owner'", 'a gated column on the left');
+                expectThrowsWith(() => lower('label IN (grants.scope, grants.grantee)'), 'EXISTS WHERE correlation must reference the gated table', 'EXISTS columns in the list');
+                expectThrowsWith(() => lower("label IN ('a', 1 + 2)"), 'EXISTS WHERE value must be a literal', 'an expression in the list');
+            },
+        },
+        {
+            name: '[PARSE55] one rule for names in an EXISTS filter: a bare name must belong to exactly one of the two tables',
+            invoke: async () => {
+                // docs (owner, kind, resource) is gated; caps (label, owner, grantee) and docs itself are local targets
+                const lower = (predicate: string) => lowerGated(predicate);
+                const leaf = (predicate: string) => {
+                    const lowered = lower(predicate);
+                    return lowered.p === 'exists' ? JSON.stringify(lowered.where) : 'not an exists';
+                };
+
+                assertEquals(leaf("EXISTS (caps WHERE label = 'admin' AND grantee = $author)"), JSON.stringify({ label: 'admin', grantee: '$author' }),
+                    'names only the EXISTS table has are its columns');
+                assertEquals(leaf('EXISTS (caps WHERE grantee = kind)'), JSON.stringify({ grantee: '$row.kind' }),
+                    'a name only the gated table has is a value');
+                assertEquals(leaf('EXISTS (caps WHERE caps.owner = docs.owner)'), JSON.stringify({ owner: '$row.owner' }), 'qualified names are never ambiguous');
+
+                expectThrowsWith(() => lower("EXISTS (caps WHERE caps.label = 'admin' AND owner = $author)"),
+                    "ambiguous column 'owner'; qualify with table name (exists in both 'docs' and 'caps')",
+                    'a bare name both tables have, as the column of a comparison');
+                expectThrowsWith(() => lower("EXISTS (caps WHERE caps.label = 'admin' OR owner = $author)"), "ambiguous column 'owner'", 'also under an OR');
+                expectThrowsWith(() => lower("EXISTS (caps WHERE owner IN ($author, 'x'))"), "ambiguous column 'owner'", 'and on the left of IN');
+                expectThrowsWith(() => lower('EXISTS (caps WHERE caps.grantee = owner)'), "ambiguous column 'owner'", 'and as a value');
+                expectThrowsWith(() => lower("EXISTS (caps WHERE caps.label = 'admin' AND kind = 'x')"),
+                    "EXISTS WHERE filter must reference the EXISTS table: 'kind' is a column of 'docs', not of 'caps'",
+                    'a bare name only the gated table has is not a filter on the target');
+                expectThrowsWith(() => lower("EXISTS (caps WHERE kind IN ('x', 'y'))"), "'kind' is a column of 'docs', not of 'caps'", 'also on the left of IN');
+                expectThrowsWith(() => lower("EXISTS (caps WHERE nope = 'x')"), "unknown column 'nope'", 'a name neither table has');
+
+                // a target in a bound group: its columns are not known here
+                assertEquals(leaf("EXISTS (auth.caps WHERE label = 'admin' AND grantee = $author)"), JSON.stringify({ label: 'admin', grantee: '$author' }),
+                    "a bare name the gated table lacks is the target's");
+                expectThrowsWith(() => lower("EXISTS (auth.caps WHERE label = 'admin' AND owner = $author)"), "ambiguous column 'owner'; qualify with table name",
+                    'a bare name the gated table has is an error when the target is in a bound group');
+                assertEquals(leaf("EXISTS (auth.caps WHERE auth.caps.owner = $author AND caps.label = docs.kind)"), JSON.stringify({ owner: '$author', label: '$row.kind' }),
+                    'qualified with the target, by its full or bare name, it is fine');
+
+                // a self-referential EXISTS: the alias is required and every name is qualified
+                expectThrowsWith(() => lower("EXISTS (docs WHERE owner = $author)"), 'EXISTS docs is self-referential; use AS alias', 'the alias is required');
+                expectThrowsWith(() => lower("EXISTS (docs AS d WHERE owner = $author)"), "ambiguous column 'owner'", 'a bare name is in both tables');
+                assertEquals(leaf("EXISTS (docs AS d WHERE d.owner = $author AND d.kind = docs.kind)"), JSON.stringify({ owner: '$author', kind: '$row.kind' }),
+                    'with every name qualified it lowers');
+
+                // a gate has no gated table, so no bare name is ambiguous
+                const gate = parseStatement("SELECT * FROM g.t WHERE EXISTS (auth.caps WHERE owner = $author OR label IN ('a', 'b'));");
+                assertTrue(gate.ok && gate.value.kind === 'select' && gate.value.where !== undefined, 'the gate predicate parses');
+                if (!gate.ok || gate.value.kind !== 'select' || gate.value.where === undefined) return;
+                const lowered = lowerRestrictionPredicate(gate.value.where, { columnsOf: () => undefined });
+                assertEquals(JSON.stringify(lowered), JSON.stringify({ p: 'exists', table: 'auth.caps', where: { $or: [{ owner: '$author' }, { $or: [{ label: 'a' }, { label: 'b' }] }] } }),
+                    'in a gate every bare name is the target\'s');
+            },
+        },
+        {
+            name: '[PARSE56] a column named twice in one AND of an EXISTS filter is an error that suggests the rewrite',
+            invoke: async () => {
+                const lower = (filter: string) => lowerGated(`EXISTS (caps WHERE ${filter})`, [':tier']);
+                expectThrowsWith(() => lower('grantee = $author AND grantee = docs.owner'),
+                    'EXISTS WHERE compares caps.grantee twice in one AND, to $author and to docs.owner. '
+                    + 'A row has one value for a column, so this holds only when the two are equal: '
+                    + 'keep one comparison and compare the values outside the EXISTS, as in '
+                    + '$author = docs.owner AND EXISTS (caps WHERE caps.grantee = $author)',
+                    'the error names the column and both values, and shows the rewrite');
+                expectThrowsWith(() => lower("label = 'writer' AND grantee = $author AND label = 'manager'"),
+                    "to 'writer' and to 'manager'", 'literals are shown as written');
+                expectThrowsWith(() => lower("label = 'a' AND (grantee = $author AND label = :tier)"), "to 'a' and to :tier",
+                    'a parenthesized conjunction is part of the same leaf');
+                expectThrowsWith(() => lower("label = 'a' AND label IN ('b')"), "to 'a' and to 'b'", 'a one-value IN is an equality of the same leaf');
+                expectThrowsWith(() => lowerGated("EXISTS (docs AS d WHERE d.owner = $author AND d.owner = docs.owner)"),
+                    '$author = docs.owner AND EXISTS (docs AS d WHERE d.owner = $author)', 'the alias is kept in the suggested rewrite');
+
+                // the suggested rewrite compiles
+                const rewritten = lowerGated('docs.owner = $author AND EXISTS (caps WHERE caps.grantee = $author)');
+                assertEquals(rewritten.p, 'and', 'the rewrite is a comparison beside the EXISTS');
+                // and a column in two arms of an OR, or in a leaf and a list, is not named twice
+                assertTrue(lower("label = 'a' OR label = 'b'").p === 'exists', 'two arms of an OR');
+                assertTrue(lower("label = 'a' AND label IN ('b', 'c')").p === 'exists', 'a leaf and a list');
+            },
+        },
     ],
 };
+
+// Lowers one rule of `docs`, a table gated beside the local tables `caps` and
+// `grants`; `auth` names a bound group, whose tables are not known here.
+function lowerGated(predicate: string, params: string[] = []) {
+    const result = parseStatement(`CREATE SCHEMA s AS (
+        TABLE docs (owner string READONLY, kind string READONLY, resource string READONLY, area string READONLY) ALLOW insert IF ${predicate},
+        TABLE caps (label string PUB, owner string PUB, grantee string PUB),
+        TABLE grants (label string PUB, grantee string PUB, resource string PUB, scope string PUB, level integer PUB)
+    );`);
+    if (!result.ok || result.value.kind !== 'create-schema') {
+        throw new Error(`parse failed for '${predicate}': ${JSON.stringify(result.ok ? result.value.kind : result.diagnostics.map((d) => d.message))}`);
+    }
+    const table = result.value.tables[0];
+    const allow = table.options.find((o) => o.kind === 'allow-rule');
+    if (allow === undefined || allow.kind !== 'allow-rule') throw new Error('no allow rule');
+    return lowerRestrictionPredicate(allow.predicate, {
+        gated: { name: table.name, columns: columnSetFromTableDecl(table) },
+        columnsOf: columnsOfFromTableDecls(result.value.tables),
+        params: new Set(params.map((p) => p.substring(1))),
+    });
+}
+
+function expectThrowsWith(fn: () => unknown, messagePart: string, why: string) {
+    let message = '<no error>';
+    try {
+        fn();
+    } catch (e) {
+        message = e instanceof Error ? e.message : String(e);
+    }
+    assertTrue(message.includes(messagePart), `${why}: expected an error mentioning '${messagePart}', got '${message}'`);
+}
 
 function expectParseError(allow: string, messagePart: string, why: string) {
     const result = parseStatement(`CREATE SCHEMA s AS (TABLE t (name string READONLY, n integer READONLY, m integer READONLY) ${allow});`);

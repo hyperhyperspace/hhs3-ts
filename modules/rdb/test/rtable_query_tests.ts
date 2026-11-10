@@ -6,9 +6,10 @@ import { createMockRContext } from "./mock_rcontext.js";
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
 import { RTableGroupImpl, rTableGroupFactory } from "../src/rtable_group/group.js";
 import { deriveRowId } from "../src/rtable/hash.js";
-import type { TableDef } from "../src/rschema/payload.js";
-import type { Row } from "../src/rtable/interfaces.js";
+import type { TableDef, Where } from "../src/rschema/payload.js";
+import type { Row, RTableView } from "../src/rtable/interfaces.js";
 import type { TruthTableView } from "../src/rtable/view.js";
+import { existsOnView, evaluatePredicate } from "../src/rtable_group/predicates.js";
 import type { ColumnTypes, RowFilter, RowQuery } from "../src/rtable/query.js";
 import { evalRowFilter, orderRows, projectRow, validateRowQuery } from "../src/rtable/query.js";
 import { likeMatch, isValidLikePattern } from "../src/rschema/expr.js";
@@ -511,7 +512,7 @@ export const rtableQueryTests = {
                 await tickets.insert('t3', { kind: 'task', status: 'open' });     // status written
 
                 const view = await tickets.getView();
-                const exists = (view as unknown as TruthTableView).existsMatching.bind(view);
+                const exists = (where: { [field: string]: string }) => existsOnView(view as unknown as TruthTableView, where);
                 // Sequential on purpose: one traversal per view evaluation.
                 const named = async (rowIds: B64Hash[]): Promise<string> => {
                     const names: string[] = [];
@@ -532,6 +533,105 @@ export const rtableQueryTests = {
                 assertEquals((await exists({ status: 'open', kind: 'bug' })).status, 'true', 'EXISTS, default field first');
                 assertEquals((await exists({ kind: 'bug', status: 'open' })).status, 'true', 'EXISTS, default field second');
                 assertEquals((await exists({ status: 'closed', kind: 'task' })).status, 'false', 'EXISTS finds no closed task');
+            }
+        },
+        {
+            name: '[QRY11] engine: under an $or a field at its default makes every row a candidate, and beside other fields it lists no rows beyond theirs',
+            invoke: async () => {
+                const { group } = await createTicketsGroup();
+                const tickets = await group.getTable('tickets');
+                await tickets.insert('t1', { kind: 'bug' });                      // status is the default
+                await tickets.insert('t2', { kind: 'bug', status: 'closed' });
+                await tickets.insert('t3', { kind: 'task', status: 'open' });     // status written
+                await tickets.insert('t4', { kind: 'chore', status: 'closed' });
+                const names = new Map(['t1', 't2', 't3', 't4'].map((uuid) => [deriveRowId(uuid), uuid]));
+
+                // Whether a row matches, and the rows the read looked at: a row is
+                // read only when it is a candidate that carries some leaf.
+                const read = async (where: Where): Promise<{ status: string; rows: string }> => {
+                    const view = await tickets.getView() as unknown as TruthTableView;
+                    const seen = new Set<string>();
+                    const columnValue = view.columnValue.bind(view);
+                    const rowLiveness = view.rowLiveness.bind(view);
+                    view.columnValue = async (rowId, column) => { seen.add(names.get(rowId)!); return columnValue(rowId, column); };
+                    view.rowLiveness = async (rowId) => { seen.add(names.get(rowId)!); return rowLiveness(rowId); };
+                    const status = (await existsOnView(view, where)).status;
+                    return { status, rows: [...seen].sort().join(',') };
+                };
+
+                // a row that never wrote the column is a witness through the default arm
+                const viaDefault = await read({ $or: [{ status: 'open' }, { kind: 'none' }] });
+                assertEquals(viaDefault.status, 'true', 'a row that never wrote status matches status = its default');
+                assertEquals(viaDefault.rows, 't1', 'and the read stops at it: t1 is the first of every inserted row');
+                const onlyDefault = await read({ $or: [{ status: 'open', kind: 'none' }, { $and: [{ status: 'open' }, { $or: [{ kind: 'none' }, { kind: 'nil' }] }] }] });
+                assertEquals(onlyDefault.status, 'false', 'no row has those kinds');
+                assertEquals(onlyDefault.rows, '', 'and no row is read: the default narrows nothing, the other fields list no rows');
+
+                // a leaf that pairs a default field with another field
+                const leaf = await read({ status: 'open', kind: 'task' });
+                assertEquals(leaf.status, 'true', 'the open task');
+                assertEquals(leaf.rows, 't3', 'only the rows that carry kind = task are read');
+
+                // an $or with a default member inside an $and
+                const narrowed = await read({ $and: [{ kind: 'chore' }, { $or: [{ status: 'open' }, { status: 'closed' }] }] });
+                assertEquals(narrowed.status, 'true', 'the closed chore');
+                assertEquals(narrowed.rows, 't4', "only the rows the $and's other member lists are read");
+                const narrowedMiss = await read({ $and: [{ kind: 'none' }, { $or: [{ status: 'open' }, { status: 'closed' }] }] });
+                assertEquals(narrowedMiss.status, 'false', 'no row of that kind');
+                assertEquals(narrowedMiss.rows, '', 'and no row is read, though every row carries the default');
+
+                // an $or of two such leaves lists the union of what their other fields list
+                const union = await read({ $or: [{ kind: 'chore', status: 'open' }, { kind: 'task', status: 'closed' }] });
+                assertEquals(union.status, 'false', 'no open chore and no closed task');
+                assertEquals(union.rows, 't4', 'the chores for the first arm, and no row for the second: no task carries closed');
+            }
+        },
+        {
+            name: '[QRY12] engine: a view that only has the public reads answers a where tree as the engine view does',
+            invoke: async () => {
+                const { group } = await createTicketsGroup();
+                const tickets = await group.getTable('tickets');
+                await tickets.insert('t1', { kind: 'bug' });
+                await tickets.insert('t2', { kind: 'bug', status: 'closed' });
+                await tickets.insert('t3', { kind: 'task', status: 'open' });
+
+                const view = await tickets.getView();
+                // the same view behind its public contract alone: predicates then read
+                // a tree through findRowIds, one leaf at a time
+                const publicOnly = {
+                    hasRow: (rowId: B64Hash) => view.hasRow(rowId),
+                    getAuthor: (rowId: B64Hash) => view.getAuthor(rowId),
+                    getRow: (rowId: B64Hash) => view.getRow(rowId),
+                    findRowIds: (where: { [column: string]: string }) => view.findRowIds(where),
+                } as unknown as RTableView;
+
+                const trees: [Where, boolean][] = [
+                    [{ kind: 'bug', status: 'open' }, true],
+                    [{ kind: 'task', status: 'closed' }, false],
+                    [{ $or: [{ kind: 'none' }, { kind: 'task' }] }, true],
+                    [{ $or: [{ kind: 'none' }, { kind: 'nil' }] }, false],
+                    [{ $and: [{ kind: 'bug' }, { $or: [{ status: 'closed' }, { status: 'gone' }] }] }, true],
+                    [{ $and: [{ kind: 'task' }, { $or: [{ status: 'closed' }, { status: 'gone' }] }] }, false],
+                    [{ $and: [{ $or: [{ kind: 'bug' }, { kind: 'task' }] }, { $or: [{ status: 'closed' }, { kind: 'task' }] }] }, true],
+                    // through the subject row: its kind is `task`
+                    [{ $or: [{ kind: 'none' }, { kind: '$row.kind' }] }, true],
+                    [{ $and: [{ kind: '$row.kind' }, { $or: [{ status: 'closed' }, { status: 'gone' }] }] }, false],
+                    [{ $or: [{ kind: '$row.missing' }, { kind: 'bug' }] }, true],
+                    // a field that is not searchable matches no row; the other arm still decides
+                    [{ $or: [{ nope: 'x' }, { kind: 'task' }] }, true],
+                    [{ $or: [{ nope: 'x' }, { kind: 'none' }] }, false],
+                ];
+                for (const [where, expected] of trees) {
+                    for (const [label, target] of [['the engine view', view], ['the public reads', publicOnly]] as const) {
+                        const result = await evaluatePredicate({ p: 'exists', table: 'tickets', where }, {
+                            getTableView: async () => target,
+                            getForeignTableView: async () => undefined,
+                            subjectRow: { kind: 'task' },
+                            context: 'row',
+                        });
+                        assertEquals(result, expected, `${label}: ${JSON.stringify(where)}`);
+                    }
+                }
             }
         },
     ],

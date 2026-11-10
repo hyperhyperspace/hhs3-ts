@@ -96,7 +96,7 @@ export async function withFiles(): Promise<{ v100: ReleaseFile; v110: ReleaseFil
         const v100 = await exportVersion(runtime, catalogId, '1.0.0');
         await runtime.execute(`ALTER CATALOG editor VERSION '1.1.0' AS (
             ADD FILES media USING IDENTITIES user.identities
-              ALLOW WRITE IF EXISTS user.caps WHERE user.caps.label = 'manager' AND user.caps.grantee = $author
+              ALLOW WRITE IF EXISTS (user.caps WHERE user.caps.label = 'manager' AND user.caps.grantee = $author)
         ) NOTE 'media' BY $admin;`);
         return { v100, v110: await exportVersion(runtime, catalogId, '1.1.0') };
     } finally {

@@ -1,7 +1,7 @@
 import { testing } from '@hyper-hyper-space/hhs3_util';
 import { checkFormat, Type, Format, FormatOptions } from '../format.js';
 import { Literal } from '../literal.js';
-import { isLiteral, toStringCanonical, toStringNormalized } from '../normalize.js';
+import { isLiteral, isWellFormedString, literalProblem, toStringCanonical, toStringNormalized } from '../normalize.js';
 
 async function testStrictRejectsUnknownKeys() {
     const format: Format = {
@@ -202,6 +202,32 @@ async function testIsLiteral() {
     testing.assertFalse(isLiteral(undefined), 'undefined');
 }
 
+async function testIsWellFormedString() {
+    testing.assertTrue(isWellFormedString(''), 'empty string');
+    testing.assertTrue(isWellFormedString('plain ✓'), 'BMP text');
+    testing.assertTrue(isWellFormedString('a😀b'), 'a surrogate pair');
+    testing.assertTrue(isWellFormedString('x�y'), 'U+FFFD is an ordinary character');
+    testing.assertFalse(isWellFormedString('x\ud800y'), 'lone high surrogate');
+    testing.assertFalse(isWellFormedString('x\ud800'), 'lone high surrogate at the end');
+    testing.assertFalse(isWellFormedString('\udc00x'), 'lone low surrogate at the start');
+    testing.assertFalse(isWellFormedString('\ude00\ud83d'), 'a pair in the wrong order');
+    testing.assertFalse(isWellFormedString('\ud83d😀'), 'a high surrogate before a pair');
+}
+
+async function testLiteralProblem() {
+    testing.assertTrue(literalProblem({ a: [1, 'x�y', true, { b: [] }] }) === undefined, 'a literal has no problem');
+
+    testing.assertFalse(isLiteral('x\ud800y'), 'ill-formed string');
+    testing.assertFalse(isLiteral({ a: [{ b: 'x\udc00' }] }), 'ill-formed string at depth');
+    testing.assertFalse(isLiteral({ a: { 'k\ud800': 1 } }), 'ill-formed key at depth');
+
+    testing.assertEquals(literalProblem([1, null]), 'null', 'names null');
+    testing.assertEquals(literalProblem({ a: Number.NaN }), 'a non-finite number', 'names a non-finite number');
+    testing.assertEquals(literalProblem(['x\ud800y']), 'a string that is not well-formed Unicode', 'names an ill-formed string');
+    testing.assertEquals(literalProblem({ 'k\ud800': 1 }), 'a key that is not well-formed Unicode', 'names an ill-formed key');
+    testing.assertEquals(literalProblem([undefined]), 'a value of type undefined', 'names an illegal type');
+}
+
 const canonicalTests = {
     title: '[CANONICAL] toStringCanonical and isLiteral',
     tests: [
@@ -209,6 +235,8 @@ const canonicalTests = {
         { name: '[CANONICAL_01] strings fully escaped, keys sorted', invoke: testCanonicalEscapesStrings },
         { name: '[CANONICAL_02] rejects null and non-finite numbers', invoke: testCanonicalRejectsNonLiterals },
         { name: '[CANONICAL_03] isLiteral rejects null at any depth', invoke: testIsLiteral },
+        { name: '[CANONICAL_04] isWellFormedString rejects lone surrogates', invoke: testIsWellFormedString },
+        { name: '[CANONICAL_05] isLiteral rejects ill-formed strings and keys, literalProblem names the problem', invoke: testLiteralProblem },
     ]
 };
 

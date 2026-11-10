@@ -20,7 +20,7 @@ export const lexerTests = {
         {
             name: '[LEX02] tokenizes qualified column identifiers in EXISTS WHERE',
             invoke: async () => {
-                const result = lex('EXISTS users.identities WHERE users.identities.keyId = profiles.keyId');
+                const result = lex('EXISTS (users.identities WHERE users.identities.keyId = profiles.keyId)');
                 assertTrue(result.ok, 'lexing should succeed');
                 if (!result.ok) return;
                 const identifiers = result.value.filter((t) => t.kind === 'identifier').map((t) => t.text);

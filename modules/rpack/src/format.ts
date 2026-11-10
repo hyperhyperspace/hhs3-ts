@@ -154,7 +154,8 @@ function isMap(value: unknown): value is json.LiteralMap {
 // problem found.
 export function checkReleaseFile(value: unknown): ReleaseFile {
     if (!isMap(value)) throw new ReleaseFileError('a release file must be a JSON object');
-    if (!json.isLiteral(value)) throw new ReleaseFileError('a release file must not contain null values');
+    const problem = json.literalProblem(value);
+    if (problem !== undefined) throw new ReleaseFileError('a release file must not contain ' + problem);
 
     const format = value['format'];
     if (format !== RELEASE_FILE_FORMAT) {
@@ -189,7 +190,8 @@ export function checkReleaseFile(value: unknown): ReleaseFile {
 
 export function checkSchemaReleaseFile(value: unknown): SchemaReleaseFile {
     if (!isMap(value)) throw new ReleaseFileError('a release file must be a JSON object');
-    if (!json.isLiteral(value)) throw new ReleaseFileError('a release file must not contain null values');
+    const problem = json.literalProblem(value);
+    if (problem !== undefined) throw new ReleaseFileError('a release file must not contain ' + problem);
 
     const format = value['format'];
     if (format !== RELEASE_FILE_FORMAT) {

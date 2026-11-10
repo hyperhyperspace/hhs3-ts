@@ -16,6 +16,8 @@
 // Case-fold collisions are legal here; mounts give the colliding files
 // distinct disk names.
 
+import { json } from "@hyper-hyper-space/hhs3_json";
+
 export const MAX_PATH_BYTES = 1024;
 export const MAX_PATH_SEGMENTS = 32;
 export const MAX_SEGMENT_BYTES = 255;
@@ -28,20 +30,6 @@ const RESERVED_NAMES = new Set([
 ]);
 
 const encoder = new TextEncoder();
-
-function isWellFormed(s: string): boolean {
-    for (let i = 0; i < s.length; i++) {
-        const c = s.charCodeAt(i);
-        if (c >= 0xd800 && c <= 0xdbff) {
-            const d = i + 1 < s.length ? s.charCodeAt(i + 1) : 0;
-            if (d < 0xdc00 || d > 0xdfff) return false;
-            i++;
-        } else if (c >= 0xdc00 && c <= 0xdfff) {
-            return false;
-        }
-    }
-    return true;
-}
 
 function segmentReason(segment: string): string | undefined {
     if (segment.length === 0) return 'has an empty segment';
@@ -64,7 +52,7 @@ function segmentReason(segment: string): string | undefined {
 export function filePathReason(path: unknown): string | undefined {
     if (typeof path !== 'string') return 'is not a string';
     if (path.length === 0) return 'is empty';
-    if (!isWellFormed(path)) return 'is not well-formed Unicode';
+    if (!json.isWellFormedString(path)) return 'is not well-formed Unicode';
     if (path.normalize('NFC') !== path) return 'is not NFC-normalized';
     if (encoder.encode(path).length > MAX_PATH_BYTES) return `is longer than ${MAX_PATH_BYTES} bytes`;
     const segments = path.split('/');

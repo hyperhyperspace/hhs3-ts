@@ -239,6 +239,15 @@ export const rtableIdentityTests = {
                     "the update restriction of table 'docs' reads $author, which needs an idProvider",
                     'a restriction over $author is rejected');
 
+                // $author inside a group of an exists `where`
+                const capsDocs: TableDef = { ...docsTable, restrictions: [{ on: 'delete', rule: {
+                    p: 'exists', table: 'f.caps', where: { $or: [{ label: 'open' }, { grantee: '$author' }] },
+                } }] };
+                const grouped = await createSchema(ctx, '06d', [capsDocs], admin);
+                await expectRejected(() => createGroup(ctx, 'ident06-grouped', grouped, { bindings: { f: foreign.getId() } }),
+                    "the delete restriction of table 'docs' reads $author, which needs an idProvider",
+                    'a restriction that reads $author inside an $or is rejected');
+
                 const withProvider = await createSchema(ctx, '06c', [ownedDocs, identitiesTableDef()], admin);
                 const group = await createGroup(ctx, 'ident06-ok', withProvider, {
                     bindings: { f: foreign.getId() }, canObserve: { f: authorGate }, idProvider: IDENTITIES_TABLE,

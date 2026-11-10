@@ -25,7 +25,7 @@ import { CreateRSchemaPayload, SchemaUpdatePayload, SchemaCreator } from "./payl
 import { validateMigrationRule, validateRSchemaPayloadFormat, type ValidateReason } from "./validate.js";
 import { ColumnType, TableDef, MigrationRule } from "./payload.js";
 import { collectExistsAtoms, collectRowFieldRefs, checkPredicateColumns, isValidSchemaName } from "./validate.js";
-import { splitTableRef } from "./payload.js";
+import { splitTableRef, whereEqualities } from "./payload.js";
 import type { RSchema, RSchemaView } from "./interfaces.js";
 import { compareSemver } from "../semver.js";
 
@@ -169,7 +169,8 @@ function checkLocalPredicateTargets(
             const target = tables.get(table);
             if (target === undefined) return `table '${def.name}': EXISTS target '${table}' does not exist`;
 
-            for (const field of Object.keys(atom.where ?? {})) {
+            for (const [field] of whereEqualities(atom.where)) {
+                if (field === 'rowAuthor') continue;
                 const column = target.columns[field];
                 if (column === undefined || !(column.pub ?? false)) {
                     return `table '${def.name}': EXISTS field '${table}.${field}' is not a pub column`;
@@ -253,7 +254,8 @@ function applyRule(
                 for (const restriction of other.restrictions ?? []) {
                     for (const atom of collectExistsAtoms(restriction.rule)) {
                         const [group, t] = splitTableRef(atom.table);
-                        if (group === undefined && t === rule.table && (atom.where ?? {})[rule.column] !== undefined) {
+                        if (group === undefined && t === rule.table
+                            && whereEqualities(atom.where).some(([field]) => field === rule.column)) {
                             return `column '${rule.table}.${rule.column}' is still used by an EXISTS in ${name}'s ${restriction.on} restriction`;
                         }
                     }

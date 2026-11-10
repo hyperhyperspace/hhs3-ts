@@ -524,6 +524,41 @@ export const rschemaTests = {
                 const fk = applyMigrationRules(tables(), [{ rule: 'drop-column', table: 'lines', column: 'orderId' }]);
                 assertFalse(fk.ok, 'a column with an FK cannot be dropped');
                 if (!fk.ok) assertTrue(fk.reason.includes('still has an FK'), 'the reason says why');
+
+                // A column that only a group of an exists `where` names: as a field of
+                // the target, and as a $row term of the gated table.
+                const grants: TableDef = {
+                    name: 'grants',
+                    columns: { grantee: { type: 'string', pub: true }, resource: { type: 'string', pub: true }, scope: { type: 'string', pub: true } },
+                };
+                const docs: TableDef = {
+                    name: 'docs',
+                    columns: { body: { type: 'string' }, resource: { type: 'string', readonly: true }, kind: { type: 'string', readonly: true } },
+                    restrictions: [{ on: 'update', rule: { p: 'exists', table: 'grants', where: { $and: [
+                        { grantee: 'g' },
+                        { $or: [{ resource: '$row.resource' }, { scope: '$row.kind' }] },
+                    ] } } }],
+                };
+                const granted = () => new Map<string, TableDef>([['grants', grants], ['docs', docs]]);
+                const field = applyMigrationRules(granted(), [{ rule: 'drop-column', table: 'grants', column: 'scope' }]);
+                assertFalse(field.ok, 'a column a group names as a field cannot be dropped');
+                if (!field.ok) assertEquals(field.reason, "column 'grants.scope' is still used by an EXISTS in docs's update restriction", 'the reason names the rule');
+                const term = applyMigrationRules(granted(), [{ rule: 'drop-column', table: 'docs', column: 'kind' }]);
+                assertFalse(term.ok, 'a column a group names as a $row term cannot be dropped');
+                if (!term.ok) assertEquals(term.reason, "column 'docs.kind' is still used by the table's update restriction", 'the reason names the rule');
+                assertTrue(applyMigrationRules(granted(), [{ rule: 'drop-column', table: 'docs', column: 'body' }]).ok,
+                    'a column no rule names can be dropped');
+
+                // set-restrictions checks the fields of a group, and takes rowAuthor as a create does
+                const restrict = (where: json.Literal) => applyMigrationRules(granted(), [{
+                    rule: 'set-restrictions', table: 'docs',
+                    restrictions: [{ on: 'delete', rule: { p: 'exists', table: 'docs', where } as never }],
+                }]);
+                const nonPub = restrict({ $or: [{ rowAuthor: 'k' }, { body: 'x' }] });
+                assertFalse(nonPub.ok, 'a field that is not pub, inside an $or, is refused');
+                if (!nonPub.ok) assertEquals(nonPub.reason, "table 'docs': EXISTS field 'docs.body' is not a pub column", 'the reason names the field');
+                assertTrue(restrict({ rowAuthor: 'k' }).ok, 'rowAuthor is searchable without being a column');
+                assertTrue(restrict({ $or: [{ rowAuthor: 'k' }, { rowAuthor: 'j' }] }).ok, 'also inside a group');
             }
         },
         {

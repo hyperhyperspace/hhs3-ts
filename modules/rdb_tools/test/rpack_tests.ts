@@ -23,7 +23,7 @@ CREATE SCHEMA hhs:user CREATORS ($dev) AS (
     label string PUB READONLY,
     grantee identity PUB READONLY
   ) CONCURRENT DELETES
-    ALLOW insert IF EXISTS caps AS c WHERE c.label = 'manager' AND c.grantee = $author
+    ALLOW insert IF EXISTS (caps AS c WHERE c.label = 'manager' AND c.grantee = $author)
 );
 
 CREATE SCHEMA hhs:doc CREATORS ($dev) AS (
@@ -31,7 +31,7 @@ CREATE SCHEMA hhs:doc CREATORS ($dev) AS (
   TABLE pages (
     title string,
     deleted boolean
-  ) ALLOW all IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author
+  ) ALLOW all IF EXISTS (user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author)
 );
 
 CREATE CATALOG editor CREATORS ($dev) PARAMS (:admin identity) AS (

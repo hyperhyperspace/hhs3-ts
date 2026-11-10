@@ -205,6 +205,90 @@ async function createTwoAdminUsersGroup(
     return { schema, group };
 }
 
+// Grants over resources: a grant names its grantee and one resource, or '*'
+// for every resource. `docs` carries its resource, and both tables honor
+// concurrent deletes.
+const GRANT_FOR_DOC: Predicate = { p: 'exists', table: 'grants', where: { grantee: '$author', resource: '$row.resource' } };
+const GRANT_FOR_ALL: Predicate = { p: 'exists', table: 'grants', where: { grantee: '$author', resource: '*' } };
+const GRANT_AS_TWO_ATOMS: Predicate = { p: 'or', args: [GRANT_FOR_DOC, GRANT_FOR_ALL] };
+// EXISTS (grants WHERE grantee = $author AND grants.resource IN (docs.resource, '*'))
+const GRANT_AS_ONE_ATOM: Predicate = { p: 'exists', table: 'grants', where: { $and: [
+    { grantee: '$author' },
+    { $or: [{ resource: '$row.resource' }, { resource: '*' }] },
+] } };
+
+// A revoke rule with alternatives in one atom: the author holds a manager cap
+// or a deputy cap.
+// EXISTS (caps WHERE grantee = $author AND label IN ('<manager>', 'deputy'))
+const MANAGER_OR_DEPUTY: Predicate = { p: 'exists', table: CAPS_TABLE, where: { $and: [
+    { grantee: '$author' },
+    { $or: [{ label: USERS_MANAGER_LABEL }, { label: 'deputy' }] },
+] } };
+
+function grantedDocsTables(docsRules: TableDef['restrictions']): TableDef[] {
+    return [
+        ...usersSchemaTables(),
+        { name: 'grants', columns: {
+              grantee: { type: 'string', pub: true, readonly: true },
+              resource: { type: 'string', pub: true, readonly: true },
+          },
+          concurrentDeletes: true, restrictions: [{ on: 'all', rule: { p: 'true' } }] },
+        { name: 'docs', columns: { body: { type: 'string' }, resource: { type: 'string', readonly: true } },
+          concurrentDeletes: true, restrictions: docsRules },
+    ];
+}
+
+// A group over grantedDocsTables with `holders` registered, each holding a
+// '*' grant, and one doc `d1` of resource r1.
+async function createGrantedDocsGroup(
+    ctx: RContext, seed: string, docsRules: TableDef['restrictions'], holders: OwnIdentity[],
+): Promise<{ group: RTableGroupImpl; docId: B64Hash }> {
+    const admin = await makeIdentity();
+    const schemaInit = await RSchemaImpl.create({
+        name: `${seed}:schema`,
+        creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
+        tables: grantedDocsTables(docsRules),
+    });
+    const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
+    const pinned = await (await schema.getScopedDag()).getFrontier();
+    const groupInit = await RTableGroupImpl.create({
+        name: `${seed}-group`, seed: `${seed}-group`, schemaRef: schema.getId(), schemaVersion: pinned,
+        idProvider: IDENTITIES_TABLE,
+        initialRows: {
+            [IDENTITIES_TABLE]: [admin, ...holders].map((id, i) => identityRow('id-' + i, id)),
+            grants: holders.map((h, i) => genesisRow('grant-all-' + i, { grantee: h.keyId, resource: '*' })),
+            docs: [genesisRow('d1', { body: 'x', resource: 'r1' })],
+        },
+    });
+    const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
+    return { group, docId: deriveRowId('d1') };
+}
+
+// A '*' holder updates the doc while an anonymous delete of it, which the
+// table's rules allow, runs concurrently. Returns whether the update is void
+// at the merge.
+async function wildcardUpdateRacesDelete(seed: string, updateRule: Predicate): Promise<boolean> {
+    const ctx = newCtx();
+    const holder = await makeIdentity();
+    const { group, docId } = await createGrantedDocsGroup(ctx, seed, [
+        { on: 'insert', rule: { p: 'true' } },
+        { on: 'update', rule: updateRule },
+        { on: 'delete', rule: { p: 'true' } },
+    ], [holder]);
+
+    const docs = await group.getTable('docs');
+    const base = await frontier(group);
+    const update = await docs.update(docId, { body: 'y' }, holder, base);
+    const del = await docs.delete(docId, undefined, base);
+    const merged = await frontier(group);
+
+    const g = await freshGroup(ctx, group.getId());
+    assertFalse(await g.isEntryVoided(del, merged), `${seed}: the delete is live`);
+    assertFalse(await (await (await g.getView(merged, merged)).getTableView('docs')).hasRow(docId),
+        `${seed}: the doc is deleted at the merge`);
+    return g.isEntryVoided(update, merged);
+}
+
 // Every root cap survives and every ring revoke is void, on a fresh group
 // queried forward and on another queried in reverse.
 async function assertRevokeRingSurvives(n: number): Promise<void> {
@@ -1438,6 +1522,125 @@ export const rtablePermTests = {
                 assertFalse(await view.hasRow(deriveRowId('root-cap-1')), 'admin 1 loses the cap');
                 assertFalse(await view.hasRow(deriveRowId('root-cap-2')), 'admin 2 loses the cap');
                 assertTrue(await view.hasRow(deriveRowId('root-cap-0')), 'admin 0 keeps the cap');
+            }
+        },
+        {
+            name: '[PERM23] an exists over alternatives with a clean candidate through one arm, beside one in a revoke ring through the other, holds',
+            invoke: async () => {
+                const ctx = newCtx();
+                const admins = [await makeIdentity(), await makeIdentity()];
+                // each admin also holds a deputy cap that no one revokes
+                const { group } = await createRingGroupWith(ctx, admins, usersTablesWithRevokeRule(MANAGER_OR_DEPUTY), {
+                    [CAPS_TABLE]: admins.map((a, i) => capRow('deputy-cap-' + i, a.keyId, 'deputy') as unknown as json.Literal),
+                });
+
+                // admin i deletes admin i+1's root cap
+                const base = await frontier(group);
+                const caps = await group.getTable(CAPS_TABLE);
+                const revokes: B64Hash[] = [];
+                for (let i = 0; i < 2; i++) {
+                    revokes.push(await caps.delete(deriveRowId('root-cap-' + ((i + 1) % 2)), admins[i], base));
+                }
+                const merged = await frontier(group);
+
+                for (const order of [[0, 1], [1, 0]]) {
+                    const g = await freshGroup(ctx, group.getId());
+                    const view = await (await g.getView(merged, merged)).getTableView(CAPS_TABLE);
+                    for (const i of order) {
+                        assertFalse(await view.hasRow(deriveRowId('root-cap-' + i)),
+                            `order ${order}: root cap ${i} is revoked (its revoker is authorized through the deputy arm)`);
+                        assertTrue(await view.hasRow(deriveRowId('deputy-cap-' + i)),
+                            `order ${order}: deputy cap ${i} survives`);
+                        assertFalse(await g.isEntryVoided(revokes[i], merged),
+                            `order ${order}: revoke ${i} is live`);
+                    }
+                }
+            }
+        },
+        {
+            name: '[PERM24] under a rule with alternatives, an outsider revoked by a 3-ring member loses the cap: the outsider cap is no candidate of the ring\'s rule',
+            invoke: async () => {
+                const ctx = newCtx();
+                const ring: OwnIdentity[] = [];
+                for (let i = 0; i < 3; i++) ring.push(await makeIdentity());
+                const outsider = await makeIdentity();
+                const { group } = await createRingGroupWith(ctx, [...ring, outsider], usersTablesWithRevokeRule(MANAGER_OR_DEPUTY));
+
+                const base = await frontier(group);
+                const caps = await group.getTable(CAPS_TABLE);
+                const ringRevokes: B64Hash[] = [];
+                for (let i = 0; i < 3; i++) {
+                    ringRevokes.push(await caps.delete(deriveRowId('root-cap-' + ((i + 1) % 3)), ring[i], base));
+                }
+                const outsiderRevoke = await caps.delete(deriveRowId('root-cap-3'), ring[0], base);
+                const merged = await frontier(group);
+
+                for (const first of ['outsider', 'ring']) {
+                    const g = await freshGroup(ctx, group.getId());
+                    const checkOutsider = async () => {
+                        assertFalse(await g.isEntryVoided(outsiderRevoke, merged),
+                            `${first} first: the outsider revoke is authorized by the surviving ring cap`);
+                    };
+                    const checkRing = async () => {
+                        for (const revoke of ringRevokes) {
+                            assertEquals((await g.explainEntryVoided(revoke, merged))?.kind, 'undecided-cycle',
+                                `${first} first: a ring revoke is void as undecided-cycle`);
+                        }
+                    };
+                    if (first === 'outsider') { await checkOutsider(); await checkRing(); }
+                    else { await checkRing(); await checkOutsider(); }
+
+                    const view = await (await g.getView(merged, merged)).getTableView(CAPS_TABLE);
+                    assertFalse(await view.hasRow(deriveRowId('root-cap-3')), `${first} first: the outsider cap is removed`);
+                    for (let i = 0; i < 3; i++) {
+                        assertTrue(await view.hasRow(deriveRowId('root-cap-' + i)), `${first} first: ring cap ${i} survives`);
+                    }
+                }
+            }
+        },
+        {
+            name: '[PERM25] an update by a wildcard holder concurrent with a delete of its doc is live when the arm that holds does not read the doc, and void under a rule that reads the doc in every arm',
+            invoke: async () => {
+                assertFalse(await wildcardUpdateRacesDelete('perm25_two_atoms', GRANT_AS_TWO_ATOMS),
+                    'as two EXISTS atoms the update is live: the wildcard atom does not read the doc');
+                assertFalse(await wildcardUpdateRacesDelete('perm25_one_atom', GRANT_AS_ONE_ATOM),
+                    'as one EXISTS the update is live too: only the arm that names the doc reads it');
+
+                // a rule that reads the doc in every arm: the doc is deleted
+                const readsTheDoc: Predicate = { p: 'and', args: [
+                    { p: 'cmp', cmp: 'eq', left: { col: 'resource' }, right: { lit: 'r1' } },
+                    GRANT_FOR_ALL,
+                ] };
+                assertTrue(await wildcardUpdateRacesDelete('perm25_reads_doc', readsTheDoc),
+                    'a rule whose every arm reads the doc is void: the doc is not live');
+            }
+        },
+        {
+            name: '[PERM26] two wildcard holders deleting one doc concurrently are both live, as one EXISTS and as two',
+            invoke: async () => {
+                const forms: [string, Predicate][] = [['perm26_two_atoms', GRANT_AS_TWO_ATOMS], ['perm26_one_atom', GRANT_AS_ONE_ATOM]];
+                for (const [seed, rule] of forms) {
+                    const ctx = newCtx();
+                    const holders = [await makeIdentity(), await makeIdentity()];
+                    const { group, docId } = await createGrantedDocsGroup(ctx, seed, [
+                        { on: 'insert', rule: { p: 'true' } },
+                        { on: 'delete', rule },
+                    ], holders);
+
+                    const docs = await group.getTable('docs');
+                    const base = await frontier(group);
+                    const deletes = [await docs.delete(docId, holders[0], base), await docs.delete(docId, holders[1], base)];
+                    const merged = await frontier(group);
+
+                    for (const order of [[0, 1], [1, 0]]) {
+                        const g = await freshGroup(ctx, group.getId());
+                        for (const i of order) {
+                            assertFalse(await g.isEntryVoided(deletes[i], merged), `${seed}, order ${order}: delete ${i} is live`);
+                        }
+                        assertFalse(await (await (await g.getView(merged, merged)).getTableView('docs')).hasRow(docId),
+                            `${seed}, order ${order}: the doc is deleted`);
+                    }
+                }
             }
         },
     ],

@@ -915,6 +915,79 @@ async function testFetchInitHashMismatch() {
     local.close();
 }
 
+// A message must be a Literal. JSON text can carry a lone surrogate as an
+// escape, and a UTF-8 encoder writes U+FFFD for it, so a payload holding one
+// would hash like a different payload.
+async function testCodecRejectsNonLiterals() {
+    const throws = (data: Uint8Array) => { try { decode(data); return false; } catch { return true; } };
+    const text = (data: Uint8Array) => new TextDecoder().decode(data);
+
+    const illFormedPayload: PayloadMsg = {
+        type: 'payload-msg', requestId: 'r1', sequence: 0, hash: 'h1',
+        payload: { s: 'x\ud800y' },
+    };
+    const encoded = encode(illFormedPayload);
+    testing.assertTrue(text(encoded).includes('\\ud800'), 'the lone surrogate travels as an escape');
+    testing.assertTrue(throws(encoded), 'a payload with an ill-formed string is rejected');
+
+    const illFormedKey: HeaderBatch = {
+        type: 'header-batch', requestId: 'r1', sequence: 0,
+        headers: [{ hash: 'h1', header: { payloadHash: 'p1', prevEntryHashes: { 'k\udc00': '' } } }],
+    };
+    testing.assertTrue(throws(encode(illFormedKey)), 'a header with an ill-formed key is rejected');
+
+    const withNull = new TextEncoder().encode('{"type":"new-frontier","dagId":"d","frontier":[null]}');
+    testing.assertTrue(throws(withNull), 'a message containing null is rejected');
+
+    const wellFormed: PayloadMsg = {
+        type: 'payload-msg', requestId: 'r1', sequence: 0, hash: 'h1',
+        payload: { s: 'x�y', pair: 'a😀b' },
+    };
+    const decoded = decode(encode(wellFormed)) as PayloadMsg;
+    testing.assertTrue(json.eq(decoded.payload, wellFormed.payload), 'U+FFFD and a surrogate pair round-trip');
+}
+
+// The object wanted has U+FFFD in its create payload. The peer answers with a
+// lone surrogate in that place, which hashes to the same object id.
+async function testFetchInitIgnoresIllFormedCreatePayload() {
+    const expectedPayload = { action: 'create', type: 'hhs/test', seed: 'x�y' };
+    const forgedPayload = { action: 'create', type: 'hhs/test', seed: 'x\ud800y' };
+    const objectId = dag.createEntry(expectedPayload, {}, dag.position(), sha256).hash;
+
+    const { local, remote } = createChannelPair('fetch-init-ill-formed', 'peerA', 'peerB');
+    const swarmPeer: SwarmPeer = { keyId: 'peerB', endpoint: 'mem://peerB', channel: local };
+    const swarm = stubSwarm([swarmPeer]);
+
+    let answered = 0;
+    remote.onMessage((data) => {
+        const msg = decode(data);
+        if (msg.type !== 'init-request' || msg.objectId !== objectId) return;
+        const resp: InitResponse = {
+            type: 'init-response',
+            objectId,
+            createPayload: forgedPayload,
+        };
+        answered++;
+        remote.send(encode(resp));
+    });
+
+    const initTimeoutMs = 300;
+    let threw = false;
+    try {
+        await fetchInit(objectId, [swarm], sha256, { timeoutMs: initTimeoutMs, peerTimeoutMs: 5_000 });
+    } catch (e: any) {
+        threw = true;
+        testing.assertTrue(
+            typeof e.message === 'string' && e.message.includes(`fetchInit timed out after ${initTimeoutMs}ms`),
+            `the forged answer is ignored, so the fetch times out, got: ${e.message}`,
+        );
+    }
+    testing.assertTrue(answered > 0, 'the peer did answer');
+    testing.assertTrue(threw, 'fetchInit should not accept a create payload with an ill-formed string');
+
+    local.close();
+}
+
 async function testFetchInitLatePeer() {
     const payload = { action: 'create', type: 'hhs/test', seed: 'late' };
     const objectId = dag.createEntry(payload, {}, dag.position(), sha256).hash;
@@ -1439,5 +1512,7 @@ export const syncSuite = {
         { name: '[SYNC_16] Payload hash mismatch is not poisoned', invoke: testPayloadHashMismatchNotPoisoned },
         { name: '[SYNC_17] rejectedEntries eviction re-admits oldest, keeps newest', invoke: testRejectedCapEviction },
         { name: '[SYNC_18] validate/apply throw defers (not rejects) and does not abort the pass', invoke: testValidateThrowDefersNotRejects },
+        { name: '[SYNC_22] Codec rejects a message that is not a Literal', invoke: testCodecRejectsNonLiterals },
+        { name: '[SYNC_23] fetchInit ignores a create payload with an ill-formed string', invoke: testFetchInitIgnoresIllFormedCreatePayload },
     ],
 };

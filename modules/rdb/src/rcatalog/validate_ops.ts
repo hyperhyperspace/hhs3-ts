@@ -31,7 +31,7 @@ import {
 } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RSchema, RSchemaView } from "../rschema/interfaces.js";
-import { RSCHEMA_TYPE_ID, splitTableRef, parseParamTerm, parseRowFieldTerm, ColumnType, type IdProvider, type TableDef } from "../rschema/payload.js";
+import { RSCHEMA_TYPE_ID, splitTableRef, parseParamTerm, parseRowFieldTerm, whereEqualities, ColumnType, type IdProvider, type TableDef } from "../rschema/payload.js";
 import {
     collectExistsAtoms, columnValueMatchesType, columnValueValidReason, findAuthorRestriction, predicateReferencesAuthor,
     type ExistsAtom,
@@ -361,7 +361,7 @@ function checkExistsAtomAgainstTable(
     sourceSchemaView?: RSchemaView,
 ): string | undefined {
     if (targetDef === undefined) return `${clause} reads ${atom.table}: schema ${targetSchemaName} has no table ${targetTable}`;
-    for (const [field, value] of Object.entries(atom.where ?? {})) {
+    for (const [field, value] of whereEqualities(atom.where)) {
         if (field === 'rowAuthor') continue;
         const column = targetDef.columns[field];
         if (column === undefined) return `${clause} reads ${atom.table}.${field}, which ${targetTable} doesn't have`;

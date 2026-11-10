@@ -216,6 +216,40 @@ export function parseParamTerm(s: string): string | undefined {
 // field term ($row.<col>), or a schema parameter term ($param.<name>).
 export type WhereValue = json.Literal | IdTerm | RowFieldTerm | ParamTerm;
 
+// The `where` of an exists atom. A leaf maps columns of the target table to
+// the values they must equal: every field holds. A group combines leaves and
+// groups. A field name never starts with '$', so a group, whose only key is
+// `$and` or `$or`, cannot be mistaken for a leaf.
+export type WhereLeaf = { [field: string]: WhereValue };
+export type Where = WhereLeaf | { $and: Where[] } | { $or: Where[] };
+
+export type WhereGroup = { op: '$and' | '$or'; members: Where[] };
+
+// The group a `where` node is, or undefined for a leaf.
+export function whereGroup(where: Where): WhereGroup | undefined {
+    const node = where as { [key: string]: unknown };
+    if (Array.isArray(node['$and'])) return { op: '$and', members: node['$and'] as Where[] };
+    if (Array.isArray(node['$or'])) return { op: '$or', members: node['$or'] as Where[] };
+    return undefined;
+}
+
+// Every leaf of a `where` tree, in order.
+export function whereLeaves(where: Where, out: WhereLeaf[] = []): WhereLeaf[] {
+    const group = whereGroup(where);
+    if (group === undefined) {
+        out.push(where as WhereLeaf);
+    } else {
+        for (const member of group.members) whereLeaves(member, out);
+    }
+    return out;
+}
+
+// Every [field, value] of a `where` tree: each equality the atom states.
+export function whereEqualities(where: Where | undefined): [string, WhereValue][] {
+    if (where === undefined) return [];
+    return whereLeaves(where).flatMap((leaf) => Object.entries(leaf));
+}
+
 export type PredicateContext = 'row' | 'object';
 
 // Operand of a query value expression (cmp / like atoms). `col` resolves to the
@@ -248,7 +282,7 @@ export const ARITH_FNS = ['add', 'sub', 'mul'] as const;
 export type Predicate =
     | { p: 'true' }
     | { p: 'false' }
-    | { p: 'exists'; table: string; where: { [field: string]: WhereValue } }
+    | { p: 'exists'; table: string; where: Where }
     | { p: 'cmp'; cmp: CmpOp; left: RuleOperand; right: RuleOperand }
     | { p: 'like'; value: RuleOperand; pattern: RuleOperand }
     | { p: 'and'; args: Predicate[] }

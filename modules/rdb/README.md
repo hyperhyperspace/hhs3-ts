@@ -59,7 +59,7 @@ CREATE SCHEMA shop VERSION '1.0.0' AS (
   TABLE products (
     sku string PUB READONLY,
     name string
-  ) ALLOW insert IF EXISTS users.caps WHERE label = 'writer' AND grantee = $author
+  ) ALLOW insert IF EXISTS (users.caps WHERE label = 'writer' AND grantee = $author)
 );
 
 CREATE CATALOG store VERSION '1.0.0' AS (
@@ -67,7 +67,7 @@ CREATE CATALOG store VERSION '1.0.0' AS (
   TABLEGROUP shop_prod USING SCHEMA shop AT LATEST
     BIND users => users
     USING IDENTITIES users.identities
-    ALLOW DEPLOY IF EXISTS users.caps WHERE label = 'deployer' AND grantee = $author
+    ALLOW DEPLOY IF EXISTS (users.caps WHERE label = 'deployer' AND grantee = $author)
 ) BY $dev;
 
 CREATE DATABASE store_prod USING CATALOG store AT '1.0.0' CREATORS ($admin) BY $admin;
@@ -125,7 +125,7 @@ A catalog `FILES` definition (see [rdb_lang](../rdb_lang#catalog-files)) gives e
 ```sql
 FILES media
   USING IDENTITIES user.identities
-  ALLOW WRITE IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author
+  ALLOW WRITE IF EXISTS (user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author)
 ```
 
 - **Access.** Every op is signed. A writer's key comes from the identity table, and `canWrite` holds, at the group version the op observes: the latest signed `ref-advance` of the group in its past, or the group's genesis. So a key the genesis rows admit writes right away, and the writers append a ref-advance when the group has moved. Admission is checked when an op is validated; a key that loses access later can still append at a position from before (no view-time voiding).
@@ -195,9 +195,9 @@ npm test
 TABLE pages (
   title string,
   deleted boolean
-) ALLOW insert IF EXISTS user.caps
+) ALLOW insert IF EXISTS (user.caps
     WHERE user.caps.label = 'writer'
-      AND user.caps.grantee = $author
+      AND user.caps.grantee = $author)
 ```
 
 Register `$santi` with the identity provider:
@@ -225,7 +225,7 @@ rdb:app:-> insert into doc.pages (title, deleted) values ('No dice', false) by $
 <input>:1:1: error VALIDATION_REJECTED: row envelope rejected
 (object A0bzGQCM55iFHvguG0VHNRB73xtHcJ8o0Xl98n3lTJc=):
 pages insert on row 'oITlMHy/egymP9j7nhQhCVRNR+u20bvMIvQ9K8T5I/o=' does not satisfy
-ALLOW insert IF EXISTS user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author
+ALLOW insert IF EXISTS (user.caps WHERE user.caps.label = 'writer' AND user.caps.grantee = $author)
 ```
 
 Grant `$santi` the `writer` capability:
@@ -362,4 +362,4 @@ hash      | prev      | op                                | status
 #R1tDyESK | #0XQ3qXkC | UPDATE REF #p0N+nsa85uTC7o93fh... | OK
 ```
 
-**HIPs:** [2](../../hips/0002-rpack-rhost.md), [3](../../hips/0003-schema-composability.md), [7](../../hips/0007-ideal-concurrency.md), [8](../../hips/0008-rset-gated-ref-advances.md), [11](../../hips/0011-single-pass-widening-bound.md), [12](../../hips/0012-mvt-bound-walk.md), [14](../../hips/0014-observer-frame-ref.md)
+**HIPs:** [2](../../hips/0002-rpack-rhost.md), [3](../../hips/0003-schema-composability.md), [7](../../hips/0007-ideal-concurrency.md), [8](../../hips/0008-rset-gated-ref-advances.md), [11](../../hips/0011-single-pass-widening-bound.md), [12](../../hips/0012-mvt-bound-walk.md), [14](../../hips/0014-observer-frame-ref.md), [21](../../hips/0021-exists-where-or.md)

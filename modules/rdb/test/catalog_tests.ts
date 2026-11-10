@@ -500,6 +500,10 @@ export const catalogTests = {
                     "FILES extra: ALLOW WRITE IF reads user.caps.level, which caps doesn't have", 'a missing where column is rejected');
                 await rejects(() => withFiles(mediaDef(userHash, 'extra', { canWrite: { p: 'exists', table: 'user.identities', where: { name: 'Admin' } } })),
                     "FILES extra: ALLOW WRITE IF reads user.identities.name, which isn't PUB in identities", 'a non-PUB where column is rejected');
+                await rejects(() => withFiles(mediaDef(userHash, 'extra', { canWrite: { p: 'exists', table: 'user.identities', where: { $or: [{ keyId: '$author' }, { name: 'Admin' }] } } })),
+                    "FILES extra: ALLOW WRITE IF reads user.identities.name, which isn't PUB in identities", 'a non-PUB where column inside an $or is rejected');
+                await rejects(() => withFiles(mediaDef(userHash, 'extra', { canWrite: { p: 'exists', table: 'user.identities', where: { $or: [{ keyId: '$author' }, { level: 'x' }] } } })),
+                    "FILES extra: ALLOW WRITE IF reads user.identities.level, which identities doesn't have", 'a missing where column inside an $or is rejected');
                 await rejects(() => catalog.publishRelease({ version: '1.1.0', add: [docDef(docSchema, docPin, userHash, { name: 'media' })] }, dev),
                     "group name 'media' is already used", 'a later group cannot take a FILES name');
                 await rejects(() => catalog.release({
@@ -581,6 +585,14 @@ export const catalogTests = {
                     name: 'd1', canDeploy: { p: 'exists', table: 'user.identities', where: { name: 'Admin' } },
                 })), "TABLEGROUP d1: ALLOW DEPLOY IF reads user.identities.name, which isn't PUB in identities",
                 'ALLOW DEPLOY IF where column must be PUB');
+                await rejects(() => publish(docDef(docSchema, docPin, userHash, {
+                    name: 'd1', canDeploy: { p: 'exists', table: 'user.identities', where: { $or: [{ keyId: '$author' }, { name: 'Admin' }] } },
+                })), "TABLEGROUP d1: ALLOW DEPLOY IF reads user.identities.name, which isn't PUB in identities",
+                'a where column inside an $or must be PUB too');
+                await rejects(() => publish(docDef(docSchema, docPin, userHash, {
+                    name: 'd1', canDeploy: { p: 'exists', table: 'user.identities', where: { $or: [{ keyId: '$author' }, { keyId: 5 }] } },
+                })), 'TABLEGROUP d1: ALLOW DEPLOY IF: user.identities.keyId is string, and 5 is not',
+                'a value of the wrong type inside an $or is rejected');
 
                 // ALLOW UPDATE REF checks (read in the observer's frame, like table rules)
                 await rejects(() => publish(docDef(docSchema, docPin, userHash, {

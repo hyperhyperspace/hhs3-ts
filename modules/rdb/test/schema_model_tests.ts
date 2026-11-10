@@ -14,7 +14,7 @@ import {
     validateColumnDef,
     columnValueMatchesType, columnValueValid, columnValueValidReason,
     isValidName, isValidSchemaName, isValidTableRef,
-    MAX_EXPR_DEPTH,
+    MAX_EXPR_DEPTH, MAX_EXPR_ARGS, MAX_WHERE_FIELDS,
 } from "../src/rschema/validate.js";
 
 function ordersTable(): TableDef {
@@ -204,6 +204,11 @@ async function testColumnValueReasons() {
     const nestedNull = columnValueValidReason([1, null] as unknown as json.Literal, { type: 'json' });
     assertTrue(nestedNull === 'JSON values cannot contain null', `nested null in json is rejected: ${nestedNull}`);
     assertFalse(columnValueMatchesType({ a: null } as unknown as json.Literal, 'json'), 'coarse check rejects nested null too');
+    // and so is a string with a lone surrogate (it has no UTF-8 encoding)
+    const loneSurrogate = columnValueValidReason({ a: ['x\ud800y'] }, { type: 'json' });
+    assertTrue(loneSurrogate === 'JSON values cannot contain a string that is not well-formed Unicode',
+        `ill-formed string in json is rejected: ${loneSurrogate}`);
+    assertFalse(columnValueMatchesType({ 'k\udc00': 1 }, 'json'), 'coarse check rejects an ill-formed key');
 
     assertTrue(columnValueValid('abc', cappedStr) === (columnValueValidReason('abc', cappedStr) === undefined),
         'columnValueValid agrees with columnValueValidReason (valid)');
@@ -409,6 +414,71 @@ async function testPredicates() {
         'a malformed $row term in a where value should not validate (reserved)');
 }
 
+// The `where` of an exists atom as a tree: a leaf, or a group of leaves and
+// groups under `$and` / `$or`.
+async function testWhereTrees() {
+    const exists = (where: unknown, context?: 'row' | 'object') =>
+        validatePredicate({ p: 'exists', table: 'caps', where } as json.Literal, context);
+    const a = { label: 'writer' };
+    const b = { label: 'manager' };
+    const c = { grantee: '$author' };
+
+    assertTrue(exists({ $or: [a, b] }), 'an $or of two leaves should validate');
+    assertTrue(exists({ $and: [c, { $or: [a, b] }] }), 'an $and of a leaf and an $or should validate');
+    assertTrue(exists({ $and: [{ $or: [a, b] }, { $or: [c, a] }] }), 'an $and of two groups should validate');
+    assertTrue(exists({ $or: [a, a] }), 'equal members should validate, as in predicate groups');
+    assertTrue(exists({ $or: [{ $or: [a, b] }, c] }), 'a group inside a group of the same kind should validate');
+    assertTrue(exists({ $or: [{ label: 'writer', grantee: '$author' }, { $and: [c, { $or: [a, b] }] }] }),
+        'leaves with several fields and nested groups should validate');
+    assertTrue(exists({ $or: [{ resource: '$row.resource' }, { resource: '$param.all' }] }), 'terms inside a group should validate');
+
+    assertFalse(exists({ $or: [a] }), 'a one-member $or should not validate (not canonical)');
+    assertFalse(exists({ $and: [a] }), 'a one-member $and should not validate (not canonical)');
+    assertFalse(exists({ $or: [] }), 'an empty group should not validate');
+    assertFalse(exists({ $and: [a, c] }), 'two leaves in an $and should not validate: one conjunction shares a leaf');
+    assertFalse(exists({ $and: [a, { $or: [a, b] }, c] }), 'two leaves in an $and beside a group should not validate');
+    assertFalse(exists({ $or: [a, b], label: 'writer' }), 'a group with a second key should not validate');
+    assertFalse(exists({ $or: [a, b], $and: [c, { $or: [a, b] }] }), 'a group with both keys should not validate');
+    assertFalse(exists({ $not: [a, b] }), 'an unknown $ key should not validate');
+    assertFalse(exists({ $or: [a, { $nor: [a, b] }] }), 'an unknown $ key inside a group should not validate');
+    assertFalse(exists({ $or: a }), 'a group whose members are not a list should not validate');
+    assertFalse(exists({ $or: [a, 'writer'] }), 'a member that is not an object should not validate');
+    assertFalse(exists({ $or: [a, {}] }), 'an empty leaf inside a group should not validate');
+    assertFalse(exists({ $or: [a, { '2bad': 1 }] }), 'an invalid field name inside a group should not validate');
+    assertFalse(exists({ $or: [a, { label: '$nope' }] }), 'a reserved $-string inside a group should not validate');
+    assertFalse(exists({ $or: [a, { resource: '$row.resource' }] }, 'object'),
+        'a $row term inside a group should not validate in object context');
+
+    // limits: 64 equalities in the whole atom, 64 members per group
+    const leafOf = (n: number, prefix: string) => Object.fromEntries([...Array(n).keys()].map((i) => [`${prefix}${i}`, i]));
+    assertTrue(exists(leafOf(MAX_WHERE_FIELDS, 'f')), 'a leaf of 64 fields should validate, as today');
+    assertFalse(exists(leafOf(MAX_WHERE_FIELDS + 1, 'f')), 'a leaf of 65 fields should not validate, as today');
+    const singles = (n: number) => [...Array(n).keys()].map((i) => ({ label: `l${i}` }));
+    assertTrue(exists({ $or: singles(MAX_EXPR_ARGS) }), 'an $or of 64 one-field leaves should validate');
+    assertFalse(exists({ $or: singles(MAX_EXPR_ARGS + 1) }), 'a 65th member should not validate');
+    assertTrue(exists({ $or: [leafOf(32, 'a'), leafOf(32, 'b')] }), '64 equalities over two leaves should validate');
+    assertFalse(exists({ $or: [leafOf(32, 'a'), leafOf(33, 'b')] }), 'a 65th equality should not validate');
+    assertFalse(exists({ $and: [leafOf(60, 'a'), { $or: [{ x: 1 }, { x: 2 }, { x: 3 }, { x: 4 }, { x: 5 }] }] }),
+        'a 65th equality in a nested group should not validate');
+
+    // nesting counts toward the predicate's depth: a group's members sit one
+    // level below it
+    const nested = (levels: number): unknown => {
+        let where: unknown = a;
+        for (let i = 0; i < levels; i++) where = { $or: [where, b] };
+        return where;
+    };
+    assertTrue(exists(nested(MAX_EXPR_DEPTH)), 'groups nested to the depth limit should validate');
+    assertFalse(exists(nested(MAX_EXPR_DEPTH + 1)), 'groups nested past the depth limit should not validate');
+    assertTrue(validatePredicate({ p: 'or', args: [{ p: 'true' }, { p: 'exists', table: 'caps', where: nested(MAX_EXPR_DEPTH - 1) }] } as json.Literal),
+        'an atom one level down has one level less');
+    assertFalse(validatePredicate({ p: 'or', args: [{ p: 'true' }, { p: 'exists', table: 'caps', where: nested(MAX_EXPR_DEPTH) }] } as json.Literal),
+        "the predicate's own nesting counts too");
+    let deepAtom: json.Literal = { p: 'exists', table: 'caps', where: a };
+    for (let i = 0; i < MAX_EXPR_DEPTH; i++) deepAtom = { p: 'and', args: [deepAtom, { p: 'true' }] };
+    assertTrue(validatePredicate(deepAtom), 'a leaf atom at the depth limit should validate, as today');
+}
+
 async function testPredicateContexts() {
     // 'object' context: no subject-row fields, but $author where-values are valid.
     assertTrue(validatePredicate({ p: 'exists', table: 'users.caps', where: { label: 'deploy', grantee: '$author' } }, 'object'),
@@ -606,6 +676,38 @@ async function testSchemaTables() {
     };
     assertTrue(validateSchemaTables([identityToInt, intTarget]) !== undefined,
         'exists correlating an identity $row field to an integer target field should not validate');
+
+    // The same checks reach a term inside a group of the `where` tree.
+    const grouped = (leaf: { [field: string]: json.Literal }, table = 'grants'): TableDef => ({
+        name: 'items',
+        columns: {
+            resource: { type: 'string', readonly: true },
+            mutableResource: { type: 'string' },
+            qty: { type: 'integer', readonly: true },
+        },
+        restrictions: [{ on: 'insert', rule: { p: 'exists', table, where: { $or: [{ resource: 'any' }, leaf] } } }],
+    });
+    const reason = (leaf: { [field: string]: json.Literal }, table?: string, params?: { name: string; type: 'string' | 'integer' }[]) =>
+        validateSchemaTables([grouped(leaf, table), grants, capsTable()], params);
+    assertTrue(reason({ resource: '$row.resource' }) === undefined, 'a valid correlation inside an $or should validate');
+    assertTrue(reason({ resource: '$row.mutableResource' })?.includes('is not readonly') ?? false,
+        'a $row column that is not readonly, inside an $or, should not validate');
+    assertTrue(reason({ resource: '$row.nope' })?.includes("$row field 'nope' not found") ?? false,
+        'a $row column that does not exist, inside an $or, should not validate');
+    assertTrue(reason({ resource: '$row.qty' })?.includes("does not match exists where field 'resource'") ?? false,
+        'a $row value of the wrong type, inside an $or, should not validate');
+    assertTrue(reason({ resource: '$param.scope' })?.includes("parameter ':scope' not declared") ?? false,
+        'an undeclared parameter inside an $or should not validate');
+    assertTrue(reason({ resource: '$param.scope' }, undefined, [{ name: 'scope', type: 'string' }]) === undefined,
+        'a declared parameter inside an $or should validate');
+    assertTrue(reason({ resource: '$param.scope' }, undefined, [{ name: 'scope', type: 'integer' }])?.includes("parameter ':scope' type 'integer'") ?? false,
+        'a parameter of the wrong type inside an $or should not validate');
+    const overNonPubInGroup = docsTable([{ on: 'insert', rule: { p: 'exists', table: 'caps', where: { $or: [{ label: 'x' }, { note: 'x' }] } } }]);
+    assertTrue(validateSchemaTables([overNonPubInGroup, capsTable()])?.includes("exists where field 'note' in table 'caps' is not pub") ?? false,
+        'a field that is not pub, inside an $or, should not validate');
+    const overMissingInGroup = docsTable([{ on: 'insert', rule: { p: 'exists', table: 'caps', where: { $and: [{ label: 'x' }, { $or: [{ grantee: 'a' }, { nope: 'x' }] }] } } }]);
+    assertTrue(validateSchemaTables([overMissingInGroup, capsTable()])?.includes("exists where field 'nope' not found") ?? false,
+        'a missing field in a nested group should not validate');
 }
 
 async function testMigrationRules() {
@@ -679,6 +781,7 @@ export const schemaModelTests = {
         { name: '[MODEL04b] One restriction per op', invoke: testOneRestrictionPerOp },
         { name: '[MODEL05] FKs', invoke: testFKs },
         { name: '[MODEL06] Predicates', invoke: testPredicates },
+        { name: '[MODEL06b] Where trees of an exists atom', invoke: testWhereTrees },
         { name: '[MODEL07] Predicate contexts', invoke: testPredicateContexts },
         { name: '[MODEL08] Schema table sets', invoke: testSchemaTables },
         { name: '[MODEL09] Migration rules', invoke: testMigrationRules },

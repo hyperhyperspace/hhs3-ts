@@ -10,7 +10,7 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import { createBasicCrypto, HASH_SHA256, type B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { version as versionOf, type Version } from "@hyper-hyper-space/hhs3_mvt";
 import {
-    catalogGroupHash, filesAccessReason, filesViewReason, groupViewReason, rowsTableReason, rowTemplateReason,
+    catalogGroupHash, filesAccessReason, filesViewReason, groupViewReason, rowsTableReason, rowTemplateReason, whereEqualities,
     type BoundGroupView,
 } from "@hyper-hyper-space/hhs3_rdb";
 import type {
@@ -330,7 +330,7 @@ export async function compileCatalogFiles(
         }
         const columns = columnsOf(atom.table);
         if (columns === undefined) throw rejected(`ALLOW WRITE IF reads ${atom.table}: schema ${view.getName()} has no table ${table}`, expr.canWrite.span);
-        for (const column of Object.keys(atom.where)) {
+        for (const [column] of whereEqualities(atom.where)) {
             if (!columns.has(column)) throw rejected(`ALLOW WRITE IF reads ${atom.table}.${column}, which ${table} doesn't have`, expr.canWrite.span);
         }
     }
@@ -341,10 +341,9 @@ export async function compileCatalogFiles(
     return def;
 }
 
-function existsAtoms(predicate: Predicate): { table: string; where: { [column: string]: unknown } }[] {
-    const p = predicate as { p: string; table?: string; where?: { [column: string]: unknown }; args?: Predicate[] };
-    if (p.p === 'exists') return [{ table: p.table!, where: p.where ?? {} }];
-    if (p.p === 'and' || p.p === 'or') return (p.args ?? []).flatMap(existsAtoms);
+function existsAtoms(predicate: Predicate): Extract<Predicate, { p: 'exists' }>[] {
+    if (predicate.p === 'exists') return [predicate];
+    if (predicate.p === 'and' || predicate.p === 'or') return predicate.args.flatMap(existsAtoms);
     return [];
 }
 

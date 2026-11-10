@@ -62,8 +62,8 @@ CREATE SCHEMA web_auth CREATORS ($me) AS (
   TABLE caps (
     label string PUB,
     grantee string PUB
-  ) ALLOW insert IF EXISTS caps AS c
-      WHERE c.label = 'manager' AND c.grantee = $author
+  ) ALLOW insert IF EXISTS (caps AS c
+      WHERE c.label = 'manager' AND c.grantee = $author)
 );
 CREATE CATALOG web_auth_catalog VERSION '1.0.0' PARAMS (:manager identity) AS (
   TABLEGROUP web_auth_g USING SCHEMA web_auth

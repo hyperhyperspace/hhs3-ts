@@ -1,7 +1,7 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
 
-import type { Predicate, RuleOperand, WhereValue } from "./payload.js";
-import { parseParamTerm, parseRowFieldTerm } from "./payload.js";
+import type { Predicate, RuleOperand, Where, WhereGroup, WhereLeaf, WhereValue } from "./payload.js";
+import { parseParamTerm, parseRowFieldTerm, whereGroup } from "./payload.js";
 import type { RowOpPayload } from "../rtable/payload.js";
 
 // quoteIdent renders a table / column name; C-SQL passes one that quotes
@@ -11,9 +11,11 @@ export type FormatPredicateScope = { gatedTable?: string; quoteIdent?: (name: st
 type FormatContext = { gatedTable?: string; ident: (name: string) => string };
 
 // Renders C-SQL that parses back to the same predicate: groups get only the
-// parentheses the grammar needs (OR inside AND, a group inside a group of
-// the same kind, which would otherwise merge into it, and EXISTS, whose
-// WHERE takes the rest of the condition).
+// parentheses the grammar needs (OR inside AND, and a group inside a group of
+// the same kind, which would otherwise merge into it). An EXISTS brings its
+// own: `EXISTS (t WHERE filter)`. Its filter follows the same rule for groups,
+// writes a leaf as its equalities joined by AND, and writes an `$or` of
+// one-field leaves on one column as `column IN (values)`.
 export function formatPredicate(pred: Predicate, scope: FormatPredicateScope = {}): string {
     return formatPred(pred, { gatedTable: scope.gatedTable, ident: scope.quoteIdent ?? ((name) => name) });
 }
@@ -53,9 +55,7 @@ function formatPred(pred: Predicate, ctx: FormatContext): string {
 
 function formatGroupMember(member: Predicate, parent: 'and' | 'or', ctx: FormatContext): string {
     const text = formatPred(member, ctx);
-    const needsParens = member.p === 'exists'
-        || member.p === parent
-        || (member.p === 'or' && parent === 'and');
+    const needsParens = member.p === parent || (member.p === 'or' && parent === 'and');
     return needsParens ? `(${text})` : text;
 }
 
@@ -68,9 +68,52 @@ function formatExists(pred: Extract<Predicate, { p: 'exists' }>, ctx: FormatCont
     const table = pred.table.split('.').map(ctx.ident).join('.');
     const existsRef = alias !== undefined ? `${table} AS ${ctx.ident(alias)}` : table;
     const existsQual = alias !== undefined ? ctx.ident(alias) : table;
-    const conds = Object.entries(pred.where)
-        .map(([k, v]) => `${existsQual}.${ctx.ident(k)} = ${formatExistsWhereValue(v, ctx)}`);
-    return conds.length > 0 ? `EXISTS ${existsRef} WHERE ${conds.join(' AND ')}` : `EXISTS ${existsRef}`;
+    const filter = formatWhere(pred.where ?? {}, existsQual, ctx);
+    return filter.length > 0 ? `EXISTS (${existsRef} WHERE ${filter})` : `EXISTS (${existsRef})`;
+}
+
+// A `where` tree as a filter. Every column is qualified with the exists
+// table (or its alias), so no name depends on which tables have it.
+function formatWhere(where: Where, qual: string, ctx: FormatContext): string {
+    const group = whereGroup(where);
+    if (group === undefined) {
+        return Object.entries(where as WhereLeaf)
+            .map(([field, value]) => `${qual}.${ctx.ident(field)} = ${formatExistsWhereValue(value, ctx)}`)
+            .join(' AND ');
+    }
+    const list = inList(group);
+    if (list !== undefined) {
+        return `${qual}.${ctx.ident(list.column)} IN (${list.values.map((value) => formatExistsWhereValue(value, ctx)).join(', ')})`;
+    }
+    return group.members
+        .map((member) => formatWhereMember(member, group.op, qual, ctx))
+        .join(group.op === '$and' ? ' AND ' : ' OR ');
+}
+
+// A leaf joins its parent as it is: its equalities are a conjunction, which
+// binds tighter than OR and merges into an AND. An IN list is one term.
+function formatWhereMember(member: Where, parent: '$and' | '$or', qual: string, ctx: FormatContext): string {
+    const text = formatWhere(member, qual, ctx);
+    const group = whereGroup(member);
+    if (group === undefined || inList(group) !== undefined) return text;
+    const needsParens = group.op === parent || (group.op === '$or' && parent === '$and');
+    return needsParens ? `(${text})` : text;
+}
+
+// The column and values of an `$or` whose members are all one-field leaves on
+// one column, equal members included: what `column IN (values)` lowers to.
+function inList(group: WhereGroup): { column: string; values: WhereValue[] } | undefined {
+    if (group.op !== '$or') return undefined;
+    let column: string | undefined;
+    const values: WhereValue[] = [];
+    for (const member of group.members) {
+        if (whereGroup(member) !== undefined) return undefined;
+        const fields = Object.keys(member);
+        if (fields.length !== 1 || (column !== undefined && fields[0] !== column)) return undefined;
+        column = fields[0];
+        values.push((member as WhereLeaf)[column]);
+    }
+    return column === undefined ? undefined : { column, values };
 }
 
 function existsAlias(tableName: string): string {

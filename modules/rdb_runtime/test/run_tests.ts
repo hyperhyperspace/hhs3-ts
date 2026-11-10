@@ -719,7 +719,7 @@ CREATE CATALOG gate_catalog VERSION '1.0.0' AS (
     WITH ROWS (identities (keyId = $me, publicKey = publicKey($me))),
   TABLEGROUP h USING SCHEMA h_schema,
   TABLEGROUP g USING SCHEMA g_schema BIND k => k, h => h USING IDENTITIES k.identities
-    ALLOW UPDATE REF h IF EXISTS k.caps WHERE grantee = $author,
+    ALLOW UPDATE REF h IF EXISTS (k.caps WHERE grantee = $author),
   TABLEGROUP notes_g USING SCHEMA notes_schema
 );
 CREATE DATABASE gate_db USING CATALOG gate_catalog;

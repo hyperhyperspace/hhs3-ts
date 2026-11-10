@@ -217,7 +217,7 @@ AS (
     body string
   )
     ALLOW insert IF length(body) <= :max_len
-                AND EXISTS auth.caps WHERE label = :write_cap AND grantee = $author
+                AND EXISTS (auth.caps WHERE label = :write_cap AND grantee = $author)
 );
 ```
 
@@ -252,7 +252,7 @@ ALTER SCHEMA hhs:comments AS (
   ADD COLUMN comments.flagged boolean DEFAULT false,
   SET ALLOW RULES ON comments (
     ALLOW insert IF length(body) <= :max_len
-                AND EXISTS auth.caps WHERE label = :write_cap AND grantee = $author
+                AND EXISTS (auth.caps WHERE label = :write_cap AND grantee = $author)
   )
 );
 ```
@@ -290,7 +290,7 @@ At runtime an `EXISTS` whose column is missing, or is not `PUB`, is false. A con
 - Gates may not read each other's bindings in a cycle: a gate on `a` that reads `b.caps` and a gate on `b` that reads `a.caps` are rejected.
 - A gate that reads the observer's own tables can race a delete of the importer's row whose rule reads the group being imported. The two can void each other; an `UPDATE REF` from the merge, which has seen the delete, settles it. The runtime does not repeat an import on its own.
 
-Catalogs written before this rule named the observed group's tables without a qualifier, `EXISTS caps WHERE caps.grantee = $author`. Such a gate now reads the observer's own `caps`, and is rejected when the observer has none: write it as `EXISTS user.caps WHERE user.caps.grantee = $author`.
+Catalogs written before this rule named the observed group's tables without a qualifier, `EXISTS (caps WHERE caps.grantee = $author)`. Such a gate now reads the observer's own `caps`, and is rejected when the observer has none: write it as `EXISTS (user.caps WHERE user.caps.grantee = $author)`.
 
 ## The path of one release
 
