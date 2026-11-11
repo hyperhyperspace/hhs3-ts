@@ -837,11 +837,11 @@ export const restPhaseTests = {
                     if (!select.ok || select.value.kind !== 'select' || select.value.rows.length !== 1) return undefined;
                     return select.value.rows[0].values['body'];
                 };
-                const canon = (value: json.Literal | undefined) => value === undefined ? '<missing>' : json.toStringCanonical(value);
+                const canon = (value: json.Literal | undefined) => value === undefined ? '<missing>' : json.toStringNormalized(value);
                 assertEquals(canon(await readBody()), canon(inserted), 'inserted json object reads back exactly');
 
                 const update = await execute(await parseBind(
-                    `UPDATE docs_prod.notes SET body = JSON '${json.toStringCanonical(updated)}' WHERE rowId = '${insert.value.rowId}';`, lang));
+                    `UPDATE docs_prod.notes SET body = JSON '${json.toStringNormalized(updated)}' WHERE rowId = '${insert.value.rowId}';`, lang));
                 assertTrue(update.ok && update.value.kind === 'update', 'json array update succeeds');
                 assertEquals(canon(await readBody()), canon(updated), 'updated json array reads back exactly');
 

@@ -947,6 +947,37 @@ async function testCodecRejectsNonLiterals() {
     testing.assertTrue(json.eq(decoded.payload, wellFormed.payload), 'U+FFFD and a surrogate pair round-trip');
 }
 
+// A payload nests at most json.MAX_LITERAL_DEPTH levels, and a message holds
+// it one level in. JSON.parse reads text nested far deeper than the code that
+// then hashes the payload can walk, so decode counts the levels.
+async function testCodecRejectsDeepNesting() {
+    const error = (data: Uint8Array) => { try { decode(data); return undefined; } catch (e: any) { return String(e.message); } };
+    const nested = (depth: number): json.Literal => { let v: json.Literal = 1; for (let i = 0; i < depth; i++) v = [v]; return v; };
+    const payloadMsg = (payload: json.Literal): PayloadMsg =>
+        ({ type: 'payload-msg', requestId: 'r1', sequence: 0, hash: 'h1', payload });
+
+    const atLimit = nested(json.MAX_LITERAL_DEPTH);
+    const decoded = decode(encode(payloadMsg(atLimit))) as PayloadMsg;
+    testing.assertTrue(json.eq(decoded.payload, atLimit), 'a payload nested exactly to the limit round-trips');
+
+    const tooDeep = error(encode(payloadMsg(nested(json.MAX_LITERAL_DEPTH + 1))));
+    testing.assertTrue(tooDeep !== undefined && tooDeep.includes('levels of nesting'),
+        `a payload nested one level too deep is rejected: ${tooDeep}`);
+
+    const init = new TextEncoder().encode(
+        '{"type":"init-response","objectId":"o","createPayload":' + '['.repeat(json.MAX_LITERAL_DEPTH + 1) + ']'.repeat(json.MAX_LITERAL_DEPTH + 1) + '}');
+    testing.assertTrue(error(init) !== undefined, 'a create payload nested one level too deep is rejected');
+
+    // Far past what the hashing code could walk: named by the count, with no
+    // stack overflow.
+    const depth = 100000;
+    const huge = new TextEncoder().encode(
+        '{"type":"payload-msg","requestId":"r1","sequence":0,"hash":"h1","payload":' + '['.repeat(depth) + ']'.repeat(depth) + '}');
+    const hugeError = error(huge);
+    testing.assertTrue(hugeError !== undefined && hugeError.includes('levels of nesting'),
+        `a payload nested ${depth} levels deep is rejected by the count: ${hugeError}`);
+}
+
 // The object wanted has U+FFFD in its create payload. The peer answers with a
 // lone surrogate in that place, which hashes to the same object id.
 async function testFetchInitIgnoresIllFormedCreatePayload() {
@@ -1514,5 +1545,6 @@ export const syncSuite = {
         { name: '[SYNC_18] validate/apply throw defers (not rejects) and does not abort the pass', invoke: testValidateThrowDefersNotRejects },
         { name: '[SYNC_22] Codec rejects a message that is not a Literal', invoke: testCodecRejectsNonLiterals },
         { name: '[SYNC_23] fetchInit ignores a create payload with an ill-formed string', invoke: testFetchInitIgnoresIllFormedCreatePayload },
+        { name: '[SYNC_24] Codec rejects a payload nested deeper than 128 levels', invoke: testCodecRejectsDeepNesting },
     ],
 };

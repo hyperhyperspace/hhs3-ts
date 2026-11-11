@@ -25,6 +25,12 @@ import { isPatchVersion, PATCH_VERSION_RESERVED } from "./model.js";
 
 export const RELEASE_FILE_FORMAT = 1;
 
+// A release file holds each entry payload five levels in (the file, `objects`,
+// an object, its `entries`, an entry), so it may nest that much deeper than a
+// Literal: a payload at the limit must still load. Install checks every
+// payload against the Literal limit itself when it appends it.
+export const RELEASE_FILE_MAX_DEPTH = json.MAX_LITERAL_DEPTH + 5;
+
 export type ReleaseManifest = {
     kind?: 'catalog';
     name: string;
@@ -154,7 +160,7 @@ function isMap(value: unknown): value is json.LiteralMap {
 // problem found.
 export function checkReleaseFile(value: unknown): ReleaseFile {
     if (!isMap(value)) throw new ReleaseFileError('a release file must be a JSON object');
-    const problem = json.literalProblem(value);
+    const problem = json.literalProblem(value, RELEASE_FILE_MAX_DEPTH);
     if (problem !== undefined) throw new ReleaseFileError('a release file must not contain ' + problem);
 
     const format = value['format'];
@@ -190,7 +196,7 @@ export function checkReleaseFile(value: unknown): ReleaseFile {
 
 export function checkSchemaReleaseFile(value: unknown): SchemaReleaseFile {
     if (!isMap(value)) throw new ReleaseFileError('a release file must be a JSON object');
-    const problem = json.literalProblem(value);
+    const problem = json.literalProblem(value, RELEASE_FILE_MAX_DEPTH);
     if (problem !== undefined) throw new ReleaseFileError('a release file must not contain ' + problem);
 
     const format = value['format'];

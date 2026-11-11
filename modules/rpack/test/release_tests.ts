@@ -1,9 +1,11 @@
+import { json } from "@hyper-hyper-space/hhs3_json";
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 
 import {
     buildVersion, initProject, logReleases, newVersion, releaseVersion, RpackError, setBase, statusOf, type RpackContext,
 } from "../src/commands.js";
 import type { ReleaseDraft } from "../src/draft.js";
+import { checkReleaseFile, RELEASE_FILE_FORMAT, RELEASE_FILE_MAX_DEPTH } from "../src/format.js";
 import { formatReleaseConfirm, formatReleasePreview, formatStatus, type ReleasePreview } from "../src/format_draft.js";
 import { folderVersion, formatVersionFile, MemoryProject, parseRpackConfig, parseVersionFile } from "../src/project.js";
 import { verifyRelease } from "../src/verify.js";
@@ -607,6 +609,26 @@ export const releaseTests = [
             assertEquals(rebuilt.lines[1], `It is the update.sql ${now} was released with`, `and build says so:\n${rebuilt.lines.join('\n')}`);
             assertEquals((await statusOf(ctx, '1.0.0')).lines[4], `Released as ${now}`, 'the folder is as released');
             assertTrue((await verifyRelease(project.files.get(`releases/${now}.rpack`)!)).ok, 'the new file verifies');
+        },
+    },
+    {
+        name: '[RPACK27] a release file may hold a payload nested to the Literal limit, and no deeper',
+        invoke: async () => {
+            const nested = (depth: number): json.Literal => { let v: json.Literal = 1; for (let i = 0; i < depth; i++) v = [v]; return v; };
+            const fileWith = (payload: json.Literal): json.Literal => ({
+                format: RELEASE_FILE_FORMAT,
+                manifest: { name: 'editor', catalog: 'c', version: '1.0.0', release: 'r', parents: [] },
+                objects: [{ id: 'o', create: {}, entries: [{ hash: 'h', prevs: [], payload }] }],
+            });
+
+            assertEquals(RELEASE_FILE_MAX_DEPTH, json.MAX_LITERAL_DEPTH + 5, 'the file wraps a payload in five levels');
+
+            const atLimit = nested(json.MAX_LITERAL_DEPTH);
+            const file = checkReleaseFile(fileWith(atLimit));
+            assertTrue(json.eq(file.objects[0].entries[0].payload, atLimit), 'a payload nested exactly to the limit loads');
+
+            await expectThrows(async () => checkReleaseFile(fileWith(nested(json.MAX_LITERAL_DEPTH + 1))),
+                'levels of nesting', 'a payload nested one level too deep');
         },
     },
 ];

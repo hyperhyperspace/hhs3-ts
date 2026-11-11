@@ -44,19 +44,46 @@ wherever a value enters from outside: when it creates an entry and when it
 decodes a message from a peer. `U+FFFD` itself is an ordinary character
 and is valid.
 
+A Literal nests at most **128 levels**. A boolean, a number or a string has
+depth 0. An array or an object has a depth one more than its deepest
+member, and depth 1 when it is empty. A value nested deeper is not a valid
+Literal and MUST be rejected at the same two points: when an entry is
+created and when a message from a peer is decoded. The limit applies to the
+whole payload of an entry (§4.3). JSON text can nest to any depth, while
+the code that walks a parsed value usually recurses and fails at a depth
+that differs between runtimes. The fixed limit makes every implementation
+accept the same values, and an implementation MUST enforce it by counting
+levels, not by running out of stack.
+
 ### 2.2 Serialization Rules
 
-Given a Literal, canonical serialization produces a UTF-8 string as follows:
+Canonical serialization is the JSON Canonicalization Scheme of
+[RFC 8785](https://www.rfc-editor.org/rfc/rfc8785), applied to a Literal.
+The RFC is normative. This table summarizes it:
 
 | Type | Rule |
 |------|------|
 | `boolean` | `true` or `false` (no quotes) |
-| `number` | Per ECMA-262 `Number::toString` (equivalent to RFC 8785 §3.2.2.3). See §2.2.1 for details. |
-| `string` | Enclosed in double quotes. Only two escape sequences: `\\` for backslash, `\"` for double quote. No other escaping (no `\n`, `\t`, `\uXXXX`). |
-| `array` | `[` + comma-separated serialized elements + `]` |
-| `object` | `{` + comma-separated `key:value` pairs + `}`, where keys are **sorted lexicographically** and serialized as strings (quoted, escaped), with no space after the colon |
+| `number` | Per ECMA-262 `Number::toString` (RFC 8785 §3.2.2.3). See §2.2.1 for details. |
+| `string` | Enclosed in double quotes. A double quote is written `\"` and a backslash `\\`. The control characters `U+0008`, `U+0009`, `U+000A`, `U+000C` and `U+000D` are written `\b`, `\t`, `\n`, `\f` and `\r`. Any other character below `U+0020` is written as `\u00` followed by its two lowercase hex digits. Every other character is written as is (RFC 8785 §3.2.2.2). |
+| `array` | `[` + comma-separated serialized elements, in order + `]` |
+| `object` | `{` + comma-separated `key:value` pairs + `}`, with no space after the colon. Keys are serialized as strings and **sorted by UTF-16 code unit**, comparing the keys before they are escaped (RFC 8785 §3.2.3). |
 
-No whitespace between tokens. No trailing commas.
+No whitespace between tokens. No trailing commas. The result is encoded as
+UTF-8, and it is valid JSON text that parses back to the same Literal.
+
+Sorting by UTF-16 code unit differs from sorting by code point, or by
+UTF-8 bytes, in one case only: a character at or above `U+10000` compared
+with one in `U+E000`–`U+FFFF`. In UTF-16 the first is a surrogate pair that
+starts with a code unit in `U+D800`–`U+DBFF`, so it sorts first. An
+implementation in a language whose strings are not UTF-16 needs a
+comparator that reproduces this order.
+
+A Literal is narrower than the input the RFC accepts in two ways: it has no
+`null`, and it nests at most 128 levels (§2.1). The RFC's own input rules
+already hold for a Literal: its strings are well-formed Unicode and its
+numbers are finite float64 values. Any implementation of RFC 8785
+therefore produces the canonical form of a Literal.
 
 #### 2.2.1 Number Format
 
@@ -94,7 +121,24 @@ and Dragon4 in other languages.
 | `-0` | `0` |
 | `1e+21` | `1e+21` |
 | `[3, 1, 2]` | `[3,1,2]` |
+| `[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]` | `[0,1,2,3,4,5,6,7,8,9,10,11]` |
 | `"say \"hi\""` | `"say \"hi\""` |
+| the three characters `a`, `U+000A` (line feed), `b` | `"a\nb"` |
+| the single character `U+000F` | `"\u000f"` |
+| the single character `U+00E9` (`é`) | `"é"` |
+
+Key order. An object with the keys `U+20AC`, `U+000D`, `U+FB33`, `1`,
+`U+1F600`, `U+0080` and `U+00F6` serializes them in the order `U+000D`,
+`1`, `U+0080`, `U+00F6`, `U+20AC`, `U+1F600`, `U+FB33`. `U+1F600` comes
+before `U+FB33` because its first UTF-16 code unit is `U+D83D`. This is the
+example of RFC 8785 §3.2.3.
+
+Nesting. `[[…[1]…]]` with 128 pairs of brackets is a valid Literal. With 129
+pairs it is not.
+
+The examples of RFC 8785 (§3.2.2, §3.2.3 and Appendix B) are test vectors
+for this section. The `null` in the §3.2.2 example is left out, since a
+Literal has none.
 
 ### 2.4 Sets
 

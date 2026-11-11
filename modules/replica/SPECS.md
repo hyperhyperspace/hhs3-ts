@@ -75,8 +75,9 @@ payload, and the set of predecessor entry hashes that define where
 in causal history this operation was applied.
 - An **entry hash**: the hash of the canonicalized header.
 
-Hashing is deterministic: JSON values are canonicalized (sorted keys, no
-whitespace, minimal escaping, no trailing `.0` on integers), encoded as
+Hashing is deterministic: JSON values are canonicalized as RFC 8785
+defines (sorted keys, no whitespace, arrays in order, the shortest form of
+each number), encoded as
 UTF-8, hashed with SHA-256, and the digest is encoded as standard Base64
 with padding. The resulting `B64Hash` type is the universal identifier
 throughout the protocol — entry hashes, object IDs, topic IDs, and key IDs

@@ -568,8 +568,8 @@ function renderRowValue(column: string, value: json.Literal, options?: RenderOpt
 
 export function renderLiteral(value: json.Literal): string {
     if (typeof value === 'string') return renderStringLiteral(value);
-    if (typeof value === 'object') return `JSON ${renderStringLiteral(json.toStringCanonical(value))}`;
-    return json.toStringCanonical(value);
+    if (typeof value === 'object') return `JSON ${renderStringLiteral(json.toStringNormalized(value))}`;
+    return json.toStringNormalized(value);
 }
 
 function renderNote(note?: string): string {

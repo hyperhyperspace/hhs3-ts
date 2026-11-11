@@ -71,7 +71,7 @@ export type CatalogModel = {
 export const RESTRICTION_OPS = ['insert', 'update', 'delete'] as const;
 
 export function literalKey(value: json.Literal): string {
-    return json.toStringCanonical(value);
+    return json.toStringNormalized(value);
 }
 
 export function effectiveFks(def: TableDef): FKs {

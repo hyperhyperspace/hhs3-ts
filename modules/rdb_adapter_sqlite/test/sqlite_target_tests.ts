@@ -119,7 +119,7 @@ export function sqliteHarness(): TargetHarness {
 
 function toParam(value: json.Literal, type: ColumnType): number | string {
     if (type === 'boolean') return value ? 1 : 0;
-    if (type === 'json') return json.toStringCanonical(value);
+    if (type === 'json') return json.toStringNormalized(value);
     return value as number | string;
 }
 
@@ -923,7 +923,7 @@ export const sqliteSpecificTests = {
                 assertTrue(same(events[0]!.event.op, op), 'a stored op event with control characters reads back unchanged');
 
                 const edited = { note: 'multi\nline', seq: [...long].reverse() };
-                db.prepare('UPDATE docs SET body = ? WHERE id = ?').run(json.toStringCanonical(edited), stored.id);
+                db.prepare('UPDATE docs SET body = ? WHERE id = ?').run(json.toStringNormalized(edited), stored.id);
                 const batch = await target.drainChanges();
                 const change = batch.changes.find((c) => c.kind === 'update');
                 assertTrue(change !== undefined && change.kind === 'update' && same(change.values['body'], edited),

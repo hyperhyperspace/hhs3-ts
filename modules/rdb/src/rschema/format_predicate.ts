@@ -171,8 +171,8 @@ function formatCmp(cmp: string): string {
 
 function formatLiteral(value: json.Literal): string {
     if (typeof value === 'string') return renderStringLiteral(value);
-    if (typeof value === 'object') return `JSON ${renderStringLiteral(json.toStringCanonical(value))}`;
-    return json.toStringCanonical(value);
+    if (typeof value === 'object') return `JSON ${renderStringLiteral(json.toStringNormalized(value))}`;
+    return json.toStringNormalized(value);
 }
 
 // A C-SQL '...' literal that lexes back to `value`. The lexer reads \n, \r,
