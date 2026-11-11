@@ -1,11 +1,11 @@
 # HIP-21: `OR` in `EXISTS ... WHERE`
 
 - **Type:** design
-- **Status:** draft
+- **Status:** implemented
 - **Modules:** rdb, rdb_lang, mvt, rpack, rdb_tools, rdb_repl_web, rdb_runtime, rhost
 - **Requires:** —
 - **Superseded by:** —
-- **Implemented in:** —
+- **Implemented in:** `1171554`
 
 ## Summary
 
