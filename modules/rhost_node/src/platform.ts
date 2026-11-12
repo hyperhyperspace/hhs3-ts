@@ -141,6 +141,24 @@ class NodeHosts implements HostStore {
         }
     }
 
+    // Rewrites host.json through a temporary file in the host's own folder, so
+    // a reader never sees half a record. A host that is not there is not made.
+    async update(name: string, record: HostRecord): Promise<void> {
+        checkHostName(name);
+        const folder = hostDir(this.dir, name);
+        const file = join(folder, HOST_FILE);
+        if (!await exists(file)) throw new Error(`no host '${name}'`);
+        const pending = join(folder, `.${HOST_FILE}.pending`);
+        try {
+            // writeFile makes no folder: if the host was removed meanwhile, this fails.
+            await fs.writeFile(pending, JSON.stringify(record, undefined, 2) + '\n');
+            await fs.rename(pending, file);
+        } catch (err) {
+            await fs.rm(pending, { force: true });
+            throw err;
+        }
+    }
+
     async openReplica(name: string): Promise<DagBackend> {
         const folder = hostDir(this.dir, name);
         if (!await exists(join(folder, HOST_FILE))) throw new Error(`no host '${name}'`);

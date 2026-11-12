@@ -2,7 +2,7 @@
 // factory, the allow-list authorizer, and starting, fetching and tearing down a
 // database's sync over a mesh attached to its replica.
 
-import type { KeyId, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
+import type { B64Hash, KeyId, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import type { IssueReporter, Mesh, PeerAuthorizer, PeerDiscovery, ScopedMeshConfig } from "@hyper-hyper-space/hhs3_mesh";
 import type { RObject } from "@hyper-hyper-space/hhs3_mvt";
 import { RDB_TYPE_ID, type RDb } from "@hyper-hyper-space/hhs3_rdb";
@@ -41,6 +41,29 @@ export type ColumnSource = Extract<AllowSource, { type: 'column' }>;
 
 export type ColumnLookup = (source: ColumnSource) => Promise<Iterable<unknown>>;
 
+// The frontier of the group a source reads, sorted. `undefined` while that
+// group is not on this replica yet. Throws when the database has no group by
+// that name.
+export type AllowFrontier = (source: ColumnSource) => Promise<B64Hash[] | undefined>;
+
+// Where a host first found its own key on its allow list: the group whose
+// column listed it, and that group's frontier then.
+export type ListedAt = { group: string; frontier: B64Hash[] };
+
+// Given to the authorizer of a host that is bootstrapping: one that joined its
+// database and has not found its own key on its allow list yet.
+export type AllowBootstrap = {
+    self: KeyId;
+    // Called once, when the key is first found.
+    found(at: ListedAt): Promise<void>;
+};
+
+export type AllowOptions = {
+    // Lets the authorizer keep the listed keys until a group it reads changes.
+    frontier?: AllowFrontier;
+    bootstrap?: AllowBootstrap;
+};
+
 export function allowIsEveryone(sources: AllowSource[]): boolean {
     return sources.length === 0 || sources.some((s) => s.type === 'everyone');
 }
@@ -75,28 +98,78 @@ export function parseAllowSource(text: string): AllowSource {
     };
 }
 
-// A peer is accepted when its key appears in any of the columns. `everyone`
-// anywhere in the list means no authorizer at all.
+// A key is listed when it appears in any of the columns. `everyone` anywhere in
+// the list means no authorizer at all.
+//
+// A host serves only listed peers, and admits only listed peers, with one
+// exception: while it is bootstrapping it admits any peer, since its copy of
+// the list is older than its own admission and can't tell members from
+// strangers. Bootstrapping ends the first time the host's own key is listed,
+// and never starts again.
 export function createAllowAuthorizer(
     sources: AllowSource[],
     lookup: ColumnLookup,
+    options: AllowOptions = {},
 ): PeerAuthorizer | undefined {
     if (allowIsEveryone(sources)) return undefined;
     const columns = sources.filter((s): s is ColumnSource => s.type === 'column');
-    return {
-        async authorize(keyId: KeyId): Promise<boolean> {
-            for (const source of columns) {
-                let values: Iterable<unknown>;
-                try {
-                    values = await lookup(source);
-                } catch {
-                    continue;
-                }
-                for (const value of values) {
-                    if (value === keyId || String(value) === keyId) return true;
-                }
+    const { frontier } = options;
+    let pending = options.bootstrap;
+    let cached: { stamp: string; keys: Set<string> } | undefined;
+
+    async function stamp(): Promise<string | undefined> {
+        if (frontier === undefined) return undefined;
+        const parts: string[] = [];
+        for (const source of columns) {
+            let at: B64Hash[] | undefined;
+            try { at = await frontier(source); } catch { at = undefined; }
+            parts.push(at === undefined ? '-' : at.join(','));
+        }
+        return parts.join('|');
+    }
+
+    async function listedKeys(): Promise<Set<string>> {
+        const before = await stamp();
+        if (before !== undefined && cached !== undefined && cached.stamp === before) return cached.keys;
+        const keys = new Set<string>();
+        let foundIn: ColumnSource | undefined;
+        for (const source of columns) {
+            let values: Iterable<unknown>;
+            try {
+                values = await lookup(source);
+            } catch {
+                continue;
             }
-            return false;
+            for (const value of values) {
+                const key = String(value);
+                keys.add(key);
+                if (foundIn === undefined && pending !== undefined && key === pending.self) foundIn = source;
+            }
+        }
+        if (before !== undefined) cached = { stamp: before, keys };
+        if (foundIn !== undefined && pending !== undefined) {
+            const bootstrap = pending;
+            pending = undefined;
+            // Read after the lookup, so the position is at or past the one the
+            // key was found at. A group that listed the key has entries; if its
+            // frontier can't be read, bootstrapping goes on and the next read
+            // tries again.
+            let at: B64Hash[] | undefined;
+            try { at = await frontier?.(foundIn); } catch { at = undefined; }
+            if (at === undefined || at.length === 0) pending = bootstrap;
+            else await bootstrap.found({ group: foundIn.group, frontier: at });
+        }
+        return keys;
+    }
+
+    return {
+        async serves(keyId: KeyId): Promise<boolean> {
+            return (await listedKeys()).has(keyId);
+        },
+        async authorize(keyId: KeyId): Promise<boolean> {
+            const keys = await listedKeys();
+            if (pending !== undefined) return true;
+            return keys.has(keyId);
         },
     };
 }
@@ -115,10 +188,13 @@ export function columnLookup(session: RdbSession): ColumnLookup {
     };
 }
 
-// Runs every column query once, so a typo fails before sync starts.
-export async function validateAllowSources(sources: AllowSource[], lookup: ColumnLookup): Promise<void> {
+// Runs every column query once, so a typo fails before sync starts. With a
+// frontier, a group the database has but this replica hasn't created yet is
+// skipped: a joined host gets its groups from sync.
+export async function validateAllowSources(sources: AllowSource[], lookup: ColumnLookup, frontier?: AllowFrontier): Promise<void> {
     for (const source of sources) {
         if (source.type !== 'column') continue;
+        if (frontier !== undefined && await frontier(source) === undefined) continue;
         await lookup(source);
     }
 }

@@ -109,6 +109,19 @@ export class IdbHosts implements HostStore {
         }
     }
 
+    // Replaces the record of a published host. The row is read and written in
+    // one transaction, so a host that was removed, or is still being made, is
+    // never written back.
+    async update(name: string, record: HostRecord): Promise<void> {
+        const db = await this.database();
+        const tx = db.transaction(BROWSER_HOSTS_STORE, 'readwrite');
+        const store = tx.objectStore(BROWSER_HOSTS_STORE);
+        const row = await idbRequest<HostRow | undefined>(store.get(name));
+        if (row?.state !== 'published') throw new Error(`no host '${name}'`);
+        await idbRequest(store.put({ ...row, record }));
+        await idbTransactionDone(tx);
+    }
+
     async openReplica(name: string): Promise<DagBackend> {
         const row = await this.readRow(name);
         if (row?.state !== 'published') throw new Error(`no host '${name}'`);

@@ -33,7 +33,8 @@ function clientPair(host: Host) {
         find: (id: number, kind: 'result' | 'error' | 'event') => received.filter((m) => m.id === id && kind in m),
     };
 }
-import { runAllowSourceParseTests, runSyncAuthorizerTests } from "./sync_tests.js";
+import { bootstrapTests } from "./bootstrap_tests.js";
+import { runAllowSourceParseTests, runBootstrapAuthorizerTests, runSyncAuthorizerTests } from "./sync_tests.js";
 
 function throwsWith(fn: () => unknown, fragment: string, what: string): void {
     try {
@@ -126,6 +127,19 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
 
             const record = parseHostRecord(copy(RECORD));
             assertEquals(record.key.keyId, 'KID', 'a good host.json parses');
+            assertEquals(record.listedAt, undefined, 'with no position until the host writes one');
+            const listed = parseHostRecord({ ...RECORD, listedAt: { group: 'user', frontier: ['H1', 'H2'] } });
+            assertEquals(listed.listedAt?.group, 'user', 'listedAt names a group');
+            assertEquals(listed.listedAt?.frontier.join(','), 'H1,H2', 'and a frontier');
+            throwsWith(() => parseHostRecord({ ...RECORD, listedAt: { group: 'user', frontier: [] } }),
+                'listedAt.frontier must be a list of at least one hash', 'an empty frontier');
+            throwsWith(() => parseHostRecord({ ...RECORD, listedAt: { group: 'user', frontier: ['H1', ''] } }),
+                'listedAt.frontier must be a list of at least one hash', 'an empty hash');
+            throwsWith(() => parseHostRecord({ ...RECORD, listedAt: { group: 'user' } }),
+                'listedAt.frontier must be a list of at least one hash', 'a missing frontier');
+            throwsWith(() => parseHostRecord({ ...RECORD, listedAt: { frontier: ['H1'] } }), 'listedAt.group', 'a missing group');
+            throwsWith(() => parseHostRecord({ ...RECORD, listedAt: { group: 'user', frontier: ['H1'], at: 1 } }),
+                'is not a known field', 'an unknown field in listedAt');
             throwsWith(() => parseHostRecord({ ...RECORD, extra: 1 }), "host.json: 'extra' is not a known field", 'unknown top-level field');
             throwsWith(() => parseHostRecord({ ...RECORD, releases: 'other/' }), "'releases' is not a known field", 'releases are the app\'s');
             throwsWith(() => parseHostRecord({ ...RECORD, allow: [] }), "'allow' is not a known field", 'so is allow');
@@ -169,6 +183,7 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
             assertEquals(adoptionRangeFor('1.1.0'), '<2.0.0', 'the range is everything below the next major');
 
             await runSyncAuthorizerTests();
+            await runBootstrapAuthorizerTests();
             runAllowSourceParseTests();
         },
     },
@@ -726,6 +741,7 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
             }
         },
     },
+    ...bootstrapTests,
 ];
 
 async function main() {

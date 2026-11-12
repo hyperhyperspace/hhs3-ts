@@ -145,8 +145,11 @@ Per-swarm authorization policy. If provided in the swarm config, the authorizer 
 ```typescript
 interface PeerAuthorizer {
     authorize(keyId: KeyId): Promise<boolean>;
+    serves?(keyId: KeyId): Promise<boolean>;
 }
 ```
+
+`authorize` decides whether a peer joins the swarm. `serves`, when present, decides whether a peer already in the swarm is given data, and may answer differently over time: the mesh does not act on it, it only passes the answer on. Whoever sends on the swarm's channels asks `swarm.wouldServe(keyId)` each time it is about to send. `wouldServe` returns `true` at once, with no promise, when the swarm has no authorizer or the authorizer has no `serves`, so a swarm that only admits serves every peer it admitted.
 
 ### ConnectionPool
 

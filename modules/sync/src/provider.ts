@@ -30,10 +30,32 @@ export interface DagProvider {
     destroy(): void;
 }
 
-export function createDagProvider(dag: Dag): DagProvider {
+// What a peer's answer under way holds in `activeResp`.
+type Slot = { requestId: string; cancel: () => void };
+
+// `mayServe` says whether a peer may be sent data. It is asked before every
+// batch of an answer, the first included, and a no drops everything queued for
+// that peer. Without it every peer may.
+export function createDagProvider(dag: Dag, mayServe?: (peerKey: string) => true | Promise<boolean>): DagProvider {
 
     const peerQueues  = new Map<string, QueuedResponse[]>();
-    const activeResp  = new Map<string, { requestId: string; cancel: () => void }>();
+    const activeResp  = new Map<string, Slot>();
+
+    async function served(pk: string): Promise<boolean> {
+        if (mayServe === undefined) return true;
+        try {
+            return (await mayServe(pk)) === true;
+        } catch {
+            return false;
+        }
+    }
+
+    // A stream that ended gives up the peer's slot, if it still holds it, and
+    // lets the next queued answer start.
+    function release(pk: string, slot: Slot, channel: TopicChannel) {
+        if (activeResp.get(pk) === slot) activeResp.delete(pk);
+        if (!activeResp.has(pk)) startNext(pk, channel);
+    }
     let tickTimer: ReturnType<typeof setInterval> | undefined;
 
     function peerKey(ch: TopicChannel): string {
@@ -137,11 +159,37 @@ export function createDagProvider(dag: Dag): DagProvider {
         const resp = q.shift()!;
         if (q.length === 0) peerQueues.delete(pk);
 
-        if (resp.kind === 'headers') {
-            startHeaderStream(pk, resp, channel);
-        } else {
-            startPayloadStream(pk, resp, channel);
+        const start = () => {
+            if (resp.kind === 'headers') {
+                startHeaderStream(pk, resp, channel);
+            } else {
+                startPayloadStream(pk, resp, channel);
+            }
+        };
+        if (mayServe === undefined) {
+            start();
+            return;
         }
+
+        // An answer may have waited in the queue, or follow a header answer
+        // with no request of its own (auto-payloads): ask before its first
+        // batch. The slot is held meanwhile, so a request that arrives now
+        // queues behind this one.
+        let cancelled = false;
+        const slot: Slot = {
+            requestId: resp.kind === 'headers' ? resp.request.requestId : resp.requestId,
+            cancel: () => { cancelled = true; },
+        };
+        activeResp.set(pk, slot);
+        void served(pk).then((ok) => {
+            if (cancelled) {
+                release(pk, slot, channel);
+            } else if (!ok) {
+                cancelPeer(pk);
+            } else {
+                start();
+            }
+        });
     }
 
     // --- header streaming ---
@@ -212,45 +260,37 @@ export function createDagProvider(dag: Dag): DagProvider {
             return true;
         }
 
-        activeResp.set(pk, {
+        const slot: Slot = {
             requestId: request.requestId,
             cancel: () => { cancelled = true; },
-        });
+        };
+        activeResp.set(pk, slot);
 
-        // try to send the first batch immediately
-        const done = sendNextBatch();
-        if (done) {
-            activeResp.delete(pk);
-            startNext(pk, channel);
+        // The first batch goes out now: startNext has just asked.
+        if (sendNextBatch()) {
+            release(pk, slot, channel);
             return;
         }
 
-        // register tick handler for remaining batches
-        const tickHandler = () => {
-            if (cancelled || !channel.open) {
-                activeResp.delete(pk);
-                startNext(pk, channel);
-                return;
+        // The remaining batches go out one per tick, each after asking again.
+        // A tick does nothing while the previous one is still asking.
+        let asking = false;
+        const interval = setInterval(async () => {
+            if (asking) return;
+            if (mayServe !== undefined && !cancelled && channel.open) {
+                asking = true;
+                const ok = await served(pk);
+                asking = false;
+                if (!ok && !cancelled) {
+                    clearInterval(interval);
+                    cancelPeer(pk);
+                    return;
+                }
             }
-            const finished = sendNextBatch();
-            if (finished) {
-                activeResp.delete(pk);
-                startNext(pk, channel);
-            }
-        };
-
-        activeResp.set(pk, {
-            requestId: request.requestId,
-            cancel: () => {
-                cancelled = true;
-            },
-        });
-
-        // Replace tick with per-peer drainer
-        const interval = setInterval(() => {
-            tickHandler();
-            if (cancelled || !activeResp.has(pk) || activeResp.get(pk)?.requestId !== request.requestId) {
+            // sendNextBatch answers true, and sends nothing, once cancelled or closed.
+            if (sendNextBatch()) {
                 clearInterval(interval);
+                release(pk, slot, channel);
             }
         }, TICK_INTERVAL_MS);
     }
@@ -301,24 +341,40 @@ export function createDagProvider(dag: Dag): DagProvider {
             return idx >= hashes.length;
         }
 
-        activeResp.set(pk, {
+        const slot: Slot = {
             requestId,
             cancel: () => { cancelled = true; },
-        });
+        };
+        activeResp.set(pk, slot);
 
-        // Fire the first burst immediately; only use interval for subsequent bursts
-        sendBurst().then(done => {
+        // The first burst goes out now: startNext has just asked.
+        void sendBurst().then(done => {
             if (done || cancelled) {
-                activeResp.delete(pk);
-                startNext(pk, channel);
+                release(pk, slot, channel);
                 return;
             }
+            // The remaining bursts go out one per tick, each after asking
+            // again. A tick does nothing while the previous one is still
+            // asking or sending.
+            let busy = false;
             const interval = setInterval(async () => {
-                const finished = await sendBurst();
-                if (finished || cancelled) {
-                    clearInterval(interval);
-                    activeResp.delete(pk);
-                    startNext(pk, channel);
+                if (busy) return;
+                busy = true;
+                try {
+                    if (mayServe !== undefined && !cancelled && channel.open && !(await served(pk))) {
+                        if (!cancelled) {
+                            clearInterval(interval);
+                            cancelPeer(pk);
+                            return;
+                        }
+                    }
+                    const finished = await sendBurst();
+                    if (finished || cancelled) {
+                        clearInterval(interval);
+                        release(pk, slot, channel);
+                    }
+                } finally {
+                    busy = false;
                 }
             }, TICK_INTERVAL_MS);
         });

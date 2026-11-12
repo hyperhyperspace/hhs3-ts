@@ -17,7 +17,10 @@ import { TRACE_MESH, TRACE_SWARM, trace } from './trace.js';
 export type SwarmMode = 'dormant' | 'passive' | 'active';
 
 export interface PeerAuthorizer {
+    // May this peer join the swarm?
     authorize(keyId: KeyId): Promise<boolean>;
+    // May this peer be given entries? Absent: every peer in the swarm is served.
+    serves?(keyId: KeyId): Promise<boolean>;
 }
 
 export interface SwarmConfig {
@@ -56,6 +59,8 @@ export interface Swarm {
     onPeerLeave(callback: PeerCallback): void;
     blockPeer(keyId: KeyId, endpoint: NetworkAddress): void;
     wouldAccept(keyId: KeyId): Promise<boolean>;
+    // `true` at once when the authorizer has no serve check.
+    wouldServe(keyId: KeyId): true | Promise<boolean>;
     adopt(keyId: KeyId, endpoint: NetworkAddress): boolean;
 }
 
@@ -229,6 +234,11 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
             return authorizer.authorize(keyId);
         }
         return true;
+    }
+
+    function wouldServe(keyId: KeyId): true | Promise<boolean> {
+        if (authorizer?.serves === undefined) return true;
+        return authorizer.serves(keyId);
     }
 
     // --- discovery + connect loop ---
@@ -487,6 +497,7 @@ export function createSwarm(config: SwarmConfig, deps: SwarmDeps): Swarm {
         onPeerLeave: (cb: PeerCallback) => { leaveCallbacks.push(cb); },
         blockPeer,
         wouldAccept,
+        wouldServe,
         adopt: adoptPeer,
     };
 }

@@ -21,7 +21,7 @@ interface RhostClient {
 - **`ClientStatus`** is a `HostStatus` or a `StoppedStatus`; `isHostStatus` tells them apart.
   - `HostStatus` is the status rhost computes from the replica: the `host` name, deployed, adopted and held releases, members, `upgradeRequired`, `hostBehind` and `running`.
   - A host that's behind adds `notDeployed`, why the shipped release isn't deployed (`autoDeploy` is `none`, a major bump, the key isn't a creator, or a missing param), and `missingParams`, each `{ name, type }`, when params are why.
-  - While it runs, it adds `peers`, `files` (one `FilesMountStatus` per file mount: `mounted` with its file, missing and local-only counts and whether this key can write, or `pending`) and `lastError`.
+  - While it runs, it adds `peers`, `bootstrapping` (`true` while a host that joined has not yet found its own key on the app's `allow` list, and so admits any peer; see rhost's [Allow lists](../rhost/README.md#allow-lists)), `files` (one `FilesMountStatus` per file mount: `mounted` with its file, missing and local-only counts and whether this key can write, or `pending`) and `lastError`.
   - `StoppedStatus` is what a client in another process knows of a host that isn't running: its name, database, catalog, and whether it was created here.
 - **`ClientEvent`** is a rejected local write, or a concurrent change that voided or reinstated one. It has the same fields as the projection's op-event log, plus its id.
 

@@ -64,6 +64,10 @@ export type HostStatus = {
     missingParams?: ClientParam[];
     running: boolean;
     peers?: number;
+    // A running host that joined its database and has not found its own key on
+    // its allow list yet: it admits any peer and gives entries to none it
+    // doesn't find listed.
+    bootstrapping?: boolean;
     files?: FilesMountStatus[];
     lastError?: string;
 };

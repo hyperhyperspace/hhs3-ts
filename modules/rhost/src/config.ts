@@ -12,7 +12,7 @@ import {
 } from "@hyper-hyper-space/hhs3_mesh";
 import { validateIndexSpec, type IndexDecl, type IndexSpec } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
-import { parseAllowSource, type AllowSource } from "./sync.js";
+import { parseAllowSource, type AllowSource, type ListedAt } from "./sync.js";
 
 export type AutoDeploy = 'minor' | 'major' | 'none';
 
@@ -61,6 +61,10 @@ export type HostRecord = {
     database: B64Hash;
     catalog: string;
     created: boolean;
+    // Where a joined host first found its own key on its allow list. Written
+    // by the host; while it is absent, or names entries the replica doesn't
+    // hold, the host is bootstrapping.
+    listedAt?: ListedAt;
     key: HostKeyConfig;
     mesh?: MeshConfig;
     params?: ParamsConfig;
@@ -309,7 +313,7 @@ export function parseAppConfig(value: unknown, source = 'app.json'): AppConfig {
 
 export function parseHostRecord(value: unknown, source = 'host.json'): HostRecord {
     const c = new Checker(source);
-    const o = c.object(value, '', ['database', 'catalog', 'created', 'key', 'mesh', 'params', 'autoDeploy', 'projection']);
+    const o = c.object(value, '', ['database', 'catalog', 'created', 'listedAt', 'key', 'mesh', 'params', 'autoDeploy', 'projection']);
     const created = o['created'];
     if (created === undefined) return c.fail('created', 'is missing');
     if (typeof created !== 'boolean') return c.fail('created', 'must be true or false');
@@ -320,6 +324,14 @@ export function parseHostRecord(value: unknown, source = 'host.json'): HostRecor
         key: checkKey(c, o['key'], 'key'),
         ...(o['mesh'] !== undefined ? { mesh: readMesh(o['mesh'], source, 'mesh') } : {}),
     };
+    if (o['listedAt'] !== undefined) {
+        const l = c.object(o['listedAt'], 'listedAt', ['group', 'frontier']);
+        const frontier = l['frontier'];
+        if (!Array.isArray(frontier) || frontier.length === 0 || frontier.some((h) => typeof h !== 'string' || h.length === 0)) {
+            return c.fail('listedAt.frontier', 'must be a list of at least one hash');
+        }
+        record.listedAt = { group: c.string(l['group'], 'listedAt.group'), frontier: frontier as B64Hash[] };
+    }
     if (o['params'] !== undefined) record.params = checkParams(c, o['params'], 'params');
     if (o['autoDeploy'] !== undefined) record.autoDeploy = checkAutoDeploy(c, o['autoDeploy'], 'autoDeploy');
     if (o['projection'] !== undefined) record.projection = checkProjection(c, o['projection'], 'projection');

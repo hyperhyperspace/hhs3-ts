@@ -49,6 +49,12 @@ type PeerHandle = {
     channel: import('@hyper-hyper-space/hhs3_mesh').TopicChannel;
 };
 
+// What the session keeps per peer to ask its swarm whether to serve it.
+type PeerGate = {
+    serves: () => true | Promise<boolean>;
+    gossip: Promise<void>;      // keeps frontier gossip to this peer in order
+};
+
 const REQUEST_TYPES = new Set([
     'header-request', 'payload-request', 'cancel-request',
 ]);
@@ -56,6 +62,7 @@ const REQUEST_TYPES = new Set([
 export function createSyncSession(target: SyncTarget, swarms: Swarm[], opts?: SyncSessionOptions): SyncSession {
 
     const activePeers = new Map<string, PeerHandle>();
+    const gates = new Map<string, PeerGate>();
     const emitReport = opts?.report;
 
     function reportIssue(peerKey: string, partial: Omit<IssueReport, 'source' | 'dagId' | 'keyId' | 'endpoint'>) {
@@ -84,13 +91,26 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[], opts?: Sy
     }
 
     function sendToWithReport(peer: PeerHandle, msg: SyncMsg): SendResult {
+        // Frontier gossip goes only to peers this host serves.
+        if (msg.type === 'new-frontier') {
+            const gate = gates.get(peer.key);
+            const answer = gate === undefined ? true : gate.serves();
+            if (answer !== true) {
+                gate!.gossip = gate!.gossip.then(async () => {
+                    if (!activePeers.has(peer.key)) return;
+                    if (await answer) sendTo(peer, msg);
+                    else refuse(peer.key);
+                }).catch(() => { /* a failed check sends nothing */ });
+                return 'sent';
+            }
+        }
         const result = sendTo(peer, msg);
         if (result === 'closed') reportIssue(peer.key, { kind: 'send-closed', severity: 'low' });
         if (result === 'error')  reportIssue(peer.key, { kind: 'send-error', severity: 'low' });
         return result;
     }
 
-    const provider: DagProvider = createDagProvider(target.dag);
+    const provider: DagProvider = createDagProvider(target.dag, (pk) => gates.get(pk)?.serves() ?? true);
     const synchronizer: DagSynchronizer = createDagSynchronizer(
         target.dagId,
         target.dag,
@@ -102,9 +122,17 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[], opts?: Sy
         { report: emitReport },
     );
 
+    // This host just found that it does not serve a peer: drop what is still
+    // queued for it, and don't count a withheld frontier as sent.
+    function refuse(key: string) {
+        provider.cancelPeer(key);
+        synchronizer.forgetSentFrontier(key);
+    }
+
     function cleanupPeer(key: string) {
         if (!activePeers.has(key)) return;
         activePeers.delete(key);
+        gates.delete(key);
         if (TRACE_SYNC) trace('sync.peer remove', { dag: target.dagId, peer: key });
         provider.cancelPeer(key);
         synchronizer.removePeer(key);
@@ -139,12 +167,14 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[], opts?: Sy
         if (sp.channel.open) sp.channel.send(encode(resp));
     }
 
-    function onPeerJoin(sp: SwarmPeer) {
+    function onPeerJoin(sp: SwarmPeer, swarm: Swarm) {
         const key = peerKeyOf(sp);
         if (activePeers.has(key)) return;
 
         const handle: PeerHandle = { key, channel: sp.channel };
         activePeers.set(key, handle);
+        const serves = () => swarm.wouldServe(sp.keyId);
+        gates.set(key, { serves, gossip: Promise.resolve() });
         if (TRACE_SYNC) trace('sync.peer add', { dag: target.dagId, peer: key });
 
         // Per-peer inbound FIFO: message N fully settles before N+1 starts.
@@ -164,11 +194,14 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[], opts?: Sy
             }
 
             if (msg.type === 'init-request' && msg.objectId === target.dagId) {
-                await handleInitRequest(sp, key);
+                if (await serves()) await handleInitRequest(sp, key);
+                else refuse(key);
                 return;
             }
-            if (REQUEST_TYPES.has(msg.type) || msg.type === 'new-frontier') {
-                provider.handleMessage(msg, sp.channel);
+            if (REQUEST_TYPES.has(msg.type)) {
+                // A peer this host does not serve gets no answer.
+                if (msg.type === 'cancel-request' || await serves()) provider.handleMessage(msg, sp.channel);
+                else refuse(key);
             }
             await synchronizer.handleMessage(msg, sp.channel);
         }
@@ -191,9 +224,9 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[], opts?: Sy
 
     for (const swarm of swarms) {
         for (const existing of swarm.peers()) {
-            onPeerJoin(existing);
+            onPeerJoin(existing, swarm);
         }
-        swarm.onPeerJoin(onPeerJoin);
+        swarm.onPeerJoin((sp) => onPeerJoin(sp, swarm));
         swarm.onPeerLeave(onPeerLeave);
     }
 
@@ -201,6 +234,7 @@ export function createSyncSession(target: SyncTarget, swarms: Swarm[], opts?: Sy
         synchronizer.destroy();
         provider.destroy();
         activePeers.clear();
+        gates.clear();
     }
 
     return {

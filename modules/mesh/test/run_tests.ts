@@ -1630,6 +1630,43 @@ async function testRefusalsNameTheTopic() {
     swarm.destroy();
 }
 
+// Whether a swarm gives entries to a peer is the authorizer's `serves`. A swarm
+// with no authorizer, or one without `serves`, answers `true` at once, with no
+// promise to wait for.
+async function testWouldServeFollowsTheAuthorizer() {
+    const topic = sha256.hashToB64(stringToUint8Array('authz-serve-topic'));
+    const deps = () => ({
+        pool: new ConnectionPool(),
+        discovery: makeStubDiscovery([]),
+        authenticator: makeStubAuthenticator(new Map()),
+        transports: [],
+    });
+    const member = makeFakePeer('mem://member');
+    const stranger = makeFakePeer('mem://stranger');
+
+    const open = createSwarm({ topic, targetPeers: 2 }, deps());
+    testing.assertTrue(open.wouldServe(stranger.keyId) === true, 'no authorizer: served, answered at once');
+
+    const admitOnly = createSwarm({ topic, targetPeers: 2, authorizer: { authorize: async () => false } }, deps());
+    testing.assertTrue(admitOnly.wouldServe(stranger.keyId) === true, 'an authorizer without serves: served, answered at once');
+
+    const asked: string[] = [];
+    const gated = createSwarm({
+        topic, targetPeers: 2,
+        authorizer: {
+            authorize: async () => true,
+            serves: async (keyId) => { asked.push(keyId); return keyId === member.keyId; },
+        },
+    }, deps());
+    testing.assertTrue(await gated.wouldServe(member.keyId), 'serves says yes');
+    testing.assertFalse(await gated.wouldServe(stranger.keyId), 'serves says no, though authorize says yes');
+    testing.assertEquals(asked.join(','), [member.keyId, stranger.keyId].join(','), 'serves is asked each time');
+
+    open.destroy();
+    admitOnly.destroy();
+    gated.destroy();
+}
+
 async function testMaxPeersCapsInbound() {
     const pool = new ConnectionPool();
     const topic = sha256.hashToB64(stringToUint8Array('cap-topic'));
@@ -2454,6 +2491,7 @@ const authZTests = {
         { name: '[AUTH_Z_05] maxPeers defaults above targetPeers', invoke: testMaxPeersDefaultsAboveTarget },
         { name: '[AUTH_Z_06] maxPeers must exceed targetPeers', invoke: testMaxPeersMustExceedTarget },
         { name: '[AUTH_Z_07] refusals name the swarm topic', invoke: testRefusalsNameTheTopic },
+        { name: '[AUTH_Z_08] wouldServe is true without an authorizer or without serves, and follows serves otherwise', invoke: testWouldServeFollowsTheAuthorizer },
     ],
 };
 

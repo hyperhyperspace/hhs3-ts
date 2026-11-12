@@ -6,7 +6,8 @@ The Node platform for [rhost](../rhost): an app folder, with a SQLite replica an
 my-app/
   app.json  catalogs/
   hosts/<name>/
-    host.json          the database, catalog, key, network settings, and any overrides
+    host.json          the database, catalog, key, network settings, any overrides, and listedAt
+                       (written once by a joined host: where it found its key on the allow list)
     rdb/replica.rdb    the replica
     db/data.sqlite     the projection (projection.path; this is rhost init's default)
     files/<mount>/     one folder per projection.files entry, at its path

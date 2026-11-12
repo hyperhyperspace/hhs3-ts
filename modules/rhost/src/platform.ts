@@ -21,6 +21,8 @@ export interface HostStore {
     // the host published under `name`; if `build` throws, nothing is left
     // behind.
     create(name: string, build: (backend: DagBackend) => Promise<HostRecord>): Promise<void>;
+    // Replaces the record of a published host.
+    update(name: string, record: HostRecord): Promise<void>;
     // The replica storage of a published host.
     openReplica(name: string): Promise<DagBackend>;
     remove(name: string): Promise<void>;

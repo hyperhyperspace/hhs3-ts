@@ -322,6 +322,47 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
             }
         },
     },
+    {
+        name: '[RHOST_BROWSER03] update replaces the record in the host\'s row, and never makes a host',
+        invoke: async () => {
+            await resetDatabases();
+            const release = await editor();
+            const { files } = memoryFiles();
+            const platform = browserPlatform({
+                name: 'editor',
+                releases: [release],
+                passphrase: async () => 'pw',
+                locks: createQueueLocks(),
+                files,
+                BroadcastChannel: FakeBroadcastChannel,
+                mesh: { BroadcastChannelCtor: channelCtor },
+            });
+            await (await platform.keyVault()).create('me', 'pw');
+            const app = await Rhost.open(appConfig(), platform);
+            try {
+                await app.create('default', { key: 'me', passphrase: 'prompt', mesh: quietMesh('b03') });
+                const hosts = platform.hosts;
+                const before = await hosts.read('default');
+                assertTrue(before !== undefined && before.listedAt === undefined, 'a new record names no position');
+
+                const listedAt = { group: 'user', frontier: ['H1', 'H2'] };
+                await hosts.update('default', { ...before!, listedAt });
+                const after = await hosts.read('default');
+                assertEquals(JSON.stringify(after?.listedAt), JSON.stringify(listedAt), 'the position reads back');
+                assertEquals(JSON.stringify({ ...after, listedAt: undefined }), JSON.stringify(before), 'the other fields are unchanged');
+                assertEquals((await hosts.list()).join(','), 'default', 'the host is still published');
+
+                await rejects(() => hosts.update('other', { ...before!, listedAt }), "no host 'other'", 'a host that never was');
+                await app.remove('default');
+                await rejects(() => hosts.update('default', { ...before!, listedAt }), "no host 'default'", 'a host that was removed');
+                assertEquals((await hosts.list()).join(','), '', 'no host is made');
+                assertEquals(await hosts.read('default'), undefined, 'and no record');
+            } finally {
+                await app.close();
+                await platform.close();
+            }
+        },
+    },
 ];
 
 async function main() {

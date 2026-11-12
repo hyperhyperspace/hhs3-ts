@@ -14,6 +14,18 @@ divergence), header fetch (learning causal structure), and payload fetch
 simultaneously — every peer serves headers and payloads from its local
 DAG while also fetching entries it does not yet have.
 
+**Withholding.** A peer MAY decline to serve another peer on the topic,
+and MAY change its mind at any time. A peer that is not served receives
+no `new-frontier`, no `init-response`, and no answer to a
+`header-request` or a `payload-request`. The decision is made each time
+the peer is about to send: when a request arrives, before each batch of
+a response, and before each `new-frontier`. A response MAY therefore
+stop part way, with no `header-batch` or `payload-msg` after the last
+one sent. Nothing tells the other peer that it is not served: to it, the
+silence is a request that times out (section 7). A peer that withholds
+still reads the other peer's `new-frontier` messages and may fetch from
+it.
+
 ## 2. Message Encoding
 
 Each message is a JSON object with a `type` field that identifies the
@@ -57,7 +69,8 @@ Direction: any peer → all peers on the topic.
 
 A peer MUST broadcast a `new-frontier` when its DAG grows (new entries
 appended locally or received from sync). A peer MUST send its frontier
-to a newly connected peer.
+to a newly connected peer. Both apply to the peers it serves (section
+1): a peer sends no `new-frontier` to a peer it does not serve.
 
 **Push-back.** When a peer receives a `new-frontier` that differs from
 the local frontier, it SHOULD send its own `new-frontier` back so the
@@ -65,7 +78,8 @@ sender can discover divergence. If the received frontier is identical to
 the local frontier, the peer MUST NOT push back. If the local frontier
 has not changed since the last `new-frontier` sent to that peer (whether
 by push-back or broadcast), the peer SHOULD NOT push back more than once
-per 15 seconds.
+per 15 seconds. A `new-frontier` that was withheld does not count as
+sent.
 
 ### 3.2 Header Fetch
 

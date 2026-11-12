@@ -85,6 +85,26 @@ export async function withParam(): Promise<{ v100: ReleaseFile; v110: ReleaseFil
     }
 }
 
+// 1.0.0, then 1.1.0 which adds a table group, `notes`.
+export async function withGroup(): Promise<{ v100: ReleaseFile; v110: ReleaseFile }> {
+    const runtime = await RdbRuntime.openMemory({ keyVault: new MemoryKeyVault() });
+    try {
+        await runtime.session.createKey('admin', 'pw');
+        runtime.session.selectAuthor('admin');
+        await runtime.execute(await readFile(EDITOR_SQL, 'utf8'));
+        const catalogId = (await runtime.workspace.roots.resolveCatalog(nameRef('editor'))).id;
+        const v100 = await exportVersion(runtime, catalogId, '1.0.0');
+        await runtime.execute(`ALTER CATALOG editor VERSION '1.1.0' AS (
+            ADD TABLEGROUP notes USING SCHEMA hhs:doc AT LATEST
+              BIND user => user
+              USING IDENTITIES user.identities
+        ) NOTE 'notes' BY $admin;`);
+        return { v100, v110: await exportVersion(runtime, catalogId, '1.1.0') };
+    } finally {
+        await runtime.close();
+    }
+}
+
 // 1.0.0, then 1.1.0 which adds FILES media, writable by managers.
 export async function withFiles(): Promise<{ v100: ReleaseFile; v110: ReleaseFile }> {
     const runtime = await RdbRuntime.openMemory({ keyVault: new MemoryKeyVault() });
@@ -229,6 +249,11 @@ class MemHosts implements HostStore {
         const record = await build(backend);
         this.backends.set(name, backend);
         this.records.set(name, record);
+    }
+
+    async update(name: string, record: HostRecord): Promise<void> {
+        if (!this.records.has(name)) throw new Error(`no host '${name}'`);
+        this.records.set(name, JSON.parse(JSON.stringify(record)) as HostRecord);
     }
 
     async openReplica(name: string): Promise<DagBackend> {

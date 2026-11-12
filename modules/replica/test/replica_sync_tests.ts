@@ -19,6 +19,7 @@ function createStubSwarm(): any {
         onPeerLeave(_cb: any) {},
         blockPeer() {},
         wouldAccept() { return Promise.resolve(false); },
+        wouldServe() { return true as const; },
         adopt() { return false; },
     };
 }

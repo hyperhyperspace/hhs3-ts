@@ -438,7 +438,9 @@ function formatStatus(status: HostStatus, pid: number | undefined): string[] {
         if (hint !== undefined) lines.push(`          ${hint}`);
     }
     lines.push(`running   ${pid !== undefined ? `pid ${pid}` : 'stopped'}`);
-    if (status.peers !== undefined) lines.push(`peers     ${status.peers}`);
+    if (status.peers !== undefined) {
+        lines.push(`peers     ${status.peers}${status.bootstrapping === true ? ' (bootstrapping: this host is not on its allow list yet)' : ''}`);
+    }
     for (const mount of status.files ?? []) lines.push(`files     ${formatFilesMount(mount)}`);
     if (status.lastError !== undefined) lines.push(`error     ${status.lastError}`);
     return lines;

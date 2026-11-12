@@ -74,6 +74,9 @@ export interface DagSynchronizer {
     addPeer(peer: PeerHandle): void;
     removePeer(peerKey: string): void;
     broadcastFrontier(): Promise<void>;
+    // A frontier handed to the send path for this peer was not delivered:
+    // forget it, so the peer's next announcement gets an answer.
+    forgetSentFrontier(peerKey: string): void;
     destroy(): void;
     getDiagnostics(): { pendingHeaderRequests: number; pendingPayloadRequests: number };
 }
@@ -1521,5 +1524,9 @@ export function createDagSynchronizer(
         };
     }
 
-    return { handleMessage, addPeer, removePeer, broadcastFrontier, destroy, getDiagnostics };
+    function forgetSentFrontier(peerKey: string) {
+        lastSentFrontier.delete(peerKey);
+    }
+
+    return { handleMessage, addPeer, removePeer, broadcastFrontier, forgetSentFrontier, destroy, getDiagnostics };
 }

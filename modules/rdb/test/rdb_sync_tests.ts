@@ -28,6 +28,7 @@ type StubSwarm = {
     onPeerLeave(cb: unknown): void;
     blockPeer(): void;
     wouldAccept(): Promise<boolean>;
+    wouldServe(): true;
     adopt(): boolean;
     mode: string;
 };
@@ -53,6 +54,7 @@ function createStubMesh() {
                 onPeerLeave(_cb: unknown) {},
                 blockPeer() {},
                 wouldAccept() { return Promise.resolve(false); },
+                wouldServe() { return true as const; },
                 adopt() { return false; },
             };
             swarms.push(swarm);

@@ -38,7 +38,7 @@ const gaming = await app.join(databaseId, 'gaming', { key: 'me', mesh: { scope: 
 await editor.start();                                 // or app.start() for every host
 
 const [status] = await app.status('default');
-editor.onStatus((s) => { /* deployed, held, members, peers, notDeployed, lastError */ });
+editor.onStatus((s) => { /* deployed, held, members, peers, bootstrapping, notDeployed, lastError */ });
 
 await app.update();                                   // install the shipped releases, deploy when due
 await editor.deploy({ params: { moderator: '$me' } }); // deploy now, whatever autoDeploy says
@@ -71,7 +71,7 @@ const gaming = await app.join(databaseId, 'gaming', { key: 'me', mesh: { scope: 
 await editor.start();                                 // or app.start() for every host
 
 const [status] = await app.status('default');
-editor.onStatus((s) => { /* deployed, held, members, peers, notDeployed, lastError */ });
+editor.onStatus((s) => { /* deployed, held, members, peers, bootstrapping, notDeployed, lastError */ });
 
 await app.update();                                   // install the shipped releases, deploy when due
 await editor.deploy({ params: { moderator: '$me' } }); // deploy now, whatever autoDeploy says
@@ -90,13 +90,13 @@ await app.close();
   - `params` sets every param the release newly declares.
 
   Otherwise the report's `notDeployed` says why, such as `1.1.0 needs a value for :moderator (identity), which params don't set`, and `missingParams` lists the params by name and type. A hold isn't an error: `start()` runs `update()`, and the host still starts and syncs on the release it has.
-- **`status(name?)`** is the database's catalog status plus the shipped release and two flags: `upgradeRequired` (a held release has a higher major than the shipped one) and `hostBehind` (the shipped release is above every deployed one). A host that's behind also gets `notDeployed`, and `missingParams` when params are why. A running host adds its peers and last error.
+- **`status(name?)`** is the database's catalog status plus the shipped release and two flags: `upgradeRequired` (a held release has a higher major than the shipped one) and `hostBehind` (the shipped release is above every deployed one). A host that's behind also gets `notDeployed`, and `missingParams` when params are why. A running host adds its peers and last error, and `bootstrapping` while it is waiting to find its own key on the app's `allow` list (see [Allow lists](#allow-lists)).
 - **`deploy({ release?, params? })`** deploys the shipped release, or the one `release` names (`M.m.p`, `M.m.p-<tag>`, `#<hash>`), whatever `autoDeploy` says. It keeps the authority check, and refuses a release that is deployed already or below a deployed one.
   - `params` gives values for the params the release newly declares, in the same forms as `app.json`. A name the release doesn't declare, or one the database already has, is refused. Nothing is written: the database keeps the values.
   - `paramNeeds({ release?, params? })` lists the params such a deploy would still need.
 - **`project()`** brings the host's projection up to date and stops it again, so the target is current without the host running. A running host already projects, so it does nothing.
 - **`start(name?)` and `stop(name?)`** start and stop hosts one by one; without a name they act on every host.
-  - A started host holds the platform's lock for it, updates, starts sync with its `sync` settings and the authorizer from the app's `allow`, and opens its projection with the host's key as writer.
+  - A started host holds the platform's lock for it, updates, checks the app's `allow` entries, starts sync with its `sync` settings and the authorizer from `allow`, and opens its projection with the host's key as writer.
   - Last, it listens for clients when the platform can (`run/rhost.sock` on Node).
   - Neither `create` nor `join` starts a host.
 - **`remove(name)`** stops the host, closes its replica and deletes it.
@@ -143,7 +143,7 @@ A host's key is unlocked once per app, by key id: relabeling it in the keystore 
 
 - `params`: identity params take `$me` (the host's key) or `$<label>` (a key in the keystore); value params take a JSON literal of the declared type. Every name must be a param of the shipped release.
 - `autoDeploy` is `minor` (the default: patch and minor bumps), `major`, or `none`.
-- `allow` is which peers every host accepts. Each entry is `everyone` or `group.table.column [where <condition>]`, and `start` checks the columns against the deployed catalog. Without `allow`, every peer is accepted.
+- `allow` is which peers every host syncs with (see [Allow lists](#allow-lists)). Each entry is `everyone` or `group.table.column [where <condition>]`. Without `allow`, every peer is accepted.
 - `projection.path` is a relative path in the host folder, without `..`; `rhost init` writes `db/data.sqlite`. On Node, missing parent folders are created when the projection opens. `projection.indexes` and `projection.indexPub` are the projection index spec, in rdb names, shared by every host. Omitting both leaves an already installed spec alone. An explicit `"indexes": []` installs that empty spec.
 - `projection.files` mounts FILES members as folders (see [File mounts](#file-mounts)). Names are identifiers, unique in the list; paths follow the same rules as `projection.path`, and are unique, not inside one another, and not the projection's own path. `files/<name>` keeps them together.
 - No path may be or lie inside `host.json`, `rdb` or `run`, which rhost keeps for the host record, the replica, and the running process's lock, socket and log.
@@ -156,6 +156,7 @@ Each host's `host.json` is written by `create` or `join`:
   "database": "z7xH...",
   "catalog": "editor",
   "created": true,
+  "listedAt": { "group": "user", "frontier": ["Qm9i..."] },
   "key": { "label": "me", "keyId": "...", "publicKey": "...", "passphrase": "prompt" },
   "mesh": {
     "scope": "internet",
@@ -167,10 +168,70 @@ Each host's `host.json` is written by `create` or `join`:
 
 - `mesh` is a [MeshConfig](../mesh). `scope` is `internet` or `localhost`. `transports.ws.listen` is a dialable `ws://` URL (not `0.0.0.0`). `transports.webrtc` listens through a `wss://` signaling server. `discovery` is a list of `tracker`, `folder`, and `broadcast-channel` sources. A host value replaces the same key from `app.json`: `scope`, each transport, and the whole `discovery` array. On `internet`, an omitted WebRTC section listens at `wss://signal.mypeer.net:4612`, and an omitted tracker is `wss://tracker.mypeer.net:4610`. On `localhost`, an omitted WebSocket section listens at `ws://127.0.0.1` on a free port. `false` turns that transport off.
 - A host may override `params`, `autoDeploy`, `projection`, and `mesh`. It can't set `releases`, `keystore`, or `allow`.
+- `listedAt` is written by a joined host, once, when it first finds its own key on the `allow` list: the group that listed it and that group's frontier then. It is absent on a host that created its database, and under an app with no `allow` list. Don't write it by hand; removing it makes the host bootstrap again at its next start.
 
 Both files are strict: every object in them, nested ones included, refuses a field it doesn't know and names it, and a missing required field is reported as missing. `parseAppConfig`, `parseHostRecord` and `effectiveConfig` do the checking and merging.
 
 For each catalog, the newest release file ships. Two files with the same version for one catalog are an error.
+
+## Allow lists
+
+The app's `allow` list says which peers its hosts sync with. Each entry is `everyone`, or a column of the database that holds keys: `group.table.column [where <condition>]`. A key is *listed* when it appears in one of those columns.
+
+Every host reads the list from its own replica. The list is data like any other, so it arrives by sync, and two hosts can hold different copies of it for a while. That is why a host answers two questions about a peer separately.
+
+### Serve: whom a host gives entries to
+
+A host gives entries only to a listed peer.
+
+- **It checks each time it is about to send:** when a request arrives, before each batch of a longer answer, and before it announces its frontier. A member that is removed while its host is connected stops receiving at the next batch.
+- **A peer that is not served is told nothing.** Its requests go unanswered and it hears no announcements. That includes the entry that removed it, so a removed member cannot tell removal from a quiet network.
+- **The host still listens to that peer** and takes entries from it. Every entry is checked against the database's rules when it arrives, whoever delivers it.
+
+### Admit: whom a host takes into its swarms
+
+A host admits a peer when the peer is listed. There is one exception.
+
+### Bootstrapping
+
+A host that has just joined cannot use its list. The tables the list reads don't exist until sync creates them, and then they hold only the rows the catalog seeds, which name the database's admin. Going by that list, the host would refuse the members that can bring it up to date.
+
+So a host that joined *bootstraps*: it admits any peer, and takes entries from it, until the first time it finds its own key on its list.
+
+- **It still serves only listed peers.** A stranger it admits gets nothing from it. The stranger does take one of a swarm's places while it stays.
+- **It ends once.** The host writes `listedAt` into its `host.json`: the group whose column listed it, and that group's frontier at that moment. From then on it goes by its list, also if it is later removed or its list comes to match nobody.
+- **Peers admitted meanwhile stay** until they disconnect.
+- **A host that created its database never bootstraps.**
+
+At each start, a joined host is bootstrapping unless `host.json` has `listedAt` and the replica holds those entries.
+
+| What happens | Result |
+| :--- | :--- |
+| A start finds no peer | Nothing is written. The host is bootstrapping at its next start. |
+| `listedAt` cannot be written | It becomes the host's last error. The host goes by its list for that run, and the next start writes it. |
+| The replica is put back from a copy older than `listedAt` | The host bootstraps again. |
+| The host was never added, or an entry misspells a column | The host keeps bootstrapping: it admits any peer and serves none. |
+
+`status().bootstrapping` is `true` while a running host bootstraps, and `onStatus` listeners are told when it ends. An app can show a host that is waiting to be let in.
+
+### Adding and removing members
+
+- **Adding.** A member that the database's rules allow writes the newcomer's key into the list, and the newcomer gets the database id. Any member that has received that write serves the newcomer; the one who wrote it need not be online. Until some online member has it, nobody does.
+- **Removing.** Each host stops serving the removed key as soon as it holds the removal.
+- **Adding again.** Nothing is reset. The host's list still names the members it knew, and they accept it again. It needs a restart, since a swarm looks for peers only when it starts or when a peer leaves.
+
+### The check at start
+
+`start` checks every `allow` entry before sync starts:
+
+1. The group must be a group of the database as this replica has it, or of the release the app ships. A misspelled group fails the start. The shipped release is there for a group added after the database was created: a new host has only the groups the database was created with until sync brings the upgrade.
+2. If the group is on the replica, the query runs once, so a misspelled table or column fails the start. If it is not there yet, as on a joined host's first start, the entry is skipped and checked at the next start.
+
+### Limits
+
+- **A member whose list is out of date** refuses members added while it was away. It catches up when a peer both know is online.
+- **A second device with a key the catalog seeds**, such as the admin's, finds that key on its list as soon as its groups exist. It stops bootstrapping before it has received anything, then admits only the keys its seed rows name, and so receives nothing from the other members.
+- **A host that is removed and later added again** needs a restart, as above.
 
 ## File mounts
 
@@ -207,7 +268,7 @@ interface HostPlatform {
     readonly keystoreLocation?: string;          // named in errors about missing keys
     passphrase(key: HostKeyConfig): Promise<string>;
     readReleases(folder: string): Promise<ReleaseFile[]>;
-    hosts: HostStore;   // list, read, create(name, build), openReplica(name), remove
+    hosts: HostStore;   // list, read, create(name, build), update(name, record), openReplica(name), remove
     meshFactory: SyncMeshFactory;
     projectionTarget(host: string, config: ProjectionConfig): Promise<BidirectionalTarget>;
     filesDirectory(host: string, mount: FilesMountConfig): Promise<FileDirectory>;
@@ -216,7 +277,7 @@ interface HostPlatform {
 }
 ```
 
-`hosts.create(name, build)` hands `build` a fresh replica backend and publishes the host only once `build` returns its record, so a failed create or join leaves nothing behind.
+`hosts.create(name, build)` hands `build` a fresh replica backend and publishes the host only once `build` returns its record, so a failed create or join leaves nothing behind. `hosts.update(name, record)` replaces the record of a published host. It throws when the host is not there, and never makes one.
 
 ## Services
 
@@ -234,6 +295,6 @@ The REPL's `\sync` and `\project` use the same services as rhost:
 npm test
 ```
 
-The tests run on the catalog in [`examples/editor.sql`](../rdb/examples/editor.sql), released at 1.0.0, 1.1.0 and 2.0.0, over a memory platform and a shared in-memory mesh. A 1.1.0 that declares `:moderator` drives the param hold, and one that adds `FILES media` drives the two-host mount test, on `MemoryDirectory` folders.
+The tests run on the catalog in [`examples/editor.sql`](../rdb/examples/editor.sql), released at 1.0.0, 1.1.0 and 2.0.0, over a memory platform and a shared in-memory mesh. A 1.1.0 that declares `:moderator` drives the param hold, one that adds `FILES media` drives the two-host mount test, on `MemoryDirectory` folders, and one that adds a group drives the allow-list test for a group added after the database was created.
 
-**HIPs:** [2](../../hips/0002-rpack-rhost.md), [5](../../hips/0005-reactive-queries.md)
+**HIPs:** [2](../../hips/0002-rpack-rhost.md), [5](../../hips/0005-reactive-queries.md), [23](../../hips/0023-join-bootstrap.md)

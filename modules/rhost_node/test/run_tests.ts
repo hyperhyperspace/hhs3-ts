@@ -335,6 +335,40 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
             });
         },
     },
+    {
+        name: '[RHOST_NODE07] update rewrites host.json in place, and never makes a host',
+        invoke: async () => {
+            const { v100 } = await editorReleases();
+            await withDir('rh-update-', async (dir) => {
+                const appDir = await newApp(dir, [v100]);
+                const app = await openApp(appDir, appOptions(dir));
+                try {
+                    await app.create(undefined, hostSetup());
+                    const hosts = app.platform.hosts;
+                    const folder = join(appDir, 'hosts', 'default');
+                    const before = await hosts.read('default');
+                    assertTrue(before !== undefined && before.listedAt === undefined, 'a new record names no position');
+
+                    const listedAt = { group: 'user', frontier: ['H1', 'H2'] };
+                    await hosts.update('default', { ...before!, listedAt });
+                    const after = await hosts.read('default');
+                    assertEquals(JSON.stringify(after?.listedAt), JSON.stringify(listedAt), 'the position reads back');
+                    assertEquals(JSON.stringify({ ...after, listedAt: undefined }), JSON.stringify(before), 'the other fields are unchanged');
+                    const onDisk = JSON.parse(await fs.readFile(join(folder, 'host.json'), 'utf8')) as { listedAt?: unknown };
+                    assertEquals(JSON.stringify(onDisk.listedAt), JSON.stringify(listedAt), 'it is in host.json');
+                    assertTrue((await fs.readdir(folder)).every((name) => !name.includes('pending')), 'no temporary file is left');
+
+                    await app.remove('default');
+                    const refused = await refusal(() => hosts.update('default', { ...before!, listedAt }));
+                    assertTrue(refused.includes("no host 'default'"), `a host that was removed is not updated (${refused})`);
+                    assertTrue(!existsSync(folder), 'and its folder is not made again');
+                    assertEquals((await hosts.list()).length, 0, 'no host is left');
+                } finally {
+                    await app.close();
+                }
+            });
+        },
+    },
 ];
 
 async function main() {

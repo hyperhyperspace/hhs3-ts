@@ -13,6 +13,8 @@ Every peer in a sync session runs **both** sides of the protocol simultaneously:
 
 This means there is no client/server distinction. When two peers connect on a topic, each one advertises its frontier and each one can serve the other's requests.
 
+A session serves only the peers its swarm serves. Each time it is about to send a peer something (an answer to a request, each batch of that answer, a frontier), it asks the peer's swarm with `swarm.wouldServe(keyId)`. A peer that is not served is sent nothing and is still listened to. A swarm whose authorizer has no `serves` answers yes for every peer, so nothing changes for it. See the mesh's `PeerAuthorizer` and section 1 of [SPECS.md](SPECS.md).
+
 ## Architecture
 
 ```
@@ -81,7 +83,7 @@ session.destroy();
 | Export | Description |
 |--------|-------------|
 | `createSyncSession` | Creates a session that syncs a single DAG across swarms |
-| `createDagProvider` | Lower-level: serves headers/payloads for a DAG |
+| `createDagProvider` | Lower-level: serves headers/payloads for a DAG. Its optional second argument is asked before every batch whether a peer may be sent data |
 | `createDagSynchronizer` | Lower-level: fetches and applies remote entries |
 | `encode` / `decode` | Codec for sync protocol messages |
 | `SyncMsg` | Union type of all protocol message types |

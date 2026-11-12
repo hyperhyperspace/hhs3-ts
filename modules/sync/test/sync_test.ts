@@ -845,6 +845,7 @@ function stubSwarm(peers: SwarmPeer[]): Swarm {
         onPeerLeave() {},
         blockPeer() {},
         wouldAccept() { return Promise.resolve(true); },
+        wouldServe: () => true as const,
         adopt() { return false; },
     };
 }
@@ -865,6 +866,7 @@ function joinableSwarm(): { swarm: Swarm; join(peer: SwarmPeer): void } {
         onPeerLeave() {},
         blockPeer() {},
         wouldAccept() { return Promise.resolve(true); },
+        wouldServe: () => true as const,
         adopt() { return false; },
     };
     return {
@@ -1229,6 +1231,180 @@ async function testAutoPayloadCountMismatch() {
 // captured in `sent`; structured reports in `reports`. Responses are fed by
 // calling sync.handleMessage(msg, channel) directly, so tests control ordering,
 // provenance (which channel delivers), and payload bytes precisely.
+// --- [SYNC_25]: a session gives entries only to the peers its swarm serves ---
+
+// The messages that give a peer something: a frontier, a creation payload,
+// headers or payloads.
+const GIVES = new Set<SyncMsg['type']>([
+    'new-frontier', 'init-response', 'header-response-meta', 'header-batch', 'payload-response-meta', 'payload-msg',
+]);
+
+function wrapLoadEntry(d: dag.Dag, delayMs: number): void {
+    const orig = d.loadEntry.bind(d);
+    d.loadEntry = async (h: B64Hash) => {
+        await wait(delayMs);
+        return orig(h);
+    };
+}
+
+// A dag that starts with a creation payload, followed by a chain of `length` entries.
+async function chainDag(length: number): Promise<{ d: dag.Dag; root: B64Hash; hashes: B64Hash[] }> {
+    const d = createTestDag();
+    const root = await d.append({ action: 'create', type: 'test-object' }, {});
+    const hashes: B64Hash[] = [];
+    let prev = root;
+    for (let i = 0; i < length; i++) {
+        prev = await d.append({ op: i }, {}, new Set([prev]));
+        hashes.push(prev);
+    }
+    return { d, root, hashes };
+}
+
+// A session over a swarm whose serve answer the test sets. The peer is driven
+// by hand: `sent` is what the session sent it. With `answer`, the peer also
+// answers the session's own requests from that dag.
+function gatedSession(dagId: B64Hash, d: dag.Dag, serve: { on: boolean }, answer?: dag.Dag) {
+    const { local, remote } = createChannelPair(`sync25-${dagId}`, 'host', 'peer');
+    const swarmPeer: SwarmPeer = { keyId: 'peer', endpoint: 'mem://peer', channel: local };
+    const swarm: Swarm = { ...stubSwarm([swarmPeer]), wouldServe: async () => serve.on };
+    const sent: SyncMsg[] = [];
+    const peerProvider = answer === undefined ? undefined : createDagProvider(answer);
+    fifoOnMessage(remote, (data) => {
+        const msg = decode(data);
+        sent.push(msg);
+        peerProvider?.handleMessage(msg, remote);
+    });
+    const session = createSyncSession(
+        { dagId, dag: d, rObject: createMockRObject(d, dagId), hashSuite: sha256 },
+        [swarm],
+    );
+    return {
+        sent,
+        count: (type: SyncMsg['type']) => sent.filter((m) => m.type === type).length,
+        given: () => sent.filter((m) => GIVES.has(m.type)).length,
+        say: (msg: SyncMsg) => { remote.send(encode(msg)); },
+        close: () => {
+            session.destroy();
+            peerProvider?.destroy();
+            local.close();
+        },
+    };
+}
+
+async function testServeCheck() {
+    // 1. A peer that is not served is given nothing, and is still listened to.
+    {
+        const { d, root, hashes } = await chainDag(2);
+        const tip = hashes[hashes.length - 1]!;
+        const peer = await chainDag(0);
+        testing.assertEquals(peer.root, root, 'both sides share the creation entry');
+        const x = await peer.d.append({ op: 'X' }, {}, new Set([peer.root]));
+        const serve = { on: false };
+        const s = gatedSession(root, d, serve, peer.d);
+
+        s.say({ type: 'init-request', objectId: root });
+        s.say({ type: 'header-request', requestId: 'h1', dagId: root, start: [tip], limits: [], maxHeaders: 1024, autoPayload: true });
+        s.say({ type: 'payload-request', requestId: 'p1', dagId: root, hashes: [tip] });
+        await wait(250);
+        testing.assertEquals(s.given(), 0, 'not served: no frontier, and no answer to any request');
+
+        s.say({ type: 'new-frontier', dagId: root, frontier: [x] });
+        await waitUntil(async () => (await d.loadEntry(x)) !== undefined, 20, 3000);
+        await wait(150);
+        testing.assertEquals(s.given(), 0, 'what the peer serves is applied, and the new frontier is withheld too');
+
+        // 2. It is served once the swarm's answer changes.
+        serve.on = true;
+        s.say({ type: 'init-request', objectId: root });
+        s.say({ type: 'header-request', requestId: 'h2', dagId: root, start: [tip], limits: [], maxHeaders: 1024, autoPayload: false });
+        s.say({ type: 'payload-request', requestId: 'p2', dagId: root, hashes: [tip] });
+        await waitUntil(
+            async () => s.count('init-response') === 1 && s.count('header-batch') === 1 && s.count('payload-msg') === 1,
+            20, 3000,
+        );
+        testing.assertEquals(s.count('new-frontier'), 0, 'nothing is announced until this side has a new entry');
+        await d.append({ op: 'later' }, {}, new Set(await d.getFrontier()));
+        await waitUntil(async () => s.count('new-frontier') === 1, 20, 3000);
+        s.close();
+    }
+
+    // 3. A withheld frontier does not count as sent. Once the peer is served,
+    //    its next announcement is answered, well inside the 15 s in which a
+    //    repeated frontier is held back.
+    {
+        const { d, root, hashes } = await chainDag(1);
+        const serve = { on: false };
+        const s = gatedSession(root, d, serve);
+
+        s.say({ type: 'new-frontier', dagId: root, frontier: [root] });
+        await wait(200);
+        testing.assertEquals(s.given(), 0, 'the answer to the announcement is withheld');
+
+        serve.on = true;
+        s.say({ type: 'new-frontier', dagId: root, frontier: [root] });
+        await waitUntil(async () => s.count('new-frontier') === 1, 20, 3000);
+        const answer = s.sent.find((m) => m.type === 'new-frontier') as NewFrontierMsg;
+        testing.assertEquals(answer.frontier.join(','), hashes[0], 'the peer gets this side\'s frontier');
+        s.close();
+    }
+
+    // 4. A no part way through an answer stops it: no further batch, no
+    //    payloads after the headers, and nothing for a request that was
+    //    waiting behind it.
+    {
+        const { d, root, hashes } = await chainDag(300);
+        const tip = hashes[hashes.length - 1]!;
+        const serve = { on: true };
+        const s = gatedSession(root, d, serve);
+
+        s.say({ type: 'header-request', requestId: 'h1', dagId: root, start: [tip], limits: [], maxHeaders: 1024, autoPayload: true });
+        await waitUntil(async () => s.count('header-batch') === 1, 5, 3000);
+        s.say({ type: 'payload-request', requestId: 'p1', dagId: root, hashes: [tip] });
+        await wait(30);
+        serve.on = false;
+        await wait(500);
+        testing.assertEquals(s.count('header-batch'), 1, 'no batch after the no: one of the three went out');
+        testing.assertEquals(s.count('payload-msg'), 0, 'no payloads after the headers, and none for the request that waited');
+        s.close();
+    }
+
+    // 5. An answer that starts later is asked about before its first batch:
+    //    the payloads that follow a header answer, and a request that waited
+    //    its turn. The provider here says yes to the first question only.
+    {
+        const { d, root, hashes } = await chainDag(3);
+        const tip = hashes[hashes.length - 1]!;
+        const { local, remote } = createChannelPair('sync25-provider', 'host', 'peer');
+        const got: SyncMsg[] = [];
+        fifoOnMessage(remote, (data) => { got.push(decode(data)); });
+        const count = (type: SyncMsg['type']) => got.filter((m) => m.type === type).length;
+
+        let asked = 0;
+        const afterHeaders = createDagProvider(d, async () => ++asked === 1);
+        afterHeaders.handleMessage(
+            { type: 'header-request', requestId: 'h1', dagId: root, start: [tip], limits: [], maxHeaders: 1024, autoPayload: true },
+            local,
+        );
+        await wait(250);
+        testing.assertEquals(count('header-batch'), 1, 'the header answer goes out on the yes');
+        testing.assertEquals(count('payload-msg'), 0, 'its payloads start as an answer of their own, and get the no');
+        testing.assertEquals(asked, 2, 'the provider asked once for each');
+        afterHeaders.destroy();
+
+        got.length = 0;
+        asked = 0;
+        wrapLoadEntry(d, 30);
+        const queued = createDagProvider(d, async () => ++asked === 1);
+        queued.handleMessage({ type: 'payload-request', requestId: 'p1', dagId: root, hashes: hashes.slice(0, 2) }, local);
+        queued.handleMessage({ type: 'payload-request', requestId: 'p2', dagId: root, hashes: [tip] }, local);
+        await wait(400);
+        const payloads = got.filter((m): m is PayloadMsg => m.type === 'payload-msg');
+        testing.assertEquals(payloads.map((m) => m.requestId).join(','), 'p1,p1', 'the first request is answered, the one that waited is not');
+        queued.destroy();
+        local.close();
+    }
+}
+
 function manualDriver(dagId: B64Hash, dagA: dag.Dag, rObjectA: RObject, opts?: { rejectedCap?: number }) {
     const topic = 'drv';
     const chB = new MockChannel(topic, 'peerB', 'mem://peerB');
@@ -1546,5 +1722,6 @@ export const syncSuite = {
         { name: '[SYNC_22] Codec rejects a message that is not a Literal', invoke: testCodecRejectsNonLiterals },
         { name: '[SYNC_23] fetchInit ignores a create payload with an ill-formed string', invoke: testFetchInitIgnoresIllFormedCreatePayload },
         { name: '[SYNC_24] Codec rejects a payload nested deeper than 128 levels', invoke: testCodecRejectsDeepNesting },
+        { name: '[SYNC_25] A session gives entries only to the peers its swarm serves', invoke: testServeCheck },
     ],
 };

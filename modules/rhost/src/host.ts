@@ -5,7 +5,7 @@
 
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import { parseMeshConfig, type IssueReporter } from "@hyper-hyper-space/hhs3_mesh";
-import { deserializePublicKeyFromBase64, serializePublicKeyToBase64, type Version } from "@hyper-hyper-space/hhs3_mvt";
+import { deserializePublicKeyFromBase64, serializePublicKeyToBase64, type ScopedDag, type Version } from "@hyper-hyper-space/hhs3_mvt";
 import {
     CatalogUpdateError, RDbImpl, catalogStatus, compareSemver, deployCatalogRelease,
     type CatalogParamDecl, type ParamValue, type RCatalogImpl,
@@ -27,7 +27,7 @@ import { adoptionRangeFor, majorOf, shippedReleases } from "./releases.js";
 import { serveClient } from "./serve.js";
 import {
     allowIsEveryone, columnLookup, createAllowAuthorizer, fetchDatabase, startDatabaseSync, validateAllowSources,
-    type DatabaseSync,
+    type AllowBootstrap, type AllowFrontier, type DatabaseSync, type ListedAt,
 } from "./sync.js";
 
 export type { HostStatus };
@@ -450,7 +450,7 @@ type DeployHold = { reason: string; missingParams?: ClientParam[] };
 export class Host {
     readonly app: Rhost;
     readonly name: string;
-    readonly record: HostRecord;
+    private current: HostRecord;
     readonly runtime: RdbRuntime;
     readonly db: RDbImpl;
     readonly config: EffectiveConfig;
@@ -461,18 +461,33 @@ export class Host {
     private readonly onDbChange = (_version: Version): void => { this.notify(); };
     private closed = false;
     private inProcess: RhostClient | undefined;
+    // Bootstrapping: this host joined its database and has not found its own
+    // key on its allow list yet. `bootstrapRun` is the start whose finding of
+    // the key may still write the record; a stop clears it.
+    private pendingBootstrap = false;
+    private bootstrapRun: object | undefined;
+    private listedAtError: string | undefined;
 
     constructor(app: Rhost, name: string, record: HostRecord, runtime: RdbRuntime, db: RDbImpl) {
         this.app = app;
         this.name = name;
-        this.record = record;
+        this.current = record;
         this.runtime = runtime;
         this.db = db;
         this.config = effectiveConfig(app.config, record);
     }
 
+    get record(): HostRecord {
+        return this.current;
+    }
+
     get running(): boolean {
         return this.services !== undefined;
+    }
+
+    // True while this host runs and is bootstrapping.
+    get bootstrapping(): boolean {
+        return this.services !== undefined && this.pendingBootstrap;
     }
 
     get lastError(): string | undefined {
@@ -729,6 +744,7 @@ export class Host {
         if (file !== undefined) status.shipped = shippedInfo(file);
         if (cs.unresolved !== undefined) status.unresolved = cs.unresolved;
         if (this.services?.sync !== undefined) status.peers = this.services.sync.peerCount();
+        if (this.bootstrapping) status.bootstrapping = true;
         const files = this.services?.projection?.filesStatus() ?? [];
         if (files.length > 0) status.files = files;
         if (this.lastErrorMessage !== undefined) status.lastError = this.lastErrorMessage;
@@ -840,7 +856,39 @@ export class Host {
             await this.update();
 
             const lookup = columnLookup(this.runtime.session);
-            if (!allowIsEveryone(this.config.allow)) await validateAllowSources(this.config.allow, lookup);
+            const frontier: AllowFrontier = async (source) => {
+                const dag = await this.allowGroupDag(source.group);
+                return dag === undefined ? undefined : [...await dag.getFrontier()].sort();
+            };
+            const gated = !allowIsEveryone(this.config.allow);
+            if (gated) await validateAllowSources(this.config.allow, lookup, frontier);
+            // A host that joined bootstraps until it first finds its own key on
+            // its list. The record says where that was; a replica that doesn't
+            // hold those entries is behind the record, and bootstraps again.
+            let bootstrap: AllowBootstrap | undefined;
+            this.listedAtError = undefined;
+            this.pendingBootstrap = gated && !this.record.created && !(await this.holdsListedAt());
+            if (this.pendingBootstrap) {
+                const run = {};
+                this.bootstrapRun = run;
+                bootstrap = {
+                    self: identity.keyId,
+                    found: async (at) => {
+                        // A host that stopped or was removed meanwhile writes nothing.
+                        if (this.bootstrapRun !== run) return;
+                        this.pendingBootstrap = false;
+                        await this.recordListedAt(at);
+                        this.notify();
+                    },
+                };
+            }
+            const authorizer = createAllowAuthorizer(this.config.allow, lookup, {
+                frontier,
+                ...(bootstrap !== undefined ? { bootstrap } : {}),
+            });
+            // Reads the list once: a host that already holds its admission is
+            // done before it admits anyone.
+            if (bootstrap !== undefined) await authorizer?.serves?.(identity.keyId);
             const built = await this.app.platform.meshFactory(this.config.mesh, {
                 identity,
                 ...(this.app.report !== undefined ? { report: this.app.report } : {}),
@@ -850,7 +898,7 @@ export class Host {
                 db: this.db,
                 built,
                 meshLabel: `rhost-${this.name}`,
-                authorizer: createAllowAuthorizer(this.config.allow, lookup),
+                ...(authorizer !== undefined ? { authorizer } : {}),
                 ...(this.app.report !== undefined ? { report: this.app.report } : {}),
             });
 
@@ -872,13 +920,81 @@ export class Host {
             if (this.app.platform.listen !== undefined) {
                 services.closeListener = await this.app.platform.listen(this.name, (connection) => serveClient(this, connection));
             }
-            this.lastErrorMessage = undefined;
+            // A record that could not be written while starting stays reported.
+            this.lastErrorMessage = this.listedAtError;
             this.notify();
         } catch (err) {
             this.services = undefined;
+            this.bootstrapRun = undefined;
+            this.pendingBootstrap = false;
             await stopServices(services);
             this.fail(err);
             throw err;
+        }
+    }
+
+    // The DAG of a group an allow entry reads, by name. `undefined` while the
+    // group is not on this replica: sync has not created it yet, or it belongs
+    // to the shipped release and this replica has not received its deploy.
+    // Throws when neither the database nor the shipped release has the group.
+    private async allowGroupDag(name: string): Promise<ScopedDag | undefined> {
+        const id = (await this.db.getMemberGroupNames()).get(name);
+        if (id === undefined) {
+            if (!(await this.shippedGroupNames()).has(name)) throw new Error(`Unknown group '${name}'`);
+            return undefined;
+        }
+        const group = await this.runtime.workspace.replica.getObject(id);
+        return group === undefined ? undefined : group.getScopedDag();
+    }
+
+    // The groups of the release this app ships, from the installed catalog.
+    // A database created at an earlier release names only that release's
+    // groups until sync brings the upgrade.
+    private async shippedGroupNames(): Promise<Set<string>> {
+        const file = this.shipped();
+        if (file === undefined) return new Set();
+        try {
+            const catalog = await this.runtime.workspace.replica.getObject(file.manifest.catalog);
+            if (catalog === undefined) return new Set();
+            const state = (await (catalog as unknown as RCatalogImpl).getIndex()).releaseState(file.manifest.release);
+            return new Set([...state.defs.values()].map((def) => def.name));
+        } catch {
+            return new Set();
+        }
+    }
+
+    // Whether the replica holds the position the record names: the entries at
+    // which this host first found its own key on its allow list.
+    private async holdsListedAt(): Promise<boolean> {
+        const listedAt = this.record.listedAt;
+        if (listedAt === undefined) return false;
+        let dag: ScopedDag | undefined;
+        try {
+            dag = await this.allowGroupDag(listedAt.group);
+        } catch {
+            return false;
+        }
+        if (dag === undefined) return false;
+        for (const hash of listedAt.frontier) {
+            if (await dag.loadEntry(hash) === undefined) return false;
+        }
+        return true;
+    }
+
+    // Writes the position into the stored record. On a failure the host goes
+    // by its list for this run all the same, and the next start finds the key
+    // again and writes it then.
+    private async recordListedAt(listedAt: ListedAt): Promise<void> {
+        try {
+            const stored = await this.app.platform.hosts.read(this.name);
+            if (stored === undefined) return;       // the host was removed meanwhile
+            const next: HostRecord = { ...stored, listedAt };
+            await this.app.platform.hosts.update(this.name, next);
+            this.current = next;
+            this.listedAtError = undefined;
+        } catch (err) {
+            this.listedAtError = `could not record that this host is on its allow list: ${errorMessage(err)}`;
+            this.fail(this.listedAtError);
         }
     }
 
@@ -887,6 +1003,8 @@ export class Host {
             try { await this.starting; } catch { /* a failed start left nothing running */ }
         }
         const services = this.services;
+        this.bootstrapRun = undefined;
+        this.pendingBootstrap = false;
         if (services === undefined) return;
         this.services = undefined;
         await stopServices(services);
