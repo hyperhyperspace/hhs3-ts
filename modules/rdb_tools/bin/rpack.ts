@@ -5,12 +5,12 @@
 //     init [--schema] <name> [--key <label>]
 //     new <version> [--base <release> [+ <release>]...]
 //     set base <release> [+ <release>]... [--force]
-//     import <schema> [<version>] [--registry <dir>]
+//     import <schema> [<version>] [--registry <dir>] [--force]
 //     status
 //     build
 //     stage [--passphrase-stdin]
 //     release [--passphrase-stdin] [--force] [--yes]
-//     publish [<version>] [--registry <dir>]
+//     publish [<version>] [--registry <dir>] [--force]
 //     log
 //     verify <file>
 //     export <store.db> <catalog> [<version>] [--out <dir>]
@@ -48,12 +48,12 @@ const USAGE = [
     '  init [--schema] <name> [--key <label>]',
     '  new <version> [--base <release> [+ <release>]...]',
     '  set base <release> [+ <release>]... [--force]',
-    '  import <schema> [<version>] [--registry <dir>]',
+    '  import <schema> [<version>] [--registry <dir>] [--force]',
     '  status',
     '  build',
     '  stage [--passphrase-stdin]',
     '  release [--passphrase-stdin] [--force] [--yes]',
-    '  publish [<version>] [--registry <dir>]',
+    '  publish [<version>] [--registry <dir>] [--force]',
     '  log',
     '  verify <file>',
     '  export <store.db> <catalog> [<version>] [--out <dir>]',
@@ -281,19 +281,19 @@ async function stageCommand(global: Global, args: string[]): Promise<number> {
 }
 
 async function publishCommand(global: Global, args: string[]): Promise<number> {
-    const parsed = parseArgs(args, ['--registry'], []);
+    const parsed = parseArgs(args, ['--registry'], ['--force']);
     const [selector, ...rest] = parsed.positional;
     noArguments(rest);
     const { root } = await repository(global);
     const project = new NodeProject(root);
     const config = await readRepoConfig(project);
     const regDir = resolveRegistryDir(root, config, single(parsed, '--registry'));
-    print(await publishRelease(project, new NodeProject(regDir), selector));
+    print(await publishRelease(project, new NodeProject(regDir), selector, { force: parsed.switches.has('--force') }));
     return 0;
 }
 
 async function importCommand(global: Global, args: string[]): Promise<number> {
-    const parsed = parseArgs(args, ['--registry'], []);
+    const parsed = parseArgs(args, ['--registry'], ['--force']);
     const [schemaName, versionSelector, ...rest] = parsed.positional;
     if (schemaName === undefined) throw new UsageError('Import needs a schema name');
     noArguments(rest);
@@ -301,7 +301,7 @@ async function importCommand(global: Global, args: string[]): Promise<number> {
     const located = await repository(global);
     const config = await readRepoConfig(project);
     const regDir = resolveRegistryDir(located.root, config, single(parsed, '--registry'));
-    const res = await importSchema(project, new NodeProject(regDir), folder, schemaName, versionSelector);
+    const res = await importSchema(project, new NodeProject(regDir), folder, schemaName, versionSelector, { force: parsed.switches.has('--force') });
     print(res.lines);
     return 0;
 }

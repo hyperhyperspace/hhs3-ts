@@ -115,6 +115,8 @@ rpack release                    # sign, write releases/ and .released/
 
 A release that turns out wrong before anyone else has it can be signed again. `rpack release --force` in its folder replaces the file with one made from the working files. Dependents — releases built on it — are made again from their own folders, on the new parent. A dependent that does not build stops the whole re-release, and nothing is written. The writes finish by removing the old files last, so an interrupted run leaves extra files and never a missing release.
 
+A catalog release is only known once it is signed, so a re-release asks for the passphrase and then says what changed. When the release comes out the same, nothing is replaced and nothing is asked; the folder just reads as released again.
+
 A file that was already shared stays a valid release. A replica that has it holds it next to the new file of the same version. Re-releasing is for releases nobody has yet. Re-releasing the first release starts a new catalog: replicas of the old one take none of the new releases.
 
 ### Seeing the upgrade against data
@@ -180,7 +182,7 @@ The first time a catalog imports a schema, even at 1.1.0, `rpack` replays the pa
 
 Once a schema is imported in a catalog, it stays imported. Once it is written inline with `CREATE SCHEMA`, it stays inline. The `imports` lock is the record of which is which. Two histories can pass through the same tables and then diverge; comparing the tables cannot tell them apart, and the parent links can.
 
-A schema release that turns out wrong can be made again too. `rpack release --force` in its folder replaces it, and makes the releases built on it again, by the rules a catalog follows. It replaces the files in the schema's own repository and nothing else. A registry that already holds the old file refuses the new one until that file is removed from it. A catalog that imported the old one keeps it until its copy and its lock are removed and it imports again, and a catalog already released on it has to be re-released. `rpack` says so before it asks, and again when it is done.
+A schema release that turns out wrong can be made again too. `rpack release --force` in its folder replaces it, and makes the releases built on it again, by the rules a catalog follows. It replaces the files in the schema's own repository and nothing else. A registry that already holds the old file refuses the new one until `rpack publish --force` replaces it. A catalog that imported the old one keeps it until `rpack import --force` replaces its copy and its lock, and a catalog already released on it has to be re-released. `rpack` says so before it asks, and again when it is done.
 
 `rpack publish` copies a release file into a directory registry. A directory can be copied and read offline, which is the whole distribution mechanism these tools use. The directory is `--registry`, then `$HHS_REGISTRY`, then `registry` in `rpack.json`, then `~/.hhs/registry`. A name with colons becomes directories: `hhs:comments` lives at `hhs/comments/`. Publishing refuses to put a schema and a catalog under the same name, or two catalogs with different ids.
 

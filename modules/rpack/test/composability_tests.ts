@@ -773,21 +773,28 @@ CREATE CATALOG blog CREATORS ($dev) AS (
         },
     },
     {
-        name: '[RPACK30] after a schema re-release: publish and import refuse the new release and name what to remove; with that removed by hand both go through',
+        name: '[RPACK30] after a schema re-release: publish and import refuse and name --force; with it publish replaces the registry\'s files and import the lock and the copy, and the re-released catalog is published over the old one',
         invoke: async () => {
             const dev = await devKeys();
             const unlock = (label: string) => dev.vault.unlock(label, PASSPHRASE);
             const registry = new MemoryProject();
+            const tagOf = (name: string) => name.slice(name.lastIndexOf('-') + 1);
+            const listed = async (project: MemoryProject, dir: string) => (await project.list(dir)).sort().join(',');
+            const files = (...names: string[]) => names.map((n) => `${n}.rpack`).sort().join(',');
 
+            // hhs:comments 1.0.0 and 1.1.0, published
             const schemaProj = new MemoryProject();
             const schemaCtx: RpackContext = { project: schemaProj };
             await initProject(schemaProj, 'hhs:comments', '', { kind: 'schema' });
             await newVersion(schemaCtx, '1.0.0');
             await schemaProj.write(workPath('1.0.0', SCHEMA_SOURCE_FILE), COMMENTS_100);
-            const old = (await releaseVersion(schemaCtx, '1.0.0')).produced.name;
+            const old100 = (await releaseVersion(schemaCtx, '1.0.0')).produced.name;
+            await newVersion(schemaCtx, '1.1.0');
+            await schemaProj.write(workPath('1.1.0', SCHEMA_SOURCE_FILE), COMMENTS_110);
+            const old110 = (await releaseVersion(schemaCtx, '1.1.0')).produced.name;
             await publishRelease(schemaProj, registry);
 
-            // A catalog imports it and is released on it
+            // blog 1.0.0 imports 1.0.0 and blog 1.1.0 imports 1.1.0, both released and published
             const catProj = new MemoryProject();
             const catCtx: RpackContext = { project: catProj, vault: dev.vault };
             await initProject(catProj, 'blog', 'dev');
@@ -807,42 +814,73 @@ CREATE CATALOG blog CREATORS ($dev) AS (
     BIND target => posts (items => articles)
 );
 `);
-            const blog = (await releaseVersion(catCtx, '1.0.0', unlock)).produced.name;
+            const blog100 = (await releaseVersion(catCtx, '1.0.0', unlock)).produced.name;
+            await newVersion(catCtx, '1.1.0');
+            await importSchema(catProj, registry, '1.1.0', 'hhs:comments', '1.1.0');
+            const blog110 = (await releaseVersion(catCtx, '1.1.0', unlock)).produced.name;
+            await publishRelease(catProj, registry);
+            assertEquals(await listed(registry, 'blog'), files(blog100, blog110), 'the registry holds both blog releases');
 
-            // The schema's 1.0.0 is re-released with a column. With nothing built on it, nothing asks
-            await schemaProj.write(workPath('1.0.0', SCHEMA_SOURCE_FILE), COMMENTS_100.replace('len integer READONLY', 'len integer READONLY,\n    lang string NULL'));
-            const redone = await releaseVersion(schemaCtx, '1.0.0', undefined, { force: true });
-            const now = redone.produced.name;
-            assertTrue(redone.lines.join('\n').includes(`Warning: copies of ${old} that were published or imported are not replaced.`),
-                `the result warns about the copies:\n${redone.lines.join('\n')}`);
+            // The schema's 1.0.0 is re-released with a column, and 1.1.0 on it
+            const withLang = (source: string) => source.replace('len integer READONLY', 'len integer READONLY,\n    lang string NULL');
+            await schemaProj.write(workPath('1.0.0', SCHEMA_SOURCE_FILE), withLang(COMMENTS_100));
+            await schemaProj.write(workPath('1.1.0', SCHEMA_SOURCE_FILE), withLang(COMMENTS_110));
+            const redone = await releaseVersion(schemaCtx, '1.0.0', undefined, { force: true, yes: true });
+            const new100 = redone.produced.name;
+            const new110 = redone.rebuilt[0]!.name;
+            const warned = redone.lines.join('\n');
+            assertTrue(warned.includes(`Warning: copies of ${old100} and ${old110} that were published or imported are not replaced.`)
+                && warned.includes('rpack publish --force replaces it there') && warned.includes('rpack import --force replaces its copy and its lock'),
+                `the result warns about the copies and names the commands:\n${warned}`);
 
-            // The registry holds the old 1.0.0
-            const inRegistry = `hhs/comments/${old}.rpack`;
-            await expectThrows(() => publishRelease(schemaProj, registry), `to replace it, remove ${inRegistry} from the registry and publish again`,
-                'publishing over the old release');
-            assertEquals((await registry.list('hhs/comments')).join(','), `${old}.rpack`, 'the registry is as it was');
-            await registry.remove(inRegistry);
-            await publishRelease(schemaProj, registry);
-            assertEquals((await registry.list('hhs/comments')).join(','), `${now}.rpack`, 'with the old file removed, the new one is published');
+            // The registry holds the old ones: publish refuses, naming every file and the flag
+            await expectThrows(() => publishRelease(schemaProj, registry),
+                `'hhs:comments' 1.0.0 and 1.1.0 are already in the registry with a different hash `
+                + `(hhs/comments/${old100}.rpack, hhs/comments/${old110}.rpack): rpack publish --force replaces them`, 'publishing over the old releases');
+            assertEquals(await listed(registry, 'hhs/comments'), files(old100, old110), 'the registry is as it was');
+            const published = (await publishRelease(schemaProj, registry, undefined, { force: true })).join('\n');
+            assertEquals(await listed(registry, 'hhs/comments'), files(new100, new110), '--force replaces both');
+            assertTrue(published.includes(`removed hhs/comments/${old100}.rpack from the registry`) && published.includes(`removed hhs/comments/${old110}.rpack from the registry`),
+                `and says what it removed:\n${published}`);
+            assertTrue(published.includes('A catalog that imported one keeps it until rpack import --force.'), `and who still has them:\n${published}`);
 
-            // The catalog locks the old 1.0.0
+            // The catalog locks the old ones: import refuses, and leaves imports/ as it was
             await expectThrows(() => importSchema(catProj, registry, '1.0.0', 'hhs:comments', '1.0.0'),
-                `remove that entry from "imports" in rpack.json and imports/${old}.rpack, then import again`, 'importing over the lock');
-            assertEquals((await catProj.list('imports')).join(','), `${old}.rpack`, 'a refused import leaves imports/ as it was');
-            const config = JSON.parse(catProj.files.get('rpack.json')!);
-            delete config.imports['hhs:comments']['1.0.0'];
-            await catProj.write('rpack.json', JSON.stringify(config, null, 2));
-            await catProj.remove(`imports/${old}.rpack`);
-            const imported = await importSchema(catProj, registry, '1.0.0', 'hhs:comments', '1.0.0');
-            assertEquals(imported.file.manifest.release, redone.produced.hash, 'with the lock and the copy removed, the new release is imported');
+                `rpack.json already locks hhs:comments 1.0.0 at #${tagOf(old100)}, not #${tagOf(new100)}: rpack import --force replaces the lock and imports/${old100}.rpack`,
+                'importing over the lock');
+            assertEquals(await listed(catProj, 'imports'), files(old100, old110), 'a refused import leaves imports/ as it was');
 
-            // The catalog was released on the old one, and is re-released on the new one
-            const built = await buildVersion(catCtx, '1.0.0');
-            assertEquals(built.draft.refusals.length, 0, `the catalog builds on the new schema:\n${built.lines.join('\n')}`);
-            assertEquals(built.matches, false, 'its update.sql is no longer the released one');
-            const again = await releaseVersion(catCtx, '1.0.0', unlock, { force: true, confirm: async () => true });
-            assertTrue(again.produced.name !== blog, 'the catalog is re-released');
-            assertTrue((await verifyRelease(catProj.files.get(`releases/${again.produced.name}.rpack`)!)).ok, 'and its file verifies');
+            // --force replaces that one version, and warns about the other one, made on the old 1.0.0
+            const imported = await importSchema(catProj, registry, '1.0.0', 'hhs:comments', '1.0.0', { force: true });
+            assertEquals(imported.file.manifest.release, redone.produced.hash, 'the new 1.0.0 is imported');
+            assertEquals(await listed(catProj, 'imports'), files(new100, old110), 'its copy replaces the old one');
+            assertEquals(parseRpackConfig(catProj.files.get('rpack.json')!).imports?.['hhs:comments']?.['1.0.0'], redone.produced.hash, 'and so does its lock');
+            const said = imported.lines.join('\n');
+            assertTrue(said.includes(`replaced the lock at #${tagOf(old100)} and removed imports/${old100}.rpack`), `the import says what it replaced:\n${said}`);
+            assertTrue(said.includes(`Warning: imports/${old110}.rpack was made on another 1.0.0: rpack import --force hhs:comments 1.1.0 takes its new release.`),
+                `and warns about the copy made on the old 1.0.0:\n${said}`);
+            assertTrue(said.includes('Warning: a release of blog made on the old hhs:comments 1.0.0 has to be re-released'), `and about the catalog's releases:\n${said}`);
+
+            // With one lock replaced and the other not, the catalog's re-release is refused whole
+            const mixed = catProj.files.size;
+            await expectThrows(() => releaseVersion(catCtx, '1.0.0', unlock, { force: true, yes: true }), "1.1.0 doesn't build on the new 1.0.0; nothing was written",
+                'a catalog on a mix of the old and the new schema');
+            assertEquals(catProj.files.size, mixed, 'and nothing is written');
+            const second = (await importSchema(catProj, registry, '1.1.0', 'hhs:comments', '1.1.0', { force: true })).lines.join('\n');
+            assertTrue(!second.includes('was made on another'), `with both replaced, no copy is of the old history:\n${second}`);
+            assertEquals(await listed(catProj, 'imports'), files(new100, new110), 'imports/ holds the new releases');
+
+            // The catalog is re-released on the new schema: a new catalog, which the registry refuses beside the old one
+            const again = await releaseVersion(catCtx, '1.0.0', unlock, { force: true, yes: true });
+            const newBlog100 = again.produced.name;
+            const newBlog110 = again.rebuilt[0]!.name;
+            assertTrue(again.produced.catalog !== parseReleaseFile(registry.files.get(`blog/${blog100}.rpack`)!).manifest.catalog, 'the re-released blog is another catalog');
+            const refusal = await expectThrows(() => publishRelease(catProj, registry), "'blog' in the registry is another catalog (#", 'publishing the new catalog beside the old one');
+            assertTrue(refusal.endsWith(`, in blog/${blog100}.rpack, blog/${blog110}.rpack: rpack publish --force replaces them`), `the refusal names its files and the flag: ${refusal}`);
+            const over = (await publishRelease(catProj, registry, undefined, { force: true })).join('\n');
+            assertEquals(await listed(registry, 'blog'), files(newBlog100, newBlog110), '--force replaces the old catalog');
+            assertTrue(over.includes("Hosts of the removed catalog take none of the new one's releases."), `and says what that means for its hosts:\n${over}`);
+            for (const name of [newBlog100, newBlog110]) assertTrue((await verifyRelease(registry.files.get(`blog/${name}.rpack`)!)).ok, `${name} verifies`);
         },
     },
 ];

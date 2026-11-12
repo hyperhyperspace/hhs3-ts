@@ -570,7 +570,7 @@ export const releaseTests = [
         },
     },
     {
-        name: '[RPACK26] a folder released with EXISTS in the grammar before HIP-21: build says its update.sql differs and names --force, and the re-release makes it as released again',
+        name: '[RPACK26] a folder released with EXISTS in the grammar before HIP-21: build says its update.sql differs and names --force, and the re-release, which comes out as the same release, asks nothing and makes it as released again',
         invoke: async () => {
             const dev = await devKeys();
             const project = new MemoryProject();
@@ -600,8 +600,14 @@ export const releaseTests = [
                 `build names the way out:\n${built.lines.join('\n')}`);
             assertEquals((await statusOf(ctx, '1.0.0')).lines[4], `Released as ${r100}; changed since release`, 'status marks the folder');
 
-            const redone = await releaseVersion(ctx, '1.0.0', unlock, { force: true, confirm: async () => true });
+            let asked = false;
+            const redone = await releaseVersion(ctx, '1.0.0', unlock, { force: true, confirm: async () => { asked = true; return true; } });
             const now = redone.produced.name;
+            assertEquals(now, r100, 'signed again, it is the release it was');
+            assertTrue(!asked, 'so nothing is asked, and no new catalog is announced');
+            assertEquals(redone.lines.join('\n'), `${r100} is unchanged: the re-release is the same release. Wrote work/1.0.0/.released/`, 'the result says so');
+            assertEquals((await project.list('releases')).join(','), `${r100}.rpack`, 'releases/ holds that one file');
+            assertEquals(project.files.get(`releases/${r100}.rpack`), releaseFile, 'byte for byte as it was');
             assertEquals(project.files.get(at('1.0.0', '.released/target-catalog.sql')), EDITOR_SOURCE, '.released/ holds the source as it is written now');
             assertTrue(!project.files.get(at('1.0.0', '.released/update.sql'))!.includes('EXISTS caps'), 'and an update.sql in the new form');
             const rebuilt = await buildVersion(ctx, '1.0.0');
@@ -629,6 +635,72 @@ export const releaseTests = [
 
             await expectThrows(async () => checkReleaseFile(fileWith(nested(json.MAX_LITERAL_DEPTH + 1))),
                 'levels of nesting', 'a payload nested one level too deep');
+        },
+    },
+    {
+        name: '[RPACK31] a catalog re-release signs first: one that changes is previewed after the key and a no writes nothing; one that comes out the same is not replaced or asked about, alone or under a changed release built on it',
+        invoke: async () => {
+            const dev = await devKeys();
+            const project = new MemoryProject();
+            const ctx: RpackContext = { project, vault: dev.vault };
+            const order: string[] = [];
+            const unlock = async (label: string) => {
+                order.push('unlocked');
+                return dev.vault.unlock(label, PASSPHRASE);
+            };
+            const releases = async () => (await project.list('releases')).sort().join(',');
+            const unchanged = (name: string, folder: string) => `${name} is unchanged: the re-release is the same release. Wrote work/${folder}/.released/`;
+            // .released/update.sql as an older rpack rendered it: the folder still makes its release, and the text differs
+            const stale = async (folder: string) => {
+                const path = at(folder, '.released/update.sql');
+                await project.write(path, `-- rendered by an older rpack\n${project.files.get(path)!}`);
+            };
+
+            await initProject(project, 'editor', 'dev');
+            await newVersion(ctx, '1.0.0');
+            await project.write(at('1.0.0', 'target-catalog.sql'), EDITOR_SOURCE);
+            const r100 = (await releaseVersion(ctx, '1.0.0', unlock)).produced.name;
+            await newVersion(ctx, '1.1.0');
+            await project.write(at('1.1.0', 'target-catalog.sql'), V110);
+            const r110 = (await releaseVersion(ctx, '1.1.0', unlock)).produced.name;
+
+            // A release that changes: the key first, then the preview; no writes nothing
+            await project.write(at('1.1.0', 'target-catalog.sql'), withTag(V110));
+            const edited = snapshot(project);
+            order.length = 0;
+            await expectThrows(() => releaseVersion(ctx, '1.1.0', unlock, { force: true, confirm: async () => { order.push('asked'); return false; } }), 'aborted', 'no aborts');
+            assertEquals(order.join(','), 'unlocked,asked', 'the preview follows the key');
+            assertEquals(snapshot(project), edited, 'no writes nothing');
+            await project.write(at('1.1.0', 'target-catalog.sql'), V110);
+
+            // Both come out the same: nothing is asked or replaced, and .released/ is written again
+            await stale('1.0.0');
+            assertEquals((await buildVersion(ctx, '1.0.0')).matches, false, 'the stale update.sql reads as a change');
+            const before = await releases();
+            let asked = false;
+            const same = await releaseVersion(ctx, '1.0.0', unlock, { force: true, confirm: async () => { asked = true; return true; } });
+            assertTrue(!asked, 'nothing is asked when no release changes');
+            assertEquals(same.lines.join('\n'), [unchanged(r100, '1.0.0'), unchanged(r110, '1.1.0')].join('\n'), 'the result names both as unchanged');
+            assertEquals(await releases(), before, 'releases/ is as it was');
+            assertEquals((await buildVersion(ctx, '1.0.0')).matches, true, 'and the folder is as released again');
+
+            // 1.0.0 the same and 1.1.0 changed: only 1.1.0 is replaced
+            await stale('1.0.0');
+            await project.write(at('1.1.0', 'target-catalog.sql'), withTag(V110));
+            let preview: ReleasePreview | undefined;
+            const mixed = await releaseVersion(ctx, '1.0.0', unlock, { force: true, confirm: async (p) => { preview = p; return true; } });
+            const text = formatReleasePreview(preview!).join('\n');
+            assertTrue(text.startsWith(`Re-releasing 1.0.0 makes ${r100} again, unchanged.\n`), `the preview says 1.0.0 is unchanged:\n${text}`);
+            assertTrue(!text.includes('starts a new catalog'), `and announces no new catalog:\n${text}`);
+            assertTrue(text.includes(`It re-releases 1 release built on it:\n  1.1.0  replaces ${r110}  (changed since release)`), `it names the one that changes:\n${text}`);
+            assertTrue(text.endsWith(`Copies of ${r110} already shared stay valid releases: a replica that has one would hold it next to the new one.`),
+                `and the copies of that one alone:\n${text}`);
+            assertEquals(mixed.produced.name, r100, '1.0.0 is the release it was');
+            const n110 = mixed.rebuilt[0]!.name;
+            assertTrue(n110 !== r110, '1.1.0 is a new release');
+            assertEquals(await releases(), [`${r100}.rpack`, `${n110}.rpack`].sort().join(','), 'only the old 1.1.0 is removed');
+            assertEquals(mixed.lines[0], unchanged(r100, '1.0.0'), 'the result says 1.0.0 is unchanged');
+            assertEquals(mixed.lines[1], `re-released ${n110} on it, from work/1.1.0/`, 'and that 1.1.0 is re-released');
         },
     },
 ];

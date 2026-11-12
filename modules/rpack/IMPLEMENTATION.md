@@ -42,12 +42,12 @@ rpack [-C <dir>] [--keystore <path>] <command>
   init [--schema] <name> [--key <label>]
   new <version> [--base <release> [+ <release>]...]
   set base <release> [+ <release>]... [--force]
-  import <schema> [<version>] [--registry <dir>]
+  import <schema> [<version>] [--registry <dir>] [--force]
   status
   build
   stage [--passphrase-stdin]
   release [--passphrase-stdin] [--force] [--yes]
-  publish [<version>] [--registry <dir>]
+  publish [<version>] [--registry <dir>] [--force]
   log
   verify <file>
   export <store.db> <catalog> [<version>] [--out <dir>]
@@ -120,7 +120,9 @@ The new release is drafted as if the old one had never been made: every release 
 
 Each released dependent is then made, by version, from its own folder's working files and note, on its `base` with the replaced names mapped to the new ones. A dependent ends at its own `target-catalog.sql`, so a change the re-release introduced that the dependent's source does not have is undone there, and shows up in its warnings. A dependent whose files changed since its own release ships those changes too, and the preview says so. A dependent that does not build fails the whole re-release.
 
-On a terminal the preview lists each replacement, its count and warnings, and the unreleased folders built on them, then asks. Without dependents it asks before the passphrase. With them it asks after, because the dependents can only be made once the new release is signed. Without a terminal, a re-release that has dependents needs `--yes`.
+A catalog release's hash covers its signature, so only the signed release tells whether anything changed. A re-release therefore asks for the passphrase first, then makes the release and its dependents, and compares each hash with the release it replaces. When every one comes out the same — a source rewritten in a newer syntax, or an `update.sql` an older `rpack` rendered differently — nothing is replaced and nothing is asked: each folder's `.released/` is written again, so `status` and `build` read the folder as released.
+
+Otherwise, on a terminal, the preview lists each replacement, its count and warnings, and the unreleased folders built on them, then asks once. A release that came out the same is shown as unchanged and is not replaced. The line about starting a new catalog shows only when the first release itself changed: its hash is the catalog's id. A no writes nothing. Without a terminal, a re-release that has dependents needs `--yes`, and is refused before the passphrase.
 
 Writes, in order: the new release files; each folder's `.released/`; the dependents' `version.json`; the `version.json` of each unreleased folder on a replaced release, repointed, and listed so the author can check it; `rpack.json`; and last, removal of the replaced files.
 
@@ -223,7 +225,7 @@ A released folder is drafted as a catalog's is: among the releases without its o
 
 `rpack release --force` in a released schema folder follows the rules of [Making a release again](#making-a-release-again): the new release is drafted without the old one and its dependents, each released dependent is made again from its own folder on the remapped base, one that has no folder or does not build fails the whole re-release, and the old files are removed last. No key is needed, so every release is made before the preview, and the preview asks once. It lists each replacement, a dependent's rules and warnings, and the unreleased folders built on them. Without a terminal, a re-release that has dependents needs `--yes`.
 
-A re-release reaches only this repository. The preview and the result end with a warning about the copies others took: a registry that holds the old file, a catalog that imported it, and a catalog released on it. Those are replaced by hand (see [The registry](#the-registry)).
+A re-release reaches only this repository. The preview and the result end with a warning about the copies others took: a registry that holds the old file, a catalog that imported it, and a catalog released on it. `rpack publish --force` and `rpack import --force` replace the first two, and the catalog is then re-released and published with `--force` (see [The registry](#the-registry)).
 
 A schema `.rpack` file has `manifest.kind` set to `"schema"` and carries the steps in its causal past. Every step in the file has a distinct version string. Per-slot resolution then never falls through to an entry-hash tie between two concurrent steps of one pack, and the pack resolves the same way in every catalog that replays it.
 
@@ -273,9 +275,9 @@ Publish and pull need a place both tools can read without a service. The registr
 
 `rpack` resolves it from `--registry`, then `$HHS_REGISTRY`, then `rpack.json`'s `registry` relative to the repository, then `~/.hhs/registry`. `rhost` uses the flag, then `$HHS_REGISTRY`, then `~/.hhs/registry`. It has no `rpack.json`.
 
-`rpack publish` verifies the named release, or every release in `released` when the name is omitted, and copies the file to `<registry>/<name with colons as slashes>/`. It refuses a directory that already holds the other kind, schema or catalog, or another catalog id under that name. It also refuses a version the registry already holds with another hash, which is what a re-release makes, and names the file to remove from the registry first.
+`rpack publish` verifies the named release, or every release in `released` when the name is omitted, and copies the file to `<registry>/<name with colons as slashes>/`. It refuses a directory that already holds the other kind, schema or catalog, or another catalog id under that name. A re-release makes files the registry cannot hold beside the old ones: a version at another hash, or, when a catalog's first release was made again, another catalog under the name. `publish` refuses those, naming every file in the way. `publish --force` writes the new files and then removes the old ones, in that order, and says which. With a version named it replaces that version alone; without one it replaces every released version, which is what a re-release needs.
 
-`rpack import` runs in a catalog version folder. It finds the schema in the registry, the highest version when none is named, and refuses a catalog file. It copies the file into `imports/`, sets `imports[schema][version]` to the step hash, and inserts or updates `IMPORT SCHEMA` in `target-catalog.sql`. Importing a version that descends from one already listed replaces the ancestor. Importing a concurrent branch lists both versions. A version already locked at another hash is refused before anything is written. The refusal names the lock in `rpack.json` and the file in `imports/` to remove, which is how a catalog takes a re-released schema. A catalog already released on the old one is then re-released itself.
+`rpack import` runs in a catalog version folder. It finds the schema in the registry, the highest version when none is named, and refuses a catalog file. It copies the file into `imports/`, sets `imports[schema][version]` to the step hash, and inserts or updates `IMPORT SCHEMA` in `target-catalog.sql`. Importing a version that descends from one already listed replaces the ancestor. Importing a concurrent branch lists both versions. A version already locked at another hash is refused before anything is written. `import --force` replaces that version's lock and its copy in `imports/`, which is how a catalog takes a re-released schema. It warns about any other locked copy made on the old history, which needs `import --force` too, and a catalog already released on the old one is then re-released itself. A catalog left on a mix of the two histories does not build, and its re-release writes nothing.
 
 `rhost init --catalog <name> [--version <v>]` resolves a catalog file the same way, refuses a schema, copies it into `catalogs/`, asks for any parameter the flags leave out, and writes `app.json`. Identity parameters default to `$me`. `rhost init --release <file>` copies the given files and writes no keys.
 

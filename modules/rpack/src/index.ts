@@ -67,7 +67,7 @@ export {
 } from "./project.js";
 export {
     importSchemaFromRegistry, publishToRegistry, readLockedImports, registryPath, resolveCatalogInRegistry,
-    type ResolvedRegistryCatalog,
+    type RegistryOptions, type ResolvedRegistryCatalog,
 } from "./registry.js";
 export {
     draftSchemaRelease, formatSchemaDraft, formatSchemaDraftSql, formatSchemaUpgrade, produceSchemaRelease,

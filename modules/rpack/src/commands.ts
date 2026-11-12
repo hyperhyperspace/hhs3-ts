@@ -19,7 +19,7 @@ import {
     compareFolders, folderVersion, formatRpackConfig, formatVersionFile, parseRpackConfig, parseVersionFile, releasedPath, workPath,
     type RpackConfig, type RpackKind, type RpackProject, type VersionFile,
 } from "./project.js";
-import { importSchemaFromRegistry, publishToRegistry, readLockedImports } from "./registry.js";
+import { importSchemaFromRegistry, publishToRegistry, readLockedImports, type RegistryOptions } from "./registry.js";
 import { describeRelease, Released, sortReleases, type ReleaseInfo } from "./released.js";
 import {
     draftSchemaRelease, formatSchemaDraft, formatSchemaReleasePreview, formatSchemaUpgrade, produceSchemaRelease, readSchemaSource, ReleasedSchemas,
@@ -712,16 +712,23 @@ async function listFolders(project: RpackProject): Promise<string[]> {
     return out.sort(compareFolders);
 }
 
-type Made = { folder: string; produced: ProducedRelease; draft: ReleaseDraft; inputs: Inputs; version: VersionFile };
+type Made = { folder: string; replaces: ReleaseInfo; produced: ProducedRelease; draft: ReleaseDraft; inputs: Inputs; version: VersionFile };
 
 // Replaces a released folder's release with one made from its working files.
 // Everything is made in a scratch replica without the release and the
 // releases built on it (its dependents): the new release first, then each
 // dependent again, by version, from its own folder's working files and note on
 // the remapped base. A dependent without a folder, or one that doesn't build,
-// fails the whole re-release. Then, in order: the new release files, each
-// folder's .released/, the dependents' and unreleased folders' version.json,
-// rpack.json, and last the replaced release files are removed.
+// fails the whole re-release.
+//
+// A release's hash covers its signature, so only the signed releases tell
+// what changed: the key is unlocked and all of them are made before anything
+// is asked. When each has the hash of the release it replaces, nothing is
+// replaced or asked, and each folder's .released/ is written, so the folders
+// read as released again. Otherwise the preview is shown, and then, in order:
+// the new release files, each folder's .released/, the dependents' and
+// unreleased folders' version.json, rpack.json, and last the replaced release
+// files are removed.
 async function rerelease(ctx: RpackContext, repo: Repo, folder: Folder, unlock: Unlock, options: ReleaseOptions): Promise<ReleaseResult> {
     const { config, keys } = repo;
     const labels = keys.labels();
@@ -743,19 +750,16 @@ async function rerelease(ctx: RpackContext, repo: Repo, folder: Folder, unlock: 
             throw new RpackError(`nothing to re-release: ${workPath(folder.name)}/ makes ${old.name} as it is`);
         }
 
-        const repointed = await unreleasedOn(ctx.project, config, (entry) => canonicalName(repo.released, entry), new Set(surface.replaced.map((r) => r.name)));
         const confirm = options.yes === true ? undefined : options.confirm;
         if (dependents.length > 0 && confirm === undefined && options.yes !== true) {
             throw new RpackError(`Re-releasing ${folder.version} re-releases ${dependents.map((d) => d.version).join(', ')} too, built on it: `
                 + 'run it on a terminal to review that, or pass --yes');
         }
-        const preview: ReleasePreview = { catalog: config.name, draft, replaces: old, rebuilt: [], repointed: repointed.map((u) => u.folder) };
-        if (dependents.length === 0 && confirm !== undefined && !await confirm(preview)) throw new RpackError('aborted');
 
         const key = await unlock(config.key);
         const produced = await produceRelease(draft, scratch, key, noteOption(folder.note));
         const renamed = new Map([[old.name, produced.name]]);
-        const made: Made[] = [{ folder: folder.name, produced, draft, inputs, version: rebased(folder, folder.base) }];
+        const made: Made[] = [{ folder: folder.name, replaces: old, produced, draft, inputs, version: rebased(folder, folder.base) }];
         const rebuilt: RebuiltRelease[] = [];
         for (const d of dependents) {
             const dFolder = await readFolder(ctx, repo, folders.get(d.name)!);
@@ -776,13 +780,23 @@ async function rerelease(ctx: RpackContext, repo: Repo, folder: Folder, unlock: 
             const edited = await editedSinceRelease(ctx.project, repo, dFolder);
             const dProduced = await produceRelease(dDraft, scratch, key, noteOption(dFolder.note));
             renamed.set(d.name, dProduced.name);
-            rebuilt.push({ folder: dFolder.name, replaces: d, draft: dDraft, edited });
-            made.push({ folder: dFolder.name, produced: dProduced, draft: dDraft, inputs: dInputs, version: rebased(dFolder, base) });
+            if (dProduced.hash !== d.hash) rebuilt.push({ folder: dFolder.name, replaces: d, draft: dDraft, edited });
+            made.push({ folder: dFolder.name, replaces: d, produced: dProduced, draft: dDraft, inputs: dInputs, version: rebased(dFolder, base) });
         }
-        if (dependents.length > 0) {
-            preview.rebuilt = rebuilt;
-            if (confirm !== undefined && !await confirm(preview)) throw new RpackError('aborted');
+
+        const unchanged = (m: Made) => `${m.replaces.name} is unchanged: the re-release is the same release. Wrote ${releasedPath(m.folder)}/`;
+        const changed = made.filter((m) => m.produced.hash !== m.replaces.hash);
+        if (changed.length === 0) {
+            for (const m of made) await writeReleased(ctx.project, m.folder, m.inputs, formatUpgrade(m.draft, labels));
+            return { produced, draft, rebuilt: made.slice(1).map((m) => m.produced), lines: made.map(unchanged) };
         }
+
+        const repointed = await unreleasedOn(ctx.project, config, (entry) => canonicalName(repo.released, entry), new Set(changed.map((m) => m.replaces.name)));
+        const preview: ReleasePreview = {
+            catalog: config.name, draft, replaces: old, rebuilt, repointed: repointed.map((u) => u.folder),
+            ...(produced.hash === old.hash ? { same: true } : {}),
+        };
+        if (confirm !== undefined && !await confirm(preview)) throw new RpackError('aborted');
 
         for (const m of made) await ctx.project.write(`${RELEASES_DIR}/${m.produced.name}.rpack`, m.produced.text);
         for (const m of made) await writeReleased(ctx.project, m.folder, m.inputs, formatUpgrade(m.draft, labels));
@@ -801,8 +815,12 @@ async function rerelease(ctx: RpackContext, repo: Repo, folder: Folder, unlock: 
             removed.push(stored.path);
         }
 
-        const lines = [`re-released ${produced.name}: wrote ${RELEASES_DIR}/${produced.name}.rpack and ${releasedPath(folder.name)}/`];
-        for (const m of made.slice(1)) lines.push(`re-released ${m.produced.name} on it, from ${workPath(m.folder)}/`);
+        const lines = [produced.hash === old.hash
+            ? unchanged(made[0]!)
+            : `re-released ${produced.name}: wrote ${RELEASES_DIR}/${produced.name}.rpack and ${releasedPath(folder.name)}/`];
+        for (const m of made.slice(1)) {
+            lines.push(m.produced.hash === m.replaces.hash ? unchanged(m) : `re-released ${m.produced.name} on it, from ${workPath(m.folder)}/`);
+        }
         if (removed.length > 0) lines.push(`removed ${removed.join(', ')}`);
         for (const u of repointed) {
             lines.push(`${workPath(u.folder, VERSION_FILE)} now names the new releases; ${u.folder} was written against the old ${old.version}: check it`);
@@ -1318,27 +1336,31 @@ async function logSchemaReleases(ctx: RpackContext, config: RpackConfig): Promis
     return lines;
 }
 
+// `force` replaces the registry's files that stand in the way: see `publishToRegistry`.
 export async function publishRelease(
     project: RpackProject,
     registry: RpackProject,
     selector?: string,
+    options: RegistryOptions = {},
 ): Promise<string[]> {
     try {
-        return await publishToRegistry(project, registry, selector);
+        return await publishToRegistry(project, registry, selector, options);
     } catch (err) {
         throw new RpackError(err instanceof Error ? err.message : String(err));
     }
 }
 
+// `force` replaces a lock at another hash, and its copy: see `importSchemaFromRegistry`.
 export async function importSchema(
     project: RpackProject,
     registry: RpackProject,
     folderName: string,
     schemaName: string,
     versionSelector?: string,
+    options: RegistryOptions = {},
 ): Promise<{ file: SchemaReleaseFile; lines: string[] }> {
     try {
-        return await importSchemaFromRegistry(project, registry, folderName, schemaName, versionSelector);
+        return await importSchemaFromRegistry(project, registry, folderName, schemaName, versionSelector, options);
     } catch (err) {
         throw new RpackError(err instanceof Error ? err.message : String(err));
     }

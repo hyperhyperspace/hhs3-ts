@@ -91,11 +91,26 @@ function pickHighestVersion(entries: StoredEntry[], pkgName: string): StoredEntr
     return highest;
 }
 
-// Publishes one or all released versions of `project` into `registry`.
+export type RegistryOptions = {
+    // Replace what the registry, or the catalog's lock, already holds.
+    force?: boolean;
+};
+
+function catalogIdOf(file: AnyReleaseFile): B64Hash | undefined {
+    return isSchemaReleaseFile(file) ? undefined : file.manifest.catalog;
+}
+
+// Publishes one or all released versions of `project` into `registry`. Files
+// already there stand in the way when they are of another catalog under the
+// name (a re-released first release starts one), or hold a version being
+// published at another hash. That is refused, naming them, unless `force`:
+// then the new files are written and those are removed, in that order, so the
+// registry never lacks a version it had.
 export async function publishToRegistry(
     project: RpackProject,
     registry: RpackProject,
     selector?: string,
+    options: RegistryOptions = {},
 ): Promise<string[]> {
     const configText = await project.read(CONFIG_FILE);
     if (configText === undefined) {
@@ -135,38 +150,65 @@ export async function publishToRegistry(
         if (exKind !== expectedKind) {
             throw new Error(`'${config.name}' in the registry is a ${exKind}, not a ${expectedKind}`);
         }
-        if (!isSchemaReleaseFile(ex.file) && !isSchemaReleaseFile(toPublish[0].file)) {
-            if (ex.file.manifest.catalog !== toPublish[0].file.manifest.catalog) {
-                throw new Error(`'${config.name}' in the registry has catalog #${ex.file.manifest.catalog.slice(0, 8)}, which differs from #${toPublish[0].file.manifest.catalog.slice(0, 8)}`);
-            }
+    }
+
+    const catalogId = catalogIdOf(toPublish[0].file);
+    const strangers = existing.filter((ex) => catalogIdOf(ex.file) !== catalogId);
+    const clashes = existing.filter((ex) => !strangers.includes(ex)
+        && toPublish.some((e) => e.file.manifest.version === ex.file.manifest.version && e.file.manifest.release !== ex.file.manifest.release));
+    const paths = (entries: StoredEntry[]) => entries.map((e) => e.path).join(', ');
+    if (options.force !== true) {
+        if (strangers.length > 0) {
+            throw new Error(`'${config.name}' in the registry is another catalog (#${catalogIdOf(strangers[0].file)!.slice(0, 8)}, not #${catalogId!.slice(0, 8)}), `
+                + `in ${paths(strangers)}: rpack publish --force replaces ${strangers.length === 1 ? 'it' : 'them'}`);
+        }
+        if (clashes.length > 0) {
+            const one = clashes.length === 1;
+            throw new Error(`'${config.name}' ${clashes.map((e) => e.file.manifest.version).join(' and ')} ${one ? 'is' : 'are'} already in the registry `
+                + `with a different hash (${paths(clashes)}): rpack publish --force replaces ${one ? 'it' : 'them'}`);
         }
     }
 
     const lines: string[] = [];
+    const written = new Set<string>();
     for (const entry of toPublish) {
         const m = entry.file.manifest;
-        const clash = existing.find((e) => e.file.manifest.version === m.version && e.file.manifest.release !== m.release);
-        if (clash !== undefined) {
-            throw new Error(`'${config.name}' ${m.version} is already in the registry with a different hash (#${releaseTag(clash.file.manifest.release)}): `
-                + `to replace it, remove ${clash.path} from the registry and publish again`);
-        }
         const outName = releaseFileName(m.name, m.version, m.release);
         const dest = `${regDir}/${outName}`;
         await registry.write(dest, serializeReleaseFile(entry.file));
+        written.add(dest);
         lines.push(`published ${entry.releaseName} to ${dest}`);
+    }
+    const removed = [...strangers, ...clashes].filter((old) => !written.has(old.path));
+    for (const old of removed) {
+        await registry.remove(old.path);
+        lines.push(`removed ${old.path} from the registry`);
+    }
+    if (removed.length > 0) {
+        const one = removed.length === 1;
+        lines.push('', `Warning: copies of the removed ${one ? 'file' : 'files'} that were already taken are not replaced.`);
+        if (expectedKind === 'schema') {
+            lines.push(`  A catalog that imported ${one ? 'it' : 'one'} keeps it until rpack import --force.`);
+        } else {
+            if (strangers.length > 0) lines.push("  Hosts of the removed catalog take none of the new one's releases.");
+            if (clashes.length > 0) lines.push(`  A host that has ${one ? 'the removed release' : 'a removed release'} holds it next to the new one.`);
+        }
     }
     return lines;
 }
 
 // Imports a schema release from `registry` into `project`'s `imports/`, locks
 // its step hash in `rpack.json`, and inserts or updates `IMPORT SCHEMA` in
-// `work/<folderName>/target-catalog.sql`.
+// `work/<folderName>/target-catalog.sql`. A version locked at another hash (a
+// re-released schema) is refused unless `force`: then the lock and the copy
+// of that one version are replaced.
 export async function importSchemaFromRegistry(
     project: RpackProject,
     registry: RpackProject,
     folderName: string,
     schemaName: string,
     versionSelector?: string,
+    options: RegistryOptions = {},
 ): Promise<{ file: SchemaReleaseFile; lines: string[] }> {
     const configText = await project.read(CONFIG_FILE);
     if (configText === undefined) {
@@ -209,9 +251,12 @@ export async function importSchemaFromRegistry(
     // leaves imports/ as it was.
     const { name, version, release } = schemaFile.manifest;
     const existingLock = config.imports?.[schemaName]?.[version];
-    if (existingLock !== undefined && existingLock !== release) {
-        throw new Error(`${CONFIG_FILE} already locks ${schemaName} ${version} at #${releaseTag(existingLock)}, not #${releaseTag(release)}: `
-            + `to take the new one, remove that entry from "imports" in ${CONFIG_FILE} and ${IMPORTS_DIR}/${releaseFileName(name, version, existingLock)}, then import again`);
+    const lockedPath = existingLock !== undefined && existingLock !== release
+        ? `${IMPORTS_DIR}/${releaseFileName(name, version, existingLock)}`
+        : undefined;
+    if (lockedPath !== undefined && options.force !== true) {
+        throw new Error(`${CONFIG_FILE} already locks ${schemaName} ${version} at #${releaseTag(existingLock!)}, not #${releaseTag(release)}: `
+            + `rpack import --force replaces the lock and ${lockedPath}`);
     }
 
     const importFileName = releaseFileName(name, version, release);
@@ -222,18 +267,39 @@ export async function importSchemaFromRegistry(
     if (config.imports[schemaName] === undefined) config.imports[schemaName] = {};
     config.imports[schemaName][version] = release;
     await project.write(CONFIG_FILE, formatRpackConfig(config));
+    if (lockedPath !== undefined && lockedPath !== importPath) await project.remove(lockedPath);
 
     const updatedSource = await rewriteImportStatement(project, config, sourceText, schemaName, schemaFile);
     if (updatedSource !== sourceText) {
         await project.write(sourcePath, updatedSource);
     }
 
-    return {
-        file: schemaFile,
-        lines: [
-            `imported ${schemaName} ${schemaFile.manifest.version} (${releaseTag(schemaFile.manifest.release)}) into ${importPath} and ${sourcePath}`,
-        ],
-    };
+    const lines = [`imported ${schemaName} ${version} (${releaseTag(release)}) into ${importPath} and ${sourcePath}`];
+    if (lockedPath !== undefined) {
+        lines.push(`replaced the lock at #${releaseTag(existingLock!)} and removed ${lockedPath}`, '');
+        lines.push(...await staleImports(project, config, schemaFile));
+        lines.push(`Warning: a release of ${config.name} made on the old ${schemaName} ${version} has to be re-released (rpack release --force), then published with --force.`);
+    }
+    return { file: schemaFile, lines };
+}
+
+// The other locked copies of a schema that were made on another history than
+// `file`: they hold another step for a version `file` has too. A warning each.
+async function staleImports(project: RpackProject, config: RpackConfig, file: SchemaReleaseFile): Promise<string[]> {
+    const { name, version } = file.manifest;
+    const mine = new Map(file.steps.map((s) => [s.version, s.hash]));
+    const lines: string[] = [];
+    for (const [other, hash] of Object.entries(config.imports?.[name] ?? {})) {
+        if (other === version) continue;
+        const path = `${IMPORTS_DIR}/${releaseFileName(name, other, hash)}`;
+        const text = await project.read(path);
+        if (text === undefined) continue;
+        const differs = parseSchemaReleaseFile(text).steps.filter((s) => mine.has(s.version) && mine.get(s.version) !== s.hash).map((s) => s.version);
+        if (differs.length > 0) {
+            lines.push(`Warning: ${path} was made on another ${differs.join(' and ')}: rpack import --force ${name} ${other} takes its new release.`);
+        }
+    }
+    return lines;
 }
 
 async function rewriteImportStatement(

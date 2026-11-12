@@ -333,4 +333,79 @@ CREATE CATALOG blog CREATORS ($dev) PARAMS (:admin identity) AS (
             }
         },
     },
+    {
+        name: "[RDB_TOOLS69] after a schema re-release, rpack publish and rpack import exit 1 and name --force; with it publish replaces the registry's files and import the lock and the copy",
+        invoke: async () => {
+            const dir = await fs.mkdtemp(join(tmpdir(), 'rpack-force-'));
+            try {
+                const keystore = join(dir, 'user-keys.json');
+                const keys = await KeyStore.open(keystore, hashSuite);
+                await keys.create('dev', 'pw');
+
+                const registry = join(dir, 'registry');
+                const schemaRepo = join(dir, 'notes');
+                const catRepo = join(dir, 'blog');
+                await fs.mkdir(schemaRepo);
+                await fs.mkdir(catRepo);
+                const schemaFolder = join(schemaRepo, 'work', '1.0.0');
+                const catFolder = join(catRepo, 'work', '1.0.0');
+                const rpackSchema = (args: string[], at = schemaRepo) => runBin('rpack', ['-C', at, '--keystore', keystore, ...args]);
+                const rpackCat = (args: string[], input?: string, at = catRepo) => runBin('rpack', ['-C', at, '--keystore', keystore, ...args], input);
+
+                // A schema and a catalog that imports it, both released and published
+                const notes = 'CREATE SCHEMA hhs:notes AS (\n  TABLE notes (\n    body string PUB\n  )\n);\n';
+                ok(await rpackSchema(['init', '--schema', 'hhs:notes']), 'rpack init --schema');
+                ok(await rpackSchema(['new', '1.0.0']), 'rpack new 1.0.0 in the schema repo');
+                await fs.writeFile(join(schemaFolder, 'target-schema.sql'), notes);
+                ok(await rpackSchema(['release'], schemaFolder), 'release the schema');
+                ok(await rpackSchema(['publish', '--registry', registry]), 'publish the schema');
+                const [old] = await fs.readdir(join(registry, 'hhs', 'notes'));
+
+                ok(await rpackCat(['init', 'blog', '--key', 'dev']), 'rpack init blog');
+                ok(await rpackCat(['new', '1.0.0']), 'rpack new 1.0.0 in blog');
+                ok(await rpackCat(['import', 'hhs:notes', '--registry', registry], undefined, catFolder), 'rpack import hhs:notes');
+                await fs.writeFile(join(catFolder, 'target-catalog.sql'),
+                    "IMPORT SCHEMA hhs:notes VERSION '1.0.0';\n\nCREATE CATALOG blog CREATORS ($dev) AS (\n  TABLEGROUP notes USING SCHEMA hhs:notes\n);\n");
+                ok(await rpackCat(['release', '--passphrase-stdin'], 'pw\n', catFolder), 'release blog 1.0.0');
+                ok(await rpackCat(['publish', '--registry', registry]), 'publish blog 1.0.0');
+                const [oldBlog] = await fs.readdir(join(registry, 'blog'));
+
+                // The schema is re-released with a column
+                await fs.writeFile(join(schemaFolder, 'target-schema.sql'), notes.replace('body string PUB', 'body string PUB,\n    pinned boolean NULL'));
+                const redone = await rpackSchema(['release', '--force'], schemaFolder);
+                ok(redone, 'rpack release --force in the schema repo');
+                assertTrue(redone.stdout.includes('rpack publish --force replaces it there'), `the re-release names the next command (${redone.stdout})`);
+
+                // publish: refused, then --force
+                const refused = await rpackSchema(['publish', '--registry', registry]);
+                assertEquals(refused.code, 1, 'publishing over the old release fails');
+                assertTrue(refused.stderr.includes(`(hhs/notes/${old}): rpack publish --force replaces it`), `and names the file and the flag (${refused.stderr})`);
+                const forced = await rpackSchema(['publish', '--registry', registry, '--force']);
+                ok(forced, 'rpack publish --force');
+                assertTrue(forced.stdout.includes(`removed hhs/notes/${old} from the registry`), `it says what it removed (${forced.stdout})`);
+                const now = await fs.readdir(join(registry, 'hhs', 'notes'));
+                assertTrue(now.length === 1 && now[0] !== old, `the registry holds the new file alone (${now.join(', ')})`);
+
+                // import: refused, then --force
+                const locked = await rpackCat(['import', 'hhs:notes', '--registry', registry], undefined, catFolder);
+                assertEquals(locked.code, 1, 'importing over the lock fails');
+                assertTrue(locked.stderr.includes(`rpack import --force replaces the lock and imports/${old}`), `and names the flag and the copy (${locked.stderr})`);
+                const relocked = await rpackCat(['import', 'hhs:notes', '--registry', registry, '--force'], undefined, catFolder);
+                ok(relocked, 'rpack import --force');
+                assertTrue(relocked.stdout.includes(`removed imports/${old}`), `it says what it replaced (${relocked.stdout})`);
+                assertEquals((await fs.readdir(join(catRepo, 'imports'))).join(','), now[0], 'imports/ holds the new copy alone');
+
+                // The catalog, re-released on it, is another catalog
+                ok(await rpackCat(['release', '--force', '--passphrase-stdin'], 'pw\n', catFolder), 'rpack release --force in blog');
+                const beside = await rpackCat(['publish', '--registry', registry]);
+                assertEquals(beside.code, 1, 'publishing the new catalog beside the old one fails');
+                assertTrue(beside.stderr.includes(`in blog/${oldBlog}: rpack publish --force replaces it`), `and names its file and the flag (${beside.stderr})`);
+                ok(await rpackCat(['publish', '--registry', registry, '--force']), 'rpack publish --force in blog');
+                const blogNow = await fs.readdir(join(registry, 'blog'));
+                assertTrue(blogNow.length === 1 && blogNow[0] !== oldBlog, `the registry holds the new catalog alone (${blogNow.join(', ')})`);
+            } finally {
+                await fs.rm(dir, { recursive: true, force: true });
+            }
+        },
+    },
 ];

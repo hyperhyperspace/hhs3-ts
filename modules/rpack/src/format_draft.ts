@@ -229,6 +229,9 @@ export type ReleasePreview = {
     // again on it (by version), and the unreleased folders whose version.json
     // names a replaced release.
     replaces?: ReleaseInfo;
+    // The re-release came out as `replaces` itself, by hash: only releases
+    // built on it are replaced. `rebuilt` lists those that changed.
+    same?: boolean;
     rebuilt: RebuiltRelease[];
     repointed: string[];
     // Set by a schema repository: the preview as it prints. A schema draft
@@ -240,13 +243,17 @@ export function formatReleasePreview(preview: ReleasePreview): string[] {
     if (preview.lines !== undefined) return preview.lines;
     const replaced = preview.replaces;
     if (replaced === undefined) return formatReleaseConfirm(preview.draft);
-    const lines = [`Re-releasing ${preview.draft.version} replaces ${replaced.name}.`, ...formatReleaseConfirm(preview.draft)];
-    if (replaced.parents.length === 0) {
+    const same = preview.same === true;
+    const lines = same
+        ? [`Re-releasing ${preview.draft.version} makes ${replaced.name} again, unchanged.`]
+        : [`Re-releasing ${preview.draft.version} replaces ${replaced.name}.`, ...formatReleaseConfirm(preview.draft)];
+    // The first release's hash is the catalog's id.
+    if (!same && replaced.parents.length === 0) {
         lines.push('', `${replaced.version} is the first release: the re-release starts a new catalog, and replicas of the old one take none of its releases.`);
     }
     if (preview.rebuilt.length > 0) {
         const n = preview.rebuilt.length;
-        lines.push('', `It also re-releases ${n} ${n === 1 ? 'release' : 'releases'} built on it:`);
+        lines.push('', `It ${same ? '' : 'also '}re-releases ${n} ${n === 1 ? 'release' : 'releases'} built on it:`);
         for (const r of preview.rebuilt) {
             lines.push(`  ${r.draft.version}  replaces ${r.replaces.name}${r.edited ? '  (changed since release)' : ''}`);
             lines.push(...formatReleaseConfirm(r.draft).map((l) => (l === '' ? '' : `    ${l}`)));
@@ -255,7 +262,7 @@ export function formatReleasePreview(preview: ReleasePreview): string[] {
     for (const folder of preview.repointed) {
         lines.push('', `work/${folder}/ is written against the old ${replaced.version}; its version.json will name the new one: check it.`);
     }
-    const all = [replaced, ...preview.rebuilt.map((r) => r.replaces)];
+    const all = [...(same ? [] : [replaced]), ...preview.rebuilt.map((r) => r.replaces)];
     lines.push('', `Copies of ${all.map((r) => r.name).join(', ')} already shared stay valid releases: a replica that has one would hold it next to the new ${all.length === 1 ? 'one' : 'ones'}.`);
     return lines;
 }

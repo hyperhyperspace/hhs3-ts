@@ -605,9 +605,9 @@ export function schemaRereleaseWarning(replaced: ReleaseInfo[]): string[] {
     const one = replaced.length === 1;
     return [
         `Warning: copies of ${replaced.map((r) => r.name).join(' and ')} that were published or imported are not replaced.`,
-        `  A registry that holds ${one ? 'it' : 'one'} refuses the new release of that version until the old file is removed from it.`,
-        `  A catalog that imported ${one ? 'it' : 'one'} keeps it until its copy in imports/ and its lock in rpack.json are removed and it imports again.`,
-        `  A catalog released on the old ${one ? 'one' : 'ones'} has to be re-released on the new ${one ? 'one' : 'ones'}.`,
+        `  A registry that holds ${one ? 'it' : 'one'} refuses the new release of that version: rpack publish --force replaces it there.`,
+        `  A catalog that imported ${one ? 'it' : 'one'} keeps it: rpack import --force replaces its copy and its lock.`,
+        `  A catalog released on the old ${one ? 'one' : 'ones'} has to be re-released on the new ${one ? 'one' : 'ones'} (rpack release --force), then published with --force.`,
     ];
 }
 
