@@ -22,8 +22,9 @@ import {
 import { importSchemaFromRegistry, publishToRegistry, readLockedImports } from "./registry.js";
 import { describeRelease, Released, sortReleases, type ReleaseInfo } from "./released.js";
 import {
-    draftSchemaRelease, formatSchemaDraft, formatSchemaUpgrade, produceSchemaRelease, readSchemaSource, ReleasedSchemas, renderSchemaSource,
-    type ProducedSchemaRelease, type SchemaReleaseDraft,
+    draftSchemaRelease, formatSchemaDraft, formatSchemaReleasePreview, formatSchemaUpgrade, produceSchemaRelease, readSchemaSource, ReleasedSchemas,
+    renderSchemaSource, schemaRereleaseWarning, schemaStepOf,
+    type ProducedSchemaRelease, type RebuiltSchemaRelease, type SchemaReleaseDraft,
 } from "./schema_pack.js";
 import { formatWhere, isBlankSql, maximalImportedVersions, readSource, SourceError } from "./source.js";
 import { stripCatalogVersion, writeSource } from "./write_source.js";
@@ -682,13 +683,15 @@ export async function releaseVersion(ctx: RpackContext, folderName: string, unlo
 }
 
 // The unreleased folders whose version.json names one of `replaced`, with the
-// base by name.
-async function unreleasedOn(project: RpackProject, repo: Repo, replaced: Set<string>): Promise<{ folder: string; file: VersionFile }[]> {
+// base by name: `canonical` gives the name a base entry stands for.
+async function unreleasedOn(
+    project: RpackProject, config: RpackConfig, canonical: (entry: string) => string, replaced: Set<string>,
+): Promise<{ folder: string; file: VersionFile }[]> {
     const out: { folder: string; file: VersionFile }[] = [];
     for (const folder of await listFolders(project)) {
-        if (repo.config.released.has(folder)) continue;
+        if (config.released.has(folder)) continue;
         const file = await readVersionFile(project, folder);
-        const base = file.base.map((entry) => canonicalName(repo.released, entry));
+        const base = file.base.map(canonical);
         if (base.some((name) => replaced.has(name))) out.push({ folder, file: { ...file, base } });
     }
     return out;
@@ -740,7 +743,7 @@ async function rerelease(ctx: RpackContext, repo: Repo, folder: Folder, unlock: 
             throw new RpackError(`nothing to re-release: ${workPath(folder.name)}/ makes ${old.name} as it is`);
         }
 
-        const repointed = await unreleasedOn(ctx.project, repo, new Set(surface.replaced.map((r) => r.name)));
+        const repointed = await unreleasedOn(ctx.project, config, (entry) => canonicalName(repo.released, entry), new Set(surface.replaced.map((r) => r.name)));
         const confirm = options.yes === true ? undefined : options.confirm;
         if (dependents.length > 0 && confirm === undefined && options.yes !== true) {
             throw new RpackError(`Re-releasing ${folder.version} re-releases ${dependents.map((d) => d.version).join(', ')} too, built on it: `
@@ -904,6 +907,11 @@ function resolveSchemaSelector(released: ReleasedSchemas, selector: string): Rel
     }
 }
 
+// The name a base entry stands for; an entry no release matches stays as written.
+function canonicalSchemaName(released: ReleasedSchemas, entry: string): string {
+    return tryResolveSchema(released, entry)?.name ?? entry;
+}
+
 function resolveSchemaBase(released: ReleasedSchemas, folder: { name: string; base: string[] }): ReleaseInfo[] {
     return folder.base.map((entry) => {
         const release = tryResolveSchema(released, entry);
@@ -1036,21 +1044,45 @@ async function readSchemaInputs(project: RpackProject, folder: string): Promise<
     return { source, manual };
 }
 
-async function assembleSchemaDraft(ctx: RpackContext, repo: SchemaRepo, folder: Folder): Promise<{ draft: SchemaReleaseDraft; inputs: Inputs; lines: string[] }> {
-    const parents = resolveSchemaBase(repo.released, folder);
-    checkSchemaParents(repo.released, folder.version, parents);
+// Where a schema folder's release is drafted: every release, or for a released
+// folder, the releases without its own and the ones built on it, as
+// `surfaceFor` has it for a catalog. `replaced` is those, the folder's first.
+type SchemaSurface = { released: ReleasedSchemas; replaced: ReleaseInfo[] };
+
+function schemaSurface(repo: SchemaRepo, folder: Folder): SchemaSurface {
+    if (folder.release === undefined) return { released: repo.released, replaced: [] };
+    const replaced = [folder.release, ...repo.released.descendants(folder.release.hash)];
+    return { released: repo.released.without(replaced.map((r) => r.hash)), replaced };
+}
+
+type SchemaAssembly = { draft: SchemaReleaseDraft; inputs: Inputs; lines: string[] };
+
+// The release a folder's working files make among `released`.
+async function assembleSchemaDraft(
+    ctx: RpackContext, repo: SchemaRepo, released: ReleasedSchemas, folder: { name: string; version: string; base: string[] },
+): Promise<SchemaAssembly> {
+    const parents = resolveSchemaBase(released, folder);
+    checkSchemaParents(released, folder.version, parents);
     const inputs = await readSchemaInputs(ctx.project, folder.name);
     const source = readSchemaSource(inputs.source, repo.config.name, SCHEMA_SOURCE_FILE, folder.version);
     const draft = await draftSchemaRelease({
         schema: repo.config.name,
         version: folder.version,
         parents,
-        released: repo.released,
+        released,
         source,
         nextText: inputs.manual,
     });
     const lines = formatSchemaDraft(draft);
     return { draft, inputs, lines };
+}
+
+// A released folder's draft still makes its release. A schema step is
+// unsigned, so the draft's step has the release's hash exactly when the base,
+// the note, the tables or rules and the parameters are the released ones.
+function makesSchemaRelease(folder: Folder, draft: SchemaReleaseDraft): boolean {
+    return folder.release !== undefined && draft.refusals.length === 0
+        && schemaStepOf(draft, noteOption(folder.note)).hash === folder.release.hash;
 }
 
 async function statusOfSchema(
@@ -1064,21 +1096,15 @@ async function statusOfSchema(
         const r = tryResolveSchema(repo.released, e);
         return r !== undefined ? describeRelease(r) : e;
     }).join(' + ');
-    let matches: boolean | undefined;
-    if (folder.release !== undefined) {
-        const inputs = await readSchemaInputs(ctx.project, folder.name);
-        const oldSource = await ctx.project.read(releasedPath(folder.name, SCHEMA_SOURCE_FILE));
-        const oldManual = (await ctx.project.read(releasedPath(folder.name, UPGRADE_MANUAL_FILE))) ?? '';
-        matches = oldSource === inputs.source && oldManual === inputs.manual;
-    }
-    const relLine = releasedLine(folder, matches);
-    const header = statusHeader(config.name, folder.version, baseText, relLine);
+    let draft: SchemaReleaseDraft;
+    let lines: string[];
     try {
-        const { draft, lines } = await assembleSchemaDraft(ctx, repo, folder);
-        return { draft, lines: [...header, '', ...lines] };
+        ({ draft, lines } = await assembleSchemaDraft(ctx, repo, schemaSurface(repo, folder).released, folder));
     } catch (err) {
-        throw new RpackError('', formatStatusError(config.name, folder.version, baseText, assemblyDetail(err), relLine));
+        throw new RpackError('', formatStatusError(config.name, folder.version, baseText, assemblyDetail(err), releasedLine(folder)));
     }
+    const matches = folder.release !== undefined ? makesSchemaRelease(folder, draft) : undefined;
+    return { draft, lines: [...statusHeader(config.name, folder.version, baseText, releasedLine(folder, matches)), '', ...lines] };
 }
 
 async function buildSchemaVersion(
@@ -1091,14 +1117,21 @@ async function buildSchemaVersion(
     let draft: SchemaReleaseDraft;
     let lines: string[];
     try {
-        ({ draft, lines } = await assembleSchemaDraft(ctx, repo, folder));
+        ({ draft, lines } = await assembleSchemaDraft(ctx, repo, schemaSurface(repo, folder).released, folder));
     } catch (err) {
         throw new RpackError('', [`Error assembling ${folder.version}`, ...assemblyDetail(err)]);
     }
     if (draft.refusals.length > 0) return { draft, lines };
     const updateSql = formatSchemaUpgrade(draft);
     await ctx.project.write(workPath(folder.name, `${BUILD_DIR}/${UPDATE_FILE}`), updateSql);
-    return { draft, lines: [`Generated ${BUILD_DIR}/${UPDATE_FILE}`] };
+    const result: { draft: SchemaReleaseDraft; matches?: boolean; lines: string[] } = { draft, lines: [`Generated ${BUILD_DIR}/${UPDATE_FILE}`] };
+    if (folder.release !== undefined) {
+        result.matches = makesSchemaRelease(folder, draft);
+        result.lines.push(result.matches
+            ? `${workPath(folder.name)}/ still makes ${folder.release.name}`
+            : `${workPath(folder.name)}/ no longer makes ${folder.release.name}: rpack release --force re-releases ${folder.version}`);
+    }
+    return result;
 }
 
 async function writeSchemaReleased(project: RpackProject, folder: string, inputs: Inputs, updateSql: string): Promise<void> {
@@ -1108,22 +1141,27 @@ async function writeSchemaReleased(project: RpackProject, folder: string, inputs
     await project.write(workPath(folder, `${BUILD_DIR}/${UPDATE_FILE}`), updateSql);
 }
 
+type SchemaReleaseResult = { produced: ProducedSchemaRelease; draft: SchemaReleaseDraft; rebuilt: ProducedSchemaRelease[]; lines: string[] };
+
 async function releaseSchemaVersion(
     ctx: RpackContext,
     config: RpackConfig,
     folderName: string,
     options: ReleaseOptions = {},
-): Promise<{ produced: ProducedSchemaRelease; draft: SchemaReleaseDraft; rebuilt: ProducedSchemaRelease[]; lines: string[] }> {
+): Promise<SchemaReleaseResult> {
     const repo = await openSchemaRepo(ctx, config);
     const folder = await readSchemaFolder(ctx, repo, folderName);
-    if (folder.release !== undefined && !options.force) {
-        throw new RpackError(`${workPath(folder.name)}/ is already released as ${folder.release.name}; pass --force to replace it`);
+    if (folder.release !== undefined) {
+        if (options.force !== true) {
+            throw new RpackError(`${folder.name} is released as ${folder.release.name}; rpack release --force re-releases it, and rpack new <version> starts another version`);
+        }
+        return rereleaseSchema(ctx, repo, folder, options);
     }
     let draft: SchemaReleaseDraft;
     let inputs: Inputs;
     let lines: string[];
     try {
-        ({ draft, inputs, lines } = await assembleSchemaDraft(ctx, repo, folder));
+        ({ draft, inputs, lines } = await assembleSchemaDraft(ctx, repo, repo.released, folder));
     } catch (err) {
         throw new RpackError('', [`Error assembling ${folder.version}`, ...assemblyDetail(err)]);
     }
@@ -1139,6 +1177,120 @@ async function releaseSchemaVersion(
         rebuilt: [],
         lines: [`released ${produced.name}: wrote ${RELEASES_DIR}/${produced.name}.rpack and ${releasedPath(folder.name)}/`],
     };
+}
+
+// A released schema folder no longer makes its release, or can't be read.
+async function schemaFolderChanged(ctx: RpackContext, repo: SchemaRepo, folder: Folder): Promise<boolean> {
+    try {
+        const { draft } = await assembleSchemaDraft(ctx, repo, schemaSurface(repo, folder).released, folder);
+        return !makesSchemaRelease(folder, draft);
+    } catch {
+        return true;
+    }
+}
+
+type MadeSchema = { folder: string; produced: ProducedSchemaRelease; draft: SchemaReleaseDraft; inputs: Inputs; version: VersionFile };
+
+// Replaces a released schema folder's release with one made from its working
+// files, by the rules of a catalog's `rerelease`. Everything is made among the
+// releases without the old one and the ones built on it (its dependents): the
+// new release first, then each dependent again, by version, from its own
+// folder's working files and note on the remapped base. A dependent without a
+// folder, or one that doesn't build, fails the whole re-release. No key is
+// needed, so all of it is made before the one question. Then, in order: the
+// new release files, each folder's .released/, the dependents' and unreleased
+// folders' version.json, rpack.json, and last the replaced release files are
+// removed. The copies a registry or a catalog took stay as they are: the
+// preview and the result say so.
+async function rereleaseSchema(ctx: RpackContext, repo: SchemaRepo, folder: Folder, options: ReleaseOptions): Promise<SchemaReleaseResult> {
+    const { config } = repo;
+    const old = folder.release!;
+    const { released: scratch, replaced } = schemaSurface(repo, folder);
+    const dependents = replaced.slice(1);
+    const folders = new Map<string, string>();
+    for (const d of dependents) {
+        const f = folderOf(config, d.name);
+        if (f === undefined) throw new RpackError(`${d.name} is built on ${old.name} and has no work folder, so it can't be re-released on the new ${old.version}`);
+        folders.set(d.name, f);
+    }
+
+    let own: SchemaAssembly;
+    try {
+        own = await assembleSchemaDraft(ctx, repo, scratch, folder);
+    } catch (err) {
+        throw new RpackError('', [`Error assembling ${folder.version}`, ...assemblyDetail(err)]);
+    }
+    if (own.draft.refusals.length > 0) throw new RpackError('the re-release is refused', own.lines);
+    if (makesSchemaRelease(folder, own.draft)) {
+        throw new RpackError(`nothing to re-release: ${workPath(folder.name)}/ makes ${old.name} as it is`);
+    }
+    const confirm = options.yes === true ? undefined : options.confirm;
+    if (dependents.length > 0 && confirm === undefined && options.yes !== true) {
+        throw new RpackError(`Re-releasing ${folder.version} re-releases ${dependents.map((d) => d.version).join(', ')} too, built on it: `
+            + 'run it on a terminal to review that, or pass --yes');
+    }
+
+    const produced = await produceSchemaRelease(own.draft, scratch, noteOption(folder.note));
+    const renamed = new Map([[old.name, produced.name]]);
+    const made: MadeSchema[] = [{ folder: folder.name, produced, draft: own.draft, inputs: own.inputs, version: rebased(folder, folder.base) }];
+    const rebuilt: RebuiltSchemaRelease[] = [];
+    for (const d of dependents) {
+        const dFolder = await readSchemaFolder(ctx, repo, folders.get(d.name)!);
+        const base = dFolder.base.map((entry) => {
+            const name = canonicalSchemaName(repo.released, entry);
+            return renamed.get(name) ?? name;
+        });
+        let next: SchemaAssembly;
+        try {
+            next = await assembleSchemaDraft(ctx, repo, scratch, { name: dFolder.name, version: dFolder.version, base });
+        } catch (err) {
+            throw new RpackError(`${d.version} can't be re-released on the new ${old.version}; nothing was written`, [`Error assembling ${d.version}`, ...assemblyDetail(err)]);
+        }
+        if (next.draft.refusals.length > 0) {
+            throw new RpackError(`${d.version} doesn't build on the new ${old.version}; nothing was written`, next.lines);
+        }
+        const edited = await schemaFolderChanged(ctx, repo, dFolder);
+        const dProduced = await produceSchemaRelease(next.draft, scratch, noteOption(dFolder.note));
+        renamed.set(d.name, dProduced.name);
+        rebuilt.push({ folder: dFolder.name, replaces: d, draft: next.draft, edited });
+        made.push({ folder: dFolder.name, produced: dProduced, draft: next.draft, inputs: next.inputs, version: rebased(dFolder, base) });
+    }
+
+    const versionOf = new Map(replaced.map((r) => [r.name, r.version]));
+    const repointed = (await unreleasedOn(ctx.project, config, (entry) => canonicalSchemaName(repo.released, entry), new Set(versionOf.keys())))
+        .map((u) => ({ ...u, versions: u.file.base.flatMap((name) => versionOf.get(name) ?? []) }));
+    if (confirm !== undefined) {
+        const lines = formatSchemaReleasePreview({ draft: own.draft, replaces: old, rebuilt, repointed });
+        // The CLI asks from the catalog's preview: the name, the version and how many are rebuilt.
+        const preview = { catalog: config.name, draft: own.draft, replaces: old, rebuilt, repointed: repointed.map((u) => u.folder), lines };
+        if (!await confirm(preview as unknown as ReleasePreview)) throw new RpackError('aborted');
+    }
+
+    for (const m of made) await ctx.project.write(`${RELEASES_DIR}/${m.produced.name}.rpack`, m.produced.text);
+    for (const m of made) await writeSchemaReleased(ctx.project, m.folder, m.inputs, formatSchemaUpgrade(m.draft));
+    for (const m of made.slice(1)) await writeVersionFile(ctx.project, m.folder, m.version);
+    for (const u of repointed) {
+        await writeVersionFile(ctx.project, u.folder, { ...u.file, base: u.file.base.map((name) => renamed.get(name) ?? name) });
+    }
+    for (const m of made) config.released.set(m.folder, m.produced.name);
+    await writeConfig(ctx.project, config);
+    const removed: string[] = [];
+    const kept = new Set(made.map((m) => m.produced.name));
+    for (const r of replaced) {
+        const stored = repo.stored.get(r.name);
+        if (stored === undefined || kept.has(r.name)) continue;
+        await ctx.project.remove(stored.path);
+        removed.push(stored.path);
+    }
+
+    const lines = [`re-released ${produced.name}: wrote ${RELEASES_DIR}/${produced.name}.rpack and ${releasedPath(folder.name)}/`];
+    for (const m of made.slice(1)) lines.push(`re-released ${m.produced.name} on it, from ${workPath(m.folder)}/`);
+    if (removed.length > 0) lines.push(`removed ${removed.join(', ')}`);
+    for (const u of repointed) {
+        lines.push(`${workPath(u.folder, VERSION_FILE)} now names the new releases; ${u.folder} was written against the old ${u.versions.join(' + ')}: check it`);
+    }
+    lines.push('', ...schemaRereleaseWarning(replaced));
+    return { produced, draft: own.draft, rebuilt: made.slice(1).map((m) => m.produced), lines };
 }
 
 async function logSchemaReleases(ctx: RpackContext, config: RpackConfig): Promise<string[]> {

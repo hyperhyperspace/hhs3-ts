@@ -206,6 +206,16 @@ export class ReleasedSchemas {
         }
     }
 
+    // These releases without the steps `hashes` name. A step built on a
+    // dropped one has to be dropped with it.
+    without(hashes: Iterable<B64Hash>): ReleasedSchemas {
+        const dropped = new Set(hashes);
+        const copy = new ReleasedSchemas(this.schemaName);
+        for (const [hash, step] of this.stepsByHash) if (!dropped.has(hash)) copy.stepsByHash.set(hash, step);
+        for (const [hash, info] of this.infos) if (!dropped.has(hash)) copy.infos.set(hash, info);
+        return copy;
+    }
+
     addStep(name: string, step: SchemaReleaseStep): ReleaseInfo {
         this.stepsByHash.set(step.hash, step);
         const tag = releaseTag(step.hash);
@@ -570,6 +580,56 @@ export function formatSchemaDraft(plan: SchemaReleaseDraft): string[] {
     return lines;
 }
 
+// A released version built on a re-released one, made again on it.
+export type RebuiltSchemaRelease = {
+    folder: string;
+    replaces: ReleaseInfo;
+    draft: SchemaReleaseDraft;
+    // The folder no longer makes `replaces`.
+    edited: boolean;
+};
+
+// What a schema re-release would do, shown before anything is written.
+export type SchemaReleasePreview = {
+    draft: SchemaReleaseDraft;
+    replaces: ReleaseInfo;
+    rebuilt: RebuiltSchemaRelease[];
+    // The unreleased folders whose version.json names a replaced release, and
+    // the versions of the ones each names.
+    repointed: { folder: string; versions: string[] }[];
+};
+
+// A re-release replaces the files in this repository. The copies a registry
+// or a catalog took are theirs.
+export function schemaRereleaseWarning(replaced: ReleaseInfo[]): string[] {
+    const one = replaced.length === 1;
+    return [
+        `Warning: copies of ${replaced.map((r) => r.name).join(' and ')} that were published or imported are not replaced.`,
+        `  A registry that holds ${one ? 'it' : 'one'} refuses the new release of that version until the old file is removed from it.`,
+        `  A catalog that imported ${one ? 'it' : 'one'} keeps it until its copy in imports/ and its lock in rpack.json are removed and it imports again.`,
+        `  A catalog released on the old ${one ? 'one' : 'ones'} has to be re-released on the new ${one ? 'one' : 'ones'}.`,
+    ];
+}
+
+export function formatSchemaReleasePreview(preview: SchemaReleasePreview): string[] {
+    const { draft, replaces, rebuilt, repointed } = preview;
+    const warnings = (plan: SchemaReleaseDraft) => (plan.warnings.length > 0 ? ['', 'warnings', ...plan.warnings.map((w) => `  ${w}`)] : []);
+    const lines = [`Re-releasing ${draft.version} replaces ${replaces.name}.`, ...warnings(draft)];
+    if (rebuilt.length > 0) {
+        const n = rebuilt.length;
+        lines.push('', `It also re-releases ${n} ${n === 1 ? 'release' : 'releases'} built on it:`);
+        for (const r of rebuilt) {
+            lines.push(`  ${r.draft.version}  replaces ${r.replaces.name}${r.edited ? '  (changed since release)' : ''}`);
+            lines.push(...[...formatSchemaDraftSql(r.draft), ...warnings(r.draft)].map((l) => (l === '' ? '' : `    ${l}`)));
+        }
+    }
+    for (const { folder, versions } of repointed) {
+        lines.push('', `work/${folder}/ is written against the old ${versions.join(' + ')}; its version.json will name the new one: check it.`);
+    }
+    lines.push('', ...schemaRereleaseWarning([replaces, ...rebuilt.map((r) => r.replaces)]));
+    return lines;
+}
+
 export type ProducedSchemaRelease = {
     hash: B64Hash;
     version: string;
@@ -577,6 +637,27 @@ export type ProducedSchemaRelease = {
     file: SchemaReleaseFile;
     text: string;
 };
+
+// The step a draft makes. A step is unsigned, so its hash is known without
+// producing the release: two drafts make the same release when it is equal.
+export function schemaStepOf(draft: SchemaReleaseDraft, options: { note?: string } = {}): SchemaReleaseStep {
+    const stepBody: Omit<SchemaReleaseStep, 'hash'> = draft.first
+        ? {
+            parents: [],
+            version: draft.version,
+            ...(draft.params.length > 0 ? { params: draft.params } : {}),
+            tables: [...draft.desired.tables.values()],
+            ...(options.note !== undefined ? { note: options.note } : {}),
+        }
+        : {
+            parents: draft.parents.map((p) => p.hash).sort(),
+            version: draft.version,
+            ...(draft.params.length > 0 ? { params: draft.params } : {}),
+            ...(draft.rules.length > 0 ? { migration: draft.rules.map((r) => r.rule) } : {}),
+            ...(options.note !== undefined ? { note: options.note } : {}),
+        };
+    return { hash: schemaStepHash(draft.schema, stepBody), ...stepBody };
+}
 
 export async function produceSchemaRelease(
     draft: SchemaReleaseDraft,
@@ -587,25 +668,9 @@ export async function produceSchemaRelease(
         throw new Error(`the draft has refusals:\n${draft.refusals.map((r) => r.message).join('\n')}`);
     }
 
-    const parentHashes = draft.parents.map((p) => p.hash).sort();
-    const stepBody: Omit<SchemaReleaseStep, 'hash'> = draft.first
-        ? {
-            parents: [],
-            version: draft.version,
-            ...(draft.params.length > 0 ? { params: draft.params } : {}),
-            tables: [...draft.desired.tables.values()],
-            ...(options.note !== undefined ? { note: options.note } : {}),
-        }
-        : {
-            parents: parentHashes,
-            version: draft.version,
-            ...(draft.params.length > 0 ? { params: draft.params } : {}),
-            ...(draft.rules.length > 0 ? { migration: draft.rules.map((r) => r.rule) } : {}),
-            ...(options.note !== undefined ? { note: options.note } : {}),
-        };
-
-    const hash = schemaStepHash(draft.schema, stepBody);
-    const step: SchemaReleaseStep = { hash, ...stepBody };
+    const step = schemaStepOf(draft, options);
+    const hash = step.hash;
+    const parentHashes = step.parents;
     const priorSteps = draft.first ? [] : released.stepsClosure(parentHashes);
     const steps = [...priorSteps, step];
 

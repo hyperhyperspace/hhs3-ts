@@ -147,7 +147,8 @@ export async function publishToRegistry(
         const m = entry.file.manifest;
         const clash = existing.find((e) => e.file.manifest.version === m.version && e.file.manifest.release !== m.release);
         if (clash !== undefined) {
-            throw new Error(`'${config.name}' ${m.version} is already in the registry with a different hash (#${releaseTag(clash.file.manifest.release)})`);
+            throw new Error(`'${config.name}' ${m.version} is already in the registry with a different hash (#${releaseTag(clash.file.manifest.release)}): `
+                + `to replace it, remove ${clash.path} from the registry and publish again`);
         }
         const outName = releaseFileName(m.name, m.version, m.release);
         const dest = `${regDir}/${outName}`;
@@ -204,17 +205,22 @@ export async function importSchemaFromRegistry(
         throw new Error(`schema '${schemaName}' ${schemaFile.manifest.version} in the registry is invalid: ${report.problems.join('; ')}`);
     }
 
-    const importFileName = releaseFileName(schemaFile.manifest.name, schemaFile.manifest.version, schemaFile.manifest.release);
+    // The lock is checked before anything is written, so a refused import
+    // leaves imports/ as it was.
+    const { name, version, release } = schemaFile.manifest;
+    const existingLock = config.imports?.[schemaName]?.[version];
+    if (existingLock !== undefined && existingLock !== release) {
+        throw new Error(`${CONFIG_FILE} already locks ${schemaName} ${version} at #${releaseTag(existingLock)}, not #${releaseTag(release)}: `
+            + `to take the new one, remove that entry from "imports" in ${CONFIG_FILE} and ${IMPORTS_DIR}/${releaseFileName(name, version, existingLock)}, then import again`);
+    }
+
+    const importFileName = releaseFileName(name, version, release);
     const importPath = `${IMPORTS_DIR}/${importFileName}`;
     await project.write(importPath, serializeReleaseFile(schemaFile));
 
     if (config.imports === undefined) config.imports = {};
     if (config.imports[schemaName] === undefined) config.imports[schemaName] = {};
-    const existingLock = config.imports[schemaName][schemaFile.manifest.version];
-    if (existingLock !== undefined && existingLock !== schemaFile.manifest.release) {
-        throw new Error(`${CONFIG_FILE} already locks ${schemaName} ${schemaFile.manifest.version} at #${releaseTag(existingLock)}, not #${releaseTag(schemaFile.manifest.release)}`);
-    }
-    config.imports[schemaName][schemaFile.manifest.version] = schemaFile.manifest.release;
+    config.imports[schemaName][version] = release;
     await project.write(CONFIG_FILE, formatRpackConfig(config));
 
     const updatedSource = await rewriteImportStatement(project, config, sourceText, schemaName, schemaFile);

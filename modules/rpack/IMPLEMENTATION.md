@@ -219,6 +219,12 @@ comments/
 
 `target-schema.sql` is a single `CREATE SCHEMA` whose name matches `rpack.json`. `CREATORS` is omitted. `rpack new` in a schema repository writes the merged `CREATE SCHEMA` into that file. A version that produces neither migration rules nor new parameter declarations is refused, including a merge that adds neither. Major versions 1000 and above are refused: that range belongs to catalog-local patches.
 
+A released folder is drafted as a catalog's is: among the releases without its own and the ones built on it. A schema step is unsigned, so `rpack` knows the hash of the step a draft makes without producing the file. The folder still makes its release when that hash is the release's. The hash covers the base, the note, the tables or migration rules, and the parameters; comments, layout and the spelling of a rule do not count. `status` says `changed since release` and `build` names `rpack release --force` when it differs. `.released/` is the record of what was released and is not read for this.
+
+`rpack release --force` in a released schema folder follows the rules of [Making a release again](#making-a-release-again): the new release is drafted without the old one and its dependents, each released dependent is made again from its own folder on the remapped base, one that has no folder or does not build fails the whole re-release, and the old files are removed last. No key is needed, so every release is made before the preview, and the preview asks once. It lists each replacement, a dependent's rules and warnings, and the unreleased folders built on them. Without a terminal, a re-release that has dependents needs `--yes`.
+
+A re-release reaches only this repository. The preview and the result end with a warning about the copies others took: a registry that holds the old file, a catalog that imported it, and a catalog released on it. Those are replaced by hand (see [The registry](#the-registry)).
+
 A schema `.rpack` file has `manifest.kind` set to `"schema"` and carries the steps in its causal past. Every step in the file has a distinct version string. Per-slot resolution then never falls through to an entry-hash tie between two concurrent steps of one pack, and the pack resolves the same way in every catalog that replays it.
 
 ```json
@@ -267,9 +273,9 @@ Publish and pull need a place both tools can read without a service. The registr
 
 `rpack` resolves it from `--registry`, then `$HHS_REGISTRY`, then `rpack.json`'s `registry` relative to the repository, then `~/.hhs/registry`. `rhost` uses the flag, then `$HHS_REGISTRY`, then `~/.hhs/registry`. It has no `rpack.json`.
 
-`rpack publish` verifies the named release, or every release in `released` when the name is omitted, and copies the file to `<registry>/<name with colons as slashes>/`. It refuses a directory that already holds the other kind, schema or catalog, or another catalog id under that name.
+`rpack publish` verifies the named release, or every release in `released` when the name is omitted, and copies the file to `<registry>/<name with colons as slashes>/`. It refuses a directory that already holds the other kind, schema or catalog, or another catalog id under that name. It also refuses a version the registry already holds with another hash, which is what a re-release makes, and names the file to remove from the registry first.
 
-`rpack import` runs in a catalog version folder. It finds the schema in the registry, the highest version when none is named, and refuses a catalog file. It copies the file into `imports/`, sets `imports[schema][version]` to the step hash, and inserts or updates `IMPORT SCHEMA` in `target-catalog.sql`. Importing a version that descends from one already listed replaces the ancestor. Importing a concurrent branch lists both versions.
+`rpack import` runs in a catalog version folder. It finds the schema in the registry, the highest version when none is named, and refuses a catalog file. It copies the file into `imports/`, sets `imports[schema][version]` to the step hash, and inserts or updates `IMPORT SCHEMA` in `target-catalog.sql`. Importing a version that descends from one already listed replaces the ancestor. Importing a concurrent branch lists both versions. A version already locked at another hash is refused before anything is written. The refusal names the lock in `rpack.json` and the file in `imports/` to remove, which is how a catalog takes a re-released schema. A catalog already released on the old one is then re-released itself.
 
 `rhost init --catalog <name> [--version <v>]` resolves a catalog file the same way, refuses a schema, copies it into `catalogs/`, asks for any parameter the flags leave out, and writes `app.json`. Identity parameters default to `$me`. `rhost init --release <file>` copies the given files and writes no keys.
 

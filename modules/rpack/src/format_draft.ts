@@ -231,9 +231,13 @@ export type ReleasePreview = {
     replaces?: ReleaseInfo;
     rebuilt: RebuiltRelease[];
     repointed: string[];
+    // Set by a schema repository: the preview as it prints. A schema draft
+    // has no count to make it from.
+    lines?: string[];
 };
 
 export function formatReleasePreview(preview: ReleasePreview): string[] {
+    if (preview.lines !== undefined) return preview.lines;
     const replaced = preview.replaces;
     if (replaced === undefined) return formatReleaseConfirm(preview.draft);
     const lines = [`Re-releasing ${preview.draft.version} replaces ${replaced.name}.`, ...formatReleaseConfirm(preview.draft)];

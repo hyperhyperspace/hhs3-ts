@@ -5,12 +5,13 @@ import {
     type RpackContext,
 } from "../src/commands.js";
 import { isSchemaReleaseFile, parseAnyReleaseFile, parseReleaseFile, parseSchemaReleaseFile } from "../src/format.js";
+import { formatReleasePreview, type ReleasePreview } from "../src/format_draft.js";
 import { MemoryProject, parseRpackConfig, SCHEMA_SOURCE_FILE, SOURCE_FILE, UPGRADE_MANUAL_FILE, workPath } from "../src/project.js";
 import { readLockedImports, resolveCatalogInRegistry } from "../src/registry.js";
 import { readSource } from "../src/source.js";
 import { verifyRelease } from "../src/verify.js";
 import { writeSource } from "../src/write_source.js";
-import { devKeys, PASSPHRASE } from "./fixtures.js";
+import { devKeys, expectThrows, PASSPHRASE } from "./fixtures.js";
 
 const COMMENTS_100 = `CREATE SCHEMA hhs:comments PARAMS (:maxLen integer DEFAULT 200) AS (
   TABLE comments (
@@ -105,6 +106,8 @@ export const composabilityTests = [
             // Status and log work in a schema repo
             const st = await statusOf(ctx, '1.1.0');
             assertTrue(st.lines.join('\n').includes('hhs:comments 1.1.0'), 'status prints schema header');
+            assertEquals(st.draft.refusals.length, 0, `the released folder's status is not refused:\n${st.lines.join('\n')}`);
+            assertEquals(st.lines[4], `Released as ${r110.produced.name}`, 'status names the release made from the folder');
             const log = await logReleases(ctx);
             assertEquals(log.length, 2, 'log lists 1.0.0 and 1.1.0');
 
@@ -634,6 +637,212 @@ CREATE CATALOG blog CREATORS ($dev) AS (
             const introduced = await buildVersion(addedCtx, '1.1.0');
             assertTrue(introduced.draft.warnings.some((w) => w.includes('overridden by the local ALTER SCHEMA patch') && w.includes('restrictions') && w.includes('1.2.0')),
                 `an override added with the upstream change warns: ${introduced.draft.warnings.join('; ')}`);
+        },
+    },
+    {
+        name: '[RPACK28] a released schema folder: status and build work in it, and the step it makes decides whether it changed since release',
+        invoke: async () => {
+            const project = new MemoryProject();
+            const ctx: RpackContext = { project };
+            await initProject(project, 'hhs:comments', '', { kind: 'schema' });
+            await newVersion(ctx, '1.0.0');
+            await project.write(workPath('1.0.0', SCHEMA_SOURCE_FILE), COMMENTS_100);
+            const r100 = (await releaseVersion(ctx, '1.0.0')).produced.name;
+
+            // The first version, when releases/ holds its release alone
+            const first = await statusOf(ctx, '1.0.0');
+            assertEquals(first.draft.refusals.length, 0, `the first version's status is not refused:\n${first.lines.join('\n')}`);
+            assertEquals(first.lines[4], `Released as ${r100}`, 'status names the release');
+            const built = await buildVersion(ctx, '1.0.0');
+            assertEquals(built.matches, true, `build makes the release:\n${built.lines.join('\n')}`);
+            assertEquals(built.lines[1], `work/1.0.0/ still makes ${r100}`, 'and says so');
+
+            // ...and with a release built on it
+            await newVersion(ctx, '1.1.0');
+            await project.write(workPath('1.1.0', SCHEMA_SOURCE_FILE), COMMENTS_110);
+            const r110 = (await releaseVersion(ctx, '1.1.0')).produced.name;
+            const under = await statusOf(ctx, '1.0.0');
+            assertEquals(under.draft.refusals.length, 0, `1.0.0 under 1.1.0 is not refused:\n${under.lines.join('\n')}`);
+            assertEquals(under.lines[4], `Released as ${r100}`, '1.0.0 is as released with 1.1.0 built on it');
+            assertEquals((await statusOf(ctx, '1.1.0')).lines[4], `Released as ${r110}`, '1.1.0 is as released');
+
+            // Comments and layout are not part of the step
+            await project.write(workPath('1.0.0', SCHEMA_SOURCE_FILE), `-- the comments schema\n${COMMENTS_100.replace('body string PUB,', 'body   string   PUB,')}`);
+            assertEquals((await statusOf(ctx, '1.0.0')).lines[4], `Released as ${r100}`, 'a comment and spacing leave the folder as released');
+            assertEquals((await buildVersion(ctx, '1.0.0')).matches, true, 'and build still makes the release');
+
+            // A column is
+            await project.write(workPath('1.1.0', SCHEMA_SOURCE_FILE), COMMENTS_110.replace('pinned boolean NULL', 'pinned boolean NULL,\n    lang string NULL'));
+            const changed = await statusOf(ctx, '1.1.0');
+            assertEquals(changed.draft.refusals.length, 0, `the changed folder still drafts:\n${changed.lines.join('\n')}`);
+            assertEquals(changed.lines[4], `Released as ${r110}; changed since release`, 'a new column is a change');
+            const rebuilt = await buildVersion(ctx, '1.1.0');
+            assertEquals(rebuilt.matches, false, 'build makes another release');
+            assertEquals(rebuilt.lines[1], `work/1.1.0/ no longer makes ${r110}: rpack release --force re-releases 1.1.0`, 'and names the way out');
+
+            // ...and so is the note
+            await project.write(workPath('1.1.0', SCHEMA_SOURCE_FILE), COMMENTS_110);
+            assertEquals((await statusOf(ctx, '1.1.0')).lines[4], `Released as ${r110}`, 'the source as released again');
+            const versionPath = workPath('1.1.0', 'version.json');
+            const versionText = project.files.get(versionPath)!;
+            await project.write(versionPath, JSON.stringify({ ...JSON.parse(versionText), note: 'pins' }));
+            assertEquals((await statusOf(ctx, '1.1.0')).lines[4], `Released as ${r110}; changed since release`, 'a new note is a change');
+            await project.write(versionPath, versionText);
+
+            // A source that can't be read keeps the header
+            await project.write(workPath('1.0.0', SCHEMA_SOURCE_FILE), 'CREATE SCHEMA hhs:comments AS (');
+            await expectRpackError(() => statusOf(ctx, '1.0.0'), (err) => {
+                assertEquals(err.lines[4], `Released as ${r100}`, `the failure names the release:\n${err.lines.join('\n')}`);
+                assertEquals(err.lines[6], 'Error assembling 1.0.0', `then that it could not be assembled:\n${err.lines.join('\n')}`);
+            }, 'an unreadable source in a released folder');
+        },
+    },
+    {
+        name: '[RPACK29] schema re-release: --force replaces a release and makes the ones built on it again; no writes nothing, and one that does not build fails it',
+        invoke: async () => {
+            const project = new MemoryProject();
+            const ctx: RpackContext = { project };
+            const snapshot = () => JSON.stringify([...project.files.entries()].sort());
+            const baseOf = (folder: string) => (JSON.parse(project.files.get(workPath(folder, 'version.json'))!).base as string[]).join(',');
+            await initProject(project, 'hhs:comments', '', { kind: 'schema' });
+            await newVersion(ctx, '1.0.0');
+            await project.write(workPath('1.0.0', SCHEMA_SOURCE_FILE), COMMENTS_100);
+            const r100 = (await releaseVersion(ctx, '1.0.0')).produced.name;
+            await newVersion(ctx, '1.1.0');
+            await project.write(workPath('1.1.0', SCHEMA_SOURCE_FILE), COMMENTS_110);
+            const r110 = (await releaseVersion(ctx, '1.1.0')).produced.name;
+            await newVersion(ctx, '1.2.0');
+            assertEquals(baseOf('1.2.0'), r110, 'the unreleased 1.2.0 is on 1.1.0');
+
+            // A released folder needs --force, and an unchanged one has nothing to re-release
+            const asReleased = snapshot();
+            await expectThrows(() => releaseVersion(ctx, '1.0.0'), `1.0.0 is released as ${r100}; rpack release --force re-releases it`, 'a released folder without --force');
+            await expectThrows(() => releaseVersion(ctx, '1.0.0', undefined, { force: true }), `nothing to re-release: work/1.0.0/ makes ${r100} as it is`,
+                'an unchanged folder has nothing to re-release');
+            assertEquals(snapshot(), asReleased, 'neither writes anything');
+
+            // 1.0.0 gets a column, and 1.1.0's source takes it too
+            const withLang = (source: string) => source.replace('len integer READONLY', 'len integer READONLY,\n    lang string NULL');
+            await project.write(workPath('1.0.0', SCHEMA_SOURCE_FILE), withLang(COMMENTS_100));
+            await project.write(workPath('1.1.0', SCHEMA_SOURCE_FILE), withLang(COMMENTS_110));
+            const edited = snapshot();
+
+            await expectThrows(() => releaseVersion(ctx, '1.0.0', undefined, { force: true }), '--yes', 'without a confirm, releases built on it need --yes');
+            let preview: ReleasePreview | undefined;
+            await expectThrows(() => releaseVersion(ctx, '1.0.0', undefined, { force: true, confirm: async (p) => { preview = p; return false; } }), 'aborted', 'no aborts');
+            assertEquals(snapshot(), edited, 'no writes nothing');
+            const shown = formatReleasePreview(preview!).join('\n');
+            assertTrue(shown.startsWith(`Re-releasing 1.0.0 replaces ${r100}.\n`), `the preview names the release it replaces:\n${shown}`);
+            assertTrue(shown.includes(`It also re-releases 1 release built on it:\n  1.1.0  replaces ${r110}  (changed since release)\n`), `and the one built on it:\n${shown}`);
+            assertTrue(shown.includes('ADD COLUMN comments.pinned boolean NULL') && !shown.includes('COLUMN comments.lang'),
+                `with the rules it has on the new 1.0.0:\n${shown}`);
+            assertTrue(shown.includes('work/1.2.0/ is written against the old 1.1.0; its version.json will name the new one: check it.'), `and the unreleased folder on it:\n${shown}`);
+            assertTrue(shown.includes(`Warning: copies of ${r100} and ${r110} that were published or imported are not replaced.`), `and warns about the copies:\n${shown}`);
+            assertEquals(preview!.catalog, 'hhs:comments', 'the question can name the schema');
+            assertEquals(preview!.rebuilt.length, 1, 'and how many are built on it');
+
+            // Yes re-releases both
+            const done = await releaseVersion(ctx, '1.0.0', undefined, { force: true, confirm: async () => true });
+            const n100 = done.produced.name;
+            const n110 = done.rebuilt[0]!.name;
+            assertTrue(n100 !== r100 && n110 !== r110, 'both releases are new');
+            assertEquals((await project.list('releases')).sort().join(','), [`${n100}.rpack`, `${n110}.rpack`].sort().join(','), 'the old files are gone');
+            for (const name of [n100, n110]) assertTrue((await verifyRelease(project.files.get(`releases/${name}.rpack`)!)).ok, `${name} verifies`);
+            const steps110 = parseSchemaReleaseFile(project.files.get(`releases/${n110}.rpack`)!).steps.map((s) => s.hash).join(',');
+            assertEquals(steps110, [done.produced.hash, done.rebuilt[0]!.hash].join(','), '1.1.0 ships the new 1.0.0 step and its own');
+            const config = parseRpackConfig(project.files.get('rpack.json')!);
+            assertEquals([config.released.get('1.0.0'), config.released.get('1.1.0')].join(','), [n100, n110].join(','), 'rpack.json names the new releases');
+            assertEquals(baseOf('1.1.0'), n100, "1.1.0's version.json names the new 1.0.0");
+            assertEquals(baseOf('1.2.0'), n110, "the unreleased folder's names the new 1.1.0");
+            assertEquals(project.files.get(workPath('1.0.0', '.released/target-schema.sql')), withLang(COMMENTS_100), '.released/ holds the source as it is now');
+            assertEquals((await statusOf(ctx, '1.0.0')).lines[4], `Released as ${n100}`, '1.0.0 is as released');
+            assertEquals((await statusOf(ctx, '1.1.0')).lines[4], `Released as ${n110}`, 'and so is 1.1.0');
+            assertEquals((await statusOf(ctx, '1.2.0')).lines[3], `Base: 1.1.0 (${n110.slice(n110.lastIndexOf('-') + 1)})`, 'the unreleased folder is on the new 1.1.0');
+            const said = done.lines.join('\n');
+            assertTrue(said.includes(`removed releases/${r100}.rpack, releases/${r110}.rpack`), `the result names the removed files:\n${said}`);
+            assertTrue(said.includes(`Warning: copies of ${r100} and ${r110} that were published or imported are not replaced.`), `and warns about the copies:\n${said}`);
+
+            // 1.0.0 now holds all of 1.1.0, so 1.1.0 has nothing to release on it
+            await project.write(workPath('1.0.0', SCHEMA_SOURCE_FILE), withLang(COMMENTS_110));
+            const stable = snapshot();
+            await expectRpackError(() => releaseVersion(ctx, '1.0.0', undefined, { force: true, yes: true }), (err) => {
+                assertEquals(err.message, "1.1.0 doesn't build on the new 1.0.0; nothing was written", 'a release built on it that does not build fails it');
+                assertTrue(err.lines.join('\n').includes('nothing to release'), `with the reason:\n${err.lines.join('\n')}`);
+            }, 'a dependent that does not build');
+            assertEquals(snapshot(), stable, 'and nothing is written');
+        },
+    },
+    {
+        name: '[RPACK30] after a schema re-release: publish and import refuse the new release and name what to remove; with that removed by hand both go through',
+        invoke: async () => {
+            const dev = await devKeys();
+            const unlock = (label: string) => dev.vault.unlock(label, PASSPHRASE);
+            const registry = new MemoryProject();
+
+            const schemaProj = new MemoryProject();
+            const schemaCtx: RpackContext = { project: schemaProj };
+            await initProject(schemaProj, 'hhs:comments', '', { kind: 'schema' });
+            await newVersion(schemaCtx, '1.0.0');
+            await schemaProj.write(workPath('1.0.0', SCHEMA_SOURCE_FILE), COMMENTS_100);
+            const old = (await releaseVersion(schemaCtx, '1.0.0')).produced.name;
+            await publishRelease(schemaProj, registry);
+
+            // A catalog imports it and is released on it
+            const catProj = new MemoryProject();
+            const catCtx: RpackContext = { project: catProj, vault: dev.vault };
+            await initProject(catProj, 'blog', 'dev');
+            await newVersion(catCtx, '1.0.0');
+            await importSchema(catProj, registry, '1.0.0', 'hhs:comments', '1.0.0');
+            await catProj.write(workPath('1.0.0', SOURCE_FILE), `IMPORT SCHEMA hhs:comments VERSION '1.0.0';
+
+CREATE SCHEMA blog:posts AS (
+  TABLE articles (
+    title string PUB
+  )
+);
+
+CREATE CATALOG blog CREATORS ($dev) AS (
+  TABLEGROUP posts USING SCHEMA blog:posts,
+  TABLEGROUP post_comments USING SCHEMA hhs:comments
+    BIND target => posts (items => articles)
+);
+`);
+            const blog = (await releaseVersion(catCtx, '1.0.0', unlock)).produced.name;
+
+            // The schema's 1.0.0 is re-released with a column. With nothing built on it, nothing asks
+            await schemaProj.write(workPath('1.0.0', SCHEMA_SOURCE_FILE), COMMENTS_100.replace('len integer READONLY', 'len integer READONLY,\n    lang string NULL'));
+            const redone = await releaseVersion(schemaCtx, '1.0.0', undefined, { force: true });
+            const now = redone.produced.name;
+            assertTrue(redone.lines.join('\n').includes(`Warning: copies of ${old} that were published or imported are not replaced.`),
+                `the result warns about the copies:\n${redone.lines.join('\n')}`);
+
+            // The registry holds the old 1.0.0
+            const inRegistry = `hhs/comments/${old}.rpack`;
+            await expectThrows(() => publishRelease(schemaProj, registry), `to replace it, remove ${inRegistry} from the registry and publish again`,
+                'publishing over the old release');
+            assertEquals((await registry.list('hhs/comments')).join(','), `${old}.rpack`, 'the registry is as it was');
+            await registry.remove(inRegistry);
+            await publishRelease(schemaProj, registry);
+            assertEquals((await registry.list('hhs/comments')).join(','), `${now}.rpack`, 'with the old file removed, the new one is published');
+
+            // The catalog locks the old 1.0.0
+            await expectThrows(() => importSchema(catProj, registry, '1.0.0', 'hhs:comments', '1.0.0'),
+                `remove that entry from "imports" in rpack.json and imports/${old}.rpack, then import again`, 'importing over the lock');
+            assertEquals((await catProj.list('imports')).join(','), `${old}.rpack`, 'a refused import leaves imports/ as it was');
+            const config = JSON.parse(catProj.files.get('rpack.json')!);
+            delete config.imports['hhs:comments']['1.0.0'];
+            await catProj.write('rpack.json', JSON.stringify(config, null, 2));
+            await catProj.remove(`imports/${old}.rpack`);
+            const imported = await importSchema(catProj, registry, '1.0.0', 'hhs:comments', '1.0.0');
+            assertEquals(imported.file.manifest.release, redone.produced.hash, 'with the lock and the copy removed, the new release is imported');
+
+            // The catalog was released on the old one, and is re-released on the new one
+            const built = await buildVersion(catCtx, '1.0.0');
+            assertEquals(built.draft.refusals.length, 0, `the catalog builds on the new schema:\n${built.lines.join('\n')}`);
+            assertEquals(built.matches, false, 'its update.sql is no longer the released one');
+            const again = await releaseVersion(catCtx, '1.0.0', unlock, { force: true, confirm: async () => true });
+            assertTrue(again.produced.name !== blog, 'the catalog is re-released');
+            assertTrue((await verifyRelease(catProj.files.get(`releases/${again.produced.name}.rpack`)!)).ok, 'and its file verifies');
         },
     },
 ];
