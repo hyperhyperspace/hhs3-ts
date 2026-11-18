@@ -131,14 +131,14 @@ export const LANG_COMMAND_REFS: readonly LangCommandRef[] = [
         section: 'data',
         kind: 'insert',
         syntax: 'INSERT INTO [[db.]group.]table (col, ...) VALUES (value, ...) [BY author] [AT version];',
-        description: 'Inserts a row into a table. Supply uuid for deterministic row identity. For REFERENCES columns, pass the FK value as a #rowIdPrefix of the target row. Write json values as JSON \'<json text>\' (no null inside).',
+        description: 'Inserts a row into a table. Supply uuid for deterministic row identity. For REFERENCES columns, pass the FK value as a #rowIdPrefix of the target row. Write json values as JSON \'<json text>\' (no null inside). NULL sets a nullable column to NULL, also where it has a DEFAULT; a column left out gets its DEFAULT.',
     },
     {
         command: 'UPDATE',
         section: 'data',
         kind: 'update',
         syntax: 'UPDATE [[db.]group.]table SET col = value [, ...] WHERE rowId = #prefix [BY author] [AT version];',
-        description: 'Updates columns on an existing row, identified by rowId hash prefix.',
+        description: 'Updates columns on an existing row, identified by rowId hash prefix. SET col = NULL clears a nullable column.',
     },
     {
         command: 'DELETE',
@@ -171,7 +171,7 @@ export const LANG_COMMAND_REFS: readonly LangCommandRef[] = [
             '  [LIMIT n] [OFFSET n]',
             '  [AT version] [FROM version];',
         ].join('\n'),
-        description: 'Queries rows from a table at an optional view frontier. Read-only.',
+        description: 'Queries rows from a table at an optional view frontier. Read-only. col IS NULL holds for a column with no value, and col IS NOT NULL for one with a value; a comparison with a column that has no value is false, so use IS NULL, not = NULL.',
     },
     {
         command: 'SET VIEW',

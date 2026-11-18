@@ -9,7 +9,7 @@ import { deriveRowId } from "../src/rtable/hash.js";
 import type { TableDef, Where } from "../src/rschema/payload.js";
 import type { Row, RTableView } from "../src/rtable/interfaces.js";
 import type { TruthTableView } from "../src/rtable/view.js";
-import { existsOnView, evaluatePredicate } from "../src/rtable_group/predicates.js";
+import { existsOnView, evaluatePredicate, evaluateRowOpRestriction } from "../src/rtable_group/predicates.js";
 import type { ColumnTypes, RowFilter, RowQuery } from "../src/rtable/query.js";
 import { evalRowFilter, orderRows, projectRow, validateRowQuery } from "../src/rtable/query.js";
 import { likeMatch, isValidLikePattern } from "../src/rschema/expr.js";
@@ -106,6 +106,44 @@ async function createTicketsGroup() {
         name: 'tickets-test', seed: 'tickets-test', schemaRef: schema.getId(), schemaVersion: pinned,
     });
     const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
+    return { ctx, group, admin };
+}
+
+// Notes with nullable columns: `memo` has no default, `tag` has one, and the
+// readonly `origin` has one too and is read by the update rule.
+function notesTable(): TableDef {
+    return {
+        name: 'notes',
+        columns: {
+            title: { type: 'string' },
+            memo: { type: 'string', nullable: true },
+            tag: { type: 'string', nullable: true, default: 'none' },
+            origin: { type: 'string', nullable: true, readonly: true, default: 'web' },
+        },
+        concurrentDeletes: false,
+        restrictions: [
+            { on: 'insert', rule: { p: 'true' } },
+            { on: 'update', rule: { p: 'cmp', cmp: 'eq', left: { col: 'origin' }, right: { lit: 'web' } } },
+        ],
+    };
+}
+
+async function createNotesGroup(authors: OwnIdentity[]) {
+    const ctx = createMockRContext({ selfValidate: true });
+    ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
+    ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
+
+    const admin = await makeIdentity();
+    const schema = (await ctx.createObject(await RSchemaImpl.create({
+        name: 'notebook',
+        creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
+        tables: [notesTable(), identitiesTableDef()],
+    }))) as RSchemaImpl;
+    const group = (await ctx.createObject(await RTableGroupImpl.create({
+        name: 'notes-test', seed: 'notes-test', schemaRef: schema.getId(),
+        schemaVersion: await (await schema.getScopedDag()).getFrontier(),
+        ...localIdentityProvider(authors),
+    }))) as RTableGroupImpl;
     return { ctx, group, admin };
 }
 
@@ -631,6 +669,74 @@ export const rtableQueryTests = {
                         });
                         assertEquals(result, expected, `${label}: ${JSON.stringify(where)}`);
                     }
+                }
+            }
+        },
+        {
+            name: '[QRY13] isNull: a column with no value, whether nulled or never written, and rowAuthor on anonymous rows',
+            invoke: async () => {
+                // the pure evaluator
+                const some = row('r1', { kind: 'fruit', qty: 3 }, 'alice');
+                const none = row('r2', { kind: 'fruit' });
+                assertFalse(evalRowFilter({ p: 'isNull', col: 'qty' }, some), 'a column with a value is not null');
+                assertTrue(evalRowFilter({ p: 'isNull', col: 'qty' }, none), 'a column the row lacks is null');
+                assertTrue(evalRowFilter({ p: 'not', arg: { p: 'isNull', col: 'qty' } }, some), 'not isNull holds for a value');
+                assertTrue(evalRowFilter({ p: 'isNull', col: 'rowAuthor' }, none), 'an anonymous row has a null rowAuthor');
+                assertFalse(evalRowFilter({ p: 'isNull', col: 'rowAuthor' }, some), 'an authored row does not');
+                validateRowQuery({ where: { p: 'isNull', col: 'qty' } }, ITEM_COLUMNS);
+                validateRowQuery({ where: { p: 'not', arg: { p: 'isNull', col: 'rowAuthor' } } }, ITEM_COLUMNS);
+                expectThrow(() => validateRowQuery({ where: { p: 'isNull', col: 'nope' } }, ITEM_COLUMNS), 'isNull on an unknown column throws');
+                expectThrow(() => validateRowQuery({ where: { p: 'isNull', col: 7 } as unknown as RowFilter }, ITEM_COLUMNS), 'isNull needs a column name');
+
+                // the engine
+                const alice = await makeIdentity();
+                const { group } = await createNotesGroup([alice]);
+                const notes = await group.getTable('notes');
+                await notes.insert('value', { title: 'a', memo: 'm', tag: 'x' }, alice);
+                await notes.insert('never', { title: 'a' });
+                await notes.insert('nulled', { title: 'a', memo: null, tag: null });
+                await notes.insert('cleared', { title: 'a', memo: 'm', tag: 'x' }, alice);
+                await notes.update(deriveRowId('cleared', alice.keyId), { memo: null, tag: null }, alice);
+
+                const view = await notes.getView();
+                const isNull = (col: string): RowFilter => ({ p: 'isNull', col });
+                assertEquals(uuids(await view.query({ where: isNull('memo') })), 'cleared,never,nulled',
+                    'memo: nulled at insert, cleared by an update, and never written all read NULL');
+                assertEquals(uuids(await view.query({ where: isNull('tag') })), 'cleared,nulled',
+                    'tag: a row that never wrote it reads the default, so only the nulled ones are NULL');
+                assertEquals(uuids(await view.query({ where: { p: 'not', arg: isNull('tag') } })), 'never,value', 'IS NOT NULL is the rest');
+                assertEquals(uuids(await view.query({ where: isNull('rowAuthor') })), 'never,nulled', 'rowAuthor finds the anonymous rows');
+                assertEquals(uuids(await view.query({ where: { p: 'and', args: [isNull('memo'), { p: 'not', arg: isNull('rowAuthor') }] } })),
+                    'cleared', 'isNull combines with other filters');
+                assertEquals(uuids(await view.query({ where: { p: 'cmp', cmp: 'eq', left: { col: 'tag' }, right: { lit: 'none' } } })),
+                    'never', 'a comparison with the default does not match a nulled column');
+            }
+        },
+        {
+            name: '[QRY14] a view that only has the public reads puts no default back on a nulled column',
+            invoke: async () => {
+                const alice = await makeIdentity();
+                const { group } = await createNotesGroup([alice]);
+                const notes = await group.getTable('notes');
+                await notes.insert('defaulted', { title: 'a' });
+                await notes.insert('nulled', { title: 'a', origin: null });
+
+                const view = await notes.getView();
+                const publicOnly = {
+                    hasRow: (rowId: B64Hash) => view.hasRow(rowId),
+                    getAuthor: (rowId: B64Hash) => view.getAuthor(rowId),
+                    getRow: (rowId: B64Hash) => view.getRow(rowId),
+                    findRowIds: (where: { [column: string]: string }) => view.findRowIds(where),
+                } as unknown as RTableView;
+                const schemaView = (await group.getView()).getSchemaView();
+
+                // the update rule reads the readonly `origin`, whose default is 'web'
+                for (const [label, target] of [['the engine view', view], ['the public reads', publicOnly]] as const) {
+                    const allowed = (uuid: string) => evaluateRowOpRestriction(
+                        { action: 'update', rowId: deriveRowId(uuid), values: { title: 'b' } }, 'notes', schemaView, false,
+                        async () => target, async () => undefined);
+                    assertTrue(await allowed('defaulted'), `${label}: a row that never wrote origin reads the default`);
+                    assertFalse(await allowed('nulled'), `${label}: a row that nulled origin has no value there, and the default does not come back`);
                 }
             }
         },

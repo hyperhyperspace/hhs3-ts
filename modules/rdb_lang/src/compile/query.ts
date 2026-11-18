@@ -63,6 +63,10 @@ export async function lowerRowFilter(expr: PredicateExpr, context: LangBindConte
                 value: await lowerQueryOperand(expr.left, context),
                 pattern: lowerLikePattern(expr, await lowerQueryOperand(expr.pattern, context)),
             };
+        case 'isNull': {
+            const atom: RowFilter = { p: 'isNull', col: expr.column.name };
+            return expr.not ? { p: 'not', arg: atom } : atom;
+        }
         case 'not':
             return { p: 'not', arg: await lowerRowFilter(expr.arg, context) };
         case 'and':
@@ -127,7 +131,9 @@ async function lowerQueryOperand(expr: OperandExpr, context: LangBindContext): P
         case 'length':
             return { fn: 'len', args: [await lowerQueryOperand(expr.arg, context)] };
     }
-    const value = asJsonLiteral(await resolveValue(expr, context));
+    const resolved = await resolveValue(expr, context);
+    if (resolved === null) throw new Error('NULL cannot be compared: use IS NULL or IS NOT NULL');
+    const value = asJsonLiteral(resolved);
     if (!isScalarQueryLiteral(value)) throw new Error('query literal must be a string, number or boolean');
     return { lit: value };
 }
@@ -170,6 +176,9 @@ export function lowerRestrictionPredicate(expr: PredicateExpr, scope: RuleScope 
         }
         case 'in':
             throw new Error('IN is only supported inside an EXISTS filter');
+        case 'isNull':
+            // one error for IS NULL and IS NOT NULL: neither has a predicate to lower to
+            throw new Error('IS NULL is not supported in schema allow rules');
         case 'not':
             throw new Error('NOT is not supported in schema allow rules');
         case 'and':

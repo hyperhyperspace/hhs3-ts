@@ -73,7 +73,7 @@ import { validateInsertAgainstSchema, validateRowOpAgainstSchema, validateProvid
 
 import { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload, tableSigningContext, deployGateSetFormat } from "./payload.js";
 import { validateTableGroupPayloadFormat } from "./validate.js";
-import { evaluatePredicate, evaluateRowOpRestriction } from "./predicates.js";
+import { evaluatePredicate, evaluateRowOpRestriction, fkObligation } from "./predicates.js";
 import { rowTag } from "./scopes.js";
 
 // How a gate is evaluated before an observe is written: the observe's
@@ -453,9 +453,11 @@ async function validateRowEnvelope(envelope: RowEnvelopePayload, group: GroupOpH
         });
 }
 
-// Every FK column the op carries (or inherits from a default) must name a
+// Every reference the op answers for (see fkObligation: the FK columns it
+// sets, and for an insert the default of each one it leaves out) must name a
 // live target row, per `isTargetLive` (the full target ref, local or
-// `group.table`). Deletes carry no FK obligations.
+// `group.table`). Deletes carry no FK obligations, and neither does a column
+// set to NULL.
 async function fkTargetsLive(
     op: RowOpPayload,
     table: string,
@@ -468,8 +470,8 @@ async function fkTargetsLive(
     const def = schemaView.getTable(table);
 
     for (const column of Object.keys(fks)) {
-        const value = op.values[column] ?? def?.columns[column]?.default;
-        if (value === undefined) continue;             // absent (nullable): unconstrained
+        const value = fkObligation(op, column, def, true);
+        if (value === undefined) continue;             // no reference to answer for
         if (typeof value !== 'string') return validationFailure(`FK column '${column}' in table '${table}' must be a rowId string`);
 
         if (!await isTargetLive(fks[column], value)) {

@@ -12,6 +12,7 @@ import {
 
 import { AdapterConfig } from "../src/types.js";
 import { rowActionsForDelta, tableRowActions } from "../src/row_actions.js";
+import { rowToUpsertAction } from "../src/project.js";
 
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
@@ -304,6 +305,102 @@ export const rowActionsTests = {
                 assertEquals(a.values['grantee_key_id'], 'KHASH', 'identity value is the key hash under <col>_key_id');
                 assertEquals(a.values['label'], 'manager', 'plain column passes through');
                 assertTrue(!('grantee' in a.values), 'raw identity column name is not emitted');
+            },
+        },
+        {
+            name: '[ADPTR10] a column change carries what the row now holds: the value, NULL, or the default when it is never written again',
+            invoke: async () => {
+                const view = {
+                    getFKs: () => ({ topic: 'topics' }),
+                    getTable: () => ({ name: 'notes', columns: {
+                        title: { type: 'string' },
+                        memo: { type: 'string', nullable: true },
+                        tag: { type: 'string', nullable: true, default: 'none' },
+                        topic: { type: 'string', nullable: true },
+                        owner: { type: 'identity', nullable: true },
+                    } }),
+                } as unknown as RSchemaView;
+
+                const changes: RTableChanges = {
+                    rowChanges: [{
+                        rowId: 'RRRR', liveBefore: true, liveAfter: true, author: undefined,
+                        columnChanges: [
+                            { column: 'title', before: 'a', after: 'b' },            // a value
+                            { column: 'memo', before: 'm', after: null },            // set to NULL
+                            { column: 'tag', before: 'x', after: undefined },        // never written again: the default
+                            { column: 'topic', before: 'T', after: undefined },      // never written again, no default
+                            { column: 'owner', before: 'K', after: null },           // a key column set to NULL
+                        ],
+                    }],
+                };
+                const [action] = tableRowActions(changes, 'notes', view, {});
+                assertTrue(action.kind === 'upsert-row', 'a live row is an upsert');
+                if (action.kind !== 'upsert-row') return;
+                assertEquals(JSON.stringify(Object.entries(action.values).sort()),
+                    JSON.stringify(Object.entries({ title: 'b', memo: null, tag: 'none', topic_id: null, owner_key_id: null }).sort()),
+                    'each column carries what the row now holds, under its projected name');
+            },
+        },
+        {
+            name: '[ADPTR11] a whole-row action names every column of the table, with null where the row has no value',
+            invoke: async () => {
+                const view = {
+                    getFKs: () => ({ topic: 'topics' }),
+                    getTable: () => ({ name: 'notes', columns: {
+                        title: { type: 'string' },
+                        memo: { type: 'string', nullable: true },
+                        tag: { type: 'string', nullable: true, default: 'none' },
+                        topic: { type: 'string', nullable: true },
+                    } }),
+                } as unknown as RSchemaView;
+
+                // a row's values already include its defaults, so what is missing is NULL
+                const action = rowToUpsertAction({ rowId: 'RRRR', uuid: 'u', values: { title: 'a' } }, 'notes', view, {});
+                assertTrue(action.kind === 'upsert-row', 'an upsert');
+                if (action.kind !== 'upsert-row') return;
+                assertEquals(JSON.stringify(Object.entries(action.values).sort()),
+                    JSON.stringify(Object.entries({ title: 'a', memo: null, tag: null, topic_id: null }).sort()),
+                    'every column is named, the missing ones with null');
+            },
+        },
+        {
+            name: '[ADPTR12] an identity provider row: no action names the public-key column, with a value or without',
+            invoke: async () => {
+                const view = {
+                    getFKs: () => ({}),
+                    getIdProvider: () => ({ keyIdColumn: 'keyId', publicKeyColumn: 'publicKey' }),
+                    getTable: () => ({ name: 'people', columns: {
+                        keyId: { type: 'string', pub: true, readonly: true },
+                        publicKey: { type: 'string', pub: true, readonly: true },
+                        name: { type: 'string', nullable: true },
+                    } }),
+                } as unknown as RSchemaView;
+
+                // whole rows: one with its public key, one without (the planner must not fail on it)
+                const full = rowToUpsertAction({ rowId: 'R1', uuid: 'u1', values: { keyId: 'KHASH', publicKey: 'PUB', name: 'ada' } }, 'people', view, {});
+                const bare = rowToUpsertAction({ rowId: 'R2', uuid: 'u2', values: { keyId: 'KHASH2' } }, 'people', view, {});
+                for (const action of [full, bare]) {
+                    assertTrue(action.kind === 'upsert-row' && !('publicKey' in action.values), 'the public-key column is not projected');
+                }
+                if (full.kind !== 'upsert-row' || bare.kind !== 'upsert-row') return;
+                assertEquals(full.values['key_id'], 'KHASH', 'the key id column projects as key_id');
+                assertEquals(full.keyMaterial?.['KHASH'], 'PUB', 'the public key travels as key material');
+                assertEquals(bare.values['name'], null, 'a column the row has no value in is named with null');
+                assertTrue(bare.keyMaterial === undefined, 'no key material without a public key');
+
+                // a delta: the public key going back to never written is not projected either
+                const changes: RTableChanges = {
+                    rowChanges: [{
+                        rowId: 'R1', liveBefore: true, liveAfter: true, author: undefined,
+                        columnChanges: [
+                            { column: 'name', before: 'ada', after: null },
+                            { column: 'publicKey', before: 'PUB', after: undefined },
+                        ],
+                    }],
+                };
+                const [delta] = tableRowActions(changes, 'people', view, {});
+                assertTrue(delta.kind === 'upsert-row' && !('publicKey' in delta.values) && delta.values['name'] === null,
+                    'the delta action carries the null and leaves the public-key column out');
             },
         },
     ],

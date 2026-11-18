@@ -34,11 +34,16 @@
 //      unwraps to a `kills` marker (opsFor), so both walks above read it like a
 //      delete op (see deriveDeployMeta in ../rtable_group/group.ts).
 //   2. Op validity (drop-on-void): an entry is VOID when any row op it carries
-//      fails its restriction predicate OR writes an FK column whose target is
+//      fails its restriction predicate OR makes an FK reference whose target is
 //      not live, both evaluated AT-USE at the op's own position observed from
 //      this view's `from` (a witness / FK target barrier-deleted concurrently
 //      with the use voids it; a causally-later delete, or a causally-later
-//      add-fk / drop-fk, does not). FK targets resolve recursively across
+//      add-fk / drop-fk, does not). An op answers for the references it makes:
+//      the FK columns it sets, and for an insert the default of each one it
+//      leaves out. Both checks read what the op carries for a column only
+//      while the column is the one it wrote to: after a concurrent drop and
+//      re-add of the column they read what its row reads, and an op whose
+//      table was dropped and added again is void. FK targets resolve recursively across
 //      tables; a `group.table` target resolves through the bound foreign group
 //      at the version observed at the op's position (resolveForeignTableView); a missing reference (unbound name or absent
 //      foreign table) voids the op. An FK reference cycle is void: nothing
@@ -55,9 +60,11 @@
 // column name at this horizon, so drop/re-add and losing concurrent add-column
 // forks do not resurrect stale writes. Voided entries are see-through in the
 // DAG cover (`findCoverWithFilter` with a liveness predicate): their writes
-// don't count, and they must not mask live writes below. Concurrent maxima
-// tiebreak by larger entry hash; untouched columns fall back to schema
-// defaults. Updates never affect liveness.
+// don't count, and they must not mask live writes below. A write gives the
+// column a value or sets it to NULL (`nulls` in the op). Among concurrent
+// maxima a value wins over a NULL, and the larger entry hash decides between
+// two of a kind. A column set to NULL is absent from the row; untouched
+// columns fall back to schema defaults. Updates never affect liveness.
 //
 // Inside a verdict evaluation an entry of the component being solved can be
 // undecided. Each read below is one see-through walk that treats undecided
@@ -94,8 +101,9 @@ import { columnSlot, existenceSlot } from "../rschema/resolve.js";
 import { colTag, rowTag, type RowsSlicePayload } from "../rtable_group/scopes.js";
 import type { OpVoidDetail } from "../rtable_group/op_void.js";
 
-import type { RTable, RTableView, Row, RowValues, DeltaRowState } from "./interfaces.js";
+import type { RTable, RTableView, Row, RowValues, DeltaRowState, WrittenValues } from "./interfaces.js";
 import type { InsertRowPayload, RowOpPayload } from "./payload.js";
+import { opNullsColumn } from "./payload.js";
 import type { ColumnTypes, RowFilter, RowQuery } from "./query.js";
 import { evalRowFilter, orderRows, projectRow, validateRowQuery } from "./query.js";
 import { TouchTest } from "./touch.js";
@@ -114,9 +122,21 @@ export type TableViewTarget = RTable & {
     schemaSlotsBetween(at: Version, wider: Version, from: Version): Promise<Set<string>>;
 };
 
-// A column read: the resolved value (undefined when no live write carries the
-// column; callers fall back to the schema default), or undecided.
-export type ColumnValue = { status: 'decided'; value: json.Literal | undefined } | Undecided;
+// A column read: what the winning live write gives the column, or undecided.
+// A column of a row is in one of three states: holding a value, set to NULL
+// (null), or never written (undefined: no live write carries the column).
+// Only the last falls back to the schema default; see resolvedColumnValue.
+export type ColumnValue = { status: 'decided'; value: json.Literal | null | undefined } | Undecided;
+
+// The value a row holds in a column, given what was read for it and the
+// column's default: the written value; nothing when the column is set to NULL,
+// which wins over the default; the default when the column was never written.
+export function resolvedColumnValue(
+    read: json.Literal | null | undefined, fallback: json.Literal | undefined,
+): json.Literal | undefined {
+    if (read === null) return undefined;
+    return read === undefined ? fallback : read;
+}
 
 // The `where` tree of an exists atom as a view reads it, with every term
 // resolved to its value. A leaf holds when every field equals its value.
@@ -214,7 +234,7 @@ function decided(truth: Truth, read: string): boolean {
     return truth.status === 'true';
 }
 
-function decidedValue(read: ColumnValue, what: string): json.Literal | undefined {
+function decidedValue(read: ColumnValue, what: string): json.Literal | null | undefined {
     if (read.status === 'undecided') throw new Error(`${what} is undecided outside the component being solved`);
     return read.value;
 }
@@ -495,12 +515,16 @@ export class RTableViewImpl implements RTableView, TruthTableView {
 
     // The LWW-resolved value for one column of a row: undefined if no live
     // write at or below `at` carries it for the column's live incarnation at
-    // this horizon. The see-through cover of the incarnation-scoped write meta
+    // this horizon, null when the winning write sets it to NULL. The
+    // see-through cover of the incarnation-scoped write meta
     // (`cols: ['<rowId>:<incarnationId>:<column>']`) is the causal maxima
-    // among live writes. Concurrent maxima tiebreak by larger entry hash. A
-    // walk that meets an undecided write not below a live one is undecided
-    // (any other write lies below a live write, so it cannot change the
-    // value). Does NOT check liveness.
+    // among live writes. Those maxima are concurrent with each other: among
+    // them a value wins over a null, and the larger entry hash decides between
+    // two values or two nulls. So a null hides the writes its writer had seen
+    // and never wins against a write it had not. A walk that meets an
+    // undecided write not below a live one is undecided (any other write lies
+    // below a live write, so it cannot change the value). Does NOT check
+    // liveness.
     async columnValue(rowId: B64Hash, column: string): Promise<ColumnValue> {
         const schemaView = await this.schemaView();
         const table = this.target.getTableName();
@@ -522,15 +546,20 @@ export class RTableViewImpl implements RTableView, TruthTableView {
         if (undecided.size > 0) return anyTruth(undecided.values()) as Undecided;
 
         let winnerHash: B64Hash | undefined;
-        let winnerValue: json.Literal | undefined;
+        let winnerValue: json.Literal | null | undefined;
 
         for (const hash of live) {
             for (const op of await this.opsAt(dag, hash, rowId)) {
                 if (op.action !== 'insert' && op.action !== 'update') continue;
-                const value = op.values[column];
-                if (value === undefined) continue;
+                let value: json.Literal | null | undefined = op.values[column];
+                if (value === undefined) {
+                    if (!opNullsColumn(op, column)) continue;
+                    value = null;
+                }
 
-                if (winnerHash === undefined || hash > winnerHash) {
+                const wins = winnerHash === undefined
+                    || ((value === null) !== (winnerValue === null) ? value !== null : hash > winnerHash);
+                if (wins) {
                     winnerHash = hash;
                     winnerValue = value;
                 }
@@ -541,7 +570,7 @@ export class RTableViewImpl implements RTableView, TruthTableView {
     }
 
     // Per-field LWW resolution over the schema's columns; untouched columns
-    // fall back to schema defaults.
+    // fall back to schema defaults, and a column set to NULL is absent.
     private async resolveRow(rowId: B64Hash): Promise<{ insert: InsertRowPayload; values: RowValues } | undefined> {
         const insert = await this.liveInsert(rowId);
         if (insert === undefined) return undefined;
@@ -552,11 +581,8 @@ export class RTableViewImpl implements RTableView, TruthTableView {
         const values: RowValues = {};
         for (const column of Object.keys(def?.columns ?? {})) {
             const written = decidedValue(await this.columnValue(rowId, column), 'a column value');
-            if (written !== undefined) {
-                values[column] = written;
-            } else if (def!.columns[column].default !== undefined) {
-                values[column] = def!.columns[column].default!;
-            }
+            const value = resolvedColumnValue(written, def!.columns[column].default);
+            if (value !== undefined) values[column] = value;
         }
 
         return { insert, values };
@@ -592,7 +618,8 @@ export class RTableViewImpl implements RTableView, TruthTableView {
     }
 
     // Delta support (see ./delta.ts). Enforced liveness + author + the LWW
-    // WRITTEN value of each requested column, with NO schema-default fallback:
+    // WRITTEN value of each requested column (null when it is set to NULL,
+    // absent when it was never written), with NO schema-default fallback:
     // columnValue is incarnation-scoped at this horizon, so a column dropped
     // or re-added between horizons yields no written value for the old
     // incarnation, and a column's default never appears as a per-row write.
@@ -602,7 +629,7 @@ export class RTableViewImpl implements RTableView, TruthTableView {
         const insert = await this.liveInsert(rowId);
         if (insert === undefined) return { live: false, author: undefined, written: {} };
 
-        const written: RowValues = {};
+        const written: WrittenValues = {};
         for (const column of columns) {
             const value = decidedValue(await this.columnValue(rowId, column), 'a column value');
             if (value !== undefined) written[column] = value;
@@ -884,7 +911,8 @@ export class RTableViewImpl implements RTableView, TruthTableView {
     // that is not possible is false with nothing read. Then what is left with
     // the three-valued reads: a field is the column read compared with its
     // value, with the schema default when no live write gives the column one
-    // (rowAuthor needs no read). `which` picks the read (see ExistsReads).
+    // and no value at all when the column is set to NULL (rowAuthor needs no
+    // read). `which` picks the read (see ExistsReads).
     private async rowMatch(
         rowId: B64Hash, where: ReadWhere, plan: ReadPlan, which: 'all' | 'plain' | 'row',
         isRead: (leaf: ReadLeaf) => boolean, reads: RowReads,
@@ -919,7 +947,7 @@ export class RTableViewImpl implements RTableView, TruthTableView {
                 truth = await everyTruth(Object.keys(leaf.fields).filter((f) => f !== 'rowAuthor'), async (field) => {
                     const read = await column(field);
                     if (read.status === 'undecided') return read;
-                    const value = read.value ?? plan.def?.columns[field]?.default;
+                    const value = resolvedColumnValue(read.value, plan.def?.columns[field]?.default);
                     return truthOf(value !== undefined && sameValue(value, leaf.fields[field]));
                 });
                 reads.leaves.set(leaf, truth);

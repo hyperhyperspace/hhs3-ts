@@ -208,11 +208,19 @@ async function openNative(name: string, docs: Record<string, json.Literal>[], in
     return db;
 }
 
-// JSON with sorted object keys, so property order does not matter.
+// JSON with sorted object keys, so property order does not matter. A document
+// (an object with an `id`) is compared without its null properties: the facade
+// stores a null property as a missing key, where a native store keeps the
+// null. That is the one difference in what a document holds, and a null is no
+// index key in either.
 function stable(v: unknown): string {
-    return JSON.stringify(v, (_k, x: unknown) => (x !== null && typeof x === 'object' && !Array.isArray(x))
-        ? Object.fromEntries(Object.entries(x as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
-        : x);
+    return JSON.stringify(v, (_k, x: unknown) => {
+        if (x === null || typeof x !== 'object' || Array.isArray(x)) return x;
+        const isDocument = 'id' in x;
+        return Object.fromEntries(Object.entries(x as Record<string, unknown>)
+            .filter(([, value]) => !(isDocument && value === null))
+            .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+    });
 }
 
 type Op =

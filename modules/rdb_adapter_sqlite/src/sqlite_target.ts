@@ -499,10 +499,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     // readonly columns). Every trigger body is gated on enabled=1 AND applying=0.
     private installTriggers(table: string, meta: TableMeta): void {
         // Drop any prior capture triggers for this table (column set may have changed).
-        const existing = this.db.prepare(
-            "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name = ? AND name LIKE 'rdb_cap_%'")
-            .all(table) as { name: string }[];
-        for (const t of existing) this.db.exec(`DROP TRIGGER ${quoteId(t.name)}`);
+        this.dropTriggers(table);
 
         const gate = '(SELECT enabled FROM rdb_capture_config) = 1 AND (SELECT applying FROM rdb_capture_config) = 0';
         const cols = Object.keys(meta.columnTypes);
@@ -533,6 +530,16 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
                 + `SELECT ${tableLit}, NEW.${id}, 'update', json_object(${quoteText(col)}, NEW.${quoteId(col)}) `
                 + `WHERE ${gate}; END`);
         });
+    }
+
+    // Remove a table's capture triggers. They name the table's columns, and
+    // SQLite refuses to drop a column while a trigger names it, so a column
+    // drop removes them first and installs them again from the new columns.
+    private dropTriggers(table: string): void {
+        const existing = this.db.prepare(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name = ? AND name LIKE 'rdb_cap_%'")
+            .all(table) as { name: string }[];
+        for (const t of existing) this.db.exec(`DROP TRIGGER ${quoteId(t.name)}`);
     }
 
     private requireCapture(): void {
@@ -800,6 +807,11 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         if (fkList.some((f) => f.from === action.column)) {
             this.rebuildTable(action.table, { dropColumn: action.column });
         } else {
+            // The capture triggers name the column, which would make the ALTER
+            // fail. They are installed again below, once the meta is written.
+            // This runs inside apply()'s transaction, with capture gated off,
+            // so no local write falls between the two.
+            if (this.capture) this.dropTriggers(action.table);
             this.db.exec(`ALTER TABLE ${quoteId(action.table)} DROP COLUMN ${quoteId(action.column)}`);
         }
         const meta = this.loadMeta(action.table);
@@ -807,7 +819,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         delete meta.fkColumns[action.column];
         meta.keyRefColumns = meta.keyRefColumns.filter((c) => c !== action.column);
         this.writeMeta(action.table, meta);
-        if (this.capture) this.installTriggers(action.table, meta);   // drop the column's trigger
+        if (this.capture) this.installTriggers(action.table, meta);   // from the columns that are left
     }
 
     // Rebuild `table` as CREATE tmp / INSERT...SELECT / DROP / RENAME, optionally
@@ -969,10 +981,13 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     // serial id (allocating on demand). A key-ref column carries a key hash;
     // intern it into rdb_keys. Cross-group `_row_hash` columns are not in
     // fkColumns and pass through as text.
+    // A null is bound as NULL: no id is allocated, no key interned and no value
+    // converted for it.
     private paramForColumn(
-        meta: TableMeta, col: string, value: json.Literal,
+        meta: TableMeta, col: string, value: json.Literal | null,
         keyMaterial?: { [keyHash: string]: string },
-    ): number | string {
+    ): number | string | null {
+        if (value === null) return null;
         const fk = meta.fkColumns[col];
         if (fk !== undefined) {
             const targetMeta = this.loadMeta(fk.targetTable);
@@ -1009,7 +1024,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
 
         if (exists) {
             const assignments: string[] = [];
-            const params: (number | string)[] = [];
+            const params: (number | string | null)[] = [];
             for (const col of columns) {
                 assignments.push(`${quoteId(col)} = ?`);
                 params.push(this.paramForColumn(meta, col, action.values[col], action.keyMaterial));
@@ -1027,8 +1042,10 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             return;
         }
 
+        // A column the action sets to NULL is named with NULL, so the table's
+        // DEFAULT does not apply to it; a column the action leaves out takes it.
         const insertCols: string[] = [meta.idColumn];
-        const insertParams: (number | string)[] = [id];
+        const insertParams: (number | string | null)[] = [id];
         for (const col of columns) {
             insertCols.push(col);
             insertParams.push(this.paramForColumn(meta, col, action.values[col], action.keyMaterial));
@@ -1151,10 +1168,12 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             }
             const meta = this.loadMeta(row.tbl);
             const stored = (row.changed === null ? {} : JSON.parse(row.changed)) as { [column: string]: unknown };
-            const values: { [column: string]: json.Literal } = {};
+            // A NULL is kept as a null: an update to NULL is a change, and an
+            // insert's captured row names every empty column with one, which
+            // the planner sorts out.
+            const values: { [column: string]: json.Literal | null } = {};
             for (const [col, raw] of Object.entries(stored)) {
-                const logical = toLogical(raw, meta.columnTypes[col] ?? 'string');
-                if (logical !== undefined) values[col] = logical;
+                values[col] = toLogical(raw, meta.columnTypes[col] ?? 'string') ?? null;
             }
             changes.push({ id: row.id, kind: row.op === 'insert' ? 'insert' : 'update', table: row.tbl, localId: row.local_id, values });
         }

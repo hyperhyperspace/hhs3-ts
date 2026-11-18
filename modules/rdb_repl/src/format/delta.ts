@@ -85,8 +85,10 @@ function formatGroupRows(session: ReplSession, payload: Extract<DeltaPayload, { 
         author: row.author === '' ? '' : ctx.formatString(row.author, { role: 'hash' }),
         columns: ((identityCols) => row.columnChanges.map((change) => {
             const opts = identityCols.has(change.column) ? { identity: true } : {};
-            const before = change.before === undefined ? '' : ctx.formatValue(change.before, opts);
-            const after = change.after === undefined ? '' : ctx.formatValue(change.after, opts);
+            // a column set to NULL shows as NULL; one no live write carries shows as nothing
+            const show = (value: unknown): string => value === undefined ? '' : value === null ? 'NULL' : ctx.formatValue(value, opts);
+            const before = show(change.before);
+            const after = show(change.after);
             return `${change.column}: ${before} -> ${after}`;
         }).join(', '))(payload.identityColumnsByTable.get(row.table) ?? new Set<string>()),
     }));

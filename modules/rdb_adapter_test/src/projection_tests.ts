@@ -14,7 +14,7 @@ import {
     DEFAULT_KEY_DOMAIN, KeyIndex, projectGroup, SchemaAction, RowAction,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
-import { createFkGroup, createFlipGroup, createGroup, flipTables, frontier, sameVersion } from "./group_fixture.js";
+import { createFkGroup, createFlipGroup, createGroup, createNullsGroup, flipTables, frontier, sameVersion } from "./group_fixture.js";
 import { TargetFactory } from "./projection_reader.js";
 
 type NamedTest = { name: string; invoke: () => Promise<void> };
@@ -442,6 +442,101 @@ export function createProjectionSuite(label: string, factory: TargetFactory): { 
                         const local = await read.syncId('posts', p1);
                         assertTrue(local !== undefined, 'the dangling target rowId is interned in the fresh posts table');
                         assertEquals(row!.values.post_id, local, 'the companion holds the dangling target id');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}12] a column that is NULL in rdb reads NULL in the target, on first sight of the row and after`,
+                invoke: async () => {
+                    const { group } = await createNullsGroup();
+                    const topics = await group.getTable('topics');
+                    const notes = await group.getTable('notes');
+                    const t1 = deriveRowId('t1');
+                    const row = (uuid: string) => read.getRow('notes', deriveRowId(uuid));
+                    const shown = async (uuid: string) => JSON.stringify(Object.entries((await row(uuid))!.values).sort());
+                    const expected = (values: { [column: string]: unknown }) => JSON.stringify(Object.entries(values).sort());
+
+                    await topics.insert('t1', { name: 'topic' });
+                    await notes.insert('nulled', { title: 'a', memo: null, tag: null, done: null, topic: null });
+                    await notes.insert('full', { title: 'a', memo: 'm', tag: 'x', done: true, topic: t1 });
+
+                    const { target, read, cleanup } = await factory();
+                    try {
+                        // the first projection sees whole rows
+                        await projectGroup(group, target);
+                        const topicId = await read.syncId('topics', t1);
+                        assertEquals(await shown('nulled'), expected({ title: 'a' }),
+                            'a row first seen with nulled columns reads NULL in each, not the default of `tag`');
+                        assertEquals(await shown('full'), expected({ title: 'a', memo: 'm', tag: 'x', done: true, topic_id: topicId }),
+                            'a row with values is projected as before');
+
+                        // a later projection sees column changes and new rows
+                        await notes.update(deriveRowId('full'), { memo: null, tag: null, done: null, topic: null });
+                        await notes.insert('later-nulled', { title: 'b', tag: null });
+                        await notes.insert('later-default', { title: 'b' });
+                        await notes.update(deriveRowId('nulled'), { tag: 'y' });
+                        await projectGroup(group, target);
+
+                        assertEquals(await shown('full'), expected({ title: 'a' }),
+                            'an update to NULL clears each column: plain, with a default, boolean and foreign key');
+                        assertEquals(await shown('later-nulled'), expected({ title: 'b' }),
+                            'a new row that nulled a column with a default reads NULL there');
+                        assertEquals(await shown('later-default'), expected({ title: 'b', tag: 'none' }),
+                            'a new row that left the column out reads the default');
+                        assertEquals(await shown('nulled'), expected({ title: 'a', tag: 'y' }), 'a value written over a NULL shows');
+
+                        // and a projection from scratch agrees
+                        const fresh = await factory();
+                        try {
+                            await projectGroup(group, fresh.target);
+                            for (const uuid of ['nulled', 'full', 'later-nulled', 'later-default']) {
+                                assertEquals(
+                                    JSON.stringify(Object.entries((await fresh.read.getRow('notes', deriveRowId(uuid)))!.values).sort()),
+                                    await shown(uuid), `a fresh projection reads '${uuid}' the same`);
+                            }
+                        } finally {
+                            await fresh.cleanup?.();
+                        }
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}13] a write that becomes void: the target shows the earlier value again, the default, or NULL`,
+                invoke: async () => {
+                    const { group } = await createNullsGroup();
+                    const topics = await group.getTable('topics');
+                    const notes = await group.getTable('notes');
+                    const t1 = deriveRowId('t1');
+                    const shown = async (uuid: string) =>
+                        JSON.stringify(Object.entries((await read.getRow('notes', deriveRowId(uuid)))!.values).sort());
+                    const expected = (values: { [column: string]: unknown }) => JSON.stringify(Object.entries(values).sort());
+
+                    await topics.insert('t1', { name: 'topic' });
+                    await notes.insert('wrote', { title: 'a', tag: 'x' });
+                    await notes.insert('never', { title: 'a' });
+                    const base = await frontier(group);
+
+                    // each update sets columns and points `topic` at t1 ...
+                    await notes.update(deriveRowId('wrote'), { memo: 'm', tag: 'y', topic: t1 }, undefined, base);
+                    await notes.update(deriveRowId('never'), { memo: 'm', tag: 'y', topic: t1 }, undefined, base);
+
+                    const { target, read, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+                        const topicId = await read.syncId('topics', t1);
+                        assertEquals(await shown('wrote'), expected({ title: 'a', memo: 'm', tag: 'y', topic_id: topicId }), 'the update shows');
+
+                        // ... and a concurrent delete of t1 voids both updates
+                        await topics.delete(t1, undefined, base);
+                        await projectGroup(group, target);
+                        assertEquals(await shown('wrote'), expected({ title: 'a', tag: 'x' }),
+                            'tag shows its earlier value again; memo and topic, never written before, read NULL');
+                        assertEquals(await shown('never'), expected({ title: 'a', tag: 'none' }),
+                            'tag, never written before, shows its default again; memo and topic read NULL');
                     } finally {
                         await cleanup?.();
                     }

@@ -7,7 +7,7 @@ import { CreateRSchemaPayload, SchemaUpdatePayload, RSCHEMA_TYPE_ID } from "../s
 import { TableDef } from "../src/rschema/payload.js";
 
 import { validateRowOpFormat as validateRowOpFormatResult } from "../src/rtable/validate.js";
-import { InsertRowPayload, UpdateRowPayload, DeleteRowPayload } from "../src/rtable/payload.js";
+import { InsertRowPayload, UpdateRowPayload, DeleteRowPayload, rowWriteParts } from "../src/rtable/payload.js";
 import { deriveRowId } from "../src/rtable/hash.js";
 
 import { validateTableGroupPayloadFormat as validateTableGroupPayloadFormatResult } from "../src/rtable_group/validate.js";
@@ -171,6 +171,41 @@ async function testUpdateAndDeleteRowOps() {
     assertTrue(validateRowOpFormat(del), 'well-formed delete should validate');
 
     assertFalse(validateRowOpFormat({ action: 'delete' } as json.Literal), 'delete without rowId should not validate');
+}
+
+// `nulls`: the columns an insert or an update sets to NULL. One spelling only.
+
+async function testRowOpNulls() {
+    const rowId = deriveRowId('uuid-1', 'alice');
+    const insert = (extra: { [key: string]: json.Literal }): json.Literal => ({ ...validInsert(), ...extra } as json.Literal);
+
+    assertTrue(validateRowOpFormat(insert({ nulls: ['memo'] })), 'an insert that nulls a column validates');
+    assertTrue(validateRowOpFormat({ action: 'update', rowId, values: { total: 95 }, nulls: ['memo', 'note'] }),
+        'an update that sets one column and nulls two validates');
+    assertTrue(validateRowOpFormat({ action: 'update', rowId, values: {}, nulls: ['memo'] }),
+        'an update that only nulls a column validates');
+
+    assertFalse(validateRowOpFormat(insert({ nulls: [] })), 'empty nulls must be left out');
+    assertFalse(validateRowOpFormat({ action: 'update', rowId, values: { total: 95 }, nulls: [] }), 'empty nulls must be left out of an update');
+    assertFalse(validateRowOpFormat({ action: 'update', rowId, values: {}, nulls: [] }), 'an update that writes nothing does not validate');
+    assertFalse(validateRowOpFormat(insert({ nulls: ['note', 'memo'] })), 'unsorted nulls do not validate');
+    assertFalse(validateRowOpFormat(insert({ nulls: ['memo', 'memo'] })), 'a repeated null does not validate');
+    assertFalse(validateRowOpFormat(insert({ nulls: ['total'] })), 'a column cannot be both set and nulled');
+    assertFalse(validateRowOpFormat(insert({ nulls: ['bad name'] })), 'a null must be a valid column name');
+    assertFalse(validateRowOpFormat(insert({ nulls: 'memo' })), 'nulls must be a list');
+    assertFalse(validateRowOpFormat(insert({ nulls: [7] })), 'nulls must be a list of names');
+
+    // The order is by UTF-16 code unit: upper case, then '_', then lower case.
+    // A locale-aware order would put 'a' before 'B'.
+    assertTrue(validateRowOpFormat(insert({ nulls: ['B', '_x', 'a'] })), 'code-unit order validates');
+    assertFalse(validateRowOpFormat(insert({ nulls: ['a', 'B'] })), 'locale order does not validate');
+
+    const parts = rowWriteParts({ a: null, total: 90, B: null, _x: null });
+    assertTrue(JSON.stringify(parts.nulls) === JSON.stringify(['B', '_x', 'a']), 'rowWriteParts sorts nulls by code unit');
+    assertTrue(JSON.stringify(parts.values) === JSON.stringify({ total: 90 }), 'rowWriteParts keeps the values');
+    assertTrue(!('nulls' in rowWriteParts({ total: 90 })), 'rowWriteParts leaves nulls out when there are none');
+    assertTrue(validateRowOpFormat(insert({ ...rowWriteParts({ customer: 'c#7', a: null, B: null }) })),
+        'what rowWriteParts produces validates');
 }
 
 // RTableGroup payloads
@@ -402,5 +437,6 @@ export const payloadFormatTests = {
         { name: '[FORMAT07] RTableGroup bundle', invoke: testBundle },
         { name: '[FORMAT08] RTableGroup ref-advance', invoke: testGroupRefAdvance },
         { name: '[FORMAT09] RDb catalog payloads', invoke: testRDbPayloads },
+        { name: '[FORMAT10] RTable nulls: one spelling, in code-unit order', invoke: testRowOpNulls },
     ],
 };

@@ -29,3 +29,6 @@ A HIP proposes a change to Hyper Hyper Space: to its design, its implementation,
 | [23](0023-join-bootstrap.md) | Bootstrapping a joined host under an allow list | design | implemented |
 | [24](0024-membership-sidecar.md) | An opaque membership sidecar | design | draft |
 | [25](0025-deterministic-verdict-evaluation.md) | Deterministic verdict evaluation | design | draft |
+| [26](0026-encrypted-tables.md) | Encrypted tables | design | draft |
+| [27](0027-relays.md) | Relays: always-on hosts for databases | design | draft |
+| [28](0028-audience-keys.md) | Audience keys | design | draft |

@@ -86,8 +86,9 @@ export type ColumnConstraints = {
 
 export type ColumnDef = {
     type: ColumnType;
-    nullable?: boolean;        // default false; nullable columns may be absent from a row
-    default?: json.Literal;    // used when inserts omit the column
+    nullable?: boolean;        // default false; a nullable column may be left unwritten or set to
+                               // NULL, and is then absent from a row
+    default?: json.Literal;    // read while no write gives the column a value or sets it to NULL
     pub?: boolean;             // default false; meta-exported (insert + update), filterable
     readonly?: boolean;        // default false; fixed at insert: updates rejected.
                                // Independent of pub; permission-witness columns
@@ -132,12 +133,21 @@ export const DEFAULT_CONCURRENT_DELETES = true;
 // they pass hard validation (see isEntryVoided in ../rtable_group/group.ts
 // and explainRowOpFKReach in ../rtable_group/predicates.ts):
 //
-//   - a write op whose own FK column points at a target that is not live at
+//   - a write op that makes a reference to a target that is not live at
 //     the OP's own position (observed from the view's `from`) is VOID — a
 //     voided insert never lives; a voided FK-update contributes no value, so
 //     LWW reverts to the prior write. The FK SET itself is read from the
 //     schema at the op's position, so a causally-later add-fk / drop-fk does
 //     not revise an old write.
+//   - an op answers for the references it makes, and for no others. An
+//     insert: each FK column it sets, and the default of each one it leaves
+//     out. An update: only the FK columns it sets, never a default, and never
+//     the reference its row already holds. A column set to NULL makes no
+//     reference, and drops the one a default would make.
+//   - what an op carries for a column counts only while the column is the one
+//     it wrote to. After a concurrent drop and re-add of the column, an insert
+//     answers for the new column's default, which is what its row reads, and
+//     an update for nothing there.
 //   - this is anchored at the op, not the view horizon, so a target deleted
 //     CONCURRENTLY with the write voids it at the merge (merge stability),
 //     while a causally-LATER delete is inert (use-before-revoke): the

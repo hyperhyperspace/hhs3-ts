@@ -4,7 +4,7 @@ import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import { serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 import {
     CatalogReleasePayload, RDbImpl, RSchemaImpl, RTableGroupImpl,
-    SchemaUpdatePayload, deriveRowId,
+    SchemaUpdatePayload, deriveRowId, rowWriteParts,
 } from "@hyper-hyper-space/hhs3_rdb";
 
 import { bind, BoundStatement } from "../src/bind/bind.js";
@@ -837,7 +837,7 @@ export const restPhaseTests = {
                     if (!select.ok || select.value.kind !== 'select' || select.value.rows.length !== 1) return undefined;
                     return select.value.rows[0].values['body'];
                 };
-                const canon = (value: json.Literal | undefined) => value === undefined ? '<missing>' : json.toStringNormalized(value);
+                const canon = (value: json.Literal | null | undefined) => value === undefined ? '<missing>' : value === null ? 'NULL' : json.toStringNormalized(value);
                 assertEquals(canon(await readBody()), canon(inserted), 'inserted json object reads back exactly');
 
                 const update = await execute(await parseBind(
@@ -901,6 +901,151 @@ export const restPhaseTests = {
                 assertTrue(authorValue.includes('$author has no value: the statement is anonymous'), authorValue);
                 const me = await parseBind("INSERT INTO shop_prod.products (sku, name) VALUES ('D', $me);", lang);
                 assertTrue(me.kind === 'insert' && me.values['name'] === admin.keyId, '$me still names the session identity');
+            },
+        },
+        {
+            name: '[REST15] NULL in INSERT, UPDATE and BUNDLE: read back, and dumped row ops bind again to the same op',
+            invoke: async () => {
+                const { env, lang } = await createEnv();
+                await env.run(`
+                    CREATE SCHEMA docs CREATORS ($admin) AS (
+                      TABLE notes (
+                        title string NULL,
+                        memo string NULL,
+                        tag string NULL DEFAULT 'none'
+                      ) ALLOW all IF true
+                    );
+                    CREATE CATALOG docs_catalog VERSION '1.0.0' AS (TABLEGROUP docs_prod USING SCHEMA docs);
+                    CREATE DATABASE docs_db USING CATALOG docs_catalog;
+                `);
+                const group = await env.group('docs_prod');
+
+                // each row op of the group's dump, bound again
+                const replayed = async () => {
+                    const dump = await dumpGroup(group, { render: { profile: 'full' } });
+                    const statements = splitStatements(dump).map((s) => s.replace(/^(\s*--[^\n]*\n)+/, ''));
+                    const out: { text: string; bound: BoundStatement }[] = [];
+                    for (const text of statements.filter((s) => /^\s*(INSERT INTO|UPDATE) notes /.test(s))) {
+                        const replay = text
+                            .replace(/^(\s*(?:INSERT INTO|UPDATE)) notes /, '$1 docs_prod.notes ')
+                            .replace(/ BY #\S+/, '')
+                            .replace(/ AT \{[^}]*\}/, '');
+                        out.push({ text, bound: await parseBind(replay, lang) });
+                    }
+                    return out;
+                };
+                const partsOf = (bound: BoundStatement): string =>
+                    bound.kind === 'insert' || bound.kind === 'update' ? json.toStringNormalized(rowWriteParts(bound.values) as json.Literal) : bound.kind;
+
+                // an insert that sets no column: its dump has to parse
+                const empty = await parseBind("INSERT INTO docs_prod.notes (uuid) VALUES ('n0');", lang);
+                await execute(empty);
+                const afterEmpty = await replayed();
+                assertEquals(afterEmpty.length, 1, 'the dump holds the insert that sets no column');
+                assertEquals(partsOf(afterEmpty[0].bound), partsOf(empty), 'and it binds again to an insert of no column');
+
+                // writes with NULL
+                const sql = [
+                    "INSERT INTO docs_prod.notes (uuid, memo, tag) VALUES ('n1', NULL, NULL);",
+                    "INSERT INTO docs_prod.notes (uuid, title, memo) VALUES ('n2', 'a', NULL);",
+                    `UPDATE docs_prod.notes SET memo = NULL WHERE rowId = '${deriveRowId('n0')}';`,
+                    `UPDATE docs_prod.notes SET title = 'b', memo = NULL, tag = NULL WHERE rowId = '${deriveRowId('n2')}';`,
+                ];
+                const originals = [empty];
+                for (const statement of sql) {
+                    const bound = await parseBind(statement, lang);
+                    const result = await execute(bound);
+                    assertTrue(result.ok, `executes: ${statement}`);
+                    originals.push(bound);
+                }
+                await env.run(`
+                    BUNDLE ON docs_prod (
+                      INSERT INTO notes (uuid, title, tag) VALUES ('n3', 'c', NULL);
+                      UPDATE notes SET title = NULL WHERE rowId = '${deriveRowId('n1')}';
+                    );
+                `);
+
+                const read = async (uuid: string) => {
+                    const select = await execute(await parseBind('SELECT * FROM docs_prod.notes;', lang));
+                    const row = select.ok && select.value.kind === 'select' ? select.value.rows.find((r) => r.rowId === deriveRowId(uuid)) : undefined;
+                    if (row === undefined) throw new Error(`no row ${uuid}`);
+                    return row.values;
+                };
+                assertEquals(json.toStringNormalized(await read('n0')), json.toStringNormalized({ tag: 'none' }), 'n0: memo cleared, tag at its default');
+                assertEquals(json.toStringNormalized(await read('n1')), json.toStringNormalized({}), 'n1: every column NULL, the default does not apply');
+                assertEquals(json.toStringNormalized(await read('n2')), json.toStringNormalized({ title: 'b' }), 'n2: an update to NULL clears a default too');
+                assertEquals(json.toStringNormalized(await read('n3')), json.toStringNormalized({ title: 'c' }), 'n3: a NULL inside a bundle');
+
+                // the dump renders each null as NULL, and every row op binds again to the same write
+                const all = await replayed();
+                assertEquals(all.length, originals.length, 'the dump holds every row op written outside the bundle');
+                for (let i = 0; i < originals.length; i++) {
+                    assertEquals(partsOf(all[i].bound), partsOf(originals[i]), `row op ${i} binds again to the same values and nulls: ${all[i].text}`);
+                }
+                assertTrue(all[1].text.includes('NULL') && all[3].text.includes('= NULL'), 'a nulled column is rendered as NULL');
+
+                // the op itself carries the null, also for a column with no default
+                const carried = originals[1];
+                assertTrue(carried.kind === 'insert' && carried.values['memo'] === null && carried.values['tag'] === null,
+                    'an INSERT with NULL keeps the null for a column with a default and for one without');
+            },
+        },
+        {
+            name: '[REST16] IS [NOT] NULL in SELECT; = NULL, allow rules and EXISTS filters refuse it with their own errors',
+            invoke: async () => {
+                const { env, lang } = await createEnv();
+                await env.run(`
+                    CREATE SCHEMA docs CREATORS ($admin) AS (
+                      TABLE notes (
+                        title string PUB,
+                        memo string NULL,
+                        tag string NULL DEFAULT 'none'
+                      ) ALLOW all IF true
+                    );
+                    CREATE CATALOG docs_catalog VERSION '1.0.0' AS (TABLEGROUP docs_prod USING SCHEMA docs);
+                    CREATE DATABASE docs_db USING CATALOG docs_catalog;
+                    INSERT INTO docs_prod.notes (title, memo, tag) VALUES ('value', 'm', 'x');
+                    INSERT INTO docs_prod.notes (title) VALUES ('never');
+                    INSERT INTO docs_prod.notes (title, memo, tag) VALUES ('nulled', NULL, NULL);
+                `);
+                const titles = async (where: string): Promise<string> => {
+                    const [select] = await env.run(`SELECT title FROM docs_prod.notes WHERE ${where};`);
+                    if (select.kind !== 'select') throw new Error('not a select');
+                    return select.rows.map((r) => String(r.values['title'])).sort().join(',');
+                };
+
+                assertEquals(await titles('memo IS NULL'), 'never,nulled', 'memo: never written and nulled both read NULL');
+                assertEquals(await titles('tag IS NULL'), 'nulled', 'tag: a row that never wrote it reads the default');
+                assertEquals(await titles('tag IS NOT NULL'), 'never,value', 'IS NOT NULL is the rest');
+                assertEquals(await titles("memo IS NULL AND title != 'never'"), 'nulled', 'IS NULL combines with other conditions');
+                assertEquals(await titles('NOT (memo IS NULL)'), 'value', 'NOT around IS NULL');
+                assertEquals(await titles('memo is not null'), 'value', 'keywords are case-insensitive');
+
+                assertTrue((await env.fail('SELECT title FROM docs_prod.notes WHERE memo = NULL;')).includes('IS NULL'),
+                    '= NULL points to IS NULL');
+                assertTrue((await env.fail("SELECT title FROM docs_prod.notes WHERE length(memo) IS NULL;")).includes('IS NULL takes a column'),
+                    'IS NULL takes a column, not an expression');
+
+                // an allow rule: one error for both forms
+                const inRule = (condition: string) => env.fail(`
+                    CREATE SCHEMA ruled CREATORS ($admin) AS (
+                      TABLE t (a string NULL READONLY) ALLOW insert IF ${condition}
+                    );`);
+                const isNullError = await inRule('a IS NULL');
+                assertTrue(isNullError.includes('IS NULL is not supported in schema allow rules'), `IS NULL in an allow rule: ${isNullError}`);
+                assertEquals(await inRule('a IS NOT NULL'), isNullError, 'IS NOT NULL in an allow rule gives the same error');
+
+                // an EXISTS filter takes neither
+                const inExists = (filter: string) => env.fail(`
+                    CREATE SCHEMA gated CREATORS ($admin) AS (
+                      TABLE caps (label string PUB, memo string NULL PUB) ALLOW all IF true,
+                      TABLE t (a string) ALLOW insert IF EXISTS (caps WHERE ${filter})
+                    );`);
+                assertTrue((await inExists('memo IS NULL')).includes('EXISTS WHERE supports only'), 'IS NULL inside an EXISTS filter is an error');
+                assertTrue((await inExists('memo IS NOT NULL')).includes('EXISTS WHERE supports only'), 'and so is IS NOT NULL');
+
+                // NULL stays an error where it is not a column write
+                assertTrue((await env.fail("INSERT INTO docs_prod.notes (uuid, title) VALUES (NULL, 'x');")).length > 0, 'a NULL uuid is refused');
             },
         },
     ],

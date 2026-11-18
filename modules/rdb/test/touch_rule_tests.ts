@@ -37,7 +37,7 @@ import { createMockRContext } from "./mock_rcontext.js";
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
 import { RTableGroupImpl, rTableGroupFactory } from "../src/rtable_group/group.js";
 import type { RTableImpl } from "../src/rtable/rtable.js";
-import { RTableViewImpl } from "../src/rtable/view.js";
+import { RTableViewImpl, resolvedColumnValue } from "../src/rtable/view.js";
 import type { ColumnValue, TableViewTarget } from "../src/rtable/view.js";
 import { deriveRowId } from "../src/rtable/hash.js";
 import type { MigrationRule, TableDef, Where, WhereLeaf } from "../src/rschema/payload.js";
@@ -230,7 +230,7 @@ function answerOfTruth(t: Truth): Answer {
 
 function answerOfColumn(c: ColumnValue): Answer {
     if (c.status === 'undecided') return { decided: false, support: new Set(c.support) };
-    return { decided: true, value: c.value === undefined ? '-' : json.toStringNormalized(c.value) };
+    return { decided: true, value: c.value === undefined ? '-' : c.value === null ? 'NULL' : json.toStringNormalized(c.value) };
 }
 
 async function viewAnswer(view: RTableViewImpl, read: Read): Promise<Answer> {
@@ -530,7 +530,7 @@ class VariantRule {
             return everyTruth(Object.keys(leaf), async (field): Promise<Truth> => {
                 const read = await this.columnValue(D, pending, rowId, field);
                 if (read.status === 'undecided') return read;
-                const value = read.value ?? def.columns[field]?.default;
+                const value = resolvedColumnValue(read.value, def.columns[field]?.default);
                 return truthOf(value !== undefined && sameValue(value, leaf[field]));
             });
         };

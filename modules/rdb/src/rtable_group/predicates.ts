@@ -41,8 +41,9 @@ import { splitTableRef, parseParamTerm, parseRowFieldTerm, whereGroup } from "..
 import { evalOperand, compareOperands, resolveCmpType, likeMatch } from "../rschema/expr.js";
 import type { RTableView, RowValues } from "../rtable/interfaces.js";
 import type { RowOpPayload } from "../rtable/payload.js";
-import { RTableViewImpl, readLeaves } from "../rtable/view.js";
-import type { ColumnValue, ExistsReads, ReadLeaf, ReadWhere, TruthTableView } from "../rtable/view.js";
+import { opNullsColumn } from "../rtable/payload.js";
+import { RTableViewImpl, readLeaves, resolvedColumnValue } from "../rtable/view.js";
+import type { ExistsReads, ReadLeaf, ReadWhere, TruthTableView } from "../rtable/view.js";
 
 export type PredicateEnv = {
     // Anchored table-view supplier: views at the op's position, observed from
@@ -69,12 +70,17 @@ export type PredicateEnv = {
     paramTypeOf?: (param: string) => ColumnType | undefined;
 };
 
+// A value of the subject row, or undecided. It is resolved: the column's
+// default is already applied, and a column set to NULL has no value, like one
+// that was never written and has no default. So no null reaches a comparison.
+export type SubjectValue = { status: 'decided'; value: json.Literal | undefined } | Undecided;
+
 // The subject row behind $row.<col> terms, read lazily: whether the row is
 // live for the op (always, for an insert) and its readonly-resolved column
 // values (undefined when absent).
 export type SubjectRow = {
     live(): Promise<Truth>;
-    column(column: string): Promise<ColumnValue>;
+    column(column: string): Promise<SubjectValue>;
 };
 
 export type TruthPredicateEnv = {
@@ -121,7 +127,13 @@ function truthView(view: RTableView): TruthTableView {
     if (view instanceof RTableViewImpl) return view;
     return {
         rowLiveness: async (rowId) => ({ truth: truthOf(await view.hasRow(rowId)), author: await view.getAuthor(rowId) }),
-        columnValue: async (rowId, column) => ({ status: 'decided', value: (await view.getRow(rowId))?.values[column] }),
+        // A row's public values are final: its defaults are applied, and a
+        // column it lacks reads NULL. So a missing column is reported as null,
+        // and the caller puts no default back on it.
+        columnValue: async (rowId, column) => {
+            const row = await view.getRow(rowId);
+            return { status: 'decided', value: row === undefined ? undefined : row.values[column] ?? null };
+        },
         existsMatching: async (where) => {
             const found = new Map<ReadLeaf, Set<B64Hash>>();
             const rowsOf = async (leaf: ReadLeaf): Promise<Set<B64Hash>> => {
@@ -369,7 +381,7 @@ async function existsTruth(pred: Extract<Predicate, { p: 'exists' }>, env: Truth
         if (subject === undefined || live.status === 'false') {
             tree = simplifyWhere(tree, (leaf) => leaf.row);
         } else {
-            const columns = new Map<string, ColumnValue>();
+            const columns = new Map<string, SubjectValue>();
             const noValue = new Set<ReadLeaf>();
             for (const leaf of rowLeaves) {
                 const undecided: Undecided[] = [];
@@ -488,15 +500,63 @@ async function readSubject(
     return { live, values };
 }
 
+// What a row op writes to `column`: a value, null when it sets the column to
+// NULL, undefined when it does not write it.
+function opWrite(op: RowOpPayload, column: string): json.Literal | null | undefined {
+    if (op.action === 'delete') return undefined;
+    const value = op.values[column];
+    if (value !== undefined) return value;
+    return opNullsColumn(op, column) ? null : undefined;
+}
+
+// The schema a check runs under can differ from the one its op was written
+// under. At use it also holds the deploys concurrent with the op, so a table
+// or a column may have been dropped and added again since. What the op wrote
+// then belongs to the old table or column, which no row reads any more.
+// `own` is the schema at the op's own position, the one its meta was derived
+// under. Without it the two are the same schema, as at validation.
+
+// Whether `table` is still the table the op wrote to.
+function sameTable(table: string, schemaView: RSchemaView, own: RSchemaView | undefined): boolean {
+    return own === undefined || schemaView.getTableIncarnation(table) === own.getTableIncarnation(table);
+}
+
+// Whether `column` is still the column the op wrote to: only then does what
+// the op carries for it count in the op's checks.
+function sameColumn(table: string, column: string, schemaView: RSchemaView, own: RSchemaView | undefined): boolean {
+    return own === undefined || schemaView.getColumnIncarnation(table, column) === own.getColumnIncarnation(table, column);
+}
+
+// The reference a row op answers for in a foreign key column, undefined when
+// it answers for none. An op answers for the references it makes: an insert
+// for each foreign key column it sets and for the default of each one it
+// leaves out, an update only for the ones it sets. A column it sets to NULL
+// makes no reference. `counts` says whether what the op carries for the column
+// counts (see sameColumn); when it does not, the op is taken as not writing it.
+export function fkObligation(
+    op: RowOpPayload, column: string, def: TableDef | undefined, counts: boolean,
+): json.Literal | undefined {
+    const written = counts ? opWrite(op, column) : undefined;
+    if (written === null) return undefined;
+    if (written !== undefined) return written;
+    return op.action === 'insert' ? def?.columns[column]?.default : undefined;
+}
+
 // The subject row of a row op. Inserts: the op's values plus schema defaults
 // (the row's resolved state at insert). Updates / deletes: the post-image, the
 // row's resolved values overlaid with the op's writes (none for delete); a row
-// that is not live fails every $row atom (positive logic).
+// that is not live fails every $row atom (positive logic). A column the op or
+// the row sets to NULL has no value, and its default does not apply. `counts`
+// says for a column whether what the op carries for it counts (see
+// sameColumn): if not, an insert is read as leaving the column out and an
+// update as not writing it, which is what the row reads.
 function opSubject(
     op: RowOpPayload, table: string, def: TableDef | undefined,
     getTableView: (table: string) => Promise<TruthTableView>,
+    counts: (column: string) => boolean,
 ): SubjectRow {
     const fallback = (column: string) => def?.columns[column]?.default;
+    const carried = (column: string) => counts(column) ? opWrite(op, column) : undefined;
 
     if (op.action === 'insert') {
         return {
@@ -505,7 +565,7 @@ function opSubject(
                 status: 'decided',
                 value: column === 'rowAuthor'
                     ? op.author
-                    : def?.columns[column] === undefined ? undefined : op.values[column] ?? fallback(column),
+                    : def?.columns[column] === undefined ? undefined : resolvedColumnValue(carried(column), fallback(column)),
             }),
         };
     }
@@ -516,9 +576,10 @@ function opSubject(
         live: async () => (await row()).truth,
         column: async (column) => {
             if (column === 'rowAuthor') return { status: 'decided', value: (await row()).author };
-            if (op.action === 'update' && op.values[column] !== undefined) return { status: 'decided', value: op.values[column] };
+            const written = carried(column);
+            if (written !== undefined) return { status: 'decided', value: written === null ? undefined : written };
             const read = await (await getTableView(table)).columnValue(op.rowId, column);
-            return read.status === 'undecided' ? read : { status: 'decided', value: read.value ?? fallback(column) };
+            return read.status === 'undecided' ? read : { status: 'decided', value: resolvedColumnValue(read.value, fallback(column)) };
         },
     };
 }
@@ -556,7 +617,12 @@ export type RowOpRestrictionFailure = {
     rule: Predicate;
 };
 
-// The restriction's truth, with the failure when it is false.
+// The restriction's truth, with the failure when it is false. `ownSchemaView`
+// is the schema at the op's own position, given when `schemaView` may differ
+// from it (the view-time recheck). An op whose table is gone under
+// `schemaView` fails, and so does one whose table was dropped and added again:
+// its row belongs to the old table. In a subject row, what the op carries for
+// a column that was dropped and added again does not count.
 export async function explainRowOpRestriction(
     op: RowOpPayload,
     table: string,
@@ -565,8 +631,9 @@ export async function explainRowOpRestriction(
     getTableView: (table: string) => Promise<TruthTableView>,
     getForeignTableView: (group: string, table: string) => Promise<TruthTableView | undefined>,
     params?: { [name: string]: json.Literal },
+    ownSchemaView?: RSchemaView,
 ): Promise<{ truth: Truth; failure?: RowOpRestrictionFailure }> {
-    if (!schemaView.hasTable(table)) {
+    if (!schemaView.hasTable(table) || !sameTable(table, schemaView, ownSchemaView)) {
         return { truth: FALSE, failure: { table, action: op.action, rowId: op.rowId, rule: { p: 'false' } } };
     }
     const rule = schemaView.getRestriction(table, op.action, authenticated);
@@ -576,7 +643,7 @@ export async function explainRowOpRestriction(
 
     const truth = await evaluatePredicateTruth(rule, {
         getTableView, getForeignTableView, author: op.author,
-        subject: opSubject(op, table, def, getTableView),
+        subject: opSubject(op, table, def, getTableView, (column) => sameColumn(table, column, schemaView, ownSchemaView)),
         params,
         context: 'row',
         typeOf,
@@ -594,8 +661,9 @@ export type RowOpFKFailure = {
     targetRowId: B64Hash;
 };
 
-// At-use FK reach: every FK column the op writes (or inherits as a schema
-// default) must name a target row that is LIVE at the op's OWN position,
+// At-use FK reach: every reference the op answers for (see fkObligation: the
+// FK columns it sets, and for an insert the default of each one it leaves out)
+// must name a target row that is LIVE at the op's OWN position,
 // observed from the evaluating view's `from`. This folds FK enforcement into
 // op-voiding — a dangling write voids the op on the same view-time path as a
 // restriction recheck: a voided insert never lives, a voided FK-update
@@ -618,6 +686,11 @@ export type RowOpFKFailure = {
 // the entry is all-or-nothing and was order-validated at write time, and the
 // views diagnosing an entry read that entry as void. undefined = not touched
 // by the entry: check the view.
+//
+// `ownSchemaView` is the schema at the op's own position, given when
+// `schemaView` may differ from it. What the op carries for a column that was
+// dropped and added again since does not count: an insert then answers for the
+// new column's default, as its row reads it, and an update for nothing there.
 export async function explainRowOpFKReach(
     op: RowOpPayload,
     table: string,
@@ -625,6 +698,7 @@ export async function explainRowOpFKReach(
     getTableView: (table: string) => Promise<TruthTableView>,
     getForeignTableView: (group: string, table: string) => Promise<TruthTableView | undefined>,
     localTargetProvided?: (table: string, rowId: B64Hash) => boolean | undefined,
+    ownSchemaView?: RSchemaView,
 ): Promise<{ truth: Truth; failure?: RowOpFKFailure }> {
     if (op.action === 'delete') return { truth: TRUE };
 
@@ -633,8 +707,8 @@ export async function explainRowOpFKReach(
 
     const undecided: Truth[] = [];
     for (const column of Object.keys(fks)) {
-        const value = op.values[column] ?? def?.columns[column]?.default;
-        if (value === undefined) continue;             // absent (nullable): unconstrained
+        const value = fkObligation(op, column, def, sameColumn(table, column, schemaView, ownSchemaView));
+        if (value === undefined) continue;             // no reference to answer for
         const targetRef = fks[column];
         const failure: RowOpFKFailure = {
             table, action: op.action, rowId: op.rowId, column, targetRef,

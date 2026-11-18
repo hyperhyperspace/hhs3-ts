@@ -554,5 +554,37 @@ export const columnIncarnationTests = {
                 }
             }
         },
+        {
+            name: '[INC13] a null written before a drop is gone after the re-add: the row reads the new default',
+            invoke: async () => {
+                const { group, schema, admin } = await createEnv([
+                    open('orders', { customer: { type: 'string' }, status: { type: 'string', nullable: true, default: 'new' } }),
+                ]);
+                const orders = await group.getTable('orders');
+                const nulledAtInsert = deriveRowId('o-1');
+                const cleared = deriveRowId('o-2');
+
+                await orders.insert('o-1', { customer: 'ada', status: null });
+                await orders.insert('o-2', { customer: 'bob', status: 'shipped' });
+                await orders.update(cleared, { status: null });
+                const before = await orders.getView();
+                assertTrue(!('status' in (await before.getRow(nulledAtInsert))!.values), 'the null shows before the drop');
+                assertTrue(!('status' in (await before.getRow(cleared))!.values), 'the cleared column reads NULL before the drop');
+
+                await schema.updateSchema([{ rule: 'drop-column', table: 'orders', column: 'status' }], admin, 'drop status');
+                await group.deploy(await schemaFrontier(schema));
+                await schema.updateSchema([{
+                    rule: 'add-column', table: 'orders', column: 'status',
+                    def: { type: 'string', nullable: true, default: 'fresh' },
+                }], admin, 're-add status');
+                await group.deploy(await schemaFrontier(schema));
+
+                const after = await orders.getView();
+                assertEquals((await after.getRow(nulledAtInsert))!.values['status'], 'fresh',
+                    'a null written to the old column does not carry over');
+                assertEquals((await after.getRow(cleared))!.values['status'], 'fresh',
+                    'an update to null of the old column does not carry over');
+            }
+        },
     ],
 };

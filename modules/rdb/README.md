@@ -43,7 +43,7 @@ The same mechanism covers data and schemas. A schema is referenced by hash and r
 A delta reports how the database differs between two versions, on three channels:
 
 - **Schema** — how the schema evolved: added columns and defaults, dropped tables, changed foreign keys, restrictions, flags, and table/column **reincarnations** (a same-shape drop+re-add whose resolved def is unchanged but whose incarnation reset, so a consumer must clear and re-materialize rather than diff in place).
-- **Row (data)** — rows whose live values changed (materialized projection diff).
+- **Row (data)** — rows whose live values changed (materialized projection diff). Each side of a column change is a value, NULL, or unset when no live write gives the column anything, in which case the consumer applies the column's default (see [Nulls and defaults](#nulls-and-defaults)).
 - **Op** — group DAG entries whose at-use void verdict flipped (reconciliation mind-changed), including gated observes when they void. Each flip carries a structured void reason at the voided horizon (`start` when un-voided, `end` when became voided): restriction failure, dangling FK, observe-gate failure, or an undecided dependency cycle.
 
 A row-channel liveness transition pinpoints operations discarded by reconciliation: an insert that never went live, or a row revoked when a concurrent revoke or deploy came into view, appears as a row going from live to dead. So does a row deleted by a deploy that adds an FK it doesn't honor, though no op flips for it. The op channel names the underlying entry-level void flip and explains *why* at the voided horizon; the row channel does not.
@@ -151,9 +151,49 @@ Row **liveness** is incarnation-scoped, not just column values: a row belongs to
 
 **Adopting an FK.** A `set-fks` that adds or retargets an FK always deploys, whatever the existing data. The deploy deletes the rows live at its parents that don't honor the FK (a value that isn't the rowId of a live target), as if it carried a delete of each: they are dead from the deploy on, permanently within the table incarnation, and a branch concurrent to the deploy sees the deletion at the merge when the table's `concurrentDeletes` flag is on. The deletion follows chains and self-references through the FKs the same deploy adopts; a row pointing at a deleted row through an FK that already held stays live, dangling, as after any delete. A table the deploy resets and a column it re-creates hold no old values, so they lose nothing. Each replica derives the deleted rows when it applies the deploy and stores them in the entry's meta, so the rule is part of the protocol: changing it needs a store migration.
 
+## Nulls and defaults
+
+A nullable column of a row is in one of three states: it was never written, it holds a value, or it is set to NULL. An insert or an update sets a column to NULL by naming it with a null (`NULL` in C-SQL, `null` in the write API). As in SQL, an explicit NULL wins over the column's default, and a column that is left out gets the default.
+
+| Write | Column has a default | No default |
+|---|---|---|
+| Insert, column left out | the default | NULL |
+| Insert, explicit NULL | NULL | NULL |
+| Update to a value | the value | the value |
+| Update to NULL | NULL | NULL |
+| Row older than the column | the default | NULL |
+
+**Where a NULL is allowed.** Only in a nullable column. An update cannot set a `readonly` column to NULL, as it cannot set it to anything; an insert can. An identity provider's key id and public key columns always need a value.
+
+**Reading.** A column that reads NULL is absent from a row's values. "Set to NULL" and "never written, with no default" read the same, and nothing in the read API tells them apart. A comparison with a NULL column is false, in queries and in allow rules. In a query, `isNull` (`IS NULL` in C-SQL) holds for a column with no value, and on `rowAuthor` it finds the anonymous rows. A NULL adds nothing to the index of a `pub` column, so a lookup by a value never finds it, and a lookup by the default's value does not find a row that set the column to NULL.
+
+**The operation.** A row operation carries the columns it gives a value in `values`, and the names of the ones it sets to NULL in `nulls`. A json literal has no null, so the two travel apart and no null enters a hash. `nulls` has one spelling: left out when empty, its names in ascending order by UTF-16 code unit, none repeated, and none also in `values`. `rowWriteParts` builds both from a write. An update must write something, a value or a NULL.
+
+**Concurrency.** A NULL is a write like any other: it hides the writes its writer had seen. Among concurrent writes to one column, a value wins over a NULL, and the larger entry hash decides between two values or between two NULLs. So a NULL clears only what its writer saw, and a clear never wins a race against a write. When two concurrent inserts create the same row, a column that one of them leaves out does not compete: the other insert's value, or NULL, shows.
+
+**Voiding.** A NULL write that becomes void is ignored, like any void write. What it hid shows again: the earlier value, or the default when there was none.
+
+**No way back to the default.** Nothing takes a column back to "never written". Writing the default's value gives the same result, because a default never changes: no rule edits a column's default or nullability in place. A column gets a new default only by being dropped and added again, which starts a new incarnation and leaves the old writes, NULLs included, behind.
+
+### What an operation answers for
+
+A foreign key reference is checked on the operation that makes it, at that operation's own position (a target deleted concurrently voids it; one deleted later does not). An operation answers for the references it makes, and for no others:
+
+- an insert answers for each foreign key column it sets, and for the default of each one it leaves out;
+- an update answers only for the foreign key columns it sets. It never re-checks a default, nor the reference its row already holds, so a row whose target was deleted later stays live and still takes updates;
+- a column set to NULL makes no reference. Where the column has a default, an explicit NULL also drops the reference the default would have made.
+
+The same holds for the row an allow rule reads: an insert's row is its values, its NULLs and the defaults of the columns it leaves out.
+
+**A column or a table added again.** An operation is checked twice: when it is appended, under the schema at its own position, and again by every reader, under a schema that also holds the deploys concurrent with it. So by the second check a column of its table may have been dropped and added again. What the operation carries for such a column, a value or a NULL, was written to the old column, and its row does not read it. The checks follow the row:
+
+- an insert is checked as if it left the column out: its rule reads the new column's default, and it answers for the default's reference;
+- an update is checked as if it did not write the column, and its other columns apply as usual;
+- an operation whose table was dropped and added again is void, as one for a dropped table is. Its row belongs to the old table, and a bundle that carries it is void as a whole.
+
 ## Column types
 
-A column has a base type and, optionally, a set of type-scoped `constraints`. Values are carried in the row as `json.Literal`s; the string-carried numeric and byte types use a **canonical string** so they hash stably and round-trip losslessly across target databases (SQLite / Postgres / IndexedDB).
+A column has a base type and, optionally, a set of type-scoped `constraints`. It may also be `nullable` and have a `default`: see [Nulls and defaults](#nulls-and-defaults). Values are carried in the row as `json.Literal`s; the string-carried numeric and byte types use a **canonical string** so they hash stably and round-trip losslessly across target databases (SQLite / Postgres / IndexedDB).
 
 | Type | Carrier | Canonical form | Constraints |
 |------|---------|----------------|-------------|

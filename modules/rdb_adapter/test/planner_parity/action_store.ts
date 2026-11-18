@@ -135,14 +135,21 @@ export class ActionStore {
         }
         const table = requireTable(this.tables, action.table);
         const existing = table.rows.get(action.rowId);
+        // a null is a NULL: kept as a missing key, and it takes no default
         if (existing !== undefined) {
-            for (const [column, value] of Object.entries(action.values)) existing.values[column] = value;
+            for (const [column, value] of Object.entries(action.values)) {
+                if (value === null) delete existing.values[column];
+                else existing.values[column] = value;
+            }
             if (action.author !== undefined) existing.author = action.author;
             return;
         }
-        const values: { [column: string]: json.Literal } = { ...action.values };
+        const values: { [column: string]: json.Literal } = {};
+        for (const [column, value] of Object.entries(action.values)) {
+            if (value !== null) values[column] = value;
+        }
         for (const [column, meta] of table.columns) {
-            if (values[column] === undefined && meta.def.default !== undefined) values[column] = meta.def.default;
+            if (!(column in action.values) && meta.def.default !== undefined) values[column] = meta.def.default;
         }
         const row: { author?: string; values: { [column: string]: json.Literal } } = { values };
         if (action.author !== undefined) row.author = action.author;

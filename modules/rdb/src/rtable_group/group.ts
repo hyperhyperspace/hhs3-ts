@@ -1182,6 +1182,10 @@ export class RTableGroupImpl implements RTableGroupContract {
 
         const opPos = version(entryHash);
         const schemaView = await this.resolveSchemaView(opPos, from);
+        // The schema the entry was written under. `schemaView` also holds the
+        // deploys concurrent with the entry, so a table or a column may have
+        // been dropped and added again since: the checks compare the two.
+        const ownSchemaView = await this.resolveSchemaView(opPos);
         const effectiveParams = await this.resolveEffectiveParams(opPos, from);
         const getTableView = async (table: string) => new RTableViewImpl(this.makeTable(table), opPos, from, evaluation, entryHash);
         const getForeignTableView = (group: string, table: string) =>
@@ -1205,7 +1209,7 @@ export class RTableGroupImpl implements RTableGroupContract {
         const undecided: Truth[] = [];
         for (const [index, { table, op }] of ops.entries()) {
             const restriction = await explainRowOpRestriction(
-                op, table, schemaView, authenticated, getTableView, getForeignTableView, effectiveParams,
+                op, table, schemaView, authenticated, getTableView, getForeignTableView, effectiveParams, ownSchemaView,
             );
             if (restriction.failure !== undefined) {
                 // row-not-live is an explain alias for restriction failure when
@@ -1235,7 +1239,7 @@ export class RTableGroupImpl implements RTableGroupContract {
             undecided.push(restriction.truth);
 
             const fk = await explainRowOpFKReach(
-                op, table, schemaView, getTableView, getForeignTableView, localTargetProvided,
+                op, table, schemaView, getTableView, getForeignTableView, localTargetProvided, ownSchemaView,
             );
             if (fk.failure !== undefined) {
                 const detail: OpVoidDetail = {

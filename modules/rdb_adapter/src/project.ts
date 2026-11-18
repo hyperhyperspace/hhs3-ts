@@ -27,7 +27,11 @@ import { initialSchemaActions, reprojectedTables, schemaDeltaActions } from "./s
 import { rowActionsForDelta } from "./row_actions.js";
 import { groupIndexDecls, planIndexActions, resolveIndexes, withIndexActions } from "./index_actions.js";
 
-// Project one live rdb Row into a full-row upsert action (all written columns).
+// Project one live rdb Row into a full-row upsert action: every column of the
+// table, with `null` for the ones the row holds no value in. A row's values
+// already include its defaults, so a missing value is a NULL. Naming it keeps
+// a target from filling the column's default into a new row, and clears a
+// local edit when the action reverts a row to what rdb holds.
 // Shared by the initial backfill and the ingestion-failure recovery path (which
 // re-materializes a genuinely-failed row from rdb truth). Provider public-key
 // columns are captured into keyMaterial; identity columns project as `_key_id`.
@@ -38,12 +42,17 @@ export function rowToUpsertAction(
     const fks = schemaView.getFKs(rdbTable);
     const provider = schemaView.getIdProvider?.(rdbTable);
 
-    const values: { [column: string]: json.Literal } = {};
+    const values: { [column: string]: json.Literal | null } = {};
     const keyMaterial: { [keyHash: string]: string } = {};
     let keyHash: string | undefined;
     let publicKey: string | undefined;
 
-    for (const [column, value] of Object.entries(row.values)) {
+    // the table's columns; without a table def, the ones the row has
+    const columnDefs = schemaView.getTable?.(rdbTable)?.columns;
+    for (const column of Object.keys(columnDefs ?? row.values)) {
+        const value: json.Literal | null = row.values[column] ?? null;
+        // The provider check comes first: a public-key column is never
+        // projected, with a value or without, and has no projected name.
         const role = providerColumnRole(provider, column);
         if (role.role === 'publicKey') {
             if (typeof value === 'string') publicKey = value;
@@ -52,7 +61,7 @@ export function rowToUpsertAction(
         if (role.role === 'keyId') {
             if (typeof value === 'string') keyHash = value;
         }
-        const colDef = schemaView.getTable?.(rdbTable)?.columns?.[column];
+        const colDef = columnDefs?.[column];
         if (colDef !== undefined && colDef.type === 'identity') {
             values[projectedIdentityColumnName(config, rdbTable, column)] = value;
             continue;

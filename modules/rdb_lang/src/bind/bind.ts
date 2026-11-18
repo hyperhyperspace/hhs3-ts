@@ -1,10 +1,10 @@
 import type { B64Hash, KeyId, OwnIdentity, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
 import type { json } from "@hyper-hyper-space/hhs3_json";
 import { serializePublicKeyToBase64, type Version } from "@hyper-hyper-space/hhs3_mvt";
-import { compareSemver, deriveRowId, isValidSemver, paramTypeFits, DEFAULT_SCHEMA_VERSION } from "@hyper-hyper-space/hhs3_rdb";
+import { compareSemver, deriveRowId, isValidSemver, paramTypeFits, rowWriteParts, DEFAULT_SCHEMA_VERSION } from "@hyper-hyper-space/hhs3_rdb";
 import type {
     CatalogFilesDef, CatalogGroupDef, CatalogParamDecl, CatalogReleaseSpec, ColumnDef, InsertRowPayload, MigrationRule, ParamValue,
-    RCatalogImpl, RDbImpl, RowOpPayload, RowQuery, RTableGroup, SchemaParamDecl,
+    RCatalogImpl, RDbImpl, RowOpPayload, RowQuery, RowWrite, RTableGroup, SchemaParamDecl,
 } from "@hyper-hyper-space/hhs3_rdb";
 
 import { DiagnosticBag, err, ok, Result, SpannedError } from "../diagnostics.js";
@@ -26,7 +26,7 @@ import type {
     LangBindContext, LangValue, ResolvedDatabaseRef, ResolvedGroupRef, ResolvedLogTarget, ResolvedSchemaRef,
     ResolvedTableRef, VersionScope,
 } from "./context.js";
-import { asJsonLiteral, canonicalEncodeRowValues, canonicalEncodeValue, resolveCreator, resolveValue } from "./values.js";
+import { asJsonLiteral, asRowWriteValue, canonicalEncodeRowValues, canonicalEncodeValue, resolveCreator, resolveValue } from "./values.js";
 import { bindGetFile, bindListFiles, bindPutFile, type BoundGetFile, type BoundListFiles, type BoundPutFile } from "./files.js";
 
 export type { BoundGetFile, BoundListFiles, BoundPutFile, OwnerRef } from "./files.js";
@@ -147,7 +147,7 @@ export type BoundInsert = {
     kind: 'insert';
     ast: InsertStatement;
     table: ResolvedTableRef;
-    values: { [column: string]: json.Literal };
+    values: RowWrite;                 // null: the column is set to NULL
     author?: OwnIdentity;
     at: Version;
     uuid: string;
@@ -157,7 +157,7 @@ export type BoundUpdate = {
     kind: 'update';
     ast: UpdateStatement;
     table: ResolvedTableRef;
-    values: { [column: string]: json.Literal };
+    values: RowWrite;                 // null: the column is set to NULL
     rowId: B64Hash;
     author?: OwnIdentity;
     at: Version;
@@ -575,8 +575,8 @@ async function bindUpdate(ast: UpdateStatement, context: LangBindContext): Promi
     const statementAuthor = await resolveGroupAuthor(ast.author, table.group, 'writes', context);
     const author = statementAuthor.author;
     const valueContext = contextWithAuthor(context, statementAuthor);
-    const rawValues: { [column: string]: json.Literal } = {};
-    for (const v of ast.values) rawValues[v.column] = asJsonLiteral(await resolveValue(v.value, valueContext));
+    const rawValues: RowWrite = {};
+    for (const v of ast.values) rawValues[v.column] = asRowWriteValue(await resolveValue(v.value, valueContext));
     const at = await context.resolveVersion(ast.at, { kind: 'group', id: table.groupId, group: table.group });
     const values = canonicalEncodeRowValues(rawValues, await resolveColumnDefs(table, at));
     const rowId = await bindRowId(ast.rowId, context, table, at);
@@ -614,15 +614,15 @@ async function bindBundleWrite(write: BundleWriteStatement, context: LangBindCon
         if (write.columns.length !== write.values.length) throw new Error('BUNDLE INSERT column count does not match value count');
         const table = await context.resolveTable(write.table);
         const { uuid, values } = await bindInsertColumns(write.columns, write.values, context, table, at, context);
-        const op: InsertRowPayload = { action: 'insert', rowId: deriveRowId(uuid, author), uuid, values };
+        const op: InsertRowPayload = { action: 'insert', rowId: deriveRowId(uuid, author), uuid, ...rowWriteParts(values) };
         return { table: write.table.table, op };
     }
     if (write.kind === 'update') {
         const table = await context.resolveTable(write.table);
-        const rawValues: { [column: string]: json.Literal } = {};
-        for (const v of write.values) rawValues[v.column] = asJsonLiteral(await resolveValue(v.value, context));
+        const rawValues: RowWrite = {};
+        for (const v of write.values) rawValues[v.column] = asRowWriteValue(await resolveValue(v.value, context));
         const values = canonicalEncodeRowValues(rawValues, await resolveColumnDefs(table, at));
-        return { table: write.table.table, op: { action: 'update', rowId: await bindRowId(write.rowId, context, table, at), values } };
+        return { table: write.table.table, op: { action: 'update', rowId: await bindRowId(write.rowId, context, table, at), ...rowWriteParts(values) } };
     }
     const table = await context.resolveTable(write.table);
     return { table: write.table.table, op: { action: 'delete', rowId: await bindRowId(write.rowId, context, table, at) } };
@@ -783,9 +783,9 @@ async function bindInsertColumns(
     table: ResolvedTableRef,
     at: Version,
     valueContext: LangBindContext,
-): Promise<{ uuid: string; values: { [column: string]: json.Literal } }> {
+): Promise<{ uuid: string; values: RowWrite }> {
     let uuid: string | undefined;
-    const values: { [column: string]: json.Literal } = {};
+    const values: RowWrite = {};
     const columnDefs = await resolveColumnDefs(table, at);
     for (let i = 0; i < columns.length; i += 1) {
         const column = columns[i];
@@ -809,7 +809,7 @@ async function bindInsertColumns(
                 values[column] = await context.resolveFkRowId(expr.prefix, table, column, at, at);
             }
         } else {
-            values[column] = asJsonLiteral(await resolveValue(expr, valueContext));
+            values[column] = asRowWriteValue(await resolveValue(expr, valueContext));
         }
     }
     return { uuid: uuid ?? context.createUuid(), values: canonicalEncodeRowValues(values, columnDefs) };

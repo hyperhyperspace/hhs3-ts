@@ -1576,6 +1576,16 @@ class Parser {
             }
             return like;
         }
+        if (this.matchKeyword('IS')) {
+            const not = this.matchKeyword('NOT');
+            const span = combineSpans(left.span, this.expectKeyword('NULL').span);
+            const column = this.toOperand(left);
+            if (column.kind !== 'column') {
+                this.diagnostics.add('PARSE_EXPECTED_TOKEN', 'IS NULL takes a column on its left', left.span);
+                return { e: 'pred', pred: { kind: 'true', span }, span };
+            }
+            return { e: 'pred', pred: { kind: 'isNull', column, not, span }, span };
+        }
         // IN is contextual (not reserved): an operator only after an operand
         // inside an EXISTS filter, and an ordinary name everywhere else.
         if (this.existsFilters > 0 && this.checkContextual('IN')) {

@@ -1,7 +1,7 @@
 import { assertTrue, assertFalse, assertEquals } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
-import { Version, serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
+import { version, Version, serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 
 import { createMockRContext } from "./mock_rcontext.js";
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
@@ -310,6 +310,60 @@ export const opDeltaTests = {
                     assertEquals(flip!.reason.targetRef, 'orders');
                     assertEquals(flip!.reason.targetRowId, orderId);
                 }
+            },
+        },
+        {
+            name: '[OPDELTA07] the row channel tells a value, a NULL and a never-written column apart',
+            invoke: async () => {
+                const { group } = await createEnv([
+                    open('targets', { name: { type: 'string' } }, { concurrentDeletes: true }),
+                    open('notes', {
+                        title: { type: 'string' },
+                        memo: { type: 'string', nullable: true },
+                        ref: { type: 'string', nullable: true },
+                    }, { fks: { ref: 'targets' } }),
+                ]);
+                const targets = await group.getTable('targets');
+                const notes = await group.getTable('notes');
+                const target = deriveRowId('t-1');
+                const noteId = deriveRowId('n-1');
+                const otherId = deriveRowId('n-2');
+
+                const show = (v: unknown): string => v === undefined ? 'unset' : v === null ? 'NULL' : String(v);
+                const changesOf = async (start: Version, end: Version, rowId: string): Promise<string> => {
+                    const out: string[] = [];
+                    for (const strategy of ['bounded', 'full'] as const) {
+                        group.setDeltaStrategy(strategy);
+                        const delta = await group.computeDelta(start, end);
+                        const row = (delta.tableChanges.get(notes.getId())?.rowChanges ?? []).find((r) => r.rowId === rowId);
+                        out.push((row?.columnChanges ?? []).map((c) => `${c.column}: ${show(c.before)} -> ${show(c.after)}`).join('; '));
+                    }
+                    assertEquals(out[0], out[1], 'the bounded walk and the full walk report the same changes');
+                    return out[0];
+                };
+
+                await targets.insert('t-1', { name: 't' });
+                await notes.insert('n-1', { title: 'a', memo: 'm' });
+                await notes.insert('n-2', { title: 'a' });
+                const s0 = await groupFrontier(group);
+
+                await notes.update(noteId, { memo: null });
+                const s1 = await groupFrontier(group);
+                assertEquals(await changesOf(s0, s1, noteId), 'memo: m -> NULL', 'a value that becomes NULL');
+
+                await notes.update(noteId, { memo: 'm2' });
+                const s2 = await groupFrontier(group);
+                assertEquals(await changesOf(s1, s2, noteId), 'memo: NULL -> m2', 'a NULL that becomes a value');
+
+                // a null that becomes void: the column goes back to never written
+                const base = await groupFrontier(group);
+                await targets.delete(target, undefined, base);
+                const hUpdate = await notes.update(otherId, { memo: null, ref: target }, undefined, base);
+                const merged = await groupFrontier(group);
+                assertEquals(await changesOf(base, version(hUpdate), otherId), 'memo: unset -> NULL; ref: unset -> ' + target,
+                    'a never-written column that becomes NULL');
+                assertEquals(await changesOf(version(hUpdate), merged, otherId), 'memo: NULL -> unset; ref: ' + target + ' -> unset',
+                    'a void null: the column is never written again');
             },
         },
     ],

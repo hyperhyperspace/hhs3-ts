@@ -78,6 +78,45 @@ async function replicate(
     return copy;
 }
 
+// An insert into `tasks` that carries `carried` for column `c`, concurrent with
+// a deploy that drops `c` and adds it again as a foreign key to `projects` with
+// the project 'inbox' as its default. 'p1' stands for a live project. Returns
+// why the insert is void after the merge (undefined when live) and the row, on
+// the writer and on a second replica built by re-applying the entries.
+async function columnReadd(opts: { carried: 'some text' | 'p1' | null; deleteDefaultTarget: boolean }) {
+    const inbox = deriveRowId('inbox');
+    const { group, schema, admin, schemaInit, groupInit } = await createEnv([
+        open('projects', { name: { type: 'string' } }),
+        open('tasks', { title: { type: 'string' }, c: { type: 'string', nullable: true } }),
+    ]);
+    const projects = await group.getTable('projects');
+    await projects.insert('inbox', { name: 'inbox' });
+    await projects.insert('p1', { name: 'p1' });
+    if (opts.deleteDefaultTarget) await projects.delete(inbox);
+
+    await schema.updateSchema([
+        { rule: 'drop-column', table: 'tasks', column: 'c' },
+        { rule: 'add-column', table: 'tasks', column: 'c', def: { type: 'string', nullable: true, default: inbox } },
+        { rule: 'set-fks', table: 'tasks', fks: { c: 'projects' } },
+    ], admin, 're-add c');
+    const base = await groupFrontier(group);
+
+    const deployHash = await group.deploy(await schemaFrontier(schema), undefined, base);
+    const carried = opts.carried === 'p1' ? deriveRowId('p1') : opts.carried;
+    const insertHash = await (await group.getTable('tasks')).insert('t', { title: 'a', c: carried }, undefined, base);
+    const merged = await groupFrontier(group);
+
+    const replicas = [];
+    for (const [replica, label] of [[group, 'the writer'], [await replicate(schema, schemaInit, group, groupInit), 'a second replica']] as const) {
+        replicas.push({
+            label,
+            reason: await replica.explainEntryVoided(insertHash, merged),
+            row: await (await viewAt(replica, 'tasks', merged, merged)).getRow(deriveRowId('t')),
+        });
+    }
+    return { inbox, replicas, group, deployHash, insertHash, merged };
+}
+
 // permissive table: unauthored ops never void (focus on the deploy revision)
 function open(name: string, columns: TableDef['columns'], extra?: Partial<TableDef>): TableDef {
     return { name, columns, restrictions: [{ on: 'all', rule: { p: 'true' } }], ...extra };
@@ -914,6 +953,213 @@ export const rtableDeployTests = {
                 assertTrue(!resolved.has(schema.getId()), 'the canonical schema version drops the genesis below the deploy');
                 const shown = (await group.getView()).getSchemaView().getVersion();
                 assertTrue(!shown.has(schema.getId()), 'the group view reports that canonical version');
+            }
+        },
+        {
+            name: '[DEPLOY22] an add-fk deploy keeps a row whose column is NULL',
+            invoke: async () => {
+                const { group, schema, admin } = await createEnv([
+                    open('orders', { customer: { type: 'string' } }),
+                    open('lines', { order: { type: 'string', nullable: true }, qty: { type: 'integer' } }),
+                ]);
+                const lines = await group.getTable('lines');
+
+                // one row cleared a value that would have dangled, the other was inserted with a null
+                const clearedId = deriveRowId('l-1');
+                const nulledId = deriveRowId('l-2');
+                await lines.insert('l-1', { order: deriveRowId('ghost-order'), qty: 1 });
+                await lines.update(clearedId, { order: null });
+                await lines.insert('l-2', { order: null, qty: 1 });
+
+                await schema.updateSchema([{ rule: 'set-fks', table: 'lines', fks: { order: 'orders' } }], admin, 'add fk');
+                const deployHash = await group.deploy(await schemaFrontier(schema));
+
+                const entry = (await (await group.getScopedDag()).loadEntry(deployHash))!;
+                assertTrue(entry.meta['tables'] === undefined, 'the deploy entry lists no table to delete from');
+                const merged = await groupFrontier(group);
+                const view = await viewAt(group, 'lines', merged, merged);
+                assertTrue(await view.hasRow(clearedId), 'a row that nulled the column before the deploy stays live');
+                assertTrue(await view.hasRow(nulledId), 'a row inserted with a null stays live');
+            }
+        },
+        {
+            name: '[DEPLOY23] an insert concurrent with a re-add of a column it set is checked on what its row reads, not on what it carried',
+            invoke: async () => {
+                // carried a text that is no project, while the new column's default points at a live one
+                const stray = await columnReadd({ carried: 'some text', deleteDefaultTarget: false });
+                for (const r of stray.replicas) {
+                    assertEquals(r.reason, undefined, `${r.label}: the insert is live; the text it carried was written to the old column`);
+                    assertEquals(r.row?.values['c'], stray.inbox, `${r.label}: the row reads the new column's default`);
+                }
+
+                // carried a live project, while the new column's default points at a deleted one
+                const dangling = await columnReadd({ carried: 'p1', deleteDefaultTarget: true });
+                for (const r of dangling.replicas) {
+                    assertEquals(r.reason?.kind, 'fk', `${r.label}: the insert is void; its row would read a default with a dead target`);
+                    assertTrue(r.row === undefined, `${r.label}: the row is not live`);
+                }
+            }
+        },
+        {
+            name: '[DEPLOY24] the same holds for an insert that nulled the column: the null was written to the old column',
+            invoke: async () => {
+                const live = await columnReadd({ carried: null, deleteDefaultTarget: false });
+                for (const r of live.replicas) {
+                    assertEquals(r.reason, undefined, `${r.label}: the insert is live`);
+                    assertEquals(r.row?.values['c'], live.inbox, `${r.label}: the row reads the new column's default, not NULL`);
+                }
+
+                const dangling = await columnReadd({ carried: null, deleteDefaultTarget: true });
+                for (const r of dangling.replicas) {
+                    assertEquals(r.reason?.kind, 'fk', `${r.label}: the insert is void; the null does not cover the new column`);
+                    assertTrue(r.row === undefined, `${r.label}: the row is not live`);
+                }
+            }
+        },
+        {
+            name: '[DEPLOY25] an operation for a table that was dropped and added again concurrently is void, and so is its bundle',
+            invoke: async () => {
+                for (const newRule of [{ p: 'true' }, { p: 'false' }] as Predicate[]) {
+                    const { group, schema, admin, schemaInit, groupInit } = await createEnv([
+                        open('tasks', { title: { type: 'string' } }),
+                        open('notes', { text: { type: 'string' } }),
+                    ]);
+                    await schema.updateSchema([
+                        { rule: 'drop-table', table: 'tasks' },
+                        { rule: 'add-table', def: { name: 'tasks', columns: { title: { type: 'string' } }, restrictions: [{ on: 'all', rule: newRule }] } },
+                    ], admin, 're-add tasks');
+                    const base = await groupFrontier(group);
+
+                    await group.deploy(await schemaFrontier(schema), undefined, base);
+                    const bundleHash = await group.bundle([
+                        { table: 'tasks', op: { action: 'insert', rowId: deriveRowId('t'), uuid: 't', values: { title: 'a' } } },
+                        { table: 'notes', op: { action: 'insert', rowId: deriveRowId('n'), uuid: 'n', values: { text: 'hello' } } },
+                    ], undefined, base);
+                    const aloneHash = await (await group.getTable('tasks')).insert('t-alone', { title: 'a' }, undefined, base);
+                    const merged = await groupFrontier(group);
+
+                    const what = `the new table allows ${newRule.p === 'true' ? 'every' : 'no'} write`;
+                    for (const [replica, label] of [[group, 'the writer'], [await replicate(schema, schemaInit, group, groupInit), 'a second replica']] as const) {
+                        const view = await replica.getView(merged, merged);
+                        assertTrue(await replica.isEntryVoided(bundleHash, merged), `${label}, ${what}: the bundle is void`);
+                        assertFalse(await (await view.getTableView('tasks')).hasRow(deriveRowId('t')), `${label}, ${what}: its row in the reset table is not live`);
+                        assertFalse(await (await view.getTableView('notes')).hasRow(deriveRowId('n')), `${label}, ${what}: nor is its row in the other table`);
+                        assertTrue(await replica.isEntryVoided(aloneHash, merged), `${label}, ${what}: a single insert into the old table is void`);
+                    }
+                }
+            }
+        },
+        {
+            name: '[DEPLOY26] an update concurrent with a re-add of a column it set answers for no reference there, and its other columns apply',
+            invoke: async () => {
+                for (const deleteDefaultTarget of [false, true]) {
+                    const inbox = deriveRowId('inbox');
+                    const { group, schema, admin, schemaInit, groupInit } = await createEnv([
+                        open('projects', { name: { type: 'string' } }),
+                        open('tasks', { title: { type: 'string' }, c: { type: 'string', nullable: true } }),
+                    ]);
+                    const projects = await group.getTable('projects');
+                    const tasks = await group.getTable('tasks');
+                    await projects.insert('inbox', { name: 'inbox' });
+                    await tasks.insert('t', { title: 'a' });
+                    if (deleteDefaultTarget) await projects.delete(inbox);
+                    await schema.updateSchema([
+                        { rule: 'drop-column', table: 'tasks', column: 'c' },
+                        { rule: 'add-column', table: 'tasks', column: 'c', def: { type: 'string', nullable: true, default: inbox } },
+                        { rule: 'set-fks', table: 'tasks', fks: { c: 'projects' } },
+                    ], admin, 're-add c');
+                    const base = await groupFrontier(group);
+
+                    await group.deploy(await schemaFrontier(schema), undefined, base);
+                    const updateHash = await tasks.update(deriveRowId('t'), { title: 'b', c: 'some text' }, undefined, base);
+                    const merged = await groupFrontier(group);
+
+                    const what = `the default target is ${deleteDefaultTarget ? 'deleted' : 'live'}`;
+                    for (const [replica, label] of [[group, 'the writer'], [await replicate(schema, schemaInit, group, groupInit), 'a second replica']] as const) {
+                        assertFalse(await replica.isEntryVoided(updateHash, merged), `${label}, ${what}: the update is live`);
+                        const row = (await (await viewAt(replica, 'tasks', merged, merged)).getRow(deriveRowId('t')))!;
+                        assertEquals(row.values['title'], 'b', `${label}, ${what}: the other column it set applies`);
+                        assertEquals(row.values['c'], inbox, `${label}, ${what}: the re-added column reads its default, not the text`);
+                    }
+                }
+            }
+        },
+        {
+            name: '[DEPLOY27] an insert rule over a readonly column is evaluated on the re-added column\'s default, not on the value the insert carried',
+            invoke: async () => {
+                const levelIsHigh: Predicate = { p: 'cmp', cmp: 'eq', left: { col: 'level' }, right: { lit: 'high' } };
+                const docs = (level: string): TableDef => ({
+                    name: 'docs',
+                    columns: { title: { type: 'string' }, level: { type: 'string', readonly: true, default: level } },
+                    restrictions: [{ on: 'insert', rule: levelIsHigh }],
+                });
+                const { group, schema, admin, schemaInit, groupInit } = await createEnv([docs('high')]);
+                // a column a rule reads cannot be dropped, so the rule steps aside for the re-add
+                await schema.updateSchema([
+                    { rule: 'set-restrictions', table: 'docs', restrictions: [{ on: 'all', rule: { p: 'true' } }] },
+                    { rule: 'drop-column', table: 'docs', column: 'level' },
+                    { rule: 'add-column', table: 'docs', column: 'level', def: { type: 'string', readonly: true, default: 'low' } },
+                    { rule: 'set-restrictions', table: 'docs', restrictions: [{ on: 'insert', rule: levelIsHigh }] },
+                ], admin, 're-add level');
+                const base = await groupFrontier(group);
+
+                await group.deploy(await schemaFrontier(schema), undefined, base);
+                const table = await group.getTable('docs');
+                const carried = await table.insert('d-carried', { title: 'a', level: 'high' }, undefined, base);
+                const defaulted = await table.insert('d-defaulted', { title: 'a' }, undefined, base);
+                const merged = await groupFrontier(group);
+
+                for (const [replica, label] of [[group, 'the writer'], [await replicate(schema, schemaInit, group, groupInit), 'a second replica']] as const) {
+                    assertTrue(await replica.isEntryVoided(carried, merged),
+                        `${label}: the insert that carried 'high' is void, since its row would read the new default 'low'`);
+                    assertTrue(await replica.isEntryVoided(defaulted, merged),
+                        `${label}: the insert that left the column out is void too`);
+                }
+            }
+        },
+        {
+            name: '[DEPLOY28] the delta from either branch to the merge reports a re-added column the same under both strategies',
+            invoke: async () => {
+                const rowId = deriveRowId('t');
+                const show = (v: unknown): string => v === undefined ? 'unset' : v === null ? 'NULL' : String(v);
+                // the delta's op flips for the insert and its row change, checked equal under both strategies
+                const deltaOf = async (c: Awaited<ReturnType<typeof columnReadd>>, start: Version) => {
+                    const seen: string[] = [];
+                    let last: { flip: string; row: string } = { flip: '', row: '' };
+                    for (const strategy of ['bounded', 'full'] as const) {
+                        c.group.setDeltaStrategy(strategy);
+                        const delta = await c.group.computeDelta(start, c.merged);
+                        const flip = delta.opVerdictChanges.find((f) => f.entry === c.insertHash);
+                        const row = (delta.tableChanges.get((await c.group.getTable('tasks')).getId())?.rowChanges ?? []).find((r) => r.rowId === rowId);
+                        last = {
+                            flip: flip === undefined ? 'none' : `${flip.voidBefore ? 'void' : 'live'} -> ${flip.voidAfter ? 'void' : 'live'} (${flip.reason?.kind ?? '-'})`,
+                            row: row === undefined ? 'none'
+                                : `${row.liveBefore ? 'live' : 'absent'} -> ${row.liveAfter ? 'live' : 'absent'}: `
+                                    + row.columnChanges.map((ch) => `${ch.column} ${show(ch.before)} -> ${show(ch.after)}`).join(', '),
+                        };
+                        seen.push(JSON.stringify(last));
+                    }
+                    assertEquals(seen[0], seen[1], 'the bounded walk and the full walk report the same');
+                    return last;
+                };
+
+                // the insert ends void: its row would read a default with a dead target
+                const dangling = await columnReadd({ carried: 'p1', deleteDefaultTarget: true });
+                const fromInsert = await deltaOf(dangling, version(dangling.insertHash));
+                assertEquals(fromInsert.flip, 'live -> void (fk)', "from the insert's branch, the op channel reports the insert going void");
+                assertEquals(fromInsert.row.split(':')[0], 'live -> absent', "from the insert's branch, the row goes away");
+                const fromDeploy = await deltaOf(dangling, version(dangling.deployHash));
+                assertEquals(fromDeploy.row, 'none', "from the deploy's branch, the void insert adds no row");
+
+                // the insert stays live, and its row reads the new column's default
+                const stray = await columnReadd({ carried: 'some text', deleteDefaultTarget: false });
+                const liveFromInsert = await deltaOf(stray, version(stray.insertHash));
+                assertEquals(liveFromInsert.flip, 'none', "from the insert's branch, the insert does not change verdict");
+                assertEquals(liveFromInsert.row, 'none',
+                    'the row channel is silent: the text was written to the old column, and the re-add is in the schema channel');
+                const liveFromDeploy = await deltaOf(stray, version(stray.deployHash));
+                assertEquals(liveFromDeploy.row, 'absent -> live: title unset -> a',
+                    "from the deploy's branch, the row arrives with no write to the re-added column");
             }
         },
     ],

@@ -24,6 +24,14 @@ export const MAX_UUID_LENGTH = 128;
 
 export type RowOpPayload = InsertRowPayload | UpdateRowPayload | DeleteRowPayload;
 
+// A column an insert or an update writes holds a value, in `values`, or is set
+// to NULL, by being named in `nulls`. A json literal has no null, so the two
+// travel apart. `nulls` has one spelling: left out when empty, its names in
+// strictly ascending order by UTF-16 code unit (the order of `<` on strings),
+// and none of them also a key of `values`.
+
+const nullsFormat: json.Format = [json.Type.BoundedArray, [json.Type.BoundedString, MAX_NAME_LENGTH], MAX_COLUMNS];
+
 // Insert a row:
 
 export type InsertRowPayload = {
@@ -31,6 +39,7 @@ export type InsertRowPayload = {
     rowId: B64Hash;                               // must equal deriveRowId(uuid, author)
     uuid: string;
     values: { [column: string]: json.Literal };
+    nulls?: string[];                             // columns set to NULL
     author?: KeyId;                               // authored variant (signature verified at validation)
     signature?: string;
 };
@@ -40,18 +49,20 @@ export const insertRowFormat: json.Format = {
     rowId: [json.Type.BoundedString, MAX_HASH_LENGTH],
     uuid: [json.Type.BoundedString, MAX_UUID_LENGTH],
     values: [json.Type.BoundedMap, [json.Type.BoundedString, MAX_NAME_LENGTH], json.Type.Something, MAX_COLUMNS],
+    nulls: [json.Type.Option, nullsFormat],
     author: [json.Type.Option, [json.Type.BoundedString, MAX_KEY_ID_LENGTH]],
     signature: [json.Type.Option, [json.Type.BoundedString, MAX_SIGNATURE_LENGTH]],
 };
 
 // Update a row (partial: only the updated fields are carried; per-field
 // last-writer-wins with a deterministic entry-hash tiebreak for concurrent
-// writers):
+// writers). It must write something: a value or a null.
 
 export type UpdateRowPayload = {
     action: 'update';
     rowId: B64Hash;
     values: { [column: string]: json.Literal };
+    nulls?: string[];                             // columns set to NULL
     author?: KeyId;
     signature?: string;
 };
@@ -60,9 +71,36 @@ export const updateRowFormat: json.Format = {
     action: [json.Type.Constant, 'update'],
     rowId: [json.Type.BoundedString, MAX_HASH_LENGTH],
     values: [json.Type.BoundedMap, [json.Type.BoundedString, MAX_NAME_LENGTH], json.Type.Something, MAX_COLUMNS],
+    nulls: [json.Type.Option, nullsFormat],
     author: [json.Type.Option, [json.Type.BoundedString, MAX_KEY_ID_LENGTH]],
     signature: [json.Type.Option, [json.Type.BoundedString, MAX_SIGNATURE_LENGTH]],
 };
+
+// What a caller hands to a writer: for each column a value, or null to set the
+// column to NULL.
+export type RowWrite = { [column: string]: json.Literal | null };
+
+// Split a write into the `values` and `nulls` of a row op, in the one spelling
+// the format accepts: spread the result into an insert or an update payload.
+// The sort has no comparator on purpose. It orders by UTF-16 code unit, which
+// is what the validator checks; a locale-aware order would differ between
+// runtimes.
+export function rowWriteParts(write: RowWrite): { values: { [column: string]: json.Literal }; nulls?: string[] } {
+    const values: { [column: string]: json.Literal } = {};
+    const nulls: string[] = [];
+    for (const [column, value] of Object.entries(write)) {
+        if (value === null) nulls.push(column);
+        else values[column] = value;
+    }
+    if (nulls.length === 0) return { values };
+    nulls.sort();
+    return { values, nulls };
+}
+
+// Whether an insert or an update sets `column` to NULL.
+export function opNullsColumn(op: InsertRowPayload | UpdateRowPayload, column: string): boolean {
+    return op.nulls !== undefined && op.nulls.includes(column);
+}
 
 // Delete a row. PERMANENT: rowIds are write-once, so re-insertion of a
 // deleted rowId is invalid. Always barrier-tagged at write; whether the

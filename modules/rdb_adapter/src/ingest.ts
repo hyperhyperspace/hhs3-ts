@@ -29,11 +29,11 @@
 import type { json } from "@hyper-hyper-space/hhs3_json";
 import type { KeyId } from "@hyper-hyper-space/hhs3_crypto";
 import {
-    BundleWrite, deriveRowId, InsertRowPayload, RowOpPayload, RSchemaView,
+    BundleWrite, deriveRowId, InsertRowPayload, RowOpPayload, RowWrite, rowWriteParts, RSchemaView, TableDef,
 } from "@hyper-hyper-space/hhs3_rdb";
 
 import {
-    AdapterConfig, CapturedBatch, CapturedChange, IngestRejection, SyncMapping,
+    AdapterConfig, CapturedBatch, CapturedChange, CapturedValues, IngestRejection, SyncMapping,
 } from "./types.js";
 import {
     isSystemColumn, keyRefColumnFromTarget, rdbColumnName, rdbFkColumnFromTarget, rdbTableName,
@@ -124,13 +124,13 @@ function disjoint(a: { [k: string]: unknown }, b: { [k: string]: unknown }): boo
 // ---------------------------------------------------------------------------
 
 // One original update change folded into a (possibly merged) update net op.
-type UpdatePart = { values: { [column: string]: json.Literal }; sources: CapturedChange[] };
+type UpdatePart = { values: CapturedValues; sources: CapturedChange[] };
 
 type NetChange = {
     table: string;
     localId: number;
     kind: 'insert' | 'update' | 'delete';
-    values: { [column: string]: json.Literal };
+    values: CapturedValues;
     sources: CapturedChange[];
     // Update only: the constituent per-change updates (>1 iff a merge happened),
     // used to build the merged op's per-change fallback.
@@ -257,12 +257,15 @@ function mintInserts(
 // offending column's reject reason.
 // ---------------------------------------------------------------------------
 
-type Reversed = { ok: true; values: { [column: string]: json.Literal }; deps: string[] } | { ok: false; reason: string };
+type Reversed = { ok: true; values: RowWrite; deps: string[] } | { ok: false; reason: string };
 
-// Reverse a set of target columns into rdb columns/values for `rdbTable`.
+// Reverse a set of target columns into rdb columns/values for `rdbTable`. A
+// null maps to a null of the rdb column: in each branch the readonly check
+// runs first and the null is mapped next, before any lookup, since a NULL
+// foreign key or key id resolves to nothing.
 function reverseCols(
     rdbTable: string,
-    targetValues: { [column: string]: json.Literal },
+    targetValues: CapturedValues,
     ctx: NodeContext,
     isUpdate: boolean,
     lookup: MappingLookup,
@@ -280,14 +283,19 @@ function reverseCols(
         }
     }
 
-    const values: { [column: string]: json.Literal } = {};
+    const values: RowWrite = {};
     const deps: string[] = [];
     for (const targetCol of Object.keys(targetValues)) {
+        const raw = targetValues[targetCol];
         const fkInfo = rdbFkColumnFromTarget(config, rdbTable, fks, targetCol);
         if (fkInfo !== undefined) {
             const rdbCol = fkInfo.rdbColumn;
             if (isUpdate && def?.columns?.[rdbCol]?.readonly) {
                 return { ok: false, reason: `cannot update readonly column '${rdbTable}.${rdbCol}'` };
+            }
+            if (raw === null) {
+                values[rdbCol] = null;
+                continue;
             }
             if (fkInfo.resolvesToId) {
                 const targetTable = fkInfo.targetTable!;
@@ -300,7 +308,7 @@ function reverseCols(
                 values[rdbCol] = targetRowId;
                 if (!fkInfo.crossGroup) deps.push(tKey);
             } else {
-                values[rdbCol] = targetValues[targetCol];
+                values[rdbCol] = raw;
             }
             continue;
         }
@@ -311,7 +319,11 @@ function reverseCols(
             if (isUpdate && def?.columns?.[rdbCol]?.readonly) {
                 return { ok: false, reason: `cannot update readonly column '${rdbTable}.${rdbCol}'` };
             }
-            const keyId = targetValues[targetCol] as number;
+            if (raw === null) {
+                values[rdbCol] = null;
+                continue;
+            }
+            const keyId = raw as number;
             const info = keyLookup(keyId);
             if (info === undefined) {
                 return { ok: false, reason: `unknown key id ${keyId} for '${rdbTable}.${rdbCol}'` };
@@ -335,9 +347,26 @@ function reverseCols(
         if (isUpdate && def?.columns?.[rdbCol]?.readonly) {
             return { ok: false, reason: `cannot update readonly column '${rdbTable}.${rdbCol}'` };
         }
-        values[rdbCol] = targetValues[targetCol];
+        values[rdbCol] = raw;
     }
     return { ok: true, values, deps };
+}
+
+// The columns an insert op carries, from the reversed columns of a captured
+// insert. A value is kept. A null is kept only where the column has a default,
+// where it means "NULL, not the default". Everywhere else it is left out: a
+// target cannot tell an explicit NULL from an empty column (SQLite captures an
+// insert as the whole row, with a NULL for every empty column), and in rdb the
+// two read the same. That covers a column rdb's schema does not have: a deploy
+// that drops a column can arrive between the local insert and its ingestion,
+// and the insert asked for no value there.
+function insertWrite(reversed: RowWrite, def: TableDef | undefined): RowWrite {
+    const write: RowWrite = {};
+    for (const [column, value] of Object.entries(reversed)) {
+        if (value === null && def?.columns?.[column]?.default === undefined) continue;
+        write[column] = value;
+    }
+    return write;
 }
 
 function translateNet(
@@ -397,7 +426,10 @@ function translateNet(
             return { rejects: [{ change: lastSource, table: net.table, localId: net.localId, rowId: m.rowId,
                 kind: 'insert', author: writerKeyId, op: failWrite, reason: rev.reason }] };
         }
-        const op: InsertRowPayload = { action: 'insert', rowId: m.rowId, uuid: m.uuid, values: rev.values };
+        const op: InsertRowPayload = {
+            action: 'insert', rowId: m.rowId, uuid: m.uuid,
+            ...rowWriteParts(insertWrite(rev.values, ctx.schemaView.getTable?.(rdbTable))),
+        };
         const mapping: SyncMapping = { table: net.table, localId: net.localId, rowId: m.rowId,
             uuid: m.uuid, author: writerKeyId, status: 'active' };
         return { op: { key, groupId, rdbTable, table: net.table, localId: net.localId, kind: 'insert',
@@ -408,7 +440,8 @@ function translateNet(
     // update: translate each constituent part; a part that reverses OK
     // contributes its columns to the merged op AND becomes a fallback op; a part
     // that reverses to a reject (readonly / dangling / unknown key) is recorded
-    // as its own failure (so the good parts still land).
+    // as its own failure (so the good parts still land). An update keeps every
+    // null: it names only columns the app wrote, so a NULL there is a clear.
     const rowId = subjectRowId();
     if (rowId === undefined) {
         return { rejects: [{ change: lastSource, table: net.table, localId: net.localId, kind: 'update',
@@ -416,7 +449,7 @@ function translateNet(
     }
     const parts = net.parts ?? [{ values: net.values, sources: net.sources }];
     const rejects: PlannedReject[] = [];
-    const okParts: { values: { [c: string]: json.Literal }; deps: string[]; sources: CapturedChange[] }[] = [];
+    const okParts: { values: RowWrite; deps: string[]; sources: CapturedChange[] }[] = [];
     for (const part of parts) {
         const rev = reverseCols(rdbTable, part.values, ctx, true, lookup, keyLookup, minted);
         if (!rev.ok) {
@@ -433,7 +466,7 @@ function translateNet(
 
     if (okParts.length === 0) return { rejects };
 
-    const mergedValues: { [c: string]: json.Literal } = {};
+    const mergedValues: RowWrite = {};
     const mergedDeps: string[] = [];
     const mergedSources: CapturedChange[] = [];
     for (const p of okParts) {
@@ -441,14 +474,14 @@ function translateNet(
         mergedDeps.push(...p.deps);
         mergedSources.push(...p.sources);
     }
-    const mergedWrite: BundleWrite = { table: rdbTable, op: { action: 'update', rowId, values: mergedValues } };
+    const mergedWrite: BundleWrite = { table: rdbTable, op: { action: 'update', rowId, ...rowWriteParts(mergedValues) } };
 
     // Fallback ops (per surviving part) only when a merge actually happened.
     let fallback: PlannedOp[] | undefined;
     if (okParts.length > 1) {
         fallback = okParts.map((p) => ({
             key, groupId, rdbTable, table: net.table, localId: net.localId, kind: 'update' as const,
-            write: { table: rdbTable, op: { action: 'update' as const, rowId, values: p.values } },
+            write: { table: rdbTable, op: { action: 'update' as const, rowId, ...rowWriteParts(p.values) } },
             sources: p.sources, deps: p.deps,
         }));
     }

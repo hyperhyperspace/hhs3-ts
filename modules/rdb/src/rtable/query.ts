@@ -30,11 +30,15 @@ export type TypeOf = (column: string) => ColumnType | undefined;
 // Two-valued logic: an operand that does not resolve (missing column value)
 // makes its cmp/like atom false; `not` negates normally (no SQL three-valued
 // NULL). The implicit `rowAuthor` system column can be queried like a string
-// column.
+// column. `isNull` holds when the row has no value for the column: it was set
+// to NULL, or never written with no default. On `rowAuthor` it finds the
+// anonymous rows. It is never pushed down to an index, so a filter that is
+// only `isNull` scans the table.
 export type RowFilter =
     | { p: 'true' }
     | { p: 'cmp'; cmp: CmpOp; left: Operand; right: Operand }
     | { p: 'like'; value: Operand; pattern: Operand }
+    | { p: 'isNull'; col: string }
     | { p: 'not'; arg: RowFilter }         // query-only (forbidden in restrictions)
     | { p: 'and'; args: RowFilter[] }
     | { p: 'or'; args: RowFilter[] };
@@ -75,6 +79,8 @@ export function evalRowFilter(filter: RowFilter, row: Row, typeOf?: TypeOf): boo
             if (typeof v !== 'string' || typeof pattern !== 'string') return false;
             return likeMatch(v, pattern);
         }
+        case 'isNull':
+            return lookup(filter.col) === undefined;
         case 'not':
             return !evalRowFilter(filter.arg, row, typeOf);
         case 'and':
@@ -212,6 +218,11 @@ function validateRowFilter(filter: RowFilter, columns: ColumnTypes, depth: numbe
             if ('lit' in pattern && typeof pattern.lit === 'string' && !isValidLikePattern(pattern.lit)) {
                 throw new Error("LIKE pattern ends in an unescaped '\\'");
             }
+            return;
+        }
+        case 'isNull': {
+            if (typeof filter.col !== 'string') throw new Error("isNull column must be a string");
+            if (!(filter.col in columns) && filter.col !== 'rowAuthor') throw new Error(`unknown column '${filter.col}' in query filter`);
             return;
         }
         case 'not':

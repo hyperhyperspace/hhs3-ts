@@ -39,10 +39,13 @@ type DeltaTable = RTable & {
 
 const NOT_LIVE: DeltaRowState = { live: false, author: undefined, written: {} };
 
+// One column of a row whose written value changed. Each side is the value, null
+// when the column is set to NULL, or undefined when no live write carries it
+// (the consumer then applies the column's default).
 export type ColumnValueChange = {
     column: string;
-    before: json.Literal | undefined;
-    after: json.Literal | undefined;
+    before: json.Literal | null | undefined;
+    after: json.Literal | null | undefined;
 };
 
 export type RowChange = {
@@ -57,8 +60,8 @@ export type RTableChanges = {
     rowChanges: RowChange[];           // sorted by rowId; empty rows dropped
 };
 
-function sameLiteral(a: json.Literal | undefined, b: json.Literal | undefined): boolean {
-    if (a === undefined || b === undefined) return a === b;
+function sameLiteral(a: json.Literal | null | undefined, b: json.Literal | null | undefined): boolean {
+    if (a === undefined || b === undefined || a === null || b === null) return a === b;
     return json.toStringNormalized(a) === json.toStringNormalized(b);
 }
 

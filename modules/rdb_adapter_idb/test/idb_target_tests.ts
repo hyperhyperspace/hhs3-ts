@@ -54,13 +54,13 @@ function idbLocal(target: IdbTarget): LocalMutator {
             const db = target.database;
             const tx = db.transaction([table], 'readwrite');
             const done = waitTx(tx);
-            const row: Record<string, json.Literal> = { ...values };
+            const row: Record<string, json.Literal | null> = { ...values };
             if (author !== undefined) row[DEFAULT_AUTHOR_COLUMN] = author;
             const id = await waitReq(tx.objectStore(table).add(row));
             await done;
             return id as number;
         },
-        update: async (table, localId, values: RowValues) => {
+        update: async (table, localId, values) => {
             const db = target.database;
             const tx = db.transaction([table], 'readwrite');
             const done = waitTx(tx);
@@ -227,6 +227,63 @@ export const idbSpecificTests = {
                 } finally {
                     a.close();
                     b.close();
+                }
+            },
+        },
+        {
+            name: '[ADPTI-06] a null property is stored as a missing key, and a put captures a null or a dropped property as the same clear',
+            invoke: async () => {
+                const target = await IdbTarget.open(uniqueDbName('nulls'), { captureChanges: true });
+                try {
+                    const { group, admin } = await createGroup();
+                    await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', amount: '10.00', memo: 'paid' }, admin);
+                    await (await group.getTable('ledger')).insert('l2', { ref: 'R-2', amount: '20.00' }, admin);
+                    await projectGroup(group, target);
+
+                    const write = async (fn: (store: ReturnType<FacadeTransaction['objectStore']>) => Promise<void>): Promise<void> => {
+                        const tx = target.database.transaction(['ledger'], 'readwrite');
+                        const done = waitTx(tx);
+                        await fn(tx.objectStore('ledger'));
+                        await done;
+                    };
+                    const readAll = async (): Promise<{ [id: string]: Record<string, json.Literal> }> => {
+                        const tx = target.database.transaction(['ledger'], 'readonly');
+                        const docs = await waitReq(tx.objectStore('ledger').getAll());
+                        return Object.fromEntries(docs.map((d) => [String(d.ref), d]));
+                    };
+                    const captured = async (): Promise<string> => {
+                        const { changes } = await target.drainChanges();
+                        return changes.map((c) => c.kind === 'delete' ? 'delete' : `${c.kind} ${JSON.stringify(c.values)}`).join('; ');
+                    };
+                    const before = await readAll();
+                    const withMemo = before['R-1'];   // memo is 'paid'
+                    const noMemo = before['R-2'];     // the target left memo empty
+                    assertTrue(!('memo' in noMemo), 'a column that is NULL in rdb is a missing key');
+
+                    // a put with memo: null over a value, and a put that drops the property, are the same clear
+                    await write(async (store) => { await waitReq(store.put({ ...withMemo, memo: null })); });
+                    assertTrue(!('memo' in (await readAll())['R-1']), 'a null property is stored as a missing key');
+                    assertEquals(await captured(), 'update {"memo":null}', 'a put of null over a value is captured as a change to null');
+
+                    // nothing to capture when the column was already empty, with either spelling
+                    await write(async (store) => { await waitReq(store.put({ ...noMemo, memo: null })); });
+                    await write(async (store) => { await waitReq(store.put({ ...noMemo })); });
+                    assertEquals(await captured(), 'update {"memo":null}', 'a null put over an empty column captures nothing');
+
+                    // back to a value, then drop the property
+                    await write(async (store) => { await waitReq(store.put({ ...withMemo, memo: 'again' })); });
+                    const { memo: _dropped, ...withoutMemo } = withMemo;
+                    await write(async (store) => { await waitReq(store.put(withoutMemo)); });
+                    assertEquals(await captured(), 'update {"memo":null}; update {"memo":"again"}; update {"memo":null}',
+                        'a put that drops a property the row had is captured as a change to null');
+
+                    // an added record keeps no key for a null, and its capture names the null
+                    await write(async (store) => { await waitReq(store.add({ ref: 'R-3', amount: '1.00', memo: null })); });
+                    assertTrue(!('memo' in (await readAll())['R-3']), 'an added null property is stored as a missing key');
+                    assertTrue((await captured()).endsWith('insert {"ref":"R-3","memo":null,"amount":"1.00"}'),
+                        'the captured insert names the null the app wrote');
+                } finally {
+                    target.close();
                 }
             },
         },

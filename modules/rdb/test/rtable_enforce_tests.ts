@@ -526,5 +526,209 @@ export const rtableEnforceTests = {
                     'a deploy by an admin grantee should pass canDeploy');
             }
         },
+        {
+            name: '[ENF14] A null write is accepted for a nullable column only, and never in an update of a readonly one',
+            invoke: async () => {
+                const { group } = await createEnv([
+                    open('notes', {
+                        title: { type: 'string' },
+                        memo: { type: 'string', nullable: true },
+                        tag: { type: 'string', nullable: true, default: 'none' },
+                        origin: { type: 'string', nullable: true, readonly: true },
+                    }),
+                ]);
+                const notes = await group.getTable('notes');
+
+                // inserts: a null is fine for any nullable column, with a default or without
+                await notes.insert('n-1', { title: 'a', memo: null });
+                await notes.insert('n-2', { title: 'a', tag: null });
+                await notes.insert('n-3', { title: 'a', origin: null });
+                await notes.insert('n-4', { title: 'a', memo: null, tag: null, origin: null });
+                await expectFailure(() => notes.insert('n-5', { title: null }),
+                    'a null for a NOT NULL column is refused in an insert', "column 'title' is not nullable");
+                await expectFailure(() => notes.insert('n-6', { title: 'a', nope: null }),
+                    'a null for an unknown column is refused in an insert', "column 'nope' does not exist");
+
+                // updates: the same, and a readonly column cannot be nulled
+                const row = deriveRowId('n-1');
+                await notes.update(row, { memo: null });
+                await notes.update(row, { tag: null, title: 'b' });
+                await expectFailure(() => notes.update(row, { title: null }),
+                    'a null for a NOT NULL column is refused in an update', "column 'title' is not nullable");
+                await expectFailure(() => notes.update(row, { origin: null }),
+                    'a null for a readonly column is refused in an update', "column 'origin' is readonly");
+                await expectFailure(() => notes.update(row, { nope: null }),
+                    'a null for an unknown column is refused in an update', "column 'nope' does not exist");
+                await expectFailure(() => notes.update(row, {}), 'an update that writes nothing is refused');
+            }
+        },
+        {
+            name: '[ENF15] An identity provider row cannot null its key id or its public key',
+            invoke: async () => {
+                const someone = await makeIdentity();
+                const publicKey = serializePublicKeyToBase64(someone.publicKey);
+                // the provider columns are nullable here, so only the provider rule stands in the way
+                const { group } = await createEnv([{
+                    name: 'people',
+                    columns: {
+                        keyId: { type: 'string', pub: true, readonly: true, nullable: true },
+                        publicKey: { type: 'string', pub: true, readonly: true, nullable: true },
+                        name: { type: 'string', nullable: true },
+                    },
+                    idProvider: { keyIdColumn: 'keyId', publicKeyColumn: 'publicKey' },
+                    restrictions: [{ on: 'all', rule: { p: 'true' } }],
+                }]);
+                const people = await group.getTable('people');
+
+                await people.insert('p-1', { keyId: someone.keyId, publicKey, name: null });
+                await expectFailure(() => people.insert('p-2', { keyId: null, publicKey }),
+                    'a provider row that nulls its key id is refused', 'provider row must carry');
+                await expectFailure(() => people.insert('p-3', { keyId: someone.keyId, publicKey: null }),
+                    'a provider row that nulls its public key is refused', 'provider row must carry');
+            }
+        },
+        {
+            name: '[ENF16] A null write that becomes void is ignored: the earlier value shows again, or the default',
+            invoke: async () => {
+                const { group } = await createEnv([
+                    open('targets', { name: { type: 'string' } }, { concurrentDeletes: true }),
+                    open('notes', {
+                        title: { type: 'string' },
+                        memo: { type: 'string', nullable: true },
+                        tag: { type: 'string', nullable: true, default: 'none' },
+                        ref: { type: 'string', nullable: true },
+                    }, { fks: { ref: 'targets' } }),
+                ]);
+                const targets = await group.getTable('targets');
+                const notes = await group.getTable('notes');
+                const target = deriveRowId('t-1');
+                const wrote = deriveRowId('n-1');
+                const neverWrote = deriveRowId('n-2');
+
+                await targets.insert('t-1', { name: 't' });
+                await notes.insert('n-1', { title: 'a', memo: 'm', tag: 'x' });
+                await notes.insert('n-2', { title: 'a' });
+                const base = await groupFrontier(group);
+
+                // one branch deletes the target; on the other, an update of each
+                // note nulls columns and points `ref` at the target, so the
+                // delete voids both updates at the merge
+                await targets.delete(target, undefined, base);
+                const h1 = await notes.update(wrote, { memo: null, tag: null, ref: target }, undefined, base);
+                const h2 = await notes.update(neverWrote, { tag: null, ref: target }, undefined, base);
+
+                const branch = await tableView(group, 'notes', version(h1, h2));
+                const onBranch1 = (await branch.getRow(wrote))!.values;
+                assertTrue(!('memo' in onBranch1) && !('tag' in onBranch1), 'on their own branch the nulls show');
+                assertTrue(!('tag' in (await branch.getRow(neverWrote))!.values), 'on their own branch the null hides the default');
+
+                const merged = await tableView(group, 'notes');
+                const after1 = (await merged.getRow(wrote))!.values;
+                assertEquals(after1['memo'], 'm', 'a void null does not hide the earlier value');
+                assertEquals(after1['tag'], 'x', 'a void null does not hide the earlier value of a column with a default');
+                const after2 = (await merged.getRow(neverWrote))!.values;
+                assertEquals(after2['tag'], 'none', 'with no earlier write, the default shows again');
+                assertTrue(!('ref' in after1) && !('ref' in after2), 'the void reference is gone too');
+            }
+        },
+        {
+            name: '[ENF17] A null in a foreign key column is no reference: nothing is checked for it',
+            invoke: async () => {
+                const { group } = await createEnv([
+                    open('targets', { name: { type: 'string' } }),
+                    open('notes', { title: { type: 'string' }, ref: { type: 'string', nullable: true } }, { fks: { ref: 'targets' } }),
+                ]);
+                const targets = await group.getTable('targets');
+                const notes = await group.getTable('notes');
+                const target = deriveRowId('t-1');
+                const noteId = deriveRowId('n-1');
+
+                await targets.insert('t-1', { name: 't' });
+                await notes.insert('n-1', { title: 'a', ref: target });
+                await notes.update(noteId, { ref: null });
+                await targets.delete(target);
+
+                // the row dropped its reference before the target went away
+                await notes.update(noteId, { title: 'b' });
+                await notes.update(noteId, { ref: null, title: 'c' });
+                await notes.insert('n-2', { title: 'a', ref: null });
+
+                const view = await tableView(group, 'notes');
+                const row = (await view.getRow(noteId))!;
+                assertEquals(row.values['title'], 'c', 'the row is live and takes updates');
+                assertTrue(!('ref' in row.values), 'its foreign key column reads NULL');
+                assertTrue(await view.hasRow(deriveRowId('n-2')), 'an insert with a null foreign key is live');
+                await expectFailure(() => notes.update(noteId, { ref: target }),
+                    'a reference to the deleted target is still refused');
+            }
+        },
+        {
+            name: '[ENF18] An update answers only for the foreign keys it sets, an insert also for the defaults it leaves in place',
+            invoke: async () => {
+                const inbox = deriveRowId('inbox');
+                const p1 = deriveRowId('p-1');
+                const { group } = await createEnv([
+                    open('projects', { name: { type: 'string' } }),
+                    open('tasks', { title: { type: 'string' }, project: { type: 'string', nullable: true, default: inbox } },
+                        { fks: { project: 'projects' } }),
+                ]);
+                const projects = await group.getTable('projects');
+                const tasks = await group.getTable('tasks');
+                const taskId = deriveRowId('t-1');
+
+                await projects.insert('inbox', { name: 'inbox' });
+                await projects.insert('p-1', { name: 'p1' });
+                await tasks.insert('t-1', { title: 'a', project: p1 });   // never pointed at the default
+                await projects.delete(inbox);
+
+                // the update does not write `project`, so the default's dead target is not its concern
+                await tasks.update(taskId, { title: 'b' });
+                assertEquals((await (await tableView(group, 'tasks')).getRow(taskId))!.values['title'], 'b',
+                    'an update of another column is accepted after the default target was deleted');
+
+                // nor is the row's own target, once it is deleted later
+                await projects.delete(p1);
+                await tasks.update(taskId, { title: 'c' });
+                assertEquals((await (await tableView(group, 'tasks')).getRow(taskId))!.values['title'], 'c',
+                    'a row whose own target was deleted later still takes updates');
+
+                // what an operation does write, or leaves to the default in an insert, it answers for
+                await expectFailure(() => tasks.update(taskId, { project: inbox }),
+                    'an update that sets the column to a dead target is refused', "FK column 'project'");
+                await expectFailure(() => tasks.insert('t-2', { title: 'a' }),
+                    'an insert that leaves the column out answers for the default', "FK column 'project'");
+            }
+        },
+        {
+            name: '[ENF19] An explicit null in a foreign key column drops the reference its default would make',
+            invoke: async () => {
+                const inbox = deriveRowId('inbox');
+                const p1 = deriveRowId('p-1');
+                const { group } = await createEnv([
+                    open('projects', { name: { type: 'string' } }),
+                    open('tasks', { title: { type: 'string' }, project: { type: 'string', nullable: true, default: inbox } },
+                        { fks: { project: 'projects' } }),
+                ]);
+                const projects = await group.getTable('projects');
+                const tasks = await group.getTable('tasks');
+
+                await projects.insert('inbox', { name: 'inbox' });
+                await projects.insert('p-1', { name: 'p1' });
+                await tasks.insert('t-1', { title: 'a', project: p1 });
+                await projects.delete(inbox);
+
+                // an insert that nulls the column makes no reference at all
+                await tasks.insert('t-2', { title: 'a', project: null });
+                const inserted = (await (await tableView(group, 'tasks')).getRow(deriveRowId('t-2')))!;
+                assertTrue(!('project' in inserted.values), 'the row is live and reads NULL, not the default');
+
+                // an update to null drops the reference the row held
+                await tasks.update(deriveRowId('t-1'), { project: null });
+                await projects.delete(p1);
+                await tasks.update(deriveRowId('t-1'), { title: 'b' });
+                const cleared = (await (await tableView(group, 'tasks')).getRow(deriveRowId('t-1')))!;
+                assertTrue(!('project' in cleared.values) && cleared.values['title'] === 'b', 'the row is live with no reference');
+            }
+        },
     ],
 };

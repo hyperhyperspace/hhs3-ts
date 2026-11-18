@@ -449,6 +449,9 @@ export type PredicateExpr =
     | { kind: 'exists'; table: string; alias?: string; where: PredicateExpr; span: TextSpan }
     // `column IN (v1, ..., vn)`: only inside an EXISTS filter.
     | { kind: 'in'; left: OperandExpr; values: OperandExpr[]; span: TextSpan }
+    // `column IS [NOT] NULL`. `not` is set for IS NOT NULL, which is one node,
+    // with no `not` around it.
+    | { kind: 'isNull'; column: Extract<OperandExpr, { kind: 'column' }>; not: boolean; span: TextSpan }
     | { kind: 'not'; arg: PredicateExpr; span: TextSpan }
     | { kind: 'and'; args: PredicateExpr[]; span: TextSpan }
     | { kind: 'or'; args: PredicateExpr[]; span: TextSpan };

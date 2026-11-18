@@ -19,8 +19,10 @@ computation: its answer table plus its stack, passed through every helper that
 takes part in that computation.
 
 An entry is VOID when a row op it carries fails its restriction predicate or
-writes an FK column whose target is not live, evaluated at-use at the op's own
-position observed from the view's `from`. That computation recurses, and the
+makes an FK reference whose target is not live, evaluated at-use at the op's own
+position observed from the view's `from`. (Which references an op makes, and
+what its checks read after a concurrent re-add of its column or table, is in
+the README, under *What an operation answers for*.) That computation recurses, and the
 recursion is exactly a **normal logic program** (Datalog with negation):
 
 - **Facts.** The genesis create entry is fiat — never voided. Ref-advances
@@ -162,8 +164,8 @@ none.
   unhonored one met by the walk could hide it; otherwise the `or` over the
   undecided honored deletes.
 - **Column read:** if the walk met no undecided write that a live write does
-  not dominate, the result is the two-valued one (the max-hash write in the
-  cover, or the default). Otherwise it is undecided, with those writes as its
+  not dominate, the result is the two-valued one (among the writes in the
+  cover a value over a NULL, then the max hash; or the default with no write). Otherwise it is undecided, with those writes as its
   support. Sound: any other write lies below a live write on every path. So
   with the insert writing `grantee` alice and an undecided update writing bob,
   every atom on `grantee` — `grantee == carol` included — is undecided

@@ -35,6 +35,11 @@ import { projectedColumnName, projectedIdentityColumnName, providerColumnRole, t
 // publicKeyColumn is DROPPED from values but captured into `keyMaterial` so the
 // target can intern (key_hash, public_key) into rdb_keys. An identity-typed
 // column projects as `<col>_key_id` with the key-hash VALUE.
+//
+// A column change carries what the row now holds in the column: the written
+// value; `null` when the column is set to NULL; and, when the column went back
+// to never written (the write that set it became void), the column's default,
+// or `null` when it has none. So the target row ends up as rdb reads it.
 export function tableRowActions(
     changes: RTableChanges,
     rdbTable: string,
@@ -44,6 +49,7 @@ export function tableRowActions(
     const table = targetTableName(config, rdbTable);
     const fks = schemaView.getFKs(rdbTable);
     const provider = schemaView.getIdProvider?.(rdbTable);
+    const columnDefs = schemaView.getTable?.(rdbTable)?.columns;
     const actions: RowAction[] = [];
 
     for (const row of changes.rowChanges) {
@@ -54,29 +60,31 @@ export function tableRowActions(
             continue;
         }
 
-        const values: { [column: string]: json.Literal } = {};
+        const values: { [column: string]: json.Literal | null } = {};
         const keyMaterial: { [keyHash: string]: string } = {};
         let keyHash: string | undefined;
         let publicKey: string | undefined;
 
         for (const change of row.columnChanges) {
-            if (change.after === undefined) continue;   // unset value: nothing to write
+            // The provider check comes first: a public-key column is never
+            // projected, whatever it holds, and has no projected name.
             const role = providerColumnRole(provider, change.column);
             if (role.role === 'publicKey') {
                 if (typeof change.after === 'string') publicKey = change.after;
                 continue;   // not projected
             }
+            const colDef = columnDefs?.[change.column];
+            const after: json.Literal | null = change.after !== undefined ? change.after : colDef?.default ?? null;
             if (role.role === 'keyId') {
-                if (typeof change.after === 'string') keyHash = change.after;
+                if (typeof after === 'string') keyHash = after;
             }
             // Identity-typed columns: value is a key hash; no public key on the
             // business column itself (interning uses hash alone until registered).
-            const colDef = schemaView.getTable?.(rdbTable)?.columns?.[change.column];
             if (colDef !== undefined && colDef.type === 'identity') {
-                values[projectedIdentityColumnName(config, rdbTable, change.column)] = change.after;
+                values[projectedIdentityColumnName(config, rdbTable, change.column)] = after;
                 continue;
             }
-            values[projectedColumnName(config, rdbTable, change.column, fks, provider)] = change.after;
+            values[projectedColumnName(config, rdbTable, change.column, fks, provider)] = after;
         }
 
         if (keyHash !== undefined && publicKey !== undefined) {

@@ -342,18 +342,25 @@ export function renderSchemaUpdate(payload: SchemaUpdatePayload, options?: Rende
 export function renderRowOp(payload: RowOpPayload, table?: string, options?: RenderOptions): string {
     const bare = table !== undefined ? renderIdent(table) : '<table>';
     const target = options?.groupTarget !== undefined ? `${options.groupTarget}.${bare}` : bare;
+    // Each list holds the columns the op gives a value and the ones it sets to
+    // NULL, so the text binds again to the same op. `uuid` is one more item of
+    // an insert's lists, which keeps an insert of no column well formed.
     if (payload.action === 'insert') {
         const insert = payload as InsertRowPayload;
-        const cols = Object.keys(insert.values).map(renderIdent);
-        const vals = Object.values(insert.values).map(renderLiteral);
+        const cols = [...Object.keys(insert.values), ...(insert.nulls ?? [])].map(renderIdent);
+        const vals = [...Object.values(insert.values).map(renderLiteral), ...(insert.nulls ?? []).map(() => 'NULL')];
         if (isFullProfile(options) && insert.uuid !== undefined) {
-            return `INSERT INTO ${target} (uuid, ${cols.join(', ')}) VALUES (${renderStringLiteral(insert.uuid)}, ${vals.join(', ')})${renderBy(insert.author, options)}${renderAt(options)};`;
+            cols.unshift('uuid');
+            vals.unshift(renderStringLiteral(insert.uuid));
         }
         return `INSERT INTO ${target} (${cols.join(', ')}) VALUES (${vals.join(', ')})${renderBy(insert.author, options)}${renderAt(options)};`;
     }
     if (payload.action === 'update') {
         const update = payload as UpdateRowPayload;
-        const values = Object.entries(update.values).map(([k, v]) => `${renderIdent(k)} = ${renderLiteral(v)}`).join(', ');
+        const values = [
+            ...Object.entries(update.values).map(([k, v]) => `${renderIdent(k)} = ${renderLiteral(v)}`),
+            ...(update.nulls ?? []).map((k) => `${renderIdent(k)} = NULL`),
+        ].join(', ');
         return `UPDATE ${target} SET ${values} WHERE rowId = #${update.rowId}${renderBy(update.author, options)}${renderAt(options)};`;
     }
     return `DELETE FROM ${target} WHERE rowId = #${payload.rowId}${renderBy(payload.author, options)}${renderAt(options)};`;

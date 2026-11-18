@@ -9,7 +9,7 @@ import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import Database from "better-sqlite3";
 
 import {
-    CheckpointMovedError, ingestChanges, projectGroup, reconcileIndexes, SchemaAction, RowAction, SyncMapping,
+    CheckpointMovedError, ingestChanges, projectGroup, reconcileIndexes, SchemaAction, RowAction, SyncMapping, syncGroup,
     type GroupProjection, type IndexDecl, type IndexSpec, type ResolvedIndex,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import {
@@ -117,7 +117,8 @@ export function sqliteHarness(): TargetHarness {
     return { target: new SqliteTarget(db), read: sqliteReader(db), cleanup: () => { db.close(); } };
 }
 
-function toParam(value: json.Literal, type: ColumnType): number | string {
+function toParam(value: json.Literal | null, type: ColumnType): number | string | null {
+    if (value === null) return null;   // a NULL, of any column type
     if (type === 'boolean') return value ? 1 : 0;
     if (type === 'json') return json.toStringNormalized(value);
     return value as number | string;
@@ -136,7 +137,7 @@ function sqliteLocal(db: Database.Database, target: SqliteTarget): LocalMutator 
             const m = meta(table);
             const ct = JSON.parse(m.column_types) as { [column: string]: ColumnType };
             const cols: string[] = [];
-            const params: (number | string)[] = [];
+            const params: (number | string | null)[] = [];
             if (author !== undefined && m.author_column !== null) { cols.push(m.author_column); params.push(author); }
             for (const [c, v] of Object.entries(values)) { cols.push(c); params.push(toParam(v, ct[c] ?? 'string')); }
             const placeholders = params.map(() => '?').join(', ');
@@ -148,7 +149,7 @@ function sqliteLocal(db: Database.Database, target: SqliteTarget): LocalMutator 
             const m = meta(table);
             const ct = JSON.parse(m.column_types) as { [column: string]: ColumnType };
             const sets: string[] = [];
-            const params: (number | string)[] = [];
+            const params: (number | string | null)[] = [];
             for (const [c, v] of Object.entries(values)) { sets.push(`${quoteId(c)} = ?`); params.push(toParam(v, ct[c] ?? 'string')); }
             params.push(localId);
             db.prepare(`UPDATE ${quoteId(table)} SET ${sets.join(', ')} WHERE ${quoteId(m.id_column)} = ?`).run(...params);
@@ -929,6 +930,52 @@ export const sqliteSpecificTests = {
                 assertTrue(change !== undefined && change.kind === 'update' && same(change.values['body'], edited),
                     'a captured local json edit drains unchanged');
                 db.close();
+            },
+        },
+        {
+            name: '[ADPTS-SQL17] an insert captured before a column drop arrives: the NULL of the dropped column is left out, a value there is refused',
+            invoke: async () => {
+                // A sync ingests first and projects after, so a captured insert can be
+                // planned under a schema that already dropped a column the target
+                // still has. The captured row names every column of the table.
+                const run = async (sql: string, params: string[]) => {
+                    const { group, schema, admin } = await createGroup();
+                    const db = new Database(':memory:');
+                    const target = new SqliteTarget(db, { captureChanges: true });
+                    try {
+                        await syncGroup(group, target, { writer: admin });
+                        db.prepare(sql).run(...params);
+                        const captured = (db.prepare('SELECT changed FROM rdb_outbox').all() as { changed: string }[]).map((r) => r.changed);
+
+                        await schema.updateSchema([{ rule: 'drop-column', table: 'ledger', column: 'memo' }], admin, 'drop memo');
+                        await group.deploy(await (await schema.getScopedDag()).getFrontier());
+                        const result = await syncGroup(group, target, { writer: admin });
+
+                        return {
+                            captured, result,
+                            inRdb: (await groupRows(group, 'ledger')).length,
+                            inSqlite: (db.prepare('SELECT * FROM ledger').all() as Record<string, unknown>[]),
+                        };
+                    } finally {
+                        db.close();
+                    }
+                };
+
+                // the app never wrote to memo: its captured NULL is not an error
+                const empty = await run('INSERT INTO ledger (ref, amount) VALUES (?, ?)', ['r1', '1.00']);
+                assertEquals(empty.captured.join(';'), '{"ref":"r1","memo":null,"amount":"1.00"}', 'the captured row names the empty column');
+                assertEquals(empty.result.accepted, 1, 'the insert is accepted');
+                assertEquals(empty.result.rejected.length, 0, 'nothing is rejected');
+                assertEquals(empty.inRdb, 1, 'the row is in rdb');
+                assertEquals(empty.inSqlite.length, 1, 'and stays in SQLite');
+                assertTrue(!('memo' in empty.inSqlite[0]), 'the column is gone from the table after the projection');
+
+                // the app wrote a value to memo: rdb has no such column, so the insert is refused and undone
+                const set = await run('INSERT INTO ledger (ref, memo, amount) VALUES (?, ?, ?)', ['r1', 'hi', '1.00']);
+                assertEquals(set.result.accepted, 0, 'an insert with a value in the dropped column is refused');
+                assertEquals(set.result.rejected.length, 1, 'one rejection');
+                assertEquals(set.inRdb, 0, 'no row in rdb');
+                assertEquals(set.inSqlite.length, 0, 'the local row is removed');
             },
         },
         {

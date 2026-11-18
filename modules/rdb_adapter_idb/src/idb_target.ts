@@ -475,10 +475,13 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         const setAuthor = meta.authorColumn !== undefined && action.author !== undefined;
         const authorId = setAuthor ? await this.internKey(ctx.tx, action.author!) : undefined;
 
+        // A null in the action means NULL, which this target keeps as a missing
+        // key: no id is allocated and no key interned for it.
         if (existing !== undefined) {
             const before: RowRecord = { ...existing };
             for (const [column, value] of Object.entries(action.values)) {
-                existing[column] = await this.valueForColumn(ctx, meta, column, value, action.keyMaterial);
+                if (value === null) delete existing[column];
+                else existing[column] = await this.valueForColumn(ctx, meta, column, value, action.keyMaterial);
             }
             if (setAuthor && meta.authorColumn !== undefined) existing[meta.authorColumn] = authorId;
             await storePut(ctx.tx, ROWS, existing);
@@ -490,10 +493,13 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         const rec: RowRecord = { table: action.table, id };
         rec[meta.idColumn] = id;
         for (const [column, value] of Object.entries(action.values)) {
-            rec[column] = await this.valueForColumn(ctx, meta, column, value, action.keyMaterial);
+            if (value !== null) rec[column] = await this.valueForColumn(ctx, meta, column, value, action.keyMaterial);
         }
+        // A default goes to a column the action leaves out. The test is whether
+        // the action names the column, not whether the record has the key: a
+        // column the action sets to NULL has no key and takes no default.
         for (const [column, def] of Object.entries(meta.defaults)) {
-            if (rec[column] === undefined) rec[column] = def;
+            if (!(column in action.values)) rec[column] = def;
         }
         if (setAuthor && meta.authorColumn !== undefined) rec[meta.authorColumn] = authorId;
         await storePut(ctx.tx, ROWS, rec);

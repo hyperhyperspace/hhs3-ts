@@ -94,6 +94,8 @@ The same database name opened with `indexedDB.open` shows the physical stores (`
 
 `add()` without an `id` allocates `nextId` in that transaction. `put` writes the whole document — read-merge-write when you are editing a few columns. `delete` takes the local `id`.
 
+A `null` property sets the column to NULL, and the store keeps no key for it: a document written with `memo: null` reads back without `memo`, exactly like one written without the property. This is one difference from native IndexedDB, which would keep the `null`. In return a row reads the same before and after its write is ingested and projected back, and the same on every device. A `put` that sets a property to `null` and a `put` that drops a property the row had are the same change, a clear of the column. See [NULL values](../rdb_adapter#null-values) for what a clear becomes in rdb.
+
 A transaction is a batch. Either every write in it lands, or none of them do (`abort()`, or a failed request). IndexedDB runs each request asynchronously: `add` / `put` / `get` / `delete` return a request, and the result arrives on `onsuccess`. The transaction itself stays alive only while a request is in flight. As soon as your code returns to the event loop with nothing pending — `await fetch(...)`, `setTimeout`, a call into another API — IndexedDB commits (or aborts) the batch. That is why the pattern is: listen for `oncomplete` the moment the transaction is created, then `await` only those requests, then `await` completion.
 
 ```typescript

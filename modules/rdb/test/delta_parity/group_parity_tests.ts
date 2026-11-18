@@ -4,6 +4,7 @@ import {
     generateGatedGroupHistory, generateGatedCrossGroupHistory, generateRingGroupHistory, generateShapedHistories,
 } from "./generate.js";
 import { generateObserverGateHistory, generateObserverLocalGateHistory } from "./generate_observer.js";
+import { generateNullsHistory } from "./generate_nulls.js";
 
 export const groupDeltaParityTests = {
     title: "[DELTA_PARITY] RTableGroup computeDelta parity (bounded vs full)",
@@ -55,6 +56,13 @@ export const groupDeltaParityTests = {
             invoke: async () => {
                 const options = resolveFuzzSweepOptions(process.argv.slice(2));
                 await runGroupSeedSweep(generateObserverLocalGateHistory, options);
+            },
+        },
+        {
+            name: "[DELTA_PARITY_NULLS] bounded and full computeDelta agree on null writes, re-added columns and bundles over a reset table",
+            invoke: async () => {
+                const options = resolveFuzzSweepOptions(process.argv.slice(2));
+                await runGroupSeedSweep(generateNullsHistory, options);
             },
         },
         {

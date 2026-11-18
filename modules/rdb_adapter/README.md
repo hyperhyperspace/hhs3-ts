@@ -29,6 +29,23 @@ Change ingestion works at the data level only. Schema changes can only be perfor
 
 The projection replaces hash-based ids with database-native numeric ids, that also are used for foreign key dependencies when possible. The numeric ids are not inter-replica stable, and are meant for local usage. If the app needs to communicate off-replica, it sould use the hash-based row/key ids. They can be obtained by using the projection API (`projection.keyHashForId`, `projection.rowHashForLocalId`, etc.) or by directly inspecting the shadow tables that maintain sync state (not recommended).
 
+## NULL values
+
+An rdb column can be set to NULL (see [Nulls and defaults](../rdb#nulls-and-defaults) for the rules). This is how a NULL crosses the adapter in each direction.
+
+**Projection.** A row action's `values` can hold `null`, which means "write NULL": the target clears the column and does not fill in its default.
+
+- SQLite stores `NULL`. The memory and IndexedDB targets keep no key for the column, the same as for a column that was never set.
+- A whole-row action (the first projection, a re-projection, a revert) names every column of the table, with `null` for the ones the row has no value in.
+- When the write that set a column becomes void, the action carries what the row reads again: the earlier value, the column's default, or `null`.
+
+**Ingestion.** A captured change's `values` can hold `null`.
+
+- A local update to NULL becomes a null write. A value written concurrently on another replica wins over it, so every device ends with the value.
+- A local insert keeps a NULL only where the column has a default, where it means "NULL, not the default". Elsewhere nothing is written: an explicit NULL and an empty column read the same in rdb, and a target cannot always tell them apart (SQLite captures an insert as the whole row, with a `NULL` for every empty column). That covers a column rdb's schema no longer has, when a deploy that drops it arrives between the local insert and its ingestion.
+- A NULL foreign key or key id maps to a NULL of the rdb column, with no lookup.
+- A NULL in a column rdb declares `NOT NULL` is refused by rdb. The local row is put back and the refusal is logged, like any ingestion failure.
+
 ## Usage
 
 ### REPL

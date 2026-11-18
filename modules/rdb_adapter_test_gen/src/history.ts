@@ -4,7 +4,7 @@ import { dag } from "@hyper-hyper-space/hhs3_dag";
 import { version, Version } from "@hyper-hyper-space/hhs3_mvt";
 import {
     RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory,
-    deriveRowId, TableDef, MigrationRule, ColumnDef,
+    deriveRowId, rowWriteParts, TableDef, MigrationRule, ColumnDef,
 } from "@hyper-hyper-space/hhs3_rdb";
 
 import { createMockRContext } from "./mock_rcontext.js";
@@ -173,7 +173,10 @@ export async function generateProjectHistory(
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
         tables: [
             open('orders', { customer: { type: 'string' } }),
-            open('lines', { order: { type: 'string' }, qty: { type: 'integer' } }, { fks: { order: 'orders' } }),
+            // `tag` is nullable with a default, and no deploy touches it: lines can
+            // hold it as a value, as an explicit NULL, or unwritten, all along
+            open('lines', { order: { type: 'string' }, qty: { type: 'integer' }, tag: { type: 'string', nullable: true, default: 'none' } },
+                { fks: { order: 'orders' } }),
         ],
     });
     const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
@@ -407,6 +410,21 @@ export async function generateProjectHistory(
         return `[${opIndex}] schema ${schemaKind}`;
     };
 
+    // The nullable columns of `table` at `at`. Row writes set some of them to
+    // NULL. The choice reuses draws the history already makes, so the null
+    // writes add no draw of their own.
+    const nullableAt = async (table: string, at: Version): Promise<Set<string>> => {
+        const def = (await group.getView(at, at)).getSchemaView().getTable(table);
+        return new Set(Object.entries(def?.columns ?? {}).filter(([, column]) => column.nullable === true).map(([name]) => name));
+    };
+
+    // What a line write does to `tag`, decided by the quantity it draws anyway:
+    // an explicit NULL, a value, or nothing (the default, or what the row has).
+    const tagWrite = (write: { [c: string]: string | number | null }, qty: number): void => {
+        if (qty % 3 === 0) write['tag'] = null;
+        else if (qty % 3 === 1) write['tag'] = `t-${qty}`;
+    };
+
     for (let opIndex = 0; opIndex < ops; opIndex++) {
         const at = pickConcurrentAt(prng, checkpoints);
         const atV = at ?? await groupFrontier();
@@ -426,12 +444,20 @@ export async function generateProjectHistory(
                     bump(tallies, kind, 'rejected');
                     continue;
                 }
-                const vals: { [c: string]: string | number } = { customer: `c-${prng.nextInt(0, 5)}` };
+                const nullable = await nullableAt('orders', atV);
+                const vals: { [c: string]: string | number | null } = { customer: `c-${prng.nextInt(0, 5)}` };
                 if (st.hasStatus && prng.next() < 0.5) vals['status'] = `s-${prng.nextInt(0, 3)}`;
-                if (st.memo !== 'absent' && prng.next() < 0.4) {
-                    vals['memo'] = st.memo === 'integer' ? prng.nextInt(0, 9) : `m-${prng.nextInt(0, 3)}`;
+                // a nullable column gets a value, an explicit NULL, or is left out
+                if (st.memo !== 'absent') {
+                    const r = prng.next();
+                    if (r < 0.4) vals['memo'] = st.memo === 'integer' ? prng.nextInt(0, 9) : `m-${prng.nextInt(0, 3)}`;
+                    else if (r < 0.7 && nullable.has('memo')) vals['memo'] = null;
                 }
-                if (st.hasNote && prng.next() < 0.4) vals['note'] = `n-${prng.nextInt(0, 3)}`;
+                if (st.hasNote) {
+                    const r = prng.next();
+                    if (r < 0.4) vals['note'] = `n-${prng.nextInt(0, 3)}`;
+                    else if (r < 0.7 && nullable.has('note')) vals['note'] = null;
+                }
                 await (await group.getTable('orders')).insert(orderUuid(i), vals, undefined, at);
                 log = `[${opIndex}] insert orders ${orderUuid(i)}`;
             } else if (roll < 28) {
@@ -444,21 +470,36 @@ export async function generateProjectHistory(
                     bump(tallies, kind, 'rejected');
                     continue;
                 }
-                const vals: { [c: string]: string | number } = { qty: prng.nextInt(1, 9) };
-                if (st.hasOrderColumn) vals['order'] = orderRowId(target);
+                const vals: { [c: string]: string | number | null } = { qty: prng.nextInt(1, 9) };
+                tagWrite(vals, vals['qty'] as number);
+                // now and then a line with a NULL order, where the column allows it
+                if (st.hasOrderColumn) {
+                    vals['order'] = i % 3 === 0 && (await nullableAt('lines', atV)).has('order') ? null : orderRowId(target);
+                }
                 await (await group.getTable('lines')).insert(lineUuid(i), vals, undefined, at);
                 log = `[${opIndex}] insert lines ${lineUuid(i)} order=${orderUuid(target)}`;
             } else if (roll < 36) {
                 kind = 'update-order';
                 const target = pick(prng, await liveIds(group, 'orders', atV, ORDER_POOL, orderRowId));
                 if (target === undefined) { bump(tallies, kind, 'rejected'); continue; }
-                await (await group.getTable('orders')).update(orderRowId(target), { customer: `c-${prng.nextInt(0, 5)}` }, undefined, at);
+                // some updates also clear a nullable column
+                const customer = prng.nextInt(0, 5);
+                const nullable = await nullableAt('orders', atV);
+                const write: { [c: string]: string | null } = { customer: `c-${customer}` };
+                if (customer % 2 === 0 && nullable.has('memo')) write['memo'] = null;
+                if (customer % 2 === 1 && nullable.has('note')) write['note'] = null;
+                await (await group.getTable('orders')).update(orderRowId(target), write, undefined, at);
                 log = `[${opIndex}] update orders ${orderUuid(target)}`;
             } else if (roll < 44) {
                 kind = 'update-line';
                 const target = pick(prng, await liveIds(group, 'lines', atV, LINE_POOL, lineRowId));
                 if (target === undefined) { bump(tallies, kind, 'rejected'); continue; }
-                await (await group.getTable('lines')).update(lineRowId(target), { qty: prng.nextInt(1, 9) }, undefined, at);
+                // some updates also clear the line's order
+                const qty = prng.nextInt(1, 9);
+                const write: { [c: string]: string | number | null } = { qty };
+                tagWrite(write, qty);
+                if (qty >= 6 && (await nullableAt('lines', atV)).has('order')) write['order'] = null;
+                await (await group.getTable('lines')).update(lineRowId(target), write, undefined, at);
                 log = `[${opIndex}] update lines ${lineUuid(target)}`;
             } else if (roll < 52) {
                 kind = 'delete-order';
@@ -479,11 +520,12 @@ export async function generateProjectHistory(
                 const gv = await group.getView(atV, atV);
                 if (await (await gv.getTableView('orders')).hasRow(orderRowId(oi))) { bump(tallies, kind, 'rejected'); continue; }
                 if (await (await gv.getTableView('lines')).hasRow(lineRowId(li))) { bump(tallies, kind, 'rejected'); continue; }
-                const lineVals: { [c: string]: string | number } = { qty: prng.nextInt(1, 9) };
+                const lineVals: { [c: string]: string | number | null } = { qty: prng.nextInt(1, 9) };
+                tagWrite(lineVals, lineVals['qty'] as number);
                 if (st.hasOrderColumn) lineVals['order'] = orderRowId(oi);
                 await group.bundle([
                     { table: 'orders', op: { action: 'insert', rowId: orderRowId(oi), uuid: orderUuid(oi), values: { customer: `c-${prng.nextInt(0, 5)}` } } },
-                    { table: 'lines', op: { action: 'insert', rowId: lineRowId(li), uuid: lineUuid(li), values: lineVals } },
+                    { table: 'lines', op: { action: 'insert', rowId: lineRowId(li), uuid: lineUuid(li), ...rowWriteParts(lineVals) } },
                 ], undefined, at);
                 log = `[${opIndex}] bundle order=${orderUuid(oi)} line=${lineUuid(li)}`;
             } else if (roll < 72 && st.hasTags) {

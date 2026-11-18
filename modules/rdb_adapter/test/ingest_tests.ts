@@ -353,5 +353,110 @@ export const ingestTests = {
                 assertEquals(del.rejects.length, 1, 'the delete is dropped');
             },
         },
+        {
+            name: '[ADPTI19] a captured NULL maps to a null of the rdb column with no lookup, for a plain, a foreign key and a key column',
+            invoke: async () => {
+                // lookups that fail the test if a NULL ever reaches them
+                const noRow: MappingLookup = (table, localId) => {
+                    if (table === 'notes' && localId === 1) return { table, localId, rowId: 'ROW1', uuid: 'u-row', status: 'active' };
+                    throw new Error(`unexpected row lookup ${table}#${String(localId)}`);
+                };
+                const noKey = (keyId: number): undefined => { throw new Error(`unexpected key lookup ${String(keyId)}`); };
+                const view = {
+                    getTableNames: () => ['notes', 'topics'],
+                    hasTable: (n: string) => n === 'notes' || n === 'topics',
+                    getTable: (n: string) => n === 'notes'
+                        ? { name: 'notes', columns: {
+                            title: { type: 'string' },
+                            memo: { type: 'string', nullable: true },
+                            topic: { type: 'string', nullable: true },
+                            origin: { type: 'string', nullable: true },
+                            owner: { type: 'identity', nullable: true },
+                            fixed: { type: 'string', nullable: true, readonly: true },
+                        } }
+                        : n === 'topics' ? { name: 'topics', columns: { name: { type: 'string' } } } : undefined,
+                    getFKs: (n: string) => n === 'notes' ? { topic: 'topics', origin: 'archive.entries' } : {},
+                } as unknown as RSchemaView;
+
+                const plan = changesToEntries({ changes: [{
+                    id: 1, kind: 'update', table: 'notes', localId: 1,
+                    values: { memo: null, topic_id: null, origin_row_hash: null, owner_key_id: null },
+                }] }, view, noRow, {}, WRITER, counterUuid(), noKey);
+                assertEquals(plan.rejects.length, 0, 'nothing rejected');
+                assertEquals(plan.entries.length, 1, 'an update of only nulls is an op, not dropped as empty');
+                const op = plan.entries[0].ops[0].write.op;
+                assertTrue(op.action === 'update', 'an update op');
+                if (op.action !== 'update') return;
+                assertEquals(JSON.stringify(op.values), '{}', 'no values');
+                assertEquals(JSON.stringify(op.nulls), JSON.stringify(['memo', 'origin', 'owner', 'topic']),
+                    'each null is carried under its rdb column, sorted');
+                assertEquals(plan.entries[0].ops[0].deps.length, 0, 'a NULL foreign key adds no dependency');
+
+                // the readonly check still comes first
+                const readonly = changesToEntries(
+                    { changes: [{ id: 1, kind: 'update', table: 'notes', localId: 1, values: { fixed: null } }] },
+                    view, noRow, {}, WRITER, counterUuid(), noKey);
+                assertEquals(readonly.entries.length, 0, 'a NULL for a readonly column lands no op');
+                assertTrue(readonly.rejects[0]?.reason.includes('readonly'), 'and is refused as readonly');
+
+                // values and nulls in one update
+                const mixed = changesToEntries(
+                    { changes: [{ id: 1, kind: 'update', table: 'notes', localId: 1, values: { title: 'b', memo: null } }] },
+                    view, noRow, {}, WRITER, counterUuid(), noKey);
+                const mixedOp = mixed.entries[0].ops[0].write.op;
+                assertTrue(mixedOp.action === 'update' && mixedOp.values.title === 'b' && JSON.stringify(mixedOp.nulls) === '["memo"]',
+                    'a value and a null travel in one op');
+            },
+        },
+        {
+            name: '[ADPTI20] an insert keeps a NULL only where the column has a default; an update keeps every NULL',
+            invoke: async () => {
+                const view = {
+                    getTableNames: () => ['notes'],
+                    hasTable: (n: string) => n === 'notes',
+                    getTable: (n: string) => n === 'notes'
+                        ? { name: 'notes', columns: {
+                            title: { type: 'string' },
+                            memo: { type: 'string', nullable: true },
+                            tag: { type: 'string', nullable: true, default: 'none' },
+                        } }
+                        : undefined,
+                    getFKs: () => ({}),
+                } as unknown as RSchemaView;
+                const existing: MappingLookup = (table, localId) =>
+                    localId === 9 ? { table, localId, rowId: 'ROW9', uuid: 'u-row', status: 'active' } : undefined;
+
+                // an insert as SQLite captures it: every empty column named with NULL,
+                // one of them a column rdb's schema no longer has
+                const insert = changesToEntries({ changes: [{
+                    id: 1, kind: 'insert', table: 'notes', localId: 1,
+                    values: { title: 'a', memo: null, tag: null, gone: null },
+                }] }, view, existing, {}, WRITER, counterUuid());
+                assertEquals(insert.rejects.length, 0, 'nothing rejected');
+                const insertOp = insert.entries[0].ops[0].write.op;
+                assertTrue(insertOp.action === 'insert', 'an insert op');
+                if (insertOp.action !== 'insert') return;
+                assertEquals(JSON.stringify(insertOp.values), JSON.stringify({ title: 'a' }), 'the value is kept');
+                assertEquals(JSON.stringify(insertOp.nulls), JSON.stringify(['tag']),
+                    'only the NULL of the column with a default is written: not the one without, not the one rdb does not have');
+
+                // an insert with no NULL of that kind has no nulls at all
+                const plain = changesToEntries(
+                    { changes: [{ id: 1, kind: 'insert', table: 'notes', localId: 1, values: { title: 'a', memo: null } }] },
+                    view, existing, {}, WRITER, counterUuid());
+                const plainOp = plain.entries[0].ops[0].write.op;
+                assertTrue(plainOp.action === 'insert' && plainOp.nulls === undefined, 'no nulls key when none is kept');
+
+                // an update names only what the app wrote, so every NULL is kept: also for a
+                // column rdb does not have, which rdb then refuses as it refuses a value there
+                const update = changesToEntries({ changes: [{
+                    id: 2, kind: 'update', table: 'notes', localId: 9, values: { memo: null, tag: null, gone: null },
+                }] }, view, existing, {}, WRITER, counterUuid());
+                const updateOp = update.entries[0].ops[0].write.op;
+                assertTrue(updateOp.action === 'update', 'an update op');
+                if (updateOp.action !== 'update') return;
+                assertEquals(JSON.stringify(updateOp.nulls), JSON.stringify(['gone', 'memo', 'tag']), 'an update keeps every null');
+            },
+        },
     ],
 };

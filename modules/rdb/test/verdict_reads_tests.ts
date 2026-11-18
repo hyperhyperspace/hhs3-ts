@@ -8,7 +8,7 @@ import { createMockRContext } from "./mock_rcontext.js";
 import { RSchemaImpl, rSchemaFactory } from "../src/rschema/rschema.js";
 import { RTableGroupImpl, rTableGroupFactory } from "../src/rtable_group/group.js";
 import type { RTableImpl } from "../src/rtable/rtable.js";
-import { RTableViewImpl } from "../src/rtable/view.js";
+import { RTableViewImpl, resolvedColumnValue } from "../src/rtable/view.js";
 import type { ColumnValue, ReadLeaf, ReadWhere, TableViewTarget } from "../src/rtable/view.js";
 import { deriveRowId } from "../src/rtable/hash.js";
 import type { Predicate, TableDef, Where } from "../src/rschema/payload.js";
@@ -18,7 +18,7 @@ import { freshVerdictEvaluation } from "../src/rtable_group/verdict_evaluation.j
 import {
     evaluatePredicateTruth, existsOnView, simplifyWhere, asideArm, touchedArm, touchedRowArm,
 } from "../src/rtable_group/predicates.js";
-import type { SubjectRow } from "../src/rtable_group/predicates.js";
+import type { SubjectRow, SubjectValue } from "../src/rtable_group/predicates.js";
 
 // The three-valued read rules of RTableViewImpl (VOID_SEMANTICS.md section 4)
 // over one fixed DAG, with every entry's verdict injected through a stub
@@ -123,10 +123,10 @@ function fromColumn(read: ColumnValue): Result {
 function subjectOf(view: RTableViewImpl, rowId: B64Hash) {
     return {
         live: async () => (await view.rowLiveness(rowId)).truth,
-        column: async (column: string): Promise<ColumnValue> => {
+        column: async (column: string): Promise<SubjectValue> => {
             const read = await view.columnValue(rowId, column);
             if (read.status === 'undecided') return read;
-            return { status: 'decided', value: read.value ?? grantsTable.columns[column]?.default };
+            return { status: 'decided', value: resolvedColumnValue(read.value, grantsTable.columns[column]?.default) };
         },
     };
 }
@@ -778,7 +778,7 @@ async function modelStateOf(fixture: TwoRowFixture, view: RTableViewImpl, tree: 
             const checks: Truth[] = [];
             for (const [field, v] of Object.entries(fields)) {
                 const read = await view.columnValue(rowId, field);
-                checks.push(read.status === 'undecided' ? read : truthOf((read.value ?? grantsTable.columns[field]?.default) === v));
+                checks.push(read.status === 'undecided' ? read : truthOf(resolvedColumnValue(read.value, grantsTable.columns[field]?.default) === v));
             }
             onRows.push(allTruth(checks));
         }
@@ -798,7 +798,7 @@ function distributedPredicate(tree: TreeCase): Predicate {
 }
 
 // A subject row with fixed answers, for the term cases.
-function fixedSubject(live: Truth, columns: { [column: string]: ColumnValue }): SubjectRow {
+function fixedSubject(live: Truth, columns: { [column: string]: SubjectValue }): SubjectRow {
     return { live: async () => live, column: async (column) => columns[column] ?? { status: 'decided', value: undefined } };
 }
 

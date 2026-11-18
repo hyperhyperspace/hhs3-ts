@@ -4,6 +4,7 @@ import {
     deriveRowId,
     evaluatePredicate,
     evaluateRowOpRestriction,
+    rowWriteParts,
     RTableGroupImpl,
 } from "@hyper-hyper-space/hhs3_rdb";
 import type { ObserveGateOptions, RowOpPayload } from "@hyper-hyper-space/hhs3_rdb";
@@ -189,11 +190,11 @@ function rowOpFromBound(bound: BoundInsert | BoundUpdate | BoundDelete, keyId: K
                 action: 'insert',
                 rowId: deriveRowId(bound.uuid, keyId),
                 uuid: bound.uuid,
-                values: bound.values,
+                ...rowWriteParts(bound.values),
                 author: keyId,
             };
         case 'update':
-            return { action: 'update', rowId: bound.rowId, values: bound.values, author: keyId };
+            return { action: 'update', rowId: bound.rowId, ...rowWriteParts(bound.values), author: keyId };
         case 'delete':
             return { action: 'delete', rowId: bound.rowId, author: keyId };
     }

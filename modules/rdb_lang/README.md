@@ -203,6 +203,9 @@ BUNDLE ON shop_prod (
 );
 ```
 
+- `NULL` as a column's value sets the column to NULL, in `INSERT` and in `UPDATE ... SET col = NULL`, alone or inside a `BUNDLE`: `INSERT INTO shop_prod.products (sku, name, memo) VALUES ('C', 'Gizmo', NULL);`. The column must be nullable. As in SQL, an explicit `NULL` wins over the column's `DEFAULT`, and a column left out of an `INSERT` gets the `DEFAULT`. See [Nulls and defaults](../rdb#nulls-and-defaults) for what a NULL does under concurrency.
+- `NULL` is an error everywhere else a value goes: the `uuid` pseudo-column, a `rowId`, a `:param`, a catalog's `WITH ROWS`, and a `DEFAULT`.
+
 Queries and history:
 
 ```sql
@@ -210,6 +213,7 @@ SET VIEW AT {#at} FROM {#from};
 SELECT sku, name FROM shop_prod.products WHERE name LIKE 'Wid%' ORDER BY sku LIMIT 10;
 LOG shop_prod LIMIT 20;  -- table/vertical: truncated reverse-render op preview; JSON: raw payload only
 EXPLAIN LOG shop_prod LIMIT 20;  -- adds reason column for Cancelled group/table ops
+SELECT sku FROM shop_prod.products WHERE memo IS NULL;
 ```
 
 ## Expressions
@@ -221,7 +225,7 @@ condition  = or ;
 or         = and { "OR" and } ;
 and        = not { "AND" not } ;
 not        = "NOT" not | compare ;
-compare    = sum [ cmp_op sum | "LIKE" sum [ "ESCAPE" string ] ] ;
+compare    = sum [ cmp_op sum | "LIKE" sum [ "ESCAPE" string ] | "IS" [ "NOT" ] "NULL" ] ;
 cmp_op     = "=" | "!=" | "<" | "<=" | ">" | ">=" ;
 sum        = product { ( "+" | "-" ) product } ;
 product    = unary { "*" unary } ;
@@ -244,7 +248,8 @@ value      = literal | variable | column ;   (* a column of the gated table *)
 
 - A string is single-quoted. `''` is a quote, and `\n`, `\r`, `\t` and `\\` are a line feed, carriage return, tab and backslash. A backslash before any other character is kept as it is (`'100\%'` is the five characters `100\%`), and `\'` is not a quote escape. A line break typed inside the quotes is part of the string.
 
-- A condition must be a comparison, `LIKE`, `EXISTS`, `TRUE`/`FALSE`, or a `NOT`/`AND`/`OR` of conditions; a bare value (`WHERE name`) is an error, and so is a condition used as a value (`a = (b > 1)`).
+- A condition must be a comparison, `LIKE`, `IS [NOT] NULL`, `EXISTS`, `TRUE`/`FALSE`, or a `NOT`/`AND`/`OR` of conditions; a bare value (`WHERE name`) is an error, and so is a condition used as a value (`a = (b > 1)`).
+- `column IS NULL` holds when the row has no value in the column: it was set to NULL, or never written with no `DEFAULT`. `column IS NOT NULL` is the opposite. The left side must be a column, and `rowAuthor IS NULL` finds the rows written without an author. It is for `SELECT ... WHERE` only: an allow rule and an `EXISTS` filter refuse both forms. A comparison with a column that has no value is false, so `col = NULL` never matches and is an error that points here. The logic is two-valued: `NOT (a = 1)` matches a row whose `a` is NULL, where SQL would not.
 - `+`, `-` and `*` are left-associative; `a - b - c` means `(a - b) - c`. `length(x)` is the string length in UTF-16 code units, like JavaScript's `.length`. In payloads they become the `add`, `sub`, `mul` and `len` operand functions.
 - Unary minus applies only to numeric literals (`-1`, `-(2)`, `-1.5e-3`); for anything else write `0 - x`. Numbers are otherwise unsigned, with an optional fraction and exponent.
 - `EXISTS (table WHERE filter)` is true when some live row of `table` matches the filter. The parenthesis that matches `EXISTS (` ends it, and every parenthesis inside it groups, so an `EXISTS` needs no parentheses of its own inside `AND` / `OR`: `EXISTS (t WHERE t.a = $author) OR b = 1`. The form without parentheses, `EXISTS t WHERE ...`, is an error that shows this one.

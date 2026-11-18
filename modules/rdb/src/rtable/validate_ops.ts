@@ -25,8 +25,10 @@ import { columnValueValidReason } from "../rschema/validate.js";
 import type { InsertRowPayload, UpdateRowPayload, RowOpPayload } from "./payload.js";
 
 // An insert conforms to the schema iff the table exists, every carried column
-// exists with a matching value type, and every non-nullable column is covered
-// (carried, or backed by a default).
+// exists with a matching value type, every column it sets to NULL exists and
+// is nullable (with or without a default: an explicit NULL wins over the
+// default), and every non-nullable column is covered (carried, or backed by a
+// default).
 export function validateInsertAgainstSchema(insert: InsertRowPayload, view: RSchemaView, table: string): ValidationResult {
     const def = view.getTable(table);
     if (def === undefined) return validationFailure(`table '${table}' does not exist`);
@@ -40,6 +42,12 @@ export function validateInsertAgainstSchema(insert: InsertRowPayload, view: RSch
         }
     }
 
+    for (const column of insert.nulls ?? []) {
+        const columnDef = def.columns[column];
+        if (columnDef === undefined) return validationFailure(`column '${column}' does not exist on table '${table}'`);
+        if (!(columnDef.nullable ?? false)) return validationFailure(`column '${column}' is not nullable`);
+    }
+
     for (const column of Object.keys(def.columns)) {
         const columnDef = def.columns[column];
         if (columnDef.nullable ?? false) continue;
@@ -51,14 +59,17 @@ export function validateInsertAgainstSchema(insert: InsertRowPayload, view: RSch
 }
 
 // An update conforms to the schema iff the table exists, at least one column
-// is carried, and every carried column exists with a matching value type and
-// is not readonly (readonly columns are fixed at insert).
+// is written (to a value or to NULL), every carried column exists with a
+// matching value type and is not readonly (readonly columns are fixed at
+// insert), and every column it sets to NULL exists, is not readonly and is
+// nullable.
 export function validateUpdateAgainstSchema(update: UpdateRowPayload, view: RSchemaView, table: string): ValidationResult {
     const def = view.getTable(table);
     if (def === undefined) return validationFailure(`table '${table}' does not exist`);
 
     const columns = Object.keys(update.values);
-    if (columns.length === 0) return validationFailure("update carries no column values");
+    const nulls = update.nulls ?? [];
+    if (columns.length === 0 && nulls.length === 0) return validationFailure("update carries no column values");
 
     for (const column of columns) {
         const columnDef = def.columns[column];
@@ -68,6 +79,13 @@ export function validateUpdateAgainstSchema(update: UpdateRowPayload, view: RSch
         if (reason !== undefined) {
             return validationFailure(`column '${column}' (${columnDef.type}): ${reason}`);
         }
+    }
+
+    for (const column of nulls) {
+        const columnDef = def.columns[column];
+        if (columnDef === undefined) return validationFailure(`column '${column}' does not exist on table '${table}'`);
+        if (columnDef.readonly ?? false) return validationFailure(`column '${column}' is readonly`);
+        if (!(columnDef.nullable ?? false)) return validationFailure(`column '${column}' is not nullable`);
     }
 
     return validationOk();

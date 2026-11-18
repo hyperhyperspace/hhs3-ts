@@ -78,7 +78,7 @@ RCap, the capability object in std_types, is the closest existing type: a standa
 | 1 | One secret for the life of the database | Anyone who ever held it: members and past members. |
 | 2 | A secret replaced at every removal and delivered to the remaining members | Members. A past member keeps what it could read when it left. |
 
-Level 2 needs a way to deliver each new secret to every remaining member, and a place to keep it that is not the genesis. Nothing in the system does that today.
+Level 2 needs a way to deliver each new secret to every remaining member, and a place to keep it that is not the genesis. Nothing in the system does that today. [HIP-28](0028-audience-keys.md) proposes one: the keys of the *database audience*, an audience that names the database's members. Its secret is replaced by the first writer after each removal, sent to each remaining member encrypted to a key the member publishes, and kept in an object of its own.
 
 At either level, anyone who can fetch the sidecar sees how many entries it has and when they arrived, which is the pace of joins and removals without the names. Anyone who knows the sidecar's topic sees which hosts answer for it.
 
@@ -97,12 +97,12 @@ At either level, anyone who can fetch the sidecar sees how many entries it has a
 
 ## Open questions
 
-- **Is level 1 enough?** A past member could test any key it knows against the list, and watch joins and removals, for as long as the database lives. If that is not acceptable, the sidecar depends on level 2, which is new cryptography.
+- **Is level 1 enough?** A past member could test any key it knows against the list, and watch joins and removals, for as long as the database lives. If that is not acceptable, the sidecar depends on level 2, and so on HIP-28.
 - **Membership becomes a fact of the database.** Today `allow` is the app's choice, and two apps on one database can disagree. A sidecar has one answer. What declares it: the catalog? And what becomes of an `allow` entry that names some other column?
 - **One source of truth or two.** Either the sidecar is where a member is added and the tables mirror it, or the host that writes a grant writes both. Two objects cannot be written in one step, so the second form needs a repair for a write that reached only one. And a key that is in the sidecar but holds no capability in the tables can read the database and write nothing: is that a role we want, or a state to prevent?
 - **Entries from removed members.** Anyone can deliver an entry to the sidecar, at any time. A removed manager can deliver one it signed after its removal, naming only earlier entries as its predecessors. Whether such an entry counts is decided by the sidecar's rules, as it is for RCap and for tables today. What changes is reach: today such an entry travels only through a member that still syncs with its author. The rule for removals has to be judged with that door open.
 - **Holders without the secret.** A newcomer carrying its own admission cannot validate what it carries. Should a host without the secret accept anything beyond what it was handed? If it does, anyone can fill sidecars with entries that only members can tell are worthless.
 - **Answering for the topic.** With the sidecar, a host confirms to anyone who knows the sidecar's topic that it holds it. Today a host confirms nothing to a peer that is not on its list. The topic can be derived from the database id in one direction only, so that only someone who has the id can ask.
-- **Where the secret lives.** In the genesis it is fixed for good and reaches every host that is ever served the database. Level 2 needs it elsewhere.
+- **Where the secret lives.** In the genesis it is fixed for good and reaches every host that is ever served the database. Level 2 needs it elsewhere: under HIP-28, in the part of the database audience, which syncs only among members. HIP-28 asks in turn whether the sidecar stays a standalone object that takes its secrets from there, or becomes that part.
 - **RCap or a new type.** Whether RCap's rules, with tags as grantees and sealed signer keys, are the rules the sidecar needs.
 - **The shared topics.** A database's catalog and schemas are shared with every database of that catalog, and an app ships them. Today the list gates their swarms like any other. Whether it should is a separate question.

@@ -86,9 +86,11 @@ async function prefetchBatch(
         const rdbTable = rdbTableName(ctx.config, change.table);
         const fks = ctx.schemaView.hasTable(rdbTable) ? ctx.schemaView.getFKs(rdbTable) : {};
         for (const targetCol of Object.keys(change.values)) {
+            const value = change.values[targetCol];
+            if (value === null) continue;   // a NULL foreign key points at no row: nothing to look up
             const fkInfo = rdbFkColumnFromTarget(ctx.config, rdbTable, fks, targetCol);
             if (fkInfo?.resolvesToId === true && fkInfo.targetTable !== undefined) {
-                await prefetch(fkInfo.targetTable, change.values[targetCol] as number);
+                await prefetch(fkInfo.targetTable, value as number);
             }
         }
     }
@@ -117,6 +119,7 @@ async function prefetchKeys(
         for (const targetCol of Object.keys(change.values)) {
             const keyRef = keyRefColumnFromTarget(ctx.config, rdbTable, provider, targetCol, identityColumns);
             if (keyRef === undefined) continue;
+            if (change.values[targetCol] === null) continue;   // a NULL key id names no key
             const keyId = change.values[targetCol] as number;
             if (cache.has(keyId)) continue;
             const keyHash = await keys.keyHashForId(DEFAULT_KEY_DOMAIN, keyId);

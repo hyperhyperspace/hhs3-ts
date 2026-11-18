@@ -10,6 +10,7 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import type { RObject, Version, View } from "@hyper-hyper-space/hhs3_mvt";
 
 import type { RowQuery } from "./query.js";
+import type { RowWrite } from "./payload.js";
 import type { OpVoidDetail } from "../rtable_group/op_void.js";
 
 export type RowValues = { [column: string]: json.Literal };
@@ -18,17 +19,21 @@ export type Row = {
     rowId: B64Hash;
     uuid: string;
     author?: KeyId;       // insert author; absent for unauthored/genesis rows
-    values: RowValues;    // per-field LWW-resolved at the view position
+    values: RowValues;    // per-field LWW-resolved at the view position; a column that reads NULL is absent
 };
+
+// What the live writes give each column of a row: a value, or null when the
+// column is set to NULL. A column no live write carries is absent.
+export type WrittenValues = { [column: string]: json.Literal | null };
 
 // Delta support (see src/rtable/delta.ts): a row's enforced liveness + author +
 // LWW-resolved WRITTEN column values, with NO schema-default fallback. `written`
-// holds only columns carrying an actual write; `live === false` => author
-// undefined and written empty.
+// holds only columns carrying an actual write (null for one set to NULL);
+// `live === false` => author undefined and written empty.
 export type DeltaRowState = {
     live: boolean;
     author: KeyId | undefined;
-    written: RowValues;
+    written: WrittenValues;
 };
 
 export interface RTable extends RObject {
@@ -44,10 +49,13 @@ export interface RTable extends RObject {
     // provider; a group with no provider rejects authored ops. `at` defaults
     // to the GROUP frontier (not the table-scope
     // frontier): by default a write extends the group's consistent snapshot.
-    insert(uuid: string, values: RowValues, author?: OwnIdentity, at?: Version): Promise<B64Hash>;
-    // partial update: only the changed values; per-field LWW with entry-hash
-    // tiebreak; the row must be live at `at`; readonly columns rejected
-    update(rowId: B64Hash, values: RowValues, author?: OwnIdentity, at?: Version): Promise<B64Hash>;
+    // A column given as null is set to NULL, which wins over the column's
+    // default; a column left out gets the default.
+    insert(uuid: string, values: RowWrite, author?: OwnIdentity, at?: Version): Promise<B64Hash>;
+    // partial update: only the changed values, null to set a column to NULL;
+    // per-field LWW with entry-hash tiebreak; the row must be live at `at`;
+    // readonly columns rejected
+    update(rowId: B64Hash, values: RowWrite, author?: OwnIdentity, at?: Version): Promise<B64Hash>;
     delete(rowId: B64Hash, author?: OwnIdentity, at?: Version): Promise<B64Hash>;
 
     getView(at?: Version, from?: Version): Promise<RTableView>;

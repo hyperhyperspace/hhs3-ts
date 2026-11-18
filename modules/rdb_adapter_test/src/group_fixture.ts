@@ -93,6 +93,31 @@ export function flipTables(): TableDef[] {
     ];
 }
 
+// Tables for null writes. `topics` is a plain parent. `notes` has nullable
+// columns of each kind a null has to pass through: `memo` with no default,
+// `tag` with one, the boolean `done`, and `topic`, a foreign key to `topics`.
+export function nullTables(): TableDef[] {
+    return [
+        {
+            name: 'topics',
+            columns: { name: { type: 'string' } },
+            restrictions: [{ on: 'all', rule: { p: 'true' } }],
+        },
+        {
+            name: 'notes',
+            columns: {
+                title: { type: 'string' },
+                memo: { type: 'string', nullable: true },
+                tag: { type: 'string', nullable: true, default: 'none' },
+                done: { type: 'boolean', nullable: true },
+                topic: { type: 'string', nullable: true },
+            },
+            fks: { topic: 'topics' },
+            restrictions: [{ on: 'all', rule: { p: 'true' } }],
+        },
+    ];
+}
+
 export type GroupFixture = {
     schema: RSchemaImpl;
     group: RTableGroupImpl;
@@ -137,6 +162,12 @@ export async function createFkGroup(): Promise<GroupFixture> {
 // an FK companion (drives the FK-ness flip live-view backfill conformance).
 export async function createFlipGroup(): Promise<GroupFixture> {
     return buildGroup('flip', flipTables());
+}
+
+// A group for null writes: nullable columns with and without a default, a
+// nullable boolean and a nullable foreign key.
+export async function createNullsGroup(): Promise<GroupFixture> {
+    return buildGroup('notebook', nullTables());
 }
 
 export async function frontier(group: RTableGroupImpl): Promise<Version> {

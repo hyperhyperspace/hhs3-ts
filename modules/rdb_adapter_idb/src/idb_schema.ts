@@ -82,7 +82,7 @@ export type OutboxRecord = {
     table: string;
     localId: number;
     op: 'insert' | 'update' | 'delete';
-    changed?: { [column: string]: json.Literal };
+    changed?: { [column: string]: json.Literal | null };   // null: the column was set to NULL
 };
 
 export type OpEventRecord = OpEvent & { id?: number };

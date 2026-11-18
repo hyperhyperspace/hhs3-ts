@@ -28,7 +28,7 @@ import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 
 import { compareSortTuples, evalWhere, normalizeOrder, projectColumns, rowOnSide } from "./query_eval.js";
 import {
-    CapturedBatch, CapturedChange, ChangeSignalListener, ChangeSignalSource,
+    CapturedBatch, CapturedChange, CapturedValues, ChangeSignalListener, ChangeSignalSource,
     CheckpointMovedError, IndexDecl, IndexSpec, IndexState, IndexTarget, IngestSettle, KeyIndex,
     MaterializationTarget, MaterializedChangeSource, OpEvent, OpEventQuery, pageOpEvents,
     ProjectedRow, QueryableTarget, ReactiveChangeTarget, ResolvedIndex,
@@ -259,21 +259,29 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
     // Insert a fresh local row (no sync mapping yet - its rdb identity is minted
     // at ingestion). Returns the projection-local id. `author` here is the
     // numeric key id (into rdb_keys), matching the projected author_key_id column.
-    localInsert(table: string, values: RowValues, author?: number): number {
+    // A null sets the column to NULL: the row keeps no key for it (as for a
+    // column that was never set), and the change is recorded with the null.
+    localInsert(table: string, values: CapturedValues, author?: number): number {
         const state = requireTable(this.store, table);
         const id = state.nextId++;
-        const row: MemoryRow = { values: { ...values } };
+        const row: MemoryRow = { values: {} };
+        for (const [column, value] of Object.entries(values)) {
+            if (value !== null) row.values[column] = value;
+        }
         if (state.authorColumn !== undefined && author !== undefined) row.author = author;
         state.rows.set(id, row);
         this.record({ kind: 'insert', table, localId: id, values: { ...values } });
         return id;
     }
 
-    localUpdate(table: string, localId: number, values: RowValues): void {
+    localUpdate(table: string, localId: number, values: CapturedValues): void {
         const state = requireTable(this.store, table);
         const row = state.rows.get(localId);
         if (row === undefined) throw new Error(`no local row ${table}#${localId}`);
-        for (const [column, value] of Object.entries(values)) row.values[column] = value;
+        for (const [column, value] of Object.entries(values)) {
+            if (value === null) delete row.values[column];
+            else row.values[column] = value;
+        }
         this.record({ kind: 'update', table, localId, values: { ...values } });
     }
 
@@ -289,8 +297,8 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
     }
 
     private record(change:
-        | { kind: 'insert'; table: string; localId: number; values: RowValues }
-        | { kind: 'update'; table: string; localId: number; values: RowValues }
+        | { kind: 'insert'; table: string; localId: number; values: CapturedValues }
+        | { kind: 'update'; table: string; localId: number; values: CapturedValues }
         | { kind: 'delete'; table: string; localId: number }): void {
         if (!this.captureProvisioned || !this.captureEnabled) return;
         const id = this.outboxNextId++;
@@ -807,10 +815,13 @@ function upsertRow(store: Store, action: Extract<RowAction, { kind: 'upsert-row'
         }
     }
 
+    // A null in the action means NULL, which this target keeps as a missing
+    // key: no id is allocated and no key interned for it.
     const existing = state.rows.get(id);
     if (existing !== undefined) {
         for (const [column, value] of Object.entries(action.values)) {
-            existing.values[column] = valueForColumn(store, state, column, value, action.keyMaterial);
+            if (value === null) delete existing.values[column];
+            else existing.values[column] = valueForColumn(store, state, column, value, action.keyMaterial);
         }
         if (setAuthor) existing.author = authorId;
         return { kind: 'update', table: action.table, localId: id, values: fullImage(state, id, existing) };
@@ -818,13 +829,15 @@ function upsertRow(store: Store, action: Extract<RowAction, { kind: 'upsert-row'
 
     const values: RowValues = {};
     for (const [column, value] of Object.entries(action.values)) {
-        values[column] = valueForColumn(store, state, column, value, action.keyMaterial);
+        if (value !== null) values[column] = valueForColumn(store, state, column, value, action.keyMaterial);
     }
     // Fill schema defaults the insert omitted (as SQLite's create-table DEFAULT
     // does on INSERT). New-row only: an update never re-defaults. Defaults are
-    // plain-column values, stored directly (no FK / key-ref translation).
+    // plain-column values, stored directly (no FK / key-ref translation). The
+    // test is whether the action names the column, not whether the row has
+    // the key: a column the action sets to NULL has no key and takes no default.
     for (const [column, def] of Object.entries(state.defaults)) {
-        if (values[column] === undefined) values[column] = def;
+        if (!(column in action.values)) values[column] = def;
     }
     const row: MemoryRow = { values };
     if (setAuthor) row.author = authorId;

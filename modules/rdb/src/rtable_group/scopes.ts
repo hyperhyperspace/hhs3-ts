@@ -176,7 +176,9 @@ export function deriveRowOpInnerMeta(op: RowOpPayload, table: string, schemaView
     }
 
     if (op.action === 'insert' || op.action === 'update') {
-        const columns = Object.keys(op.values);
+        // a column set to NULL is a write to it like any other, so it is tagged
+        // in `cols`; it has no value to export under `pub-<column>`
+        const columns = [...Object.keys(op.values), ...(op.nulls ?? [])];
         if (columns.length > 0) {
             const tags: string[] = [];
             for (const column of columns) {

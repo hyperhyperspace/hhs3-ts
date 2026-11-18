@@ -9,7 +9,8 @@
 //
 //   insert
 //     Creates a row. Carries: `rowId` (must equal deriveRowId(uuid, author)),
-//     `uuid`, column `values`, optional author/signature. Values of
+//     `uuid`, column `values`, the columns it sets to NULL in `nulls`,
+//     optional author/signature. Values of
 //     `pub` columns are exported to entry meta (derived, re-checked at
 //     validation).
 //
@@ -19,7 +20,8 @@
 //     writers). The row must be live at the op's position. `readonly`
 //     columns are fixed at insert and cannot be updated; `pub` columns CAN
 //     be updated (independent modifiers) and export their new values to
-//     entry meta. Optional authoring. Empty `values` rejected.
+//     entry meta. `nulls` names the columns it sets to NULL. Optional
+//     authoring. An update that writes nothing is rejected.
 //
 //   delete
 //     Deletes a row by `rowId`. PERMANENT: rowIds are write-once identities,
@@ -70,8 +72,8 @@ import type { Verdict, VerdictEvaluation } from "@hyper-hyper-space/hhs3_mvt";
 import type { OpVoidDetail } from "../rtable_group/op_void.js";
 import { freshVerdictEvaluation } from "../rtable_group/verdict_evaluation.js";
 
-import type { RTable as RTableContract, RTableView as RTableViewContract, RowValues } from "./interfaces.js";
-import { InsertRowPayload, UpdateRowPayload, DeleteRowPayload, RowOpPayload } from "./payload.js";
+import type { RTable as RTableContract, RTableView as RTableViewContract } from "./interfaces.js";
+import { InsertRowPayload, UpdateRowPayload, DeleteRowPayload, RowOpPayload, RowWrite, rowWriteParts } from "./payload.js";
 import { deriveRowId } from "./hash.js";
 import { RTableViewImpl } from "./view.js";
 import { RTableDeltaAccumulator } from "./delta.js";
@@ -151,14 +153,14 @@ export class RTableImpl implements RTableContract {
     // Row writers. `at` defaults to the GROUP frontier: by default a write
     // extends the group's consistent snapshot (not just this table's scope).
 
-    async insert(uuid: string, values: RowValues, author?: OwnIdentity, at?: Version): Promise<B64Hash> {
+    async insert(uuid: string, values: RowWrite, author?: OwnIdentity, at?: Version): Promise<B64Hash> {
         at = at ?? await (await this.group.getScopedDag()).getFrontier();
 
         const base: InsertRowPayload = {
             action: 'insert',
             rowId: deriveRowId(uuid, author?.keyId),
             uuid,
-            values,
+            ...rowWriteParts(values),
         };
 
         const payload = author !== undefined ? await this.signRowOp(base, author, at) : base;
@@ -166,10 +168,10 @@ export class RTableImpl implements RTableContract {
         return this.appendRowOp(payload, at);
     }
 
-    async update(rowId: B64Hash, values: RowValues, author?: OwnIdentity, at?: Version): Promise<B64Hash> {
+    async update(rowId: B64Hash, values: RowWrite, author?: OwnIdentity, at?: Version): Promise<B64Hash> {
         at = at ?? await (await this.group.getScopedDag()).getFrontier();
 
-        const base: UpdateRowPayload = { action: 'update', rowId, values };
+        const base: UpdateRowPayload = { action: 'update', rowId, ...rowWriteParts(values) };
         const payload = author !== undefined ? await this.signRowOp(base, author, at) : base;
 
         return this.appendRowOp(payload, at);

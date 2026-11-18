@@ -10,15 +10,16 @@
 
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
+import type { json } from "@hyper-hyper-space/hhs3_json";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
-import { deriveRowId, Row, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
+import { deriveRowId, MigrationRule, Row, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 import {
     BidirectionalTarget, CapturedBatch, CapturedChange, CheckpointMovedError, IngestSettle,
     ingestChanges, MemoryTarget, OpEvent, OpEventQuery, projectGroup, RowAction, SchemaAction,
     StoredOpEvent, SyncMapping,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
-import { createFkGroup, createGroup } from "./group_fixture.js";
+import { createFkGroup, createFlipGroup, createGroup, createNullsGroup, GroupFixture } from "./group_fixture.js";
 import { ProjectionReader, RowValues } from "./projection_reader.js";
 
 // A BidirectionalTarget wrapper that DROPS the first commitIngest (its settle
@@ -131,13 +132,17 @@ class LandBeforeWalk implements BidirectionalTarget {
     }
 }
 
+// What the app writes to a projected row: a logical value per column, or null
+// to set the column to NULL. (A row read back has no nulls; see ReadRow.)
+export type LocalValues = { [column: string]: json.Literal | null };
+
 // The app-side write surface a backend must expose for the suite: direct
 // mutations of the projected tables that the capture machinery observes. Values
 // are LOGICAL; the backend converts to its stored form. `insert` returns the
 // projection-local id the row was given.
 export interface LocalMutator {
-    insert(table: string, values: RowValues, author?: number): number | Promise<number>;
-    update(table: string, localId: number, values: RowValues): void | Promise<void>;
+    insert(table: string, values: LocalValues, author?: number): number | Promise<number>;
+    update(table: string, localId: number, values: LocalValues): void | Promise<void>;
     delete(table: string, localId: number): void | Promise<void>;
     setCaptureEnabled(on: boolean): void | Promise<void>;
 }
@@ -172,6 +177,25 @@ export function memoryIngestionHarness(): IngestionHarness {
 }
 
 type NamedTest = { name: string; invoke: () => Promise<void> };
+
+// A row's values as a sorted list, for whole-row comparisons.
+function sorted(values: { [column: string]: unknown } | undefined): string {
+    return values === undefined ? '<no row>' : JSON.stringify(Object.entries(values).sort());
+}
+
+// The row ops the group holds for `table`, oldest first, as written.
+async function rowOps(group: RTableGroup, table: string): Promise<{ action: string; values: { [c: string]: unknown }; nulls?: string[] }[]> {
+    const ops: { action: string; values: { [c: string]: unknown }; nulls?: string[] }[] = [];
+    for await (const entry of (await group.getScopedDag()).loadAllEntries()) {
+        const payload = entry.payload as { action?: string; table?: string; op?: unknown; writes?: { table: string; op: unknown }[] };
+        const writes = payload.action === 'bundle' ? payload.writes ?? []
+            : payload.action === 'row' && payload.table !== undefined ? [{ table: payload.table, op: payload.op }] : [];
+        for (const write of writes) {
+            if (write.table === table) ops.push(write.op as { action: string; values: { [c: string]: unknown }; nulls?: string[] });
+        }
+    }
+    return ops;
+}
 
 // Live rows of an rdb group table (the assertion target: what ingestion wrote).
 async function rdbRows(group: RTableGroup, table: string): Promise<Row[]> {
@@ -809,6 +833,222 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                         const events = await target.drainOpEvents();
                         assertEquals(events.filter((e) => e.event.origin === 'ingestion').length, 0,
                             'no ingestion/failure op-event');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN20] a column is dropped while capture is on: the drop projects, and later local writes are captured`,
+                invoke: async () => {
+                    // Each case: project, deploy a schema change that drops a column of a
+                    // table the target captures writes for, project again, then insert
+                    // locally and ingest.
+                    const cases: {
+                        what: string; fixture: () => Promise<GroupFixture>; rules: MigrationRule[];
+                        table: string; values: LocalValues; gone: string[]; present: string[];
+                    }[] = [
+                        {
+                            what: 'the drop of a plain column', fixture: createGroup,
+                            rules: [{ rule: 'drop-column', table: 'ledger', column: 'memo' }],
+                            table: 'ledger', values: { ref: 'R-9', amount: '1.00' }, gone: ['memo'], present: ['ref', 'amount'],
+                        },
+                        {
+                            what: 'a plain column that becomes a foreign key', fixture: createFlipGroup,
+                            rules: [{ rule: 'set-fks', table: 'comments', fks: { post: 'posts' } }],
+                            table: 'comments', values: { body: 'hello' }, gone: ['post'], present: ['body', 'post_id'],
+                        },
+                        {
+                            what: 'a column dropped and added again in one deploy', fixture: createGroup,
+                            rules: [
+                                { rule: 'drop-column', table: 'ledger', column: 'memo' },
+                                { rule: 'add-column', table: 'ledger', column: 'memo', def: { type: 'string', nullable: true, default: 'none' } },
+                            ],
+                            table: 'ledger', values: { ref: 'R-9', amount: '1.00' }, gone: [], present: ['ref', 'amount', 'memo'],
+                        },
+                    ];
+                    for (const c of cases) {
+                        const { group, schema, admin } = await c.fixture();
+                        const { target, read, local, cleanup } = await factory();
+                        try {
+                            await projectGroup(group, target);
+                            await schema.updateSchema(c.rules, admin, c.what);
+                            await group.deploy(await (await schema.getScopedDag()).getFrontier());
+                            await projectGroup(group, target);
+
+                            for (const column of c.gone) {
+                                assertTrue(await read.columnType(c.table, column) === undefined, `${c.what}: '${column}' is gone from the target`);
+                            }
+                            for (const column of c.present) {
+                                assertTrue(await read.columnType(c.table, column) !== undefined, `${c.what}: '${column}' is in the target`);
+                            }
+
+                            const before = (await rdbRows(group, c.table)).length;
+                            await local.insert(c.table, c.values);
+                            const result = await ingestChanges(group, target, { writer: admin });
+                            assertEquals(result.accepted, 1, `${c.what}: a local insert made after it is captured and ingested`);
+                            assertEquals(result.rejected.length, 0, `${c.what}: nothing is rejected`);
+                            assertEquals((await rdbRows(group, c.table)).length, before + 1, `${c.what}: the row is in rdb`);
+                            await projectGroup(group, target);
+                        } finally {
+                            await cleanup?.();
+                        }
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN21] a local update to NULL becomes a null write, and every device then reads NULL`,
+                invoke: async () => {
+                    const { group, admin } = await createNullsGroup();
+                    const t1 = deriveRowId('t1');
+                    await (await group.getTable('topics')).insert('t1', { name: 'topic' });
+                    await (await group.getTable('notes')).insert('n1', { title: 'a', memo: 'm', tag: 'x', done: true, topic: t1 }, admin);
+                    const n1 = deriveRowId('n1', admin.keyId);
+
+                    const a = await factory();
+                    const b = await factory();
+                    try {
+                        await projectGroup(group, a.target);
+                        const localId = (await a.read.syncId('notes', n1))!;
+
+                        // a plain column, one with a default, a boolean and a foreign key
+                        await a.local.update('notes', localId, { memo: null, tag: null, done: null, topic_id: null });
+                        const result = await ingestChanges(group, a.target, { writer: admin });
+                        assertEquals(result.rejected.length, 0, 'nothing is rejected: a NULL foreign key needs no lookup');
+                        assertTrue(result.accepted >= 1, 'the update is ingested');
+
+                        const row = (await rdbRows(group, 'notes')).find((r) => r.rowId === n1);
+                        assertEquals(sorted(row?.values), sorted({ title: 'a' }), 'rdb reads NULL in each column, also the one with a default');
+                        const nulled = (await rowOps(group, 'notes')).filter((op) => op.action === 'update').flatMap((op) => op.nulls ?? []).sort();
+                        assertEquals(nulled.join(','), 'done,memo,tag,topic', 'the update ops carry the nulls');
+                        assertEquals((await a.target.drainChanges()).changes.length, 0, 'the outbox is acked');
+
+                        // the writing device after the projection of its own write, and a second device
+                        await projectGroup(group, a.target);
+                        await projectGroup(group, b.target);
+                        assertEquals(sorted((await a.read.getRow('notes', n1))?.values), sorted({ title: 'a' }), 'the writing device still reads NULL');
+                        assertEquals(sorted((await b.read.getRow('notes', n1))?.values), sorted({ title: 'a' }), 'a second device reads NULL');
+                    } finally {
+                        await a.cleanup?.();
+                        await b.cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN22] a local update to NULL loses to a concurrent write of a value: every device ends with the value`,
+                invoke: async () => {
+                    const { group, admin } = await createNullsGroup();
+                    const notes = await group.getTable('notes');
+                    await notes.insert('n1', { title: 'a', memo: 'old', tag: 'old' }, admin);
+                    const n1 = deriveRowId('n1', admin.keyId);
+
+                    const a = await factory();
+                    const b = await factory();
+                    try {
+                        await projectGroup(group, a.target);
+                        const base = await (await group.getScopedDag()).getFrontier();
+
+                        // device A clears both columns; another replica, not having seen that, sets them
+                        await a.local.update('notes', (await a.read.syncId('notes', n1))!, { memo: null, tag: null });
+                        const result = await ingestChanges(group, a.target, { writer: admin });
+                        assertEquals(result.rejected.length, 0, 'the clear is ingested');
+                        await notes.update(n1, { memo: 'new', tag: 'new' }, admin, base);
+
+                        await projectGroup(group, a.target);
+                        await projectGroup(group, b.target);
+                        for (const [device, what] of [[a, 'the device that cleared'], [b, 'a second device']] as const) {
+                            assertEquals(sorted((await device.read.getRow('notes', n1))?.values), sorted({ title: 'a', memo: 'new', tag: 'new' }),
+                                `${what} ends with the concurrent value`);
+                        }
+                    } finally {
+                        await a.cleanup?.();
+                        await b.cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN23] a local insert: an explicit NULL is kept where the column has a default, and written nowhere else`,
+                invoke: async () => {
+                    const { group, admin } = await createNullsGroup();
+                    const a = await factory();
+                    const b = await factory();
+                    try {
+                        await projectGroup(group, a.target);
+                        await a.local.insert('notes', { title: 'nulled', memo: null, tag: null, topic_id: null });
+                        await a.local.insert('notes', { title: 'left-out' });
+                        const result = await ingestChanges(group, a.target, { writer: admin });
+                        assertEquals(result.accepted, 2, 'both inserts are ingested');
+                        assertEquals(result.rejected.length, 0, 'nothing is rejected');
+
+                        const rows = await rdbRows(group, 'notes');
+                        const nulled = rows.find((r) => r.values.title === 'nulled')!;
+                        const leftOut = rows.find((r) => r.values.title === 'left-out')!;
+                        assertEquals(sorted(nulled.values), sorted({ title: 'nulled' }), 'the explicit NULL wins over the default of `tag`');
+                        assertEquals(sorted(leftOut.values), sorted({ title: 'left-out', tag: 'none' }), 'a column left out gets its default');
+
+                        // a null is written only for a column with a default: elsewhere it
+                        // reads the same as leaving the column out
+                        const inserts = (await rowOps(group, 'notes')).filter((op) => op.action === 'insert');
+                        const insertOf = (title: string) => inserts.find((op) => op.values['title'] === title)!;
+                        assertEquals((insertOf('nulled').nulls ?? []).join(','), 'tag', 'only the null of the column with a default is written');
+                        assertTrue(insertOf('left-out').nulls === undefined, 'an insert with no NULL of that kind writes no null');
+
+                        await projectGroup(group, a.target);
+                        await projectGroup(group, b.target);
+                        assertEquals(sorted((await a.read.getRow('notes', nulled.rowId))?.values), sorted({ title: 'nulled' }), 'the writing device reads NULL');
+                        assertEquals(sorted((await b.read.getRow('notes', nulled.rowId))?.values), sorted({ title: 'nulled' }), 'a second device reads NULL');
+                        assertEquals(sorted((await b.read.getRow('notes', leftOut.rowId))?.values), sorted({ title: 'left-out', tag: 'none' }),
+                            'a second device reads the default of the column left out');
+                    } finally {
+                        await a.cleanup?.();
+                        await b.cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN24] a refused local write is undone also where rdb holds NULL, and ingestion goes on`,
+                invoke: async () => {
+                    const { group, admin } = await createNullsGroup();
+                    await (await group.getTable('notes')).insert('n1', { title: 'a' }, admin);
+                    const n1 = deriveRowId('n1', admin.keyId);
+
+                    const { target, read, local, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+                        const localId = (await read.syncId('notes', n1))!;
+
+                        // `topic` is NULL in rdb; the app points it at a row that does not exist
+                        await local.update('notes', localId, { topic_id: 987654 });
+                        const dangling = await ingestChanges(group, target, { writer: admin });
+                        assertEquals(dangling.accepted, 0, 'the dangling reference lands no rdb op');
+                        assertEquals(dangling.rejected.length, 1, 'one rejection');
+                        assertEquals(sorted((await read.getRow('notes', n1))?.values), sorted({ title: 'a', tag: 'none' }),
+                            'the local row is put back to what rdb holds: the foreign key is NULL again');
+                        assertEquals((await target.drainChanges()).changes.length, 0, 'the outbox is acked');
+
+                        // a NULL for a NOT NULL column: where the target lets the app write it,
+                        // rdb refuses it, the row is put back, and the refusal is recorded
+                        let wrote = true;
+                        try {
+                            await local.update('notes', localId, { title: null });
+                        } catch {
+                            wrote = false;   // the target itself refuses the write (a NOT NULL column in SQL)
+                        }
+                        if (wrote) {
+                            const refused = await ingestChanges(group, target, { writer: admin });
+                            assertEquals(refused.accepted, 0, 'a NULL for a NOT NULL column lands no rdb op');
+                            assertEquals(refused.rejected.length, 1, 'one rejection');
+                            assertEquals((await read.getRow('notes', n1))?.values.title, 'a', 'the local row has its title back');
+                            const events = await target.drainOpEvents();
+                            assertTrue(events.some((e) => e.event.direction === 'failure'), 'the refusal is recorded as an op-event');
+                            assertEquals((await target.drainChanges()).changes.length, 0, 'the outbox is acked');
+                        }
+
+                        // the next pass runs
+                        await local.update('notes', localId, { memo: 'ok' });
+                        const next = await ingestChanges(group, target, { writer: admin });
+                        assertEquals(next.accepted, 1, 'a later local write is ingested');
+                        assertEquals((await rdbRows(group, 'notes')).find((r) => r.rowId === n1)?.values.memo, 'ok', 'and it is in rdb');
                     } finally {
                         await cleanup?.();
                     }

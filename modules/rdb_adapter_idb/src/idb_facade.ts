@@ -234,26 +234,34 @@ function stripTable(rec: RowRecord | undefined): Record<string, json.Literal> | 
     return out;
 }
 
-function businessValues(rec: Record<string, json.Literal>, meta: TableMetaRecord): { [column: string]: json.Literal } {
-    const values: { [column: string]: json.Literal } = {};
+// A record the app writes. A null property sets the column to NULL: the stored
+// row keeps no key for it, as for a column that was never set.
+export type FacadeRecord = Record<string, json.Literal | null>;
+
+// The business columns of a record the app adds, as captured: its values, and
+// a null for each column it names with null.
+function businessValues(rec: FacadeRecord, meta: TableMetaRecord): { [column: string]: json.Literal | null } {
+    const values: { [column: string]: json.Literal | null } = {};
     for (const col of Object.keys(meta.columnTypes)) {
         if (rec[col] !== undefined) values[col] = rec[col];
     }
     return values;
 }
 
+// The business columns a put changes. A missing property and a null are the
+// same thing, NULL, on both sides: a column that had a value and now has
+// neither is a change to null, and a null put over a column with no value
+// changes nothing.
 function changedColumns(
-    oldRec: Record<string, json.Literal> | undefined,
-    newRec: Record<string, json.Literal>,
+    oldRec: FacadeRecord | undefined,
+    newRec: FacadeRecord,
     meta: TableMetaRecord,
-): { [column: string]: json.Literal } {
-    const changed: { [column: string]: json.Literal } = {};
+): { [column: string]: json.Literal | null } {
+    const changed: { [column: string]: json.Literal | null } = {};
     for (const col of Object.keys(meta.columnTypes)) {
-        const next = newRec[col];
-        const prev = oldRec?.[col];
-        if (next !== prev) {
-            if (next !== undefined) changed[col] = next;
-        }
+        const next = newRec[col] ?? null;
+        const prev = oldRec?.[col] ?? null;
+        if (next !== prev) changed[col] = next;
     }
     return changed;
 }
@@ -388,11 +396,11 @@ export class FacadeObjectStore {
         whenAll(req, syncEntryRequests(entries, indexes, id, oldRow, newRow), 'write', done);
     }
 
-    add(value: Record<string, json.Literal>, key?: IDBValidKey): FacadeRequest<IDBValidKey> {
+    add(value: FacadeRecord, key?: IDBValidKey): FacadeRequest<IDBValidKey> {
         return this.issueWrite('add', value, key);
     }
 
-    put(value: Record<string, json.Literal>, key?: IDBValidKey): FacadeRequest<IDBValidKey> {
+    put(value: FacadeRecord, key?: IDBValidKey): FacadeRequest<IDBValidKey> {
         return this.issueWrite('put', value, key);
     }
 
@@ -429,7 +437,7 @@ export class FacadeObjectStore {
         if (this.transaction.mode === 'readonly') throw readOnlyTransaction();
     }
 
-    private issueWrite(kind: 'add' | 'put', value: Record<string, json.Literal>, key?: IDBValidKey): FacadeRequest<IDBValidKey> {
+    private issueWrite(kind: 'add' | 'put', value: FacadeRecord, key?: IDBValidKey): FacadeRequest<IDBValidKey> {
         this.checkWritable();
         if (key !== undefined) validateKey(this.cmpFn, key);
         // The value is cloned when issued, so later changes to it are not
@@ -460,7 +468,7 @@ export class FacadeObjectStore {
     }
 
     private write(
-        req: FacadeRequest<IDBValidKey>, kind: 'add' | 'put', value: Record<string, json.Literal>, explicitKey?: IDBValidKey,
+        req: FacadeRequest<IDBValidKey>, kind: 'add' | 'put', value: FacadeRecord, explicitKey?: IDBValidKey,
     ): void {
         const tx = this.transaction.real;
         if (this.name === DEFAULT_KEY_TABLE) {
@@ -486,7 +494,14 @@ export class FacadeObjectStore {
                         req.fail(constraintError());
                         return;
                     }
-                    const rec: RowRecord = { ...value, table: this.name, [meta.idColumn]: assignedId, id: assignedId };
+                    // a null property is NULL, stored as a missing key
+                    const rec: RowRecord = { table: this.name, id: assignedId };
+                    for (const [column, v] of Object.entries(value)) {
+                        if (v !== null) rec[column] = v;
+                    }
+                    rec.table = this.name;
+                    rec[meta.idColumn] = assignedId;
+                    rec.id = assignedId;
                     if (assignedId >= meta.nextId) {
                         meta.nextId = assignedId + 1;
                         wire(req, tx.objectStore(TABLE_META).put(meta), 'write', () => {});
@@ -496,7 +511,7 @@ export class FacadeObjectStore {
                         if (old === undefined) {
                             this.queueOutbox(req, {
                                 table: this.name, localId: assignedId, op: 'insert',
-                                changed: businessValues(stripped, meta),
+                                changed: businessValues(value, meta),
                             });
                         } else {
                             const changed = changedColumns(stripTable(old), stripped, meta);

@@ -2,7 +2,7 @@ import { createBasicCrypto, getSigningSuite, HASH_SHA256 } from "@hyper-hyper-sp
 import type { KeyId, OwnIdentity, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
 import type { json } from "@hyper-hyper-space/hhs3_json";
 import { computeKeyId, deserializePublicKeyFromBase64, serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
-import type { ColumnDef } from "@hyper-hyper-space/hhs3_rdb";
+import type { ColumnDef, RowWrite } from "@hyper-hyper-space/hhs3_rdb";
 import { normalizeBigint, normalizeDecimal, normalizeBase64, columnValueValidReason } from "@hyper-hyper-space/hhs3_rdb";
 
 import type { ValueExpr } from "../syntax/ast.js";
@@ -73,15 +73,17 @@ export function canonicalEncodeValue(value: json.Literal, def: ColumnDef): json.
 // same message the engine's write-time gate produces — instead of only
 // surfacing later as a VALIDATION_REJECTED at execute. Columns absent from the
 // schema (or system pseudo-columns) pass through unchanged; the engine still
-// gates them. This is a UX pre-check, not a security boundary.
+// gates them. This is a UX pre-check, not a security boundary. A null, which
+// sets the column to NULL, has nothing to encode and passes through: the
+// engine refuses it where the column is not nullable.
 export function canonicalEncodeRowValues(
-    values: { [column: string]: json.Literal },
+    values: RowWrite,
     columns: { [column: string]: ColumnDef },
-): { [column: string]: json.Literal } {
-    const out: { [column: string]: json.Literal } = {};
+): RowWrite {
+    const out: RowWrite = {};
     for (const [column, value] of Object.entries(values)) {
         const def = columns[column];
-        if (def === undefined) {
+        if (def === undefined || value === null) {
             out[column] = value;
             continue;
         }
@@ -91,6 +93,12 @@ export function canonicalEncodeRowValues(
         out[column] = encoded;
     }
     return out;
+}
+
+// A value written to a column by INSERT or UPDATE. NULL stays null there and
+// sets the column to NULL; everywhere else a NULL is refused by asJsonLiteral.
+export function asRowWriteValue(value: LangValue): json.Literal | null {
+    return value === null ? null : asJsonLiteral(value);
 }
 
 export function asJsonLiteral(value: LangValue): json.Literal {

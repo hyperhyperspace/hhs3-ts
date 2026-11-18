@@ -131,16 +131,24 @@ export type CrossGroupResolver = (qualifiedRef: string) => string | undefined;
 // interpreted as an insert serial.
 export type CapturedChangeId = string | number;
 
+// The columns of a captured insert or update, by target column name, as
+// LOGICAL values. A `null` is a column the app left or set to NULL.
+export type CapturedValues = { [column: string]: json.Literal | null };
+
 // One local mutation observed in the projected DB, in TARGET vocabulary.
 // `localId` is the projection-local integer PK (`id`); the core resolves it to
 // a content-addressed rowId via the sync table. `values` (insert/update) uses
 // target column names and carries LOGICAL values; update carries only the
-// columns that changed.
+// columns that changed. A column set to NULL is carried as `null`: an update
+// to NULL becomes a null write in rdb. An insert may name its empty columns
+// with `null` or leave them out, as the target's capture allows; the planner
+// keeps an insert's null only where the column has a default (see
+// translateNet in ./ingest.ts).
 export type CapturedChange =
     | { id: CapturedChangeId; kind: 'insert'; table: string; localId: number;
-        values: { [column: string]: json.Literal } }
+        values: CapturedValues }
     | { id: CapturedChangeId; kind: 'update'; table: string; localId: number;
-        values: { [column: string]: json.Literal } }
+        values: CapturedValues }
     | { id: CapturedChangeId; kind: 'delete'; table: string; localId: number };
 
 // The changes drained in one ingestion pass, in COMMIT order. Reproducing the
@@ -500,10 +508,13 @@ export function isIndexTarget(t: object): t is IndexTarget {
 // provider / identity key-ref column the VALUE in `values` is still the key
 // hash; `keyMaterial` optionally supplies the matching public key so the target
 // can populate `rdb_keys.public_key` while interning (the public key itself is
-// never a projected column).
+// never a projected column). A `null` in `values` means "write NULL": the
+// column holds no value in rdb, so the target clears it and does not fill in
+// its default. A column left out of `values` is not touched in an existing
+// row, and takes its default in a new one.
 export type RowAction =
     | { kind: 'upsert-row'; table: string; rowId: B64Hash; author?: KeyId;
-        values: { [column: string]: json.Literal };
+        values: { [column: string]: json.Literal | null };
         keyMaterial?: { [keyHash: string]: string } }
     | { kind: 'delete-row'; table: string; rowId: B64Hash };
 
