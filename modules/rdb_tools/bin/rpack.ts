@@ -126,7 +126,7 @@ async function context(global: Global): Promise<RpackContext> {
 async function inFolder(global: Global, command: string): Promise<{ ctx: RpackContext; project: NodeProject; folder: string }> {
     const located = await repository(global);
     if (located.folder === undefined) {
-        throw new RpackError(`Rpack ${command} runs inside a version folder: cd ${WORK_DIR}/<version>, or pass -C ${WORK_DIR}/<version>`);
+        throw new RpackError(`rpack ${command} runs inside a version folder: cd ${WORK_DIR}/<version>, or pass -C ${WORK_DIR}/<version>`);
     }
     const project = new NodeProject(located.root);
     return { ctx: { project, vault: await openKeys(global) }, project, folder: located.folder };
@@ -140,12 +140,12 @@ async function readStdin(): Promise<string> {
 
 function unlocker(ctx: RpackContext, parsed: Parsed, prompter: ReturnType<typeof ttyPrompter>, command: string) {
     return async (label: string) => {
-        if (ctx.vault === undefined) throw new RpackError(`Rpack ${command} needs a keystore`);
+        if (ctx.vault === undefined) throw new RpackError(`rpack ${command} needs a keystore`);
         const passphrase = parsed.switches.has('--passphrase-stdin')
             ? await readStdin()
             : prompter.interactive
                 ? await prompter.secret(`passphrase (${label}): `)
-                : (() => { throw new RpackError(`Rpack ${command} needs the passphrase of '${label}': run it on a terminal, or pass --passphrase-stdin`); })();
+                : (() => { throw new RpackError(`rpack ${command} needs the passphrase of '${label}': run it on a terminal, or pass --passphrase-stdin`); })();
         return ctx.vault.unlock(label, passphrase);
     };
 }

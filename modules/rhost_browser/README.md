@@ -1,6 +1,6 @@
 # rhost_browser
 
-The browser platform for [rhost](../rhost). One app on an origin keeps each host's record, replica and projection, and the app's keys, in IndexedDB. File mounts live in the origin private file system. The mesh is [`createBrowserMesh`](../mesh_browser) on the host's merged `mesh` document. A Web Lock is `run/rhost.lock`. A BroadcastChannel is `run/rhost.sock`.
+The browser platform for [rhost](../rhost). One app on an origin keeps each host's record, replica and projection, and the app's keys, in IndexedDB. File mounts live in the origin private file system. The mesh is [`createBrowserMesh`](../mesh_browser) on the host's merged `mesh` document. A Web Lock is `run/rhost.lock`. A BroadcastChannel is `run/rhost.sock`. Browsers give Web Locks only to secure contexts, so the page has to be served over https or from localhost; over plain http the platform refuses to start and says so.
 
 ```ts
 import { Rhost } from '@hyper-hyper-space/hhs3_rhost';

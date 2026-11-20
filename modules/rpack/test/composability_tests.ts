@@ -93,6 +93,37 @@ export const composabilityTests = [
             const bBadParam = await buildVersion(ctx, '1.1.0');
             assertTrue(bBadParam.draft.refusals.some((r) => r.message.includes('needs a DEFAULT')),
                 'new parameter without DEFAULT on schema update is refused');
+            assertFalse(bBadParam.lines.some((l) => l.startsWith('Removed')), 'a refusal with no earlier build removes nothing, and says nothing');
+
+            // A refused or failed build removes the build/update.sql an earlier one left
+            const update110 = workPath('1.1.0', 'build/update.sql');
+            await schemaProj.write(workPath('1.1.0', SCHEMA_SOURCE_FILE), COMMENTS_110);
+            await buildVersion(ctx, '1.1.0');
+            assertTrue(schemaProj.files.has(update110), '1.1.0 builds');
+            await schemaProj.write(workPath('1.1.0', SCHEMA_SOURCE_FILE),
+                COMMENTS_110.replace(':allowAnon boolean DEFAULT false', ':allowAnon boolean'));
+            const refusedAfter = await buildVersion(ctx, '1.1.0');
+            assertTrue(refusedAfter.draft.refusals.length > 0, 'the build is refused again');
+            assertFalse(schemaProj.files.has(update110), 'a refused schema build removes the earlier build/update.sql');
+            assertEquals(refusedAfter.lines[refusedAfter.lines.length - 1], 'Removed the earlier build/update.sql',
+                `and says so last:\n${refusedAfter.lines.join('\n')}`);
+            await schemaProj.write(workPath('1.1.0', SCHEMA_SOURCE_FILE), COMMENTS_110);
+            await buildVersion(ctx, '1.1.0');
+            await schemaProj.write(workPath('1.1.0', SCHEMA_SOURCE_FILE), 'NOT SQL\n');
+            await expectRpackError(
+                () => buildVersion(ctx, '1.1.0'),
+                (err) => {
+                    assertEquals(err.lines[0], 'Error assembling 1.1.0', `a failed build names the version:\n${err.lines.join('\n')}`);
+                    assertEquals(err.lines[err.lines.length - 1], 'Removed the earlier build/update.sql', `and says it removed the earlier build:\n${err.lines.join('\n')}`);
+                },
+                'unreadable target-schema.sql fails build',
+            );
+            assertFalse(schemaProj.files.has(update110), 'a failed schema build removes the earlier build/update.sql');
+            await expectRpackError(
+                () => statusOf(ctx, '1.1.0'),
+                (err) => assertEquals(err.lines[0], 'Schema "hhs:comments"', `a failed status names the schema:\n${err.lines.join('\n')}`),
+                'unreadable target-schema.sql fails status',
+            );
 
             // 1.1.0 with DEFAULT builds and releases
             await schemaProj.write(workPath('1.1.0', SCHEMA_SOURCE_FILE), COMMENTS_110);
@@ -105,6 +136,7 @@ export const composabilityTests = [
 
             // Status and log work in a schema repo
             const st = await statusOf(ctx, '1.1.0');
+            assertEquals(st.lines[0], 'Schema "hhs:comments"', `status names the schema, not a catalog:\n${st.lines.join('\n')}`);
             assertTrue(st.lines.join('\n').includes('hhs:comments 1.1.0'), 'status prints schema header');
             assertEquals(st.draft.refusals.length, 0, `the released folder's status is not refused:\n${st.lines.join('\n')}`);
             assertEquals(st.lines[4], `Released as ${r110.produced.name}`, 'status names the release made from the folder');

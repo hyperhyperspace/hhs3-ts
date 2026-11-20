@@ -62,7 +62,9 @@ export type HostSetup = { key: string; passphrase?: string; mesh: MeshConfig };
 
 // `catalog` picks the shipped catalog when the app ships several; `name` is
 // the database's name (the host's by default).
-export type CreateOptions = HostSetup & { catalog?: string; name?: string };
+// `params` sets the database's params, in the same forms as app.json, and wins
+// over app.json's value for a name both give.
+export type CreateOptions = HostSetup & { catalog?: string; name?: string; params?: ParamsConfig };
 
 // `release` picks a release of the host's catalog instead of the shipped one;
 // `params` sets the params it newly declares, in the same forms as app.json.
@@ -307,7 +309,7 @@ export class Rhost {
                 const replica = runtime.workspace.replica;
                 await installRelease(replica, file);
                 const index = await ((await replica.getObject(catalog)) as unknown as RCatalogImpl).getIndex();
-                const params = resolveParams(this.config.params ?? {}, index.releaseState(release).params, this.keyVault, me);
+                const params = resolveParams({ ...this.config.params, ...options.params }, index.releaseState(release).params, this.keyVault, me);
                 const dbName = options.name ?? name;
                 const payload = await RDbImpl.create({
                     seed: runtime.session.createSeed('rdb', dbName),

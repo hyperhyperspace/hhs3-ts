@@ -709,6 +709,42 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
         },
     },
     {
+        name: "[RHOST27] create takes params in the same forms as app.json: they set the database's params, win over app.json's, and are checked like them",
+        invoke: async () => {
+            const { v100 } = await editor();
+            const mesh = new SharedMesh();
+            const platform = await MemPlatform.withKey([v100], mesh);
+            await platform.vault.create('other', 'pw');
+            const me = platform.vault.resolvePublic('me').keyId;
+            const adminOf = async (host: Host) => {
+                const admin = (await host.db.getParams())['admin'];
+                return admin !== undefined && 'identity' in admin ? admin.identity.keyId : undefined;
+            };
+
+            const bare = await Rhost.open(appConfig({ params: {} }), platform);
+            try {
+                await rejectsWith(() => bare.create('a', hostSetup()), "the release needs 'admin'", 'with params in neither, create names the missing one');
+                await rejectsWith(() => bare.create('a', { ...hostSetup(), params: { admin: '$me', color: 'red' } }),
+                    "declares no param 'color'", 'a name the release does not declare is refused, as from app.json');
+                assertEquals((await bare.hosts()).join(','), '', 'a refused create leaves no host');
+                const a = await bare.create('a', { ...hostSetup(), params: { admin: '$me' } });
+                assertEquals(await adminOf(a), me, 'the option sets the param');
+            } finally {
+                await bare.close();
+            }
+
+            const other = await Rhost.open(appConfig({ params: { admin: '$other' } }), platform);
+            try {
+                const b = await other.create('b', { ...hostSetup(), params: { admin: '$me' } });
+                assertEquals(await adminOf(b), me, "the option wins over app.json's value");
+                assertEquals(formatReleases((await b.status()).deployed), '1.0.0', 'and the host deploys the shipped release');
+            } finally {
+                await other.close();
+                mesh.close();
+            }
+        },
+    },
+    {
         name: '[RHOST13] each host has its own network settings; two hosts of an app cannot listen on one port',
         invoke: async () => {
             const { v100 } = await editor();

@@ -530,4 +530,23 @@ export const hostTests = [
             });
         },
     },
+    {
+        name: '[RDB_TOOLS70] rdb --help prints the usage, and a flag before the workspace file is a usage error; neither creates a file',
+        invoke: async () => {
+            await withDir('rdb-usage-', async (dir) => {
+                const help = await runBin('rdb', ['--help'], {}, dir);
+                assertEquals(help.code, 0, `--help succeeds (${help.stderr})`);
+                assertTrue(help.stdout.startsWith('Usage: rdb <workspace.db>'), `and prints the usage on stdout (${help.stdout})`);
+                const short = await runBin('rdb', ['-h'], {}, dir);
+                assertTrue(short.code === 0 && short.stdout === help.stdout, `-h is the same (${short.stdout}${short.stderr})`);
+                const flagFirst = await runBin('rdb', ['-c', 'SELECT 1'], {}, dir);
+                assertEquals(flagFirst.code, 1, 'a flag where the workspace file goes fails');
+                assertTrue(flagFirst.stderr.startsWith("The workspace file comes first, not '-c'\nUsage: rdb <workspace.db>"),
+                    `naming the flag, then the usage (${flagFirst.stderr})`);
+                const none = await runBin('rdb', [], {}, dir);
+                assertTrue(none.code === 1 && none.stderr.startsWith('Usage: rdb <workspace.db>'), `no arguments prints only the usage (${none.stderr})`);
+                assertEquals((await fs.readdir(dir)).join(','), '', 'no workspace file was created');
+            });
+        },
+    },
 ];

@@ -103,7 +103,14 @@ export class BrowserPlatform implements HostPlatform {
         const factory = options.indexedDB ?? globalThis.indexedDB;
         if (factory === undefined) throw new Error('no IndexedDB; pass indexedDB');
         const locks = options.locks ?? defaultLocks();
-        if (locks === undefined) throw new Error('no Web Lock manager; pass locks');
+        if (locks === undefined) {
+            // Browsers give navigator.locks only to secure contexts, so a page
+            // over plain http (a phone on the LAN, say) has none.
+            if (globalThis.isSecureContext === false) {
+                throw new Error("no Web Lock manager: this page isn't a secure context, and browsers give Web Locks only to https and localhost pages; pass locks");
+            }
+            throw new Error('no Web Lock manager; pass locks');
+        }
         const Channel = options.BroadcastChannel ?? defaultChannel();
         if (Channel === undefined) throw new Error('no BroadcastChannel; pass BroadcastChannel');
         this.options = options;

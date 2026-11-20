@@ -1,5 +1,5 @@
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
+import { assertEquals, assertFalse, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 
 import {
     buildVersion, initProject, logReleases, newVersion, releaseVersion, RpackError, setBase, statusOf, type RpackContext,
@@ -159,7 +159,9 @@ export async function releaseChain(dev: DevKeys, project: MemoryProject, check =
         assertTrue(lines.some((l: string) => /^target-catalog\.sql:\d+:\d+: /.test(l)), `the issue names the file and line:\n${lines.join('\n')}`);
         assertEquals(failure.message, '', 'the report is the lines, not the message');
         const buildFailure = await rpackError(() => buildVersion(ctx, '2.0.0'), 'unreadable target-catalog.sql should fail build');
-        assertEquals(buildFailure.lines.join('\n'), ['Error assembling 2.0.0', ...lines.slice(6)].join('\n'), 'build names the version, then the source error');
+        assertEquals(buildFailure.lines.join('\n'), ['Error assembling 2.0.0', ...lines.slice(6), 'Removed the earlier build/update.sql'].join('\n'),
+            'build names the version, then the source error, then that it removed the earlier build');
+        assertFalse(project.files.has(at('2.0.0', 'build/update.sql')), 'a failed build removes the earlier build/update.sql');
         const withAge = saved.replace('name string NULL PUB', 'name string NULL PUB,\n    age integer');
         await project.write(at('2.0.0', 'target-catalog.sql'), withAge);
         const rowFailure = await rpackError(() => statusOf(ctx, '2.0.0'), 'a WITH ROWS row missing a NOT NULL column should fail status');
@@ -171,6 +173,9 @@ export async function releaseChain(dev: DevKeys, project: MemoryProject, check =
         assertEquals(rowFailure.lines[5], 'Error assembling 2.0.0', 'the failure says the version could not be assembled');
         assertEquals(rowFailure.lines[6], expected, `the row is located in the source:\n${rowFailure.lines.join('\n')}`);
         await project.write(at('2.0.0', 'target-catalog.sql'), saved);
+        const rebuilt = await buildVersion(ctx, '2.0.0');
+        assertEquals(rebuilt.lines.join('\n'), 'Generated build/update.sql', 'the build after the fix says nothing about an earlier one');
+        assertEquals(project.files.get(at('2.0.0', 'build/update.sql')), upgrade, 'and writes build/update.sql again');
     }
     await releaseVersion(ctx, '2.0.0', unlock);
     if (check) {
@@ -258,7 +263,11 @@ export const releaseTests = [
                 'a refusal does not print a count');
             const refusedPlan = await buildVersion(ctx, '2.1.0');
             assertTrue(refusedPlan.draft.refusals.length > 0 && refusedPlan.lines.includes('refused'), 'the build is refused, and says so');
-            assertEquals(project.files.get(at('2.1.0', 'build/update.sql')), '-- keep\n', 'a refusal leaves build/update.sql');
+            assertFalse(project.files.has(at('2.1.0', 'build/update.sql')), 'a refusal removes the earlier build/update.sql');
+            assertEquals(refusedPlan.lines[refusedPlan.lines.length - 1], 'Removed the earlier build/update.sql', `and says so last:\n${refusedPlan.lines.join('\n')}`);
+            const refusedAgain = await buildVersion(ctx, '2.1.0');
+            assertTrue(refusedAgain.lines.includes('refused') && !refusedAgain.lines.some((l) => l.startsWith('Removed')),
+                `with no earlier build there is nothing to remove, and nothing said:\n${refusedAgain.lines.join('\n')}`);
             const more = baseline.replace('deleted boolean', 'deleted boolean,\n    more string NULL');
             await project.write(at('2.1.0', 'target-catalog.sql'), more);
             const narrow = await buildVersion(ctx, '2.1.0');

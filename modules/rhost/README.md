@@ -79,7 +79,7 @@ await app.remove('gaming');                           // this device's copy only
 await app.close();
 ```
 
-- **`create(name?, { key, sync, passphrase?, catalog?, name? })`** creates a database from the shipped release, with the host's key as creator and the app's params, and deploys it.
+- **`create(name?, { key, sync, passphrase?, catalog?, name?, params? })`** creates a database from the shipped release, with the host's key as creator and the app's params, and deploys it. `params` gives the database's params in the same forms as `app.json`, and wins over `app.json` for a name both give, so a value that differs per database (a server's name, say) doesn't need its own `app.json`.
   - `key` is a label or `#<key id>` in the platform's keystore. `host.json` records its label, key id and public key, and `passphrase`, the source of its passphrase: `prompt`, `env:<VAR>`, or absent for a key stored without one.
   - `mesh` is the host's network settings, written to `host.json` as given (see [Config](#config)). Two hosts of an app can't listen on the same WebSocket port.
   - The host name defaults to `default`, and the database name to the host name.

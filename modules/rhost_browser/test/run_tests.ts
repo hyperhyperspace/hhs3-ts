@@ -363,6 +363,41 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
             }
         },
     },
+    {
+        name: '[RHOST_BROWSER04] without Web Locks the platform refuses to start, and on a page that is not a secure context it says why',
+        invoke: async () => {
+            const navigatorWas = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+            const secureWas = Object.getOwnPropertyDescriptor(globalThis, 'isSecureContext');
+            const restore = (name: string, was: PropertyDescriptor | undefined) => {
+                if (was !== undefined) Object.defineProperty(globalThis, name, was);
+                else delete (globalThis as { [name: string]: unknown })[name];
+            };
+            const thrown = (fn: () => unknown): string => {
+                try {
+                    fn();
+                } catch (err) {
+                    return (err as Error).message;
+                }
+                return '';
+            };
+            try {
+                Object.defineProperty(globalThis, 'navigator', { value: {}, configurable: true, writable: true });
+                const { files } = memoryFiles();
+                const options = { name: 'locks', releases: [], files, BroadcastChannel: FakeBroadcastChannel };
+                assertEquals(thrown(() => browserPlatform(options)), 'no Web Lock manager; pass locks', 'with no navigator.locks, it names the option');
+                Object.defineProperty(globalThis, 'isSecureContext', { value: false, configurable: true, writable: true });
+                assertEquals(thrown(() => browserPlatform(options)),
+                    "no Web Lock manager: this page isn't a secure context, and browsers give Web Locks only to https and localhost pages; pass locks",
+                    'on an insecure page, it says why there are none');
+                const given = browserPlatform({ ...options, locks: createQueueLocks() });
+                await given.close();
+            } finally {
+                restore('navigator', navigatorWas);
+                restore('isSecureContext', secureWas);
+            }
+            assertTrue(globalThis.navigator?.locks !== undefined, 'the globals are restored');
+        },
+    },
 ];
 
 async function main() {

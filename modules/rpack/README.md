@@ -107,7 +107,7 @@ rpack build                      # write build/update.sql, or the refusals
 rpack release                    # sign, write releases/ and .released/
 ```
 
-`rpack build` writes the derived statements to `build/update.sql` and prints that it did. A refusal prints the reason and writes nothing. `rpack release` signs that draft, checks the file in a fresh replica, checks that the file reads back as `target-catalog.sql`, and then writes the release file, `.released/`, and the `rpack.json` entry. The working files stay as they are. The same inputs give the same bytes. On a terminal it shows the same summary as `status` and asks before signing.
+`rpack build` writes the derived statements to `build/update.sql` and prints that it did. A refusal or a failure prints the reason, writes nothing, and removes the `build/update.sql` an earlier build left, so the folder never shows a file this build didn't make. `rpack release` signs that draft, checks the file in a fresh replica, checks that the file reads back as `target-catalog.sql`, and then writes the release file, `.released/`, and the `rpack.json` entry. The working files stay as they are. The same inputs give the same bytes. On a terminal it shows the same summary as `status` and asks before signing.
 
 `rpack set base` moves a folder onto different parents and writes the starting files again. Work already done on the current base stops it, unless `--force` discards that work. `rpack log` shows the history, the lower releases that no higher release includes yet, folders whose files have changed since they were signed, and the versions under way.
 

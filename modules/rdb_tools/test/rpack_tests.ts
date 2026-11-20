@@ -74,7 +74,7 @@ export const rpackTests = [
                 assertTrue(unknown.stderr.includes('Usage:'), 'then the command list');
                 const outside = await rpack(['build']);
                 assertEquals(outside.code, 1, 'build outside a version folder fails');
-                assertTrue(outside.stderr.includes('runs inside a version folder'), `and says where it runs (${outside.stderr})`);
+                assertTrue(outside.stderr.includes('rpack build runs inside a version folder'), `and says where it runs (${outside.stderr})`);
                 assertTrue(!outside.stderr.includes('Usage:'), 'which is not a usage error');
 
                 const created = await rpack(['new', '1.0.0']);

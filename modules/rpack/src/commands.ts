@@ -511,7 +511,7 @@ export async function statusOf(ctx: RpackContext, folderName: string): Promise<D
                 draft = await draftOn(repo, surface.released, folder.version, parents, await readInputs(ctx.project, folder.name), folder.note);
             } catch (err) {
                 const base = describeBase(repo.released, folder.base);
-                throw new RpackError('', formatStatusError(repo.config.name, folder.version, base, assemblyDetail(err), releasedLine(folder)));
+                throw new RpackError('', formatStatusError('catalog', repo.config.name, folder.version, base, assemblyDetail(err), releasedLine(folder)));
             }
             const matches = folder.release !== undefined ? await matchesRelease(ctx.project, repo, folder, draft) : undefined;
             return { draft, lines: formatStatus(draft, releasedLine(folder, matches)) };
@@ -524,8 +524,18 @@ export type BuildResult = DraftResult & {
     matches?: boolean;
 };
 
-// Writes work/<version>/build/update.sql. A refusal writes nothing and
-// returns the draft's refusals as the lines.
+// A build that refuses or fails writes no build/update.sql, so it removes the
+// one an earlier build left: what is in build/ is always this build's. The line
+// says so when there was one.
+async function removeEarlierBuild(project: RpackProject, folder: string): Promise<string[]> {
+    const path = workPath(folder, `${BUILD_DIR}/${UPDATE_FILE}`);
+    if (await project.read(path) === undefined) return [];
+    await project.remove(path);
+    return [`Removed the earlier ${BUILD_DIR}/${UPDATE_FILE}`];
+}
+
+// Writes work/<version>/build/update.sql. A refusal writes nothing, removes
+// any earlier build/update.sql, and returns the draft's refusals as the lines.
 export async function buildVersion(ctx: RpackContext, folderName: string): Promise<BuildResult> {
     const config = await readConfig(ctx.project);
     if (config.kind === 'schema') return buildSchemaVersion(ctx, config, folderName) as unknown as Promise<BuildResult>;
@@ -537,10 +547,13 @@ export async function buildVersion(ctx: RpackContext, folderName: string): Promi
                 const parents = resolveBase(surface.released, folder);
                 draft = await draftOn(repo, surface.released, folder.version, parents, await readInputs(ctx.project, folder.name), folder.note);
             } catch (err) {
-                throw new RpackError('', [`Error assembling ${folder.version}`, ...assemblyDetail(err)]);
+                const removed = await removeEarlierBuild(ctx.project, folder.name);
+                throw new RpackError('', [`Error assembling ${folder.version}`, ...assemblyDetail(err), ...removed]);
             }
             const labels = repo.keys.labels();
-            if (draft.refusals.length > 0) return { draft, lines: formatDraft(draft, labels) };
+            if (draft.refusals.length > 0) {
+                return { draft, lines: [...formatDraft(draft, labels), ...await removeEarlierBuild(ctx.project, folder.name)] };
+            }
             await ctx.project.write(workPath(folder.name, `${BUILD_DIR}/${UPDATE_FILE}`), formatUpgrade(draft, labels));
             const lines = [`Generated ${BUILD_DIR}/${UPDATE_FILE}`];
             const result: BuildResult = { draft, lines };
@@ -1119,10 +1132,10 @@ async function statusOfSchema(
     try {
         ({ draft, lines } = await assembleSchemaDraft(ctx, repo, schemaSurface(repo, folder).released, folder));
     } catch (err) {
-        throw new RpackError('', formatStatusError(config.name, folder.version, baseText, assemblyDetail(err), releasedLine(folder)));
+        throw new RpackError('', formatStatusError('schema', config.name, folder.version, baseText, assemblyDetail(err), releasedLine(folder)));
     }
     const matches = folder.release !== undefined ? makesSchemaRelease(folder, draft) : undefined;
-    return { draft, lines: [...statusHeader(config.name, folder.version, baseText, releasedLine(folder, matches)), '', ...lines] };
+    return { draft, lines: [...statusHeader('schema', config.name, folder.version, baseText, releasedLine(folder, matches)), '', ...lines] };
 }
 
 async function buildSchemaVersion(
@@ -1137,9 +1150,10 @@ async function buildSchemaVersion(
     try {
         ({ draft, lines } = await assembleSchemaDraft(ctx, repo, schemaSurface(repo, folder).released, folder));
     } catch (err) {
-        throw new RpackError('', [`Error assembling ${folder.version}`, ...assemblyDetail(err)]);
+        const removed = await removeEarlierBuild(ctx.project, folder.name);
+        throw new RpackError('', [`Error assembling ${folder.version}`, ...assemblyDetail(err), ...removed]);
     }
-    if (draft.refusals.length > 0) return { draft, lines };
+    if (draft.refusals.length > 0) return { draft, lines: [...lines, ...await removeEarlierBuild(ctx.project, folder.name)] };
     const updateSql = formatSchemaUpgrade(draft);
     await ctx.project.write(workPath(folder.name, `${BUILD_DIR}/${UPDATE_FILE}`), updateSql);
     const result: { draft: SchemaReleaseDraft; matches?: boolean; lines: string[] } = { draft, lines: [`Generated ${BUILD_DIR}/${UPDATE_FILE}`] };

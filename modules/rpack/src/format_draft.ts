@@ -9,7 +9,7 @@ import {
 
 import type { ReleaseDraft } from "./draft.js";
 import { isPatchVersion } from "./model.js";
-import { SOURCE_FILE, UPGRADE_MANUAL_FILE } from "./project.js";
+import { SOURCE_FILE, UPGRADE_MANUAL_FILE, type RpackKind } from "./project.js";
 import { describeRelease, type ReleaseInfo } from "./released.js";
 import { formatWhere } from "./source.js";
 
@@ -141,11 +141,11 @@ function countPhrase(n: number, verb: string, one: string, many: string): string
     return `${verb} ${n} ${n === 1 ? one : many}`;
 }
 
-// The lines every status starts with: the catalog, the version, its base, and
-// for a released folder, the release made from it.
-export function statusHeader(catalog: string, version: string, base: string, released?: string): string[] {
+// The lines every status starts with: the catalog or schema, the version, its
+// base, and for a released folder, the release made from it.
+export function statusHeader(kind: RpackKind, name: string, version: string, base: string, released?: string): string[] {
     return [
-        `Catalog "${catalog}"`,
+        `${kind === 'schema' ? 'Schema' : 'Catalog'} "${name}"`,
         '',
         `Version: ${version}`,
         `Base: ${base}`,
@@ -155,8 +155,8 @@ export function statusHeader(catalog: string, version: string, base: string, rel
 
 // A failure before a draft exists: the header, then that the version could not
 // be assembled, then each detail (a source location, or a message with none).
-export function formatStatusError(catalog: string, version: string, base: string, detail: string[], released?: string): string[] {
-    return [...statusHeader(catalog, version, base, released), '', `Error assembling ${version}`, ...detail];
+export function formatStatusError(kind: RpackKind, name: string, version: string, base: string, detail: string[], released?: string): string[] {
+    return [...statusHeader(kind, name, version, base, released), '', `Error assembling ${version}`, ...detail];
 }
 
 // The count line `status` prints for a draft that was not refused.
@@ -271,7 +271,7 @@ export function formatReleasePreview(preview: ReleasePreview): string[] {
 // shape. Refusals replace the count. Warnings are a count; `formatDraft` prints them.
 export function formatStatus(plan: ReleaseDraft, released?: string): string[] {
     const base = plan.first ? 'None, this is the first release' : plan.parents.map(describeRelease).join(' + ');
-    const lines = statusHeader(plan.catalog, plan.version, base, released);
+    const lines = statusHeader('catalog', plan.catalog, plan.version, base, released);
     lines.push('');
     if (plan.refusals.length > 0) {
         lines.push('refused');

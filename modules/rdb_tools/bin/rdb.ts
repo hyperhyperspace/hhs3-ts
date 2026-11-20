@@ -15,11 +15,20 @@ import { runScriptFile, runScriptStdin } from "../src/script/run_script.js";
 import { WorkspaceSession } from "../src/session/session.js";
 import { Workspace } from "../src/workspace/workspace.js";
 
+const USAGE = 'Usage: rdb <workspace.db> [-c command] [-f file|-] [-k] [--json] [--keystore <path>]';
+
 async function main(): Promise<void> {
     const args = process.argv.slice(2);
     const workspacePath = args.shift();
-    if (workspacePath === undefined) {
-        stderr.write("Usage: rdb <workspace.db> [-c command] [-f file|-] [-k] [--json] [--keystore <path>]\n");
+    if (workspacePath === '--help' || workspacePath === '-h') {
+        stdout.write(USAGE + '\n');
+        return;
+    }
+    // The workspace file comes first. A flag there would otherwise be opened,
+    // and so created, as a workspace file named after it.
+    if (workspacePath === undefined || workspacePath.startsWith('-')) {
+        if (workspacePath !== undefined) stderr.write(`The workspace file comes first, not '${workspacePath}'\n`);
+        stderr.write(USAGE + '\n');
         process.exitCode = 1;
         return;
     }
