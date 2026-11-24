@@ -29,11 +29,13 @@ import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import { compareSortTuples, evalWhere, normalizeOrder, projectColumns, rowOnSide } from "./query_eval.js";
 import {
     CapturedBatch, CapturedChange, CapturedValues, ChangeSignalListener, ChangeSignalSource,
-    CheckpointMovedError, IndexDecl, IndexSpec, IndexState, IndexTarget, IngestSettle, KeyIndex,
+    CheckpointMovedError, PendingChangesError, IndexDecl, IndexSpec, IndexState, IndexTarget, IngestSettle, KeyIndex,
     MaterializationTarget, MaterializedChangeSource, OpEvent, OpEventQuery, pageOpEvents,
     ProjectedRow, QueryableTarget, ReactiveChangeTarget, ResolvedIndex,
     RowAction, RowIdentityIndex, SchemaAction, SingleTableQueryPlan, StoredOpEvent,
     SyncMapping, SyncStatus, TargetCommitEvent, TargetCommitListener, TargetRowChange, versionsEqual,
+    CapturedChangeId, ChangeRecord, mergeChangeRecord,
+    WriterRecord, WriterRecordStore,
 } from "./types.js";
 
 type RowValues = { [column: string]: json.Literal };
@@ -81,6 +83,10 @@ type TableState = {
     // them: add-column backfills existing rows and a new-row upsert fills any
     // defaulted column the insert omitted (mirroring SQLite's DDL DEFAULT).
     defaults: { [column: string]: json.Literal };
+    // The group the table was created for, and its name in that group's
+    // schema (HIP-20): capture reads the group's mode from the writer record.
+    groupId?: B64Hash;
+    schemaName?: string;
 };
 
 type Store = {
@@ -89,6 +95,9 @@ type Store = {
     // one RDb). Table/sync names are globally unique, so only the checkpoint is
     // per-group.
     checkpoints: Map<B64Hash, Version>;
+    // The observes an end of a pass recorded beside each group's checkpoint
+    // (HIP-29). Every settle clears them all.
+    endObserves: Map<B64Hash, B64Hash[]>;
     // Shared keys side table: keyHash -> entry. nextKeyId allocates new ids.
     keysByHash: Map<string, KeyEntry>;
     keysById: Map<number, KeyEntry>;
@@ -101,13 +110,6 @@ type Store = {
 
 function indexKey(table: string, name: string): string {
     return table + '\u0000' + name;
-}
-
-// Whether two column values are the same value: NULL equals NULL, and a json
-// value is compared by its contents.
-function sameValue(a: json.Literal | null, b: json.Literal | null): boolean {
-    if (a === null || b === null) return a === b;
-    return json.eq(a, b);
 }
 
 function cloneRow(row: MemoryRow): MemoryRow {
@@ -132,6 +134,8 @@ function cloneTable(state: TableState): TableState {
         fkColumns: { ...state.fkColumns },
         keyRefColumns: new Set(state.keyRefColumns),
         defaults: { ...state.defaults },
+        ...(state.groupId !== undefined ? { groupId: state.groupId } : {}),
+        ...(state.schemaName !== undefined ? { schemaName: state.schemaName } : {}),
     };
 }
 
@@ -140,6 +144,8 @@ function cloneStore(store: Store): Store {
     for (const [name, state] of store.tables) tables.set(name, cloneTable(state));
     const checkpoints = new Map<B64Hash, Version>();
     for (const [groupId, v] of store.checkpoints) checkpoints.set(groupId, new Set(v));
+    const endObserves = new Map<B64Hash, B64Hash[]>();
+    for (const [groupId, list] of store.endObserves) endObserves.set(groupId, [...list]);
     const keysByHash = new Map<string, KeyEntry>();
     const keysById = new Map<number, KeyEntry>();
     for (const [hash, entry] of store.keysByHash) {
@@ -149,15 +155,15 @@ function cloneStore(store: Store): Store {
         keysById.set(clone.id, clone);
     }
     return {
-        tables, checkpoints, keysByHash, keysById, nextKeyId: store.nextKeyId,
+        tables, checkpoints, endObserves, keysByHash, keysById, nextKeyId: store.nextKeyId,
         indexSpec: store.indexSpec, indexes: new Map(store.indexes),
     };
 }
 
 export class MemoryTarget implements MaterializationTarget, MaterializedChangeSource, ChangeSignalSource,
-    ReactiveChangeTarget, QueryableTarget, RowIdentityIndex, KeyIndex, IndexTarget {
+    ReactiveChangeTarget, QueryableTarget, RowIdentityIndex, KeyIndex, IndexTarget, WriterRecordStore {
     private store: Store = {
-        tables: new Map(), checkpoints: new Map(),
+        tables: new Map(), checkpoints: new Map(), endObserves: new Map(),
         keysByHash: new Map(), keysById: new Map(), nextKeyId: 1,
         indexSpec: undefined, indexes: new Map(),
     };
@@ -183,6 +189,9 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
     private opEvents: StoredOpEvent[] = [];
     private opEventNextId = 1;
     private opEventKeys = new Set<string>();
+
+    // The writer record (HIP-20), instance state like the outbox.
+    private writerRecord: WriterRecord | undefined;
 
     constructor(opts: { captureChanges?: boolean } = {}) {
         this.captureProvisioned = opts.captureChanges === true;
@@ -240,9 +249,11 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
         if (expectIndexSpec !== undefined && (this.store.indexSpec?.fingerprint ?? null) !== expectIndexSpec) {
             throw new CheckpointMovedError(groupId);
         }
+        // No projection over a pending change (HIP-29).
+        if (this.captureProvisioned && this.outbox.length > 0) throw new PendingChangesError(groupId);
         // Atomicity: mutate a clone, swap in only on full success.
         const working = cloneStore(this.store);
-        for (const action of schemaActions) applySchemaAction(working, action);
+        for (const action of schemaActions) applySchemaAction(working, action, groupId);
         const changes: TargetRowChange[] = [];
         for (const action of rowActions) {
             const change = applyRowAction(working, action);
@@ -292,6 +303,14 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
             row.author = author;
             recorded[state.authorColumn] = author;
         }
+        // An empty author column gets the writer key's id, in the row and in the
+        // recorded change, where the table's group mode is `on` (HIP-29), as
+        // SQLite's insert trigger does. Only while capture is on, as there.
+        const filled = this.fillAuthor(state);
+        if (state.authorColumn !== undefined && row.author === undefined && filled !== undefined) {
+            row.author = filled;
+            recorded[state.authorColumn] = filled;
+        }
         // A column the insert leaves out gets its default, in the row and in the
         // recorded change, as SQLite's DEFAULT does. A null is not left out: it
         // is an explicit NULL.
@@ -305,12 +324,10 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
         return id;
     }
 
-    // Only the columns whose value changes are written and recorded, compared by
-    // value (json by its contents, NULL equal to a missing key): a captured
-    // unchanged value would become a write, which wins over a clear made
-    // concurrently on another device. An update that changes nothing records
-    // nothing. An update of a row the table doesn't have does nothing and
-    // returns false, since rdb accepts an update only of a live row. The id
+    // Every column it is given is written and recorded, changed or not (HIP-29:
+    // a named column is a write). An update that names no column but the id
+    // records nothing. An update of a row the table doesn't have does nothing
+    // and returns false, since rdb accepts an update only of a live row. The id
     // can't change, as on SQLite: a value for the id column is set aside when it
     // is the row's own id, and throws otherwise.
     localUpdate(table: string, localId: number, values: CapturedValues): boolean {
@@ -324,14 +341,13 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
         for (const [column, value] of Object.entries(values)) {
             if (column === state.idColumn) continue;
             if (column === state.authorColumn) {
-                // a change of the author is recorded, and ingestion refuses it
-                if (sameValue(row.author ?? null, value)) continue;
+                // recorded: ingestion sets it aside when it is the row's own
+                // author, and refuses another
                 if (typeof value === 'number') row.author = value;
                 else delete row.author;
                 changed[column] = value;
                 continue;
             }
-            if (sameValue(row.values[column] ?? null, value)) continue;
             if (value === null) delete row.values[column];
             else row.values[column] = value;
             changed[column] = value;
@@ -352,6 +368,16 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
     // Runtime enable/disable (level 2). No-op unless provisioned.
     setCaptureEnabled(on: boolean): void {
         if (this.captureProvisioned) this.captureEnabled = on;
+    }
+
+    // The key id capture fills an empty author column with: the writer key's,
+    // where the writer record says the table's group mode is `on`, and capture
+    // is on. Otherwise none: with no writer record, nothing is filled (HIP-29).
+    private fillAuthor(state: TableState): number | undefined {
+        if (!this.captureProvisioned || !this.captureEnabled) return undefined;
+        const record = this.writerRecord;
+        if (record === undefined || record.writerKeyId === undefined || state.groupId === undefined) return undefined;
+        return record.groups[state.groupId]?.mode === 'on' ? record.writerKeyId : undefined;
     }
 
     private record(change:
@@ -442,6 +468,26 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
     // MaterializedChangeSource (inbound). Meaningful only when provisioned.
     // -----------------------------------------------------------------------
 
+    async hasPendingChanges(): Promise<boolean> {
+        return this.captureProvisioned && this.outbox.length > 0;
+    }
+
+    async recordWriter(record: WriterRecord): Promise<void> {
+        this.writerRecord = { ...record, groups: { ...record.groups } };
+    }
+
+    async readWriterRecord(): Promise<WriterRecord | undefined> {
+        return this.writerRecord === undefined ? undefined : { ...this.writerRecord, groups: { ...this.writerRecord.groups } };
+    }
+
+    // The table's group and its name in the schema, from the table's meta.
+    tableGroup(table: string): { groupId?: B64Hash; schemaName?: string } | undefined {
+        const state = this.store.tables.get(table);
+        if (state === undefined) return undefined;
+        return { ...(state.groupId !== undefined ? { groupId: state.groupId } : {}),
+            ...(state.schemaName !== undefined ? { schemaName: state.schemaName } : {}) };
+    }
+
     async drainChanges(): Promise<CapturedBatch> {
         this.requireCapture();
         this.announce(this.outbox.map((row) => row.id).filter((id): id is number => typeof id === 'number'));
@@ -466,80 +512,78 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
         return undefined;
     }
 
-    async reserveMint(reservations: SyncMapping[]): Promise<SyncMapping[]> {
+    async writeRecord(id: CapturedChangeId, record: ChangeRecord): Promise<void> {
         this.requireCapture();
-        const effective: SyncMapping[] = [];
-        for (const m of reservations) {
-            const state = this.store.tables.get(m.table);
-            if (state === undefined) { effective.push(m); continue; }
-            // Claim-or-adopt: does another row_hash already hold this local id?
-            // (Same resolution as resolveRow: a minted/ingested row via syncInfo,
-            // or a uuid-less projected row via the sync map.)
-            const incumbent = this.incumbentFor(state, m.table, m.localId);
-            if (incumbent !== undefined && incumbent.rowId !== m.rowId) {
-                effective.push(incumbent);   // adopt
-                continue;
-            }
-            state.sync.set(m.rowId, m.localId);
-            const info: { rowId: string; uuid: string; author?: KeyId } = { rowId: m.rowId, uuid: m.uuid };
-            if (m.author !== undefined) info.author = m.author;
-            state.syncInfo.set(m.localId, info);
-            if (!state.syncStatus.has(m.rowId)) state.syncStatus.set(m.rowId, m.status ?? 'active');
-            effective.push(m);   // claim (or identical replay)
-        }
-        return effective;
+        // A new entry, so a batch an earlier drain returned keeps what it read.
+        this.outbox = this.outbox.map((row) => row.id === id ? { ...row, record: mergeChangeRecord(row.record, record) } : row);
     }
 
-    // The identity currently mapped to `localId` in `state`, or undefined. Mirrors
-    // resolveRow's two-source resolution (minted row via syncInfo; uuid-less
-    // projected row via the sync map).
-    private incumbentFor(
-        state: TableState, table: string, localId: number,
-    ): SyncMapping | undefined {
-        const info = state.syncInfo.get(localId);
-        if (info !== undefined) {
-            return { table, localId, rowId: info.rowId, uuid: info.uuid,
-                status: state.syncStatus.get(info.rowId) ?? 'active' };
-        }
-        for (const [rowId, id] of state.sync) {
-            if (id === localId) {
-                return { table, localId, rowId, uuid: '', status: state.syncStatus.get(rowId) ?? 'active' };
-            }
-        }
-        return undefined;
+    async recordEndObserve(groupId: B64Hash, hash: B64Hash): Promise<void> {
+        this.requireCapture();
+        this.store.endObserves.set(groupId, [...(this.store.endObserves.get(groupId) ?? []), hash]);
     }
 
+    async getEndObserves(groupId: B64Hash): Promise<B64Hash[]> {
+        return [...(this.store.endObserves.get(groupId) ?? [])];
+    }
+
+    // The settle, in HIP-29's order (see IngestSettle). It is atomic, as apply
+    // is: it works on a clone of the store and swaps it in, with the outbox and
+    // the events, only when every step succeeded.
     async commitIngest(settle: IngestSettle): Promise<void> {
         this.requireCapture();
-        // Persist any (redundant, idempotent) mappings.
-        for (const m of settle.mappings ?? []) {
-            const state = this.store.tables.get(m.table);
-            if (state === undefined) continue;
+        // 1. Each group's checkpoint is still the one the pass found.
+        for (const { groupId, expected } of settle.checkpoints ?? []) {
+            if (!versionsEqual(this.store.checkpoints.get(groupId), expected)) throw new CheckpointMovedError(groupId);
+        }
+        // 2. The handled rows leave the outbox; the rest is read.
+        const consumedSet = new Set(settle.consumed);
+        const handled = this.outbox.filter((c) => consumedSet.has(c.id));
+        const remaining = this.outbox.filter((c) => !consumedSet.has(c.id));
+        const working = cloneStore(this.store);
+        // 3. The handled inserts' mappings, then the accepted deletes.
+        for (const m of settle.inserts ?? []) {
+            const state = requireTable(working, m.table);
             state.sync.set(m.rowId, m.localId);
             const info: { rowId: string; uuid: string; author?: KeyId } = { rowId: m.rowId, uuid: m.uuid };
             if (m.author !== undefined) info.author = m.author;
             state.syncInfo.set(m.localId, info);
+            state.syncStatus.set(m.rowId, m.status ?? 'active');
         }
-        // Reverts (echo-free: applyRowAction never records to the outbox).
-        for (const action of settle.reverts ?? []) applyRowAction(this.store, action);
-        // Sync status transitions (after reverts).
-        for (const s of settle.statuses ?? []) {
-            const state = this.store.tables.get(s.table);
-            if (state !== undefined) state.syncStatus.set(s.rowId, s.status);
+        for (const d of settle.deletes ?? []) {
+            const state = requireTable(working, d.table);
+            if (state.sync.has(d.rowId)) state.syncStatus.set(d.rowId, 'deleted');
         }
-        // Op-events (idempotent by (opHash, direction)).
-        const logged = this.logEvents(settle.events);
+        // 4. The rows of refused inserts that had no identity, and 5. the reverts,
+        // each with its changes still in the outbox on top.
+        const reverted = new Set<string>();
+        for (const o of settle.orphans ?? []) {
+            revertRow(working, { table: o.table, localId: o.localId }, remaining, false);
+            reverted.add(o.table);
+        }
+        for (const r of settle.reverts ?? []) {
+            revertRow(working, r, remaining, true);
+            reverted.add(r.table);
+        }
+        // 6. Memory keeps json values, not text: nothing to rewrite.
+        // 8. The new checkpoints, and every group's end observes cleared.
+        for (const { groupId, next } of settle.checkpoints ?? []) working.checkpoints.set(groupId, new Set(next));
+        working.endObserves = new Map();
+
+        this.store = working;
+        this.outbox = remaining;
+        this.emittedOutboxIds = new Set(remaining.map((row) => row.id).filter((id): id is number => typeof id === 'number'));
+        // 7. The handled rows' failure events, then the settle's own
+        // (idempotent by (opHash, direction)).
+        const failures = handled.map((c) => c.record?.failure).filter((e): e is OpEvent => e !== undefined);
+        const logged = this.logEvents([...failures, ...(settle.events ?? [])]);
         const revertedTables = [...new Set([
-            ...(settle.reverts ?? []).map((action) => action.table),
+            ...reverted,
             ...logged.map((stored) => stored.event.table).filter((table): table is string => table !== undefined),
         ])];
-        if ((settle.reverts?.length ?? 0) > 0 || logged.length > 0) {
+        if (reverted.size > 0 || logged.length > 0) {
             this.emit({ source: 'settle', revertedTables, events: logged });
         }
-        // Ack: drop consumed outbox rows. The drain rule announced them first.
-        const consumedSet = new Set(settle.consumed);
-        this.outbox = this.outbox.filter((c) => !consumedSet.has(c.id));
-        this.emittedOutboxIds = new Set(this.outbox.map((row) => row.id).filter((id): id is number => typeof id === 'number'));
     }
 
     async drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]> {
@@ -674,9 +718,9 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
 // Schema channel
 // ---------------------------------------------------------------------------
 
-function applySchemaAction(store: Store, action: SchemaAction): void {
+function applySchemaAction(store: Store, action: SchemaAction, groupId?: B64Hash): void {
     switch (action.kind) {
-        case 'create-table': return createTable(store, action);
+        case 'create-table': return createTable(store, action, groupId);
         case 'drop-table': return dropTable(store, action);
         case 'add-column': return addColumn(store, action);
         case 'drop-column': return dropColumn(store, action);
@@ -707,7 +751,7 @@ function requireTable(store: Store, table: string): TableState {
     return state;
 }
 
-function createTable(store: Store, action: Extract<SchemaAction, { kind: 'create-table' }>): void {
+function createTable(store: Store, action: Extract<SchemaAction, { kind: 'create-table' }>, groupId?: B64Hash): void {
     for (const index of store.indexes.values()) {
         if (index.table === action.table) {
             throw new Error(`cannot recreate '${action.table}': index '${index.name}' is still recorded on it`);
@@ -736,6 +780,8 @@ function createTable(store: Store, action: Extract<SchemaAction, { kind: 'create
         fkColumns,
         keyRefColumns,
         defaults,
+        ...(groupId !== undefined ? { groupId } : {}),
+        schemaName: action.schemaName ?? action.table,
     });
 }
 
@@ -908,6 +954,57 @@ function upsertRow(store: Store, action: Extract<RowAction, { kind: 'upsert-row'
     if (setAuthor) row.author = authorId;
     state.rows.set(id, row);
     return { kind: existed ? 'update' : 'insert', table: action.table, localId: id, values: fullImage(state, id, row) };
+}
+
+// Sets a row to rdb's row, or to none, then puts its changes still in the
+// outbox back on top, as capture recorded them (HIP-29's Reverts). A row named
+// only by its row hash is found through the sync map. `markDeleted`: a row
+// removed this way has its active mapping marked deleted.
+function revertRow(
+    store: Store, revert: { table: string; rowId?: B64Hash; localId?: number; row?: Extract<RowAction, { kind: 'upsert-row' }> },
+    remaining: CapturedChange[], markDeleted: boolean,
+): void {
+    const state = requireTable(store, revert.table);
+    let id = revert.localId ?? (revert.rowId !== undefined ? state.sync.get(revert.rowId) : undefined);
+    if (revert.row !== undefined) {
+        id = upsertRow(store, revert.row).localId;
+    } else if (id !== undefined) {
+        state.rows.delete(id);
+        const rowId = revert.rowId;
+        if (markDeleted && rowId !== undefined && state.sync.has(rowId) && (state.syncStatus.get(rowId) ?? 'active') === 'active') {
+            state.syncStatus.set(rowId, 'deleted');
+        }
+    }
+    if (id === undefined) return;
+    for (const change of remaining) {
+        if (change.table === revert.table && change.localId === id) applyCaptured(state, id, change);
+    }
+}
+
+// Writes one captured change back into the table, as the app wrote it: an
+// update writes its columns where the row is, a delete removes the row, and
+// an insert writes its whole row.
+function applyCaptured(state: TableState, id: number, change: CapturedChange): void {
+    if (change.kind === 'delete') {
+        state.rows.delete(id);
+        return;
+    }
+    let row = state.rows.get(id);
+    if (change.kind === 'insert') {
+        row = { values: {} };
+        state.rows.set(id, row);
+    }
+    if (row === undefined) return;
+    for (const [column, value] of Object.entries(change.values)) {
+        if (column === state.idColumn) continue;
+        if (column === state.authorColumn) {
+            if (typeof value === 'number') row.author = value;
+            else delete row.author;
+            continue;
+        }
+        if (value === null) delete row.values[column];
+        else row.values[column] = value;
+    }
 }
 
 function deleteRow(store: Store, action: Extract<RowAction, { kind: 'delete-row' }>): TargetRowChange | undefined {

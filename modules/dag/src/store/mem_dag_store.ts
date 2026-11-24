@@ -12,13 +12,21 @@ export class MemDagStorage implements DagStore {
     private frontier = new Set<B64Hash>();
     private roots = new Set<B64Hash>();
     private listeners = new Set<DagGrowthListener>();
+    private transactions: Promise<unknown> = Promise.resolve();
 
+    // Transactions run one at a time, in the order they were asked for, as on
+    // the SQL and IndexedDB stores, so a check and the write it guards can't
+    // interleave with another transaction. A failed one doesn't stop the next.
     async withTransaction<T extends TxResult>(fn: () => Promise<T>): Promise<T> {
-        const result = await fn();
-        if (result.fireListeners) {
-            this.fireListeners({ entries: result.entries ?? [], frontier: await this.getFrontier() });
-        }
-        return result;
+        const run = this.transactions.then(async () => {
+            const result = await fn();
+            if (result.fireListeners) {
+                this.fireListeners({ entries: result.entries ?? [], frontier: await this.getFrontier() });
+            }
+            return result;
+        });
+        this.transactions = run.catch(() => undefined);
+        return run;
     }
 
     async append(entry: Entry): Promise<void> {

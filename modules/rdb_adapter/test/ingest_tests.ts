@@ -7,7 +7,8 @@ import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test
 import { deriveRowId, FKs, RSchemaView, TableDef } from "@hyper-hyper-space/hhs3_rdb";
 
 import { CapturedBatch } from "../src/types.js";
-import { changesToEntries, MappingLookup } from "../src/ingest.js";
+import { changesToEntries, IngestPlan, KeyLookup, MappingLookup, NodeContext, planDatabaseEntries, SubjectRow } from "../src/ingest.js";
+import type { AdapterConfig } from "../src/types.js";
 
 const WRITER = 'writer-key-id';
 
@@ -36,6 +37,22 @@ function mockView(): RSchemaView {
 
 const noLookup: MappingLookup = () => undefined;
 
+// The writer key's id in the target's key table. Capture fills it into an
+// insert's empty author column, from the writer record the projection keeps
+// in the target (HIP-29), so a captured insert of a signed group carries it.
+// planCaptured plans a batch as capture records it.
+const WRITER_KEY_ID = 1;
+function planCaptured(
+    batch: CapturedBatch, view: RSchemaView, lookup: MappingLookup, config: AdapterConfig,
+    writer: string | undefined, newUuid: () => string, keyLookup: KeyLookup = () => undefined,
+): IngestPlan {
+    const author = config.authorColumn === false ? undefined : (config.authorColumn ?? 'author_key_id');
+    const changes = batch.changes.map((c) => c.kind !== 'insert' || writer === undefined || author === undefined
+        || (c.values[author] ?? null) !== null ? c : { ...c, values: { ...c.values, [author]: WRITER_KEY_ID } });
+    const keys: KeyLookup = (id) => id === WRITER_KEY_ID && writer !== undefined ? { keyHash: writer } : keyLookup(id);
+    return changesToEntries({ changes }, view, lookup, config, writer, newUuid, keys);
+}
+
 // Deterministic uuid minter: u1, u2, ... in mint (commit) order.
 function counterUuid(): () => string {
     let n = 0;
@@ -51,7 +68,7 @@ export const ingestTests = {
                 const batch: CapturedBatch = { changes: [
                     { id: 1, kind: 'insert', table: 'comments', localId: 1, values: { body: 'x', origin_row_hash: 'HASH123' } },
                 ] };
-                const plan = changesToEntries(batch, mockView(), noLookup, {}, WRITER, counterUuid());
+                const plan = planCaptured(batch, mockView(), noLookup, {}, WRITER, counterUuid());
 
                 assertEquals(plan.rejects.length, 0, 'nothing rejected');
                 assertEquals(plan.entries.length, 1, 'one entry');
@@ -63,48 +80,26 @@ export const ingestTests = {
             },
         },
         {
-            name: '[ADPTI02] local self-FK: consecutive FK-linked parent+child bundle, parent first, minted rowId resolved',
+            name: '[ADPTI02] local self-FK: a parent and a child inserted in one batch are two entries, parent first, and the child resolves the parent\'s minted rowId',
             invoke: async () => {
                 const batch: CapturedBatch = { changes: [
                     { id: 1, kind: 'insert', table: 'comments', localId: 1, values: { body: 'root' } },
                     { id: 2, kind: 'insert', table: 'comments', localId: 2, values: { body: 'child', parent_id: 1 } },
                 ] };
-                const plan = changesToEntries(batch, mockView(), noLookup, {}, WRITER, counterUuid());
+                const plan = planCaptured(batch, mockView(), noLookup, {}, WRITER, counterUuid());
 
                 assertEquals(plan.rejects.length, 0, 'nothing rejected');
-                assertEquals(plan.entries.length, 1, 'one bundled entry (child FK-links to the consecutive parent)');
-                assertEquals(plan.entries[0].ops.length, 2, 'both writes in the one bundle');
+                assertEquals(plan.entries.map((e) => e.ops.length).join(','), '1,1', 'one entry per change (HIP-29)');
 
                 // Mint order is commit order: root=u1, child=u2.
                 const rootRowId = deriveRowId('u1', WRITER);
                 const op0 = plan.entries[0].ops[0].write.op;
-                const op1 = plan.entries[0].ops[1].write.op;
-                assertTrue(op0.action === 'insert' && op0.values.body === 'root', 'parent ordered first in the bundle');
-                assertTrue(op1.action === 'insert' && op1.values.body === 'child', 'child ordered second');
+                const op1 = plan.entries[1].ops[0].write.op;
+                assertTrue(op0.action === 'insert' && op0.values.body === 'root', 'the parent comes first');
+                assertTrue(op1.action === 'insert' && op1.values.body === 'child', 'the child second');
                 if (op1.action !== 'insert') return;
                 assertEquals(op1.values.parent, rootRowId, 'child FK rewritten to the parent minted rowId');
                 assertEquals(op1.values.parent_id, undefined, 'the projected id column name is not carried into rdb');
-            },
-        },
-        {
-            name: '[ADPTI02b] fkBundling:false emits the FK-linked parent+child as two single-op entries',
-            invoke: async () => {
-                const batch: CapturedBatch = { changes: [
-                    { id: 1, kind: 'insert', table: 'comments', localId: 1, values: { body: 'root' } },
-                    { id: 2, kind: 'insert', table: 'comments', localId: 2, values: { body: 'child', parent_id: 1 } },
-                ] };
-                const plan = changesToEntries(batch, mockView(), noLookup, { fkBundling: false }, WRITER, counterUuid());
-
-                assertEquals(plan.rejects.length, 0, 'nothing rejected');
-                assertEquals(plan.entries.length, 2, 'two single-op entries when bundling is off');
-                assertEquals(plan.entries[0].ops.length, 1, 'parent is its own entry');
-                assertEquals(plan.entries[1].ops.length, 1, 'child is its own entry');
-
-                const rootRowId = deriveRowId('u1', WRITER);
-                const op1 = plan.entries[1].ops[0].write.op;
-                assertTrue(op1.action === 'insert', 'child insert');
-                if (op1.action !== 'insert') return;
-                assertEquals(op1.values.parent, rootRowId, 'child FK still resolves to the parent minted rowId');
             },
         },
         {
@@ -113,7 +108,7 @@ export const ingestTests = {
                 const batch: CapturedBatch = { changes: [
                     { id: 1, kind: 'insert', table: 'comments', localId: 1, values: { body: 'orphan', post_id: 99 } },
                 ] };
-                const plan = changesToEntries(batch, mockView(), noLookup, {}, WRITER, counterUuid());
+                const plan = planCaptured(batch, mockView(), noLookup, {}, WRITER, counterUuid());
 
                 assertEquals(plan.entries.length, 0, 'no entry emitted for the dangling row');
                 assertEquals(plan.rejects.length, 1, 'one rejection');
@@ -135,7 +130,7 @@ export const ingestTests = {
                 const batch: CapturedBatch = { changes: [
                     { id: 1, kind: 'insert', table: 'comments', localId: 1, values: { body: 'x', origin_id: 7 } },
                 ] };
-                const plan = changesToEntries(batch, mockView(), lookup, config, WRITER, counterUuid());
+                const plan = planCaptured(batch, mockView(), lookup, config, WRITER, counterUuid());
 
                 assertEquals(plan.rejects.length, 0, 'nothing rejected');
                 assertEquals(plan.entries.length, 1, 'one entry');
@@ -166,7 +161,7 @@ export const ingestTests = {
                 const batch: CapturedBatch = { changes: [
                     { id: 1, kind: 'insert', table: 'caps', localId: 1, values: { label: 'manager', grantee_key_id: 7 } },
                 ] };
-                const plan = changesToEntries(batch, view, noLookup, {}, WRITER, counterUuid(), keyLookup);
+                const plan = planCaptured(batch, view, noLookup, {}, WRITER, counterUuid(), keyLookup);
 
                 assertEquals(plan.rejects.length, 0, 'nothing rejected');
                 assertEquals(plan.entries.length, 1, 'one entry');
@@ -175,61 +170,6 @@ export const ingestTests = {
                 if (op.action !== 'insert') return;
                 assertEquals(op.values.grantee, 'KH', 'identity key-ref reverse-maps to the key hash');
                 assertEquals(op.values.grantee_key_id, undefined, 'the projected key-ref name is not carried into rdb');
-            },
-        },
-        {
-            name: '[ADPTI07] updateMerge: consecutive same-row disjoint-field updates fold into one op carrying per-field fallback',
-            invoke: async () => {
-                const lookup: MappingLookup = (table, localId) =>
-                    table === 'posts' && localId === 5 ? { table, localId, rowId: 'POST5', uuid: '' } : undefined;
-                const batch: CapturedBatch = { changes: [
-                    { id: 1, kind: 'update', table: 'posts', localId: 5, values: { title: 'A' } },
-                    { id: 2, kind: 'update', table: 'posts', localId: 5, values: { note: 'B' } },
-                ] };
-                const plan = changesToEntries(batch, mockView(), lookup, {}, WRITER, counterUuid());
-
-                assertEquals(plan.rejects.length, 0, 'nothing rejected');
-                assertEquals(plan.entries.length, 1, 'the two updates merged into one entry');
-                assertEquals(plan.entries[0].ops.length, 1, 'one merged op');
-                const merged = plan.entries[0].ops[0];
-                assertTrue(merged.write.op.action === 'update', 'update op');
-                if (merged.write.op.action !== 'update') return;
-                assertEquals(merged.write.op.rowId, 'POST5', 'subject resolved via lookup');
-                assertEquals(merged.write.op.values.title, 'A', 'first field folded in');
-                assertEquals(merged.write.op.values.note, 'B', 'second field folded in');
-                // The merged op carries its per-change fallback so the orchestrator
-                // can resubmit each field independently if the merged op is rejected.
-                assertTrue(merged.fallback !== undefined && merged.fallback.length === 2, 'two per-field fallback ops');
-                const fbFields = merged.fallback!.map((f) => f.write.op.action === 'update' ? Object.keys(f.write.op.values).join(',') : '?');
-                assertTrue(fbFields.includes('title') && fbFields.includes('note'), 'fallback ops split by field');
-            },
-        },
-        {
-            name: '[ADPTI07b] updateMerge off / repeated-field runs stay one op per change (no fold, order preserved)',
-            invoke: async () => {
-                const lookup: MappingLookup = (table, localId) =>
-                    table === 'posts' && localId === 5 ? { table, localId, rowId: 'POST5', uuid: '' } : undefined;
-
-                // updateMerge:false -> two disjoint updates stay two entries.
-                const disjoint: CapturedBatch = { changes: [
-                    { id: 1, kind: 'update', table: 'posts', localId: 5, values: { title: 'A' } },
-                    { id: 2, kind: 'update', table: 'posts', localId: 5, values: { note: 'B' } },
-                ] };
-                const off = changesToEntries(disjoint, mockView(), lookup, { updateMerge: false }, WRITER, counterUuid());
-                assertEquals(off.entries.length, 2, 'updateMerge off keeps two per-change entries');
-                assertTrue(off.entries.every((e) => e.ops.length === 1 && e.ops[0].fallback === undefined), 'no fallback when unmerged');
-
-                // Even with updateMerge on, a REPEATED field breaks the run.
-                const repeated: CapturedBatch = { changes: [
-                    { id: 1, kind: 'update', table: 'posts', localId: 5, values: { title: 'A' } },
-                    { id: 2, kind: 'update', table: 'posts', localId: 5, values: { title: 'B' } },
-                ] };
-                const on = changesToEntries(repeated, mockView(), lookup, {}, WRITER, counterUuid());
-                assertEquals(on.entries.length, 2, 'a repeated field is not folded (would lose the intermediate)');
-                const first = on.entries[0].ops[0].write.op;
-                const second = on.entries[1].ops[0].write.op;
-                assertTrue(first.action === 'update' && first.values.title === 'A', 'first write preserved');
-                assertTrue(second.action === 'update' && second.values.title === 'B', 'second write preserved, in order');
             },
         },
         {
@@ -247,7 +187,7 @@ export const ingestTests = {
                 const batch: CapturedBatch = { changes: [
                     { id: 1, kind: 'insert', table: 'caps', localId: 1, values: { grantee_key_id: 99 } },
                 ] };
-                const plan = changesToEntries(batch, view, noLookup, {}, WRITER, counterUuid());
+                const plan = planCaptured(batch, view, noLookup, {}, WRITER, counterUuid());
 
                 assertEquals(plan.entries.length, 0, 'no entry emitted for the unknown key');
                 assertEquals(plan.rejects.length, 1, 'one rejection');
@@ -255,11 +195,8 @@ export const ingestTests = {
             },
         },
         {
-            name: '[ADPTI14] an insert on a poisoned (ingestion_failure) local id is dropped, not re-minted',
+            name: '[ADPTI14] an insert on a local id with an ingestion_failure identity is refused, naming that identity, and nothing is minted',
             invoke: async () => {
-                // The local id already maps to a poisoned identity (a prior insert
-                // rdb rejected). A fresh insert capture on that id is a stale replay:
-                // drop it (acked warning), never mint a NEW identity for it.
                 const lookup: MappingLookup = (table, localId) =>
                     table === 'comments' && localId === 1
                         ? { table, localId, rowId: 'POISON', uuid: 'u-old', status: 'ingestion_failure' }
@@ -267,18 +204,17 @@ export const ingestTests = {
                 const batch: CapturedBatch = { changes: [
                     { id: 1, kind: 'insert', table: 'comments', localId: 1, values: { body: 'stale' } },
                 ] };
-                const plan = changesToEntries(batch, mockView(), lookup, {}, WRITER, counterUuid());
+                const plan = planCaptured(batch, mockView(), lookup, {}, WRITER, counterUuid());
 
-                assertEquals(plan.entries.length, 0, 'no op emitted for the poisoned id');
-                assertEquals(plan.reservations.length, 0, 'no identity reserved');
-                assertEquals(plan.rejects.length, 1, 'one acked warning');
-                assertTrue(plan.rejects[0].reason.includes('cannot be reused'), 'reason names the un-reusable identity');
-                assertEquals(plan.rejects[0].table, undefined, 'a drop carries no table (no op-event / mark)');
-                assertEquals(plan.rejects[0].kind, undefined, 'a drop carries no kind');
+                assertEquals(plan.entries.length, 0, 'no op emitted for the id');
+                assertEquals(plan.rejects.length, 1, 'one refusal');
+                const r = plan.rejects[0];
+                assertTrue(r.reason.includes('already has an rdb identity'), 'the reason names the identity');
+                assertEquals(`${r.table}#${r.localId} ${r.kind} ${r.rowId}`, 'comments#1 insert POISON', 'a refusal with a kind, naming the identity\'s row');
             },
         },
         {
-            name: '[ADPTI15] an insert on a deleted local id is dropped (id never reused)',
+            name: '[ADPTI15] an insert on a deleted local id is refused, naming the deleted identity',
             invoke: async () => {
                 const lookup: MappingLookup = (table, localId) =>
                     table === 'comments' && localId === 1
@@ -287,70 +223,75 @@ export const ingestTests = {
                 const batch: CapturedBatch = { changes: [
                     { id: 1, kind: 'insert', table: 'comments', localId: 1, values: { body: 'stale' } },
                 ] };
-                const plan = changesToEntries(batch, mockView(), lookup, {}, WRITER, counterUuid());
+                const plan = planCaptured(batch, mockView(), lookup, {}, WRITER, counterUuid());
 
                 assertEquals(plan.entries.length, 0, 'no op emitted for a deleted id');
-                assertEquals(plan.reservations.length, 0, 'no identity reserved');
-                assertEquals(plan.rejects.length, 1, 'one acked warning');
+                assertEquals(plan.rejects.length, 1, 'one refusal');
+                assertEquals(`${plan.rejects[0].kind} ${plan.rejects[0].rowId}`, 'insert GONE', 'with a kind and the identity\'s row');
             },
         },
         {
-            name: '[ADPTI16] an insert on an ACTIVE mapping reuses its uuid (crash-replay read-back), no new mint',
+            name: '[ADPTI16] an insert on an active mapping is refused, naming its identity, not planned again with its uuid',
             invoke: async () => {
                 const reusedUuid = 'u-existing';
+                const rowId = deriveRowId(reusedUuid, WRITER);
                 const lookup: MappingLookup = (table, localId) =>
                     table === 'comments' && localId === 1
-                        ? { table, localId, rowId: deriveRowId(reusedUuid, WRITER), uuid: reusedUuid, status: 'active' }
+                        ? { table, localId, rowId, uuid: reusedUuid, status: 'active' }
                         : undefined;
                 const batch: CapturedBatch = { changes: [
                     { id: 1, kind: 'insert', table: 'comments', localId: 1, values: { body: 'again' } },
                 ] };
-                const plan = changesToEntries(batch, mockView(), lookup, {}, WRITER, counterUuid());
+                const plan = planCaptured(batch, mockView(), lookup, {}, WRITER, counterUuid());
 
-                assertEquals(plan.rejects.length, 0, 'nothing dropped');
-                assertEquals(plan.entries.length, 1, 'one entry');
-                const op = plan.entries[0].ops[0].write.op;
-                assertTrue(op.action === 'insert', 'insert op');
-                if (op.action !== 'insert') return;
-                assertEquals(op.rowId, deriveRowId(reusedUuid, WRITER), 'the reserved uuid is reused (identical rowId)');
-                assertEquals(op.uuid, reusedUuid, 'no fresh uuid was minted');
-                assertEquals(plan.reservations[0].uuid, reusedUuid, 'the reservation carries the reused uuid');
+                assertEquals(plan.entries.length, 0, 'no op');
+                assertEquals(plan.rejects.length, 1, 'one refusal');
+                assertEquals(`${plan.rejects[0].kind} ${plan.rejects[0].rowId}`, `insert ${rowId}`, 'naming the active identity, whose row the revert reads');
             },
         },
         {
-            name: '[ADPTI17] two insert captures for one local id: mint once, drop the duplicate',
+            name: '[ADPTI17] two insert captures for one local id: the first is planned, the second refused on the identity the first gave it',
             invoke: async () => {
                 const batch: CapturedBatch = { changes: [
                     { id: 1, kind: 'insert', table: 'comments', localId: 1, values: { body: 'first' } },
                     { id: 2, kind: 'insert', table: 'comments', localId: 1, values: { body: 'dup' } },
                 ] };
-                const plan = changesToEntries(batch, mockView(), noLookup, {}, WRITER, counterUuid());
+                const plan = planCaptured(batch, mockView(), noLookup, {}, WRITER, counterUuid());
 
                 assertEquals(plan.entries.length, 1, 'exactly one insert lands');
-                assertEquals(plan.reservations.length, 1, 'exactly one identity reserved for the id');
-                assertEquals(plan.rejects.length, 1, 'the duplicate is dropped');
-                assertTrue(plan.rejects[0].reason.includes('duplicate'), 'reason names the duplicate capture');
+                assertEquals(plan.rejects.length, 1, 'the second is refused');
+                const first = plan.entries[0].ops[0].write.op;
+                assertEquals(`${plan.rejects[0].kind} ${plan.rejects[0].rowId}`, `insert ${first.rowId}`, 'on the first one\'s identity');
             },
         },
         {
-            name: '[ADPTI18] an update/delete on a poisoned local id is dropped',
+            name: '[ADPTI18] an update or a delete of a row whose insert was refused is refused, also in the batch that refused it',
             invoke: async () => {
                 const lookup: MappingLookup = (table, localId) =>
                     table === 'comments' && localId === 1
                         ? { table, localId, rowId: 'POISON', uuid: 'u-old', status: 'ingestion_failure' }
                         : undefined;
-                const upd = changesToEntries(
+                const upd = planCaptured(
                     { changes: [{ id: 1, kind: 'update', table: 'comments', localId: 1, values: { body: 'x' } }] },
                     mockView(), lookup, {}, WRITER, counterUuid());
-                assertEquals(upd.entries.length, 0, 'no update op on a poisoned id');
-                assertEquals(upd.rejects.length, 1, 'the update is dropped');
-                assertTrue(upd.rejects[0].reason.includes('previously failed ingestion'), 'reason explains the drop');
+                assertEquals(upd.entries.length, 0, 'no update op on the id');
+                assertEquals(upd.rejects.length, 1, 'the update is refused');
+                assertTrue(upd.rejects[0].reason.includes('insert was refused'), 'the reason explains it');
+                assertEquals(`${upd.rejects[0].kind} ${upd.rejects[0].rowId}`, 'update POISON', 'with a kind and the row');
 
-                const del = changesToEntries(
+                const del = planCaptured(
                     { changes: [{ id: 1, kind: 'delete', table: 'comments', localId: 1 }] },
                     mockView(), lookup, {}, WRITER, counterUuid());
-                assertEquals(del.entries.length, 0, 'no delete op on a poisoned id');
-                assertEquals(del.rejects.length, 1, 'the delete is dropped');
+                assertEquals(del.entries.length, 0, 'no delete op on the id');
+                assertEquals(del.rejects.length, 1, 'the delete is refused');
+
+                // The insert refused in the same batch gives its id the identity.
+                const batch = planCaptured({ changes: [
+                    { id: 1, kind: 'insert', table: 'comments', localId: 3, values: { body: 'orphan', post_id: 99 } },
+                    { id: 2, kind: 'update', table: 'comments', localId: 3, values: { body: 'y' } },
+                ] }, mockView(), noLookup, {}, WRITER, counterUuid());
+                assertEquals(batch.rejects.map((r) => r.kind).join(','), 'insert,update', 'both are refused');
+                assertEquals(batch.rejects[1].rowId, batch.rejects[0].rowId, 'the update names the refused insert\'s row');
             },
         },
         {
@@ -378,7 +319,7 @@ export const ingestTests = {
                     getFKs: (n: string) => n === 'notes' ? { topic: 'topics', origin: 'archive.entries' } : {},
                 } as unknown as RSchemaView;
 
-                const plan = changesToEntries({ changes: [{
+                const plan = planCaptured({ changes: [{
                     id: 1, kind: 'update', table: 'notes', localId: 1,
                     values: { memo: null, topic_id: null, origin_row_hash: null, owner_key_id: null },
                 }] }, view, noRow, {}, WRITER, counterUuid(), noKey);
@@ -390,17 +331,16 @@ export const ingestTests = {
                 assertEquals(JSON.stringify(op.values), '{}', 'no values');
                 assertEquals(JSON.stringify(op.nulls), JSON.stringify(['memo', 'origin', 'owner', 'topic']),
                     'each null is carried under its rdb column, sorted');
-                assertEquals(plan.entries[0].ops[0].deps.length, 0, 'a NULL foreign key adds no dependency');
 
                 // the readonly check still comes first
-                const readonly = changesToEntries(
+                const readonly = planCaptured(
                     { changes: [{ id: 1, kind: 'update', table: 'notes', localId: 1, values: { fixed: null } }] },
                     view, noRow, {}, WRITER, counterUuid(), noKey);
                 assertEquals(readonly.entries.length, 0, 'a NULL for a readonly column lands no op');
                 assertTrue(readonly.rejects[0]?.reason.includes('readonly'), 'and is refused as readonly');
 
                 // values and nulls in one update
-                const mixed = changesToEntries(
+                const mixed = planCaptured(
                     { changes: [{ id: 1, kind: 'update', table: 'notes', localId: 1, values: { title: 'b', memo: null } }] },
                     view, noRow, {}, WRITER, counterUuid(), noKey);
                 const mixedOp = mixed.entries[0].ops[0].write.op;
@@ -428,7 +368,7 @@ export const ingestTests = {
 
                 // an insert as SQLite captures it: every empty column named with NULL,
                 // one of them a column rdb's schema no longer has
-                const insert = changesToEntries({ changes: [{
+                const insert = planCaptured({ changes: [{
                     id: 1, kind: 'insert', table: 'notes', localId: 1,
                     values: { title: 'a', memo: null, tag: null, gone: null },
                 }] }, view, existing, {}, WRITER, counterUuid());
@@ -441,7 +381,7 @@ export const ingestTests = {
                     'only the NULL of the column with a default is written: not the one without, not the one rdb does not have');
 
                 // an insert with no NULL of that kind has no nulls at all
-                const plain = changesToEntries(
+                const plain = planCaptured(
                     { changes: [{ id: 1, kind: 'insert', table: 'notes', localId: 1, values: { title: 'a', memo: null } }] },
                     view, existing, {}, WRITER, counterUuid());
                 const plainOp = plain.entries[0].ops[0].write.op;
@@ -449,7 +389,7 @@ export const ingestTests = {
 
                 // an update names only what the app wrote, so every NULL is kept: also for a
                 // column rdb does not have, which rdb then refuses as it refuses a value there
-                const update = changesToEntries({ changes: [{
+                const update = planCaptured({ changes: [{
                     id: 2, kind: 'update', table: 'notes', localId: 9, values: { memo: null, tag: null, gone: null },
                 }] }, view, existing, {}, WRITER, counterUuid());
                 const updateOp = update.entries[0].ops[0].write.op;
@@ -459,7 +399,7 @@ export const ingestTests = {
             },
         },
         {
-            name: '[ADPTI21] a column the drain could not read is refused before any other check; an update\'s other columns are still planned',
+            name: '[ADPTI21] a column the drain could not read is refused before any other check, and an update with one is refused whole',
             invoke: async () => {
                 const view = {
                     getTableNames: () => ['notes'],
@@ -476,7 +416,7 @@ export const ingestTests = {
                 const existing: MappingLookup = (table, localId) =>
                     localId === 9 ? { table, localId, rowId: 'ROW9', uuid: 'u-row', status: 'active' } : undefined;
                 const reason = "its text is not json: \"nope\"";
-                const plan = changesToEntries({ changes: [
+                const plan = planCaptured({ changes: [
                     { id: 1, kind: 'insert', table: 'notes', localId: 1, values: { title: 'a' }, unreadable: { data: reason } },
                     { id: 2, kind: 'update', table: 'notes', localId: 9, values: { note: 'n' }, unreadable: { data: reason } },
                 ] }, view, existing, {}, WRITER, counterUuid());
@@ -488,14 +428,68 @@ export const ingestTests = {
                 assertEquals((insertReject!.sources ?? []).map((s) => s.id).join(','), '1', 'and its own captured change');
 
                 const updateRejects = plan.rejects.filter((r) => r.kind === 'update');
-                assertEquals(updateRejects.length, 1, "the update's unreadable column is refused");
-                assertEquals(updateRejects[0].column, 'data', 'at that column');
+                assertEquals(updateRejects.length, 1, "the update is refused, once");
+                assertEquals(updateRejects[0].column, 'data', 'at the unreadable column');
+                assertEquals(plan.entries.length, 0, 'and no op is planned: an update lands or is refused whole (HIP-29)');
+            },
+        },
+        {
+            name: "[ADPTI22] an update's readonly and author columns at rdb's values for the row are set aside, other values are refused; an insert's empty author is refused in a signed group, and is anonymous under autoAuthor off",
+            invoke: async () => {
+                const view = {
+                    getTableNames: () => ['notes'],
+                    hasTable: (n: string) => n === 'notes',
+                    getTable: (n: string) => n === 'notes'
+                        ? { name: 'notes', columns: {
+                            title: { type: 'string' },
+                            code: { type: 'string', readonly: true },
+                        } }
+                        : undefined,
+                    getFKs: () => ({}),
+                } as unknown as RSchemaView;
+                const existing: MappingLookup = (table, localId) =>
+                    localId === 9 ? { table, localId, rowId: 'ROW9', uuid: 'u-row', author: WRITER, status: 'active' } : undefined;
+                const subject: SubjectRow = { values: { title: 't', code: 'C1' }, author: WRITER };
+                const keys = new Map([[1, { keyHash: WRITER }], [2, { keyHash: 'other-key' }]]);
+                const plan = (values: { [c: string]: number | string | null }, kind: 'insert' | 'update', extra: Partial<NodeContext> = {}) => {
+                    const ctx: NodeContext = { groupId: 'g', schemaView: view, config: {}, writerKeyId: WRITER,
+                        subjectRow: (_t, rowId) => rowId === 'ROW9' ? subject : undefined, ...extra };
+                    return planDatabaseEntries({ changes: [{ id: 1, kind, table: 'notes', localId: kind === 'update' ? 9 : 1, values }] },
+                        () => ctx, existing, (k) => keys.get(k), counterUuid());
+                };
+                const opValues = (p: ReturnType<typeof plan>): string =>
+                    p.entries.flatMap((e) => e.ops).map((o) => JSON.stringify((o.write.op as { values?: unknown }).values ?? {})).join(';');
 
-                const ops = plan.entries.flatMap((e) => e.ops);
-                assertEquals(ops.length, 1, 'one op is planned');
-                const op = ops[0].write.op;
-                assertTrue(op.action === 'update' && JSON.stringify(op.values) === JSON.stringify({ note: 'n' }),
-                    "the update's other column is planned, and no op carries the unreadable column");
+                let p = plan({ title: 'new', code: 'C1', author_key_id: 1 }, 'update');
+                assertEquals(p.rejects.length, 0, 'the row\'s own values are no refusal');
+                assertEquals(opValues(p), '{"title":"new"}', 'and are set aside');
+
+                p = plan({ code: 'C1', author_key_id: 1 }, 'update');
+                assertEquals(p.rejects.length + p.entries.length, 0, 'an update with nothing left to write gives no op');
+
+                p = plan({ title: 'new', code: 'C2' }, 'update');
+                assertEquals(p.rejects.map((r) => r.column).join(','), 'code', 'another readonly value is refused');
+                p = plan({ author_key_id: 2 }, 'update');
+                assertEquals(p.rejects.map((r) => r.column).join(','), 'author_key_id', 'another author is refused');
+                p = plan({ author_key_id: 77 }, 'update');
+                assertEquals(p.rejects.map((r) => r.column).join(','), 'author_key_id', 'an id the key table does not know is refused');
+                p = plan({ author_key_id: null }, 'update');
+                assertEquals(p.rejects.map((r) => r.column).join(','), 'author_key_id', 'a NULL over a signed row is refused');
+
+                p = plan({ title: 'x', code: 'K' }, 'insert');
+                assertEquals(p.rejects.map((r) => r.column).join(','), 'author_key_id', 'an empty author in a signed group is refused: capture fills it');
+                p = plan({ title: 'x', code: 'K', author_key_id: 1 }, 'insert');
+                assertEquals(p.rejects.length, 0, 'one naming the writer key is not');
+                assertEquals(p.entries[0].ops[0].mapping?.author, WRITER, 'and is signed with it');
+
+                p = plan({ title: 'x', code: 'K' }, 'insert', { autoAuthorOff: true });
+                const anon = p.entries[0].ops[0];
+                assertTrue(anon.anonymous === true && anon.mapping?.author === undefined, 'under autoAuthor off an empty author is anonymous');
+                assertEquals(anon.mapping?.rowId, deriveRowId('u1'), 'its row hash comes from its uuid alone');
+                p = plan({ title: 'x', code: 'K', author_key_id: 1 }, 'insert', { autoAuthorOff: true });
+                const signed = p.entries[0].ops[0];
+                assertTrue(signed.anonymous === undefined && signed.mapping?.author === WRITER, 'and one naming the writer key is signed');
+                assertEquals(signed.mapping?.rowId, deriveRowId('u1', WRITER), 'with a row hash from its signer');
             },
         },
     ],

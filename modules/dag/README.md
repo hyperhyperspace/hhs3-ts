@@ -42,6 +42,8 @@ type Dag = {
 };
 ```
 
+An append of an entry the store already holds, with the same payload and the same parents, writes nothing: `append` returns the entry's hash and fires no growth event. The check runs inside the append's transaction, so two callers appending one entry at once store it once; the memory store runs its transactions one after another for this, as the SQLite and IndexedDB stores already do. A caller can therefore append an entry without looking for it first, a look that would race with sync, which may be appending the same entry from a peer.
+
 
 ## Building
 

@@ -745,6 +745,32 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
         },
     },
     {
+        name: "[RHOST28] the projection config takes autoAuthor, refuses a value that isn't a boolean, and the host passes it to the projection",
+        invoke: async () => {
+            const off = parseAppConfig({ ...appConfig(), projection: { path: 'data.sqlite', autoAuthor: false } });
+            assertEquals(off.projection.autoAuthor, false, 'autoAuthor parses');
+            assertEquals(parseAppConfig(appConfig()).projection.autoAuthor, undefined, 'and is absent when not given');
+            throwsWith(() => parseAppConfig({ ...appConfig(), projection: { path: 'data.sqlite', autoAuthor: 'no' } }),
+                'projection.autoAuthor must be true or false', 'a value that is not a boolean');
+
+            const { v100 } = await editor();
+            const mesh = new SharedMesh();
+            const platform = await MemPlatform.withKey([v100], mesh);
+            const app = await Rhost.open(appConfig({ projection: { path: 'data.sqlite', autoAuthor: false } }), platform);
+            try {
+                const host = await app.create(undefined, hostSetup());
+                await host.project();
+                const record = await platform.targets.get('default')!.readWriterRecord();
+                const modes = Object.values(record?.groups ?? {}).map((g) => `${g.name}:${g.mode}`).sort().join(',');
+                assertTrue(modes.includes('user:off'), `the signed group's mode is off (${modes})`);
+                assertTrue(record?.writerKeyId !== undefined, "and the host's key is the writer key");
+            } finally {
+                await app.close();
+                mesh.close();
+            }
+        },
+    },
+    {
         name: '[RHOST13] each host has its own network settings; two hosts of an app cannot listen on one port',
         invoke: async () => {
             const { v100 } = await editor();

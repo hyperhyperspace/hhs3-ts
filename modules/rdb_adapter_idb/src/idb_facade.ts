@@ -15,8 +15,8 @@ import { json } from "@hyper-hyper-space/hhs3_json";
 import { DEFAULT_KEY_TABLE, type ResolvedIndex } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 import {
-    INDEX_ENTRIES, INDEX_META, KEYS, OUTBOX, ROWS, TABLE_META,
-    type IndexEntryRecord, type OutboxRecord, type RowRecord, type TableMetaRecord,
+    CAPTURE_CONFIG, INDEX_ENTRIES, INDEX_META, KEYS, OUTBOX, ROWS, TABLE_META, WRITER_RECORD_KEY,
+    type IndexEntryRecord, type OutboxRecord, type RowRecord, type TableMetaRecord, type WriterRecordRecord,
 } from "./idb_schema.js";
 import {
     entryKeyRange, indexEntryRange, indexKeyPath, rowRange, syncEntryRequests, validateKey, wholeTableRange,
@@ -266,30 +266,17 @@ function capturedColumns(meta: TableMetaRecord): string[] {
     return meta.authorColumn !== undefined ? [...cols, meta.authorColumn] : cols;
 }
 
-// The business columns a put changes, compared by value: two structured clones
-// of a json value are equal when their contents are. A missing property and a
-// null are the same thing, NULL, on both sides: a column that had a value and
-// now has neither is a change to null, and a null put over a column with no
-// value changes nothing.
-function changedColumns(
-    oldRec: FacadeRecord | undefined,
-    newRec: FacadeRecord,
-    meta: TableMetaRecord,
-): { [column: string]: json.Literal | null } {
-    const changed: { [column: string]: json.Literal | null } = {};
-    for (const col of capturedColumns(meta)) {
-        const next = newRec[col] ?? null;
-        const prev = oldRec?.[col] ?? null;
-        if (!sameValue(next, prev)) changed[col] = next;
-    }
-    return changed;
-}
-
-// Whether two stored column values are the same value: NULL equals NULL, and a
-// json value is compared by its contents.
-function sameValue(a: json.Literal | null, b: json.Literal | null): boolean {
-    if (a === null || b === null) return a === b;
-    return json.eq(a, b);
+// What a put over an existing record captures (HIP-29): every column, since a
+// put replaces the record, as an UPDATE that names every column would. A
+// column the record leaves out counts as NULL. The author column is captured
+// only when the record gives it a value: a put that leaves it out, or gives it
+// null, keeps the stored author (HIP-20).
+function putColumns(rec: FacadeRecord, meta: TableMetaRecord): { [column: string]: json.Literal | null } {
+    const values: { [column: string]: json.Literal | null } = {};
+    for (const col of Object.keys(meta.columnTypes)) values[col] = rec[col] ?? null;
+    const author = meta.authorColumn;
+    if (author !== undefined && rec[author] !== undefined && rec[author] !== null) values[author] = rec[author];
+    return values;
 }
 
 export class FacadeObjectStore {
@@ -430,6 +417,62 @@ export class FacadeObjectStore {
         return this.issueWrite('put', value, key);
     }
 
+    // A partial update (HIP-29), IndexedDB's counterpart of an UPDATE that
+    // names some columns: it writes the fields it is given, clears the fields
+    // `delete` lists, keeps every other field as stored, and captures exactly
+    // the fields it names, changed or not, the cleared ones as NULL. It compares
+    // nothing: a comparison is for the library that calls it. `fields` holds the
+    // record's key. Like an UPDATE that matches no row, a patch of a key with no
+    // record writes and captures nothing. A field both given and listed is a
+    // DataError.
+    patch(fields: FacadeRecord, opts: { delete?: string[] } = {}): FacadeRequest<IDBValidKey> {
+        this.checkWritable();
+        const doc = structuredClone(fields);
+        if (typeof doc !== 'object' || doc === null || Array.isArray(doc)) throw dataError('The value is not a record.');
+        const cleared = opts.delete ?? [];
+        for (const column of cleared) {
+            if (column in doc) throw dataError(`'${column}' is both given and listed to clear.`);
+        }
+        const req = new FacadeRequest<IDBValidKey>();
+        return this.transaction.schedule(req, () => this.patchOne(req, doc, cleared));
+    }
+
+    private patchOne(req: FacadeRequest<IDBValidKey>, fields: FacadeRecord, cleared: string[]): void {
+        const tx = this.transaction.real;
+        wire(req, tx.objectStore(TABLE_META).get(this.name), 'read', (m) => {
+            const meta = m as TableMetaRecord | undefined;
+            if (meta === undefined) { req.fail(notFound(this.name)); return; }
+            const id = fields[meta.idColumn] as number | undefined;
+            if (id === undefined) { req.fail(dataError(`a patch names the record's key, '${meta.idColumn}'.`)); return; }
+            try { validateKey(this.cmpFn, id); } catch (e) { req.fail(e as DOMException); return; }
+            this.withIndexes(req, (indexes) => {
+                const rows = tx.objectStore(ROWS);
+                wire(req, rows.get([this.name, id]), 'read', (r) => {
+                    const old = r as RowRecord | undefined;
+                    if (old === undefined) { req.succeed(id); return; }   // no record: nothing written
+                    const rec: RowRecord = { ...old };
+                    const changed: { [column: string]: json.Literal | null } = {};
+                    for (const [column, v] of Object.entries(fields)) {
+                        if (column === meta.idColumn) continue;
+                        if (v === null) delete rec[column];
+                        else rec[column] = v;
+                        changed[column] = v;
+                    }
+                    for (const column of cleared) {
+                        delete rec[column];
+                        changed[column] = null;
+                    }
+                    wire(req, rows.put(rec), 'write', () => {
+                        if (Object.keys(changed).length > 0) {
+                            this.queueOutbox(req, { table: this.name, localId: id, op: 'update', changed });
+                        }
+                        this.syncEntries(req, indexes, id, old, rec, () => req.succeed(id));
+                    });
+                });
+            });
+        });
+    }
+
     delete(key: IDBValidKey): FacadeRequest<undefined> {
         this.checkWritable();
         this.requiredKey(key);
@@ -543,20 +586,33 @@ export class FacadeObjectStore {
                         meta.nextId = assignedId + 1;
                         wire(req, tx.objectStore(TABLE_META).put(meta), 'write', () => {});
                     }
-                    wire(req, rows.put(rec), 'write', () => {
-                        const stripped = stripTable(rec)!;
+                    const store = (): void => wire(req, rows.put(rec), 'write', () => {
                         if (old === undefined) {
                             this.queueOutbox(req, {
                                 table: this.name, localId: assignedId, op: 'insert',
                                 changed: businessValues(written, meta),
                             });
                         } else {
-                            const changed = changedColumns(stripTable(old), stripped, meta);
-                            if (Object.keys(changed).length > 0) {
-                                this.queueOutbox(req, { table: this.name, localId: assignedId, op: 'update', changed });
-                            }
+                            this.queueOutbox(req, { table: this.name, localId: assignedId, op: 'update', changed: putColumns(written, meta) });
                         }
                         this.syncEntries(req, indexes, assignedId, old, rec, () => req.succeed(assignedId));
+                    });
+                    // A new record with an empty author column gets the writer key's
+                    // id, in the row and in the captured insert, where the writer
+                    // record says the table's group mode is `on` (HIP-29).
+                    if (old !== undefined || author === undefined || rec[author] !== undefined
+                        || meta.groupId === undefined || !this.transaction.host.isCaptureOn()) {
+                        store();
+                        return;
+                    }
+                    wire(req, tx.objectStore(CAPTURE_CONFIG).get(WRITER_RECORD_KEY), 'read', (w) => {
+                        const record = w as WriterRecordRecord | undefined;
+                        const keyId = record?.writerKeyId;
+                        if (keyId !== undefined && record!.groups[meta.groupId!]?.mode === 'on') {
+                            rec[author] = keyId;
+                            written[author] = keyId;
+                        }
+                        store();
                     });
                 };
 
@@ -882,8 +938,10 @@ export class FacadeTransaction {
         this.host = host;
         this.db = db;
         this.mode = mode;
+        // The capture config store holds the writer record, which an insert reads
+        // to fill in an empty author column (HIP-29).
         this.real = host.db.transaction(
-            [ROWS, TABLE_META, KEYS, OUTBOX, INDEX_ENTRIES, INDEX_META],
+            [ROWS, TABLE_META, KEYS, OUTBOX, INDEX_ENTRIES, INDEX_META, CAPTURE_CONFIG],
             mode,
         );
         this.real.oncomplete = (ev) => {

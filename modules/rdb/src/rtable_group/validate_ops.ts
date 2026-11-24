@@ -121,12 +121,16 @@ export type GroupOpHost = {
     // caller treats both as a missing reference); throws if the bound object
     // is not present in the replica.
     resolveForeignTableView(groupName: string, table: string, at: Version, from: Version): Promise<RTableView | undefined>;
-    resolveSchemaForeignTableView(groupName: string, schemaTable: string, at: Version, from: Version): Promise<RTableView | undefined>;
+    // `live`: read the bound group through the live observes only, as a
+    // verdict does, instead of through every observe.
+    resolveSchemaForeignTableView(groupName: string, schemaTable: string, at: Version, from: Version, live?: boolean): Promise<RTableView | undefined>;
 };
 
 export type TableGroupValidationContext =
     | { mode: 'create'; ctx: RContext }
-    | { mode: 'op'; group: GroupOpHost; at: Version };
+    // `liveReads`: read bound groups through the live observes only, as the
+    // op's verdict will (HIP-29's second validation of a local op).
+    | { mode: 'op'; group: GroupOpHost; at: Version; liveReads?: boolean };
 
 export async function validateTableGroupPayload(payload: json.Literal, context: TableGroupValidationContext): Promise<ValidationResult> {
     const formatResult = validateTableGroupPayloadFormat(payload);
@@ -137,6 +141,7 @@ export async function validateTableGroupPayload(payload: json.Literal, context: 
     }
 
     const { group, at } = context;
+    const live = context.liveReads === true;
 
     if (isRefAdvancePayload(payload)) {
         return validateRefAdvance(payload as RefAdvancePayload, group, at);
@@ -147,7 +152,7 @@ export async function validateTableGroupPayload(payload: json.Literal, context: 
     if (action === 'row') {
         return wrapValidationFailure(
             'row envelope rejected',
-            await validateRowEnvelope(payload as RowEnvelopePayload, group, at),
+            await validateRowEnvelope(payload as RowEnvelopePayload, group, at, live),
             group.getId(),
         );
     }
@@ -155,7 +160,7 @@ export async function validateTableGroupPayload(payload: json.Literal, context: 
     if (action === 'bundle') {
         return wrapValidationFailure(
             `bundle rejected by group '${group.getId()}'`,
-            await validateBundle(payload as BundlePayload, group, at),
+            await validateBundle(payload as BundlePayload, group, at, live),
             group.getId(),
         );
     }
@@ -381,13 +386,14 @@ async function validateRowOpRestrictionAt(
     schemaView: RSchemaView,
     group: GroupOpHost,
     at: Version,
+    live: boolean,
 ): Promise<ValidationResult> {
     const authenticated = group.getIdProvider() !== undefined;
     const rule = schemaView.getRestriction(table, op.action, authenticated);
     const effectiveParams = await group.resolveEffectiveParams(at, at);
     const ok = await evaluateRowOpRestriction(op, table, schemaView, authenticated,
         (targetTable) => group.makeTable(targetTable).getView(at, at),
-        (groupName, targetTable) => group.resolveSchemaForeignTableView(groupName, targetTable, at, at),
+        (groupName, targetTable) => group.resolveSchemaForeignTableView(groupName, targetTable, at, at, live),
         effectiveParams,
     );
     return ok
@@ -395,7 +401,7 @@ async function validateRowOpRestrictionAt(
         : validationFailure(formatRestrictionFailureReason(table, op, rule));
 }
 
-async function validateRowEnvelope(envelope: RowEnvelopePayload, group: GroupOpHost, at: Version): Promise<ValidationResult> {
+async function validateRowEnvelope(envelope: RowEnvelopePayload, group: GroupOpHost, at: Version, live: boolean): Promise<ValidationResult> {
     const schemaView = await group.resolveSchemaView(at);
     const op = envelope.op as RowOpPayload;
 
@@ -435,7 +441,7 @@ async function validateRowEnvelope(envelope: RowEnvelopePayload, group: GroupOpH
 
     // Restrictions must pass at the parent frontier `(at, at)`; concurrent
     // revokes are still handled by view-time rechecks.
-    const restrictionResult = await validateRowOpRestrictionAt(op, envelope.table, schemaView, group, at);
+    const restrictionResult = await validateRowOpRestrictionAt(op, envelope.table, schemaView, group, at, live);
     if (!restrictionResult.valid) return restrictionResult;
 
     // FK targets must be live at `at` (single-op entry: no bundle siblings).
@@ -446,7 +452,7 @@ async function validateRowEnvelope(envelope: RowEnvelopePayload, group: GroupOpH
         async (ref, rowId) => {
             const [groupName, targetTable] = splitTableRef(ref);
             if (groupName !== undefined) {
-                const fv = await group.resolveSchemaForeignTableView(groupName, targetTable, at, at);
+                const fv = await group.resolveSchemaForeignTableView(groupName, targetTable, at, at, live);
                 return fv !== undefined && fv.hasRow(rowId);
             }
             return (await group.makeTable(targetTable).getView(at, at)).hasRow(rowId);
@@ -492,7 +498,7 @@ async function fkTargetsLive(
 //   - FK checks at each op's SEQUENTIAL CUT: a target is live iff it is live
 //     at `at` and not deleted by an earlier op, OR inserted by an earlier op
 //     (and not since deleted) — bundle order matters (decision 4).
-async function validateBundle(bundle: BundlePayload, group: GroupOpHost, at: Version): Promise<ValidationResult> {
+async function validateBundle(bundle: BundlePayload, group: GroupOpHost, at: Version, live: boolean): Promise<ValidationResult> {
     // single signer, verified once over the whole bundle; format validation
     // already pinned every op's author claim to the bundle author
     const authorshipResult = await verifyOpAuthorship(bundle as unknown as json.Literal, group, at, []);
@@ -511,7 +517,7 @@ async function validateBundle(bundle: BundlePayload, group: GroupOpHost, at: Ver
     const isTargetLive = async (targetRef: string, rowId: B64Hash): Promise<boolean> => {
         const [groupName, targetTable] = splitTableRef(targetRef);
         if (groupName !== undefined) {
-            const fv = await group.resolveSchemaForeignTableView(groupName, targetTable, at, at);
+            const fv = await group.resolveSchemaForeignTableView(groupName, targetTable, at, at, live);
             return fv !== undefined && fv.hasRow(rowId);
         }
         if ((deletedBefore.get(targetTable)?.has(rowId)) ?? false) return false;
@@ -555,7 +561,7 @@ async function validateBundle(bundle: BundlePayload, group: GroupOpHost, at: Ver
 
         // Authorization reads only the parent frontier; sibling writes in this
         // bundle can satisfy FK targets, but not permission predicates.
-        const restrictionResult = await validateRowOpRestrictionAt(op, table, schemaView, group, at);
+        const restrictionResult = await validateRowOpRestrictionAt(op, table, schemaView, group, at, live);
         if (!restrictionResult.valid) return wrapValidationFailure(`bundle write ${index} failed restrictions`, restrictionResult);
 
         const fkResult = await fkTargetsLive(op, table, schemaView, isTargetLive);

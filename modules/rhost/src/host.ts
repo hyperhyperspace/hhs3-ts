@@ -823,6 +823,7 @@ export class Host {
                 target,
                 writer: identity,
                 registerWriterKey: true,
+                ...(this.config.projection.autoAuthor !== undefined ? { autoAuthor: this.config.projection.autoAuthor } : {}),
                 ...(indexSpec !== undefined ? { indexSpec } : {}),
                 ...this.fileMounts(),
             });
@@ -912,6 +913,7 @@ export class Host {
                 target,
                 writer: identity,
                 registerWriterKey: true,
+                ...(this.config.projection.autoAuthor !== undefined ? { autoAuthor: this.config.projection.autoAuthor } : {}),
                 ...(indexSpec !== undefined ? { indexSpec } : {}),
                 ...this.fileMounts(),
                 onError: (err) => { this.fail(`projection: ${errorMessage(err)}`); },

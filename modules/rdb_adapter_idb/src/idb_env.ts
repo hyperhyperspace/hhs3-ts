@@ -1,5 +1,5 @@
 // IdbEnv owns the IDBDatabase and a per-tab write queue. Adapter apply() /
-// commitIngest / reserveMint already have their action lists computed, so they
+// commitIngest already have their action lists computed, so they
 // run inside one live readwrite transaction (awaiting only IDB requests keeps
 // the tx alive). That is the same atomic flush as dag_idb's IdbTx, without a
 // JS write buffer: there is no CPU gap between planner and IO.
@@ -78,6 +78,10 @@ export function storeAdd(tx: IDBTransaction, store: string, value: unknown): Pro
 
 export function storeDelete(tx: IDBTransaction, store: string, key: IDBValidKey): Promise<void> {
     return reqToPromise(tx.objectStore(store).delete(key)).then(() => undefined);
+}
+
+export function storeCount(tx: IDBTransaction, store: string): Promise<number> {
+    return reqToPromise(tx.objectStore(store).count());
 }
 
 export function storeGetAll<T>(tx: IDBTransaction, store: string, range?: IDBKeyRange): Promise<T[]> {

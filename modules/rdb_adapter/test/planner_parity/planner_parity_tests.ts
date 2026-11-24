@@ -11,7 +11,7 @@ export const plannerParityTests = {
             },
         },
         {
-            name: '[PLANNER] ingest planner naive vs optimized',
+            name: '[PLANNER] ingest planner: one op, refusal or mark per change, and the plan applies',
             invoke: async () => {
                 await runIngestPlannerFromArgv();
             },

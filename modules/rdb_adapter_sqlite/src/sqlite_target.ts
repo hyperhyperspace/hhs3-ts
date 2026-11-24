@@ -51,10 +51,11 @@ import {
     BoundWhereExpr, BoundOperand, CapturedBatch, CapturedChange, OrderBySpec, ProjectedRow,
     QueryableTarget, ReactiveChangeTarget, SingleTableQueryPlan,
     TargetCommitEvent, TargetCommitListener, TargetRowChange,
-    CheckpointMovedError, DEFAULT_KEY_TABLE, IndexDecl, IndexSpec, IndexState, IndexTarget, IngestSettle,
+    CheckpointMovedError, PendingChangesError, DEFAULT_KEY_TABLE, IndexDecl, IndexSpec, IndexState, IndexTarget, IngestSettle,
     KeyIndex, MaterializationTarget, MaterializedChangeSource, OpEvent, OpEventQuery, OpEventReason,
     ResolvedIndex, resolveOpEventQuery, RowAction, RowIdentityIndex, SchemaAction, StoredOpEvent, SyncMapping,
-    versionsEqual,
+    versionsEqual, WriterRecord, WriterRecordStore,
+    CapturedChangeId, ChangeRecord, mergeChangeRecord, RowRevert,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import { normalizeOrder } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
@@ -72,6 +73,10 @@ type TableMeta = {
     columnTypes: { [column: string]: ColumnType };
     fkColumns: { [column: string]: { targetTable: string } };
     keyRefColumns: string[];
+    // The group the table was created for, and its name in that group's
+    // schema (HIP-20). Capture reads the group's mode from the writer record.
+    groupId?: string;
+    schemaName?: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -113,6 +118,9 @@ function toParam(value: json.Literal, type: ColumnType): number | string {
     if (type === 'json') return json.toStringNormalized(value);
     return value as number | string;
 }
+
+// An outbox row as stored, for the settle's reverts.
+type RawOutboxRow = { tbl: string; local_id: number; op: string; changed: string | null };
 
 // The ` DEFAULT <literal>` fragment for a column decl, or '' when none.
 function defaultFragment(def: ColumnDef): string {
@@ -248,7 +256,7 @@ function readLogical(value: unknown, type: ColumnType): LogicalRead {
 }
 
 export class SqliteTarget implements MaterializationTarget, MaterializedChangeSource,
-    ReactiveChangeTarget, QueryableTarget, RowIdentityIndex, KeyIndex, IndexTarget {
+    ReactiveChangeTarget, QueryableTarget, RowIdentityIndex, KeyIndex, IndexTarget, WriterRecordStore {
     private db: Database.Database;
     private metaCache = new Map<string, TableMeta>();
     // The schema version the cache was read at (see freshMeta).
@@ -342,8 +350,8 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     // apply() transaction for the compare-and-set guard.
     private readCheckpoint(groupId: B64Hash): Version | undefined {
         const row = this.db.prepare('SELECT version FROM rdb_checkpoint WHERE group_id = ?').get(groupId) as
-            { version: string } | undefined;
-        if (row === undefined) return undefined;
+            { version: string | null } | undefined;
+        if (row === undefined || row.version === null) return undefined;
         return new Set(JSON.parse(row.version) as string[]);
     }
 
@@ -365,6 +373,9 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         if (expectIndexSpec !== undefined && (this.readIndexSpecFingerprint() ?? null) !== expectIndexSpec) {
             throw new CheckpointMovedError(groupId);
         }
+        // No projection over a pending change (HIP-29), checked again inside
+        // the transaction, where no write can land between the check and the apply.
+        if (this.outboxHasRows()) throw new PendingChangesError(groupId);
         const empty = schemaActions.length === 0 && rowActions.length === 0
             && (events === undefined || events.length === 0);
         if (empty && versionsEqual(stored, checkpoint)) return;
@@ -381,12 +392,13 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             if (expectIndexSpec !== undefined && (this.readIndexSpecFingerprint() ?? null) !== expectIndexSpec) {
                 throw new CheckpointMovedError(groupId);
             }
+            if (this.outboxHasRows()) throw new PendingChangesError(groupId);
             // Echo suppression: mark the whole batch as adapter-authored so the
             // capture triggers no-op on our own materialization writes.
             const tighten: { table: string; column: string }[] = [];
             const ensures: ResolvedIndex[] = [];
             if (this.capture) this.setApplying(true);
-            for (const action of schemaActions) this.applySchemaAction(action, tighten, ensures);
+            for (const action of schemaActions) this.applySchemaAction(action, tighten, ensures, groupId);
             for (const action of rowActions) this.applyRowAction(action);
             this.applyTightens(tighten);
             // Indexes are built last: over the loaded rows (faster than
@@ -452,11 +464,18 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         // caller from having to know about the change-signal strategy.
         if (this.walPath !== undefined) this.db.pragma('journal_mode = WAL');
         this.db.exec(
-            'CREATE TABLE IF NOT EXISTS rdb_checkpoint (group_id TEXT PRIMARY KEY, version TEXT);'
+            // `end_observes`: the observes an end of a pass recorded beside the
+            // checkpoint, a json array, cleared by every settle (HIP-29). A
+            // group with a list and no checkpoint yet has a NULL version.
+            'CREATE TABLE IF NOT EXISTS rdb_checkpoint (group_id TEXT PRIMARY KEY, version TEXT, end_observes TEXT);'
             + 'CREATE TABLE IF NOT EXISTS rdb_table_meta ('
             + '"table" TEXT PRIMARY KEY, id_column TEXT NOT NULL, author_column TEXT, '
             + "sync_table TEXT NOT NULL, column_types TEXT NOT NULL, fk_columns TEXT NOT NULL DEFAULT '{}', "
-            + "key_ref_columns TEXT NOT NULL DEFAULT '[]');"
+            + "key_ref_columns TEXT NOT NULL DEFAULT '[]', group_id TEXT, schema_name TEXT);"
+            // The writer record (HIP-20): one row, which the projection replaces.
+            // `groups` is a json object of each group's member name and mode.
+            + 'CREATE TABLE IF NOT EXISTS rdb_writer_record ('
+            + 'id INTEGER PRIMARY KEY CHECK (id = 1), writer_key_id INTEGER, hash_suite TEXT NOT NULL, groups TEXT NOT NULL);'
             + `CREATE TABLE IF NOT EXISTS ${quoteId(DEFAULT_KEY_TABLE)} (`
             + 'id INTEGER PRIMARY KEY, key_hash TEXT NOT NULL UNIQUE, public_key TEXT);'
             // The durable op-event log (ingestion failures + concurrency flips).
@@ -519,9 +538,13 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     private ensureCaptureInfra(): void {
         this.db.exec(
             'CREATE TABLE IF NOT EXISTS rdb_capture_config (enabled INTEGER NOT NULL, applying INTEGER NOT NULL);'
+            // `open`: the update row a statement is filling, one column trigger at
+            // a time (HIP-29). `record`: what ingestion recorded of the change.
             + 'CREATE TABLE IF NOT EXISTS rdb_outbox ('
             + 'id INTEGER PRIMARY KEY AUTOINCREMENT, "table" TEXT NOT NULL, '
-            + 'local_id INTEGER NOT NULL, op TEXT NOT NULL, changed TEXT);');
+            + 'local_id INTEGER NOT NULL, op TEXT NOT NULL, changed TEXT, '
+            + 'open INTEGER NOT NULL DEFAULT 0, record TEXT);'
+            + 'CREATE INDEX IF NOT EXISTS rdb_outbox_open ON rdb_outbox ("table", local_id) WHERE open = 1;');
         const has = this.db.prepare('SELECT 1 FROM rdb_capture_config LIMIT 1').get() !== undefined;
         if (!has) this.db.prepare('INSERT INTO rdb_capture_config (enabled, applying) VALUES (1, 0)').run();
     }
@@ -531,11 +554,14 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     }
 
     // Install (or reinstall) the capture triggers for a table from its current
-    // columns: one AFTER INSERT (full row image), one AFTER DELETE, and one
-    // AFTER UPDATE OF <col> per business column so an UPDATE captures ONLY the
-    // columns it actually changed (net-image updates would falsely include
-    // readonly columns). Every capture body is gated on enabled=1 AND applying=0.
-    // A BEFORE UPDATE guard, gated on applying=0 only, fails a change of the id.
+    // columns (HIP-29): an AFTER INSERT, an AFTER DELETE, and for updates a
+    // BEFORE UPDATE that closes the row's open outbox row and one AFTER UPDATE
+    // OF <col> per business column, which opens this statement's row when none
+    // is open and adds its column. So an UPDATE is one outbox row per updated
+    // row, with every column the statement names, changed or not: only UPDATE
+    // OF triggers see which columns a statement names. Every capture body is
+    // gated on enabled=1 AND applying=0. A BEFORE UPDATE guard, gated on
+    // applying=0 only, fails a change of the id.
     private installTriggers(table: string, meta: TableMeta): void {
         // Drop any prior capture triggers for this table (column set may have changed).
         this.dropTriggers(table);
@@ -553,27 +579,54 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             return `json_object(${pairs})`;
         };
 
-        this.db.exec(
-            `CREATE TRIGGER ${quoteId('rdb_cap_ins_' + table)} AFTER INSERT ON ${quoteId(table)} BEGIN `
-            + `INSERT INTO rdb_outbox ("table", local_id, op, changed) `
-            + `SELECT ${tableLit}, NEW.${id}, 'insert', ${jsonObject('NEW')} WHERE ${gate}; END`);
+        if (meta.authorColumn !== undefined && meta.groupId !== undefined) {
+            // An empty author column gets the writer key's id where the writer
+            // record says the table's group mode is `on`. A BEFORE INSERT trigger
+            // can't change the row, so this one writes it, with capture off for
+            // that write as `applying` does, then records the stored row.
+            const author = quoteId(meta.authorColumn);
+            const record = 'SELECT writer_key_id FROM rdb_writer_record WHERE id = 1';
+            const mode = `SELECT json_extract(groups, ${quoteText('$.' + JSON.stringify(meta.groupId) + '.mode')}) FROM rdb_writer_record WHERE id = 1`;
+            const stored = (): string => {
+                if (cols.length === 0) return "json_object()";
+                return `json_object(${cols.map((c) => `${quoteText(c)}, r.${quoteId(c)}`).join(', ')})`;
+            };
+            this.db.exec(
+                `CREATE TRIGGER ${quoteId('rdb_cap_ins_' + table)} AFTER INSERT ON ${quoteId(table)} WHEN ${gate} BEGIN `
+                + `UPDATE rdb_capture_config SET applying = 1; `
+                + `UPDATE ${quoteId(table)} SET ${author} = (${record}) `
+                + `WHERE ${id} = NEW.${id} AND ${author} IS NULL AND (${record}) IS NOT NULL AND (${mode}) = 'on'; `
+                + `UPDATE rdb_capture_config SET applying = 0; `
+                + `INSERT INTO rdb_outbox ("table", local_id, op, changed) `
+                + `SELECT ${tableLit}, NEW.${id}, 'insert', ${stored()} FROM ${quoteId(table)} AS r WHERE r.${id} = NEW.${id}; END`);
+        } else {
+            this.db.exec(
+                `CREATE TRIGGER ${quoteId('rdb_cap_ins_' + table)} AFTER INSERT ON ${quoteId(table)} BEGIN `
+                + `INSERT INTO rdb_outbox ("table", local_id, op, changed) `
+                + `SELECT ${tableLit}, NEW.${id}, 'insert', ${jsonObject('NEW')} WHERE ${gate}; END`);
+        }
 
         this.db.exec(
             `CREATE TRIGGER ${quoteId('rdb_cap_del_' + table)} AFTER DELETE ON ${quoteId(table)} BEGIN `
             + `INSERT INTO rdb_outbox ("table", local_id, op, changed) `
             + `SELECT ${tableLit}, OLD.${id}, 'delete', NULL WHERE ${gate}; END`);
 
-        // An update trigger fires only when the column's value changes (IS NOT
-        // treats NULL as a value): a captured unchanged value would become a
-        // write, which wins over a clear made concurrently on another device.
+        // An update of a row is one outbox row: the BEFORE UPDATE closes what an
+        // earlier statement left open, and each named column's trigger adds its
+        // column to the open row, opening it first when none is.
+        const openRow = `"table" = ${tableLit} AND local_id = NEW.${id} AND open = 1`;
+        this.db.exec(
+            `CREATE TRIGGER ${quoteId('rdb_cap_updopen_' + table)} BEFORE UPDATE ON ${quoteId(table)} WHEN ${gate} BEGIN `
+            + `UPDATE rdb_outbox SET open = 0 WHERE "table" = ${tableLit} AND local_id = OLD.${id} AND open = 1; END`);
         cols.forEach((col, i) => {
+            const path = quoteText('$.' + JSON.stringify(col));
             this.db.exec(
                 `CREATE TRIGGER ${quoteId('rdb_cap_upd_' + table + '_' + i)} `
-                + `AFTER UPDATE OF ${quoteId(col)} ON ${quoteId(table)} `
-                + `WHEN NEW.${quoteId(col)} IS NOT OLD.${quoteId(col)} BEGIN `
-                + `INSERT INTO rdb_outbox ("table", local_id, op, changed) `
-                + `SELECT ${tableLit}, NEW.${id}, 'update', json_object(${quoteText(col)}, NEW.${quoteId(col)}) `
-                + `WHERE ${gate}; END`);
+                + `AFTER UPDATE OF ${quoteId(col)} ON ${quoteId(table)} WHEN ${gate} BEGIN `
+                + `UPDATE rdb_outbox SET changed = json_set(changed, ${path}, NEW.${quoteId(col)}) WHERE ${openRow}; `
+                + `INSERT INTO rdb_outbox ("table", local_id, op, changed, open) `
+                + `SELECT ${tableLit}, NEW.${id}, 'update', json_object(${quoteText(col)}, NEW.${quoteId(col)}), 1 `
+                + `WHERE NOT EXISTS (SELECT 1 FROM rdb_outbox WHERE ${openRow}); END`);
         });
 
         // A native statement may not change a row's id: the row would sit under
@@ -611,19 +664,21 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         if (this.capture) this.db.prepare('UPDATE rdb_capture_config SET enabled = ?').run(on ? 1 : 0);
     }
 
+    // Keeps the end's observes recorded beside the checkpoint: only a settle clears them.
     private persistCheckpoint(groupId: B64Hash, checkpoint: Version): void {
-        this.db.prepare('INSERT OR REPLACE INTO rdb_checkpoint (group_id, version) VALUES (?, ?)')
+        this.db.prepare('INSERT INTO rdb_checkpoint (group_id, version) VALUES (?, ?) '
+            + 'ON CONFLICT(group_id) DO UPDATE SET version = excluded.version')
             .run(groupId, JSON.stringify([...checkpoint].sort()));
     }
 
     private writeMeta(table: string, meta: TableMeta): void {
         this.db.prepare(
             'INSERT OR REPLACE INTO rdb_table_meta '
-            + '("table", id_column, author_column, sync_table, column_types, fk_columns, key_ref_columns) '
-            + 'VALUES (?, ?, ?, ?, ?, ?, ?)')
+            + '("table", id_column, author_column, sync_table, column_types, fk_columns, key_ref_columns, group_id, schema_name) '
+            + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
             .run(table, meta.idColumn, meta.authorColumn ?? null, meta.syncTable,
                 JSON.stringify(meta.columnTypes), JSON.stringify(meta.fkColumns),
-                JSON.stringify(meta.keyRefColumns));
+                JSON.stringify(meta.keyRefColumns), meta.groupId ?? null, meta.schemaName ?? null);
         this.metaCache.set(table, meta);
     }
 
@@ -650,11 +705,12 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         if (cached !== undefined) return cached;
 
         const row = this.db.prepare(
-            'SELECT id_column, author_column, sync_table, column_types, fk_columns, key_ref_columns '
+            'SELECT id_column, author_column, sync_table, column_types, fk_columns, key_ref_columns, group_id, schema_name '
             + 'FROM rdb_table_meta WHERE "table" = ?')
             .get(table) as
             { id_column: string; author_column: string | null; sync_table: string;
-                column_types: string; fk_columns: string | null; key_ref_columns: string | null }
+                column_types: string; fk_columns: string | null; key_ref_columns: string | null;
+                group_id: string | null; schema_name: string | null }
             | undefined;
         if (row === undefined) throw new Error(`no materialized metadata for table '${table}'`);
 
@@ -665,6 +721,8 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             columnTypes: JSON.parse(row.column_types) as { [column: string]: ColumnType },
             fkColumns: JSON.parse(row.fk_columns ?? '{}') as { [column: string]: { targetTable: string } },
             keyRefColumns: JSON.parse(row.key_ref_columns ?? '[]') as string[],
+            ...(row.group_id !== null ? { groupId: row.group_id } : {}),
+            ...(row.schema_name !== null ? { schemaName: row.schema_name } : {}),
         };
         this.metaCache.set(table, meta);
         return meta;
@@ -675,10 +733,10 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     // -----------------------------------------------------------------------
 
     private applySchemaAction(
-        action: SchemaAction, tighten: { table: string; column: string }[], ensures: ResolvedIndex[],
+        action: SchemaAction, tighten: { table: string; column: string }[], ensures: ResolvedIndex[], groupId?: B64Hash,
     ): void {
         switch (action.kind) {
-            case 'create-table': return this.createTable(action);
+            case 'create-table': return this.createTable(action, groupId);
             case 'drop-table': return this.dropTable(action);
             case 'add-column': return this.addColumn(action, tighten);
             case 'drop-column': return this.dropColumn(action);
@@ -755,7 +813,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         run.immediate();
     }
 
-    private createTable(action: Extract<SchemaAction, { kind: 'create-table' }>): void {
+    private createTable(action: Extract<SchemaAction, { kind: 'create-table' }>, groupId?: B64Hash): void {
         // The app table OWNS the serial `id` (INTEGER PRIMARY KEY AUTOINCREMENT).
         // Explicit ids (allocated via the sync table) still work - SQLite raises
         // sqlite_sequence to any larger explicit rowid, so a void-flip
@@ -803,9 +861,8 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             + `"status" TEXT NOT NULL DEFAULT 'active', `
             + `FOREIGN KEY ("id") REFERENCES ${quoteId(action.table)} (${quoteId(action.primaryKey)}))`);
         // A local id maps to exactly one rdb identity: two row_hashes can never
-        // share an id. This makes reserveMint's claim-or-adopt (a second minter of
-        // the same id adopts the first's identity) well-defined and resolveRow
-        // unambiguous. Mirrors the idb target's unique (table, id) index.
+        // share an id, which keeps resolveRow unambiguous. Mirrors the idb
+        // target's unique (table, id) index.
         this.db.exec(
             `CREATE UNIQUE INDEX ${quoteId(action.syncTable + '_id_uk')} `
             + `ON ${quoteId(action.syncTable)} ("id")`);
@@ -823,6 +880,8 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             authorColumn: action.authorColumn,
             syncTable: action.syncTable,
             columnTypes,
+            ...(groupId !== undefined ? { groupId } : {}),
+            schemaName: action.schemaName ?? action.table,
             fkColumns,
             keyRefColumns,
         };
@@ -1015,19 +1074,35 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         return this.deleteRow(action);
     }
 
-    // Allocate (or reuse) the serial id for a rowId in a sync table. The sync
-    // table is keyed by row_hash; ids are handed out monotonically as MAX+1
-    // (safe because SQLite serializes writers). Allocating for a not-yet-seen
-    // target rowId (e.g. an FK reference whose target row is not yet projected)
-    // reserves the id without an app row; the app row later reuses it.
-    private allocateId(syncTable: string, rowId: string): number {
-        const existing = this.db.prepare(`SELECT "id" FROM ${quoteId(syncTable)} WHERE "row_hash" = ?`)
-            .get(rowId) as { id: number } | undefined;
-        if (existing !== undefined) return existing.id;
-        const next = (this.db.prepare(`SELECT COALESCE(MAX("id"), 0) + 1 AS n FROM ${quoteId(syncTable)}`)
-            .get() as { n: number }).n;
+    // The serial id a rowId has in a sync table, if it has one.
+    private syncIdOf(syncTable: string, rowId: string): number | undefined {
+        return (this.db.prepare(`SELECT "id" FROM ${quoteId(syncTable)} WHERE "row_hash" = ?`)
+            .get(rowId) as { id: number } | undefined)?.id;
+    }
+
+    // The serial id for a reference to a row of `table` (HIP-29's Local ids):
+    // the id its sync row has, or else the next value of the table's own
+    // counter, sqlite_sequence, reserved in a sync row with no app row. Neither
+    // a native insert nor a row the projection writes later can get that id:
+    // both take theirs from the same counter, and the row that arrives later
+    // is inserted with the reserved id. The sync table never makes up an id.
+    private allocateId(table: string, syncTable: string, rowId: string): number {
+        const existing = this.syncIdOf(syncTable, rowId);
+        if (existing !== undefined) return existing;
+        const next = this.nextSequenceValue(table);
         this.db.prepare(`INSERT INTO ${quoteId(syncTable)} ("row_hash", "id") VALUES (?, ?)`).run(rowId, next);
         return next;
+    }
+
+    // Takes the next value of a table's AUTOINCREMENT counter, creating the
+    // table's row at 0 when it never had an insert.
+    private nextSequenceValue(table: string): number {
+        const bumped = this.db.prepare('UPDATE sqlite_sequence SET seq = seq + 1 WHERE name = ? RETURNING seq')
+            .get(table) as { seq: number } | undefined;
+        if (bumped !== undefined) return bumped.seq;
+        this.db.prepare('INSERT INTO sqlite_sequence (name, seq) VALUES (?, 0)').run(table);
+        return (this.db.prepare('UPDATE sqlite_sequence SET seq = seq + 1 WHERE name = ? RETURNING seq')
+            .get(table) as { seq: number }).seq;
     }
 
     // Intern a key hash into rdb_keys, optionally backfilling public_key.
@@ -1067,7 +1142,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         const fk = meta.fkColumns[col];
         if (fk !== undefined) {
             const targetMeta = this.loadMeta(fk.targetTable);
-            return this.allocateId(targetMeta.syncTable, value as string);
+            return this.allocateId(fk.targetTable, targetMeta.syncTable, value as string);
         }
         if (meta.keyRefColumns.includes(col)) {
             const keyHash = value as string;
@@ -1078,11 +1153,17 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
 
     private upsertRow(action: Extract<RowAction, { kind: 'upsert-row' }>): void {
         const meta = this.loadMeta(action.table);
-        const id = this.allocateId(meta.syncTable, action.rowId);
+        // A row with no sync row yet has no id: it is inserted first and takes
+        // the id its insert produces (HIP-29's Local ids). One with a sync row,
+        // a reference's reservation or an earlier incarnation, keeps its id.
+        const id = this.syncIdOf(meta.syncTable, action.rowId);
         // A (re)materialized row is live: active (reinstates a prior deleted /
         // ingestion_failure record for the same rowId).
-        this.db.prepare(`UPDATE ${quoteId(meta.syncTable)} SET "status" = 'active' WHERE "row_hash" = ?`)
-            .run(action.rowId);
+        const activate = (): void => {
+            this.db.prepare(`UPDATE ${quoteId(meta.syncTable)} SET "status" = 'active' WHERE "row_hash" = ?`)
+                .run(action.rowId);
+        };
+        if (id !== undefined) activate();
 
         // Apply keyMaterial first so subsequent key-ref interns see the pubkey.
         if (action.keyMaterial !== undefined) {
@@ -1093,7 +1174,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
 
         // The stored author is read with the row, so that an action without an
         // author clears it only when it holds something.
-        const stored = this.db.prepare(
+        const stored = id === undefined ? undefined : this.db.prepare(
             `SELECT ${meta.authorColumn !== undefined ? quoteId(meta.authorColumn) : '1'} AS author `
             + `FROM ${quoteId(action.table)} WHERE ${quoteId(meta.idColumn)} = ?`).get(id) as { author: unknown } | undefined;
         const exists = stored !== undefined;
@@ -1118,18 +1199,18 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
                 assignments.push(`${quoteId(meta.authorColumn)} = NULL`);
             }
             if (assignments.length === 0) return;   // nothing to update
-            params.push(id);
+            params.push(id!);
             this.db.prepare(
                 `UPDATE ${quoteId(action.table)} SET ${assignments.join(', ')} `
                 + `WHERE ${quoteId(meta.idColumn)} = ?`).run(...params);
-            this.rememberApply(meta, action.table, id, 'update');
+            this.rememberApply(meta, action.table, id!, 'update');
             return;
         }
 
         // A column the action sets to NULL is named with NULL, so the table's
         // DEFAULT does not apply to it; a column the action leaves out takes it.
-        const insertCols: string[] = [meta.idColumn];
-        const insertParams: (number | string | null)[] = [id];
+        const insertCols: string[] = id !== undefined ? [meta.idColumn] : [];
+        const insertParams: (number | string | null)[] = id !== undefined ? [id] : [];
         for (const col of columns) {
             insertCols.push(col);
             insertParams.push(this.paramForColumn(meta, col, action.values[col], action.keyMaterial));
@@ -1139,10 +1220,16 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             insertParams.push(authorId!);
         }
         const placeholders = insertParams.map(() => '?').join(', ');
-        this.db.prepare(
-            `INSERT INTO ${quoteId(action.table)} (${insertCols.map(quoteId).join(', ')}) `
-            + `VALUES (${placeholders})`).run(...insertParams);
-        this.rememberApply(meta, action.table, id, 'insert');
+        const inserted = this.db.prepare(
+            insertCols.length === 0
+                ? `INSERT INTO ${quoteId(action.table)} DEFAULT VALUES RETURNING ${quoteId(meta.idColumn)} AS id`
+                : `INSERT INTO ${quoteId(action.table)} (${insertCols.map(quoteId).join(', ')}) `
+                    + `VALUES (${placeholders}) RETURNING ${quoteId(meta.idColumn)} AS id`).get(...insertParams) as { id: number };
+        if (id === undefined) {
+            this.db.prepare(`INSERT INTO ${quoteId(meta.syncTable)} ("row_hash", "id") VALUES (?, ?)`).run(action.rowId, inserted.id);
+            activate();
+        }
+        this.rememberApply(meta, action.table, inserted.id, 'insert');
     }
 
     private rememberApply(meta: TableMeta, table: string, id: number, kind: 'insert' | 'update'): void {
@@ -1243,6 +1330,44 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         return cached;
     }
 
+    async hasPendingChanges(): Promise<boolean> {
+        this.ensureBookkeeping();
+        return this.outboxHasRows();
+    }
+
+    async recordWriter(record: WriterRecord): Promise<void> {
+        this.ensureBookkeeping();
+        this.db.prepare('INSERT OR REPLACE INTO rdb_writer_record (id, writer_key_id, hash_suite, groups) VALUES (1, ?, ?, ?)')
+            .run(record.writerKeyId ?? null, record.hashSuite, JSON.stringify(record.groups));
+    }
+
+    async readWriterRecord(): Promise<WriterRecord | undefined> {
+        this.ensureBookkeeping();
+        const row = this.db.prepare('SELECT writer_key_id, hash_suite, groups FROM rdb_writer_record WHERE id = 1').get() as
+            { writer_key_id: number | null; hash_suite: string; groups: string } | undefined;
+        if (row === undefined) return undefined;
+        return {
+            ...(row.writer_key_id !== null ? { writerKeyId: row.writer_key_id } : {}),
+            hashSuite: row.hash_suite, groups: JSON.parse(row.groups) as WriterRecord['groups'],
+        };
+    }
+
+    // The table's group and its name in the schema, from the table's meta.
+    tableGroup(table: string): { groupId?: B64Hash; schemaName?: string } | undefined {
+        this.ensureBookkeeping();
+        this.freshMeta();
+        if (this.db.prepare('SELECT 1 FROM rdb_table_meta WHERE "table" = ?').get(table) === undefined) return undefined;
+        const meta = this.loadMeta(table);
+        return { ...(meta.groupId !== undefined ? { groupId: meta.groupId } : {}),
+            ...(meta.schemaName !== undefined ? { schemaName: meta.schemaName } : {}) };
+    }
+
+    // Whether the outbox holds a change; false without capture.
+    private outboxHasRows(): boolean {
+        if (!this.capture) return false;
+        return this.db.prepare('SELECT 1 FROM rdb_outbox LIMIT 1').get() !== undefined;
+    }
+
     async drainChanges(): Promise<CapturedBatch> {
         this.requireCapture();
         // One read transaction, so the meta each change is read with belongs to
@@ -1260,12 +1385,13 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     private readOutbox(): { rows: { id: number; tbl: string }[]; changes: CapturedChange[] } {
         this.freshMeta();
         const rows = this.db.prepare(
-            'SELECT id, "table" AS tbl, local_id, op, changed FROM rdb_outbox ORDER BY id')
-            .all() as { id: number; tbl: string; local_id: number; op: string; changed: string | null }[];
+            'SELECT id, "table" AS tbl, local_id, op, changed, record FROM rdb_outbox ORDER BY id')
+            .all() as { id: number; tbl: string; local_id: number; op: string; changed: string | null; record: string | null }[];
         const changes: CapturedChange[] = [];
         for (const row of rows) {
+            const record = row.record === null ? {} : { record: JSON.parse(row.record) as ChangeRecord };
             if (row.op === 'delete') {
-                changes.push({ id: row.id, kind: 'delete', table: row.tbl, localId: row.local_id });
+                changes.push({ id: row.id, kind: 'delete', table: row.tbl, localId: row.local_id, ...record });
                 continue;
             }
             // A table dropped since the write has no meta: its columns can't be
@@ -1289,7 +1415,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
                 else unreadable[col] = read.reason;
             }
             changes.push({ id: row.id, kind: row.op === 'insert' ? 'insert' : 'update', table: row.tbl, localId: row.local_id, values,
-                ...(Object.keys(unreadable).length > 0 ? { unreadable } : {}) });
+                ...(Object.keys(unreadable).length > 0 ? { unreadable } : {}), ...record });
         }
         return { rows, changes };
     }
@@ -1304,80 +1430,192 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         return { table, localId, rowId: row.rh, uuid: row.uuid ?? '', status: row.status as SyncMapping['status'] };
     }
 
-    // Durably persist minted identities (row_hash, id, uuid, status='active')
-    // BEFORE the append walk, in their own transaction. Claim-or-adopt: INSERT OR
-    // IGNORE lets a conflict on EITHER the row_hash PK (a crash-replay of this
-    // pass) OR the unique id index (another ingester / a projection got there
-    // first) fall through without error; the read-back by id then returns the
-    // mapping that actually holds the id, which the caller adopts.
-    async reserveMint(reservations: SyncMapping[]): Promise<SyncMapping[]> {
+    async writeRecord(id: CapturedChangeId, record: ChangeRecord): Promise<void> {
         this.requireCapture();
-        const effective: SyncMapping[] = [];
         const run = this.db.transaction(() => {
-            for (const m of reservations) {
-                const meta = this.loadMeta(m.table);
-                this.db.prepare(
-                    `INSERT OR IGNORE INTO ${quoteId(meta.syncTable)} ("row_hash", "id", "uuid", "status") `
-                    + `VALUES (?, ?, ?, ?)`)
-                    .run(m.rowId, m.localId, m.uuid === '' ? null : m.uuid, m.status ?? 'active');
-                const row = this.db.prepare(
-                    `SELECT "row_hash" AS rh, "uuid" AS uuid, "status" AS status `
-                    + `FROM ${quoteId(meta.syncTable)} WHERE "id" = ?`)
-                    .get(m.localId) as { rh: string; uuid: string | null; status: string } | undefined;
-                // Our row_hash holds the id -> claim (or identical replay): keep the
-                // reservation verbatim (preserves author). A different row_hash ->
-                // adopt the incumbent identity.
-                if (row === undefined || row.rh === m.rowId) { effective.push(m); continue; }
-                effective.push({ table: m.table, localId: m.localId, rowId: row.rh,
-                    uuid: row.uuid ?? '', status: row.status as SyncMapping['status'] });
-            }
+            const row = this.db.prepare('SELECT record FROM rdb_outbox WHERE id = ?').get(id) as { record: string | null } | undefined;
+            if (row === undefined) return;
+            const prev = row.record === null ? undefined : JSON.parse(row.record) as ChangeRecord;
+            this.db.prepare('UPDATE rdb_outbox SET record = ? WHERE id = ?').run(JSON.stringify(mergeChangeRecord(prev, record)), id);
         });
         run.immediate();
-        return effective;
     }
 
-    async commitIngest(settle: IngestSettle): Promise<void> {
+    async recordEndObserve(groupId: B64Hash, hash: B64Hash): Promise<void> {
         this.requireCapture();
         const run = this.db.transaction(() => {
+            const list = [...this.readEndObserves(groupId), hash];
+            this.db.prepare('INSERT INTO rdb_checkpoint (group_id, version, end_observes) VALUES (?, NULL, ?) '
+                + 'ON CONFLICT(group_id) DO UPDATE SET end_observes = excluded.end_observes')
+                .run(groupId, JSON.stringify(list));
+        });
+        run.immediate();
+    }
+
+    async getEndObserves(groupId: B64Hash): Promise<B64Hash[]> {
+        this.ensureBookkeeping();
+        return this.readEndObserves(groupId);
+    }
+
+    private readEndObserves(groupId: B64Hash): B64Hash[] {
+        const row = this.db.prepare('SELECT end_observes AS list FROM rdb_checkpoint WHERE group_id = ?').get(groupId) as
+            { list: string | null } | undefined;
+        return row?.list == null ? [] : JSON.parse(row.list) as B64Hash[];
+    }
+
+    // The settle, in HIP-29's order (see IngestSettle), in one transaction:
+    // a step that throws rolls back every one.
+    async commitIngest(settle: IngestSettle): Promise<void> {
+        this.requireCapture();
+        const written = new Set<string>();
+        const run = this.db.transaction(() => {
             this.freshMeta();
+            // 1. Each group's checkpoint is still the one the pass found.
+            for (const { groupId, expected } of settle.checkpoints ?? []) {
+                if (!versionsEqual(this.readCheckpoint(groupId), expected)) throw new CheckpointMovedError(groupId);
+            }
+            // 2. The handled rows' failure events are read, and the rows leave
+            // the outbox; the rest is read, by table and local id.
+            const failures: OpEvent[] = [];
+            const recordOf = this.db.prepare('SELECT record FROM rdb_outbox WHERE id = ?');
+            for (const id of settle.consumed) {
+                const row = recordOf.get(id) as { record: string | null } | undefined;
+                const failure = row?.record == null ? undefined : (JSON.parse(row.record) as ChangeRecord).failure;
+                if (failure !== undefined) failures.push(failure);
+            }
+            for (const id of settle.consumed) {
+                this.db.prepare('DELETE FROM rdb_outbox WHERE id = ?').run(id);
+            }
+            const pending = new Map<string, RawOutboxRow[]>();
+            for (const row of this.db.prepare('SELECT "table" AS tbl, local_id, op, changed FROM rdb_outbox ORDER BY id').all() as RawOutboxRow[]) {
+                const key = row.tbl + '\u0000' + row.local_id;
+                pending.set(key, [...(pending.get(key) ?? []), row]);
+            }
             // Echo suppression: reverts materialize rows; gate the capture triggers
             // so they don't re-enter the outbox.
             this.setApplying(true);
-            for (const m of settle.mappings ?? []) {
+            // 3. The handled inserts' mappings, then the accepted deletes.
+            for (const m of settle.inserts ?? []) {
                 const meta = this.loadMeta(m.table);
                 this.db.prepare(
-                    `INSERT INTO ${quoteId(meta.syncTable)} ("row_hash", "id", "uuid") VALUES (?, ?, ?) `
-                    + `ON CONFLICT("row_hash") DO UPDATE SET "id" = excluded."id", "uuid" = excluded."uuid"`)
-                    .run(m.rowId, m.localId, m.uuid === '' ? null : m.uuid);
+                    `INSERT INTO ${quoteId(meta.syncTable)} ("row_hash", "id", "uuid", "status") VALUES (?, ?, ?, ?) `
+                    + `ON CONFLICT("row_hash") DO UPDATE SET "id" = excluded."id", "uuid" = excluded."uuid", "status" = excluded."status"`)
+                    .run(m.rowId, m.localId, m.uuid === '' ? null : m.uuid, m.status ?? 'active');
             }
-            for (const action of settle.reverts ?? []) this.applyRowAction(action);
-            for (const s of settle.statuses ?? []) {
-                const meta = this.loadMeta(s.table);
-                this.db.prepare(`UPDATE ${quoteId(meta.syncTable)} SET "status" = ? WHERE "row_hash" = ?`)
-                    .run(s.status, s.rowId);
+            for (const d of settle.deletes ?? []) {
+                const meta = this.loadMeta(d.table);
+                this.db.prepare(`UPDATE ${quoteId(meta.syncTable)} SET "status" = 'deleted' WHERE "row_hash" = ?`).run(d.rowId);
             }
+            // 4. The rows of refused inserts that had no identity, and 5. the
+            // reverts, each with its changes still in the outbox on top.
+            for (const o of settle.orphans ?? []) {
+                this.revertRow({ table: o.table, localId: o.localId }, pending, false);
+                written.add(o.table);
+            }
+            for (const r of settle.reverts ?? []) {
+                this.revertRow(r, pending, true);
+                written.add(r.table);
+            }
+            // 6. Json text in canonical form, as rows from rdb have it: a query
+            // that binds a json value matches only that text.
+            for (const w of settle.jsonWrites ?? []) {
+                if (this.canonicalizeJson(w, pending)) written.add(w.table);
+            }
+            // 7. The handled rows' failure events, then the settle's own.
             const logged: StoredOpEvent[] = [];
-            for (const e of settle.events ?? []) {
+            for (const e of [...failures, ...(settle.events ?? [])]) {
                 const stored = this.logOpEvent(e);
                 if (stored !== undefined) logged.push(stored);
             }
             this.pendingEvents = logged;
+            // 8. The new checkpoints, and every group's end observes cleared.
+            for (const { groupId, next } of settle.checkpoints ?? []) this.persistCheckpoint(groupId, next);
+            this.db.prepare('UPDATE rdb_checkpoint SET end_observes = NULL WHERE end_observes IS NOT NULL').run();
             this.setApplying(false);
-            for (const id of settle.consumed) {
-                this.db.prepare('DELETE FROM rdb_outbox WHERE id = ?').run(id);
-            }
         });
         run.immediate();
         const logged = this.pendingEvents ?? [];
         this.pendingEvents = undefined;
         for (const id of settle.consumed) this.emittedOutboxIds.delete(typeof id === 'number' ? id : Number.NaN);
-        if ((settle.reverts?.length ?? 0) > 0 || logged.length > 0) {
+        if (written.size > 0 || logged.length > 0) {
             const revertedTables = [...new Set([
-                ...(settle.reverts ?? []).map((action) => action.table),
+                ...written,
                 ...logged.map((stored) => stored.event.table).filter((table): table is string => table !== undefined),
             ])];
             for (const listener of [...this.commitListeners]) listener({ source: 'settle', revertedTables, events: logged });
         }
+    }
+
+    // Sets a row to rdb's row, or to none, then puts its changes still in the
+    // outbox back on top, as capture recorded them (HIP-29's Reverts). A row
+    // named only by its row hash is found through the sync table, after the
+    // settle wrote the inserts' mappings. `markDeleted`: a row removed this way
+    // has its active mapping marked deleted. Runs with capture gated off.
+    private revertRow(revert: Pick<RowRevert, 'table' | 'localId' | 'row'> & { rowId?: B64Hash },
+        pending: Map<string, RawOutboxRow[]>, markDeleted: boolean): void {
+        const meta = this.loadMeta(revert.table);
+        const table = quoteId(revert.table);
+        const idCol = quoteId(meta.idColumn);
+        let id = revert.localId ?? (revert.rowId !== undefined ? this.syncIdOf(meta.syncTable, revert.rowId) : undefined);
+        if (revert.row !== undefined) {
+            this.upsertRow(revert.row);
+            id = this.syncIdOf(meta.syncTable, revert.row.rowId);
+        } else if (id !== undefined) {
+            this.db.prepare(`DELETE FROM ${table} WHERE ${idCol} = ?`).run(id);
+            if (markDeleted && revert.rowId !== undefined) {
+                this.db.prepare(`UPDATE ${quoteId(meta.syncTable)} SET "status" = 'deleted' WHERE "row_hash" = ? AND "status" = 'active'`)
+                    .run(revert.rowId);
+            }
+        }
+        if (id === undefined) return;
+        for (const change of pending.get(revert.table + '\u0000' + id) ?? []) this.applyCaptured(meta, revert.table, id, change);
+    }
+
+    // Writes one outbox change back into its table, as capture recorded it: an
+    // update writes its columns where the row is, a delete removes the row, and
+    // an insert writes its whole row under its local id. The stored values are
+    // read back from the outbox's json as they were written (json_extract), so
+    // each keeps its SQLite type. A column the table no longer has is skipped.
+    private applyCaptured(meta: TableMeta, tableName: string, id: number, change: RawOutboxRow): void {
+        const table = quoteId(tableName);
+        const idCol = quoteId(meta.idColumn);
+        if (change.op === 'delete') {
+            this.db.prepare(`DELETE FROM ${table} WHERE ${idCol} = ?`).run(id);
+            return;
+        }
+        const known = new Set([...Object.keys(meta.columnTypes), ...(meta.authorColumn !== undefined ? [meta.authorColumn] : [])]);
+        const columns = Object.keys(change.changed === null ? {} : JSON.parse(change.changed) as object).filter((c) => known.has(c));
+        const extract = (c: string): string => `json_extract(?, ${quoteText('$.' + JSON.stringify(c))})`;
+        if (change.op === 'insert') {
+            this.db.prepare(
+                `INSERT OR REPLACE INTO ${table} (${[idCol, ...columns.map(quoteId)].join(', ')}) `
+                + `VALUES (${['?', ...columns.map(extract)].join(', ')})`)
+                .run(id, ...columns.map(() => change.changed));
+            return;
+        }
+        if (columns.length === 0) return;
+        this.db.prepare(`UPDATE ${table} SET ${columns.map((c) => `${quoteId(c)} = ${extract(c)}`).join(', ')} WHERE ${idCol} = ?`)
+            .run(...columns.map(() => change.changed), id);
+    }
+
+    // Rewrites a json column of a handled change in canonical form. It skips a
+    // column a change still in the outbox writes, whose own settle does it, and
+    // a row that is gone. Returns whether it wrote.
+    private canonicalizeJson(w: { table: string; localId: number; column: string }, pending: Map<string, RawOutboxRow[]>): boolean {
+        const meta = this.loadMeta(w.table);
+        if (meta.columnTypes[w.column] !== 'json') return false;
+        for (const change of pending.get(w.table + '\u0000' + w.localId) ?? []) {
+            if (change.op !== 'update') return false;
+            if (change.changed !== null && w.column in (JSON.parse(change.changed) as object)) return false;
+        }
+        const row = this.db.prepare(`SELECT ${quoteId(w.column)} AS v FROM ${quoteId(w.table)} WHERE ${quoteId(meta.idColumn)} = ?`)
+            .get(w.localId) as { v: unknown } | undefined;
+        if (row === undefined || typeof row.v !== 'string') return false;
+        let canonical: string;
+        try { canonical = json.toStringNormalized(JSON.parse(row.v) as json.Literal); } catch { return false; }
+        if (canonical === row.v) return false;
+        this.db.prepare(`UPDATE ${quoteId(w.table)} SET ${quoteId(w.column)} = ? WHERE ${quoteId(meta.idColumn)} = ?`).run(canonical, w.localId);
+        return true;
     }
 
     async drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]> {

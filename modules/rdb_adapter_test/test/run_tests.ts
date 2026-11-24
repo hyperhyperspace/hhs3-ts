@@ -1,9 +1,10 @@
 import { testing } from "@hyper-hyper-space/hhs3_util";
 
 import {
-    createIngestionSuite, createKeysSuite, createProjectionSuite, createProjectionParitySuite,
+    createIngestionSuite, createIngestionSuiteWithEndsInNewCycles, createKeysSuite, createProjectionSuite, createProjectionParitySuite,
     memoryAuthorIdTest, memoryHarness, memoryIngestionHarness, parseTestFilters,
 } from "../src/index.js";
+import { scenarioTests } from "./scenario_tests.js";
 
 async function main() {
     const allTests = new Map<string, Array<{ name: string, invoke: () => Promise<void> }>>();
@@ -14,10 +15,13 @@ async function main() {
     allTests.set(memorySuite.title, memorySuite.tests);
     const memoryIngestion = createIngestionSuite('MEMORY', memoryIngestionHarness);
     allTests.set(memoryIngestion.title, memoryIngestion.tests);
+    const endsInNewCycles = createIngestionSuiteWithEndsInNewCycles('MEMORY', memoryIngestionHarness);
+    allTests.set(endsInNewCycles.title, endsInNewCycles.tests);
     const memoryKeys = createKeysSuite('MEMORY', memoryHarness);
     allTests.set(memoryKeys.title, [memoryAuthorIdTest, ...memoryKeys.tests]);
     const memoryProjection = createProjectionParitySuite('MEMORY', memoryHarness);
     allTests.set(memoryProjection.title, memoryProjection.tests);
+    allTests.set(scenarioTests.title, scenarioTests.tests);
 
     console.log('Running tests for Hyper Hyper Space v3 rdb_adapter_test module'
         + (filters.length > 0 ? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');

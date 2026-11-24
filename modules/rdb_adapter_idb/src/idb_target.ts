@@ -20,18 +20,19 @@ import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import type { ColumnType } from "@hyper-hyper-space/hhs3_rdb";
 import {
-    CapturedBatch, CapturedChange, CheckpointMovedError, DEFAULT_KEY_TABLE,
+    CapturedBatch, CapturedChange, CheckpointMovedError, DEFAULT_KEY_TABLE, PendingChangesError,
     IndexDecl, IndexSpec, IndexState, IndexTarget, IngestSettle,
     QueryableTarget, ReactiveChangeTarget, SingleTableQueryPlan, TargetCommitEvent, TargetCommitListener, TargetRowChange,
     KeyIndex, MaterializationTarget, MaterializedChangeSource, OpEvent, OpEventQuery, OpEventReason,
     pageOpEvents, ResolvedIndex, RowAction, RowIdentityIndex, SchemaAction, StoredOpEvent, SyncMapping,
-    versionsEqual,
+    versionsEqual, WriterRecord, WriterRecordStore,
+    CapturedChangeId, ChangeRecord, mergeChangeRecord, RowRevert,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import { compareSortTuples, evalWhere, normalizeOrder, projectColumns, rowOnSide } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 import { FacadeDatabase, type FacadeHost } from "./idb_facade.js";
 import {
-    deletePrefix, IdbEnv, indexGet, storeAdd, storeDelete, storeGet, storeGetAll,
+    deletePrefix, IdbEnv, indexGet, storeAdd, storeCount, storeDelete, storeGet, storeGetAll,
     storeGetAllPrefix, storePut,
 } from "./idb_env.js";
 import {
@@ -42,7 +43,7 @@ import {
     INDEX_ENTRIES, INDEX_META, INDEX_SPEC, KEYS, OP_EVENTS, OUTBOX, ROWS, SYNC, TABLE_META,
     type CaptureConfigRecord, type CheckpointRecord, type CounterRecord, type IndexEntryRecord,
     type IndexSpecRecord, type KeyRecord, type OpEventRecord, type OutboxRecord, type RowRecord,
-    type SyncRecord, type TableMetaRecord, reqToPromise,
+    type SyncRecord, type TableMetaRecord, type WriterRecordRecord, WRITER_RECORD_KEY, reqToPromise,
 } from "./idb_schema.js";
 
 export type IdbTargetOptions = {
@@ -80,7 +81,7 @@ function logicalRow(meta: TableMetaRecord, rec: RowRecord): import("@hyper-hyper
 }
 
 export class IdbTarget implements MaterializationTarget, MaterializedChangeSource,
-    ReactiveChangeTarget, QueryableTarget, RowIdentityIndex, KeyIndex, IndexTarget, FacadeHost {
+    ReactiveChangeTarget, QueryableTarget, RowIdentityIndex, KeyIndex, IndexTarget, FacadeHost, WriterRecordStore {
 
     readonly name: string;
     readonly env: IdbEnv;
@@ -183,7 +184,7 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         this.ensureOpen();
         const rec = await this.env.withRead(CHECKPOINT, (tx) =>
             storeGet<CheckpointRecord>(tx, CHECKPOINT, groupId));
-        if (rec === undefined) return undefined;
+        if (rec?.version === undefined) return undefined;
         return new Set(rec.version);
     }
 
@@ -201,18 +202,24 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
             // checkpoint inside this same readwrite transaction and reject if it is
             // not what the delta was computed against. Throwing aborts the tx, so
             // nothing is applied.
+            const prior = await storeGet<CheckpointRecord>(tx, CHECKPOINT, groupId);
             if (expectFrom !== undefined) {
-                const rec = await storeGet<CheckpointRecord>(tx, CHECKPOINT, groupId);
-                const stored = rec === undefined ? undefined : new Set(rec.version);
+                const rec = prior;
+                const stored = rec?.version === undefined ? undefined : new Set(rec.version);
                 if (!versionsEqual(stored, expectFrom ?? undefined)) throw new CheckpointMovedError(groupId);
             }
             if (expectIndexSpec !== undefined) {
                 const rec = await storeGet<IndexSpecRecord>(tx, INDEX_SPEC, 1);
                 if ((rec?.fingerprint ?? null) !== expectIndexSpec) throw new CheckpointMovedError(groupId);
             }
-            for (const action of schemaActions) await this.applySchemaAction(ctx, action);
+            // No projection over a pending change (HIP-29). The readwrite
+            // transaction covers the outbox, so no write lands in between.
+            if (this.capture && await storeCount(tx, OUTBOX) > 0) throw new PendingChangesError(groupId);
+            for (const action of schemaActions) await this.applySchemaAction(ctx, action, groupId);
             for (const action of rowActions) await this.applyRowAction(ctx, action);
+            // The end's observes beside the checkpoint stay: only a settle clears them.
             await storePut(tx, CHECKPOINT, {
+                ...(prior?.endObserves !== undefined ? { endObserves: prior.endObserves } : {}),
                 groupId, version: [...checkpoint],
             } satisfies CheckpointRecord);
             if (events !== undefined) {
@@ -246,9 +253,9 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
     // Schema channel
     // -----------------------------------------------------------------------
 
-    private async applySchemaAction(ctx: ApplyCtx, action: SchemaAction): Promise<void> {
+    private async applySchemaAction(ctx: ApplyCtx, action: SchemaAction, groupId?: B64Hash): Promise<void> {
         switch (action.kind) {
-            case 'create-table': return this.createTable(ctx, action);
+            case 'create-table': return this.createTable(ctx, action, groupId);
             case 'drop-table': return this.dropTable(ctx, action);
             case 'add-column': return this.addColumn(ctx, action);
             case 'drop-column': return this.dropColumn(ctx, action);
@@ -257,7 +264,7 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         }
     }
 
-    private async createTable(ctx: ApplyCtx, action: Extract<SchemaAction, { kind: 'create-table' }>): Promise<void> {
+    private async createTable(ctx: ApplyCtx, action: Extract<SchemaAction, { kind: 'create-table' }>, groupId?: B64Hash): Promise<void> {
         const existing = await storeGet<TableMetaRecord>(ctx.tx, TABLE_META, action.table);
         if (existing !== undefined) {
             ctx.meta.set(action.table, existing);
@@ -283,6 +290,8 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
             keyRefColumns,
             defaults,
             nextId: 1,
+            ...(groupId !== undefined ? { groupId } : {}),
+            schemaName: action.schemaName ?? action.table,
         };
         await storePut(ctx.tx, TABLE_META, meta);
         ctx.meta.set(action.table, meta);
@@ -585,6 +594,36 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         return rows.map((row) => projectColumns(row, plan.select, meta.idColumn));
     }
 
+    async hasPendingChanges(): Promise<boolean> {
+        this.ensureOpen();
+        if (!this.capture) return false;
+        return await this.env.withRead(OUTBOX, (tx) => storeCount(tx, OUTBOX)) > 0;
+    }
+
+    async recordWriter(record: WriterRecord): Promise<void> {
+        this.ensureOpen();
+        await this.env.withReadWrite(async (tx) => {
+            await storePut(tx, CAPTURE_CONFIG, { key: WRITER_RECORD_KEY, ...record } satisfies WriterRecordRecord);
+        });
+    }
+
+    async readWriterRecord(): Promise<WriterRecord | undefined> {
+        this.ensureOpen();
+        const rec = await this.env.withRead(CAPTURE_CONFIG, (tx) => storeGet<WriterRecordRecord>(tx, CAPTURE_CONFIG, WRITER_RECORD_KEY));
+        if (rec === undefined) return undefined;
+        const { key: _key, ...record } = rec;
+        return record;
+    }
+
+    // The table's group and its name in the schema, from the table's meta.
+    async tableGroup(table: string): Promise<{ groupId?: B64Hash; schemaName?: string } | undefined> {
+        this.ensureOpen();
+        const meta = await this.env.withRead(TABLE_META, (tx) => storeGet<TableMetaRecord>(tx, TABLE_META, table));
+        if (meta === undefined) return undefined;
+        return { ...(meta.groupId !== undefined ? { groupId: meta.groupId } : {}),
+            ...(meta.schemaName !== undefined ? { schemaName: meta.schemaName } : {}) };
+    }
+
     async drainChanges(): Promise<CapturedBatch> {
         this.requireCapture();
         const rows = await this.env.withRead(OUTBOX, (tx) => storeGetAll<OutboxRecord>(tx, OUTBOX));
@@ -594,13 +633,14 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         if (fresh.length > 0) this.deliver({ source: 'local', tables: [...new Set(fresh.map((row) => row.table))] }, true);
         const changes: CapturedChange[] = [];
         for (const row of rows) {
+            const record = row.record === undefined ? {} : { record: row.record };
             if (row.op === 'delete') {
-                changes.push({ id: row.id!, kind: 'delete', table: row.table, localId: row.localId });
+                changes.push({ id: row.id!, kind: 'delete', table: row.table, localId: row.localId, ...record });
                 continue;
             }
             changes.push({
                 id: row.id!, kind: row.op, table: row.table, localId: row.localId,
-                values: row.changed ?? {},
+                values: row.changed ?? {}, ...record,
             });
         }
         return { changes };
@@ -617,83 +657,168 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         };
     }
 
-    async reserveMint(reservations: SyncMapping[]): Promise<SyncMapping[]> {
+    async writeRecord(id: CapturedChangeId, record: ChangeRecord): Promise<void> {
         this.requireCapture();
-        const effective: SyncMapping[] = [];
         await this.env.withReadWrite(async (tx) => {
-            const ctx = newCtx(tx);
-            for (const m of reservations) {
-                // Claim-or-adopt: the unique (table, id) index tells us whether
-                // another row_hash already holds this local id (a concurrent
-                // ingester or a projection that materialized it first).
-                const byId = await indexGet<SyncRecord>(tx, SYNC, 'by_local_id', [m.table, m.localId]);
-                if (byId !== undefined && byId.rowHash !== m.rowId) {
-                    effective.push({ table: m.table, localId: m.localId, rowId: byId.rowHash,
-                        uuid: byId.uuid ?? '', status: byId.status });   // adopt
-                    continue;
-                }
-                const existing = await storeGet<SyncRecord>(tx, SYNC, [m.table, m.rowId]);
-                if (existing === undefined) {
-                    const meta = await this.loadMeta(ctx, m.table);
-                    if (m.localId >= meta.nextId) {
-                        meta.nextId = m.localId + 1;
-                        await storePut(tx, TABLE_META, meta);
-                    }
-                    await storePut(tx, SYNC, {
-                        table: m.table, rowHash: m.rowId, id: m.localId,
-                        uuid: m.uuid, status: m.status ?? 'active',
-                    } satisfies SyncRecord);
-                }
-                effective.push(m);   // claim (or identical replay)
-            }
+            const row = await storeGet<OutboxRecord>(tx, OUTBOX, id);
+            if (row === undefined) return;
+            await storePut(tx, OUTBOX, { ...row, record: mergeChangeRecord(row.record, record) } satisfies OutboxRecord);
         });
-        return effective;
     }
 
+    async recordEndObserve(groupId: B64Hash, hash: B64Hash): Promise<void> {
+        this.requireCapture();
+        await this.env.withReadWrite(async (tx) => {
+            const rec = await storeGet<CheckpointRecord>(tx, CHECKPOINT, groupId);
+            await storePut(tx, CHECKPOINT, { ...(rec ?? { groupId }), endObserves: [...(rec?.endObserves ?? []), hash] } satisfies CheckpointRecord);
+        });
+    }
+
+    async getEndObserves(groupId: B64Hash): Promise<B64Hash[]> {
+        this.ensureOpen();
+        const rec = await this.env.withRead(CHECKPOINT, (tx) => storeGet<CheckpointRecord>(tx, CHECKPOINT, groupId));
+        return [...(rec?.endObserves ?? [])];
+    }
+
+    // The settle, in HIP-29's order (see IngestSettle), in one readwrite
+    // transaction: a step that throws aborts every one.
     async commitIngest(settle: IngestSettle): Promise<void> {
         this.requireCapture();
         let logged: StoredOpEvent[] = [];
+        const written = new Set<string>();
         await this.env.withReadWrite(async (tx) => {
             const ctx = newCtx(tx);
-            for (const m of settle.mappings ?? []) {
-                const existing = await storeGet<SyncRecord>(tx, SYNC, [m.table, m.rowId]);
-                const rec: SyncRecord = existing ?? {
-                    table: m.table, rowHash: m.rowId, id: m.localId, uuid: m.uuid, status: 'active',
-                };
-                rec.id = m.localId;
-                rec.uuid = m.uuid;
-                await storePut(tx, SYNC, rec);
+            // 1. Each group's checkpoint is still the one the pass found.
+            for (const { groupId, expected } of settle.checkpoints ?? []) {
+                const rec = await storeGet<CheckpointRecord>(tx, CHECKPOINT, groupId);
+                const stored = rec?.version === undefined ? undefined : new Set(rec.version);
+                if (!versionsEqual(stored, expected)) throw new CheckpointMovedError(groupId);
+            }
+            // 2. The handled rows' failure events are read, and the rows leave
+            // the outbox; the rest is read, by table and local id.
+            const failures: OpEvent[] = [];
+            for (const id of settle.consumed) {
+                const row = await storeGet<OutboxRecord>(tx, OUTBOX, id);
+                if (row?.record?.failure !== undefined) failures.push(row.record.failure);
+            }
+            for (const id of settle.consumed) await storeDelete(tx, OUTBOX, id);
+            const pending = new Map<string, OutboxRecord[]>();
+            const remaining = await storeGetAll<OutboxRecord>(tx, OUTBOX);
+            remaining.sort((a, b) => (a.id ?? 0) - (b.id ?? 0));
+            for (const row of remaining) {
+                const key = row.table + '\u0000' + row.localId;
+                pending.set(key, [...(pending.get(key) ?? []), row]);
+            }
+            // 3. The handled inserts' mappings, then the accepted deletes.
+            for (const m of settle.inserts ?? []) {
+                await storePut(tx, SYNC, {
+                    table: m.table, rowHash: m.rowId, id: m.localId, uuid: m.uuid, status: m.status ?? 'active',
+                } satisfies SyncRecord);
                 const meta = await this.loadMeta(ctx, m.table);
                 if (m.localId >= meta.nextId) {
                     meta.nextId = m.localId + 1;
                     await storePut(tx, TABLE_META, meta);
                 }
             }
-            for (const action of settle.reverts ?? []) await this.applyRowAction(ctx, action);
-            for (const s of settle.statuses ?? []) {
-                const rec = await storeGet<SyncRecord>(tx, SYNC, [s.table, s.rowId]);
-                if (rec !== undefined) {
-                    rec.status = s.status;
-                    await storePut(tx, SYNC, rec);
-                }
+            for (const d of settle.deletes ?? []) {
+                const rec = await storeGet<SyncRecord>(tx, SYNC, [d.table, d.rowId]);
+                if (rec !== undefined) await storePut(tx, SYNC, { ...rec, status: 'deleted' } satisfies SyncRecord);
             }
-            for (const e of settle.events ?? []) {
+            // 4. The rows of refused inserts that had no identity, and 5. the
+            // reverts, each with its changes still in the outbox on top.
+            for (const o of settle.orphans ?? []) {
+                await this.revertRow(ctx, { table: o.table, localId: o.localId }, pending, false);
+                written.add(o.table);
+            }
+            for (const r of settle.reverts ?? []) {
+                await this.revertRow(ctx, r, pending, true);
+                written.add(r.table);
+            }
+            // 6. IndexedDB keeps json values, not text: nothing to rewrite.
+            // 7. The handled rows' failure events, then the settle's own.
+            for (const e of [...failures, ...(settle.events ?? [])]) {
                 const stored = await this.logOpEvent(tx, e);
                 if (stored !== undefined) logged.push(stored);
             }
-            for (const id of settle.consumed) {
-                await storeDelete(tx, OUTBOX, id);
-                if (typeof id === 'number') this.emittedOutboxIds.delete(id);
+            // 8. The new checkpoints, and every group's end observes cleared.
+            for (const { groupId, next } of settle.checkpoints ?? []) {
+                const rec = await storeGet<CheckpointRecord>(tx, CHECKPOINT, groupId);
+                await storePut(tx, CHECKPOINT, { ...(rec ?? { groupId }), version: [...next] } satisfies CheckpointRecord);
+            }
+            for (const rec of await storeGetAll<CheckpointRecord>(tx, CHECKPOINT)) {
+                if (rec.endObserves === undefined) continue;
+                const { endObserves: _cleared, ...kept } = rec;
+                await storePut(tx, CHECKPOINT, kept satisfies CheckpointRecord);
             }
             logged = logged.concat(ctx.events);
         });
-        if ((settle.reverts?.length ?? 0) > 0 || logged.length > 0) {
+        for (const id of settle.consumed) if (typeof id === 'number') this.emittedOutboxIds.delete(id);
+        if (written.size > 0 || logged.length > 0) {
             const revertedTables = [...new Set([
-                ...(settle.reverts ?? []).map((action) => action.table),
+                ...written,
                 ...logged.map((stored) => stored.event.table).filter((table): table is string => table !== undefined),
             ])];
             this.deliver({ source: 'settle', revertedTables, events: logged }, true);
         }
+    }
+
+    // Sets a row to rdb's row, or to none, then puts its changes still in the
+    // outbox back on top, as capture recorded them (HIP-29's Reverts), with
+    // their index entries. A row named only by its row hash is found through
+    // the sync store, after the settle wrote the inserts' mappings.
+    // `markDeleted`: a row removed this way has its active mapping marked deleted.
+    private async revertRow(
+        ctx: ApplyCtx, revert: Pick<RowRevert, 'table' | 'localId' | 'row'> & { rowId?: B64Hash },
+        pending: Map<string, OutboxRecord[]>, markDeleted: boolean,
+    ): Promise<void> {
+        const { table } = revert;
+        let id = revert.localId;
+        if (id === undefined && revert.rowId !== undefined) id = (await storeGet<SyncRecord>(ctx.tx, SYNC, [table, revert.rowId]))?.id;
+        if (revert.row !== undefined) {
+            await this.upsertRow(ctx, revert.row);
+            id = (await storeGet<SyncRecord>(ctx.tx, SYNC, [table, revert.row.rowId]))?.id;
+        } else if (id !== undefined) {
+            const old = await storeGet<RowRecord>(ctx.tx, ROWS, [table, id]);
+            if (old !== undefined) {
+                await storeDelete(ctx.tx, ROWS, [table, id]);
+                await this.syncIndexEntries(ctx, table, id, old, undefined);
+            }
+            if (markDeleted && revert.rowId !== undefined) {
+                const sync = await storeGet<SyncRecord>(ctx.tx, SYNC, [table, revert.rowId]);
+                if (sync?.status === 'active') await storePut(ctx.tx, SYNC, { ...sync, status: 'deleted' } satisfies SyncRecord);
+            }
+        }
+        if (id === undefined) return;
+        for (const change of pending.get(table + '\u0000' + id) ?? []) await this.applyCaptured(ctx, table, id, change);
+    }
+
+    // Writes one outbox change back into its table, as capture recorded it: an
+    // update writes its fields where the record is, a delete removes the
+    // record, and an insert writes its whole record under its local id.
+    private async applyCaptured(ctx: ApplyCtx, table: string, id: number, change: OutboxRecord): Promise<void> {
+        const meta = await this.loadMeta(ctx, table);
+        const old = await storeGet<RowRecord>(ctx.tx, ROWS, [table, id]);
+        if (change.op === 'delete') {
+            if (old === undefined) return;
+            await storeDelete(ctx.tx, ROWS, [table, id]);
+            await this.syncIndexEntries(ctx, table, id, old, undefined);
+            return;
+        }
+        let rec: RowRecord;
+        if (change.op === 'insert') {
+            rec = { table, id };
+            rec[meta.idColumn] = id;
+        } else {
+            if (old === undefined) return;
+            rec = { ...old };
+        }
+        for (const [column, value] of Object.entries(change.changed ?? {})) {
+            if (column === meta.idColumn || column === 'table' || column === 'id') continue;
+            if (value === null) delete rec[column];
+            else rec[column] = value;
+        }
+        await storePut(ctx.tx, ROWS, rec);
+        await this.syncIndexEntries(ctx, table, id, old, rec);
     }
 
     async drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]> {
@@ -833,7 +958,7 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
             }
             for (const [groupId, cp] of expect.checkpoints) {
                 const rec = await storeGet<CheckpointRecord>(tx, CHECKPOINT, groupId);
-                const stored = rec === undefined ? undefined : new Set(rec.version);
+                const stored = rec?.version === undefined ? undefined : new Set(rec.version);
                 if (!versionsEqual(stored, cp)) throw new CheckpointMovedError(groupId);
             }
             for (const action of actions) {

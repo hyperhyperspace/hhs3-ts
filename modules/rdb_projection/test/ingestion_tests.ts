@@ -146,7 +146,7 @@ export const ingestionTests = {
             },
         },
         {
-            name: '[RDBING03] an ungrantable observe gate surfaces the ref-advance failure as a rejection',
+            name: '[RDBING03] an ungrantable observe gate: the observe is declined and not reported, and the item is refused with its own reason',
             invoke: async () => {
                 const ctx = newCtx();
                 const caps = await makeGroup(ctx, 'caps', [open('caps', { label: { type: 'string', pub: true } })]);
@@ -171,9 +171,11 @@ export const ingestionTests = {
                 const itemsResult = results.get(items.group.getId())!;
                 assertEquals(results.get(caps.group.getId())!.accepted, 1, 'the cap still ingested');
                 assertEquals(itemsResult.accepted, 0, 'the item did not ingest (its exists cannot hold)');
-                assertTrue(itemsResult.rejected.length >= 1, 'the item pass reports a rejection');
-                assertTrue(itemsResult.rejected.some((r) => r.reason.includes('ref-advance')),
-                    'a ref-advance failure is surfaced');
+                // A declined observe isn't reported (HIP-29): the write that needed it
+                // is refused with its own reason, which is what the user can act on.
+                assertEquals(itemsResult.rejected.length, 1, 'the item is refused');
+                assertTrue(itemsResult.rejected[0].change?.table === 'items_items', 'with its own change');
+                assertTrue(!itemsResult.rejected.some((r) => r.reason.includes('ref-advance')), 'and no rejection for the observe');
                 assertEquals((await rdbRows(items.group, 'items')).length, 0, 'nothing reached rdb');
             },
         },

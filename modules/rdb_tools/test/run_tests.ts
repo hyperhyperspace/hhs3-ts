@@ -1662,6 +1662,10 @@ const tests = [
                     const grant = await runCommand(session,
                         "INSERT INTO user.caps (label, grantee) VALUES ('writer', $alice);");
                     assertEquals(grant.exitCode, 0, grant.output);
+                    // Ingestion works from what the app saw (HIP-29): the grant reaches
+                    // the target's checkpoint with a sync, before the app writes again.
+                    const synced = await runCommand(session, `\\project update ${projectId}`);
+                    assertEquals(synced.exitCode, 0, synced.output);
 
                     appDb.prepare(`INSERT INTO "${pagesTable}" (title) VALUES (?)`).run('hi');
                     const ok = await runCommand(session, `\\project update ${projectId}`);

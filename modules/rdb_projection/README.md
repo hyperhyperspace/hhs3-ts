@@ -8,15 +8,35 @@ An `RDb`'s member table groups are computed from the catalog releases deployed i
 
 - **materializes** every member with group-qualified table names (`<group>_<table>`, where `<group>` is the member name from `rdb.getMemberGroupNames()`: an identifier, unique within the database, so tables from different groups never collide);
 - **resolves cross-group FKs to serial ids** when the referenced group is co-projected (otherwise a `row_hash` passthrough);
-- **ingests local edits in commit order**, advancing co-projected cross-group refs on demand so an observer's cross-group FKs and `exists` reads validate against sibling groups ingested in the same pass; `fkBundling` (a per-member option, default on) bundles consecutive FK-linked inserts atomically;
+- **ingests local edits in commit order**, each as its own entry at its group's checkpoint, observing co-projected groups as the pass extends them so an observer's cross-group FKs and `exists` reads validate against sibling groups ingested in the same pass (see [Ingestion and checkpoints](../rdb_adapter#ingestion-and-checkpoints));
 - **interns authors and identity keys** into a shared `rdb_keys` table as `author_key_id` / `<col>_key_id` (`registerKey` / `keyHashForId` / `publicKeyForId` on the projection);
-- **stays in sync reactively** — a debounced, coalesced `syncDatabase` fires on three triggers: each member group's `subscribe` (the rdb side advanced), the target's `{ source: 'local' }` commit events on `ReactiveChangeTarget` (or `ChangeSignalSource` fallback when local edits are waiting), and the `RDb`'s own `subscribe` (a release was deployed, possibly adding members). An explicit `sync()` and a `nudge()` fallback are also provided.
+- **stays in sync reactively** — a debounced, coalesced `syncDatabase` fires on three triggers: each member group's `subscribe` (the rdb side advanced), the target's `{ source: 'local' }` commit events on `ReactiveChangeTarget` (or `ChangeSignalSource` fallback when local edits are waiting), and the `RDb`'s own `subscribe` (a release was deployed, possibly adding members). An explicit `sync()` and a `nudge()` fallback are also provided. How a cycle runs is described in [Cycles](#cycles).
 - **exposes reactive queries and commit streaming** — `projection.selectFrom(table)`, `projection.monitor(queryOrSet)`, and `projection.onCommit(listener)` delegate to the [query engine](../rdb_adapter#reactive-queries) on the underlying target.
 - **exposes the op-event log** as inspect (`opEvents({ afterId, beforeId, limit, order })`) plus live subscribe (`subscribeOpEvents` / `onOpEvents`). Subscribe does not replay history.
 - **maintains projection-local indexes** declared in an index spec, installed with `reconcileIndexes` (below).
 - **mounts FILES members as folders** with `reconcileFiles` (below). Files have no projection tables; the target is used only for `rdb_keys` ids.
 
 
+
+## Cycles
+
+A cycle ingests the local changes first and projects second, and it never projects over a change that is still pending. If the app writes while a projection pass computes its delta, the target refuses the apply with `PendingChangesError`. The cycle then ends quietly and schedules the next one, which ingests the change and projects after it. A cycle also ingests a second time when the outbox filled up during the first, so a burst of writes doesn't hold remote changes back for long. How each change is ingested at its group's checkpoint is the subject of [Ingestion and checkpoints](../rdb_adapter#ingestion-and-checkpoints).
+
+### One projector per target
+
+Cycles, single-group syncs and index reconciles take turns on a target, under one lock per target object. Two projectors on the same store, in two processes or two tabs, would move checkpoints under each other, and the projection doesn't try to repair that: when a checkpoint moved before an apply or a settle, it halts. It halts as well when the DAG appends an entry under another hash than the one ingestion recorded for it, and when the delta of an ingestion chain changes the schema, which no chain can do. A halted projection runs no more cycles. `sync()` throws the error that halted it, `onError` fires once, `haltError()` returns the error, and reads keep working.
+
+### Errors and retries
+
+Any other error ends the cycle, reaches `onError`, and leaves its message in `lastError()`. The projection then schedules the next cycle itself, after 1 s, doubling up to 60 s, and back to 1 s after a cycle that succeeds. The next cycle finishes whatever the failed pass stored, so a passing error, a busy database for instance, costs a delay and nothing else.
+
+### The writer
+
+`writer` signs what the projection ingests. At open, and whenever the members change, the projection records it in the target, with each group's mode. That record is how capture fills the empty author column of a native insert with the writer's key id, so the row shows its author before it is ingested. `autoAuthor`, true by default and settable per group through `configOverride`, decides what an empty author column means in a group with an identity provider: the writer's key, or an anonymous insert when it is false. A group with an identity provider, `autoAuthor: false` and `authorColumn: false` is refused at open: under `autoAuthor: false` an insert names its author in that column, and there is none. A group without an identity provider is recorded as anonymous whatever the option says, and needs no key.
+
+### A group without a key
+
+A projection opened without a writer can't ingest the changes of a group with an identity provider. A pass ingests the changes before the first such one and stops there. That change, and every change after it, waits in the outbox, and while it waits no projection applies, so remote changes of every group wait too. The projection warns once for each such group, through `onWarning` or `console.warn`, at open or when a cycle first meets the change, and schedules no cycle that would only stop there again. Opening the projection with a key ingests the rest.
 
 ## Indexes
 

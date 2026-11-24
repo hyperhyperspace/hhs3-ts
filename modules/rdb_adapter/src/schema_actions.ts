@@ -174,6 +174,7 @@ function createTableAction(
         syncTable: syncTableName(config, table),
         primaryKey: idColumn(config),
         columns: resolveTableColumns(config, rdbTable, def, fks, provider),
+        schemaName: rdbTable,
     };
     const author = authorColumn(config);
     if (author !== undefined) action.authorColumn = author;

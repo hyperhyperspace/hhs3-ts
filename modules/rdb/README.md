@@ -38,6 +38,12 @@ Observed targets are **groups and schemas** (roots in the replica map). Member t
 
 The same mechanism covers data and schemas. A schema is referenced by hash and reused as a module; a group's pinned schema is an observation, like its foreign-data references. Reusing a schema, sharing a capability system, and composing applications are one operation: a forward-only observation of a content-addressed object.
 
+## Writing in two steps
+
+An operation is written in two steps when the caller has to know it before it exists. `prepareBundle` and `prepareObserve` build an entry, sign it and validate it, and return it with its hash, without appending it; `appendPrepared` appends it. `bundle` and `observe` are the two steps in a row. [rdb_adapter](../rdb_adapter#ingestion-and-checkpoints) records an entry's hash in its outbox between the two, so that after a crash it can tell whether the entry reached the DAG. If the DAG ever gives the appended entry another hash than the prepared one, `appendPrepared` throws `PreparedHashMismatchError`.
+
+The first step can also check what the operation's verdict will read. An operation's checks read a bound group through every observe of it, while its verdict reads it through the live observes only, and the two differ while an observe is void, for instance when its author was removed from the group concurrently. An operation can then pass its checks and be void from the moment it is written. `prepareBundle(writes, author, at, { liveReads: true })` validates through the live observes as well, and refuses such an operation instead. `prepareObserve` always validates, whatever the replica's `selfValidate` says, so an observe it returns passes its gate.
+
 ## Deltas & Projections
 
 A delta reports how the database differs between two versions, on three channels:

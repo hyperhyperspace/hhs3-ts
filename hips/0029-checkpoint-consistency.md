@@ -6,6 +6,7 @@
 - **Requires:** [20](0020-unified-write-api.md): its *Changes* 1 except the native insert over an existing local id, which lands with this HIP. Its writer record (*What the projection records in the target*) and its `autoAuthor` setting (*Authorship*) land with this HIP too
 - **Superseded by:** —
 - **Implemented in:** —
+- **Code references:** to the tree at `e579e35`, which this HIP changes
 
 ## Summary
 
@@ -35,7 +36,7 @@ The rest follows from the four rules. A change holds every column its write name
 - **Ingestion.** *Ingestion* drains the outbox, plans the changes into rdb ops, appends them, and then *settles*: in one target transaction, it removes the drained changes from the outbox, stores op events, reverts what rdb refused and updates mappings (`rdb_adapter/src/types.ts:296-355`). Today it also saves the uuids of new rows before its first append, so that a replay after a crash makes the same inserts (`ingest_orchestrator.ts:397-411`). It bundles inserts linked by a foreign key and merges updates of one row, and when rdb refuses a bundle or an update it submits the parts one by one (`rdb_adapter/src/ingest.ts:6-17`, `ingest_orchestrator.ts:497-509`). It keeps the pass's failure events in memory until the settle (`recordFailure`, `ingest_orchestrator.ts:417-430`).
 - **The echo.** Ingestion doesn't move the checkpoint, so the next pass's delta still contains the pass's own entries. Projection applies them to the rows that already hold them, found through the mapping. It rewrites the columns each op wrote, as rdb has them, and the row's author, but not the defaults of columns nobody wrote (`rdb_adapter/src/row_actions.ts:77-99`). This second application of a device's own writes is the *echo*. It is not the code's echo suppression, the rule that writes made by projection and by reverts never enter the outbox, which stays as it is.
 - **Reverts.** A refused change is reverted by rewriting its row from rdb, unless a newer change to the same row is pending, since the revert would then overwrite it (`ingest_orchestrator.ts:615-618`).
-- **Op events.** What the UI learns about writes: a *failure* when ingestion is refused, a *void* or *reinstate* when a concurrent entry changes an entry's verdict. Each target stores them in an event table that only grows, which apps read by cursor (`rdb_adapter/src/types.ts:190-197`, `:356-362`).
+- **Op events.** What the UI learns about writes: a *failure* when ingestion is refused, a *void* or *reinstate* when a concurrent entry changes an entry's verdict. Each target stores them in an event table that only grows, which apps read by cursor (`rdb_adapter/src/types.ts:192-198`, `:357-362`).
 - **The sync cycle.** `RdbProjection` runs cycles of ingestion followed by projection (`syncDatabase`, `ingest_orchestrator.ts:640-667`). A cycle starts when rdb grows or the outbox signals a change, and never overlaps another. In rhost, one process runs a host's projection, under a lock per host. Clients in other processes and tabs write the target directly.
 
 ### What happens today
@@ -163,7 +164,7 @@ A change of a table that no member projects gets the mark of nothing to write, a
 
 ### One projector per target
 
-One process projects and ingests for a target. rhost already ensures it with a lock per host: a file lock on Node (`rhost_node/src/lock.ts:38`), a Web Lock in the browser (`rhost_browser/src/platform.ts:162`). `RdbProjection` never overlaps its own cycles. Other processes and tabs may write the target, and their writes only add to the outbox.
+One process projects and ingests for a target. rhost already ensures it with a lock per host: a file lock on Node (`rhost_node/src/lock.ts:38`), a Web Lock in the browser (`rhost_browser/src/platform.ts:169-174`). `RdbProjection` never overlaps its own cycles. Other processes and tabs may write the target, and their writes only add to the outbox.
 
 **One lock per target.** Within the process, what keeps cycles apart is one lock per target object, taken by `syncGroup`, `syncDatabase` and index reconciles. What a cycle reads and then writes belongs to the target: the outbox, the checkpoints and the index spec. `RdbProjection` passes the one target it holds to each call (`rdb_projection/src/projection.ts:206`, `:225`), so `sync()`, reactive cycles and index reconciles exclude each other.
 - **Today** the lock is keyed by the sorted ids of the member groups, and `syncGroup` takes another, keyed by its group (`rdb_adapter/src/ingest_orchestrator.ts:632-635`, `:251`, `rdb_adapter/src/index_reconcile.ts:48`). A membership change replaces the members (`projection.ts:499`), so a call that starts after a group joins takes another lock than one still running from before.

@@ -82,5 +82,41 @@ export const memoryLocalTests = {
                     'query rows show the real ids and the update');
             },
         },
+        {
+            name: '[ADPTM04] a memory settle that fails partway leaves nothing behind: rows, mappings, outbox, events, checkpoint and end observes',
+            invoke: async () => {
+                const target = await notesTarget();
+                await target.apply('g', [], [{ kind: 'upsert-row', table: 'notes', rowId: 'ROW-A', values: { title: 'rdb', memo: null } }],
+                    new Set(['c2']), [], new Set(['c']));
+                const projected = (await target.executeQuery({ table: 'notes' }))[0].id as number;
+                target.localUpdate('notes', projected, { title: 'local' });
+                const fresh = target.localInsert('notes', { title: 'new' });
+                const changes = (await target.drainChanges()).changes;
+                await target.writeRecord(changes[1].id, { failure: { origin: 'ingestion', direction: 'failure', groupId: 'g', opHash: 'op-1', kind: 'insert' } });
+                await target.recordEndObserve('g', 'end-1');
+                const before = JSON.stringify(await target.executeQuery({ table: 'notes' }));
+
+                let failed = false;
+                try {
+                    await target.commitIngest({
+                        consumed: changes.map((c) => c.id),
+                        checkpoints: [{ groupId: 'g', expected: new Set(['c2']), next: new Set(['c3']) }],
+                        inserts: [{ table: 'notes', localId: fresh, rowId: 'ROW-NEW', uuid: 'u', status: 'active' }],
+                        reverts: [
+                            { table: 'notes', rowId: 'ROW-A', localId: projected, row: { kind: 'upsert-row', table: 'notes', rowId: 'ROW-A', values: { title: 'rdb', memo: null } } },
+                            { table: 'no_such_table', rowId: 'ROW-X' },
+                        ],
+                        events: [{ origin: 'concurrency', direction: 'void', groupId: 'g', opHash: 'op-2', kind: 'insert' }],
+                    });
+                } catch { failed = true; }
+                assertTrue(failed, 'a revert of a table the target lacks fails the settle');
+                assertEquals(JSON.stringify(await target.executeQuery({ table: 'notes' })), before, 'no row changed, the one reverted first included');
+                assertEquals((await target.resolveRow('notes', fresh))?.rowId, undefined, 'no mapping is written');
+                assertEquals((await target.drainChanges()).changes.length, 2, 'the outbox is as it was');
+                assertEquals((await target.drainOpEvents()).length, 0, 'no event is stored');
+                assertEquals([...(await target.getCheckpoint('g'))!].join(','), 'c2', 'the checkpoint is as it was');
+                assertEquals((await target.getEndObserves('g')).join(','), 'end-1', "and so are the end's observes");
+            },
+        },
     ],
 };

@@ -8,7 +8,7 @@ This module (**rdb_adapter**) provides an abstract bi-directional projection mec
 
 The export (rdb → relational) is powered by a planner, that generates abstract schema and row changes starting from an Rdb delta. These changes are then applied by a `MaterializationTarget`.
 
-For ingesting changes (relational → rdb) an inverse planner is used, that maps the raw contents of the outbox back into Rdb operations, and optionally groups FK-related consecutive operations into bundles, providing atomicity. The job of draining the outbox into the inverse planner is done by a `MaterializedChangeSource` instance.
+For ingesting changes (relational → rdb) an inverse planner is used, that maps each change in the outbox back into one Rdb operation. The job of reading the outbox, and of settling what ingestion did, is done by a `MaterializedChangeSource` instance. How the two directions keep the projection consistent is described in [Ingestion and checkpoints](#ingestion-and-checkpoints).
 
 Hence to create a new a bi-directional projection, both `MaterializationTarget` and `MaterializedChangeSource` have to be implemented and injected into the generic adapter.
 
@@ -23,11 +23,59 @@ Co-transactional failures (Rdb changes reverted because of concurrency) and inge
 
 While projection is a new concept in HHS, the test suite includes a synthetic test generator and an extensive reproducible stress test runner over the generic planner and the SQLite and IndexedDB adapters. The adapters have been extensively tested using this tooling.
 
-The forward projection planner is universal, and should be usable without limitations. The revererse planner doing change ingestion can only guess the app's bundling intent (based on FK structure). If the app has sophisticated atomicity requirements, it may be necessary to apply the changes directly at the [Rdb](../rdb/) level (or using [C-SQL](../rdb_lang/) for convenience).
+The forward projection planner is universal, and should be usable without limitations. Change ingestion turns every local change into an operation of its own, so two writes the app made in one transaction reach rdb as two operations. If the app needs several writes to land or fail together, it should apply them directly at the [Rdb](../rdb/) level (or using [C-SQL](../rdb_lang/) for convenience).
 
 Change ingestion works at the data level only. Schema changes can only be performed directly on the **Rdb** instance, since the schema change logic imposes limitations that make concurrent state reconciliation in the face of schema updates more straightforward. The forward planner then applies schema changes safely on any projections.
 
 The projection replaces hash-based ids with database-native numeric ids, that also are used for foreign key dependencies when possible. The numeric ids are not inter-replica stable, and are meant for local usage. If the app needs to communicate off-replica, it sould use the hash-based row/key ids. They can be obtained by using the projection API (`projection.keyHashForId`, `projection.rowHashForLocalId`, etc.) or by directly inspecting the shadow tables that maintain sync state (not recommended).
+
+## Ingestion and checkpoints
+
+A projection keeps one promise: each group's tables hold rdb's rows at the group's checkpoint, with the local changes still in the outbox applied on top. The checkpoint is the version the target last projected, stored beside the tables, and the outbox holds what the app wrote since. Ingestion is built around keeping that promise. It is also why a projection never applies over a pending change: `apply` refuses with `PendingChangesError` while the outbox holds one, and the next cycle ingests the change first.
+
+### What capture records
+
+Each target records the app's writes in its outbox, in commit order. An insert is recorded as the row it stored, defaults included, and a delete by the row's local id. An update is recorded as the columns it names, whether their values changed or not. Naming a column is a write: rdb resolves concurrent updates column by column, so a column the app sets to the value it already has still takes part. The target READMEs say how each one captures ([SQLite](../rdb_adapter_sqlite#capture), [IndexedDB](../rdb_adapter_idb#capture-and-commit-events)).
+
+Capture also fills in the author. When an insert leaves the author column empty, the target writes the writer key's id there before recording the row, so the row shows its author at once. It knows the key from the writer record, which [rdb_projection](../rdb_projection#cycles) keeps in the target: the writer key, and for each group whether an insert with an empty author column is signed with it (`autoAuthor`, the default) or anonymous. An insert into a signed group that still has an empty author column was written while no writer was recorded, and ingestion refuses it.
+
+### A pass
+
+Ingestion works from what the app saw. For each group it starts at the checkpoint, translates the group's changes with the schema there, and turns each change into one entry, in commit order. The first entry of a group is appended at its checkpoint and each next one after the previous, so a pass builds a chain on top of the checkpoint. Nothing is bundled or merged. An insert that references a row inserted earlier in the pass finds it, since that row's entry comes first, and an update lands or is refused as a whole.
+
+Groups that bind other groups need one more step. Before a change's entry, its group observes each group it binds whose chain grew in this pass, at that group's checkpoint plus its chain so far, joined with what it already observes (rdb only accepts an observe that extends the earlier ones). A permission written natively in one group and used right away in another reaches rdb in order this way: the permission's entry comes first, and the use reads it through the observe. An observe the gate would refuse, or one that would be void where it stands, is not written. While some observe of a gated binding is void, the group's entries are also checked through the live observes only, as their verdicts will read them, so a write that would be void from the start is refused rather than appended.
+
+Remote changes that reached rdb after the checkpoint stay out of the pass. They are concurrent with the chain, and rdb resolves them against it when the next projection applies them.
+
+### What becomes of each change
+
+Before anything reaches rdb, ingestion writes into the change's outbox row what became of it. An entry is built, signed and validated, its hash is written into the row, and only then is it appended. A change that is refused gets its failure event there instead, and one with nothing to write gets a mark that says so, such as an update that names only readonly columns at their current values, or a change of a table no member projects. Every change a pass reaches ends with one of these records.
+
+Some refusals come from the adapter rather than from rdb. An update may name a readonly column or the author column as long as it holds the row's own value, which is what a form that writes back the whole row does; any other value there is refused. An insert on a local id that already has an rdb identity is refused, as with an `INSERT OR REPLACE` over a row or an insert that reuses a deleted row's id, and so is any later change of a row whose insert was refused. An error while translating a change or building its entry counts as a refusal too, with the error's message as the reason.
+
+An error from the target, or from an append, is different: it ends the pass where it happened, and the call throws ([rdb_projection](../rdb_projection#cycles) tries again later). Every record is written before its append, so what the pass stored is enough to finish it.
+
+### The end of a pass
+
+The end of a pass reads only what was stored: the outbox records, the checkpoints and rdb. It takes nothing from the pass's memory, so the process that ran the pass and the next cycle after a crash compute the same end.
+
+The handled changes are the outbox's leading rows whose record says what became of them: a failure, nothing to write, or an entry rdb holds. Each group's chain ends at its checkpoint plus the recorded hashes rdb holds. If the pass's entries made an observe due that no later change of the pass called for, as when a permission is written and nothing uses it yet, the end writes it now, so that a use in the next pass reads the permission. It records that observe beside its group's checkpoint before appending it. Then, for each group whose chain holds an observe, the end asks rdb for the delta from the checkpoint to the chain's end. An observe can bring in an entry of the bound group that changes the verdict of something the group read through it: a revocation concurrent with the grant a row relied on voids that row, and an entry that voids the revocation brings it back. The delta's verdict changes become void and reinstate events, and the rows they name are rewritten.
+
+The settle is one target transaction. It checks that each checkpoint is still the one the pass started from, removes the handled rows from the outbox, writes the inserts' mappings, rewrites the rows that need it, stores the failure events and then the delta's, and moves each checkpoint to the end of its chain. Nothing is projected back. Each entry of the chain was a change the target had already applied, so a local write that ingests cleanly is never written to the target again, and a screen that shows it doesn't change.
+
+### Reverts
+
+A refused change leaves the target showing something rdb doesn't have, and the settle puts the row back to what the promise says it holds: rdb's row at the end of the chain, with the row's changes still in the outbox applied on top. Say a ledger row reads memo `start` and amount `1.00`. The app sets the memo to a value rdb refuses, and while the pass runs it sets the amount to `2.00`. The settle writes rdb's row, memo `start`, and then the pending update, so the row reads `start` and `2.00` until the next pass ingests the amount.
+
+A row rdb no longer has is removed, and its mapping marked `deleted`. A refused insert on a local id that had no identity yet is removed too, and the id keeps the refused identity, marked `ingestion_failure`, so it is never used again. One on a local id that already had an identity, such as an `INSERT OR REPLACE` over a row, puts that identity's row back. The rows an observe voided or reinstated are rewritten the same way, and a reinstated row that was never in the target gets a new local id from its table's counter.
+
+### Crashes
+
+A crash anywhere in a pass leaves a state the next cycle finishes. When the outbox's first row has a record, the cycle runs the end first and then a new pass over the rest. An entry whose hash was recorded but never appended is built again and recorded over the old hash, and an insert gets a new uuid then, which is safe because nothing referenced it yet. rdb's DAG writes nothing for an entry it already holds, so a cycle that appends what a crashed one had already appended stores it once, and so do two devices that make the same anonymous update.
+
+Two things mean the store is not what a pass assumed: a checkpoint that moved before the settle, which only another projector on the same store does, and an entry the DAG appended under another hash than the one recorded. Both stop ingestion with an error, and [rdb_projection](../rdb_projection#cycles) halts on them.
+
+The design, and why it holds, is [HIP-29](../../hips/0029-checkpoint-consistency.md).
 
 ## NULL values
 
@@ -198,14 +246,14 @@ A UI reads the projected tables, not `RObject` views. What is on screen is a que
 Changes come from three different sources:
 
 1. **A local write.** The app inserts, updates, or deletes a row in the projection database. The row is already committed and readable by `SELECT`; the UI must paint it now, before the projection's 50 ms ingest debounce and before the replica accepts the op.
-2. **A projected `apply()`.** Remote ops — and the project-back of a local edit that ingested cleanly — are written in one transaction with capture off, so they never enter the local change queue in `rdb_outbox`.
-3. **An ingest `settle` (`commitIngest`).** Rejected local writes are reverted and logged to `rdb_op_events` in one transaction, also with capture off.
+2. **A projected `apply()`.** Remote ops are written in one transaction with capture off, so they never enter the local change queue in `rdb_outbox`.
+3. **An ingest `settle` (`commitIngest`).** Refused local writes are reverted, the rows an observe voided or reinstated are rewritten, and the events are logged to `rdb_op_events`, in one transaction, also with capture off. A local write that ingests cleanly is not written again.
 
 An `RObject.subscribe` callback fires before `apply()` writes the target, and an outbox listener never hears `apply()` or `commitIngest()`. The query engine (`QueryEngine`) sits on the target itself, where all three commits land. Because it depends only on the target (`QueryableTarget & ReactiveChangeTarget`), a client process can run reactive queries over its local `SqliteTarget` or `IdbTarget` without opening `RdbProjection`. When `RdbProjection` is in the same process, `projection.selectFrom` and `projection.monitor` delegate to the same engine.
 
 ### Why relevance is asymmetric
 
-Neither `rdb_outbox` nor a projected `delete-row` carries a before-image. On SQLite, a local `UPDATE` fires one per-column trigger per edited column, so the outbox only knows what changed, not what the rest of the row looked like before; a delete carries only `localId`. Checking a `WHERE` clause against a partial change misses **departures** — a row that used to match the query and just moved out of it, or was deleted.
+Neither `rdb_outbox` nor a projected `delete-row` carries a before-image. A local update is recorded as the columns it names, not as what the rest of the row looked like before, and a delete carries only `localId`. Checking a `WHERE` clause against a partial change misses **departures** — a row that used to match the query and just moved out of it, or was deleted.
 
 The engine handles the three commit streams differently:
 
@@ -231,16 +279,17 @@ Every target therefore enforces the **drain rule**: `drainChanges()` reads its o
 Monitors are deduplicated and reference-counted by a canonical fingerprint of the query plan (table, `select`, `where` template, sorted literal parameters, `orderBy`, cursor `side`+`id`, `limit`). Dirty monitors coalesce onto a microtask. When a re-query finishes:
 
 - Any row whose columns equal the previous snapshot's row with the same `id` reuses the previous `ProjectedRow` object reference.
-- If every row in the new result matches and no relevant `OpEvent` arrived, `getSnapshot()` keeps returning the exact same `QuerySnapshot` object and listeners are not called. In particular, when a local write is later confirmed by a matching `apply()` project-back, the UI does not re-render.
+- If every row in the new result matches and no relevant `OpEvent` arrived, `getSnapshot()` keeps returning the exact same `QuerySnapshot` object and listeners are not called.
 
 ## Layout
 
 - `types.ts` — vocabulary + `MaterializationTarget` / `MaterializedChangeSource` / `ReactiveChangeTarget` / `QueryableTarget` / `ChangeSignalSource` / `AdapterConfig`.
 - `names.ts` — target/column naming + FK resolution (`resolveFk`).
 - `schema_actions.ts`, `row_actions.ts` — pure project-side planners.
-- `ingest.ts` — pure inverse planner (coalesce, mint, translate, FK-consecutive bundling).
-- `ref_advance.ts` — cross-group ref-advance mechanism (observed→observer index + observe wrapper).
+- `ingest.ts` — pure inverse planner: one change to one op, a refusal, or nothing to write.
+- `ingest_chain.ts` — the ingestion pass and the end of a pass (see [Ingestion and checkpoints](#ingestion-and-checkpoints)).
 - `project.ts`, `ingest_orchestrator.ts` — single-group and database-level orchestrators.
+- `testing.ts` — the `/testing` entry point the suites use: `leaveEndsToNewCycles`, a process-wide switch that leaves every end of a pass to a new cycle, and two helpers of the pass.
 - `index_actions.ts` — pure index planner (spec validation, rdb → target name resolution, diff against the built indexes).
 - `index_reconcile.ts` — `reconcileIndexes`: the fingerprint check and the atomic install of an index spec.
 - `where_parser.ts`, `query_eval.ts`, `query_builder.ts`, `query_monitor.ts` — predicate parser, in-memory `WHERE` and sort-tuple evaluator, fluent `TableQuery` builder, and `QueryEngine`.
@@ -249,8 +298,8 @@ Monitors are deduplicated and reference-counted by a canonical fingerprint of th
 ## Implementation details
 
 - **Project** (rdb → relational): pure mappers turn an `RTableGroup`'s resolved schema and row deltas into ordered `SchemaAction` / `RowAction` lists (`schema_actions.ts`, `row_actions.ts`), which a `MaterializationTarget` applies transactionally per group checkpoint (`project.ts`). A same-shape **reincarnation** (a drop+re-add whose resolved def is unchanged, see [Rdb incarnations](../rdb#schema-evolution-and-incarnations)) is a reset, not an in-place diff: a table reincarnation projects as `drop-table` + `create-table` + a live-row backfill (of the table and of every table with a local FK into it, whose `<col>_id` companions referenced the dropped serial ids), and a column reincarnation as `drop-column` + `add-column`, so stale cells cannot survive an incremental apply. FK columns are reshaped to a companion form: a local (or co-projected cross-group) FK becomes an integer `<col>_id` referencing the target's serial id; a non-co-projected cross-group FK becomes a text `<col>_row_hash` passthrough. Authorship projects as integer `author_key_id` into a shared `rdb_keys(id, key_hash, public_key)` side table (duplicates of a key hash collapse to one id). An identity-provider table's keyId column projects as `key_id` (same side table); its publicKey column is **not** projected — crypto material lives only in `rdb_keys`. A first-class `identity` column type likewise projects as `<col>_key_id`.
-- **Ingest** (relational → rdb): the inverse planner (`ingest.ts`) replays the captured outbox in **commit order** — coalesce per row, mint rowIds, reverse-map names, rewrite FK / key-ref values (including reconstructing provider `keyId`+`publicKey` from `rdb_keys`) — then submits bundles via `group.bundle()` (`ingest_orchestrator.ts`), signed by the configured `writer` when the group has an identity provider and anonymous otherwise (rowIds are then derived without an author). Commit order is already FK-respecting (a local FK can only be written against an already-local row), so nothing is reordered. Consecutive same-group ops joined by an explicit FK arc are bundled into one atomic entry (`fkBundling`, default on); to get parent-child atomicity, make the inserts consecutive. New keys are introduced with `KeyIndex.registerKey(domain, keyHash, publicKey)` (public key mandatory).
-- **Replica-wide**: `projectDatabase` / `ingestDatabaseChanges` / `syncDatabase` materialize several groups of one `RDb` into **one shared target** so cross-group FKs resolve to serial ids; group-qualified names keep tables from colliding. Ingestion advances co-projected cross-group refs as it drains: a dirty map (`ref_advance.ts`) tracks which observed groups changed, and before an observer's write is appended it observes them to the version present at that point, in gate-graph order (a group that an `ALLOW UPDATE REF` gate reads before the binding the gate guards, so the gate sees its new version) — so cross-group FKs **and** `exists` / restriction reads validate against freshly-ingested rows. A closing drain advances observers that never wrote, transitively.
+- **Ingest** (relational → rdb): the inverse planner (`ingest.ts`) plans each captured change on its own, in **commit order**: it mints an insert's uuid and rowId, reverse-maps names, rewrites FK and key-ref values (including reconstructing a provider's `keyId`+`publicKey` from `rdb_keys`), and sets aside a readonly or author column that holds the row's own value. The pass (`ingest_chain.ts`) builds each entry with `prepareBundle`, records its hash in the outbox row, and appends it with `appendPrepared`, signed by the configured `writer` when the group has an identity provider and anonymous otherwise (rowIds are then derived without an author). Commit order is already FK-respecting (a local FK can only be written against an already-local row), so nothing is reordered. New keys are introduced with `KeyIndex.registerKey(domain, keyHash, publicKey)` (public key mandatory). See [Ingestion and checkpoints](#ingestion-and-checkpoints).
+- **Replica-wide**: `projectDatabase` / `ingestDatabaseChanges` / `syncDatabase` materialize several groups of one `RDb` into **one shared target** so cross-group FKs resolve to serial ids; group-qualified names keep tables from colliding. Before a group's entry, ingestion observes the co-projected groups it binds whose chain grew in the pass, in gate-graph order (a group that an `ALLOW UPDATE REF` gate reads comes before the binding the gate guards, so the gate sees its new version), so cross-group FKs **and** `exists` / restriction reads validate against freshly ingested rows. The end of a pass writes the observes that are still due, transitively. Calls that read and then write a target's outbox, checkpoints or index spec take one lock per target (`withTargetLock`), so they never interleave in a process.
 - **Reactive commits**: a `ReactiveChangeTarget` emits `local`, `apply`, `settle`, and `reconnect` commit events so both `RdbProjection` (which schedules ingestion on `local`) and `QueryEngine` monitors can react without polling. (`ChangeSignalSource` remains as a fallback for custom targets that only signal outbox growth.)
 
 ## Test
@@ -270,7 +319,7 @@ Deterministic, fast checks on the pure planners (each prints under its own conso
 
 - `[ADPT] rdb_adapter schema actions` (`schema_actions_tests.ts`) — project-side schema-action planner.
 - `[ADPTR] rdb_adapter row planner` (`row_actions_tests.ts`) — project-side row-action planner.
-- `[ADPTI] rdb_adapter inverse planner` (`ingest_tests.ts`) — ingest planner (coalesce, mint, reverse-map, FK bundling).
+- `[ADPTI] rdb_adapter inverse planner` (`ingest_tests.ts`) — ingest planner (mint, reverse-map, the set-aside of readonly and author columns, refusals).
 - `[ADPTV] rdb_adapter concurrency op-events (verdict flips)` (`verdict_events_tests.ts`).
 - `[IDX] rdb_adapter projection-local indexes` (`index_actions_tests.ts`) — index planner, plus reconcile and apply-time index maintenance end to end on the memory target.
 - `[ADPTQ] Query evaluation` and `Query monitors` (`query_eval_tests.ts`, `query_monitor_tests.ts`) — `evalWhere`, `compareSortTuples`, `MemoryTarget` commit events and keyset seeks, and `QueryEngine` relevance filtering.
@@ -280,7 +329,7 @@ Deterministic, fast checks on the pure planners (each prints under its own conso
 `[PLANNER] rdb_adapter planner-parity fuzzer` (`test/planner_parity/`) is a seeded, generative cross-check with two tests:
 
 - **project** (`project_parity.ts`, generator `@hyper-hyper-space/hhs3_rdb_adapter_test_gen`): for every extending checkpoint pair in a random schema+row history, the `full` re-projection, the `incremental` projection, and the live `rdb` projection must all agree (in-process `ActionStore`). A generated index spec covering every column of both versions rides along, and both paths must end with the same index set, equal to the spec resolved at the end version. The same generator feeds the real-target suite in [rdb_adapter_test](../rdb_adapter_test), which walks a linear checkpoint chain on a concrete backend instead of all pairs.
-- **ingest** (`ingest_parity.ts`, generator `ingest_generate.ts` in this package): the `optimized` adapter config (`updateMerge` + `fkBundling`) and a `naive` config must produce equivalent live views for the same captured outbox.
+- **ingest** (`ingest_parity.ts`, generator `ingest_generate.ts` in this package): for a random captured outbox, every change must become exactly one op, a refusal or a mark of nothing to write, an insert on a local id that already has an identity must be refused, and the planned ops must apply to rdb.
 
 Both run against a mock context with `selfValidate: true` (every mutation and view build is re-validated), which is what makes this suite heavy compared to the unit tests.
 

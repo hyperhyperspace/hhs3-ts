@@ -146,8 +146,20 @@ export async function runProjectPlannerSweep(options: ResolvedFuzzSweepOptions):
             await checkPair(history, startIdx, endIdx, start, end);
             process.stdout.write('.');
         }
+        // The pairs that start at a chain's tip: a version that was never the
+        // frontier, as a target's checkpoint is after HIP-29's settle, with
+        // entries concurrent with the chain and after it.
+        const tips = new Set(history.chainTips);
+        const tipPairs = subsamplePairs(
+            (await collectExtendingPairs(history.rawDag, history.checkpoints)).filter(([startIdx]) => tips.has(startIdx)),
+            seed ^ 0x0c4a1, options.maxPairs,
+        );
+        for (const [startIdx, endIdx, start, end] of tipPairs) {
+            await checkPair(history, startIdx, endIdx, start, end);
+            process.stdout.write('+');
+        }
         process.stdout.write(
-            `\n  seed=${seed} pairs=${pairs.length} (max ${options.maxPairs}) `
+            `\n  seed=${seed} pairs=${pairs.length} (max ${options.maxPairs}) tipPairs=${tipPairs.length} `
             + `tallies=${JSON.stringify(history.tallies)}\n`,
         );
     }

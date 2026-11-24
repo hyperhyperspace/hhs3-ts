@@ -6,6 +6,9 @@ export * from "./group_fixture.js";
 export * from "./projection_reader.js";
 export { createProjectionSuite } from "./projection_tests.js";
 export * from "./ingestion_suite.js";
+export * from "./consistency.js";
+export * from "./target_hooks.js";
+export * from "./scenarios.js";
 export { createKeysSuite, memoryKeysSuite, memoryAuthorIdTest } from "./keys_tests.js";
 export { createProjectionParitySuite } from "./projection_parity_suite.js";
 export {

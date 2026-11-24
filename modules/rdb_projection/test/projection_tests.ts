@@ -16,7 +16,7 @@ import {
     RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory, RDbImpl, rDbFactory, deriveRowId,
     RCatalogImpl, rCatalogFactory, RDeployGateImpl, rDeployGateFactory, catalogGroupHash, deployCatalogRelease,
 } from "@hyper-hyper-space/hhs3_rdb";
-import { MemoryTarget, type OpEvent, type BidirectionalTarget, type CapturedBatch, type IngestSettle, type SyncMapping, type StoredOpEvent, type SchemaAction, type RowAction, type OpEventQuery } from "@hyper-hyper-space/hhs3_rdb_adapter";
+import { MemoryTarget, type OpEvent, type BidirectionalTarget, type CapturedBatch, type CapturedChangeId, type ChangeRecord, type IngestSettle, type SyncMapping, type StoredOpEvent, type SchemaAction, type RowAction, type OpEventQuery } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 import { createMockRContext } from "../../rdb/test/mock_rcontext.js";
 import { RdbProjection, opEventPushable } from "../src/index.js";
@@ -24,11 +24,11 @@ import { RdbProjection, opEventPushable } from "../src/index.js";
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
 
-async function makeIdentity(): Promise<OwnIdentity> {
+export async function makeIdentity(): Promise<OwnIdentity> {
     return createIdentity(SIGNING_ED25519, hashSuite);
 }
 
-function newCtx(): RContext {
+export function newCtx(): RContext {
     const ctx = createMockRContext({ selfValidate: true });
     ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
     ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
@@ -38,11 +38,11 @@ function newCtx(): RContext {
     return ctx;
 }
 
-function open(name: string, columns: TableDef['columns'], extra?: Partial<TableDef>): TableDef {
+export function open(name: string, columns: TableDef['columns'], extra?: Partial<TableDef>): TableDef {
     return { name, columns, restrictions: [{ on: 'all', rule: { p: 'true' } }], ...extra };
 }
 
-type GroupSpec = { name: string; tables: TableDef[]; bindings?: { [alias: string]: string }; tableMaps?: TableMaps };
+export type GroupSpec = { name: string; tables: TableDef[]; bindings?: { [alias: string]: string }; tableMaps?: TableMaps; idProvider?: string };
 type Member = { schema: RSchemaImpl; group: RTableGroupImpl; admin: OwnIdentity };
 
 // A schema per group and a catalog group definition pinned at its genesis;
@@ -63,6 +63,7 @@ async function defineGroups(ctx: RContext, dev: OwnIdentity, specs: GroupSpec[],
             def.bindings = Object.fromEntries(Object.entries(spec.bindings).map(([alias, target]) => [alias, known.get(target)!]));
         }
         if (spec.tableMaps !== undefined) def.tableMaps = spec.tableMaps;
+        if (spec.idProvider !== undefined) def.idProvider = spec.idProvider;
         known.set(spec.name, catalogGroupHash(def));
         defs.push(def);
         schemas.set(spec.name, schema);
@@ -72,7 +73,7 @@ async function defineGroups(ctx: RContext, dev: OwnIdentity, specs: GroupSpec[],
 
 // A catalog releasing `specs` and a database deployed from it (the planner
 // creates the member groups).
-async function makeDatabase(ctx: RContext, seed: string, specs: GroupSpec[]) {
+export async function makeDatabase(ctx: RContext, seed: string, specs: GroupSpec[]) {
     const dev = await makeIdentity();
     const { defs, schemas, known } = await defineGroups(ctx, dev, specs);
     const catalog = (await ctx.createObject(await RCatalogImpl.create({
@@ -89,7 +90,7 @@ async function makeDatabase(ctx: RContext, seed: string, specs: GroupSpec[]) {
 }
 
 // Releases more groups in the catalog and deploys the release into the RDb.
-async function addGroups(ctx: RContext, db: Awaited<ReturnType<typeof makeDatabase>>, version: string, specs: GroupSpec[]) {
+export async function addGroups(ctx: RContext, db: Awaited<ReturnType<typeof makeDatabase>>, version: string, specs: GroupSpec[]) {
     const { defs } = await defineGroups(ctx, db.dev, specs, db.known);
     const published = await db.catalog.publishRelease({ version, add: defs }, db.dev);
     await deployCatalogRelease(db.rdb, { release: published.release });
@@ -116,7 +117,7 @@ async function makeCatalogAndOrders(ctx: RContext) {
     return { catalog: db.members['catalog']!, orders: db.members['orders']!, rdb: db.rdb };
 }
 
-async function poll(fn: () => boolean, timeoutMs = 2000): Promise<void> {
+export async function poll(fn: () => boolean, timeoutMs = 2000): Promise<void> {
     const start = Date.now();
     while (!fn()) {
         if (Date.now() - start > timeoutMs) throw new Error('poll timed out');
@@ -153,12 +154,13 @@ class DelayCloseTarget implements BidirectionalTarget {
     getCheckpoint(groupId: B64Hash): Promise<Version | undefined> {
         return this.inner.getCheckpoint(groupId);
     }
+    hasPendingChanges(): Promise<boolean> { return this.inner.hasPendingChanges(); }
+    writeRecord(id: CapturedChangeId, record: ChangeRecord): Promise<void> { return this.inner.writeRecord(id, record); }
+    recordEndObserve(groupId: B64Hash, hash: B64Hash): Promise<void> { return this.inner.recordEndObserve(groupId, hash); }
+    getEndObserves(groupId: B64Hash): Promise<B64Hash[]> { return this.inner.getEndObserves(groupId); }
     drainChanges(): Promise<CapturedBatch> { return this.inner.drainChanges(); }
     resolveRow(table: string, localId: number): Promise<SyncMapping | undefined> {
         return this.inner.resolveRow(table, localId);
-    }
-    reserveMint(reservations: SyncMapping[]): Promise<SyncMapping[]> {
-        return this.inner.reserveMint(reservations);
     }
     commitIngest(settle: IngestSettle): Promise<void> { return this.inner.commitIngest(settle); }
     drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]> {

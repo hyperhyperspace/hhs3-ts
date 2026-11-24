@@ -49,6 +49,7 @@ The objects below match IndexedDB's `IDBDatabase` / `IDBTransaction` / `IDBReque
 - `count(query?)`
 - `add(value, key?)` — allocates `id` when omitted; request result is the id
 - `put(value, key?)` — whole document
+- `patch(fields, { delete? })` — the fields given, and the ones listed cleared; `fields` holds the `id`
 - `delete(id)`, `clear()`
 - `indexNames` — the table's projection indexes, sorted; `index(name)` — the index, or `NotFoundError`
 - `createIndex` / `deleteIndex` — throw `InvalidStateError`; indexes come from the index spec
@@ -92,9 +93,9 @@ The same database name opened with `indexedDB.open` shows the physical stores (`
 
 ### Write
 
-`add()` without an `id` allocates `nextId` in that transaction. `put` writes the whole document — read-merge-write when you are editing a few columns. `delete` takes the local `id`.
+`add()` without an `id` allocates `nextId` in that transaction. `put` replaces the whole document, `patch` changes some of its fields, and `delete` takes the local `id`.
 
-A `null` property sets the column to NULL, and the store keeps no key for it: a document written with `memo: null` reads back without `memo`, exactly like one written without the property. This is one difference from native IndexedDB, which would keep the `null`. In return a row reads the same before and after its write is ingested and projected back, and the same on every device. A `put` that sets a property to `null` and a `put` that drops a property the row had are the same change, a clear of the column. See [NULL values](../rdb_adapter#null-values) for what a clear becomes in rdb.
+A `null` property sets the column to NULL, and the store keeps no key for it: a document written with `memo: null` reads back without `memo`, exactly like one written without the property. This is one difference from native IndexedDB, which would keep the `null`. In return a row reads the same before and after its write is ingested, and the same on every device. A `put` that sets a property to `null` and a `put` that drops a property the row had are the same change, a clear of the column. See [NULL values](../rdb_adapter#null-values) for what a clear becomes in rdb.
 
 A transaction is a batch. Either every write in it lands, or none of them do (`abort()`, or a failed request). IndexedDB runs each request asynchronously: `add` / `put` / `get` / `delete` return a request, and the result arrives on `onsuccess`. The transaction itself stays alive only while a request is in flight. As soon as your code returns to the event loop with nothing pending — `await fetch(...)`, `setTimeout`, a call into another API — IndexedDB commits (or aborts) the batch. That is why the pattern is: listen for `oncomplete` the moment the transaction is created, then `await` only those requests, then `await` completion.
 
@@ -128,7 +129,18 @@ await done;
 
 The same `'readwrite'` batch can read and write: later `get`s see `add`/`put`s already issued on this transaction.
 
-Two writers whose scopes overlap take turns: the second transaction starts after the first commits. Native IndexedDB defines that scope as the object stores named in `transaction(...)`. Here those names are projected tables we model ourselves. Every row lives in physical `rows`, and every `target.database` transaction opens that store (plus `table_meta`, `keys`, `outbox`, `index_meta`, and `index_entries`, which `add`/`put`/`delete` also touch). So two `'readwrite'` transactions — even on different app tables — run one after the other. A `'readonly'` transaction overlaps the same physical stores as a writer, so a long read of `tags` and a write to `ledger` also take turns. Two `'readonly'` transactions may run at the same time.
+`put` and `patch` differ in what they tell ingestion. A `put` over an existing record replaces it, the way an `UPDATE` that names every column would, so it is captured as a write of every column, the unchanged ones included. Two devices that edit different fields of one row with `put` therefore each write the other's field back to the value it read, and rdb keeps one device's whole row. A `patch` is captured as exactly the fields it names, so both edits land:
+
+```typescript
+await waitReq(ledger.patch({ id: 1, memo: 'paid' }));                 // memo only
+await waitReq(ledger.patch({ id: 1, amount: '5.00' }, { delete: ['memo'] }));   // amount, and memo cleared
+```
+
+`patch` reads the stored record, writes the fields it is given over it, clears the ones `delete` lists, and keeps the rest and their index entries. It compares nothing, so a field it names at its current value is still a write. Like an `UPDATE` that matches no row, a `patch` of an id with no record writes and captures nothing, and a field both given and listed is a `DataError`.
+
+The author column follows the record. A `put` that leaves it out, or gives it `null`, keeps the stored author and captures nothing for it, so a record built from a form keeps its author. An `add`, or a `put` of a new record, that leaves it empty gets the writer key's id when the writer record says the group's mode is `on`, in the row and in what is captured, as SQLite's insert trigger does.
+
+Two writers whose scopes overlap take turns: the second transaction starts after the first commits. Native IndexedDB defines that scope as the object stores named in `transaction(...)`. Here those names are projected tables we model ourselves. Every row lives in physical `rows`, and every `target.database` transaction opens that store (plus `table_meta`, `keys`, `outbox`, `index_meta`, `index_entries` and `capture_config`, which `add`/`put`/`patch`/`delete` also touch). So two `'readwrite'` transactions — even on different app tables — run one after the other. A `'readonly'` transaction overlaps the same physical stores as a writer, so a long read of `tags` and a write to `ledger` also take turns. Two `'readonly'` transactions may run at the same time.
 
 Because the native lock is already on `rows`, `db.transaction('tags').objectStore('ledger')` succeeds as long as `ledger` is materialized. Native IndexedDB would reject that: a store has to be listed in `transaction(...)` to be opened. The list you pass here still has to be known table names; it just does not narrow the lock.
 
@@ -207,7 +219,7 @@ Entries live in the `index_entries` store, keyed `[table, name, key, id]`, and a
 
 ### Capture and commit events
 
-With capture provisioned, a `put` / `add` / `delete` on `target.database` writes the row and an outbox record in the same native transaction, keeping the key `outbox.add` returns. When `oncomplete` fires, the target records those outbox ids in `emittedOutboxIds`, delivers `{ source: 'local', tables }` to its commit listeners, and posts the event on `hhs3-rdb-idb:${dbName}`. `drainChanges()` applies the drain rule for any unannounced outbox rows in its batch, and `apply()` and `commitIngest()` likewise broadcast their `apply` and `settle` commit events on the same channel so every tab shares one stream for all three commit kinds.
+With capture provisioned, an `add` / `put` / `patch` / `delete` on `target.database` writes the row and an outbox record in the same native transaction, keeping the key `outbox.add` returns. What each records is described under [Write](#write), and what ingestion does with it under [Ingestion and checkpoints](../rdb_adapter#ingestion-and-checkpoints). When `oncomplete` fires, the target records those outbox ids in `emittedOutboxIds`, delivers `{ source: 'local', tables }` to its commit listeners, and posts the event on `hhs3-rdb-idb:${dbName}`. `drainChanges()` applies the drain rule for any unannounced outbox rows in its batch, and `apply()` and `commitIngest()` likewise broadcast their `apply` and `settle` commit events on the same channel so every tab shares one stream for all three commit kinds.
 
 From there, ingest as usual — `ingestChanges(group, target, { writer })`, or let `RdbProjection` drain when `{ source: 'local' }` arrives:
 

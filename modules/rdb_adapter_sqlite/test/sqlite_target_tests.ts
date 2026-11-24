@@ -9,13 +9,13 @@ import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import Database from "better-sqlite3";
 
 import {
-    CheckpointMovedError, ingestChanges, projectGroup, reconcileIndexes, SchemaAction, RowAction, SyncMapping, syncGroup,
+    CheckpointMovedError, ingestChanges, PendingChangesError, projectGroup, reconcileIndexes, SchemaAction, RowAction, SyncMapping, syncGroup,
     type GroupProjection, type IndexDecl, type IndexSpec, type ResolvedIndex,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import {
-    createGroup, createTypedGroup, sameVersion,
+    beforeSettle, createFkGroup, createGroup, createTypedGroup, projectAs, sameVersion,
     TargetHarness, ProjectionReader, ReadRow, RowValues,
-    IngestionHarness, LocalMutator,
+    IngestionHarness, LocalMutator, LocalValues,
 } from "@hyper-hyper-space/hhs3_rdb_adapter_test";
 import type { Row, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 
@@ -134,6 +134,15 @@ function sqliteLocal(db: Database.Database, target: SqliteTarget): LocalMutator 
         db.prepare('SELECT id_column, author_column, sync_table, column_types FROM rdb_table_meta WHERE "table" = ?')
             .get(table) as MetaRow;
 
+    const insertWithId = (verb: string, table: string, localId: number, values: LocalValues): void => {
+        const m = meta(table);
+        const ct = JSON.parse(m.column_types) as { [column: string]: ColumnType };
+        const cols: string[] = [m.id_column];
+        const params: (number | string | null)[] = [localId];
+        for (const [c, v] of Object.entries(values)) { cols.push(c); params.push(toParam(v, ct[c] ?? 'string')); }
+        db.prepare(`${verb} INTO ${quoteId(table)} (${cols.map(quoteId).join(', ')}) VALUES (${params.map(() => '?').join(', ')})`).run(...params);
+    };
+
     return {
         insert: (table, values, author) => {
             const m = meta(table);
@@ -147,6 +156,8 @@ function sqliteLocal(db: Database.Database, target: SqliteTarget): LocalMutator 
                 `INSERT INTO ${quoteId(table)} (${cols.map(quoteId).join(', ')}) VALUES (${placeholders})`).run(...params);
             return Number(info.lastInsertRowid);
         },
+        insertAt: (table, localId, values) => insertWithId('INSERT', table, localId, values),
+        replaceAt: (table, localId, values) => insertWithId('INSERT OR REPLACE', table, localId, values),
         update: (table, localId, values) => {
             const m = meta(table);
             const ct = JSON.parse(m.column_types) as { [column: string]: ColumnType };
@@ -167,9 +178,22 @@ function sqliteLocal(db: Database.Database, target: SqliteTarget): LocalMutator 
 // The SQLite harness for the shared change-ingestion suite: a capture-
 // provisioned SqliteTarget plus a raw-SQL local mutator over the same handle.
 export function sqliteIngestionHarness(): IngestionHarness {
-    const db = new Database(':memory:');
+    return sqliteIngestionHarnessOn(new Database(':memory:'));
+}
+
+// A harness over `db`. Its reopen closes the database and opens a copy of what
+// it had committed, so a restart is simulated without a file.
+function sqliteIngestionHarnessOn(db: Database.Database): IngestionHarness {
     const target = new SqliteTarget(db, { captureChanges: true });
-    return { target, read: sqliteReader(db), local: sqliteLocal(db, target), cleanup: () => { db.close(); } };
+    return {
+        target, read: sqliteReader(db), local: sqliteLocal(db, target),
+        cleanup: () => { if (db.open) db.close(); },
+        reopen: async () => {
+            const image = db.serialize();
+            db.close();
+            return sqliteIngestionHarnessOn(new Database(image));
+        },
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -710,75 +734,6 @@ export const sqliteSpecificTests = {
             },
         },
         {
-            name: '[ADPTS-SQL11] reserveMint is claim-or-adopt: a second identity for one local id adopts the first',
-            invoke: async () => {
-                const { group } = await createGroup();
-                const db = new Database(':memory:');
-                const target = new SqliteTarget(db, { captureChanges: true });
-                await projectGroup(group, target);
-
-                const first: SyncMapping = { table: 'tags', localId: 1, rowId: 'ROWA', uuid: 'ua', status: 'active' };
-                const claimed = await target.reserveMint([first]);
-                assertEquals(claimed.length, 1, 'one effective mapping returned');
-                assertEquals(claimed[0].rowId, 'ROWA', 'the free id is claimed by the caller');
-
-                // A DIFFERENT identity for the same id: INSERT OR IGNORE hits the
-                // unique-id index and the read-back returns the incumbent (adopt).
-                const second: SyncMapping = { table: 'tags', localId: 1, rowId: 'ROWB', uuid: 'ub', status: 'active' };
-                const adopted = await target.reserveMint([second]);
-                assertEquals(adopted[0].rowId, 'ROWA', 'the second minter adopts the incumbent identity');
-                assertEquals(adopted[0].uuid, 'ua', 'and its uuid');
-
-                const rows = db.prepare('SELECT "row_hash" AS rh, "id" FROM tags_sync WHERE "id" = 1').all() as
-                    { rh: string; id: number }[];
-                assertEquals(rows.length, 1, 'exactly one sync row for the id (no duplicate)');
-                assertEquals(rows[0].rh, 'ROWA', 'the incumbent row_hash is kept');
-            },
-        },
-        {
-            name: '[ADPTS-SQL12] two handles ingesting one file converge to a single rdb row per local insert',
-            invoke: async () => {
-                const { group, admin } = await createGroup();
-                const dbPath = tmpDbPath('ingest-race');
-                const dbA = new Database(dbPath); dbA.pragma('busy_timeout = 5000');
-                const targetA = new SqliteTarget(dbA, { captureChanges: true, dbPath });
-                try {
-                    await projectGroup(group, targetA);   // schema + capture triggers on the file
-                    dbA.prepare('INSERT INTO tags (code) VALUES (?)').run('x');   // one local insert
-
-                    // A second handle/target on the SAME file, same in-memory group.
-                    const dbB = new Database(dbPath); dbB.pragma('busy_timeout = 5000');
-                    const targetB = new SqliteTarget(dbB, { captureChanges: true, dbPath });
-
-                    const [rA, rB] = await Promise.all([
-                        ingestChanges(group, targetA, { writer: admin }),
-                        ingestChanges(group, targetB, { writer: admin }),
-                    ]);
-
-                    // Claim-or-adopt makes both submit the same identity. The
-                    // second append is usually a write-once skip, but two
-                    // concurrent bundle()s on the same in-memory group can both
-                    // pass validation and still converge (same incarnation).
-                    // The guarantee is one rdb row, not one accepted count.
-                    assertEquals(rA.rejected.length + rB.rejected.length, 0, 'no rejections');
-
-                    const rows = (await groupRows(group, 'tags')).filter((r) => r.values.code === 'x');
-                    assertEquals(rows.length, 1, 'exactly one rdb tag row, not two');
-
-                    const syncRows = dbA.prepare('SELECT "id" FROM tags_sync').all() as { id: number }[];
-                    assertEquals(syncRows.length, 1, 'one sync mapping (ids are unique)');
-                    assertEquals((dbA.prepare('SELECT COUNT(*) AS n FROM rdb_outbox').get() as { n: number }).n, 0,
-                        'the outbox is acked by both passes');
-                    assertEquals((dbA.prepare("SELECT COUNT(*) AS n FROM rdb_op_events WHERE direction='failure'")
-                        .get() as { n: number }).n, 0, 'no ingestion/failure events');
-                    dbB.close();
-                } finally {
-                    dbA.close();
-                    cleanupDb(dbPath);
-                }
-            },
-        },
-        {
             name: '[ADPTS-SQL13] two handles projecting one file: exactly one applies the delta, the other gets CheckpointMovedError',
             invoke: async () => {
                 const { group, admin } = await createGroup();
@@ -935,7 +890,7 @@ export const sqliteSpecificTests = {
             },
         },
         {
-            name: '[ADPTS-SQL17] an insert captured before a column drop arrives: the NULL of the dropped column is left out, a value there is refused',
+            name: '[ADPTS-SQL17] an insert captured before a column drop arrives is translated with the schema at the checkpoint: with a NULL or a value in the dropped column it is accepted, and the column goes with the next projection',
             invoke: async () => {
                 // A sync ingests first and projects after, so a captured insert can be
                 // planned under a schema that already dropped a column the target
@@ -945,6 +900,7 @@ export const sqliteSpecificTests = {
                     const db = new Database(':memory:');
                     const target = new SqliteTarget(db, { captureChanges: true });
                     try {
+                        await projectAs(group, target, admin);
                         await syncGroup(group, target, { writer: admin });
                         db.prepare(sql).run(...params);
                         const captured = (db.prepare('SELECT changed FROM rdb_outbox').all() as { changed: string }[]).map((r) => r.changed);
@@ -965,20 +921,22 @@ export const sqliteSpecificTests = {
 
                 // the app never wrote to memo: its captured NULL is not an error
                 const empty = await run('INSERT INTO ledger (ref, amount) VALUES (?, ?)', ['r1', '1.00']);
-                assertEquals(empty.captured.join(';'), '{"ref":"r1","memo":null,"amount":"1.00","author_key_id":null}',
-                    'the captured row names the empty column, and the author column the app left out');
+                assertEquals(empty.captured.join(';'), '{"ref":"r1","memo":null,"amount":"1.00","author_key_id":1}',
+                    'the captured row names the empty column, and the author capture filled in');
                 assertEquals(empty.result.accepted, 1, 'the insert is accepted');
                 assertEquals(empty.result.rejected.length, 0, 'nothing is rejected');
                 assertEquals(empty.inRdb, 1, 'the row is in rdb');
                 assertEquals(empty.inSqlite.length, 1, 'and stays in SQLite');
                 assertTrue(!('memo' in empty.inSqlite[0]), 'the column is gone from the table after the projection');
 
-                // the app wrote a value to memo: rdb has no such column, so the insert is refused and undone
+                // the app wrote a value to memo: the schema at the checkpoint has the
+                // column, so the insert is accepted, concurrent with the drop (HIP-29)
                 const set = await run('INSERT INTO ledger (ref, memo, amount) VALUES (?, ?, ?)', ['r1', 'hi', '1.00']);
-                assertEquals(set.result.accepted, 0, 'an insert with a value in the dropped column is refused');
-                assertEquals(set.result.rejected.length, 1, 'one rejection');
-                assertEquals(set.inRdb, 0, 'no row in rdb');
-                assertEquals(set.inSqlite.length, 0, 'the local row is removed');
+                assertEquals(set.result.accepted, 1, 'an insert with a value in the dropped column is accepted');
+                assertEquals(set.result.rejected.length, 0, 'nothing is rejected');
+                assertEquals(set.inRdb, 1, 'the row is in rdb');
+                assertEquals(set.inSqlite.length, 1, 'and stays in SQLite');
+                assertTrue(!('memo' in set.inSqlite[0]), 'the column is gone from the table after the projection');
             },
         },
         {
@@ -1032,6 +990,7 @@ export const sqliteSpecificTests = {
                 const db = new Database(':memory:');
                 const target = new SqliteTarget(db, { captureChanges: true });
                 try {
+                    await projectAs(group, target, admin);
                     await syncGroup(group, target, { writer: admin });
                     const outbox = () => (db.prepare('SELECT COUNT(*) AS n FROM rdb_outbox').get() as { n: number }).n;
                     const refused = (sql: string, params: (string | number)[], why: string) => {
@@ -1123,6 +1082,7 @@ export const sqliteSpecificTests = {
                 const db = new Database(':memory:');
                 const target = new SqliteTarget(db, { captureChanges: true });
                 try {
+                    await projectAs(group, target, admin);
                     await syncGroup(group, target, { writer: admin });
                     const t1 = (db.prepare("SELECT id FROM things WHERE label = 't1'").get() as { id: number }).id;
                     db.pragma('ignore_check_constraints = ON');
@@ -1178,6 +1138,8 @@ export const sqliteSpecificTests = {
                     const drained = update !== undefined && update.kind === 'update' ? update.values.data : undefined;
                     assertTrue(drained !== null && typeof drained === 'object' && json.toStringNormalized(drained) === '{"k":1}',
                         `the second handle drains the new json column as json, got ${JSON.stringify(drained)}`);
+                    // Settle it, as ingestion would: a projection doesn't apply over a pending change (HIP-29).
+                    await b.commitIngest({ consumed: [update!.id] });
 
                     await a.apply(gid, [{ kind: 'add-column', table: 'acct', column: 'note', def: { type: 'string', nullable: true } }],
                         [{ kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { note: 'n' } }], new Set(['v3']));
@@ -1192,6 +1154,153 @@ export const sqliteSpecificTests = {
                     assertEquals((await query(b, 'other')).length, 0, 'and a new table can be queried');
                 } finally {
                     dbA.close(); dbB.close(); cleanupDb(dbPath);
+                }
+            },
+        },
+        {
+            name: '[ADPTS-SQL24] a change written through a second connection makes the first one\'s projection refuse, until a cycle ingests it',
+            invoke: async () => {
+                const dbPath = tmpDbPath('pending-across');
+                const dbA = new Database(dbPath); dbA.pragma('busy_timeout = 5000');
+                const dbB = new Database(dbPath); dbB.pragma('busy_timeout = 5000');
+                const a = new SqliteTarget(dbA, { captureChanges: true });
+                new SqliteTarget(dbB, { captureChanges: true });
+                try {
+                    const { group, admin } = await createGroup();
+                    const ledger = await group.getTable('ledger');
+                    await ledger.insert('l1', { ref: 'R-1', amount: '1.00' }, admin);
+                    await projectGroup(group, a);
+
+                    await ledger.insert('l2', { ref: 'R-2', amount: '2.00' }, admin);
+                    dbB.prepare('INSERT INTO tags (code) VALUES (?)').run('from-b');
+                    let refused = false;
+                    try { await projectGroup(group, a); } catch (e) { refused = e instanceof PendingChangesError; }
+                    assertTrue(refused, "the first connection's projection refuses over the second's pending change");
+                    assertTrue(await a.hasPendingChanges(), 'the first connection sees the change pending');
+
+                    await syncGroup(group, a, { writer: admin });
+                    assertTrue(!await a.hasPendingChanges(), 'a cycle ingests it');
+                    assertTrue(sameVersion(await a.getCheckpoint(group.getId()), await (await group.getScopedDag()).getFrontier()),
+                        'and then projects');
+                } finally {
+                    dbA.close(); dbB.close(); cleanupDb(dbPath);
+                }
+            },
+        },
+        {
+            name: '[ADPTS-SQL25] a native UPDATE is one outbox row per updated row, with every column it names, changed or not; NULL is kept, the id is never captured, and two connections give two rows',
+            invoke: async () => {
+                const dbPath = tmpDbPath('outbox-shapes');
+                const dbA = new Database(dbPath); dbA.pragma('busy_timeout = 5000');
+                const dbB = new Database(dbPath); dbB.pragma('busy_timeout = 5000');
+                const a = new SqliteTarget(dbA, { captureChanges: true });
+                new SqliteTarget(dbB, { captureChanges: true });
+                const outbox = (): string[] => (dbA.prepare('SELECT op, changed FROM rdb_outbox ORDER BY id').all() as { op: string; changed: string | null }[])
+                    .map((r) => `${r.op} ${r.changed === null ? '' : JSON.stringify(Object.fromEntries(Object.entries(JSON.parse(r.changed) as object).sort()))}`);
+                const clear = (): void => { dbA.prepare('DELETE FROM rdb_outbox').run(); };
+                try {
+                    const { group, admin } = await createGroup();
+                    const ledger = await group.getTable('ledger');
+                    await ledger.insert('l1', { ref: 'R-1', memo: 'm', amount: '1.00' }, admin);
+                    await ledger.insert('l2', { ref: 'R-2', amount: '2.00' }, admin);
+                    await projectGroup(group, a);
+                    const idOf = (ref: string): number => (dbA.prepare('SELECT id FROM ledger WHERE ref = ?').get(ref) as { id: number }).id;
+                    const [id1, id2] = [idOf('R-1'), idOf('R-2')];
+
+                    dbA.prepare('UPDATE ledger SET memo = memo, amount = ? WHERE id = ?').run('1.00', id1);
+                    assertEquals(outbox().join(' | '), 'update {"amount":"1.00","memo":"m"}', 'every named column, unchanged ones too, in one row');
+                    clear();
+
+                    dbA.prepare("UPDATE ledger SET memo = 'x'").run();
+                    assertEquals(outbox().join(' | '), 'update {"memo":"x"} | update {"memo":"x"}', 'one statement over two rows gives one row each');
+                    clear();
+
+                    dbA.prepare('UPDATE ledger SET memo = NULL WHERE id = ?').run(id2);
+                    assertEquals(outbox().join(' | '), 'update {"memo":null}', 'a NULL is kept');
+                    clear();
+
+                    dbA.prepare('UPDATE ledger SET id = id WHERE id = ?').run(id1);
+                    assertEquals(outbox().length, 0, 'an update that names only the id captures nothing');
+
+                    dbA.prepare("UPDATE ledger SET memo = 'a' WHERE id = ?").run(id1);
+                    dbB.prepare("UPDATE ledger SET amount = '3.00' WHERE id = ?").run(id1);
+                    assertEquals(outbox().join(' | '), 'update {"memo":"a"} | update {"amount":"3.00"}', 'two statements, on two connections, give two rows');
+                } finally {
+                    dbA.close(); dbB.close(); cleanupDb(dbPath);
+                }
+            },
+        },
+        {
+            name: "[ADPTS-SQL26] every local id comes from its table's own counter: a reference's id, a native insert's and a projected row's never meet",
+            invoke: async () => {
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db);
+                try {
+                    const { group } = await createFkGroup();
+                    await projectGroup(group, target);
+                    const groupId = group.getId();
+                    const apply = async (actions: RowAction[]): Promise<void> =>
+                        target.apply(groupId, [], actions, (await target.getCheckpoint(groupId))!);
+                    const comment = (rowId: string, post: string): RowAction =>
+                        ({ kind: 'upsert-row', table: 'comments', rowId, values: { body: rowId, post_id: post } });
+                    const postIdOf = (rowId: string): number =>
+                        (db.prepare('SELECT post_id AS p FROM comments WHERE id = (SELECT id FROM comments_sync WHERE row_hash = ?)')
+                            .get(rowId) as { p: number }).p;
+                    const syncId = (table: string, rowId: string): number | undefined =>
+                        (db.prepare(`SELECT id FROM ${table}_sync WHERE row_hash = ?`).get(rowId) as { id: number } | undefined)?.id;
+
+                    await apply([comment('C1', 'P-GHOST')]);
+                    assertEquals(postIdOf('C1'), 1, 'a reference to a table that never had an insert takes its first id');
+                    assertEquals((db.prepare('SELECT COUNT(*) AS n FROM posts').get() as { n: number }).n, 0, 'and writes no row there');
+
+                    const native = Number(db.prepare("INSERT INTO posts (title) VALUES ('native')").run().lastInsertRowid);
+                    assertEquals(native, 2, 'a native insert after a reference took an id gets a new one');
+
+                    await apply([comment('C2', 'P-GHOST-2')]);
+                    assertTrue(postIdOf('C2') !== native && postIdOf('C2') === 3,
+                        `a reference after a native insert with no mapping yet takes another id, got ${postIdOf('C2')}`);
+
+                    await apply([{ kind: 'upsert-row', table: 'posts', rowId: 'P-NEW', values: { title: 'new' } }]);
+                    const newId = syncId('posts', 'P-NEW')!;
+                    assertEquals(newId, 4, 'a row the projection writes takes the id its insert produced');
+                    assertEquals((db.prepare('SELECT title FROM posts WHERE id = ?').get(newId) as { title: string }).title, 'new', 'and its sync row names it');
+
+                    await apply([{ kind: 'upsert-row', table: 'posts', rowId: 'P-GHOST', values: { title: 'late' } }]);
+                    assertEquals((db.prepare('SELECT title FROM posts WHERE id = 1').get() as { title: string }).title, 'late',
+                        'the referenced row, arriving later, is inserted with the reserved id');
+                    assertEquals(Number(db.prepare("INSERT INTO posts (title) VALUES ('again')").run().lastInsertRowid), 5,
+                        'and the counter goes on past every id handed out');
+                } finally {
+                    db.close();
+                }
+            },
+        },
+        {
+            name: "[ADPTS-SQL27] the settle rewrites an ingested change's json text in canonical form, as rdb's rows have it, and skips a column a pending change writes",
+            invoke: async () => {
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db, { captureChanges: true });
+                try {
+                    const { group, admin } = await createTypedGroup();
+                    await projectAs(group, target, admin);
+                    const text = (id: number): string => (db.prepare('SELECT data FROM things WHERE id = ?').get(id) as { data: string }).data;
+                    const id = Number(db.prepare("INSERT INTO things (label, data) VALUES ('a', ?)").run('{ "b": 1, "a": 2 }').lastInsertRowid);
+                    await ingestChanges(group, target, { writer: admin });
+                    assertEquals(text(id), '{"a":2,"b":1}', 'the ingested text is canonical');
+                    assertEquals((db.prepare('SELECT COUNT(*) AS n FROM things WHERE data = ?').get('{"a":2,"b":1}') as { n: number }).n, 1,
+                        'so a query that binds the value finds it');
+
+                    // A change of the column captured during the pass keeps its own text until its own settle.
+                    db.prepare("UPDATE things SET data = ? WHERE id = ?").run('{ "y": 1 }', id);
+                    const pending = (): void => { db.prepare("UPDATE things SET data = ? WHERE id = ?").run('{ "z": 1 }', id); };
+                    let once = false;
+                    const hooked = beforeSettle(target, () => { if (!once) { once = true; pending(); } });
+                    await ingestChanges(group, hooked, { writer: admin });
+                    assertEquals(text(id), '{ "z": 1 }', 'a column a pending change writes is left as written');
+                    await ingestChanges(group, target, { writer: admin });
+                    assertEquals(text(id), '{"z":1}', 'and its own settle rewrites it');
+                } finally {
+                    db.close();
                 }
             },
         },

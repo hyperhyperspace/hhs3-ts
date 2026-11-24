@@ -15,7 +15,7 @@ import {
 import {
     groupIndexDecls, indexSpecFingerprint, PendingIndex, planIndexActions, resolveIndexes, validateIndexSpec,
 } from "./index_actions.js";
-import { GroupProjection, withDatabaseLock } from "./ingest_orchestrator.js";
+import { GroupProjection, withTargetLock } from "./ingest_orchestrator.js";
 
 export type IndexReconcileStatus = 'installed' | 'unchanged' | 'dry-run';
 
@@ -45,7 +45,7 @@ export async function reconcileIndexes(
     }
     const fingerprint = indexSpecFingerprint(spec);
 
-    return withDatabaseLock(members, async () => {
+    return withTargetLock(target, async () => {
         for (let attempt = 1; ; attempt++) {
             try {
                 return await reconcileOnce(members, target, spec, fingerprint, opts.dryRun === true);

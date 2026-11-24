@@ -1,7 +1,7 @@
 import { testing } from "@hyper-hyper-space/hhs3_util";
 
 import {
-    createIngestionSuite, createKeysSuite, createProjectionSuite, createProjectionParitySuite,
+    createIngestionSuite, createIngestionSuiteWithEndsInNewCycles, createKeysSuite, createProjectionSuite, createProjectionParitySuite,
     parseTestFilters,
 } from "@hyper-hyper-space/hhs3_rdb_adapter_test";
 import { sqliteHarness, sqliteIngestionHarness, sqliteSpecificTests } from "./sqlite_target_tests.js";
@@ -14,6 +14,8 @@ async function main() {
     allTests.set(sharedSuite.title, sharedSuite.tests);
     const ingestionSuite = createIngestionSuite('SQLITE', sqliteIngestionHarness);
     allTests.set(ingestionSuite.title, ingestionSuite.tests);
+    const endsInNewCycles = createIngestionSuiteWithEndsInNewCycles('SQLITE', sqliteIngestionHarness);
+    allTests.set(endsInNewCycles.title, endsInNewCycles.tests);
     const keysSuite = createKeysSuite('SQLITE', sqliteHarness);
     allTests.set(keysSuite.title, keysSuite.tests);
     const projectionSuite = createProjectionParitySuite('SQLITE', sqliteHarness);

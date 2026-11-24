@@ -120,6 +120,36 @@ async function testHashInputIsRfc8785() {
     }
 }
 
+// A second append of an entry the DAG already holds writes nothing, returns
+// its hash and fires no growth event, and two appends of one entry at once
+// write it once (HIP-29). Before, the second append put the entry back into
+// the frontier, and the memory store ran the two appends at once.
+async function testAppendOfAHeldEntry() {
+    const d = createMemDag();
+    const root = await d.append({ a: 1 }, {});
+    const child = await d.append({ b: 1 }, {}, dag.position(root));
+    let events = 0;
+    d.addListener(() => { events += 1; });
+
+    assertEquals(await d.append({ a: 1 }, {}), root, 'a second append returns the hash');
+    let frontier = await d.getFrontier();
+    assertTrue(frontier.size === 1 && frontier.has(child), "the frontier keeps the entry's child");
+    assertEquals(events, 0, 'no growth event');
+
+    const [h1, h2] = await Promise.all([
+        d.append({ x: 1 }, {}, dag.position(child)),
+        d.append({ x: 1 }, {}, dag.position(child)),
+    ]);
+    assertEquals(h1, h2, 'two appends at once return one hash');
+    assertEquals(events, 1, 'one growth event for the pair');
+    const grandchild = await d.append({ y: 1 }, {}, dag.position(h1));
+    frontier = await d.getFrontier();
+    assertTrue(frontier.size === 1 && frontier.has(grandchild), 'the frontier moved past the entry');
+    let count = 0;
+    for await (const _entry of d.loadAllEntries()) count++;
+    assertEquals(count, 4, 'each entry was written once');
+}
+
 export const entrySuite = {
     title: "\n[ENTRY] Entry creation\n",
     tests: [
@@ -127,5 +157,6 @@ export const entrySuite = {
         { name: "[ENTRY_01] U+FFFD and surrogate pairs are accepted (small DAG)",                invoke: testAcceptsReplacementCharacter },
         { name: "[ENTRY_02] A payload nested deeper than 128 levels is rejected (small DAG)",    invoke: testRejectsDeepPayload },
         { name: "[ENTRY_03] The hash input is the RFC 8785 text of the payload (small DAG)",     invoke: testHashInputIsRfc8785 },
+        { name: "[ENTRY_04] A second append of an entry writes nothing, also two at once (small DAG)", invoke: testAppendOfAHeldEntry },
     ],
 };

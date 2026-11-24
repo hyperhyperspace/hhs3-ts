@@ -2,6 +2,7 @@ import { testing } from "@hyper-hyper-space/hhs3_util";
 
 import { projectionTests } from "./projection_tests.js";
 import { ingestionTests } from "./ingestion_tests.js";
+import { pendingTests } from "./pending_tests.js";
 import { filesTests } from "./files_tests.js";
 
 async function main() {
@@ -10,6 +11,7 @@ async function main() {
 
     allTests.set(projectionTests.title, projectionTests.tests);
     allTests.set(ingestionTests.title, ingestionTests.tests);
+    allTests.set(pendingTests.title, pendingTests.tests);
     allTests.set(filesTests.title, filesTests.tests);
 
     console.log('Running tests for Hyper Hyper Space v3 rdb_projection module'

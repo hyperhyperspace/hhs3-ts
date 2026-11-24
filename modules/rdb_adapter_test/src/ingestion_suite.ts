@@ -14,126 +14,29 @@ import type { json } from "@hyper-hyper-space/hhs3_json";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import { deriveRowId, MigrationRule, Row, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 import {
-    BidirectionalTarget, CapturedBatch, CapturedChange, CheckpointMovedError, DEFAULT_KEY_DOMAIN, IngestSettle,
-    ingestChanges, KeyIndex, MemoryTarget, OpEvent, OpEventQuery, projectGroup, RowAction, SchemaAction,
-    StoredOpEvent, SyncMapping,
+    AdapterConfig, BidirectionalTarget, CapturedBatch, CapturedChange, CapturedChangeId, ChangeRecord, CheckpointMovedError, DEFAULT_KEY_DOMAIN, IngestSettle,
+    ingestChanges, KeyIndex, MemoryTarget, OpEvent, OpEventQuery, PendingChangesError, projectGroup, QueryableTarget, RowAction,
+    rowToUpsertAction,
+    SchemaAction, StoredOpEvent, SyncMapping, syncGroup, WriterRecordStore, AuthorshipMode,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import { serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
+import { leaveEndsToNewCycles } from "@hyper-hyper-space/hhs3_rdb_adapter/testing";
 
 import {
     createAnonymousGroup, createFkGroup, createFlipGroup, createGroup, createNullsGroup, createTypedGroup, GroupFixture, makeIdentity,
+    sameVersion,
 } from "./group_fixture.js";
+import { beforeApply, beforeSettle } from "./target_hooks.js";
 import { ProjectionReader, RowValues } from "./projection_reader.js";
+import { assertAtCheckpoints, CheckedTarget } from "./consistency.js";
+import { createChainCases } from "./ingestion_chain_suite.js";
+import {
+    CrashBeforeSettle, entryCount, failureEvent, localRow, projectAs, rdbRowAction, rdbRows, recordWriter, rowOps, sorted,
+} from "./ingestion_helpers.js";
 
-// A BidirectionalTarget wrapper that DROPS the first commitIngest (its settle
-// is silently discarded) then delegates normally - simulating a crash in the
-// window AFTER the rdb append but BEFORE the target ack. reserveMint still runs
-// (minted uuids are durable pre-append), and the append lands, so the outbox is
-// left un-acked for a deterministic replay. Everything else delegates to inner.
-class CrashBeforeSettle implements BidirectionalTarget {
-    private commits = 0;
-    constructor(private readonly inner: BidirectionalTarget) {}
+export { projectAs } from "./ingestion_helpers.js";
 
-    apply(g: B64Hash, s: SchemaAction[], r: RowAction[], c: Version, e?: OpEvent[], from?: Version | null): Promise<void> {
-        return this.inner.apply(g, s, r, c, e, from);
-    }
-    getCheckpoint(g: B64Hash): Promise<Version | undefined> { return this.inner.getCheckpoint(g); }
-    drainChanges(): Promise<CapturedBatch> { return this.inner.drainChanges(); }
-    resolveRow(t: string, l: number): Promise<SyncMapping | undefined> { return this.inner.resolveRow(t, l); }
-    reserveMint(m: SyncMapping[]): Promise<SyncMapping[]> { return this.inner.reserveMint(m); }
-    drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]> { return this.inner.drainOpEvents(opts); }
-    async commitIngest(settle: IngestSettle): Promise<void> {
-        this.commits += 1;
-        if (this.commits === 1) return;   // the "crash": drop the settle
-        return this.inner.commitIngest(settle);
-    }
-}
 
-// A wrapper that, before delegating its FIRST reserveMint, injects a COMPETING
-// identity (a different row_hash) for a chosen (table, localId) directly through
-// the inner target - simulating a concurrent ingester (or a projection) that
-// claimed that local id first. The delegated reserveMint must then ADOPT the
-// competitor, so the pass re-plans and submits the agreed identity.
-class RaceReserve implements BidirectionalTarget {
-    private injected = false;
-    constructor(private readonly inner: BidirectionalTarget, private readonly competitor: SyncMapping) {}
-
-    apply(g: B64Hash, s: SchemaAction[], r: RowAction[], c: Version, e?: OpEvent[], from?: Version | null): Promise<void> {
-        return this.inner.apply(g, s, r, c, e, from);
-    }
-    getCheckpoint(g: B64Hash): Promise<Version | undefined> { return this.inner.getCheckpoint(g); }
-    drainChanges(): Promise<CapturedBatch> { return this.inner.drainChanges(); }
-    resolveRow(t: string, l: number): Promise<SyncMapping | undefined> { return this.inner.resolveRow(t, l); }
-    drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]> { return this.inner.drainOpEvents(opts); }
-    commitIngest(settle: IngestSettle): Promise<void> { return this.inner.commitIngest(settle); }
-    async reserveMint(m: SyncMapping[]): Promise<SyncMapping[]> {
-        if (!this.injected) {
-            this.injected = true;
-            await this.inner.reserveMint([this.competitor]);   // the competitor claims the id first
-        }
-        return this.inner.reserveMint(m);
-    }
-}
-
-// A wrapper whose SECOND drainChanges (the orchestrator's recovery-time drain,
-// used to compute pending rows) returns an extra injected change for a chosen
-// local id - so the quiescence gate sees a "newer pending" change. Proves an
-// insert orphan is still reverted+poisoned despite the pending row.
-class InjectPendingOnRecovery implements BidirectionalTarget {
-    private drains = 0;
-    constructor(private readonly inner: BidirectionalTarget, private readonly inject: CapturedChange) {}
-
-    apply(g: B64Hash, s: SchemaAction[], r: RowAction[], c: Version, e?: OpEvent[], from?: Version | null): Promise<void> {
-        return this.inner.apply(g, s, r, c, e, from);
-    }
-    getCheckpoint(g: B64Hash): Promise<Version | undefined> { return this.inner.getCheckpoint(g); }
-    resolveRow(t: string, l: number): Promise<SyncMapping | undefined> { return this.inner.resolveRow(t, l); }
-    reserveMint(m: SyncMapping[]): Promise<SyncMapping[]> { return this.inner.reserveMint(m); }
-    drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]> { return this.inner.drainOpEvents(opts); }
-    commitIngest(settle: IngestSettle): Promise<void> { return this.inner.commitIngest(settle); }
-    async drainChanges(): Promise<CapturedBatch> {
-        this.drains += 1;
-        const batch = await this.inner.drainChanges();
-        if (this.drains === 2) return { changes: [...batch.changes, this.inject] };
-        return batch;
-    }
-}
-
-// After the first reserveMint, append the reserved identity to the group
-// BEFORE the orchestrator's submit walk. Proves a write-once conflict on a
-// freshly minted (not reusedIdentity) insert is an idempotent skip, not a
-// recorded failure: the adopter / a racing replica may land first.
-class LandBeforeWalk implements BidirectionalTarget {
-    private landed = false;
-    constructor(
-        private readonly inner: BidirectionalTarget,
-        private readonly group: RTableGroup,
-        private readonly writer: OwnIdentity,
-        private readonly rdbTable: string,
-        private readonly values: { [column: string]: string },
-    ) {}
-
-    apply(g: B64Hash, s: SchemaAction[], r: RowAction[], c: Version, e?: OpEvent[], from?: Version | null): Promise<void> {
-        return this.inner.apply(g, s, r, c, e, from);
-    }
-    getCheckpoint(g: B64Hash): Promise<Version | undefined> { return this.inner.getCheckpoint(g); }
-    drainChanges(): Promise<CapturedBatch> { return this.inner.drainChanges(); }
-    resolveRow(t: string, l: number): Promise<SyncMapping | undefined> { return this.inner.resolveRow(t, l); }
-    drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]> { return this.inner.drainOpEvents(opts); }
-    commitIngest(settle: IngestSettle): Promise<void> { return this.inner.commitIngest(settle); }
-    async reserveMint(m: SyncMapping[]): Promise<SyncMapping[]> {
-        const effective = await this.inner.reserveMint(m);
-        if (!this.landed && effective.length > 0) {
-            this.landed = true;
-            const mapping = effective[0];
-            await this.group.bundle([{
-                table: this.rdbTable,
-                op: { action: 'insert', rowId: mapping.rowId, uuid: mapping.uuid, values: this.values },
-            }], this.writer);
-        }
-        return effective;
-    }
-}
 
 // What the app writes to a projected row: a logical value per column, or null
 // to set the column to NULL. (A row read back has no nulls; see ReadRow.)
@@ -145,6 +48,13 @@ export type LocalValues = { [column: string]: json.Literal | null };
 // projection-local id the row was given.
 export interface LocalMutator {
     insert(table: string, values: LocalValues, author?: number): number | Promise<number>;
+    // An insert under an explicit local id where no row is: SQLite's INSERT
+    // with an id, IndexedDB's put of a new record. Absent on memory, which
+    // allocates every id.
+    insertAt?(table: string, localId: number, values: LocalValues): void | Promise<void>;
+    // An insert under an explicit local id that replaces the row there:
+    // SQLite's INSERT OR REPLACE. IndexedDB's put over a record is an update.
+    replaceAt?(table: string, localId: number, values: LocalValues): void | Promise<void>;
     update(table: string, localId: number, values: LocalValues): void | Promise<void>;
     delete(table: string, localId: number): void | Promise<void>;
     setCaptureEnabled(on: boolean): void | Promise<void>;
@@ -155,6 +65,10 @@ export type IngestionHarness = {
     read: ProjectionReader;
     local: LocalMutator;
     cleanup?: () => void | Promise<void>;
+    // Closes this harness and opens the same store again, as a restart after a
+    // crash finds it: what was committed, and nothing a process held in
+    // memory. Absent on memory, whose store lives only in the process.
+    reopen?: () => Promise<IngestionHarness>;
 };
 
 export type IngestionFactory = () => IngestionHarness | Promise<IngestionHarness>;
@@ -181,29 +95,21 @@ export function memoryIngestionHarness(): IngestionHarness {
 
 type NamedTest = { name: string; invoke: () => Promise<void> };
 
-// A row's values as a sorted list, for whole-row comparisons.
-function sorted(values: { [column: string]: unknown } | undefined): string {
-    return values === undefined ? '<no row>' : JSON.stringify(Object.entries(values).sort());
-}
-
-// The row ops the group holds for `table`, oldest first, as written.
-async function rowOps(group: RTableGroup, table: string): Promise<{ action: string; values: { [c: string]: unknown }; nulls?: string[] }[]> {
-    const ops: { action: string; values: { [c: string]: unknown }; nulls?: string[] }[] = [];
-    for await (const entry of (await group.getScopedDag()).loadAllEntries()) {
-        const payload = entry.payload as { action?: string; table?: string; op?: unknown; writes?: { table: string; op: unknown }[] };
-        const writes = payload.action === 'bundle' ? payload.writes ?? []
-            : payload.action === 'row' && payload.table !== undefined ? [{ table: payload.table, op: payload.op }] : [];
-        for (const write of writes) {
-            if (write.table === table) ops.push(write.op as { action: string; values: { [c: string]: unknown }; nulls?: string[] });
-        }
-    }
-    return ops;
-}
-
-// Live rows of an rdb group table (the assertion target: what ingestion wrote).
-async function rdbRows(group: RTableGroup, table: string): Promise<Row[]> {
-    const view = await (await group.getTable(table)).getView();
-    return view.query({});
+// The ingestion suite again, with every end of a pass left to a new cycle, as
+// a crash right after a pass's last record would leave it (HIP-29). The end
+// reads only what is stored, so every case holds unchanged.
+export function createIngestionSuiteWithEndsInNewCycles(label: string, factory: IngestionFactory): { title: string; tests: NamedTest[] } {
+    const suite = createIngestionSuite(`${label}-ENDS`, factory);
+    return {
+        title: `${suite.title}, every end of a pass in a new cycle`,
+        tests: suite.tests.map((t) => ({
+            name: t.name,
+            invoke: async () => {
+                leaveEndsToNewCycles(true);
+                try { await t.invoke(); } finally { leaveEndsToNewCycles(false); }
+            },
+        })),
+    };
 }
 
 export function createIngestionSuite(label: string, factory: IngestionFactory): { title: string; tests: NamedTest[] } {
@@ -218,7 +124,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
 
                     const { target, read, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         const before = (await rdbRows(group, 'tags')).length;
 
                         const localId = await local.insert('tags', { code: 'urgent' });
@@ -234,7 +140,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                         assertEquals(ingested!.author, admin.keyId, 'op authored by the configured writer');
 
                         // Convergence: reprojection reuses the local id committed by ingest.
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         assertTrue(await read.getRow('tags', ingested!.rowId) !== undefined,
                             'ingested row materialized on reprojection');
                         assertEquals(await read.syncId('tags', ingested!.rowId), localId,
@@ -252,7 +158,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
 
                     const { target, read, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         const l1 = deriveRowId('l1', admin.keyId);
                         const localId = await read.syncId('ledger', l1);
                         assertTrue(localId !== undefined, 'l1 has a local id after projection');
@@ -271,58 +177,6 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                 },
             },
             {
-                name: `[${label}-IN03] updateMerge: consecutive disjoint-field edits fold into a single op`,
-                invoke: async () => {
-                    const { group, admin } = await createGroup();
-                    await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', amount: '10.00' }, admin);
-
-                    const { target, read, local, cleanup } = await factory();
-                    try {
-                        await projectGroup(group, target);
-                        const l1 = deriveRowId('l1', admin.keyId);
-                        const localId = (await read.syncId('ledger', l1))!;
-
-                        // Disjoint columns (memo, amount) on the same row, consecutive:
-                        // the default updateMerge folds them into ONE rdb update op.
-                        await local.update('ledger', localId, { memo: 'a' });
-                        await local.update('ledger', localId, { amount: '20.00' });
-                        const result = await ingestChanges(group, target, { writer: admin });
-
-                        assertEquals(result.accepted, 1, 'two disjoint edits merge into one op');
-                        const row = (await rdbRows(group, 'ledger')).find((r) => r.rowId === l1);
-                        assertEquals(row!.values.memo, 'a', 'first field landed');
-                        assertEquals(row!.values.amount, '20.00', 'second field landed in the same op');
-                    } finally {
-                        await cleanup?.();
-                    }
-                },
-            },
-            {
-                name: `[${label}-IN03b] updateMerge:false emits one op per update change (order-preserving)`,
-                invoke: async () => {
-                    const { group, admin } = await createGroup();
-                    await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', amount: '10.00' }, admin);
-
-                    const { target, read, local, cleanup } = await factory();
-                    try {
-                        await projectGroup(group, target);
-                        const l1 = deriveRowId('l1', admin.keyId);
-                        const localId = (await read.syncId('ledger', l1))!;
-
-                        await local.update('ledger', localId, { memo: 'a' });
-                        await local.update('ledger', localId, { amount: '20.00' });
-                        const result = await ingestChanges(group, target, { writer: admin, updateMerge: false });
-
-                        assertEquals(result.accepted, 2, 'two changes stay two ops when updateMerge is off');
-                        const row = (await rdbRows(group, 'ledger')).find((r) => r.rowId === l1);
-                        assertEquals(row!.values.memo, 'a', 'first field landed');
-                        assertEquals(row!.values.amount, '20.00', 'second field landed');
-                    } finally {
-                        await cleanup?.();
-                    }
-                },
-            },
-            {
                 name: `[${label}-IN04] insert-then-delete of the same local row submits both faithfully`,
                 invoke: async () => {
                     const { group, admin } = await createGroup();
@@ -330,7 +184,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
 
                     const { target, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         const before = (await rdbRows(group, 'tags')).length;
 
                         const localId = await local.insert('tags', { code: 'temp' });
@@ -356,7 +210,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
 
                     const { target, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
 
                         await local.setCaptureEnabled(false);
                         await local.insert('tags', { code: 'ghost' });
@@ -383,7 +237,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
 
                     const { target, read, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         const l1 = deriveRowId('l1', admin.keyId);
                         const localId = (await read.syncId('ledger', l1))!;
 
@@ -407,7 +261,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
 
                     const { target, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
 
                         // Both inserted locally in one batch; child references the
                         // parent by its projection-local id.
@@ -435,7 +289,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
 
                     const { target, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
 
                         const postId = await local.insert('posts', { title: 'T' });
                         await local.insert('comments', { body: 'c', post_id: postId });
@@ -460,7 +314,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
 
                     const { target, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
 
                         // post_id points at a local id that was never allocated.
                         await local.insert('comments', { body: 'orphan', post_id: 9999 });
@@ -482,7 +336,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
 
                     const { target, read, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
 
                         const localId = await local.insert('comments', { body: 'orphan', post_id: 9999 });
                         const result = await ingestChanges(group, target, { writer: admin });
@@ -522,7 +376,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
 
                     const { target, read, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         const l1 = deriveRowId('l1', admin.keyId);
                         const localId = (await read.syncId('ledger', l1))!;
 
@@ -554,76 +408,38 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                 },
             },
             {
-                name: `[${label}-IN12] partial-failure: a multi-field update lands its valid field and records only the offender`,
-                invoke: async () => {
-                    const { group, admin } = await createGroup();
-                    await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', amount: '10.00' }, admin);
-
-                    const { target, read, local, cleanup } = await factory();
-                    try {
-                        await projectGroup(group, target);
-                        const l1 = deriveRowId('l1', admin.keyId);
-                        const localId = (await read.syncId('ledger', l1))!;
-
-                        // One editable field (memo) + one readonly field (ref), as two
-                        // consecutive updates the planner merges. The offending field
-                        // is dropped; the valid field still lands.
-                        await local.update('ledger', localId, { memo: 'ok' });
-                        await local.update('ledger', localId, { ref: 'HACKED' });
-                        const result = await ingestChanges(group, target, { writer: admin });
-
-                        assertEquals(result.accepted, 1, 'the valid field lands as one op');
-                        assertEquals(result.rejected.length, 1, 'only the readonly field is rejected');
-                        const row = (await rdbRows(group, 'ledger')).find((r) => r.rowId === l1);
-                        assertEquals(row!.values.memo, 'ok', 'the valid field landed in rdb');
-                        assertEquals(row!.values.ref, 'R-1', 'the readonly field did not');
-
-                        const events = await target.drainOpEvents();
-                        assertEquals(events.length, 1, 'one op-event for the offending field');
-                        assertEquals(events[0].event.direction, 'failure', 'a failure');
-                        assertEquals((await target.drainChanges()).changes.length, 0, 'the outbox is acked');
-                    } finally {
-                        await cleanup?.();
-                    }
-                },
-            },
-            {
-                name: `[${label}-IN13] crash-replay: append landed but settle dropped -> replay reuses the uuid, no duplicate row`,
+                name: `[${label}-IN13] a crash after the append and before the settle: the next cycle settles what was appended, with the checkpoint at its entry, and writes no entry twice`,
                 invoke: async () => {
                     const { group, admin } = await createGroup();
                     await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', amount: '10.00' }, admin);
 
                     const { target, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         const before = (await rdbRows(group, 'tags')).length;
-
+                        const entriesBefore = await entryCount(group);
                         const localId = await local.insert('tags', { code: 'once' });
 
-                        // Pass 1: the wrapper drops the settle AFTER the append lands
-                        // (a simulated crash). The reserved uuid is already durable
-                        // and the rdb op is appended, but the outbox is not acked.
+                        // The settle is dropped after the append lands (a simulated crash).
                         const first = await ingestChanges(group, new CrashBeforeSettle(target), { writer: admin });
-                        assertEquals(first.accepted, 1, 'the op was appended before the crash');
-                        assertEquals((await rdbRows(group, 'tags')).length, before + 1, 'the row is in rdb');
-                        assertTrue((await target.drainChanges()).changes.length >= 1, 'the outbox is NOT acked (crash)');
-                        const reserved = await target.resolveRow('tags', localId);
-                        assertTrue(reserved !== undefined && reserved.uuid !== '', 'the minted uuid is durable pre-append');
-                        const rowId = reserved!.rowId;
+                        assertEquals(first.accepted, 1, 'the entry was appended before the crash');
+                        const [pending] = (await target.drainChanges()).changes;
+                        assertTrue(pending?.record?.entry !== undefined, 'the outbox row holds the entry\'s hash');
+                        assertEquals(await target.resolveRow('tags', localId), undefined, 'no identity is saved before the settle');
 
-                        // Pass 2 (restart): replay drains the same change, reads the
-                        // reserved uuid back, re-appends the SAME op (rdb reports it as
-                        // already write-once -> idempotent skip), and acks.
+                        // The next cycle's end settles it, and reports it.
                         const second = await ingestChanges(group, target, { writer: admin });
-                        assertEquals(second.accepted, 0, 'the replay recognizes the op as already-applied (no re-accept)');
-                        assertEquals(second.rejected.length, 0, 'and it is NOT a failure');
-
-                        // The guarantee: exactly one row, same identity, outbox acked.
-                        assertEquals((await rdbRows(group, 'tags')).length, before + 1, 'no duplicate row after replay');
-                        const after = await target.resolveRow('tags', localId);
-                        assertEquals(after!.rowId, rowId, 'the replay reused the reserved uuid (identical rowId)');
-                        assertEquals(after!.status, 'active', 'the row is active, not a failure');
-                        assertEquals((await target.drainChanges()).changes.length, 0, 'the outbox is now acked');
+                        assertEquals(second.accepted, 1, 'the crashed pass\'s change is reported by the cycle that settles it');
+                        assertEquals(second.rejected.length, 0, 'and it is not a failure');
+                        assertEquals((await rdbRows(group, 'tags')).length, before + 1, 'one row');
+                        assertEquals(await entryCount(group), entriesBefore + 1, 'one entry');
+                        assertTrue(sameVersion(await target.getCheckpoint(group.getId()), new Set([pending.record!.entry!])),
+                            "the checkpoint is the crashed pass's last entry");
+                        const mapping = await target.resolveRow('tags', localId);
+                        assertEquals(mapping?.rowId, (await rdbRows(group, 'tags')).find((r) => r.values.code === 'once')?.rowId,
+                            'the mapping is read from the entry');
+                        assertEquals(mapping?.status, 'active', 'active');
+                        assertEquals((await target.drainChanges()).changes.length, 0, 'the outbox is empty');
                     } finally {
                         await cleanup?.();
                     }
@@ -636,7 +452,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
 
                     const { target, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
 
                         // 1. A dangling-FK insert fails and its local id is poisoned.
                         const failedId = await local.insert('comments', { body: 'orphan', post_id: 9999 });
@@ -674,99 +490,62 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                 },
             },
             {
-                name: `[${label}-IN15] crash-replay after a prior failure: the replay reuses the reserved uuid, no duplicate`,
+                name: `[${label}-IN15] a crash after a prior failure: the next cycle settles the appended insert, and the refused local id keeps its mapping`,
                 invoke: async () => {
                     const { group, admin } = await createFkGroup();
 
                     const { target, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
 
-                        // Poison comments#1, then legalize and re-insert at a new id.
-                        await local.insert('comments', { body: 'orphan', post_id: 9999 });
+                        // A refused insert, then a legal one at a new id.
+                        const failedId = await local.insert('comments', { body: 'orphan', post_id: 9999 });
                         await ingestChanges(group, target, { writer: admin });
                         const postId = await local.insert('posts', { title: 'T' });
                         await ingestChanges(group, target, { writer: admin });
+                        await projectAs(group, target, admin);
                         const newId = await local.insert('comments', { body: 'real', post_id: postId });
+                        const entriesBefore = await entryCount(group);
 
-                        // Pass A: the append lands, the settle is dropped (crash).
                         const a = await ingestChanges(group, new CrashBeforeSettle(target), { writer: admin });
                         assertEquals(a.accepted, 1, 'the comment appended before the crash');
-                        const reserved = await target.resolveRow('comments', newId);
-                        assertTrue(reserved !== undefined && reserved.uuid !== '', 'the uuid is durable pre-append');
-                        const rowId = reserved!.rowId;
-
-                        // Pass B (restart): the replay reads the reserved uuid back,
-                        // re-appends (idempotent skip), and acks. resolveRow must not be
-                        // confused by the poisoned mapping at the other local id.
                         const b = await ingestChanges(group, target, { writer: admin });
-                        assertEquals(b.accepted, 0, 'the replay recognizes the op as already-applied');
+                        assertEquals(b.accepted, 1, 'the next cycle settles it');
                         assertEquals(b.rejected.length, 0, 'and it is not a failure');
 
                         const comments = await rdbRows(group, 'comments');
-                        assertEquals(comments.length, 1, 'exactly one comment, no duplicate after replay');
-                        assertEquals(comments[0].rowId, rowId, 'the replay reused the reserved uuid (identical rowId)');
-                        assertEquals((await target.resolveRow('comments', newId))!.status, 'active', 'active mapping');
-                        assertEquals((await target.drainChanges()).changes.length, 0, 'the outbox is acked');
+                        assertEquals(comments.length, 1, 'exactly one comment');
+                        assertEquals(await entryCount(group), entriesBefore + 1, 'one entry');
+                        assertEquals((await target.resolveRow('comments', newId))?.rowId, comments[0].rowId, 'its mapping');
+                        assertEquals((await target.resolveRow('comments', failedId))?.status, 'ingestion_failure', 'the refused id keeps its mapping');
+                        assertEquals((await target.drainChanges()).changes.length, 0, 'the outbox is empty');
                     } finally {
                         await cleanup?.();
                     }
                 },
             },
             {
-                name: `[${label}-IN16] claim-or-adopt: a concurrent identity for the same local id is adopted, one rdb row`,
-                invoke: async () => {
-                    const { group, admin } = await createGroup();
-
-                    const { target, local, cleanup } = await factory();
-                    try {
-                        await projectGroup(group, target);
-                        const localId = await local.insert('tags', { code: 'x' });
-
-                        // A concurrent ingester claimed this local id first with a
-                        // DIFFERENT identity. reserveMint adopts it; the pass re-plans
-                        // and submits the adopted identity, converging to ONE row.
-                        const competitorUuid = 'competitor-uuid';
-                        const competitor: SyncMapping = {
-                            table: 'tags', localId, rowId: deriveRowId(competitorUuid, admin.keyId),
-                            uuid: competitorUuid, author: admin.keyId, status: 'active',
-                        };
-                        const result = await ingestChanges(group, new RaceReserve(target, competitor), { writer: admin });
-                        assertEquals(result.accepted, 1, 'one op submitted (the adopted identity)');
-
-                        const mine = (await rdbRows(group, 'tags')).filter((r) => r.values.code === 'x');
-                        assertEquals(mine.length, 1, 'exactly one tag row, not two');
-                        assertEquals(mine[0].rowId, competitor.rowId, 'the adopted identity landed, not a fresh mint');
-                        const mapping = await target.resolveRow('tags', localId);
-                        assertEquals(mapping!.uuid, competitorUuid, 'the sync mapping is the adopted identity');
-                        assertEquals((await target.drainChanges()).changes.length, 0, 'the outbox is acked');
-                    } finally {
-                        await cleanup?.();
-                    }
-                },
-            },
-            {
-                name: `[${label}-IN17] an insert orphan is reverted+poisoned even when a newer change for its id is pending`,
+                name: `[${label}-IN17] a refused insert's row is removed and its mapping marked ingestion_failure even when a later change of it is pending, which is refused at its turn`,
                 invoke: async () => {
                     const { group, admin } = await createFkGroup();
 
-                    const { target, read, local, cleanup } = await factory();
+                    const { target, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         const failedId = await local.insert('comments', { body: 'orphan', post_id: 9999 });
 
-                        // Inject a newer pending change for the SAME local id into the
-                        // recovery drain. Pre-fix the quiescence gate would skip the
-                        // orphan revert; now the orphan is poisoned regardless.
-                        const injected: CapturedChange = {
-                            id: 9_000_001, kind: 'update', table: 'comments', localId: failedId, values: { body: 'later' },
-                        };
-                        const result = await ingestChanges(group, new InjectPendingOnRecovery(target, injected), { writer: admin });
+                        // A later change of the same row, captured while the pass runs.
+                        const hooked = beforeSettle(target, async () => { await local.update('comments', failedId, { body: 'later' }); });
+                        const result = await ingestChanges(group, hooked, { writer: admin });
                         assertEquals(result.accepted, 0, 'the dangling insert lands nothing');
-
                         const mapping = await target.resolveRow('comments', failedId);
-                        assertEquals(mapping!.status, 'ingestion_failure', 'the orphan is poisoned despite the pending row');
-                        assertTrue(await read.getRow('comments', mapping!.rowId) === undefined, 'the orphan app row is reverted');
+                        assertEquals(mapping?.status, 'ingestion_failure', 'the refused insert keeps its identity');
+                        assertEquals(await localRow(target, 'comments', failedId), undefined, 'its row is removed, the pending update finding none');
+                        assertEquals((await target.drainChanges()).changes.length, 1, 'the later change is still pending');
+
+                        const next = await ingestChanges(group, target, { writer: admin });
+                        assertTrue(next.rejected.length === 1 && next.rejected[0].reason.includes('refused'), 'it is refused at its turn');
+                        assertEquals((await target.drainChanges()).changes.length, 0, 'and leaves the outbox');
                     } finally {
                         await cleanup?.();
                     }
@@ -810,38 +589,6 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                 },
             },
             {
-                name: `[${label}-IN19] write-once is idempotent for any own insert (even when reusedIdentity is false)`,
-                invoke: async () => {
-                    const { group, admin } = await createGroup();
-
-                    const { target, local, cleanup } = await factory();
-                    try {
-                        await projectGroup(group, target);
-                        await local.insert('tags', { code: 'x' });
-
-                        // The wrapper lands the reserved identity between reserveMint
-                        // and the submit walk. submitOp must treat the write-once
-                        // conflict as already-applied (not a failure) even though
-                        // this is a FRESH mint, not a crash-replay reuse.
-                        const result = await ingestChanges(
-                            group,
-                            new LandBeforeWalk(target, group, admin, 'tags', { code: 'x' }),
-                            { writer: admin },
-                        );
-                        assertEquals(result.rejected.length, 0, 'write-once is a skip, not a recorded failure');
-
-                        const mine = (await rdbRows(group, 'tags')).filter((r) => r.values.code === 'x');
-                        assertEquals(mine.length, 1, 'exactly one tag row (the pre-landed identity)');
-                        assertEquals((await target.drainChanges()).changes.length, 0, 'the outbox is acked');
-                        const events = await target.drainOpEvents();
-                        assertEquals(events.filter((e) => e.event.origin === 'ingestion').length, 0,
-                            'no ingestion/failure op-event');
-                    } finally {
-                        await cleanup?.();
-                    }
-                },
-            },
-            {
                 name: `[${label}-IN20] a column is dropped while capture is on: the drop projects, and later local writes are captured`,
                 invoke: async () => {
                     // Each case: project, deploy a schema change that drops a column of a
@@ -874,7 +621,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                         const { group, schema, admin } = await c.fixture();
                         const { target, read, local, cleanup } = await factory();
                         try {
-                            await projectGroup(group, target);
+                            await projectAs(group, target, admin);
                             await schema.updateSchema(c.rules, admin, c.what);
                             await group.deploy(await (await schema.getScopedDag()).getFrontier());
                             await projectGroup(group, target);
@@ -911,7 +658,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const a = await factory();
                     const b = await factory();
                     try {
-                        await projectGroup(group, a.target);
+                        await projectAs(group, a.target, admin);
                         const localId = (await a.read.syncId('notes', n1))!;
 
                         // a plain column, one with a default, a boolean and a foreign key
@@ -927,8 +674,8 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                         assertEquals((await a.target.drainChanges()).changes.length, 0, 'the outbox is acked');
 
                         // the writing device after the projection of its own write, and a second device
-                        await projectGroup(group, a.target);
-                        await projectGroup(group, b.target);
+                        await projectAs(group, a.target, admin);
+                        await projectAs(group, b.target, admin);
                         assertEquals(sorted((await a.read.getRow('notes', n1))?.values), sorted({ title: 'a' }), 'the writing device still reads NULL');
                         assertEquals(sorted((await b.read.getRow('notes', n1))?.values), sorted({ title: 'a' }), 'a second device reads NULL');
                     } finally {
@@ -948,7 +695,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const a = await factory();
                     const b = await factory();
                     try {
-                        await projectGroup(group, a.target);
+                        await projectAs(group, a.target, admin);
                         const base = await (await group.getScopedDag()).getFrontier();
 
                         // device A clears both columns; another replica, not having seen that, sets them
@@ -957,8 +704,8 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                         assertEquals(result.rejected.length, 0, 'the clear is ingested');
                         await notes.update(n1, { memo: 'new', tag: 'new' }, admin, base);
 
-                        await projectGroup(group, a.target);
-                        await projectGroup(group, b.target);
+                        await projectAs(group, a.target, admin);
+                        await projectAs(group, b.target, admin);
                         for (const [device, what] of [[a, 'the device that cleared'], [b, 'a second device']] as const) {
                             assertEquals(sorted((await device.read.getRow('notes', n1))?.values), sorted({ title: 'a', memo: 'new', tag: 'new' }),
                                 `${what} ends with the concurrent value`);
@@ -976,7 +723,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const a = await factory();
                     const b = await factory();
                     try {
-                        await projectGroup(group, a.target);
+                        await projectAs(group, a.target, admin);
                         await a.local.insert('notes', { title: 'nulled', memo: null, tag: null, topic_id: null });
                         await a.local.insert('notes', { title: 'left-out' });
                         const result = await ingestChanges(group, a.target, { writer: admin });
@@ -996,8 +743,8 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                         assertEquals((insertOf('nulled').nulls ?? []).join(','), 'tag', 'only the null of the column with a default is written');
                         assertTrue(insertOf('left-out').nulls === undefined, 'an insert with no NULL of that kind writes no null');
 
-                        await projectGroup(group, a.target);
-                        await projectGroup(group, b.target);
+                        await projectAs(group, a.target, admin);
+                        await projectAs(group, b.target, admin);
                         assertEquals(sorted((await a.read.getRow('notes', nulled.rowId))?.values), sorted({ title: 'nulled' }), 'the writing device reads NULL');
                         assertEquals(sorted((await b.read.getRow('notes', nulled.rowId))?.values), sorted({ title: 'nulled' }), 'a second device reads NULL');
                         assertEquals(sorted((await b.read.getRow('notes', leftOut.rowId))?.values), sorted({ title: 'left-out', tag: 'none' }),
@@ -1017,7 +764,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
 
                     const { target, read, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         const localId = (await read.syncId('notes', n1))!;
 
                         // `topic` is NULL in rdb; the app points it at a row that does not exist
@@ -1063,7 +810,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const { group, admin } = await createTypedGroup();
                     const { target, read, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         await local.insert('things', { label: 'bad', data: { a: null } as unknown as json.Literal });
                         await local.insert('things', { label: 'good' });
                         const result = await ingestChanges(group, target, { writer: admin });
@@ -1074,7 +821,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                         const failures = (await target.drainOpEvents()).filter((e) => e.event.direction === 'failure');
                         assertEquals(failures.length, 1, 'the refusal is logged');
                         assertEquals((await target.drainChanges()).changes.length, 0, 'the outbox is acked');
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         assertEquals((await read.getRowIds('things')).length, 1, 'the target keeps only the good row');
                     } finally {
                         await cleanup?.();
@@ -1089,13 +836,13 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const l1 = deriveRowId('l1', admin.keyId);
                     const { target, read, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         const localId = (await read.syncId('ledger', l1))!;
                         for (const ref of ['R-2', 'R-3']) {
                             await local.update('ledger', localId, { ref });
                             const result = await ingestChanges(group, target, { writer: admin });
                             assertEquals(result.rejected.length, 1, `the update to ${ref} is refused`);
-                            await projectGroup(group, target);
+                            await projectAs(group, target, admin);
                         }
                         const failures = (await target.drainOpEvents()).filter((e) => e.event.direction === 'failure');
                         assertEquals(failures.length, 2, 'both refusals are in the event log');
@@ -1113,7 +860,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const inner = await factory();
                     const target = new CrashBeforeSettle(inner.target);
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         const localId = (await inner.read.syncId('ledger', l1))!;
                         await inner.local.update('ledger', localId, { ref: 'R-2' });
                         await ingestChanges(group, target, { writer: admin });   // the settle is lost
@@ -1126,20 +873,20 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                 },
             },
             {
-                name: `[${label}-IN28] a native update that sets two readonly columns of one row logs two failure events`,
+                name: `[${label}-IN28] a native update that sets two readonly columns of one row is refused whole, with one failure event, and both are put back`,
                 invoke: async () => {
                     const { group, admin } = await createTypedGroup();
                     await (await group.getTable('things')).insert('t1', { label: 'a', code: 'c1', spec: { v: 1 } }, admin);
                     const t1 = deriveRowId('t1', admin.keyId);
                     const { target, read, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         const localId = (await read.syncId('things', t1))!;
                         await local.update('things', localId, { code: 'c2', spec: { v: 2 } });
                         const result = await ingestChanges(group, target, { writer: admin });
-                        assertEquals(result.rejected.length, 2, 'each readonly column is refused');
+                        assertEquals(result.rejected.length, 1, 'the update is refused whole (HIP-29)');
                         const failures = (await target.drainOpEvents()).filter((e) => e.event.direction === 'failure');
-                        assertEquals(failures.length, 2, 'each refusal is logged');
+                        assertEquals(failures.length, 1, 'with one failure event');
                         const row = await read.getRow('things', t1);
                         assertEquals(row?.values.code, 'c1', 'code is put back');
                         assertEquals(JSON.stringify(row?.values.spec), JSON.stringify({ v: 1 }), 'spec is put back');
@@ -1149,22 +896,22 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                 },
             },
             {
-                name: `[${label}-IN29] a native update that writes the values a row already has, NULL included, captures nothing`,
+                name: `[${label}-IN29] a native update records every column it names, changed or not, NULL included, as one change of the row`,
                 invoke: async () => {
                     const { group, admin } = await createTypedGroup();
                     await (await group.getTable('things')).insert('t1', { label: 'a', note: 'n', flag: true, data: { x: 1 } }, admin);
                     const t1 = deriveRowId('t1', admin.keyId);
                     const { target, read, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         const localId = (await read.syncId('things', t1))!;
+                        // HIP-29: a named column is a write, so capture no longer compares.
                         await local.update('things', localId, { label: 'a', note: 'n', flag: true, data: { x: 1 }, ratio: null });
-                        assertEquals((await target.drainChanges()).changes.length, 0, 'an update that changes nothing captures nothing');
-
                         await local.update('things', localId, { label: 'b', note: 'n', data: { x: 1 } });
                         const captured = (await target.drainChanges()).changes
-                            .flatMap((c) => c.kind === 'update' ? Object.keys(c.values) : [c.kind]);
-                        assertEquals(captured.join(','), 'label', 'only the column whose value changed is captured');
+                            .map((c) => c.kind === 'update' ? Object.keys(c.values).sort().join('+') : c.kind);
+                        assertEquals(captured.join(','), 'data+flag+label+note+ratio,data+label+note',
+                            'each update is one change with every column it names');
                     } finally {
                         await cleanup?.();
                     }
@@ -1177,7 +924,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const other = await makeIdentity();
                     const { target, read, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         const keys = target as unknown as KeyIndex;
                         const otherId = await keys.registerKey(DEFAULT_KEY_DOMAIN, other.keyId, serializePublicKeyToBase64(other.publicKey));
                         await local.insert('things', { label: 'x' }, otherId);
@@ -1187,7 +934,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                         assertEquals((await rdbRows(group, 'things')).length, 0, 'rdb has no row');
                         const failures = (await target.drainOpEvents()).filter((e) => e.event.direction === 'failure');
                         assertEquals(failures.length, 1, 'the refusal is logged');
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         assertEquals((await read.getRowIds('things')).length, 0, 'the local row is removed');
                     } finally {
                         await cleanup?.();
@@ -1200,7 +947,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const { group, admin } = await createTypedGroup();
                     const { target, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         const keys = target as unknown as KeyIndex;
                         const writerId = await keys.registerKey(DEFAULT_KEY_DOMAIN, admin.keyId, serializePublicKeyToBase64(admin.publicKey));
                         await local.insert('things', { label: 'named' }, writerId);
@@ -1216,7 +963,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                 },
             },
             {
-                name: `[${label}-IN32] a native update of the author column is refused and reverted, and logged; its other columns land`,
+                name: `[${label}-IN32] a native update of the author column is refused whole and reverted, with one failure event, its other columns with it`,
                 invoke: async () => {
                     const { group, admin } = await createTypedGroup();
                     await (await group.getTable('things')).insert('t1', { label: 'a' }, admin);
@@ -1224,24 +971,23 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const other = await makeIdentity();
                     const { target, read, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         const keys = target as unknown as KeyIndex;
                         const adminId = await keys.idForKeyHash(DEFAULT_KEY_DOMAIN, admin.keyId);
                         const otherId = await keys.registerKey(DEFAULT_KEY_DOMAIN, other.keyId, serializePublicKeyToBase64(other.publicKey));
                         const localId = (await read.syncId('things', t1))!;
                         await local.update('things', localId, { author_key_id: otherId, label: 'b' });
                         const result = await ingestChanges(group, target, { writer: admin });
-                        assertEquals(result.accepted, 1, 'the label lands');
-                        assertEquals(result.rejected.length, 1, 'the author change is refused');
+                        assertEquals(result.accepted, 0, 'nothing lands: an update is refused whole (HIP-29)');
+                        assertEquals(result.rejected.length, 1, 'the update is refused');
                         const failures = (await target.drainOpEvents()).filter((e) => e.event.direction === 'failure');
-                        assertEquals(failures.length, 1, 'the refusal is logged');
+                        assertEquals(failures.length, 1, 'with one failure event');
                         const rdbRow = (await rdbRows(group, 'things')).find((r) => r.rowId === t1)!;
-                        assertEquals(rdbRow.values.label, 'b', 'rdb has the new label');
-                        assertEquals(rdbRow.author, admin.keyId, 'and the same author');
-                        await projectGroup(group, target);
+                        assertEquals(rdbRow.values.label, 'a', 'rdb keeps the label');
+                        assertEquals(rdbRow.author, admin.keyId, 'and the author');
                         const row = await read.getRow('things', t1);
-                        assertEquals(row?.author, adminId, 'the local row has its author back');
-                        assertEquals(row?.values.label, 'b', 'and the new label');
+                        assertEquals(row?.author, adminId, 'the settle puts the local author back');
+                        assertEquals(row?.values.label, 'a', 'and the label'); 
                     } finally {
                         await cleanup?.();
                     }
@@ -1253,7 +999,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const { group, admin } = await createAnonymousGroup();
                     const { target, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         const keys = target as unknown as KeyIndex;
                         const adminId = await keys.registerKey(DEFAULT_KEY_DOMAIN, admin.keyId, serializePublicKeyToBase64(admin.publicKey));
                         await local.insert('things', { label: 'named' }, adminId);
@@ -1275,7 +1021,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const { group, admin } = await createTypedGroup();
                     const { target, read, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         await local.insert('things', { label: 'left-out' });
                         await local.insert('things', { label: 'nulled', kind: null });
                         const inserts = (await target.drainChanges()).changes.filter((c) => c.kind === 'insert');
@@ -1288,7 +1034,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
 
                         const result = await ingestChanges(group, target, { writer: admin });
                         assertEquals(result.accepted, 2, 'both land');
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         const rows = await rdbRows(group, 'things');
                         const leftOut = rows.find((r) => r.values.label === 'left-out')!;
                         const nulled = rows.find((r) => r.values.label === 'nulled')!;
@@ -1310,7 +1056,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const t1 = deriveRowId('t1', undefined);
                     const { target, read, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         const keys = target as unknown as KeyIndex;
                         const adminId = await keys.registerKey(DEFAULT_KEY_DOMAIN, admin.keyId, serializePublicKeyToBase64(admin.publicKey));
                         const localId = (await read.syncId('things', t1))!;
@@ -1331,7 +1077,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                         await local.update('things', localId, { author_key_id: adminId });
                         await local.setCaptureEnabled(true);
                         await things.update(t1, { label: 'b' });
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         const row = await read.getRow('things', t1);
                         assertEquals(row?.values.label, 'b', 'the remote update lands');
                         assertEquals(row?.author ?? null, null, 'and the author column is NULL again');
@@ -1340,6 +1086,520 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     }
                 },
             },
+            {
+                name: `[${label}-IN36] a projection pass refuses while a change is pending, and changes nothing; a cycle that ingests the change first then projects`,
+                invoke: async () => {
+                    const { group, admin } = await createGroup();
+                    const ledger = await group.getTable('ledger');
+                    await ledger.insert('l1', { ref: 'R-1', amount: '1.00' }, admin);
+
+                    const { target, read, local, cleanup } = await factory();
+                    try {
+                        await projectAs(group, target, admin);
+                        const checked = target as unknown as CheckedTarget;
+                        const before = await target.getCheckpoint(group.getId());
+                        await ledger.insert('l2', { ref: 'R-2', amount: '2.00' }, admin);   // a remote change
+                        await local.insert('tags', { code: 'pending' });
+
+                        let refused = false;
+                        try { await projectAs(group, target, admin); } catch (e) { refused = e instanceof PendingChangesError; }
+                        assertTrue(refused, 'the apply refuses with PendingChangesError');
+                        assertTrue(sameVersion(await target.getCheckpoint(group.getId()), before!), 'the checkpoint stays');
+                        const l2 = deriveRowId('l2', admin.keyId);
+                        assertTrue(await read.getRow('ledger', l2) === undefined, 'the remote row is not projected');
+                        await assertAtCheckpoints(checked, [{ group }], 'after the refusal');
+
+                        await syncGroup(group, target, { writer: admin });
+                        assertTrue(await read.getRow('ledger', l2) !== undefined, 'a cycle ingests the change, then projects');
+                        assertTrue(!await target.hasPendingChanges(), 'the outbox is empty');
+                        await assertAtCheckpoints(checked, [{ group }], 'after the cycle');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN37] an edit captured while a delta is computed is kept, the row never shows the remote value over it, and the next cycle ingests it first`,
+                invoke: async () => {
+                    const { group, admin } = await createGroup();
+                    const ledger = await group.getTable('ledger');
+                    await ledger.insert('l1', { ref: 'R-1', memo: 'start', amount: '1.00' }, admin);
+                    const l1 = deriveRowId('l1', admin.keyId);
+
+                    const { target, read, local, cleanup } = await factory();
+                    try {
+                        await projectAs(group, target, admin);
+                        const checked = target as unknown as CheckedTarget;
+                        const localId = (await read.syncId('ledger', l1))!;
+                        await ledger.update(l1, { memo: 'remote' }, admin);   // another device's edit reaches rdb
+
+                        let edited = false;
+                        const hooked = beforeApply(target, async () => {
+                            if (edited) return;
+                            edited = true;
+                            await local.update('ledger', localId, { memo: 'local' });   // captured during the delta
+                        });
+                        await syncGroup(group, hooked, { writer: admin });
+                        assertTrue(edited, 'the edit was made during the projection pass');
+                        assertEquals((await read.getRow('ledger', l1))?.values.memo, 'local', 'the pending edit stays on screen');
+                        assertTrue(await target.hasPendingChanges(), 'and pending');
+                        await assertAtCheckpoints(checked, [{ group }], 'after the refused apply');
+
+                        await syncGroup(group, target, { writer: admin });
+                        assertTrue(!await target.hasPendingChanges(), 'the next cycle ingests it');
+                        await assertAtCheckpoints(checked, [{ group }], 'after the next cycle');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN38] a change captured during ingestion is ingested in the same cycle, which then projects`,
+                invoke: async () => {
+                    const { group, admin } = await createGroup();
+                    const { target, local, cleanup } = await factory();
+                    try {
+                        await projectAs(group, target, admin);
+                        const checked = target as unknown as CheckedTarget;
+                        await local.insert('tags', { code: 'first' });
+
+                        let wrote = false;
+                        const hooked = beforeSettle(target, async () => {
+                            if (wrote) return;
+                            wrote = true;
+                            await local.insert('tags', { code: 'during' });   // after the drain, before the settle
+                        });
+                        await syncGroup(group, hooked, { writer: admin });
+                        assertTrue(wrote, 'the change was made during ingestion');
+                        assertTrue(!await target.hasPendingChanges(), 'both changes were ingested in the cycle');
+                        const codes = (await rdbRows(group, 'tags')).map((r) => r.values.code).sort();
+                        assertEquals(codes.join(','), 'during,first', 'both reached rdb');
+                        assertTrue(sameVersion(await target.getCheckpoint(group.getId()), await (await group.getScopedDag()).getFrontier()),
+                            'and the cycle projected');
+                        await assertAtCheckpoints(checked, [{ group }], 'after the cycle');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN39] a native update that names a column at its current value records it, and rdb takes it as a write`,
+                invoke: async () => {
+                    const { group, admin } = await createGroup();
+                    await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', memo: 'same', amount: '1.00' }, admin);
+                    const l1 = deriveRowId('l1', admin.keyId);
+                    const { target, read, local, cleanup } = await factory();
+                    try {
+                        await projectAs(group, target, admin);
+                        const localId = (await read.syncId('ledger', l1))!;
+                        await local.update('ledger', localId, { memo: 'same' });
+                        const changes = (await target.drainChanges()).changes;
+                        assertEquals(changes.map((c) => c.kind === 'update' ? JSON.stringify(c.values) : c.kind).join('; '),
+                            '{"memo":"same"}', 'the unchanged column is recorded');
+                        const before = (await rowOps(group, 'ledger')).length;
+                        const result = await ingestChanges(group, target, { writer: admin });
+                        assertEquals(result.accepted, 1, 'and ingested');
+                        assertEquals((await rowOps(group, 'ledger')).length, before + 1, 'as an update op');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN40] a native insert's empty author column reads the writer key's id at once where the group's mode is on; under autoAuthor off and in an anonymous group it stays NULL`,
+                invoke: async () => {
+                    const authorOf = async (target: BidirectionalTarget, table: string, localId: number): Promise<unknown> =>
+                        (await (target as unknown as QueryableTarget).executeQuery({ table })).find((r) => r.id === localId)?.author_key_id ?? null;
+                    const capturedAuthor = async (target: BidirectionalTarget, localId: number): Promise<unknown> => {
+                        const insert = (await target.drainChanges()).changes.find((c) => c.kind === 'insert' && c.localId === localId);
+                        return insert !== undefined && insert.kind === 'insert' ? (insert.values.author_key_id ?? null) : 'no insert';
+                    };
+
+                    const { group, admin } = await createGroup();
+                    let harness = await factory();
+                    try {
+                        await projectGroup(group, harness.target);
+                        const keyId = await recordWriter(harness.target, group, 'on', admin);
+                        const localId = await harness.local.insert('tags', { code: 'mine' });
+                        assertEquals(await authorOf(harness.target, 'tags', localId), keyId, 'the row reads the writer key at once');
+                        assertEquals(await capturedAuthor(harness.target, localId), keyId, 'and so does the captured insert');
+                    } finally {
+                        await harness.cleanup?.();
+                    }
+
+                    harness = await factory();
+                    try {
+                        await projectGroup(group, harness.target);
+                        await recordWriter(harness.target, group, 'off', admin);
+                        const localId = await harness.local.insert('tags', { code: 'anon' });
+                        assertEquals(await authorOf(harness.target, 'tags', localId), null, 'under autoAuthor off the column stays empty');
+                    } finally {
+                        await harness.cleanup?.();
+                    }
+
+                    const anon = await createAnonymousGroup();
+                    harness = await factory();
+                    try {
+                        await projectGroup(anon.group, harness.target);
+                        await recordWriter(harness.target, anon.group, 'anonymous', anon.admin);
+                        const localId = await harness.local.insert('things', { label: 'x' });
+                        assertEquals(await authorOf(harness.target, 'things', localId), null, 'in an anonymous group it stays empty');
+                    } finally {
+                        await harness.cleanup?.();
+                    }
+
+                    harness = await factory();
+                    try {
+                        await projectGroup(group, harness.target);
+                        const localId = await harness.local.insert('tags', { code: 'no record' });
+                        assertEquals(await authorOf(harness.target, 'tags', localId), null, 'and with no writer record, nothing is filled');
+                    } finally {
+                        await harness.cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN41] an update naming the author and a readonly column at the row's own values lands; at other values it is refused`,
+                invoke: async () => {
+                    const { group, admin } = await createGroup();
+                    await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', amount: '1.00' }, admin);
+                    const l1 = deriveRowId('l1', admin.keyId);
+                    const { target, read, local, cleanup } = await factory();
+                    try {
+                        await projectAs(group, target, admin);
+                        const localId = (await read.syncId('ledger', l1))!;
+                        const row = (await (target as unknown as QueryableTarget).executeQuery({ table: 'ledger' })).find((r) => r.id === localId)!;
+                        const ownAuthor = row.author_key_id as number;
+
+                        // a record read back and written whole: the author and the readonly ref at their own values
+                        await local.update('ledger', localId, { ref: 'R-1', author_key_id: ownAuthor, memo: 'whole' });
+                        let result = await ingestChanges(group, target, { writer: admin });
+                        assertEquals(result.rejected.length, 0, 'the row\'s own values are no refusal');
+                        assertEquals(result.accepted, 1, 'the update lands');
+                        const after = (await rdbRows(group, 'ledger')).find((r) => r.rowId === l1)!;
+                        assertEquals(after.values.memo, 'whole', 'with the column that changed');
+                        assertEquals(after.values.ref, 'R-1', 'and the readonly column as it was');
+
+                        await local.update('ledger', localId, { ref: 'R-2' });
+                        result = await ingestChanges(group, target, { writer: admin });
+                        assertTrue(result.rejected.length === 1 && result.rejected[0].reason.includes('readonly'), 'another readonly value is refused');
+
+                        const other = await makeIdentity();
+                        const otherId = await (target as unknown as KeyIndex).registerKey(DEFAULT_KEY_DOMAIN, other.keyId, serializePublicKeyToBase64(other.publicKey));
+                        await local.update('ledger', localId, { author_key_id: otherId });
+                        result = await ingestChanges(group, target, { writer: admin });
+                        assertTrue(result.rejected.length === 1 && result.rejected[0].reason.includes('author'), 'another author is refused');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN42] an insert with an empty author column, captured while no writer key was recorded, is refused`,
+                invoke: async () => {
+                    const { group, admin } = await createGroup();
+                    const { target, local, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+                        await recordWriter(target, group, 'on');          // opened without a writer key
+                        await local.insert('tags', { code: 'early' });
+                        await recordWriter(target, group, 'on', admin);   // then with one
+                        const result = await ingestChanges(group, target, { writer: admin });
+                        assertEquals(result.accepted, 0, 'nothing lands');
+                        assertTrue(result.rejected.length === 1 && result.rejected[0].reason.includes('author'),
+                            `the insert is refused for its empty author, got: ${result.rejected.map((r) => r.reason).join('; ')}`);
+                        assertEquals((await rdbRows(group, 'tags')).length, 0, 'and rdb has no row');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN43] under autoAuthor off a native insert that leaves the author empty is ingested anonymously, and one naming the writer key's id is signed; with no author column the writer key signs`,
+                invoke: async () => {
+                    const { group, admin } = await createGroup();
+                    let harness = await factory();
+                    try {
+                        await projectGroup(group, harness.target, { autoAuthor: false });
+                        const keyId = await recordWriter(harness.target, group, 'off', admin);
+                        await harness.local.insert('tags', { code: 'anon' });
+                        await harness.local.insert('tags', { code: 'signed', author_key_id: keyId! });
+                        const result = await ingestChanges(group, harness.target, { writer: admin, autoAuthor: false });
+                        assertEquals(result.rejected.length, 0, 'nothing is refused');
+                        const rows = await rdbRows(group, 'tags');
+                        const byCode = new Map(rows.map((r) => [r.values.code, r]));
+                        assertEquals(byCode.get('anon')?.author, undefined, 'the empty author is ingested anonymously');
+                        assertEquals(byCode.get('anon')?.rowId, deriveRowId(byCode.get('anon')!.uuid), 'with a row hash from its uuid alone');
+                        assertEquals(byCode.get('signed')?.author, admin.keyId, 'the named writer key signs');
+                        assertEquals(byCode.get('signed')?.rowId, deriveRowId(byCode.get('signed')!.uuid, admin.keyId), 'with a row hash from its signer');
+                    } finally {
+                        await harness.cleanup?.();
+                    }
+
+                    const second = await createGroup();
+                    harness = await factory();
+                    try {
+                        const config = { autoAuthor: false, authorColumn: false as const };
+                        await projectGroup(second.group, harness.target, config);
+                        await harness.local.insert('tags', { code: 'plain' });
+                        const result = await ingestChanges(second.group, harness.target, { writer: second.admin, ...config });
+                        assertEquals(result.accepted, 1, 'the insert lands');
+                        assertEquals((await rdbRows(second.group, 'tags'))[0]?.author, second.admin.keyId, 'signed with the writer key');
+                    } finally {
+                        await harness.cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN44] a settle with a moved checkpoint throws and changes nothing; with the checkpoint it expects, it writes and moves it`,
+                invoke: async () => {
+                    const { group } = await createGroup();
+                    const groupId = group.getId();
+                    const { target, local, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+                        const cp = (await target.getCheckpoint(groupId))!;
+                        const localId = await local.insert('tags', { code: 'x' });
+                        const [change] = (await target.drainChanges()).changes;
+                        const mapping: SyncMapping = { table: 'tags', localId, rowId: 'ROW-NEW', uuid: 'u-new', status: 'active' };
+                        const next = new Set(['the-next-checkpoint']);
+
+                        const wrong = new Set(['not-the-checkpoint']);
+                        let moved = false;
+                        try {
+                            await target.commitIngest({ consumed: [change.id], checkpoints: [{ groupId, expected: wrong, next }], inserts: [mapping],
+                                events: [failureEvent(groupId, 'op-x', localId)] });
+                        } catch (e) { moved = e instanceof CheckpointMovedError; }
+                        assertTrue(moved, 'a moved checkpoint throws CheckpointMovedError');
+                        assertEquals((await target.drainChanges()).changes.length, 1, 'the change is still in the outbox');
+                        assertEquals((await target.resolveRow('tags', localId))?.rowId, undefined, 'no mapping is written');
+                        assertEquals((await target.drainOpEvents()).length, 0, 'no event is stored');
+                        assertTrue(sameVersion(await target.getCheckpoint(groupId), cp), 'the checkpoint is as it was');
+
+                        await target.commitIngest({ consumed: [change.id], checkpoints: [{ groupId, expected: cp, next }], inserts: [mapping] });
+                        assertEquals((await target.drainChanges()).changes.length, 0, 'the change leaves the outbox');
+                        const stored = await target.resolveRow('tags', localId);
+                        assertTrue(stored?.rowId === 'ROW-NEW' && stored.uuid === 'u-new' && (stored.status ?? 'active') === 'active', 'the insert\'s mapping is written');
+                        assertTrue(sameVersion(await target.getCheckpoint(groupId), next), 'and the checkpoint moves');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN45] a revert with a pending change writes rdb's row with the change on top`,
+                invoke: async () => {
+                    const { group, admin } = await createGroup();
+                    await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', memo: 'start', amount: '1.00' }, admin);
+                    const l1 = deriveRowId('l1', admin.keyId);
+                    const { target, read, local, cleanup } = await factory();
+                    try {
+                        await projectAs(group, target, admin);
+                        const localId = (await read.syncId('ledger', l1))!;
+                        await local.update('ledger', localId, { memo: 'refused' });
+                        await local.update('ledger', localId, { amount: '2.00' });
+                        const [refused, pending] = (await target.drainChanges()).changes;
+                        await target.commitIngest({ consumed: [refused.id],
+                            reverts: [{ table: 'ledger', rowId: l1, localId, row: await rdbRowAction(group, 'ledger', l1) }] });
+                        const row = await localRow(target, 'ledger', localId);
+                        assertEquals(row?.memo, 'start', "rdb's value is back");
+                        assertEquals(row?.amount, '2.00', 'with the pending change on top');
+                        const left = (await target.drainChanges()).changes;
+                        assertTrue(left.length === 1 && left[0].id === pending.id, 'the pending change stays in the outbox');
+
+                        await local.delete('ledger', localId);
+                        const [, deleted] = (await target.drainChanges()).changes;
+                        await target.commitIngest({ consumed: [pending.id],
+                            reverts: [{ table: 'ledger', rowId: l1, localId, row: await rdbRowAction(group, 'ledger', l1) }] });
+                        assertEquals(await localRow(target, 'ledger', localId), undefined, 'a pending delete leaves no row');
+                        assertEquals((await target.drainChanges()).changes.map((c) => c.id).join(','), String(deleted.id), 'and stays pending');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN46] a revert of a row rdb no longer has removes it and marks its mapping deleted; a pending update of it finds no row`,
+                invoke: async () => {
+                    const { group, admin } = await createGroup();
+                    const ledger = await group.getTable('ledger');
+                    await ledger.insert('l1', { ref: 'R-1', amount: '1.00' }, admin);
+                    const l1 = deriveRowId('l1', admin.keyId);
+                    const { target, read, local, cleanup } = await factory();
+                    try {
+                        await projectAs(group, target, admin);
+                        const localId = (await read.syncId('ledger', l1))!;
+                        await ledger.delete(l1, admin);
+                        await local.update('ledger', localId, { memo: 'one' });
+                        await local.update('ledger', localId, { memo: 'two' });
+                        const [first, second] = (await target.drainChanges()).changes;
+                        await target.commitIngest({ consumed: [first.id], reverts: [{ table: 'ledger', rowId: l1, localId }] });
+                        assertEquals(await localRow(target, 'ledger', localId), undefined, 'the row is removed');
+                        assertEquals((await target.resolveRow('ledger', localId))?.status, 'deleted', 'and its mapping marked deleted');
+                        assertEquals((await target.drainChanges()).changes.map((c) => c.id).join(','), String(second.id), 'the pending update stays');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN47] writing each kind of record, and an end's observe beside a checkpoint, signals no change and moves no checkpoint`,
+                invoke: async () => {
+                    const { group } = await createGroup();
+                    const groupId = group.getId();
+                    const { target, local, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+                        const cp = (await target.getCheckpoint(groupId))!;
+                        for (const code of ['a', 'b', 'c']) await local.insert('tags', { code });
+                        const [c1, c2, c3] = (await target.drainChanges()).changes;
+
+                        const signals: string[] = [];
+                        const reactive = target as unknown as { addCommitListener?: (l: (e: { source: string }) => void) => void;
+                            removeCommitListener?: (l: (e: { source: string }) => void) => void };
+                        const listener = (e: { source: string }): void => { signals.push(e.source); };
+                        reactive.addCommitListener?.(listener);
+                        try {
+                            // arming a listener announces the outbox already pending: let it pass
+                            await new Promise((resolve) => setTimeout(resolve, 300));
+                            signals.length = 0;
+                            const failure = failureEvent(groupId, 'op-b', c2.localId);
+                            const [o1, o2] = [{ group: 'bound-1', hash: 'obs-1' }, { group: 'bound-2', hash: 'obs-2' }];
+                            await target.writeRecord(c1.id, { observes: [o1] });
+                            await target.writeRecord(c1.id, { observes: [o2], entry: 'entry-a' });
+                            await target.writeRecord(c2.id, { failure });
+                            await target.writeRecord(c3.id, { nothing: true });
+                            await target.recordEndObserve(groupId, 'end-1');
+                            await target.recordEndObserve(groupId, 'end-2');
+                            await new Promise((resolve) => setTimeout(resolve, 300));
+                            const records = (await target.drainChanges()).changes.map((c) => JSON.stringify(c.record ?? null));
+                            assertEquals(records[0], JSON.stringify({ observes: [o1, o2], entry: 'entry-a' }), 'observes add up, and the entry is kept');
+                            assertEquals(records[1], JSON.stringify({ failure }), 'a failure event');
+                            assertEquals(records[2], JSON.stringify({ nothing: true }), 'the mark of nothing to write');
+                            await target.writeRecord(c1.id, { failure });
+                            assertEquals(JSON.stringify((await target.drainChanges()).changes[0].record),
+                                JSON.stringify({ observes: [o1, o2], failure }), 'an outcome replaces the one there');
+                            assertEquals((await target.getEndObserves(groupId)).join(','), 'end-1,end-2', "the end's observes, in order");
+                            assertEquals(signals.length, 0, `no change is signalled, got: ${signals.join(',')}`);
+                            assertTrue(sameVersion(await target.getCheckpoint(groupId), cp), 'and no checkpoint moves');
+                        } finally {
+                            reactive.removeCommitListener?.(listener);
+                        }
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN88] a settle clears the end's observes of every group, also of a group whose checkpoint it doesn't move; a settle that throws leaves them all`,
+                invoke: async () => {
+                    const a = await createGroup();
+                    const b = await createFkGroup();
+                    const [ga, gb] = [a.group.getId(), b.group.getId()];
+                    const { target, cleanup } = await factory();
+                    try {
+                        await projectGroup(a.group, target);
+                        await projectGroup(b.group, target, { tablePrefix: 'b' });   // its tables apart from a's
+                        const cpA = (await target.getCheckpoint(ga))!;
+                        await target.recordEndObserve(ga, 'end-a');
+                        await target.recordEndObserve(gb, 'end-b');
+                        const wrong = new Set(['not-the-checkpoint']);
+                        await target.commitIngest({ consumed: [], checkpoints: [{ groupId: ga, expected: wrong, next: wrong }] })
+                            .catch(() => undefined);
+                        assertEquals(`${(await target.getEndObserves(ga)).join(',')}|${(await target.getEndObserves(gb)).join(',')}`, 'end-a|end-b',
+                            'a settle that throws leaves every list');
+                        await target.commitIngest({ consumed: [], checkpoints: [{ groupId: ga, expected: cpA, next: cpA }] });
+                        assertEquals((await target.getEndObserves(ga)).length + (await target.getEndObserves(gb)).length, 0,
+                            "a settle clears every group's list, the one it names and the other");
+                        assertTrue(sameVersion(await target.getCheckpoint(ga), cpA), 'and moves no checkpoint it keeps');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN48] the settle stores the failure events of the handled rows, before its other events, and none of the rows it keeps`,
+                invoke: async () => {
+                    const { group } = await createGroup();
+                    const groupId = group.getId();
+                    const { target, local, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+                        await local.insert('tags', { code: 'a' });
+                        await local.insert('tags', { code: 'b' });
+                        const [c1, c2] = (await target.drainChanges()).changes;
+                        await target.writeRecord(c1.id, { failure: failureEvent(groupId, 'op-1', c1.localId) });
+                        await target.writeRecord(c2.id, { failure: failureEvent(groupId, 'op-2', c2.localId) });
+                        await target.commitIngest({ consumed: [c1.id], events: [{ ...failureEvent(groupId, 'op-delta', c1.localId), origin: 'concurrency', direction: 'void' }] });
+                        const stored = (await target.drainOpEvents()).map((e) => e.event.opHash);
+                        assertEquals(stored.join(','), 'op-1,op-delta', "the handled row's failure event, then the settle's own");
+                        const left = (await target.drainChanges()).changes;
+                        assertTrue(left.length === 1 && left[0].record?.failure?.opHash === 'op-2', 'the kept row keeps its record');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-CHK01] the consistency check holds after a projection and over pending changes, and finds a write capture missed`,
+                invoke: async () => {
+                    const { group, admin } = await createGroup();
+                    const ledger = await group.getTable('ledger');
+                    await ledger.insert('l1', { ref: 'R-1', amount: '10.00' }, admin);
+                    await ledger.insert('l2', { ref: 'R-2', memo: 'two', amount: '2.00' }, admin);
+
+                    const { target, read, local, cleanup } = await factory();
+                    try {
+                        await projectAs(group, target, admin);
+                        const checked = target as unknown as CheckedTarget;
+                        await assertAtCheckpoints(checked, [{ group }], 'after the projection');
+
+                        const l1 = (await read.syncId('ledger', deriveRowId('l1', admin.keyId)))!;
+                        const l2 = (await read.syncId('ledger', deriveRowId('l2', admin.keyId)))!;
+                        await local.update('ledger', l1, { memo: 'ping' });
+                        await local.delete('ledger', l2);
+                        await local.insert('tags', { code: 'new' });
+                        await assertAtCheckpoints(checked, [{ group }], 'over three pending changes');
+
+                        await local.setCaptureEnabled(false);
+                        await local.update('ledger', l1, { memo: 'lost' });
+                        await local.setCaptureEnabled(true);
+                        let found = false;
+                        try {
+                            await assertAtCheckpoints(checked, [{ group }], 'after an uncaptured write');
+                        } catch (_e) {
+                            found = true;
+                        }
+                        assertTrue(found, 'the check finds a write that capture missed');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-CHK02] a reopened harness finds what was committed: the checkpoint, the rows and the pending change`,
+                invoke: async () => {
+                    const { group, admin } = await createGroup();
+                    await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', amount: '10.00' }, admin);
+
+                    let harness = await factory();
+                    try {
+                        if (harness.reopen === undefined) return;   // memory: nothing outlives the process
+                        await projectAs(group, harness.target, admin);
+                        const l1 = (await harness.read.syncId('ledger', deriveRowId('l1', admin.keyId)))!;
+                        await harness.local.update('ledger', l1, { memo: 'ping' });
+
+                        harness = await harness.reopen();
+                        const checked = harness.target as unknown as CheckedTarget;
+                        assertTrue(await harness.target.getCheckpoint(group.getId()) !== undefined, 'the checkpoint is there');
+                        assertEquals((await harness.target.drainChanges()).changes.length, 1, 'the pending change is there');
+                        await assertAtCheckpoints(checked, [{ group }], 'after the reopen');
+                    } finally {
+                        await harness.cleanup?.();
+                    }
+                },
+            },
+            ...createChainCases(label, factory),
         ],
     };
 }

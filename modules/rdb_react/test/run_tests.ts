@@ -122,7 +122,9 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
             await settle();
             assertEquals(host.textContent, "hello", "the local write is on screen");
             const painted = renders;
-            await target.reserveMint([{ table: "notes", localId: id, rowId: "row-hello", uuid: "u1" }]);
+            // Settle the insert, as ingestion would, with its mapping: a projection doesn't apply over a pending change (HIP-29).
+            await target.commitIngest({ consumed: (await target.drainChanges()).changes.map((c) => c.id),
+                inserts: [{ table: "notes", localId: id, rowId: "row-hello", uuid: "u1", status: "active" }] });
             await act(async () => {
                 await target.apply("g", [], [{
                     kind: "upsert-row", table: "notes", rowId: "row-hello", values: { title: "hello", folder_id: 1 },

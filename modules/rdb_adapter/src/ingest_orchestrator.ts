@@ -1,41 +1,26 @@
 // Inbound orchestrator: the side-effecting counterpart of projectGroup. It
-// drains captured changes from a MaterializedChangeSource, plans them with the
-// pure inverse planner, reserves minted identities durably, submits each entry
-// to the group via bundle() (with the two optimistic-bundling fallbacks),
-// reconciles genuine failures from rdb truth, and settles atomically.
+// ingests captured changes into rdb, one entry per change at each group's
+// checkpoint, recording in each outbox row what became of the change before
+// anything reaches rdb, and settles the pass in one target transaction that
+// moves the checkpoints (HIP-29; see ingest_chain.ts).
 //
 //   await ingestChanges(group, backend, { writer });   // local edits -> rdb
 //   await syncGroup(group, backend, { writer });        // ingest THEN project
 //
-// Crash safety (no cross-store transaction with the rdb DAG): minted uuids are
-// persisted (reserveMint) BEFORE the append walk, so a crash between append and
-// settle replays deterministically - the re-appended ops are recognized as
-// already-applied by their OWNED reserved identity (write-once insert /
-// not-live delete) instead of duplicated. The end-of-pass settle (ack +
-// op-events + reverts + statuses) is one target transaction.
-//
-// Failures (a change rdb rejected) are NOT retried: the row is reverted from
-// rdb truth (mark-then-revert) and recorded in the durable op-event log, the
-// same channel p2p concurrency void/reinstate flips flow through (projectGroup).
+// A refused change is recorded in the durable op-event log, the same channel
+// p2p concurrency void/reinstate flips flow through (projectGroup), and its
+// row is reverted to rdb's, with the changes still pending on top.
 
-import { json } from "@hyper-hyper-space/hhs3_json";
-import type { Version } from "@hyper-hyper-space/hhs3_mvt";
-import { ValidationRejectedError, formatValidationFailure } from "@hyper-hyper-space/hhs3_mvt";
-import type { ValidationFailure } from "@hyper-hyper-space/hhs3_mvt";
-import type { OwnIdentity, B64Hash } from "@hyper-hyper-space/hhs3_crypto";
-import type { BundleWrite, RSchemaView, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
-import { gateGraph, gateGraphOrder } from "@hyper-hyper-space/hhs3_rdb";
+import type { B64Hash } from "@hyper-hyper-space/hhs3_crypto";
+import type { RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 
 import {
-    AdapterConfig, CapturedChange, CapturedChangeId, DEFAULT_KEY_DOMAIN, IngestRejection, IngestResult,
-    KeyIndex, MaterializationTarget, MaterializedChangeSource, OpEvent, RowAction, SyncMapping, SyncStatusUpdate,
+    AdapterConfig, BidirectionalTarget, IngestResult, MaterializationTarget, PendingChangesError,
 } from "./types.js";
-import {
-    KeyLookup, MappingLookup, NodeContext, PlannedEntry, PlannedOp, PlannedReject, planDatabaseEntries,
-} from "./ingest.js";
-import { authorColumn, keyRefColumnFromTarget, rdbFkColumnFromTarget, rdbTableName, targetTableName } from "./names.js";
-import { buildObservedBy, frontierOf, observeToVersion } from "./ref_advance.js";
-import { projectGroup, rowToUpsertAction } from "./project.js";
+import { ingestOnce, mergeResults } from "./ingest_chain.js";
+import { projectGroup } from "./project.js";
+
+export type { IngestPassOutcome } from "./ingest_chain.js";
 
 function defaultNewUuid(): string {
     const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
@@ -45,224 +30,52 @@ function defaultNewUuid(): string {
     return c.randomUUID();
 }
 
-function asKeyIndex(source: MaterializedChangeSource): KeyIndex | undefined {
-    const candidate = source as MaterializedChangeSource & Partial<KeyIndex>;
-    return typeof candidate.registerKey === 'function' ? candidate as KeyIndex : undefined;
-}
+// One lock per target object (HIP-29): a sync cycle, a single-group cycle and
+// an index reconcile on one target never overlap in this process, whatever the
+// members are. What a cycle reads and then writes belongs to the target: the
+// outbox, the checkpoints and the index spec. Calls are chained per target.
+const locks = new WeakMap<object, Promise<unknown>>();
 
-// The per-group context an ingest pass needs: the resolved end-schema view, for
-// name reversal + FK reshaping.
-type GroupContext = {
-    group: RTableGroup;
-    config: AdapterConfig;
-    schemaView: RSchemaView;
-};
-
-async function buildGroupContext(group: RTableGroup, config: AdapterConfig): Promise<GroupContext> {
-    const to = await (await group.getScopedDag()).getFrontier();
-    const view = await group.getView(to, to);
-    return { group, config, schemaView: view.getSchemaView() };
-}
-
-// Prefetch the sync mappings the planner needs: the SUBJECT of every
-// update/delete, every existing id-resolving FK TARGET, AND now every INSERT's
-// own (table, localId) - so a crash-replay reads back the reserved uuid instead
-// of minting a fresh one (the read-back that makes replay idempotent).
-async function prefetchBatch(
-    changes: CapturedChange[],
-    source: MaterializedChangeSource,
-    ctxFor: (table: string) => GroupContext | undefined,
-    prefetched: Map<string, SyncMapping | undefined>,
-): Promise<void> {
-    const prefetch = async (table: string, localId: number): Promise<void> => {
-        const key = table + '\u0000' + localId;
-        if (!prefetched.has(key)) prefetched.set(key, await source.resolveRow(table, localId));
-    };
-    for (const change of changes) {
-        await prefetch(change.table, change.localId);
-        if (change.kind === 'delete') continue;
-        const ctx = ctxFor(change.table);
-        if (ctx === undefined) continue;
-        const rdbTable = rdbTableName(ctx.config, change.table);
-        const fks = ctx.schemaView.hasTable(rdbTable) ? ctx.schemaView.getFKs(rdbTable) : {};
-        for (const targetCol of Object.keys(change.values)) {
-            const value = change.values[targetCol];
-            if (value === null) continue;   // a NULL foreign key points at no row: nothing to look up
-            const fkInfo = rdbFkColumnFromTarget(ctx.config, rdbTable, fks, targetCol);
-            if (fkInfo?.resolvesToId === true && fkInfo.targetTable !== undefined) {
-                await prefetch(fkInfo.targetTable, value as number);
-            }
-        }
-    }
-}
-
-// Prefetch KeyIndex entries for every key-ref value in the batch.
-async function prefetchKeys(
-    changes: CapturedChange[],
-    keys: KeyIndex,
-    ctxFor: (table: string) => GroupContext | undefined,
-    cache: Map<number, { keyHash: string; publicKey?: string } | undefined>,
-): Promise<void> {
-    for (const change of changes) {
-        if (change.kind === 'delete') continue;
-        const ctx = ctxFor(change.table);
-        if (ctx === undefined) continue;
-        const rdbTable = rdbTableName(ctx.config, change.table);
-        const provider = ctx.schemaView.hasTable(rdbTable) ? ctx.schemaView.getIdProvider?.(rdbTable) : undefined;
-        const def = ctx.schemaView.getTable?.(rdbTable);
-        const identityColumns = new Set<string>();
-        if (def !== undefined) {
-            for (const [col, colDef] of Object.entries(def.columns)) {
-                if (colDef.type === 'identity') identityColumns.add(col);
-            }
-        }
-        const author = authorColumn(ctx.config);
-        for (const targetCol of Object.keys(change.values)) {
-            // An insert's author column names the key it asks to be signed with:
-            // the planner compares that key with the writer key.
-            const isAuthor = change.kind === 'insert' && targetCol === author;
-            const keyRef = isAuthor ? undefined : keyRefColumnFromTarget(ctx.config, rdbTable, provider, targetCol, identityColumns);
-            if (keyRef === undefined && !isAuthor) continue;
-            if (change.values[targetCol] === null) continue;   // a NULL key id names no key
-            if (typeof change.values[targetCol] !== 'number') continue;   // not a key id: the planner refuses it
-            const keyId = change.values[targetCol] as number;
-            if (cache.has(keyId)) continue;
-            const keyHash = await keys.keyHashForId(DEFAULT_KEY_DOMAIN, keyId);
-            if (keyHash === undefined) {
-                cache.set(keyId, undefined);
-                continue;
-            }
-            const publicKey = await keys.publicKeyForId(DEFAULT_KEY_DOMAIN, keyId);
-            const info: { keyHash: string; publicKey?: string } = { keyHash };
-            if (publicKey !== undefined) info.publicKey = publicKey;
-            cache.set(keyId, info);
-        }
-    }
-}
-
-// A backend that both materializes and captures (bidirectional).
-export type BidirectionalTarget = MaterializationTarget & MaterializedChangeSource;
-
-// Whether a validation failure chain mentions `needle` (walking parents).
-function whyIncludes(why: ValidationFailure, needle: string): boolean {
-    let cur: ValidationFailure | undefined = why;
-    while (cur !== undefined) {
-        if (cur.reason.includes(needle)) return true;
-        cur = cur.parent;
-    }
-    return false;
-}
-
-// bundle() reported the row as already write-once (an insert we OWN a reserved
-// identity for was already appended on a prior crashed pass) -> already applied.
-function isWriteOnceFor(why: ValidationFailure, rowId: B64Hash): boolean {
-    return whyIncludes(why, 'already exists or was deleted') && whyIncludes(why, `'${rowId}'`);
-}
-
-// bundle() reported the delete subject as not live (already deleted) -> applied.
-function isNotLiveFor(why: ValidationFailure, rowId: B64Hash): boolean {
-    return whyIncludes(why, 'is not live') && whyIncludes(why, `'${rowId}'`);
-}
-
-// The unsigned single-op bundle payload, for the op JSON stored in a failure
-// event and for a synthetic (never-appended) op hash.
-function bundlePayload(write: BundleWrite): json.Literal {
-    return { action: 'bundle', writes: [{ table: write.table, op: write.op }] } as unknown as json.Literal;
-}
-
-// The hash of a failure event, and the op JSON it may carry. The hash covers the
-// failed (never-appended) op, the ids of the captured changes it came from and,
-// for a write refused before rdb saw it, the refused column. It is position-free,
-// and the outbox keeps a change until the settle, so a crash replay derives the
-// same hash and logs the failure once, while every new write gets its own event:
-// the event log keeps one event per (hash, direction), so a hash of the op alone
-// would drop every later refusal of the same row. When the op can't be hashed
-// (it holds a value that isn't a json literal), the hash and the event leave it
-// out, and name the row instead.
-async function failureHash(
-    group: RTableGroup,
-    f: { write?: BundleWrite; sources: CapturedChange[]; column?: string; targetTable: string; localId: number; rowId?: B64Hash },
-): Promise<{ opHash: B64Hash; op?: json.Literal }> {
-    const dag = await group.getScopedDag();
-    const extra: { [key: string]: json.Literal } = { changes: f.sources.map((c) => c.id) };
-    if (f.column !== undefined) extra.column = f.column;
-    if (f.write !== undefined) {
-        const op = bundlePayload(f.write);
-        if (json.literalProblem(op) === undefined) {
-            try {
-                return { opHash: await dag.computeEntryHash({ failed: op, ...extra }), op };
-            } catch { /* recorded without its op, below */ }
-        }
-    }
-    const row: { [key: string]: json.Literal } = { table: f.targetTable, localId: f.localId };
-    if (f.rowId !== undefined) row.rowId = f.rowId;
-    return { opHash: await dag.computeEntryHash({ failed: row, ...extra }) };
-}
-
-// A genuinely-failed row to reconcile at end of pass.
-type Mark = { groupId: B64Hash; rdbTable: string; targetTable: string; rowId: B64Hash; localId: number };
-
-// Per-group / per-database single-flight lock: a sync cycle must not overlap
-// itself (duplicate rowId minting / racing projections). Chains calls per key.
-const locks = new Map<string, Promise<unknown>>();
-
-async function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
-    const prev = locks.get(key) ?? Promise.resolve();
+export async function withTargetLock<T>(target: object, fn: () => Promise<T>): Promise<T> {
+    const prev = locks.get(target) ?? Promise.resolve();
     const run = prev.then(fn, fn);
     const guard = run.catch(() => undefined);
-    locks.set(key, guard);
+    locks.set(target, guard);
     try {
         return await run;
     } finally {
-        if (locks.get(key) === guard) locks.delete(key);
+        if (locks.get(target) === guard) locks.delete(target);
     }
 }
 
-// Drain, translate, submit, reconcile, and settle local changes as rdb ops.
-// Single-group convenience wrapper over the replica-wide path (one member).
+// Ingest local changes as rdb ops, and settle them. Single-group convenience
+// wrapper over the replica-wide path (one member). The target is one that can
+// be projected to: ingestion reads its checkpoints.
 export async function ingestChanges(
     group: RTableGroup,
-    source: MaterializedChangeSource,
+    source: BidirectionalTarget,
     config: AdapterConfig = {},
     newUuid: () => string = defaultNewUuid,
 ): Promise<IngestResult> {
-    if (config.writer === undefined) throw new Error("ingestChanges requires config.writer");
+    if (config.writer === undefined && group.getIdProvider() !== undefined) {
+        throw new Error("ingestChanges requires config.writer for a group with an identity provider");
+    }
     const results = await ingestDatabaseChanges([{ group, config }], source, newUuid);
     return results.get(group.getId()) ?? { accepted: 0, rejected: [] };
 }
 
-// Whether the backend has un-ingested local changes waiting.
-async function hasPendingChanges(backend: MaterializedChangeSource): Promise<boolean> {
-    try {
-        return (await backend.drainChanges()).changes.length > 0;
-    } catch {
-        return false;
-    }
-}
-
-// The coordinated sync cycle: ingest local edits into rdb, THEN project rdb back
-// into the target. Single-flighted per group.
+// The coordinated sync cycle for one group: ingest local edits into rdb, THEN
+// project rdb back into the target, under the target's lock. A projection
+// refused by a change captured meanwhile (PendingChangesError) ends the cycle
+// without projecting: the next cycle ingests the change first.
 export async function syncGroup(
     group: RTableGroup,
     backend: BidirectionalTarget,
     config: AdapterConfig = {},
     newUuid: () => string = defaultNewUuid,
 ): Promise<IngestResult> {
-    return withLock(group.getId(), async () => {
-        let result: IngestResult = { accepted: 0, rejected: [] };
-        if (config.writer !== undefined) {
-            result = await ingestChanges(group, backend, config, newUuid);
-        }
-
-        if ((await backend.getCheckpoint(group.getId())) === undefined && await hasPendingChanges(backend)) {
-            throw new Error(
-                "refusing initial projection over un-ingested changes; "
-                + "configure a writer so ingestChanges drains them first");
-        }
-
-        await projectGroup(group, backend, config);
-        return result;
-    });
+    const outcome = await syncDatabase([{ group, config }], backend, newUuid);
+    return outcome.results.get(group.getId()) ?? { accepted: 0, rejected: [] };
 }
 
 // ---------------------------------------------------------------------------
@@ -312,356 +125,51 @@ export async function projectDatabase(
     }
 }
 
-// Drain the shared outbox ONCE and replay it op-by-op in COMMIT ORDER against
-// each change's owning group. As the walk appends a group G's entry it
-// interleaves cross-group ref-advances driven by a dirty map. A change whose
-// table belongs to no member is acked-and-dropped. See the file header for the
-// crash-safety / failure-reconciliation contract.
+// One ingestion over the shared outbox, in commit order, across every member
+// (ingest_chain.ts): the end of a crashed pass first, then a pass.
 export async function ingestDatabaseChanges(
     members: GroupProjection[],
-    source: MaterializedChangeSource,
+    source: BidirectionalTarget,
     newUuid: () => string = defaultNewUuid,
 ): Promise<Map<B64Hash, IngestResult>> {
-    const accepted = new Map<B64Hash, number>();
-    const rejects = new Map<B64Hash, IngestRejection[]>();
-    for (const m of members) {
-        accepted.set(m.group.getId(), 0);
-        rejects.set(m.group.getId(), []);
-    }
-    const toResults = (): Map<B64Hash, IngestResult> => {
-        const out = new Map<B64Hash, IngestResult>();
-        for (const m of members) {
-            const id = m.group.getId();
-            out.set(id, { accepted: accepted.get(id)!, rejected: rejects.get(id)! });
-        }
-        return out;
-    };
-
-    const batch = await source.drainChanges();
-    if (batch.changes.length === 0) return toResults();
-
-    // Build each member's context, a table -> owning group index, and lookups.
-    const contexts = new Map<B64Hash, GroupContext>();
-    const groupById = new Map<B64Hash, RTableGroup>();
-    const writerById = new Map<B64Hash, OwnIdentity>();
-    const tableToGroup = new Map<string, B64Hash>();
-    for (const m of members) {
-        const ctx = await buildGroupContext(m.group, m.config);
-        const groupId = m.group.getId();
-        contexts.set(groupId, ctx);
-        groupById.set(groupId, m.group);
-        if (m.config.writer !== undefined) writerById.set(groupId, m.config.writer);
-        for (const rdbTable of ctx.schemaView.getTableNames()) {
-            tableToGroup.set(targetTableName(ctx.config, rdbTable), groupId);
-        }
-    }
-    const ctxForTable = (table: string): GroupContext | undefined => {
-        const groupId = tableToGroup.get(table);
-        return groupId === undefined ? undefined : contexts.get(groupId);
-    };
-    const writerFor = (groupId: B64Hash): OwnIdentity => {
-        const writer = writerById.get(groupId);
-        if (writer === undefined) throw new Error(`ingestDatabaseChanges: group '${groupId}' has no config.writer`);
-        return writer;
-    };
-    // The author of a group's ingested writes: its writer, or none when the
-    // group has no idProvider and so admits only anonymous ops.
-    const authorFor = (groupId: B64Hash): OwnIdentity | undefined => {
-        const writer = writerFor(groupId);
-        return groupById.get(groupId)!.getIdProvider() !== undefined ? writer : undefined;
-    };
-
-    // Global prefetch (FK targets and insert read-back may span sibling groups).
-    const prefetched = new Map<string, SyncMapping | undefined>();
-    await prefetchBatch(batch.changes, source, ctxForTable, prefetched);
-    const lookup: MappingLookup = (table, localId) => prefetched.get(table + '\u0000' + localId);
-
-    const keyCache = new Map<number, { keyHash: string; publicKey?: string } | undefined>();
-    const keys = asKeyIndex(source);
-    if (keys !== undefined) await prefetchKeys(batch.changes, keys, ctxForTable, keyCache);
-    const keyLookup: KeyLookup = (keyId) => keyCache.get(keyId);
-
-    // Plan the whole interleaved batch (order-preserving + optimistic bundlings).
-    const nodeCtxFor = (table: string): NodeContext | undefined => {
-        const groupId = tableToGroup.get(table);
-        if (groupId === undefined) return undefined;
-        return {
-            groupId, schemaView: contexts.get(groupId)!.schemaView,
-            config: contexts.get(groupId)!.config, writerKeyId: authorFor(groupId)?.keyId,
-        };
-    };
-    const fkBundlingFor = (groupId: string): boolean => contexts.get(groupId as B64Hash)?.config.fkBundling !== false;
-    const updateMergeFor = (table: string): boolean => ctxForTable(table)?.config.updateMerge !== false;
-    let plan = planDatabaseEntries(batch, nodeCtxFor, lookup, keyLookup, newUuid, fkBundlingFor, updateMergeFor);
-
-    // Durably reserve every minted identity BEFORE the append walk. reserveMint is
-    // claim-or-adopt: a reservation whose local id is already held by a different
-    // row_hash (a concurrent ingester or a projection that materialized the row
-    // first) comes back as the incumbent identity. When any is adopted, fold ALL
-    // effective mappings into the prefetch and re-plan once so every op submits
-    // the agreed identity (and no fresh uuid is re-minted for a claimed insert).
-    // No second reserveMint: the re-plan only reuses now-durable identities.
-    if (plan.reservations.length > 0) {
-        const effective = await source.reserveMint(plan.reservations);
-        const adopted = effective.some((eff, i) => eff.rowId !== plan.reservations[i].rowId);
-        if (adopted) {
-            for (const eff of effective) prefetched.set(eff.table + '\u0000' + eff.localId, eff);
-            plan = planDatabaseEntries(batch, nodeCtxFor, lookup, keyLookup, newUuid, fkBundlingFor, updateMergeFor);
-        }
-    }
-
-    // --- failure / recovery accumulators ---
-    const failureEvents: OpEvent[] = [];
-    const marks = new Map<B64Hash, Mark>();   // keyed by rowId
-
-    const recordFailure = async (f: {
-        groupId: B64Hash; kind: 'insert' | 'update' | 'delete'; targetTable: string; rdbTable: string;
-        rowId?: B64Hash; localId: number; write?: BundleWrite; failure: ValidationFailure; source?: CapturedChange;
-        sources: CapturedChange[]; column?: string;
-    }): Promise<void> => {
-        const group = groupById.get(f.groupId)!;
-        const { opHash, op } = await failureHash(group, f);
-        const event: OpEvent = {
-            origin: 'ingestion', direction: 'failure', groupId: f.groupId, opHash, kind: f.kind,
-            table: f.targetTable, localId: f.localId, author: authorFor(f.groupId)?.keyId,
-            reason: { source: 'validation', failure: f.failure },
-        };
-        if (f.rowId !== undefined) event.rowId = f.rowId;
-        if (op !== undefined) event.op = op;
-        failureEvents.push(event);
-        rejects.get(f.groupId)!.push({ change: f.source, groupId: f.groupId, reason: formatValidationFailure(f.failure) });
-        if (f.rowId !== undefined) {
-            marks.set(f.rowId, { groupId: f.groupId, rdbTable: f.rdbTable, targetTable: f.targetTable,
-                rowId: f.rowId, localId: f.localId });
-        }
-    };
-
-    // Planner (translate-time) rejects are ingestion failures too.
-    for (const rej of plan.rejects) {
-        const groupId = rej.change !== undefined ? tableToGroup.get(rej.change.table) : undefined;
-        if (groupId === undefined || rej.table === undefined || rej.kind === undefined || rej.localId === undefined) {
-            if (groupId !== undefined) rejects.get(groupId)!.push({ change: rej.change, reason: rej.reason });
-            continue;
-        }
-        await recordFailure({
-            groupId, kind: rej.kind, targetTable: rej.table, rdbTable: rej.op?.table ?? rdbTableName(contexts.get(groupId)!.config, rej.table),
-            rowId: rej.rowId, localId: rej.localId, write: rej.op, failure: { reason: rej.reason }, source: rej.change,
-            sources: rej.sources ?? (rej.change !== undefined ? [rej.change] : []), column: rej.column,
-        });
-    }
-
-    // --- submit helpers ---
-    const bump = (groupId: B64Hash, n: number): void => { accepted.set(groupId, accepted.get(groupId)! + n); };
-
-    const attempt = async (group: RTableGroup, writes: BundleWrite[], author: OwnIdentity | undefined):
-        Promise<{ ok: true } | { ok: false; why: ValidationFailure }> => {
-        try {
-            await group.bundle(writes, author);
-            return { ok: true };
-        } catch (e) {
-            if (e instanceof ValidationRejectedError) return { ok: false, why: e.why };
-            return { ok: false, why: { reason: e instanceof Error ? e.message : String(e) } };
-        }
-    };
-
-    // Submit a single op; on reject apply the idempotent-replay skips and the
-    // per-field update fallback, else record a genuine failure.
-    const submitOp = async (groupId: B64Hash, op: PlannedOp): Promise<void> => {
-        const group = groupById.get(groupId)!;
-        const rowId = op.write.op.rowId;
-        const res = await attempt(group, [op.write], authorFor(groupId));
-        if (res.ok) { bump(groupId, 1); return; }
-
-        if (op.kind === 'insert' && isWriteOnceFor(res.why, rowId)) {
-            // The rowId is already in the DAG. rowId = hash(uuid, author) and the
-            // uuid is either our freshly-minted random one or a reserved/adopted
-            // one, so a write-once conflict can only mean THIS identity already
-            // landed - our own prior crashed pass, or a concurrent ingester that
-            // shares the reserved identity (claim-or-adopt). Idempotent skip.
-            return;
-        }
-        if (op.kind === 'delete' && isNotLiveFor(res.why, rowId)) {
-            return;   // already deleted: idempotent skip
-        }
-        if (op.kind === 'update' && op.fallback !== undefined) {
-            for (const f of op.fallback) await submitOp(groupId, f);   // per-field fallback
-            return;
-        }
-        await recordFailure({
-            groupId, kind: op.kind, targetTable: op.table, rdbTable: op.rdbTable, rowId,
-            localId: op.localId, write: op.write, failure: res.why, source: op.sources[op.sources.length - 1],
-            sources: op.sources,
-        });
-    };
-
-    // Submit one planned entry: try the FK bundle whole, else fall back to its
-    // constituent ops individually (in order).
-    const submitEntry = async (entry: PlannedEntry): Promise<void> => {
-        const groupId = entry.groupId as B64Hash;
-        const group = groupById.get(groupId)!;
-        if (entry.ops.length > 1) {
-            const res = await attempt(group, entry.ops.map((o) => o.write), authorFor(groupId));
-            if (res.ok) { bump(groupId, entry.ops.length); return; }
-            for (const op of entry.ops) await submitOp(groupId, op);   // fkBundling fallback
-            return;
-        }
-        await submitOp(groupId, entry.ops[0]);
-    };
-
-    // --- cross-group ref-advance state (unchanged interleaving) ---
-    const observedBy = buildObservedBy(members);
-    const dirty = new Map<B64Hash, Map<B64Hash, Version>>();
-    const bindingNameFor = (observerId: B64Hash, foreignId: B64Hash): string | undefined => {
-        for (const [name, fid] of Object.entries(groupById.get(observerId)!.getBindings())) {
-            if (fid === foreignId) return name;
-        }
-        return undefined;
-    };
-    const propagate = async (groupId: B64Hash): Promise<void> => {
-        const observers = observedBy.get(groupId);
-        if (observers === undefined || observers.length === 0) return;
-        const gFrontier = await frontierOf(groupById.get(groupId)!);
-        for (const { observerId } of observers) {
-            let pending = dirty.get(observerId);
-            if (pending === undefined) { pending = new Map(); dirty.set(observerId, pending); }
-            pending.set(groupId, gFrontier);
-        }
-    };
-    const flush = async (
-        observerId: B64Hash, forChanges: CapturedChange[] | undefined, guard?: Set<string>,
-    ): Promise<void> => {
-        const pending = dirty.get(observerId);
-        if (pending === undefined || pending.size === 0) return;
-        dirty.delete(observerId);
-        const observer = groupById.get(observerId)!;
-        const writer = writerFor(observerId);
-        // in gate-graph order: a group an observe gate reads is observed before
-        // the binding that gate guards, so the gate sees its new version
-        const order = gateGraphOrder(gateGraph(observer.getBindings(), observer.getCanObserve() ?? {}));
-        const rank = (id: B64Hash) => { const i = order.indexOf(id); return i < 0 ? order.length : i; };
-        for (const [foreignId, version] of [...pending].sort(([a], [b]) => rank(a) - rank(b))) {
-            const pairKey = observerId + '\u0000' + foreignId;
-            if (guard !== undefined) {
-                if (guard.has(pairKey)) continue;
-                guard.add(pairKey);
-            }
-            const bindingName = bindingNameFor(observerId, foreignId);
-            if (bindingName === undefined) continue;
-            const author = observer.observeNeedsAuthor(bindingName) ? writer : undefined;
-            const failure = await observeToVersion(observer, bindingName, foreignId, version, author);
-            if (failure !== undefined) {
-                rejects.get(observerId)!.push({
-                    change: forChanges?.[forChanges.length - 1],
-                    groupId: observerId,
-                    reason: `ref-advance to bound group '${foreignId}' failed: ${failure.reason}`,
-                });
-            }
-        }
-    };
-
-    // Linear walk: for each entry, make the owning group's observations current,
-    // submit the entry (with fallbacks), then propagate its new frontier.
-    for (const entry of plan.entries) {
-        const groupId = entry.groupId as B64Hash;
-        await flush(groupId, entry.ops.flatMap((o) => o.sources));
-        await submitEntry(entry);
-        await propagate(groupId);
-    }
-
-    // Drain: flush observers that never wrote, transitively.
-    const guard = new Set<string>();
-    for (;;) {
-        const pendingObservers = [...dirty.keys()].filter((o) => (dirty.get(o)?.size ?? 0) > 0);
-        if (pendingObservers.length === 0) break;
-        const settled = pendingObservers.find((o) =>
-            ![...dirty.get(o)!.keys()].some((observed) => (dirty.get(observed)?.size ?? 0) > 0));
-        const pick = settled ?? pendingObservers[0];
-        await flush(pick, undefined, guard);
-        await propagate(pick);
-    }
-
-    // --- mark-then-revert recovery (quiescence-gated) ---
-    const consumed: CapturedChangeId[] = batch.changes.map((c) => c.id);
-    const consumedSet = new Set<CapturedChangeId>(consumed);
-    // A row with an un-consumed (newer) outbox change pending is left alone: a
-    // later cycle ingests that write, so reverting now would clobber it.
-    const pendingRows = new Set<string>();
-    try {
-        for (const c of (await source.drainChanges()).changes) {
-            if (!consumedSet.has(c.id)) pendingRows.add(c.table + '\u0000' + c.localId);
-        }
-    } catch { /* not capture-provisioned: no pending rows */ }
-
-    const reverts: RowAction[] = [];
-    const statuses: SyncStatusUpdate[] = [];
-    for (const mark of marks.values()) {
-        const group = groupById.get(mark.groupId)!;
-        const ctx = contexts.get(mark.groupId)!;
-        const to = await (await group.getScopedDag()).getFrontier();
-        const view = await group.getView(to, to);
-        const tableView = await view.getTableView(mark.rdbTable);
-        const row = await tableView.getRow(mark.rowId);
-        if (row === undefined) {
-            // The op never landed (an insert orphan, or an already-deleted row):
-            // remove the local app row and mark the sync record ingestion_failure.
-            // This is NOT quiescence-gated: the app row has no rdb counterpart, so
-            // a newer pending change for this local id is a follow-on to a rejected
-            // insert (a stale image). Leaving the orphan in place would replay the
-            // rejected insert next cycle; instead we poison it now and the pending
-            // rows are drained-and-dropped next cycle (planner drops a poisoned id).
-            reverts.push({ kind: 'delete-row', table: mark.targetTable, rowId: mark.rowId });
-            statuses.push({ table: mark.targetTable, rowId: mark.rowId, status: 'ingestion_failure' });
-        } else {
-            // The row exists in rdb: re-materialize it fully (undo the local edit) -
-            // UNLESS a newer outbox change is pending for it (quiescence gate): a
-            // later cycle ingests that write, so reverting now would clobber it.
-            if (pendingRows.has(mark.targetTable + '\u0000' + mark.localId)) continue;
-            reverts.push(rowToUpsertAction(row, mark.rdbTable, view.getSchemaView(), ctx.config));
-        }
-    }
-
-    // --- atomic settle ---
-    await source.commitIngest({ consumed, events: failureEvents, reverts, statuses });
-
-    return toResults();
+    return (await ingestOnce(members, source, newUuid)).results;
 }
 
-// The per-database single-flight lock shared by the sync cycle and index
-// reconciliation, so a reconcile can never interleave with a sync over the
-// same member set in this process.
-export async function withDatabaseLock<T>(members: GroupProjection[], fn: () => Promise<T>): Promise<T> {
-    const lockKey = members.map((m) => m.group.getId()).sort().join('|');
-    return withLock('db:' + lockKey, fn);
-}
+// What a sync cycle did. `results`: each member's ingestion. `refused`: the
+// projection pass didn't apply, because a change was captured after ingestion
+// (PendingChangesError); the next cycle ingests it first. `stoppedAt`: the
+// groups with an identity provider and no writer key whose pending change
+// stopped ingestion; no projection applies while it is pending, and no cycle
+// is due because of it (HIP-29).
+export type SyncOutcome = { results: Map<B64Hash, IngestResult>; refused: boolean; stoppedAt: B64Hash[] };
 
-// The replica-wide coordinated cycle: ingest all members' local edits, THEN
-// project every member back into the shared target. Single-flighted across the
-// whole database (the shared outbox is drained once).
+// The replica-wide coordinated cycle, under the target's lock: ingest all
+// members' local edits, once more if the outbox filled up meanwhile, THEN
+// project every member back into the shared target. The projection never
+// applies over a pending change: a change captured after the second ingestion
+// makes it refuse, and the cycle ends.
 export async function syncDatabase(
     members: GroupProjection[],
     backend: BidirectionalTarget,
     newUuid: () => string = defaultNewUuid,
-): Promise<Map<B64Hash, IngestResult>> {
-    return withDatabaseLock(members, async () => {
-        const ingestable = members.filter((m) => m.config.writer !== undefined);
-        let results = new Map<B64Hash, IngestResult>();
-        if (ingestable.length > 0) {
-            results = await ingestDatabaseChanges(ingestable, backend, newUuid);
+): Promise<SyncOutcome> {
+    return withTargetLock(backend, async () => {
+        const first = await ingestOnce(members, backend, newUuid);
+        const results = first.results;
+        let stoppedAt = first.stoppedAt;
+        if (stoppedAt === undefined && await backend.hasPendingChanges()) {
+            const second = await ingestOnce(members, backend, newUuid);
+            mergeResults(results, second.results);
+            stoppedAt = second.stoppedAt;
         }
+        const stopped = stoppedAt === undefined ? [] : [stoppedAt];
 
-        const anyUnmaterialized = await (async (): Promise<boolean> => {
-            for (const m of members) {
-                if ((await backend.getCheckpoint(m.group.getId())) === undefined) return true;
-            }
-            return false;
-        })();
-        if (anyUnmaterialized && await hasPendingChanges(backend)) {
-            throw new Error(
-                "refusing initial projection over un-ingested changes; "
-                + "configure a writer on every member so ingestDatabaseChanges drains them first");
+        try {
+            await projectDatabase(members, backend);
+        } catch (e) {
+            if (e instanceof PendingChangesError) return { results, refused: true, stoppedAt: stopped };
+            throw e;
         }
-
-        await projectDatabase(members, backend);
-        return results;
+        return { results, refused: false, stoppedAt: stopped };
     });
 }

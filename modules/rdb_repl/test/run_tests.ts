@@ -15,6 +15,8 @@ import {
     type SchemaAction,
     type StoredOpEvent,
     type SyncMapping,
+    type CapturedChangeId,
+    type ChangeRecord,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import {
     KEM_X25519_HKDF,
@@ -93,6 +95,22 @@ class FlakyTarget implements BidirectionalTarget {
         return this.inner.getCheckpoint(groupId);
     }
 
+    hasPendingChanges(): Promise<boolean> {
+        return this.inner.hasPendingChanges();
+    }
+
+    writeRecord(id: CapturedChangeId, record: ChangeRecord): Promise<void> {
+        return this.inner.writeRecord(id, record);
+    }
+
+    recordEndObserve(groupId: B64Hash, hash: B64Hash): Promise<void> {
+        return this.inner.recordEndObserve(groupId, hash);
+    }
+
+    getEndObserves(groupId: B64Hash): Promise<B64Hash[]> {
+        return this.inner.getEndObserves(groupId);
+    }
+
     drainChanges(): Promise<CapturedBatch> {
         return this.inner.drainChanges();
     }
@@ -101,9 +119,6 @@ class FlakyTarget implements BidirectionalTarget {
         return this.inner.resolveRow(table, localId);
     }
 
-    reserveMint(reservations: SyncMapping[]): Promise<SyncMapping[]> {
-        return this.inner.reserveMint(reservations);
-    }
 
     commitIngest(settle: IngestSettle): Promise<void> {
         return this.inner.commitIngest(settle);

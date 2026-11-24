@@ -100,6 +100,14 @@ export function create<Tx = void>(
             const e = createEntry(payload, meta, after, hash);
 
             await store.withTransaction(async (...tx) => {
+                // An entry the store already holds is written once: its hash
+                // covers its payload and its parents, so a second append is
+                // the same entry, and writing it again would put it back into
+                // the frontier. The check runs inside the transaction, so two
+                // appends of one entry at once can't both write it.
+                if (await store.loadHeader(e.hash, ...tx) !== undefined) {
+                    return { fireListeners: false };
+                }
                 for (const prev of after||[]) {
                     if (await store.loadHeader(prev, ...tx) === undefined) {
                         throw new Error('cannot add ' + e.hash + ' before ' + prev);

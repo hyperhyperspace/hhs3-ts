@@ -1,15 +1,13 @@
 import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import {
-    deriveRowId, IDENTITIES_TABLE, identityRow, RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory, TableDef,
+    IDENTITIES_TABLE, identityRow, RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory, TableDef,
     usersSchemaTables,
 } from "@hyper-hyper-space/hhs3_rdb";
 
 import { createMockRContext } from "@hyper-hyper-space/hhs3_rdb_adapter_test_gen";
 import { changesToEntries, type IngestPlan, type MappingLookup } from "../../src/ingest.js";
-import type { AdapterConfig } from "../../src/types.js";
 
-import { fingerprintRdbRows } from "./fingerprint.js";
 import { generateCapturedBatch } from "./ingest_generate.js";
 import { resolveFuzzSweepOptions, type ResolvedFuzzSweepOptions } from "@hyper-hyper-space/hhs3_rdb_adapter_test_gen";
 
@@ -29,10 +27,6 @@ function counterUuid(): () => string {
     return () => 'u' + (++n);
 }
 
-function rejectIds(plan: IngestPlan): string {
-    return plan.rejects.map((r) => String(r.change?.id ?? '')).sort().join(',');
-}
-
 function opCount(plan: IngestPlan): number {
     return plan.entries.reduce((n, e) => n + e.ops.length, 0);
 }
@@ -40,15 +34,23 @@ function opCount(plan: IngestPlan): number {
 function flattenSources(plan: IngestPlan): Set<string | number> {
     const ids = new Set<string | number>();
     for (const e of plan.entries) {
-        for (const op of e.ops) {
-            for (const s of op.sources) ids.add(s.id);
-        }
+        for (const op of e.ops) ids.add(op.change.id);
     }
     return ids;
 }
 
-async function applyPlan(group: RTableGroupImpl, plan: IngestPlan, writer: OwnIdentity): Promise<void> {
+// Appends each planned op. An op that names a row rdb doesn't have, as its row
+// or in a foreign key, is left out: in ingestion rdb refuses it. That starts
+// with the refused replayed insert's row, and an insert left out this way adds
+// its own row, so a later change of that row is left out too.
+async function applyPlan(group: RTableGroupImpl, plan: IngestPlan, writer: OwnIdentity, absentRow?: string): Promise<void> {
+    const absent = new Set(absentRow === undefined ? [] : [absentRow]);
     for (const entry of plan.entries) {
+        const text = JSON.stringify(entry.ops.map((o) => o.write.op));
+        if ([...absent].some((rowId) => text.includes(JSON.stringify(rowId)))) {
+            for (const o of entry.ops) if (o.kind === 'insert') absent.add(o.write.op.rowId);
+            continue;
+        }
         await group.bundle(entry.ops.map((o) => o.write), writer);
     }
 }
@@ -105,35 +107,20 @@ export async function runIngestPlannerSweep(options: ResolvedFuzzSweepOptions): 
                 });
                 return (await ctx.createObject(init)) as RTableGroupImpl;
             };
-            const groupA = await makeGroup('opt');
-            const groupB = await makeGroup('naive');
-            const schemaView = (await groupA.getView()).getSchemaView();
-
-            const optCfg: AdapterConfig = { updateMerge: true, fkBundling: true };
-            const naiveCfg: AdapterConfig = { updateMerge: false, fkBundling: false };
-            const opt = changesToEntries(generated.batch, schemaView, lookup, optCfg, writer.keyId, counterUuid());
-            const naive = changesToEntries(generated.batch, schemaView, lookup, naiveCfg, writer.keyId, counterUuid());
-
-            if (rejectIds(opt) !== rejectIds(naive)) {
-                throw mismatch('ingest-reject-ids', seed, b,
-                    `opt=${rejectIds(opt)} naive=${rejectIds(naive)}`);
-            }
+            const group = await makeGroup('plan');
+            const schemaView = (await group.getView()).getSchemaView();
+            // One profile (HIP-29): each change is one op, a refusal, or nothing to
+            // write. The batch's inserts name no author, as if the tables had no
+            // author column, where the writer key signs them.
+            const plan = changesToEntries(generated.batch, schemaView, lookup, { authorColumn: false }, writer.keyId, counterUuid());
 
             const changeCount = generated.batch.changes.length;
-            if (opCount(naive) + naive.rejects.length !== changeCount) {
-                throw mismatch('ingest-flags-off-count', seed, b,
-                    `ops=${opCount(naive)} rejects=${naive.rejects.length} changes=${changeCount}`);
+            if (opCount(plan) + plan.rejects.length + plan.nothing.length !== changeCount) {
+                throw mismatch('ingest-count', seed, b,
+                    `ops=${opCount(plan)} rejects=${plan.rejects.length} nothing=${plan.nothing.length} changes=${changeCount}`);
             }
-
-            for (const e of opt.entries) {
-                for (const op of e.ops) {
-                    if (op.fallback !== undefined) {
-                        if (op.fallback.length < 2 || op.fallback.length !== op.sources.length) {
-                            throw mismatch('ingest-fallback-shape', seed, b,
-                                `fallback=${op.fallback.length} sources=${op.sources.length}`);
-                        }
-                    }
-                }
+            if (plan.entries.some((e) => e.ops.length !== 1)) {
+                throw mismatch('ingest-one-op-per-entry', seed, b, plan.entries.map((e) => e.ops.length).join(','));
             }
 
             const changes = generated.batch.changes;
@@ -141,8 +128,8 @@ export async function runIngestPlannerSweep(options: ResolvedFuzzSweepOptions): 
                 const a = changes[i], d = changes[i + 1];
                 if (a.kind !== 'insert' || d.kind !== 'delete') continue;
                 if (a.table !== d.table || a.localId !== d.localId) continue;
-                const src = flattenSources(naive);
-                const rejected = new Set(naive.rejects.map((r) => r.change?.id));
+                const src = flattenSources(plan);
+                const rejected = new Set(plan.rejects.map((r) => r.change?.id));
                 const covered = (src.has(a.id) ? 1 : 0) + (src.has(d.id) ? 1 : 0)
                     + (rejected.has(a.id) ? 1 : 0) + (rejected.has(d.id) ? 1 : 0);
                 if (covered !== 2) {
@@ -151,33 +138,21 @@ export async function runIngestPlannerSweep(options: ResolvedFuzzSweepOptions): 
                 }
             }
 
+            // An insert on a local id that already has an identity is refused,
+            // naming that identity's row.
             if (generated.replayLookup !== undefined) {
-                const replayOp = opt.entries.flatMap((e) => e.ops).find((o) => o.kind === 'insert'
-                    && o.table === generated.replayLookup!.table && o.localId === generated.replayLookup!.localId);
-                const expectedRowId = deriveRowId(generated.replayLookup.uuid, writer.keyId);
-                if (replayOp === undefined || replayOp.reusedIdentity !== true || replayOp.write.op.action !== 'insert'
-                    || replayOp.write.op.rowId !== expectedRowId) {
-                    throw mismatch('ingest-replay-uuid', seed, b,
-                        `reused=${replayOp?.reusedIdentity} rowId=${replayOp?.write.op.action === 'insert' ? replayOp.write.op.rowId : '?'}`
-                        + ` expected=${expectedRowId}`);
+                const replay = generated.replayLookup;
+                const insert = changes.find((c) => c.kind === 'insert' && c.table === replay.table && c.localId === replay.localId);
+                const refused = plan.rejects.find((r) => r.change?.id === insert?.id);
+                if (insert !== undefined && refused?.rowId !== replay.rowId) {
+                    throw mismatch('ingest-identity-refused', seed, b, `rowId=${refused?.rowId} expected=${replay.rowId}`);
                 }
             }
 
             try {
-                await applyPlan(groupA, opt, writer);
+                await applyPlan(group, plan, writer, generated.replayLookup?.rowId);
             } catch (e) {
-                throw mismatch('ingest-bundle-opt', seed, b, String(e));
-            }
-            try {
-                await applyPlan(groupB, naive, writer);
-            } catch (e) {
-                throw mismatch('ingest-bundle-naive', seed, b, String(e));
-            }
-
-            const fpA = await fingerprintRdbRows(await groupA.getView());
-            const fpB = await fingerprintRdbRows(await groupB.getView());
-            if (fpA !== fpB) {
-                throw mismatch('ingest-live-view', seed, b, `opt=${fpA}\nnaive=${fpB}`);
+                throw mismatch('ingest-bundle', seed, b, String(e));
             }
             process.stdout.write('.');
         }

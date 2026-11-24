@@ -25,7 +25,7 @@ import type { RContext } from "@hyper-hyper-space/hhs3_mvt";
 import type { RDb, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 import type { AdapterConfig, CrossGroupResolver, GroupProjection } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
-// Optional per-group config hook. It may set naming/fkBundling/writer, but NOT
+// Optional per-group config hook. It may set naming/writer, but NOT
 // tableNames or tablePrefix: the shared projection owns the group-qualified
 // namespace so the cross-group resolver stays consistent (an override of
 // either is ignored).
@@ -38,9 +38,9 @@ export type ScopeOptions = {
     names?: Map<B64Hash, string>;
     // Default writer applied to every member that lacks one (enables ingestion).
     writer?: OwnIdentity;
-    // Default FK-consecutive bundling applied to every member that does not set
-    // it (see AdapterConfig.fkBundling); a per-group configOverride still wins.
-    fkBundling?: boolean;
+    // Default autoAuthor for every member that does not set it (see
+    // AdapterConfig.autoAuthor); a per-group configOverride still wins.
+    autoAuthor?: boolean;
     configOverride?: GroupConfigOverride;
 };
 
@@ -124,7 +124,7 @@ export async function buildScope(groups: RTableGroup[], options: ScopeOptions = 
             crossGroup: resolverFor(group),
         };
         if (config.writer === undefined && options.writer !== undefined) config.writer = options.writer;
-        if (config.fkBundling === undefined && options.fkBundling !== undefined) config.fkBundling = options.fkBundling;
+        if (config.autoAuthor === undefined && options.autoAuthor !== undefined) config.autoAuthor = options.autoAuthor;
         members.push({ group, config });
     }
     return members;

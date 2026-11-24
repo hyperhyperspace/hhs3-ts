@@ -8,7 +8,7 @@ import {
 } from "@hyper-hyper-space/hhs3_rdb";
 
 import { createMockRContext } from "./mock_rcontext.js";
-import { pickConcurrentAt, recordCheckpoint } from "./checkpoints.js";
+import { cloneVersion, pickConcurrentAt, recordCheckpoint } from "./checkpoints.js";
 import { PRNG } from "./prng.js";
 
 const crypto = createBasicCrypto();
@@ -44,6 +44,11 @@ export type ProjectHistory = {
     schema: RSchemaImpl;
     rawDag: dag.Dag;
     checkpoints: Version[];
+    // The indexes in `checkpoints` of chain tips: a run of entries appended
+    // one after the other at an older checkpoint, recorded by its last entry
+    // alone. Such a version was never the group's frontier. After HIP-29's
+    // settle, a target's checkpoint is one, and its next delta starts there.
+    chainTips: number[];
     seed: number;
     opLog: string[];
     tallies: Tallies;
@@ -581,6 +586,46 @@ export async function generateProjectHistory(
         await recordCheckpoint(checkpoints, await groupFrontier());
     }
 
+    // Chains, after the main walk and on a PRNG of their own, so the walk above
+    // stays what it was for every seed. Each starts at an older checkpoint C
+    // and appends two or three row writes, each at the one before: what HIP-29's
+    // ingestion appends for a pass. The tip is recorded alone, then a write at
+    // the frontier, so a pair that starts at the tip has entries concurrent
+    // with the chain (those after C) and entries after it.
+    const chainPrng = new PRNG(seed ^ 0x0c4a1);
+    const chainTips: number[] = [];
+    const chains = Math.max(1, Math.floor(ops / 8));
+    for (let c = 0; c < chains; c++) {
+        const base = checkpoints[chainPrng.nextInt(0, checkpoints.length - 1)];
+        const length = chainPrng.nextInt(2, 3);
+        let pos: Version = cloneVersion(base);
+        let tip: B64Hash | undefined;
+        for (let k = 0; k < length; k++) {
+            try {
+                const live = await liveIds(group, 'orders', pos, ORDER_POOL, orderRowId);
+                const target = pick(chainPrng, live);
+                const orders = await group.getTable('orders');
+                tip = target !== undefined && chainPrng.next() < 0.6
+                    ? await orders.update(orderRowId(target), { customer: `c-${chainPrng.nextInt(0, 5)}` }, undefined, pos)
+                    : await orders.insert(`chain-${c}-${k}`, { customer: `c-${chainPrng.nextInt(0, 5)}` }, undefined, pos);
+                pos = version(tip);
+            } catch {
+                break;   // the schema at this position refuses the write: the chain ends here
+            }
+        }
+        if (tip === undefined) { bump(tallies, 'chain', 'rejected'); continue; }
+        bump(tallies, 'chain', 'accepted');
+        opLog.push(`[chain ${c}] ${length} writes at checkpoint ${checkpoints.indexOf(base)}, tip ${tip}`);
+        chainTips.push(checkpoints.length);
+        await recordCheckpoint(checkpoints, version(tip));
+        try {
+            await (await group.getTable('orders')).insert(`after-chain-${c}`, { customer: 'c-after' }, undefined, await groupFrontier());
+            await recordCheckpoint(checkpoints, await groupFrontier());
+        } catch {
+            // a frontier whose schema refuses the write: the pair from the tip still has the concurrent entries
+        }
+    }
+
     const rowAccepted = acceptedOf(tallies,
         'insert-order', 'insert-line', 'update-order', 'update-line', 'delete-order', 'delete-line',
         'bundle', 'insert-tag', 'insert-item');
@@ -595,5 +640,5 @@ export async function generateProjectHistory(
         );
     }
 
-    return { group, schema, rawDag, checkpoints, seed, opLog, tallies };
+    return { group, schema, rawDag, checkpoints, chainTips, seed, opLog, tallies };
 }

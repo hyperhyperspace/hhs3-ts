@@ -6,6 +6,10 @@
   "source": "src/index.ts",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    "./testing": { "types": "./dist/testing.d.ts", "default": "./dist/testing.js" }
+  },
   "scripts": {
     "test": "node --import ../../register.mjs ./test/run_tests.ts",
     "test:parity:fast": "node --import ../../register.mjs ./test/run_tests.ts PLANNER --profile fast",

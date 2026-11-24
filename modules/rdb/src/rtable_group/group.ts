@@ -94,7 +94,8 @@ import type { RTableView } from "../rtable/interfaces.js";
 import { RTableViewImpl } from "../rtable/view.js";
 import type { TruthTableView } from "../rtable/view.js";
 
-import type { RTableGroup as RTableGroupContract, RTableGroupView as RTableGroupViewContract, BundleWrite } from "./interfaces.js";
+import type { RTableGroup as RTableGroupContract, RTableGroupView as RTableGroupViewContract, BundleWrite, PreparedEntry, PrepareOptions } from "./interfaces.js";
+import { PreparedHashMismatchError } from "./interfaces.js";
 import { CreateTableGroupPayload, RowEnvelopePayload, BundlePayload, RTABLE_GROUP_TYPE_ID, deployGateSetFormat, type GroupParams, type TableMaps } from "./payload.js";
 import { TableScope, deriveCreateMeta, deriveEnvelopeMeta, deriveBundleMeta, deriveDeployKillMeta } from "./scopes.js";
 import type { DeployKills } from "./scopes.js";
@@ -619,10 +620,13 @@ export class RTableGroupImpl implements RTableGroupContract {
     // resolver. Used for schema FKs and schema ALLOW rules, and for the
     // references written in the catalog beside the schema (`canDeploy`,
     // `idProvider`, `canObserve`), which name tables the way the schema does.
+    // With `live`, the bound group is read through the live observes only, as
+    // a verdict reads it (the observed-version fold with `from` as its
+    // horizon); without it, through every observe, as validation reads it.
     async resolveSchemaForeignTableView(
-        groupName: string, schemaTable: string, at: Version, from: Version,
+        groupName: string, schemaTable: string, at: Version, from: Version, live = false,
     ): Promise<RTableView | undefined> {
-        return this.resolveSchemaForeignTableViewIn(freshVerdictEvaluation(), groupName, schemaTable, at, from, false);
+        return this.resolveSchemaForeignTableViewIn(freshVerdictEvaluation(), groupName, schemaTable, at, from, live);
     }
 
     async resolveSchemaForeignTableViewIn(
@@ -1018,6 +1022,23 @@ export class RTableGroupImpl implements RTableGroupContract {
     // be authored; the gate is evaluated at validation (and re-evaluated
     // at-use), exactly like a gated deploy.
     async observe(group: string | B64Hash, refVersion: Version, author?: OwnIdentity, at?: Version): Promise<B64Hash> {
+        return this.appendPrepared(await this.buildObserve(group, refVersion, author, at, this.selfValidate(), {}));
+    }
+
+    // The first of observe's two steps: builds the observe, signs it when an
+    // author is given, and validates it, without appending it. It always
+    // validates, whatever the replica's selfValidate says, so a refusal is
+    // known before anything is written. appendPrepared appends it.
+    async prepareObserve(
+        group: string | B64Hash, refVersion: Version, author?: OwnIdentity, at?: Version, opts: PrepareOptions = {},
+    ): Promise<PreparedEntry> {
+        return this.buildObserve(group, refVersion, author, at, true, opts);
+    }
+
+    private async buildObserve(
+        group: string | B64Hash, refVersion: Version, author: OwnIdentity | undefined, at: Version | undefined,
+        validate: boolean, opts: PrepareOptions,
+    ): Promise<PreparedEntry> {
         const scopedDag = await this.getScopedDag();
         at = at ?? await scopedDag.getFrontier();
 
@@ -1034,14 +1055,29 @@ export class RTableGroupImpl implements RTableGroupContract {
             : base as unknown as json.LiteralMap;
         const meta = createRefAdvanceMeta(groupId);   // barrier (default)
 
-        if (this.selfValidate()) {
-            const result = await this.validatePayload(payload, at);
+        if (validate) {
+            const result = await this.validatePayload(payload, at, opts);
             if (!result.valid) {
                 throw new ValidationRejectedError(formatValidationFailure(result.why), result.why);
             }
         }
 
-        return scopedDag.append(payload, meta, at);
+        return { payload, meta, at, hash: await scopedDag.computeEntryHash(payload, at) };
+    }
+
+    // The second step of bundle and observe: appends what the first step
+    // prepared. It throws PreparedHashMismatchError when the entry's hash isn't
+    // the prepared one: before appending, when the prepared entry no longer
+    // hashes to it, and after, when the DAG gave the appended entry another
+    // hash. So a hash recorded before the append always names the entry
+    // appended, or the caller learns it doesn't.
+    async appendPrepared(prepared: PreparedEntry): Promise<B64Hash> {
+        const scopedDag = await this.getScopedDag();
+        const expected = await scopedDag.computeEntryHash(prepared.payload, prepared.at);
+        if (expected !== prepared.hash) throw new PreparedHashMismatchError(prepared.hash, expected);
+        const hash = await scopedDag.append(prepared.payload, prepared.meta, prepared.at);
+        if (hash !== prepared.hash) throw new PreparedHashMismatchError(prepared.hash, hash);
+        return hash;
     }
 
     private resolveBoundGroupId(group: string | B64Hash): B64Hash {
@@ -1059,6 +1095,15 @@ export class RTableGroupImpl implements RTableGroupContract {
     // recombined. The whole entry validates and applies as a unit
     // (all-or-nothing).
     async bundle(writes: BundleWrite[], author?: OwnIdentity, at?: Version): Promise<B64Hash> {
+        return this.appendPrepared(await this.prepareBundle(writes, author, at));
+    }
+
+    // The first of bundle's two steps: builds the bundle, signs it when an
+    // author is given, and validates it, without appending it. With
+    // `liveReads`, it also validates with the bound groups read through the
+    // live observes only, as the bundle's verdict reads them (HIP-29), so a
+    // bundle that would be void where it stands is refused.
+    async prepareBundle(writes: BundleWrite[], author?: OwnIdentity, at?: Version, opts: PrepareOptions = {}): Promise<PreparedEntry> {
         const scopedDag = await this.getScopedDag();
         at = at ?? await scopedDag.getFrontier();
 
@@ -1078,9 +1123,16 @@ export class RTableGroupImpl implements RTableGroupContract {
         if (!result.valid) {
             throw new ValidationRejectedError(formatValidationFailure(result.why), result.why);
         }
+        if (opts.liveReads === true) {
+            const live = await this.validatePayload(payload, at, { liveReads: true });
+            if (!live.valid) {
+                throw new ValidationRejectedError(formatValidationFailure(live.why), live.why);
+            }
+        }
 
         const schemaView = await this.resolveSchemaView(at);
-        return scopedDag.append(payload, deriveBundleMeta(payload, schemaView), at);
+        const meta = deriveBundleMeta(payload, schemaView);
+        return { payload: payload as unknown as json.LiteralMap, meta, at, hash: await scopedDag.computeEntryHash(payload as unknown as json.Literal, at) };
     }
 
     // Whether an entry is VOID at this `from` horizon: row restrictions already
@@ -1294,8 +1346,10 @@ export class RTableGroupImpl implements RTableGroupContract {
 
     // RObject interface
 
-    async validatePayload(payload: Payload, at: Version): Promise<ValidationResult> {
-        return validateTableGroupPayload(payload, { mode: 'op', group: this, at });
+    // With `liveReads`, the bound groups are read through the live observes
+    // only (see prepareBundle).
+    async validatePayload(payload: Payload, at: Version, opts: PrepareOptions = {}): Promise<ValidationResult> {
+        return validateTableGroupPayload(payload, { mode: 'op', group: this, at, liveReads: opts.liveReads === true });
     }
 
     async applyPayload(payload: Payload, at: Version): Promise<B64Hash> {

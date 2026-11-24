@@ -1,30 +1,18 @@
-// Pure inverse planner: captured target-side changes -> ORDERED rdb write ops.
-// The inbound sibling of row_actions.ts. No IO, no target, no signing (bundle()
-// signs); given prefetched sync-mapping / key lookups it is a pure function of
-// (batch, schemaView, config).
+// Pure inverse planner: one captured target-side change -> one rdb write op
+// (HIP-29). The inbound sibling of row_actions.ts. No IO, no target, no
+// signing (prepareBundle signs); given prefetched sync-mapping / key lookups
+// it is a pure function of (change, schemaView, config).
 //
-// FAITHFULNESS: the outbox is drained in commit order and replayed op-by-op in
-// that order - one net op per captured change - with only TWO optional
-// optimistic bundlings, each with a safe fallback the orchestrator applies:
-//
-//   1. updateMerge (config.updateMerge !== false): a run of CONSECUTIVE update
-//      changes on the SAME row whose column sets are DISJOINT folds into ONE
-//      rdb update op (a repeated column / a different row / a non-update breaks
-//      the run). The merged op keeps its constituents as `fallback` ops so the
-//      orchestrator can re-submit them per-change if the merged op is rejected.
-//   2. fkBundling (config.fkBundling !== false): a run of CONSECUTIVE inserts
-//      linked by an explicit same-group FK arc bundles into ONE atomic entry
-//      (groupEntries). On a bundle reject the orchestrator re-submits the
-//      constituent ops individually, in order.
-//
-// It NEVER folds an insert with a later update (an insert keeps its capture-time
-// image; later edits are their own ops) and NEVER cancels an insert+delete
-// (both are submitted faithfully). Identity is the HHS opId, not the rowId; a
-// minted insert's uuid is REUSED from an existing reserved sync mapping when
-// present (crash-replay read-back) so replays reproduce the identical payload.
+// Each change becomes one op, or a refusal, or nothing to write: an update
+// whose named columns are all set aside. Nothing is bundled or merged: an
+// insert that references a row inserted earlier in the pass finds it, since
+// its entry comes after that row's, and an update lands or is refused whole.
+// Nothing is dropped either: every change the planner can't take is a
+// refusal with a kind, so the orchestrator records its failure.
 //
 // Validity (do the FKs/restrictions actually hold) is NOT decided here - rdb
-// decides it at bundle(); rejects flow back through the orchestrator.
+// decides it when it builds the entry; rejects flow back through the
+// orchestrator.
 
 import { json } from "@hyper-hyper-space/hhs3_json";
 import type { KeyId } from "@hyper-hyper-space/hhs3_crypto";
@@ -39,68 +27,65 @@ import {
     authorColumn, isSystemColumn, keyRefColumnFromTarget, rdbColumnName, rdbFkColumnFromTarget, rdbTableName,
 } from "./names.js";
 
-// One translated, ready-to-submit op plus its bookkeeping. `deps` are the
-// in-batch same-group local-FK row keys this op references (they drive
-// FK-consecutive bundling). `mapping` is present for a minted insert.
-// `reusedIdentity` marks an insert whose uuid/rowId came from an EXISTING
-// reserved sync mapping (a crash-replay read-back or an adopted concurrent
-// identity) rather than a fresh mint. Informational only: the orchestrator now
-// treats ANY write-once conflict on an insert's own rowId as already-applied
-// (the uuid is unique, so a conflict can only be this same identity). `fallback`
-// (a merged update only) holds the per-change ops to re-submit if the merged op
-// is rejected.
+// One translated, ready-to-submit op. `mapping` is the identity of an
+// insert: its row hash, uuid and signer. `anonymous` marks an insert signed by
+// no one (autoAuthor off with an empty author column).
 export type PlannedOp = {
-    key: string;              // keyOf(target table, localId)
     table: string;            // target (projected) table
     localId: number;
     groupId: string;
     rdbTable: string;
     kind: 'insert' | 'update' | 'delete';
     write: BundleWrite;
-    sources: CapturedChange[];
+    change: CapturedChange;
     mapping?: SyncMapping;
-    reusedIdentity?: boolean;
-    fallback?: PlannedOp[];
-    deps: string[];
+    anonymous?: true;
 };
 
-// One unit submitted as a single DAG entry: a bundle of >= 1 ordered ops. A
-// bundle is always single-group; the orchestrator uses `groupId` to interleave
-// cross-group ref-advances. `ops.length > 1` iff FK-bundled.
+// The entries of a planned batch, one op each, in commit order.
 export type PlannedEntry = {
     groupId: string;
     ops: PlannedOp[];
 };
 
-// A translate-time reject enriched for the op-event log: the constructed
-// (never-appended) op and the row it targeted, so the orchestrator can record a
-// failure event (full op JSON + synthetic hash) and revert the row. `sources`
-// are the captured changes the refused write came from, and `column` the
-// target column refused: the failure's hash covers both, so two refusals of
-// one row, or of two columns of one captured change, are logged apart.
+// A refusal, enriched for the op-event log: the constructed (never-appended)
+// op and the row it targeted, so the orchestrator can record a failure event
+// (op JSON + a synthetic hash) and revert the row. `sources` are the captured
+// changes the refused write came from, and `column` the target column
+// refused: the failure's hash covers both. A refused insert carries a row hash
+// and uuid: those of its local id's identity, or ones minted for it, which its
+// failure event carries.
 export type PlannedReject = IngestRejection & {
     op?: BundleWrite;
     table?: string;
     localId?: number;
     rowId?: string;
+    uuid?: string;
     kind?: 'insert' | 'update' | 'delete';
     author?: KeyId;
     sources?: CapturedChange[];
     column?: string;
 };
 
+// What the planner makes of one change.
+export type ChangePlan =
+    | { kind: 'op'; op: PlannedOp }
+    | { kind: 'refused'; reject: PlannedReject }
+    | { kind: 'nothing' };
+
+// A planned batch (planDatabaseEntries): the ops, the refusals, and the
+// changes with nothing to write, among them those of a table no member projects.
 export type IngestPlan = {
     entries: PlannedEntry[];
     rejects: PlannedReject[];
-    // Every minted insert identity (accepted AND rejected), for reserveMint to
-    // durably persist BEFORE the append walk - so a crash-replay reads the same
-    // uuid back, and a rejected insert still has a sync row to revert against.
-    reservations: SyncMapping[];
+    nothing: CapturedChange[];
 };
 
-// Resolve (target table, localId) -> the existing sync mapping, prefetched by
-// the orchestrator. Used for the SUBJECT of an update/delete, for resolving an
-// existing local FK target, AND for crash-replay uuid read-back of an insert.
+
+// Resolve (target table, localId) -> the local id's identity: its stored sync
+// mapping, or one the pass gave it, as the orchestrator keeps them. Used for
+// the subject of an update/delete, for an insert on a local id that already
+// has an identity, and for a local FK target.
 export type MappingLookup = (table: string, localId: number) => SyncMapping | undefined;
 
 // Prefetched KeyIndex lookups for key-ref reverse: key id -> {keyHash, publicKey}.
@@ -113,183 +98,37 @@ export type NodeContext = {
     schemaView: RSchemaView;
     config: AdapterConfig;
     writerKeyId: KeyId | undefined;
+    // rdb's row for an update's subject, to set aside a readonly or author
+    // column that holds the row's own value (HIP-29). Absent: none set aside.
+    subjectRow?: (rdbTable: string, rowId: string) => SubjectRow | undefined;
+    // autoAuthor off in a group with an identity provider: an insert is signed
+    // as its captured author column says, and is anonymous when it is empty.
+    autoAuthorOff?: boolean;
 };
+
+// rdb's values of a row, and its author's key hash, as an update finds it.
+export type SubjectRow = { values: { [column: string]: json.Literal }; author?: string };
+
+// Whether a value written to a column is the value rdb's row has there. NULL
+// and an absent column are the same.
+function sameRdbValue(a: json.Literal | null | undefined, b: json.Literal | null | undefined): boolean {
+    const x = a ?? null;
+    const y = b ?? null;
+    if (x === null || y === null) return x === y;
+    return json.eq(x, y);
+}
 
 function keyOf(table: string, localId: number): string {
     return table + '\u0000' + localId;
 }
 
-function disjoint(a: { [k: string]: unknown }, b: { [k: string]: unknown }): boolean {
-    for (const k of Object.keys(b)) if (k in a) return false;
-    return true;
-}
-
 // ---------------------------------------------------------------------------
-// Step 1: order-preserving planning (NO reordering, NO lossy coalescing).
+// Reverse a set of target columns to rdb columns/values, resolving FK and
+// key-ref values. Returns the rdb values, or the first offending column's
+// reject reason.
 // ---------------------------------------------------------------------------
 
-// One original update change folded into a (possibly merged) update net op.
-// `unreadable` carries a column the target could not read back, which the
-// planner refuses (CapturedChange.unreadable).
-type UpdatePart = { values: CapturedValues; unreadable?: { [column: string]: string }; sources: CapturedChange[] };
-
-type NetChange = {
-    table: string;
-    localId: number;
-    kind: 'insert' | 'update' | 'delete';
-    values: CapturedValues;
-    // The columns of `values`' changes that the target could not read back.
-    unreadable?: { [column: string]: string };
-    sources: CapturedChange[];
-    // Update only: the constituent per-change updates (>1 iff a merge happened),
-    // used to build the merged op's per-change fallback.
-    parts?: UpdatePart[];
-};
-
-// The columns a net change touches, readable or not, for the disjointness test
-// of a merge.
-function touched(net: NetChange): CapturedValues {
-    const columns: CapturedValues = { ...net.values };
-    for (const column of Object.keys(net.unreadable ?? {})) columns[column] = null;
-    return columns;
-}
-
-// Emit one net op per captured change, in order, merging ONLY a run of
-// consecutive same-row disjoint-field updates (when updateMerge is on for that
-// row's group). Inserts and deletes are always standalone.
-function planOps(batch: CapturedBatch, updateMergeFor: (table: string) => boolean): NetChange[] {
-    const out: NetChange[] = [];
-    for (const change of batch.changes) {
-        if (change.kind === 'insert') {
-            out.push({ table: change.table, localId: change.localId, kind: 'insert',
-                values: { ...change.values },
-                ...(change.unreadable !== undefined ? { unreadable: { ...change.unreadable } } : {}),
-                sources: [change] });
-            continue;
-        }
-        if (change.kind === 'delete') {
-            out.push({ table: change.table, localId: change.localId, kind: 'delete',
-                values: {}, sources: [change] });
-            continue;
-        }
-        // update: one change per column first, so each column lands or fails on
-        // its own on every target, as SQLite's per-column capture already gives,
-        // and updateMerge treats memory's and IndexedDB's multi-column changes
-        // as it treats SQLite's. Each column then merges with the
-        // immediately-preceding net op iff it is an update on the same row with
-        // a disjoint column set (any other change in between - a different row,
-        // an insert/delete - breaks the run). A column the target could not
-        // read is a part of its own, with no value, which the planner refuses.
-        const columns: { column: string; values: CapturedValues; unreadable?: { [column: string]: string } }[] = [
-            ...Object.entries(change.values).map(([column, value]) => ({ column, values: { [column]: value } })),
-            ...Object.entries(change.unreadable ?? {}).map(([column, reason]) => ({ column, values: {}, unreadable: { [column]: reason } })),
-        ];
-        for (const { column, values, unreadable } of columns) {
-            const part: UpdatePart = { values, ...(unreadable !== undefined ? { unreadable } : {}), sources: [change] };
-            const last = out[out.length - 1];
-            const canMerge = last !== undefined
-                && last.kind === 'update'
-                && last.table === change.table
-                && last.localId === change.localId
-                && updateMergeFor(change.table)
-                && disjoint(touched(last), { [column]: null });
-            if (canMerge) {
-                Object.assign(last.values, values);
-                if (unreadable !== undefined) last.unreadable = { ...(last.unreadable ?? {}), ...unreadable };
-                if (last.sources[last.sources.length - 1] !== change) last.sources.push(change);
-                last.parts!.push(part);
-                continue;
-            }
-            out.push({ table: change.table, localId: change.localId, kind: 'update',
-                values: { ...values }, ...(unreadable !== undefined ? { unreadable: { ...unreadable } } : {}),
-                sources: [change], parts: [part] });
-        }
-    }
-    return out;
-}
-
-// ---------------------------------------------------------------------------
-// Step 2: mint every insert's uuid/rowId up front (reusing a reserved uuid on
-// replay), so an FK reference to a sibling inserted anywhere in the batch
-// resolves regardless of commit order.
-// ---------------------------------------------------------------------------
-
-type Minted = { rowId: string; uuid: string; reused: boolean };
-
-// A dropped change: acked-and-warned, never submitted. Distinct from a reject
-// with a rowId (which records an op-event + a revert mark): a drop leaves no
-// trace beyond the warning because there is nothing new to reconcile.
-type MintResult = {
-    minted: Map<string, Minted>;
-    reservations: SyncMapping[];
-    // key -> human reason. Only insert keys appear here (update/delete drops are
-    // decided in translateNet from the subject's status).
-    drops: Map<string, string>;
-};
-
-function mintInserts(
-    nets: NetChange[],
-    ctxFor: (table: string) => NodeContext | undefined,
-    lookup: MappingLookup,
-    newUuid: () => string,
-): MintResult {
-    const minted = new Map<string, Minted>();
-    const reservations: SyncMapping[] = [];
-    const drops = new Map<string, string>();
-    for (const net of nets) {
-        if (net.kind !== 'insert') continue;
-        const ctx = ctxFor(net.table);
-        if (ctx === undefined) continue;
-        const key = keyOf(net.table, net.localId);
-
-        // Two insert captures for one local id in a batch: rowIds are write-once,
-        // so only the first can become a row. Mint once here; planNodes rejects
-        // the later nets as duplicates (distinguished from a non-reusable drop by
-        // the id being present in `minted`).
-        if (minted.has(key) || drops.has(key)) continue;
-
-        const existing = lookup(net.table, net.localId);
-        if (existing !== undefined) {
-            // The local id already maps to an rdb identity. Reuse it ONLY when it
-            // is a live minted row (active, with a uuid) - the crash-replay
-            // read-back that keeps replays idempotent. Otherwise this insert is a
-            // stale replay of a change whose identity cannot be reused: a poisoned
-            // (ingestion_failure) mapping, a deleted one, or a projected row we
-            // never minted a uuid for. Drop it - with monotonic local ids
-            // (never reused) a genuinely new row would carry a fresh id, so an
-            // insert on an id that already has a non-reusable mapping is always
-            // stale.
-            const reusable = existing.uuid !== ''
-                && (existing.status === undefined || existing.status === 'active');
-            if (!reusable) {
-                drops.set(key,
-                    `local row ${net.table}#${net.localId} already has an rdb identity that `
-                    + `cannot be reused (status ${existing.status ?? 'active'}); insert dropped`);
-                continue;
-            }
-            const rowId = deriveRowId(existing.uuid, ctx.writerKeyId);
-            minted.set(key, { uuid: existing.uuid, rowId, reused: true });
-            reservations.push({ table: net.table, localId: net.localId, rowId, uuid: existing.uuid,
-                author: ctx.writerKeyId, status: 'active' });
-            continue;
-        }
-
-        const uuid = newUuid();
-        const rowId = deriveRowId(uuid, ctx.writerKeyId);
-        minted.set(key, { uuid, rowId, reused: false });
-        reservations.push({ table: net.table, localId: net.localId, rowId, uuid,
-            author: ctx.writerKeyId, status: 'active' });
-    }
-    return { minted, reservations, drops };
-}
-
-// ---------------------------------------------------------------------------
-// Step 3: reverse a set of target columns to rdb columns/values, resolving FK
-// and key-ref values. Returns the rdb values + same-group FK deps, or the first
-// offending column's reject reason.
-// ---------------------------------------------------------------------------
-
-type Reversed = { ok: true; values: RowWrite; deps: string[] } | { ok: false; reason: string; column: string };
+type Reversed = { ok: true; values: RowWrite } | { ok: false; reason: string; column: string };
 
 // Reverse a set of target columns into rdb columns/values for `rdbTable`. A
 // null maps to a null of the rdb column: in each branch the readonly check
@@ -302,8 +141,8 @@ function reverseCols(
     isUpdate: boolean,
     lookup: MappingLookup,
     keyLookup: KeyLookup,
-    minted: Map<string, Minted>,
     unreadable?: { [column: string]: string },
+    subject?: SubjectRow,
 ): Reversed {
     // A column the target could not read back is refused before anything
     // else: its value never reached the planner.
@@ -325,7 +164,6 @@ function reverseCols(
 
     const authorCol = authorColumn(config);
     const values: RowWrite = {};
-    const deps: string[] = [];
     for (const targetCol of Object.keys(targetValues)) {
         const raw = targetValues[targetCol];
         const refuse = (reason: string): Reversed => ({ ok: false, reason, column: targetCol });
@@ -341,7 +179,13 @@ function reverseCols(
         // key, which signs it, or no author. In a group without an identity
         // provider, where every op is anonymous, it may name none.
         if (targetCol === authorCol) {
-            if (isUpdate) return refuse(`the author of a row of '${rdbTable}' can't be changed`);
+            if (isUpdate) {
+                // Named with the row's own author, it is set aside (HIP-29).
+                // An id the key table doesn't know names no key, so it never matches.
+                const named = raw === null ? null : typeof raw === 'number' ? keyLookup(raw)?.keyHash : undefined;
+                if (subject !== undefined && named !== undefined && named === (subject.author ?? null)) continue;
+                return refuse(`the author of a row of '${rdbTable}' can't be changed`);
+            }
             if (raw === null) continue;
             if (ctx.writerKeyId === undefined) {
                 return refuse(`'${rdbTable}' is in a group without an identity provider, so an insert can't name an author`);
@@ -355,46 +199,54 @@ function reverseCols(
             }
             continue;
         }
+        // A readonly column an update names with rdb's value for the row is set
+        // aside, compared once translated to rdb's value; another value is
+        // refused (HIP-29).
+        const readonlyUpdate = (rdbCol: string): boolean => isUpdate && def?.columns?.[rdbCol]?.readonly === true;
+        const keepsValue = (rdbCol: string, value: json.Literal | null): boolean =>
+            subject !== undefined && sameRdbValue(value, subject.values[rdbCol]);
         const fkInfo = rdbFkColumnFromTarget(config, rdbTable, fks, targetCol);
         if (fkInfo !== undefined) {
             const rdbCol = fkInfo.rdbColumn;
-            if (isUpdate && def?.columns?.[rdbCol]?.readonly) {
-                return refuse(`cannot update readonly column '${rdbTable}.${rdbCol}'`);
-            }
-            if (raw === null) {
-                values[rdbCol] = null;
-                continue;
-            }
-            if (fkInfo.resolvesToId) {
+            let value: json.Literal | null = raw;
+            if (raw !== null && fkInfo.resolvesToId) {
                 const targetTable = fkInfo.targetTable!;
                 const localRef = targetValues[targetCol] as number;
-                const tKey = keyOf(targetTable, localRef);
-                const targetRowId = minted.get(tKey)?.rowId ?? lookup(targetTable, localRef)?.rowId;
+                const targetRowId = lookup(targetTable, localRef)?.rowId;
                 if (targetRowId === undefined) {
+                    if (readonlyUpdate(rdbCol)) return refuse(`cannot update readonly column '${rdbTable}.${rdbCol}'`);
                     return refuse(`dangling FK '${rdbTable}.${rdbCol}' -> ${targetTable}#${localRef}`);
                 }
-                values[rdbCol] = targetRowId;
-                if (!fkInfo.crossGroup) deps.push(tKey);
-            } else {
-                values[rdbCol] = raw;
+                value = targetRowId;
             }
+            if (readonlyUpdate(rdbCol)) {
+                if (keepsValue(rdbCol, value)) continue;
+                return refuse(`cannot update readonly column '${rdbTable}.${rdbCol}'`);
+            }
+            values[rdbCol] = value;
             continue;
         }
 
         const keyRef = keyRefColumnFromTarget(config, rdbTable, provider, targetCol, identityColumns);
         if (keyRef !== undefined) {
             const rdbCol = keyRef.rdbColumn;
-            if (isUpdate && def?.columns?.[rdbCol]?.readonly) {
-                return refuse(`cannot update readonly column '${rdbTable}.${rdbCol}'`);
-            }
             if (raw === null) {
+                if (readonlyUpdate(rdbCol)) {
+                    if (keepsValue(rdbCol, null)) continue;
+                    return refuse(`cannot update readonly column '${rdbTable}.${rdbCol}'`);
+                }
                 values[rdbCol] = null;
                 continue;
             }
             const keyId = raw as number;
             const info = keyLookup(keyId);
             if (info === undefined) {
+                if (readonlyUpdate(rdbCol)) return refuse(`cannot update readonly column '${rdbTable}.${rdbCol}'`);
                 return refuse(`unknown key id ${keyId} for '${rdbTable}.${rdbCol}'`);
+            }
+            if (readonlyUpdate(rdbCol)) {
+                if (keepsValue(rdbCol, info.keyHash)) continue;
+                return refuse(`cannot update readonly column '${rdbTable}.${rdbCol}'`);
             }
             if (keyRef.isProviderKeyId) {
                 if (info.publicKey === undefined) {
@@ -411,12 +263,24 @@ function reverseCols(
 
         if (isSystemColumn(config, targetCol)) continue;
         const rdbCol = rdbColumnName(config, rdbTable, targetCol);
-        if (isUpdate && def?.columns?.[rdbCol]?.readonly) {
+        if (readonlyUpdate(rdbCol)) {
+            if (keepsValue(rdbCol, raw)) continue;
             return refuse(`cannot update readonly column '${rdbTable}.${rdbCol}'`);
         }
         values[rdbCol] = raw;
     }
-    return { ok: true, values, deps };
+    // Capture fills in an empty author column with the writer key from the
+    // writer record the projection keeps in the target. So an insert in a
+    // signed group that still leaves it empty was written while no writer key
+    // was recorded, and is refused, unless autoAuthor is off, where it is
+    // anonymous (HIP-29). HIP-20's writer refuses such a write too
+    // (no-writer-key).
+    if (!isUpdate && authorCol !== undefined && ctx.writerKeyId !== undefined && ctx.autoAuthorOff !== true
+        && (targetValues[authorCol] ?? null) === null) {
+        return { ok: false, column: authorCol,
+            reason: `an insert into '${rdbTable}' leaves its author empty: it was written while no writer key was recorded` };
+    }
+    return { ok: true, values };
 }
 
 // The columns an insert op carries, from the reversed columns of a captured
@@ -436,223 +300,127 @@ function insertWrite(reversed: RowWrite, def: TableDef | undefined): RowWrite {
     return write;
 }
 
-function translateNet(
-    net: NetChange,
+
+// The signer of an insert: the writer key, or no one under autoAuthor off when
+// its author column is empty (HIP-20).
+function insertSigner(change: CapturedChange, ctx: NodeContext): { signer: KeyId | undefined; anonymous: boolean } {
+    const author = authorColumn(ctx.config);
+    const values = change.kind === 'delete' ? {} : change.values;
+    const anonymous = ctx.autoAuthorOff === true && author !== undefined && (values[author] ?? null) === null;
+    return { signer: anonymous ? undefined : ctx.writerKeyId, anonymous };
+}
+
+// Plan one captured change (HIP-29). `lookup` gives each local id's identity,
+// the stored mapping or one the pass gave it: an insert on a local id that has
+// one is refused, as is an update or a delete of a row whose insert was
+// refused. An insert is minted a uuid and a row hash, also when it is refused,
+// so its failure event carries them.
+export function planChange(
+    change: CapturedChange,
     ctx: NodeContext,
     lookup: MappingLookup,
     keyLookup: KeyLookup,
-    minted: Map<string, Minted>,
-): { op?: PlannedOp; rejects: PlannedReject[] } {
+    newUuid: () => string,
+): ChangePlan {
     const { config, writerKeyId, groupId } = ctx;
-    const key = keyOf(net.table, net.localId);
-    const rdbTable = rdbTableName(config, net.table);
-    const lastSource = net.sources[net.sources.length - 1];
+    const table = change.table;
+    const localId = change.localId;
+    const rdbTable = rdbTableName(config, table);
+    const sources = [change];
+    const refused = (reject: Omit<PlannedReject, 'change' | 'table' | 'localId' | 'kind' | 'sources'>): ChangePlan =>
+        ({ kind: 'refused', reject: { change, table, localId, kind: change.kind, sources, ...reject } });
 
     if (!ctx.schemaView.hasTable(rdbTable)) {
-        return { rejects: [{ change: lastSource, table: net.table, localId: net.localId,
-            reason: `no rdb table '${rdbTable}' for target table '${net.table}'` }] };
+        return refused({ reason: `no rdb table '${rdbTable}' for target table '${table}'` });
     }
+    const identity = lookup(table, localId);
 
-    // An update/delete whose subject is a poisoned (ingestion_failure) mapping is
-    // a follow-on to an insert that rdb rejected: the row has no rdb counterpart,
-    // so drop it (acked warning, no op-event, no mark). An insert in this same
-    // batch would have re-minted the identity (minted overrides lookup), so this
-    // only fires for a genuine leftover on the poisoned id.
-    if (net.kind !== 'insert' && minted.get(key) === undefined) {
-        const subject = lookup(net.table, net.localId);
-        if (subject?.status === 'ingestion_failure') {
-            return { rejects: [{ change: lastSource,
-                reason: `local row ${net.table}#${net.localId} previously failed ingestion; `
-                    + `${net.kind} dropped` }] };
+    if (change.kind === 'insert') {
+        if (identity !== undefined) {
+            // An INSERT OR REPLACE over a row, an insert that reuses a deleted
+            // row's id, or a second insert of one local id: its revert reads
+            // that identity's row.
+            return refused({ rowId: identity.rowId, uuid: identity.uuid, author: identity.author,
+                op: { table: rdbTable, op: { action: 'insert', rowId: identity.rowId, uuid: identity.uuid, values: {} } },
+                reason: `local row ${table}#${localId} already has an rdb identity (status ${identity.status ?? 'active'}); `
+                    + 'an insert on its id is refused' });
         }
-    }
-
-    // Subject of an update/delete: a row inserted EARLIER in this same batch
-    // (minted) resolves first (faithful insert-then-update / insert-then-delete),
-    // else an already-materialized row via the prefetched lookup.
-    const subjectRowId = (): string | undefined =>
-        minted.get(key)?.rowId ?? lookup(net.table, net.localId)?.rowId;
-
-    if (net.kind === 'delete') {
-        const rowId = subjectRowId();
-        if (rowId === undefined) {
-            return { rejects: [{ change: lastSource, table: net.table, localId: net.localId, kind: 'delete',
-                reason: `cannot delete unknown local row ${net.table}#${net.localId}` }] };
-        }
-        const op: RowOpPayload = { action: 'delete', rowId };
-        return { op: { key, groupId, rdbTable, table: net.table, localId: net.localId, kind: 'delete',
-            write: { table: rdbTable, op }, sources: net.sources, deps: [] }, rejects: [] };
-    }
-
-    if (net.kind === 'insert') {
-        const rev = reverseCols(rdbTable, net.values, ctx, false, lookup, keyLookup, minted, net.unreadable);
-        const m = minted.get(key)!;
+        const { signer, anonymous } = insertSigner(change, ctx);
+        const uuid = newUuid();
+        const rowId = deriveRowId(uuid, signer);
+        const rev = reverseCols(rdbTable, change.values, ctx, false, lookup, keyLookup, change.unreadable);
         if (!rev.ok) {
-            const failWrite: BundleWrite = { table: rdbTable,
-                op: { action: 'insert', rowId: m.rowId, uuid: m.uuid, values: {} } };
-            return { rejects: [{ change: lastSource, table: net.table, localId: net.localId, rowId: m.rowId,
-                kind: 'insert', author: writerKeyId, op: failWrite, reason: rev.reason,
-                sources: net.sources, column: rev.column }] };
+            return refused({ rowId, uuid, author: signer, column: rev.column, reason: rev.reason,
+                op: { table: rdbTable, op: { action: 'insert', rowId, uuid, values: {} } } });
         }
         const op: InsertRowPayload = {
-            action: 'insert', rowId: m.rowId, uuid: m.uuid,
+            action: 'insert', rowId, uuid,
             ...rowWriteParts(insertWrite(rev.values, ctx.schemaView.getTable?.(rdbTable))),
         };
-        const mapping: SyncMapping = { table: net.table, localId: net.localId, rowId: m.rowId,
-            uuid: m.uuid, author: writerKeyId, status: 'active' };
-        return { op: { key, groupId, rdbTable, table: net.table, localId: net.localId, kind: 'insert',
-            write: { table: rdbTable, op }, sources: net.sources, mapping, reusedIdentity: m.reused,
-            deps: rev.deps }, rejects: [] };
+        const mapping: SyncMapping = { table, localId, rowId, uuid, ...(signer !== undefined ? { author: signer } : {}), status: 'active' };
+        return { kind: 'op', op: { groupId, rdbTable, table, localId, kind: 'insert', write: { table: rdbTable, op }, change, mapping,
+            ...(anonymous ? { anonymous: true as const } : {}) } };
     }
 
-    // update: translate each constituent part; a part that reverses OK
-    // contributes its columns to the merged op AND becomes a fallback op; a part
-    // that reverses to a reject (readonly / dangling / unknown key) is recorded
-    // as its own failure (so the good parts still land). An update keeps every
-    // null: it names only columns the app wrote, so a NULL there is a clear.
-    const rowId = subjectRowId();
-    if (rowId === undefined) {
-        return { rejects: [{ change: lastSource, table: net.table, localId: net.localId, kind: 'update',
-            reason: `cannot update unknown local row ${net.table}#${net.localId}` }] };
+    if (identity === undefined) {
+        return refused({ reason: `cannot ${change.kind} unknown local row ${table}#${localId}` });
     }
-    const parts = net.parts ?? [{ values: net.values, unreadable: net.unreadable, sources: net.sources }];
-    const rejects: PlannedReject[] = [];
-    const okParts: { values: RowWrite; deps: string[]; sources: CapturedChange[] }[] = [];
-    for (const part of parts) {
-        const rev = reverseCols(rdbTable, part.values, ctx, true, lookup, keyLookup, minted, part.unreadable);
-        if (!rev.ok) {
-            const src = part.sources[part.sources.length - 1];
-            const failWrite: BundleWrite = { table: rdbTable,
-                op: { action: 'update', rowId, values: {} } };
-            rejects.push({ change: src, table: net.table, localId: net.localId, rowId,
-                kind: 'update', op: failWrite, reason: rev.reason, sources: part.sources, column: rev.column });
-            continue;
-        }
-        if (Object.keys(rev.values).length === 0) continue;   // only system cols touched
-        okParts.push({ values: rev.values, deps: rev.deps, sources: part.sources });
+    if (identity.status === 'ingestion_failure') {
+        return refused({ rowId: identity.rowId, reason: `local row ${table}#${localId}'s insert was refused; its ${change.kind} is refused` });
+    }
+    const rowId = identity.rowId;
+
+    if (change.kind === 'delete') {
+        const op: RowOpPayload = { action: 'delete', rowId };
+        return { kind: 'op', op: { groupId, rdbTable, table, localId, kind: 'delete', write: { table: rdbTable, op }, change } };
     }
 
-    if (okParts.length === 0) return { rejects };
-
-    const mergedValues: RowWrite = {};
-    const mergedDeps: string[] = [];
-    const mergedSources: CapturedChange[] = [];
-    for (const p of okParts) {
-        Object.assign(mergedValues, p.values);
-        mergedDeps.push(...p.deps);
-        mergedSources.push(...p.sources);
+    // An update lands or is refused whole, and keeps every null: it names only
+    // columns the app wrote, so a NULL there is a clear.
+    const subject = ctx.subjectRow?.(rdbTable, rowId);
+    const rev = reverseCols(rdbTable, change.values, ctx, true, lookup, keyLookup, change.unreadable, subject);
+    if (!rev.ok) {
+        return refused({ rowId, column: rev.column, reason: rev.reason, op: { table: rdbTable, op: { action: 'update', rowId, values: {} } } });
     }
-    const mergedWrite: BundleWrite = { table: rdbTable, op: { action: 'update', rowId, ...rowWriteParts(mergedValues) } };
-
-    // Fallback ops (per surviving part) only when a merge actually happened.
-    let fallback: PlannedOp[] | undefined;
-    if (okParts.length > 1) {
-        fallback = okParts.map((p) => ({
-            key, groupId, rdbTable, table: net.table, localId: net.localId, kind: 'update' as const,
-            write: { table: rdbTable, op: { action: 'update' as const, rowId, ...rowWriteParts(p.values) } },
-            sources: p.sources, deps: p.deps,
-        }));
-    }
-
-    const op: PlannedOp = { key, groupId, rdbTable, table: net.table, localId: net.localId, kind: 'update',
-        write: mergedWrite, sources: mergedSources, deps: mergedDeps };
-    if (fallback !== undefined) op.fallback = fallback;
-    return { op, rejects };
+    if (Object.keys(rev.values).length === 0) return { kind: 'nothing' };   // every named column set aside
+    return { kind: 'op', op: { groupId, rdbTable, table, localId, kind: 'update',
+        write: { table: rdbTable, op: { action: 'update', rowId, ...rowWriteParts(rev.values) } }, change } };
 }
 
 // ---------------------------------------------------------------------------
-// Step 2 + 3 driver.
+// Batch entry points (tests and the planner fuzzer): plan each change in
+// order, as a pass does, with the identities the batch gives its local ids.
 // ---------------------------------------------------------------------------
 
-function planNodes(
-    nets: NetChange[],
-    ctxFor: (targetTable: string) => NodeContext | undefined,
-    lookup: MappingLookup,
-    keyLookup: KeyLookup,
-    newUuid: () => string,
-): { ops: PlannedOp[]; rejects: PlannedReject[]; reservations: SyncMapping[] } {
-    const { minted, reservations, drops } = mintInserts(nets, ctxFor, lookup, newUuid);
-
-    const ops: PlannedOp[] = [];
-    const rejects: PlannedReject[] = [];
-    const mintedUsed = new Set<string>();   // an id whose single insert already planned
-    for (const net of nets) {
-        const ctx = ctxFor(net.table);
-        if (ctx === undefined) continue;   // acked-and-dropped (untranslatable)
-        if (net.kind === 'insert') {
-            const key = keyOf(net.table, net.localId);
-            if (!minted.has(key)) {
-                // Never minted -> a non-reusable id (poisoned / deleted / uuid-less
-                // projected row). Acked warning, no op, no reservation.
-                rejects.push({ change: net.sources[net.sources.length - 1],
-                    reason: drops.get(key) ?? `insert on ${net.table}#${net.localId} dropped` });
-                continue;
-            }
-            if (mintedUsed.has(key)) {
-                // A second insert capture for an id already planned: write-once, so
-                // it can never become its own row. Drop it (acked warning).
-                rejects.push({ change: net.sources[net.sources.length - 1],
-                    reason: `duplicate insert capture for ${net.table}#${net.localId}; dropped` });
-                continue;
-            }
-            mintedUsed.add(key);
-        }
-        const result = translateNet(net, ctx, lookup, keyLookup, minted);
-        rejects.push(...result.rejects);
-        if (result.op !== undefined) ops.push(result.op);
-    }
-    return { ops, rejects, reservations };
-}
-
-// ---------------------------------------------------------------------------
-// Step 4: FK-consecutive bundling (a single commit-order pass, no reordering).
-// A node joins the open bundle iff bundling is enabled for its group AND it
-// targets the SAME group AND it has an explicit FK arc into the open bundle.
-// ---------------------------------------------------------------------------
-
-function groupEntries(ops: PlannedOp[], fkBundlingFor: (groupId: string) => boolean): PlannedEntry[] {
-    const entries: PlannedEntry[] = [];
-    let open: PlannedOp[] = [];
-    const openKeys = new Set<string>();
-
-    const close = (): void => {
-        if (open.length === 0) return;
-        entries.push({ groupId: open[0].groupId, ops: open });
-        open = [];
-        openKeys.clear();
-    };
-
-    for (const op of ops) {
-        const joins = open.length > 0
-            && open[0].groupId === op.groupId
-            && op.kind === 'insert'
-            && fkBundlingFor(op.groupId)
-            && op.deps.some((d) => openKeys.has(d));
-        if (!joins) close();
-        open.push(op);
-        openKeys.add(op.key);
-    }
-    close();
-    return entries;
-}
-
-// ---------------------------------------------------------------------------
-// Entry points
-// ---------------------------------------------------------------------------
-
-// Plan a (possibly cross-group / interleaved) batch into commit-ordered entries.
 export function planDatabaseEntries(
     batch: CapturedBatch,
     ctxFor: (targetTable: string) => NodeContext | undefined,
     lookup: MappingLookup,
     keyLookup: KeyLookup,
     newUuid: () => string,
-    fkBundlingFor: (groupId: string) => boolean,
-    updateMergeFor: (targetTable: string) => boolean = () => true,
 ): IngestPlan {
-    const nets = planOps(batch, updateMergeFor);
-    const { ops, rejects, reservations } = planNodes(nets, ctxFor, lookup, keyLookup, newUuid);
-    return { entries: groupEntries(ops, fkBundlingFor), rejects, reservations };
+    const given = new Map<string, SyncMapping>();
+    const passLookup: MappingLookup = (table, localId) => given.get(keyOf(table, localId)) ?? lookup(table, localId);
+    const plan: IngestPlan = { entries: [], rejects: [], nothing: [] };
+    for (const change of batch.changes) {
+        const ctx = ctxFor(change.table);
+        if (ctx === undefined) { plan.nothing.push(change); continue; }
+        const planned = planChange(change, ctx, passLookup, keyLookup, newUuid);
+        const key = keyOf(change.table, change.localId);
+        if (planned.kind === 'nothing') { plan.nothing.push(change); continue; }
+        if (planned.kind === 'op') {
+            plan.entries.push({ groupId: planned.op.groupId, ops: [planned.op] });
+            if (planned.op.mapping !== undefined) given.set(key, planned.op.mapping);
+            continue;
+        }
+        plan.rejects.push(planned.reject);
+        // A refused insert gives its local id an identity for the rest of the pass.
+        const r = planned.reject;
+        if (change.kind === 'insert' && passLookup(change.table, change.localId) === undefined && r.rowId !== undefined) {
+            given.set(key, { table: change.table, localId: change.localId, rowId: r.rowId, uuid: r.uuid ?? '', status: 'ingestion_failure' });
+        }
+    }
+    return plan;
 }
 
 // Single-group convenience wrapper (one fixed context for every table).
@@ -666,7 +434,5 @@ export function changesToEntries(
     keyLookup: KeyLookup = () => undefined,
 ): IngestPlan {
     const ctx: NodeContext = { groupId: '', schemaView, config, writerKeyId };
-    const fkBundling = config.fkBundling !== false;
-    const updateMerge = config.updateMerge !== false;
-    return planDatabaseEntries(batch, () => ctx, lookup, keyLookup, newUuid, () => fkBundling, () => updateMerge);
+    return planDatabaseEntries(batch, () => ctx, lookup, keyLookup, newUuid);
 }

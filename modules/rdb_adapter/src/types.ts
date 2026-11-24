@@ -86,24 +86,13 @@ export type AdapterConfig = {
     // writes are anonymous; ref-advances are signed only when the binding's
     // canObserve reads $author.
     writer?: OwnIdentity;
-    // Whether to bundle CONSECUTIVE same-group ops joined by an explicit FK arc
-    // into ONE atomic entry (so an app's parent+child inserts become visible
-    // together). Only consecutive, FK-linked ops bundle; nothing is reordered.
-    // Default on; set false to emit every op as its own single-op entry. The
-    // developer contract: to get parent-child atomicity, make the inserts
-    // consecutive. On a bundle reject the orchestrator falls back to submitting
-    // the constituent ops individually, in order.
-    fkBundling?: boolean;
-    // Whether to OPTIMISTICALLY merge a run of CONSECUTIVE update changes on the
-    // SAME row whose column sets are DISJOINT into ONE rdb update op (so a
-    // per-column capture stream folds back into a single write and cross-column
-    // restrictions see the whole post-image). A repeated column, a different
-    // row, or a non-update breaks the run. If the merged op fails validation the
-    // orchestrator falls back to the per-change update ops, in order, each
-    // validated independently. Default on; set false to emit one op per update
-    // change (still order-preserving). Never folds an insert with a later
-    // update, and never cancels an insert+delete - those are faithfully submitted.
-    updateMerge?: boolean;
+
+    // What an insert gets when it leaves the author column empty, in a group
+    // with an identity provider (HIP-20's Authorship): on (default), capture
+    // fills in the writer key's id, and the insert is signed with it; off, it
+    // is anonymous, and an insert is signed as its author column says. Ignored
+    // in an anonymous group.
+    autoAuthor?: boolean;
 
     // --- cross-group (replica-wide) projection ---
 
@@ -152,12 +141,40 @@ export type CapturedValues = { [column: string]: json.Literal | null };
 // could not read back as logical values, with the reason, such as text that
 // isn't json in a json column: they are left out of `values`, and ingestion
 // refuses them, so the drain never throws on a stored value.
+// `record` is what ingestion wrote into the change's outbox row, if anything
+// (HIP-29, see ChangeRecord).
 export type CapturedChange =
     | { id: CapturedChangeId; kind: 'insert'; table: string; localId: number;
-        values: CapturedValues; unreadable?: { [column: string]: string } }
+        values: CapturedValues; unreadable?: { [column: string]: string }; record?: ChangeRecord }
     | { id: CapturedChangeId; kind: 'update'; table: string; localId: number;
-        values: CapturedValues; unreadable?: { [column: string]: string } }
-    | { id: CapturedChangeId; kind: 'delete'; table: string; localId: number };
+        values: CapturedValues; unreadable?: { [column: string]: string }; record?: ChangeRecord }
+    | { id: CapturedChangeId; kind: 'delete'; table: string; localId: number; record?: ChangeRecord };
+
+// What became of a captured change, written into its outbox row as a pass
+// goes (HIP-29): the observes written for it, each recorded before its
+// append, and then one outcome: the hash of its entry, recorded before the
+// append, its failure event, or the mark of nothing to write. Each observe,
+// like the entry, is an entry of the change's own group; `group` is the bound
+// group it observes. A write merges into the row's record: its observes go
+// after the ones there, and an outcome it gives replaces the one there.
+export type ChangeRecord = {
+    observes?: { group: B64Hash; hash: B64Hash }[];
+    entry?: B64Hash;
+    failure?: OpEvent;
+    nothing?: true;
+};
+
+// The record a write leaves in an outbox row that holds `prev` (see ChangeRecord).
+export function mergeChangeRecord(prev: ChangeRecord | undefined, write: ChangeRecord): ChangeRecord {
+    const merged: ChangeRecord = {};
+    const observes = [...(prev?.observes ?? []), ...(write.observes ?? [])];
+    if (observes.length > 0) merged.observes = observes;
+    const outcome = write.entry !== undefined || write.failure !== undefined || write.nothing !== undefined ? write : prev;
+    if (outcome?.entry !== undefined) merged.entry = outcome.entry;
+    if (outcome?.failure !== undefined) merged.failure = outcome.failure;
+    if (outcome?.nothing !== undefined) merged.nothing = outcome.nothing;
+    return merged;
+}
 
 // The changes drained in one ingestion pass, in COMMIT order. Reproducing the
 // app's transaction boundaries is not required (bundling is dependency-driven),
@@ -172,9 +189,9 @@ export type CapturedBatch = { changes: CapturedChange[] };
 export type SyncStatus = 'active' | 'deleted' | 'ingestion_failure';
 
 // The mapping between a projection-local row and its rdb identity, kept in the
-// per-table sync table. Reserved (for minted inserts) via reserveMint BEFORE
-// the rdb append, and read (for updates/deletes and crash-replay read-back) via
-// resolveRow. `table` is the TARGET table. `status` defaults to 'active'.
+// per-table sync table. Written by projection, and by the settle for the
+// inserts a pass handled; read via resolveRow. `table` is the TARGET table.
+// `status` defaults to 'active'.
 export type SyncMapping = {
     table: string;
     localId: number;
@@ -183,10 +200,6 @@ export type SyncMapping = {
     author?: KeyId;
     status?: SyncStatus;
 };
-
-// A sync-row status transition applied during the settle transaction (e.g. a
-// reverted insert orphan -> 'ingestion_failure'). Keyed by (target table, rowId).
-export type SyncStatusUpdate = { table: string; rowId: B64Hash; status: SyncStatus };
 
 // ---------------------------------------------------------------------------
 // Op-event log: the single, durable, app-observable channel for BOTH ingestion
@@ -294,23 +307,53 @@ export function pageOpEvents(rows: StoredOpEvent[], opts?: OpEventQuery | number
 }
 
 // Everything the settle transaction persists atomically at the end of an
-// ingestion pass (see MaterializedChangeSource.commitIngest).
+// ingestion pass (see MaterializedChangeSource.commitIngest), in HIP-29's
+// order. The target also stores the failure events it reads from the records
+// of the `consumed` rows, before `events`. Every write it makes is under echo
+// suppression, so none re-enters the outbox.
 export type IngestSettle = {
-    // The drained change ids to ack (delete from the outbox). Processed-based,
-    // NOT a high-water mark, so late-committing rows are never lost.
+    // The drained change ids to ack (delete from the outbox): the handled rows.
     consumed: CapturedChangeId[];
-    // Sync mappings to (re)persist. Minted-insert identities are already durable
-    // via reserveMint; these are redundant-but-idempotent confirmations.
-    mappings?: SyncMapping[];
-    // Op-events to append (INSERT-OR-IGNORE on (opHash, direction)).
+    // The op-events of the pass's deltas (INSERT-OR-IGNORE on (opHash, direction)).
     events?: OpEvent[];
-    // Targeted full-row re-materializations undoing genuinely-failed local ops
-    // (upsert-row from rdb truth, or delete-row for an insert orphan). Applied
-    // under echo-suppression so they never re-enter the outbox.
-    reverts?: RowAction[];
-    // Sync-row status transitions applied AFTER reverts (e.g. an orphaned insert
-    // -> 'ingestion_failure').
-    statuses?: SyncStatusUpdate[];
+    //
+    // Each group's checkpoint as the pass found it, checked first, and the one
+    // to set. A group whose chain is empty gives the same version twice. A
+    // moved checkpoint throws CheckpointMovedError, and nothing is written.
+    checkpoints?: { groupId: B64Hash; expected: Version; next: Version }[];
+    // The mappings of the handled inserts: `active`, or `ingestion_failure` for
+    // a refused insert whose local id had no identity yet.
+    inserts?: SyncMapping[];
+    // The rows of accepted deletes, marked `deleted` after the inserts'
+    // mappings are written.
+    deletes?: { table: string; rowId: B64Hash }[];
+    // Refused inserts whose local id had no identity yet: the row is removed,
+    // with its changes still in the outbox put back on top.
+    orphans?: { table: string; localId: number }[];
+    // The rows set to rdb's row at the end of the chain, with their changes
+    // still in the outbox on top (see RowRevert).
+    reverts?: RowRevert[];
+    // SQLite: the json columns of handled changes, rewritten in canonical form.
+    // A column a change still in the outbox writes is skipped, and so is a row
+    // that is gone. Other targets ignore them.
+    jsonWrites?: { table: string; localId: number; column: string }[];
+};
+
+// A row the settle sets to what the invariant says it holds (HIP-29's
+// Reverts): rdb's row at the end of the chain, written as projection writes
+// it, or no row when `row` is absent, then each of the row's changes still in
+// the outbox, as capture recorded it. An update writes its columns, a delete
+// removes the row, and an insert on the row's local id writes its whole row;
+// an update or a delete of a row that isn't there does nothing. A row removed
+// this way has its mapping marked `deleted` when it was `active`. `localId` is
+// absent for a row named by its row hash only, one the delta reinstates or an
+// own insert an observe voided: the target finds it by `rowId` after it writes
+// the inserts' mappings, and a reinstated row with no mapping gets a new id.
+export type RowRevert = {
+    table: string;
+    rowId: B64Hash;
+    localId?: number;
+    row?: Extract<RowAction, { kind: 'upsert-row' }>;
 };
 
 // The capture/read side of a bidirectional backend; pairs with
@@ -322,36 +365,30 @@ export interface MaterializedChangeSource {
     // Drain captured-but-not-yet-ingested local changes, in commit order.
     drainChanges(): Promise<CapturedBatch>;
 
+    // Whether the outbox holds a change, of any group. A pure read: unlike
+    // drainChanges, it announces nothing. False on a target without capture.
+    hasPendingChanges(): Promise<boolean>;
+
     // Resolve an existing projection-local row to its rdb identity (for
     // update/delete AND crash-replay uuid read-back), or undefined when the
     // local row has no sync mapping yet.
     resolveRow(table: string, localId: number): Promise<SyncMapping | undefined>;
 
-    // Durably persist reserved sync rows (row_hash, id, uuid, status='active')
-    // BEFORE the rdb append, in their OWN transaction. Called for every minted
-    // insert of a pass (including ones that will reject). So if a crash lands
-    // between append and settle, a replay reads the SAME uuid back (via
-    // resolveRow) and reproduces the identical insert payload / rowId, letting
-    // the reappended op be recognized as already-applied instead of duplicated.
-    //
-    // CLAIM-OR-ADOPT (identity agreement for concurrent ingesters on one store):
-    // the local `id` is unique per sync table, so a reservation either CLAIMS a
-    // free id or finds one already taken (by a crash-replay of this same pass, by
-    // a concurrent ingester, or by a projection that materialized the row first).
-    // The return value is, IN ORDER, the mapping now stored for each reservation's
-    // (table, id): the reservation itself when it won the claim (or already held
-    // the id under the same row_hash), otherwise the EXISTING mapping (its rowId /
-    // uuid / status / author). The caller adopts a differing mapping and re-plans
-    // so every ingester submits the SAME identity - duplicate appends of one rowId
-    // are the same incarnation in rdb and converge. Idempotent.
-    reserveMint(reservations: SyncMapping[]): Promise<SyncMapping[]>;
+    // Write into a change's outbox row what became of it (HIP-29), merged into
+    // the record there (mergeChangeRecord). It signals no change and moves no
+    // checkpoint. A row no longer in the outbox is left alone.
+    writeRecord(id: CapturedChangeId, record: ChangeRecord): Promise<void>;
 
-    // Atomically SETTLE an ingestion pass: (re)persist mappings, append
-    // op-events (idempotent by (opHash, direction)), apply reverts under
-    // echo-suppression, transition sync statuses, and ack (delete) the consumed
-    // outbox rows - all or nothing. A crash before commit leaves the outbox
-    // intact for a deterministic replay; there is no cross-store transaction
-    // with the rdb DAG, so idempotent replay + idempotent logging bridge the gap.
+    // Add an observe the end of a pass wrote to the list beside the group's
+    // checkpoint (HIP-29), and read that list, in the order recorded. Neither
+    // signals a change or moves a checkpoint. Every settle clears every
+    // group's list.
+    recordEndObserve(groupId: B64Hash, hash: B64Hash): Promise<void>;
+    getEndObserves(groupId: B64Hash): Promise<B64Hash[]>;
+
+    // Atomically SETTLE an ingestion pass (IngestSettle): all or nothing. A
+    // crash before the commit leaves the outbox and its records as they were,
+    // and the next cycle's end of a pass settles them.
     commitIngest(settle: IngestSettle): Promise<void>;
 
     // Read the durable op-event log (cursor-based, non-destructive). Filter is
@@ -361,6 +398,9 @@ export interface MaterializedChangeSource {
     // `{ order: 'desc', limit: 1 }` (empty → 0).
     drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]>;
 }
+
+// A backend that both materializes and captures (bidirectional).
+export type BidirectionalTarget = MaterializationTarget & MaterializedChangeSource;
 
 // A change the inverse planner / a bundle submission / a cross-group ref-advance
 // could not accept. `change` names the offending captured change when the
@@ -417,8 +457,11 @@ export type SchemaActionColumn = {
 // BEFORE the table/column actions and every ensure-index AFTER them; a target
 // may defer ensures further (e.g. past the row channel) within the same apply.
 export type SchemaAction =
+    // `schemaName`: the table's name in the group's schema, which the target
+    // keeps in the table's meta with the group the apply is for (HIP-20).
+    // Absent, as tests write them: the projected name is the schema's.
     | { kind: 'create-table'; table: string; syncTable: string; primaryKey: string;
-        authorColumn?: string; columns: SchemaActionColumn[] }
+        authorColumn?: string; columns: SchemaActionColumn[]; schemaName?: string }
     | { kind: 'drop-table'; table: string; syncTable: string }
     | { kind: 'add-column'; table: string; column: string; def: ColumnDef;
         fk?: FkColumnInfo; keyRef?: true }
@@ -582,6 +625,60 @@ export class CheckpointMovedError extends Error {
     constructor(readonly groupId: B64Hash) {
         super(`checkpoint for group '${groupId}' moved since the delta was computed`);
         this.name = 'CheckpointMovedError';
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The writer record (HIP-20's What the projection records in the target): what
+// a projection records in its target when it opens and whenever its groups
+// change, so that capture, and a writer in another process, read it inside
+// their own transactions. Capture fills in an empty author column with the
+// writer key's id where the table's group mode is `on` (HIP-29).
+// ---------------------------------------------------------------------------
+
+// A group's authorship mode: `anonymous` for a group without an identity
+// provider, else `on` or `off`, from `autoAuthor`.
+export type AuthorshipMode = 'on' | 'off' | 'anonymous';
+
+export type WriterRecord = {
+    // The writer key's id in the key table, when the projection has a writer.
+    writerKeyId?: number;
+    // The replica's hash suite, by name.
+    hashSuite: string;
+    // Each projected group's member name and authorship mode, by group id.
+    groups: { [groupId: string]: { name: string; mode: AuthorshipMode } };
+};
+
+export interface WriterRecordStore {
+    // Replaces the record.
+    recordWriter(record: WriterRecord): Promise<void>;
+    // The record, or undefined when no projection has recorded one.
+    readWriterRecord(): Promise<WriterRecord | undefined>;
+}
+
+export function isWriterRecordStore(t: object): t is WriterRecordStore {
+    const c = t as Partial<WriterRecordStore>;
+    return typeof c.recordWriter === 'function' && typeof c.readWriterRecord === 'function';
+}
+
+// Thrown by apply() while the outbox holds a change, of any group (HIP-29):
+// projecting over a pending change would overwrite it, so the pass waits until
+// ingestion has taken it. Nothing was applied. It is no error: the cycle that
+// meets it ends, and the next one ingests the change first.
+export class PendingChangesError extends Error {
+    constructor(readonly groupId: B64Hash) {
+        super(`a local change is pending: group '${groupId}' isn't projected until it is ingested`);
+        this.name = 'PendingChangesError';
+    }
+}
+
+// The delta of an ingestion chain changes the schema (HIP-29). A chain holds
+// the pass's row ops and observes, and neither changes a group's schema, so
+// this says rdb or the target is not what the pass assumed: the projection halts.
+export class ChainSchemaChangeError extends Error {
+    constructor(readonly groupId: B64Hash) {
+        super(`the ingestion chain of group '${groupId}' changes its schema, which no observe or row op does`);
+        this.name = 'ChainSchemaChangeError';
     }
 }
 

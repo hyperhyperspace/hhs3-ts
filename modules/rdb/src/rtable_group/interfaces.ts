@@ -5,8 +5,11 @@
 // this DAG (NestingParent), so one group position is a consistent snapshot of
 // all member tables.
 
-import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
+import type { B64Hash, KeyId, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
+import type { ObserveGateOptions } from "./validate_ops.js";
 import type { NestingParent, RObject, Version, View } from "@hyper-hyper-space/hhs3_mvt";
+import type { MetaProps } from "@hyper-hyper-space/hhs3_dag";
+import type { json } from "@hyper-hyper-space/hhs3_json";
 
 import type { Predicate, SchemaCreator } from "../rschema/payload.js";
 import type { RSchemaView } from "../rschema/interfaces.js";
@@ -22,6 +25,29 @@ export type BundleWrite = {
     table: string;
     op: RowOpPayload;
 };
+
+// An entry built, signed and validated but not appended yet (HIP-29): the
+// first of the two steps of bundle and observe. `hash` is the entry's hash,
+// which appendPrepared checks the DAG gives it.
+export type PreparedEntry = {
+    payload: json.LiteralMap;
+    meta: MetaProps;
+    at: Version;
+    hash: B64Hash;
+};
+
+// `liveReads`: also validate with the bound groups read through the live
+// observes only, as the entry's verdict reads them.
+export type PrepareOptions = { liveReads?: boolean };
+
+// Thrown by appendPrepared when the DAG gives the appended entry another hash
+// than the one prepared.
+export class PreparedHashMismatchError extends Error {
+    constructor(readonly prepared: B64Hash, readonly appended: B64Hash) {
+        super(`the entry appended as '${appended}' was prepared as '${prepared}'`);
+        this.name = 'PreparedHashMismatchError';
+    }
+}
 
 export interface RTableGroup extends RObject, NestingParent {
     // Create-time facts
@@ -81,6 +107,28 @@ export interface RTableGroup extends RObject, NestingParent {
     // order): op i's FK conditions are checked at the sequential cut of `at`
     // and the earlier ops. The whole entry validates and applies atomically.
     bundle(writes: BundleWrite[], author?: OwnIdentity, at?: Version): Promise<B64Hash>;
+
+    // The two steps of bundle and observe (HIP-29). prepareBundle and
+    // prepareObserve build the entry, sign it and validate it, and return it
+    // with its hash, without appending it. prepareObserve always validates.
+    // appendPrepared appends a prepared entry, and throws
+    // PreparedHashMismatchError when the DAG gives it another hash.
+    prepareBundle(writes: BundleWrite[], author?: OwnIdentity, at?: Version, opts?: PrepareOptions): Promise<PreparedEntry>;
+    prepareObserve(group: string | B64Hash, refVersion: Version, author?: OwnIdentity, at?: Version, opts?: PrepareOptions): Promise<PreparedEntry>;
+    appendPrepared(prepared: PreparedEntry): Promise<B64Hash>;
+
+    // The two readings of the bound group `groupId` at `at` (HIP-29): through
+    // every observe, as an op's checks read it, and through the live observes
+    // only, as its verdict reads it. They differ only while an observe of it
+    // is void.
+    resolveObservedForeignVersion(groupId: B64Hash, at: Version, from: Version): Promise<Version>;
+    resolveLiveObservedForeignVersion(groupId: B64Hash, at: Version): Promise<Version>;
+
+    // A binding's canObserve gate for `author` importing `options.imported`, as
+    // an observe at `options.opPos` is checked: `fold: 'admission'` as
+    // validation reads it, `fold: 'use'` as its verdict does. True when the
+    // binding is ungated.
+    evaluateObserveGate(refId: B64Hash, author: KeyId | undefined, options: ObserveGateOptions): Promise<boolean>;
 
     getView(at?: Version, from?: Version): Promise<RTableGroupView>;
 

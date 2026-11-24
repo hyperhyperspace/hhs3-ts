@@ -191,6 +191,40 @@ async function testDagCopy(factory: DagFactory) {
     assertTrue(dstEntry !== undefined, 'copied entry should exist');
 }
 
+// A second append of an entry the store already holds writes nothing and
+// returns its hash. Before HIP-29 it put the entry back into the frontier.
+async function testSecondAppendWritesNothing(factory: DagFactory) {
+    const d = await factory();
+    const root = await d.append({ 'a': 1 }, {});
+    const child = await d.append({ 'b': 1 }, {}, position(root));
+
+    const again = await d.append({ 'a': 1 }, {});
+    assertEquals(again, root, 'a second append returns the hash');
+    const frontier = await d.getFrontier();
+    assertTrue(frontier.size === 1 && frontier.has(child), "the frontier keeps the entry's child");
+    let count = 0;
+    for await (const _entry of d.loadAllEntries()) count++;
+    assertEquals(count, 2, 'nothing was written');
+}
+
+// Two appends of one entry at once both return its hash and write it once.
+async function testConcurrentAppendsOfOneEntry(factory: DagFactory) {
+    const d = await factory();
+    const root = await d.append({ 'a': 1 }, {});
+
+    const [h1, h2] = await Promise.all([
+        d.append({ 'x': 1 }, {}, position(root)),
+        d.append({ 'x': 1 }, {}, position(root)),
+    ]);
+    assertEquals(h1, h2, 'both return the hash');
+    const child = await d.append({ 'y': 1 }, {}, position(h1));
+    const frontier = await d.getFrontier();
+    assertTrue(frontier.size === 1 && frontier.has(child), "the frontier keeps the entry's child");
+    let count = 0;
+    for await (const _entry of d.loadAllEntries()) count++;
+    assertEquals(count, 3, 'the entry was written once');
+}
+
 export function createBackendTestSuite(
     tag: string,
     factory: DagFactory
@@ -207,6 +241,8 @@ export function createBackendTestSuite(
             { name: `${t(5)} Cover with filter`,               invoke: () => testCoverWithFilter(factory) },
             { name: `${t(6)} Concurrent cover with filter`,    invoke: () => testConcurrentCoverWithFilter(factory) },
             { name: `${t(7)} DAG copy`,                        invoke: () => testDagCopy(factory) },
+            { name: `${t(8)} A second append of an entry writes nothing`, invoke: () => testSecondAppendWritesNothing(factory) },
+            { name: `${t(9)} Two appends of one entry at once write it once`, invoke: () => testConcurrentAppendsOfOneEntry(factory) },
         ],
     };
 }

@@ -7,7 +7,7 @@
 
 import type { json } from "@hyper-hyper-space/hhs3_json";
 import type { ColumnType } from "@hyper-hyper-space/hhs3_rdb";
-import type { IndexSpec, OpEvent, SyncStatus } from "@hyper-hyper-space/hhs3_rdb_adapter";
+import type { ChangeRecord, IndexSpec, OpEvent, SyncStatus } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 export const SCHEMA_VERSION = 1;
 
@@ -34,6 +34,9 @@ export const ALL_STORES = [
 
 export const COUNTER_NEXT_KEY_ID = 'nextKeyId';
 export const CAPTURE_KEY = 'capture';
+// The writer record (HIP-20) is a record of the capture config store: in the
+// meta store it would be taken for a table.
+export const WRITER_RECORD_KEY = 'writer';
 
 export type TableMetaRecord = {
     table: string;
@@ -45,11 +48,19 @@ export type TableMetaRecord = {
     keyRefColumns: string[];
     defaults: { [column: string]: json.Literal };
     nextId: number;
+    // The group the table was created for, and its name in that group's
+    // schema (HIP-20). Capture reads the group's mode from the writer record.
+    groupId?: string;
+    schemaName?: string;
 };
 
+// `endObserves`: the observes an end of a pass recorded beside the
+// checkpoint, cleared by every settle (HIP-29). A group with a list and no
+// checkpoint yet has no version.
 export type CheckpointRecord = {
     groupId: string;
-    version: string[];
+    version?: string[];
+    endObserves?: string[];
 };
 
 export type RowRecord = {
@@ -83,6 +94,7 @@ export type OutboxRecord = {
     localId: number;
     op: 'insert' | 'update' | 'delete';
     changed?: { [column: string]: json.Literal | null };   // null: the column was set to NULL
+    record?: ChangeRecord;   // what ingestion wrote of the change (HIP-29)
 };
 
 export type OpEventRecord = OpEvent & { id?: number };
@@ -90,6 +102,13 @@ export type OpEventRecord = OpEvent & { id?: number };
 export type CaptureConfigRecord = {
     key: string;
     enabled: boolean;
+};
+
+export type WriterRecordRecord = {
+    key: string;
+    writerKeyId?: number;
+    hashSuite: string;
+    groups: { [groupId: string]: { name: string; mode: 'on' | 'off' | 'anonymous' } };
 };
 
 export type IndexEntryRecord = {
