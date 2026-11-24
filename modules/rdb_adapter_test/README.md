@@ -29,3 +29,5 @@ npm test                     # conformance + smoke projection vs rdb (MemoryTarg
 npm run test:projection:fast
 npm run test:projection:full
 ```
+
+**HIPs:** [29](../../hips/0029-checkpoint-consistency.md)

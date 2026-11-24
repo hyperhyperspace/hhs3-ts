@@ -45,3 +45,5 @@ Pathological kinds are first-class menu entries **and** forced onto a seeded lat
 - checkpoint helpers (`endExtendsStart`, `pickConcurrentAt`, `collectExtendingPairs`, `subsamplePairs`, …)
 - `createMockRContext` — in-memory `RContext` on public APIs
 - `generateProjectHistory`, `PATHOLOGICAL_KINDS`, `assertPathologicalCoverage`, tallies
+
+**HIPs:** [29](../../hips/0029-checkpoint-consistency.md)

@@ -298,4 +298,4 @@ npm test
 
 The tests run on the catalog in [`examples/editor.sql`](../rdb/examples/editor.sql), released at 1.0.0, 1.1.0 and 2.0.0, over a memory platform and a shared in-memory mesh. A 1.1.0 that declares `:moderator` drives the param hold, one that adds `FILES media` drives the two-host mount test, on `MemoryDirectory` folders, and one that adds a group drives the allow-list test for a group added after the database was created.
 
-**HIPs:** [2](../../hips/0002-rpack-rhost.md), [5](../../hips/0005-reactive-queries.md), [23](../../hips/0023-join-bootstrap.md)
+**HIPs:** [2](../../hips/0002-rpack-rhost.md), [5](../../hips/0005-reactive-queries.md), [23](../../hips/0023-join-bootstrap.md), [29](../../hips/0029-checkpoint-consistency.md)

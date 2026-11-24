@@ -65,3 +65,5 @@ npm test
 npm run test:projection:fast
 npm run test:projection:full
 ```
+
+**HIPs:** [5](../../hips/0005-reactive-queries.md), [29](../../hips/0029-checkpoint-consistency.md)

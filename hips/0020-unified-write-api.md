@@ -303,6 +303,8 @@ export async function chat(db: QuerySource, w: RowWriter, { group }: { group: st
 
 ## Changes
 
+*Changes* 1 landed in `4db216b`, except the native insert over an existing local id, which landed with HIP-29 in `3bae793`. HIP-29 also landed the parts of *Changes* 2, 3, 4, 6 and 7 that its capture reads: the writer record on the three targets, each table's group id and name in the schema in its table meta, `autoAuthor` in `AdapterConfig`, `RdbProjection` and rhost's projection config, ingestion with `autoAuthor` off, and the projection's recording of the writer record at open and on each reconfigure. The writer itself is not started: the types of *Changes* 2 and everything after them that names `RowWriter`, `openWriter`, `rowHash`, `localId` or `tableNames`.
+
 Before the interface is fixed, one binding is written against the draft: the writes of memoblocks' chat app, ported in a copy of the app that has its own schema release and catalog. The schema already has nullable strings and readonly FKs. The copy adds a boolean column, a channel-edit form that saves every field of a row it read with a field the user empties, and an anonymous report on a message, under `autoAuthor` off: the places where the rules for unchanged columns, for `null` and for the author column show. Its tables are named through `tableNames`.
 
 In landing order:
