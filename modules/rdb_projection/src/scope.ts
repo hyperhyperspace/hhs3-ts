@@ -8,7 +8,8 @@
 //
 //   - group-qualified names: every table is projected as `<groupName>_<table>`
 //     (and its sync table likewise), so tables from different groups never
-//     collide in the shared target;
+//     collide in the shared target. The prefix goes in each group's config
+//     (tablePrefix), so a table a schema change adds later is qualified too;
 //   - a cross-group resolver: for each group, a closure that maps a qualified FK
 //     ref ('binding.table') to the referenced group's QUALIFIED target table -
 //     but only when that group is CO-PROJECTED (a member the replica holds);
@@ -25,8 +26,9 @@ import type { RDb, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 import type { AdapterConfig, CrossGroupResolver, GroupProjection } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 // Optional per-group config hook. It may set naming/fkBundling/writer, but NOT
-// tableNames: the shared projection owns the group-qualified namespace so the
-// cross-group resolver stays consistent (a tableNames override is ignored).
+// tableNames or tablePrefix: the shared projection owns the group-qualified
+// namespace so the cross-group resolver stays consistent (an override of
+// either is ignored).
 export type GroupConfigOverride = (info: { groupId: B64Hash; groupName: string; tableNames: string[] }) => AdapterConfig;
 
 export type ScopeOptions = {
@@ -104,7 +106,9 @@ export async function buildScope(groups: RTableGroup[], options: ScopeOptions = 
             const foreignTables = tableNamesById.get(foreignId);
             if (foreignTables === undefined) return undefined;   // not co-projected
             const foreignTable = group.resolveForeignTableName(alias, ref.slice(dot + 1));
-            return foreignTables[foreignTable];
+            // a table the foreign group added after the scope was built is
+            // qualified with its group's prefix, like the others
+            return foreignTables[foreignTable] ?? `${prefixes.get(foreignId)!}_${foreignTable}`;
         };
     };
 
@@ -116,6 +120,7 @@ export async function buildScope(groups: RTableGroup[], options: ScopeOptions = 
         const config: AdapterConfig = {
             ...override,
             tableNames: tableNamesById.get(id)!,       // owned by the scope (overrides any override)
+            tablePrefix: prefixes.get(id)!,            // so is the prefix of the tables added later
             crossGroup: resolverFor(group),
         };
         if (config.writer === undefined && options.writer !== undefined) config.writer = options.writer;

@@ -18,7 +18,7 @@
 // rdb truth (mark-then-revert) and recorded in the durable op-event log, the
 // same channel p2p concurrency void/reinstate flips flow through (projectGroup).
 
-import type { json } from "@hyper-hyper-space/hhs3_json";
+import { json } from "@hyper-hyper-space/hhs3_json";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import { ValidationRejectedError, formatValidationFailure } from "@hyper-hyper-space/hhs3_mvt";
 import type { ValidationFailure } from "@hyper-hyper-space/hhs3_mvt";
@@ -33,7 +33,7 @@ import {
 import {
     KeyLookup, MappingLookup, NodeContext, PlannedEntry, PlannedOp, PlannedReject, planDatabaseEntries,
 } from "./ingest.js";
-import { keyRefColumnFromTarget, rdbFkColumnFromTarget, rdbTableName } from "./names.js";
+import { authorColumn, keyRefColumnFromTarget, rdbFkColumnFromTarget, rdbTableName, targetTableName } from "./names.js";
 import { buildObservedBy, frontierOf, observeToVersion } from "./ref_advance.js";
 import { projectGroup, rowToUpsertAction } from "./project.js";
 
@@ -116,10 +116,15 @@ async function prefetchKeys(
                 if (colDef.type === 'identity') identityColumns.add(col);
             }
         }
+        const author = authorColumn(ctx.config);
         for (const targetCol of Object.keys(change.values)) {
-            const keyRef = keyRefColumnFromTarget(ctx.config, rdbTable, provider, targetCol, identityColumns);
-            if (keyRef === undefined) continue;
+            // An insert's author column names the key it asks to be signed with:
+            // the planner compares that key with the writer key.
+            const isAuthor = change.kind === 'insert' && targetCol === author;
+            const keyRef = isAuthor ? undefined : keyRefColumnFromTarget(ctx.config, rdbTable, provider, targetCol, identityColumns);
+            if (keyRef === undefined && !isAuthor) continue;
             if (change.values[targetCol] === null) continue;   // a NULL key id names no key
+            if (typeof change.values[targetCol] !== 'number') continue;   // not a key id: the planner refuses it
             const keyId = change.values[targetCol] as number;
             if (cache.has(keyId)) continue;
             const keyHash = await keys.keyHashForId(DEFAULT_KEY_DOMAIN, keyId);
@@ -165,11 +170,33 @@ function bundlePayload(write: BundleWrite): json.Literal {
     return { action: 'bundle', writes: [{ table: write.table, op: write.op }] } as unknown as json.Literal;
 }
 
-async function syntheticOpHash(group: RTableGroup, write: BundleWrite): Promise<B64Hash> {
+// The hash of a failure event, and the op JSON it may carry. The hash covers the
+// failed (never-appended) op, the ids of the captured changes it came from and,
+// for a write refused before rdb saw it, the refused column. It is position-free,
+// and the outbox keeps a change until the settle, so a crash replay derives the
+// same hash and logs the failure once, while every new write gets its own event:
+// the event log keeps one event per (hash, direction), so a hash of the op alone
+// would drop every later refusal of the same row. When the op can't be hashed
+// (it holds a value that isn't a json literal), the hash and the event leave it
+// out, and name the row instead.
+async function failureHash(
+    group: RTableGroup,
+    f: { write?: BundleWrite; sources: CapturedChange[]; column?: string; targetTable: string; localId: number; rowId?: B64Hash },
+): Promise<{ opHash: B64Hash; op?: json.Literal }> {
     const dag = await group.getScopedDag();
-    // Position-free (payload) hash: stable across crash-replays regardless of
-    // where in the frontier the (never-appended) op would have landed.
-    return dag.computeEntryHash(bundlePayload(write));
+    const extra: { [key: string]: json.Literal } = { changes: f.sources.map((c) => c.id) };
+    if (f.column !== undefined) extra.column = f.column;
+    if (f.write !== undefined) {
+        const op = bundlePayload(f.write);
+        if (json.literalProblem(op) === undefined) {
+            try {
+                return { opHash: await dag.computeEntryHash({ failed: op, ...extra }), op };
+            } catch { /* recorded without its op, below */ }
+        }
+    }
+    const row: { [key: string]: json.Literal } = { table: f.targetTable, localId: f.localId };
+    if (f.rowId !== undefined) row.rowId = f.rowId;
+    return { opHash: await dag.computeEntryHash({ failed: row, ...extra }) };
 }
 
 // A genuinely-failed row to reconcile at end of pass.
@@ -325,7 +352,7 @@ export async function ingestDatabaseChanges(
         groupById.set(groupId, m.group);
         if (m.config.writer !== undefined) writerById.set(groupId, m.config.writer);
         for (const rdbTable of ctx.schemaView.getTableNames()) {
-            tableToGroup.set(ctx.config.tableNames?.[rdbTable] ?? rdbTable, groupId);
+            tableToGroup.set(targetTableName(ctx.config, rdbTable), groupId);
         }
     }
     const ctxForTable = (table: string): GroupContext | undefined => {
@@ -390,16 +417,17 @@ export async function ingestDatabaseChanges(
     const recordFailure = async (f: {
         groupId: B64Hash; kind: 'insert' | 'update' | 'delete'; targetTable: string; rdbTable: string;
         rowId?: B64Hash; localId: number; write?: BundleWrite; failure: ValidationFailure; source?: CapturedChange;
+        sources: CapturedChange[]; column?: string;
     }): Promise<void> => {
         const group = groupById.get(f.groupId)!;
-        const opHash = f.write !== undefined ? await syntheticOpHash(group, f.write) : f.rowId ?? `${f.targetTable}#${f.localId}`;
+        const { opHash, op } = await failureHash(group, f);
         const event: OpEvent = {
             origin: 'ingestion', direction: 'failure', groupId: f.groupId, opHash, kind: f.kind,
             table: f.targetTable, localId: f.localId, author: authorFor(f.groupId)?.keyId,
             reason: { source: 'validation', failure: f.failure },
         };
         if (f.rowId !== undefined) event.rowId = f.rowId;
-        if (f.write !== undefined) event.op = bundlePayload(f.write);
+        if (op !== undefined) event.op = op;
         failureEvents.push(event);
         rejects.get(f.groupId)!.push({ change: f.source, groupId: f.groupId, reason: formatValidationFailure(f.failure) });
         if (f.rowId !== undefined) {
@@ -418,6 +446,7 @@ export async function ingestDatabaseChanges(
         await recordFailure({
             groupId, kind: rej.kind, targetTable: rej.table, rdbTable: rej.op?.table ?? rdbTableName(contexts.get(groupId)!.config, rej.table),
             rowId: rej.rowId, localId: rej.localId, write: rej.op, failure: { reason: rej.reason }, source: rej.change,
+            sources: rej.sources ?? (rej.change !== undefined ? [rej.change] : []), column: rej.column,
         });
     }
 
@@ -461,6 +490,7 @@ export async function ingestDatabaseChanges(
         await recordFailure({
             groupId, kind: op.kind, targetTable: op.table, rdbTable: op.rdbTable, rowId,
             localId: op.localId, write: op.write, failure: res.why, source: op.sources[op.sources.length - 1],
+            sources: op.sources,
         });
     };
 

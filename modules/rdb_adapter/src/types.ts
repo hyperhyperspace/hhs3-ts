@@ -38,6 +38,11 @@ export const DEFAULT_KEY_DOMAIN = 'keys';
 // SQL-identifier-safe). All keys are rdb-side names.
 export type AdapterConfig = {
     tableNames?: { [rdbTable: string]: string };
+    // The projected name of a table `tableNames` doesn't list:
+    // `<tablePrefix>_<table>`. A shared projection sets it to the group's
+    // prefix, so a table that a schema change adds after the projection opened
+    // is named like the tables the group had then.
+    tablePrefix?: string;
     columnNames?: { [rdbTable: string]: { [rdbColumn: string]: string } };
     // Projection-local integer primary key column. Allocated once per rowId via
     // the per-table sync table and stable across void flips. Defaults to 'id'.
@@ -143,12 +148,15 @@ export type CapturedValues = { [column: string]: json.Literal | null };
 // to NULL becomes a null write in rdb. An insert may name its empty columns
 // with `null` or leave them out, as the target's capture allows; the planner
 // keeps an insert's null only where the column has a default (see
-// translateNet in ./ingest.ts).
+// translateNet in ./ingest.ts). `unreadable` names the columns the target
+// could not read back as logical values, with the reason, such as text that
+// isn't json in a json column: they are left out of `values`, and ingestion
+// refuses them, so the drain never throws on a stored value.
 export type CapturedChange =
     | { id: CapturedChangeId; kind: 'insert'; table: string; localId: number;
-        values: CapturedValues }
+        values: CapturedValues; unreadable?: { [column: string]: string } }
     | { id: CapturedChangeId; kind: 'update'; table: string; localId: number;
-        values: CapturedValues }
+        values: CapturedValues; unreadable?: { [column: string]: string } }
     | { id: CapturedChangeId; kind: 'delete'; table: string; localId: number };
 
 // The changes drained in one ingestion pass, in COMMIT order. Reproducing the
@@ -511,7 +519,8 @@ export function isIndexTarget(t: object): t is IndexTarget {
 // never a projected column). A `null` in `values` means "write NULL": the
 // column holds no value in rdb, so the target clears it and does not fill in
 // its default. A column left out of `values` is not touched in an existing
-// row, and takes its default in a new one.
+// row, and takes its default in a new one. An upsert without `author` is for a
+// row rdb has no author for: the target writes NULL to its author column.
 export type RowAction =
     | { kind: 'upsert-row'; table: string; rowId: B64Hash; author?: KeyId;
         values: { [column: string]: json.Literal | null };

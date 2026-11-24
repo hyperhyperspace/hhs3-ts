@@ -118,6 +118,33 @@ export function nullTables(): TableDef[] {
     ];
 }
 
+// A table with a column of each type a write can carry, for the writer suite
+// and the native write paths: a required column, nullable columns, a nullable
+// column with a default and a required one with a default, and readonly
+// columns of two types.
+export function typedTables(): TableDef[] {
+    return [
+        {
+            name: 'things',
+            columns: {
+                label: { type: 'string' },
+                note: { type: 'string', nullable: true },
+                kind: { type: 'string', nullable: true, default: 'std' },
+                level: { type: 'integer', default: 1 },
+                ratio: { type: 'float', nullable: true },
+                flag: { type: 'boolean', nullable: true },
+                data: { type: 'json', nullable: true },
+                big: { type: 'bigint', nullable: true },
+                price: { type: 'decimal', nullable: true, constraints: { scale: 2 } },
+                blob: { type: 'bytes', nullable: true },
+                code: { type: 'string', nullable: true, readonly: true },
+                spec: { type: 'json', nullable: true, readonly: true },
+            },
+            restrictions: [{ on: 'all', rule: { p: 'true' } }],
+        },
+    ];
+}
+
 export type GroupFixture = {
     schema: RSchemaImpl;
     group: RTableGroupImpl;
@@ -125,8 +152,9 @@ export type GroupFixture = {
 };
 
 // The group is its own identity provider with `admin` registered, so the
-// suites can sign rows as `admin`.
-async function buildGroup(name: string, tables: TableDef[]): Promise<GroupFixture> {
+// suites can sign rows as `admin`. An anonymous group has no identity provider:
+// every op in it is unsigned, and `admin` signs nothing.
+async function buildGroup(name: string, tables: TableDef[], opts: { anonymous?: boolean } = {}): Promise<GroupFixture> {
     const ctx = createMockRContext({ selfValidate: true });
     ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
     ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
@@ -140,11 +168,13 @@ async function buildGroup(name: string, tables: TableDef[]): Promise<GroupFixtur
     const schema = (await ctx.createObject(schemaInit)) as RSchemaImpl;
     const pinned = await (await schema.getScopedDag()).getFrontier();
 
-    const groupInit = await RTableGroupImpl.create({
-        name: name + '-prod', seed: name + '-prod', schemaRef: schema.getId(), schemaVersion: pinned,
-        idProvider: IDENTITIES_TABLE,
-        initialRows: { [IDENTITIES_TABLE]: [identityRow('admin', admin)] },
-    });
+    const groupInit = await RTableGroupImpl.create(opts.anonymous === true
+        ? { name: name + '-prod', seed: name + '-prod', schemaRef: schema.getId(), schemaVersion: pinned }
+        : {
+            name: name + '-prod', seed: name + '-prod', schemaRef: schema.getId(), schemaVersion: pinned,
+            idProvider: IDENTITIES_TABLE,
+            initialRows: { [IDENTITIES_TABLE]: [identityRow('admin', admin)] },
+        });
     const group = (await ctx.createObject(groupInit)) as RTableGroupImpl;
     return { schema, group, admin };
 }
@@ -168,6 +198,16 @@ export async function createFlipGroup(): Promise<GroupFixture> {
 // nullable boolean and a nullable foreign key.
 export async function createNullsGroup(): Promise<GroupFixture> {
     return buildGroup('notebook', nullTables());
+}
+
+// A group with one table of every column type (see typedTables).
+export async function createTypedGroup(): Promise<GroupFixture> {
+    return buildGroup('typed', typedTables());
+}
+
+// The typed table in a group without an identity provider.
+export async function createAnonymousGroup(): Promise<GroupFixture> {
+    return buildGroup('anon', typedTables(), { anonymous: true });
 }
 
 export async function frontier(group: RTableGroupImpl): Promise<Version> {

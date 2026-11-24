@@ -26,7 +26,7 @@
 // Validity (do the FKs/restrictions actually hold) is NOT decided here - rdb
 // decides it at bundle(); rejects flow back through the orchestrator.
 
-import type { json } from "@hyper-hyper-space/hhs3_json";
+import { json } from "@hyper-hyper-space/hhs3_json";
 import type { KeyId } from "@hyper-hyper-space/hhs3_crypto";
 import {
     BundleWrite, deriveRowId, InsertRowPayload, RowOpPayload, RowWrite, rowWriteParts, RSchemaView, TableDef,
@@ -36,7 +36,7 @@ import {
     AdapterConfig, CapturedBatch, CapturedChange, CapturedValues, IngestRejection, SyncMapping,
 } from "./types.js";
 import {
-    isSystemColumn, keyRefColumnFromTarget, rdbColumnName, rdbFkColumnFromTarget, rdbTableName,
+    authorColumn, isSystemColumn, keyRefColumnFromTarget, rdbColumnName, rdbFkColumnFromTarget, rdbTableName,
 } from "./names.js";
 
 // One translated, ready-to-submit op plus its bookkeeping. `deps` are the
@@ -74,7 +74,10 @@ export type PlannedEntry = {
 
 // A translate-time reject enriched for the op-event log: the constructed
 // (never-appended) op and the row it targeted, so the orchestrator can record a
-// failure event (full op JSON + synthetic hash) and revert the row.
+// failure event (full op JSON + synthetic hash) and revert the row. `sources`
+// are the captured changes the refused write came from, and `column` the
+// target column refused: the failure's hash covers both, so two refusals of
+// one row, or of two columns of one captured change, are logged apart.
 export type PlannedReject = IngestRejection & {
     op?: BundleWrite;
     table?: string;
@@ -82,6 +85,8 @@ export type PlannedReject = IngestRejection & {
     rowId?: string;
     kind?: 'insert' | 'update' | 'delete';
     author?: KeyId;
+    sources?: CapturedChange[];
+    column?: string;
 };
 
 export type IngestPlan = {
@@ -124,18 +129,30 @@ function disjoint(a: { [k: string]: unknown }, b: { [k: string]: unknown }): boo
 // ---------------------------------------------------------------------------
 
 // One original update change folded into a (possibly merged) update net op.
-type UpdatePart = { values: CapturedValues; sources: CapturedChange[] };
+// `unreadable` carries a column the target could not read back, which the
+// planner refuses (CapturedChange.unreadable).
+type UpdatePart = { values: CapturedValues; unreadable?: { [column: string]: string }; sources: CapturedChange[] };
 
 type NetChange = {
     table: string;
     localId: number;
     kind: 'insert' | 'update' | 'delete';
     values: CapturedValues;
+    // The columns of `values`' changes that the target could not read back.
+    unreadable?: { [column: string]: string };
     sources: CapturedChange[];
     // Update only: the constituent per-change updates (>1 iff a merge happened),
     // used to build the merged op's per-change fallback.
     parts?: UpdatePart[];
 };
+
+// The columns a net change touches, readable or not, for the disjointness test
+// of a merge.
+function touched(net: NetChange): CapturedValues {
+    const columns: CapturedValues = { ...net.values };
+    for (const column of Object.keys(net.unreadable ?? {})) columns[column] = null;
+    return columns;
+}
 
 // Emit one net op per captured change, in order, merging ONLY a run of
 // consecutive same-row disjoint-field updates (when updateMerge is on for that
@@ -145,7 +162,9 @@ function planOps(batch: CapturedBatch, updateMergeFor: (table: string) => boolea
     for (const change of batch.changes) {
         if (change.kind === 'insert') {
             out.push({ table: change.table, localId: change.localId, kind: 'insert',
-                values: { ...change.values }, sources: [change] });
+                values: { ...change.values },
+                ...(change.unreadable !== undefined ? { unreadable: { ...change.unreadable } } : {}),
+                sources: [change] });
             continue;
         }
         if (change.kind === 'delete') {
@@ -153,25 +172,38 @@ function planOps(batch: CapturedBatch, updateMergeFor: (table: string) => boolea
                 values: {}, sources: [change] });
             continue;
         }
-        // update: merge with the immediately-preceding net op iff it is an
-        // update on the same row with a disjoint column set (any other change
-        // in between - a different row, an insert/delete - breaks the run).
-        const last = out[out.length - 1];
-        const canMerge = last !== undefined
-            && last.kind === 'update'
-            && last.table === change.table
-            && last.localId === change.localId
-            && updateMergeFor(change.table)
-            && disjoint(last.values, change.values);
-        if (canMerge) {
-            Object.assign(last.values, change.values);
-            last.sources.push(change);
-            last.parts!.push({ values: { ...change.values }, sources: [change] });
-            continue;
+        // update: one change per column first, so each column lands or fails on
+        // its own on every target, as SQLite's per-column capture already gives,
+        // and updateMerge treats memory's and IndexedDB's multi-column changes
+        // as it treats SQLite's. Each column then merges with the
+        // immediately-preceding net op iff it is an update on the same row with
+        // a disjoint column set (any other change in between - a different row,
+        // an insert/delete - breaks the run). A column the target could not
+        // read is a part of its own, with no value, which the planner refuses.
+        const columns: { column: string; values: CapturedValues; unreadable?: { [column: string]: string } }[] = [
+            ...Object.entries(change.values).map(([column, value]) => ({ column, values: { [column]: value } })),
+            ...Object.entries(change.unreadable ?? {}).map(([column, reason]) => ({ column, values: {}, unreadable: { [column]: reason } })),
+        ];
+        for (const { column, values, unreadable } of columns) {
+            const part: UpdatePart = { values, ...(unreadable !== undefined ? { unreadable } : {}), sources: [change] };
+            const last = out[out.length - 1];
+            const canMerge = last !== undefined
+                && last.kind === 'update'
+                && last.table === change.table
+                && last.localId === change.localId
+                && updateMergeFor(change.table)
+                && disjoint(touched(last), { [column]: null });
+            if (canMerge) {
+                Object.assign(last.values, values);
+                if (unreadable !== undefined) last.unreadable = { ...(last.unreadable ?? {}), ...unreadable };
+                if (last.sources[last.sources.length - 1] !== change) last.sources.push(change);
+                last.parts!.push(part);
+                continue;
+            }
+            out.push({ table: change.table, localId: change.localId, kind: 'update',
+                values: { ...values }, ...(unreadable !== undefined ? { unreadable: { ...unreadable } } : {}),
+                sources: [change], parts: [part] });
         }
-        out.push({ table: change.table, localId: change.localId, kind: 'update',
-            values: { ...change.values }, sources: [change],
-            parts: [{ values: { ...change.values }, sources: [change] }] });
     }
     return out;
 }
@@ -257,7 +289,7 @@ function mintInserts(
 // offending column's reject reason.
 // ---------------------------------------------------------------------------
 
-type Reversed = { ok: true; values: RowWrite; deps: string[] } | { ok: false; reason: string };
+type Reversed = { ok: true; values: RowWrite; deps: string[] } | { ok: false; reason: string; column: string };
 
 // Reverse a set of target columns into rdb columns/values for `rdbTable`. A
 // null maps to a null of the rdb column: in each branch the readonly check
@@ -271,7 +303,15 @@ function reverseCols(
     lookup: MappingLookup,
     keyLookup: KeyLookup,
     minted: Map<string, Minted>,
+    unreadable?: { [column: string]: string },
 ): Reversed {
+    // A column the target could not read back is refused before anything
+    // else: its value never reached the planner.
+    const [unread] = Object.entries(unreadable ?? {});
+    if (unread !== undefined) {
+        const [column, reason] = unread;
+        return { ok: false, reason: `column '${column}' of '${rdbTable}' holds a value the target can't read: ${reason}`, column };
+    }
     const { schemaView, config } = ctx;
     const def = schemaView.getTable?.(rdbTable);
     const fks = schemaView.getFKs?.(rdbTable) ?? {};
@@ -283,15 +323,43 @@ function reverseCols(
         }
     }
 
+    const authorCol = authorColumn(config);
     const values: RowWrite = {};
     const deps: string[] = [];
     for (const targetCol of Object.keys(targetValues)) {
         const raw = targetValues[targetCol];
+        const refuse = (reason: string): Reversed => ({ ok: false, reason, column: targetCol });
+        // A value rdb can't hold, such as a json value with a null inside it, is
+        // refused here: sent to rdb, its op could not even be hashed, and the
+        // failure could not be recorded.
+        const problem = raw === null ? undefined : json.literalProblem(raw);
+        if (problem !== undefined) {
+            return refuse(`column '${targetCol}' of '${rdbTable}' holds a value rdb can't store: it contains ${problem}`);
+        }
+        // The author column is not an rdb column: a row's author is the signer
+        // of its insert, and no op changes it. An insert may name the writer
+        // key, which signs it, or no author. In a group without an identity
+        // provider, where every op is anonymous, it may name none.
+        if (targetCol === authorCol) {
+            if (isUpdate) return refuse(`the author of a row of '${rdbTable}' can't be changed`);
+            if (raw === null) continue;
+            if (ctx.writerKeyId === undefined) {
+                return refuse(`'${rdbTable}' is in a group without an identity provider, so an insert can't name an author`);
+            }
+            const info = typeof raw === 'number' ? keyLookup(raw) : undefined;
+            if (info === undefined) {
+                return refuse(`the author column of an insert into '${rdbTable}' holds ${JSON.stringify(raw)}, which is no key id of the key table`);
+            }
+            if (info.keyHash !== ctx.writerKeyId) {
+                return refuse(`an insert into '${rdbTable}' names another key as its author; it can only be signed with the writer key`);
+            }
+            continue;
+        }
         const fkInfo = rdbFkColumnFromTarget(config, rdbTable, fks, targetCol);
         if (fkInfo !== undefined) {
             const rdbCol = fkInfo.rdbColumn;
             if (isUpdate && def?.columns?.[rdbCol]?.readonly) {
-                return { ok: false, reason: `cannot update readonly column '${rdbTable}.${rdbCol}'` };
+                return refuse(`cannot update readonly column '${rdbTable}.${rdbCol}'`);
             }
             if (raw === null) {
                 values[rdbCol] = null;
@@ -303,7 +371,7 @@ function reverseCols(
                 const tKey = keyOf(targetTable, localRef);
                 const targetRowId = minted.get(tKey)?.rowId ?? lookup(targetTable, localRef)?.rowId;
                 if (targetRowId === undefined) {
-                    return { ok: false, reason: `dangling FK '${rdbTable}.${rdbCol}' -> ${targetTable}#${localRef}` };
+                    return refuse(`dangling FK '${rdbTable}.${rdbCol}' -> ${targetTable}#${localRef}`);
                 }
                 values[rdbCol] = targetRowId;
                 if (!fkInfo.crossGroup) deps.push(tKey);
@@ -317,7 +385,7 @@ function reverseCols(
         if (keyRef !== undefined) {
             const rdbCol = keyRef.rdbColumn;
             if (isUpdate && def?.columns?.[rdbCol]?.readonly) {
-                return { ok: false, reason: `cannot update readonly column '${rdbTable}.${rdbCol}'` };
+                return refuse(`cannot update readonly column '${rdbTable}.${rdbCol}'`);
             }
             if (raw === null) {
                 values[rdbCol] = null;
@@ -326,13 +394,12 @@ function reverseCols(
             const keyId = raw as number;
             const info = keyLookup(keyId);
             if (info === undefined) {
-                return { ok: false, reason: `unknown key id ${keyId} for '${rdbTable}.${rdbCol}'` };
+                return refuse(`unknown key id ${keyId} for '${rdbTable}.${rdbCol}'`);
             }
             if (keyRef.isProviderKeyId) {
                 if (info.publicKey === undefined) {
-                    return { ok: false, reason:
-                        `key id ${keyId} has no public key; call registerKey before inserting into `
-                        + `identity-provider table '${rdbTable}'` };
+                    return refuse(`key id ${keyId} has no public key; call registerKey before inserting into `
+                        + `identity-provider table '${rdbTable}'`);
                 }
                 values[provider!.keyIdColumn] = info.keyHash;
                 values[provider!.publicKeyColumn] = info.publicKey;
@@ -345,7 +412,7 @@ function reverseCols(
         if (isSystemColumn(config, targetCol)) continue;
         const rdbCol = rdbColumnName(config, rdbTable, targetCol);
         if (isUpdate && def?.columns?.[rdbCol]?.readonly) {
-            return { ok: false, reason: `cannot update readonly column '${rdbTable}.${rdbCol}'` };
+            return refuse(`cannot update readonly column '${rdbTable}.${rdbCol}'`);
         }
         values[rdbCol] = raw;
     }
@@ -418,13 +485,14 @@ function translateNet(
     }
 
     if (net.kind === 'insert') {
-        const rev = reverseCols(rdbTable, net.values, ctx, false, lookup, keyLookup, minted);
+        const rev = reverseCols(rdbTable, net.values, ctx, false, lookup, keyLookup, minted, net.unreadable);
         const m = minted.get(key)!;
         if (!rev.ok) {
             const failWrite: BundleWrite = { table: rdbTable,
                 op: { action: 'insert', rowId: m.rowId, uuid: m.uuid, values: {} } };
             return { rejects: [{ change: lastSource, table: net.table, localId: net.localId, rowId: m.rowId,
-                kind: 'insert', author: writerKeyId, op: failWrite, reason: rev.reason }] };
+                kind: 'insert', author: writerKeyId, op: failWrite, reason: rev.reason,
+                sources: net.sources, column: rev.column }] };
         }
         const op: InsertRowPayload = {
             action: 'insert', rowId: m.rowId, uuid: m.uuid,
@@ -447,17 +515,17 @@ function translateNet(
         return { rejects: [{ change: lastSource, table: net.table, localId: net.localId, kind: 'update',
             reason: `cannot update unknown local row ${net.table}#${net.localId}` }] };
     }
-    const parts = net.parts ?? [{ values: net.values, sources: net.sources }];
+    const parts = net.parts ?? [{ values: net.values, unreadable: net.unreadable, sources: net.sources }];
     const rejects: PlannedReject[] = [];
     const okParts: { values: RowWrite; deps: string[]; sources: CapturedChange[] }[] = [];
     for (const part of parts) {
-        const rev = reverseCols(rdbTable, part.values, ctx, true, lookup, keyLookup, minted);
+        const rev = reverseCols(rdbTable, part.values, ctx, true, lookup, keyLookup, minted, part.unreadable);
         if (!rev.ok) {
             const src = part.sources[part.sources.length - 1];
             const failWrite: BundleWrite = { table: rdbTable,
                 op: { action: 'update', rowId, values: {} } };
             rejects.push({ change: src, table: net.table, localId: net.localId, rowId,
-                kind: 'update', op: failWrite, reason: rev.reason });
+                kind: 'update', op: failWrite, reason: rev.reason, sources: part.sources, column: rev.column });
             continue;
         }
         if (Object.keys(rev.values).length === 0) continue;   // only system cols touched

@@ -125,13 +125,26 @@ function defaultFragment(def: ColumnDef): string {
     return ' DEFAULT ' + quoteText(String(value));
 }
 
-// A business-column declaration: `"name" TYPE [NOT NULL] [DEFAULT x]`. SQLite
-// rejects ALTER TABLE ADD COLUMN ... NOT NULL with no non-NULL default on a
-// non-empty table. addColumn relaxes those adds to nullable and applyTightens
-// restores NOT NULL after the row backfill (same transaction).
+// The ` CHECK (...)` fragment that keeps a native write to values rdb settles
+// the same way, or '' when the type needs none. A boolean column holds 0 or 1:
+// capture reads any other value as true, while the row keeps it. A json column
+// holds json text other than `null`: capture parses the text, and the text
+// `null` would reach rdb as SQL NULL. SQL NULL passes both, since each check is
+// then unknown. A column constraint names only its column, so it goes when the
+// column is dropped.
+function checkFragment(name: string, type: ColumnType | undefined): string {
+    if (type === 'boolean') return ` CHECK (${quoteId(name)} IN (0, 1))`;
+    if (type === 'json') return ` CHECK (json_valid(${quoteId(name)}) AND json_type(${quoteId(name)}) != 'null')`;
+    return '';
+}
+
+// A business-column declaration: `"name" TYPE [NOT NULL] [DEFAULT x] [CHECK (...)]`.
+// SQLite rejects ALTER TABLE ADD COLUMN ... NOT NULL with no non-NULL default
+// on a non-empty table. addColumn relaxes those adds to nullable and
+// applyTightens restores NOT NULL after the row backfill (same transaction).
 function columnDecl(name: string, def: ColumnDef): string {
     const nn = def.nullable ? '' : ' NOT NULL';
-    return `${quoteId(name)} ${sqliteType(def.type)}${nn}${defaultFragment(def)}`;
+    return `${quoteId(name)} ${sqliteType(def.type)}${nn}${defaultFragment(def)}${checkFragment(name, def.type)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +224,6 @@ function createIndexSql(index: ResolvedIndex): string {
 
 // Convert a stored SQLite value back to its logical rdb value, inverting
 // toParam: booleans from 0/1, json from canonical text, everything else as-is.
-// Used only on the inbound path (draining captured changes).
 function toLogical(value: unknown, type: ColumnType): json.Literal | undefined {
     if (value === null || value === undefined) return undefined;
     if (type === 'boolean') return value !== 0;
@@ -219,10 +231,28 @@ function toLogical(value: unknown, type: ColumnType): json.Literal | undefined {
     return value as json.Literal;
 }
 
+// toLogical that says why a value can't be read instead of throwing. Text that
+// isn't json in a json column can't be: the column's check refuses it, but a
+// table can still hold it with SQLite's checks switched off.
+type LogicalRead = { ok: true; value: json.Literal | undefined } | { ok: false; reason: string };
+function readLogical(value: unknown, type: ColumnType): LogicalRead {
+    if (type === 'json' && typeof value === 'string') {
+        try {
+            return { ok: true, value: JSON.parse(value) as json.Literal };
+        } catch {
+            const shown = value.length > 40 ? value.slice(0, 40) + '...' : value;
+            return { ok: false, reason: `its text is not json: ${JSON.stringify(shown)}` };
+        }
+    }
+    return { ok: true, value: toLogical(value, type) };
+}
+
 export class SqliteTarget implements MaterializationTarget, MaterializedChangeSource,
     ReactiveChangeTarget, QueryableTarget, RowIdentityIndex, KeyIndex, IndexTarget {
     private db: Database.Database;
     private metaCache = new Map<string, TableMeta>();
+    // The schema version the cache was read at (see freshMeta).
+    private metaVersion: number | undefined;
     private bookkeepingReady = false;
 
     // ChangeSignalSource: an external outbox monitor (the app writes through its
@@ -340,6 +370,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         if (empty && versionsEqual(stored, checkpoint)) return;
 
         const run = this.db.transaction(() => {
+            this.freshMeta();
             // Compare-and-set guard (concurrent projectors). BEGIN IMMEDIATE took
             // the write lock, so this read of the stored checkpoint cannot race a
             // committing writer: exactly one projector wins. On mismatch throw so
@@ -370,6 +401,8 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             }
             this.pendingEvents = logged;
             if (this.capture) this.setApplying(false);
+            // The cache now holds this transaction's own schema changes.
+            this.metaVersion = this.schemaVersion();
         });
         // BEGIN IMMEDIATE: this transaction reads (the checkpoint CAS compare)
         // and then writes, so it must take the write lock up front. A deferred
@@ -381,6 +414,11 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         } catch (err) {
             this.pendingApply = undefined;
             this.pendingEvents = undefined;
+            // The rollback undid the schema changes, but not the cache edits
+            // made with them; the schema version is back where it was, so the
+            // version check alone wouldn't notice.
+            this.metaCache.clear();
+            this.metaVersion = undefined;
             throw err;
         }
         const changes = this.pendingApply;
@@ -496,13 +534,16 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     // columns: one AFTER INSERT (full row image), one AFTER DELETE, and one
     // AFTER UPDATE OF <col> per business column so an UPDATE captures ONLY the
     // columns it actually changed (net-image updates would falsely include
-    // readonly columns). Every trigger body is gated on enabled=1 AND applying=0.
+    // readonly columns). Every capture body is gated on enabled=1 AND applying=0.
+    // A BEFORE UPDATE guard, gated on applying=0 only, fails a change of the id.
     private installTriggers(table: string, meta: TableMeta): void {
         // Drop any prior capture triggers for this table (column set may have changed).
         this.dropTriggers(table);
 
         const gate = '(SELECT enabled FROM rdb_capture_config) = 1 AND (SELECT applying FROM rdb_capture_config) = 0';
-        const cols = Object.keys(meta.columnTypes);
+        // The business columns and the author column: ingestion compares an
+        // insert's author with the writer key, and refuses a change of it.
+        const cols = [...Object.keys(meta.columnTypes), ...(meta.authorColumn !== undefined ? [meta.authorColumn] : [])];
         const tableLit = quoteText(table);
         const id = quoteId(meta.idColumn);
 
@@ -522,14 +563,29 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             + `INSERT INTO rdb_outbox ("table", local_id, op, changed) `
             + `SELECT ${tableLit}, OLD.${id}, 'delete', NULL WHERE ${gate}; END`);
 
+        // An update trigger fires only when the column's value changes (IS NOT
+        // treats NULL as a value): a captured unchanged value would become a
+        // write, which wins over a clear made concurrently on another device.
         cols.forEach((col, i) => {
             this.db.exec(
                 `CREATE TRIGGER ${quoteId('rdb_cap_upd_' + table + '_' + i)} `
-                + `AFTER UPDATE OF ${quoteId(col)} ON ${quoteId(table)} BEGIN `
+                + `AFTER UPDATE OF ${quoteId(col)} ON ${quoteId(table)} `
+                + `WHEN NEW.${quoteId(col)} IS NOT OLD.${quoteId(col)} BEGIN `
                 + `INSERT INTO rdb_outbox ("table", local_id, op, changed) `
                 + `SELECT ${tableLit}, NEW.${id}, 'update', json_object(${quoteText(col)}, NEW.${quoteId(col)}) `
                 + `WHERE ${gate}; END`);
         });
+
+        // A native statement may not change a row's id: the row would sit under
+        // an id with no rdb identity, and project-back would insert it again
+        // under the old one. The trigger names no column (an UPDATE OF <id>
+        // trigger misses `SET rowid = ...`), and fails the statement whether or
+        // not capture is on. Only the adapter's own writes pass, and they never
+        // change an id.
+        this.db.exec(
+            `CREATE TRIGGER ${quoteId('rdb_cap_pk_' + table)} BEFORE UPDATE ON ${quoteId(table)} `
+            + `WHEN NEW.${id} IS NOT OLD.${id} AND (SELECT applying FROM rdb_capture_config) = 0 BEGIN `
+            + `SELECT RAISE(ABORT, ${quoteText(`can't change the id of a row of '${table}': it is the row's local id in the projection`)}); END`);
     }
 
     // Remove a table's capture triggers. They name the table's columns, and
@@ -569,6 +625,24 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
                 JSON.stringify(meta.columnTypes), JSON.stringify(meta.fkColumns),
                 JSON.stringify(meta.keyRefColumns));
         this.metaCache.set(table, meta);
+    }
+
+    // The meta cache holds what this handle read from rdb_table_meta. Another
+    // handle on the same file can change a table, as the host does while a client
+    // reads, so the cache is kept only while the schema version it was read at
+    // holds: every DDL statement bumps PRAGMA schema_version. Each entry point
+    // that reads or writes with column types calls this first, inside its
+    // transaction, so the version and the reads that follow agree.
+    private freshMeta(): void {
+        const version = this.schemaVersion();
+        if (version !== this.metaVersion) {
+            this.metaCache.clear();
+            this.metaVersion = version;
+        }
+    }
+
+    private schemaVersion(): number {
+        return this.db.pragma('schema_version', { simple: true }) as number;
     }
 
     private loadMeta(table: string): TableMeta {
@@ -827,7 +901,8 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     // plain DROP COLUMN would be rejected for naming a column in a FOREIGN KEY
     // clause, and by applyTightens to restore NOT NULL after a relaxed ADD COLUMN.
     // Column defs are read live via PRAGMA table_info, so no NOT NULL / DEFAULT
-    // detail is lost (meta records only ColumnType). Runs inside apply()'s
+    // detail is lost. table_info carries no CHECK, so a column's check is
+    // rendered again from its ColumnType in meta. Runs inside apply()'s
     // transaction; because foreign_keys is OFF, dropping the old table does not
     // trip inbound (sync-table / other-app-table) references, and the RENAME - by
     // the unchanged table name - leaves those references intact.
@@ -852,7 +927,8 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             if (c.name === meta.idColumn) return `${quoteId(c.name)} INTEGER PRIMARY KEY AUTOINCREMENT`;
             const nn = c.notnull || opts.forceNotNull?.has(c.name) ? ' NOT NULL' : '';
             return `${quoteId(c.name)} ${c.type}${nn}`
-                + `${c.dflt_value !== null ? ' DEFAULT ' + c.dflt_value : ''}`;
+                + `${c.dflt_value !== null ? ' DEFAULT ' + c.dflt_value : ''}`
+                + checkFragment(c.name, meta.columnTypes[c.name]);
         });
 
         // Re-emit every surviving FK constraint (grouped by its id), skipping the
@@ -1015,8 +1091,12 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             }
         }
 
-        const exists = this.db.prepare(
-            `SELECT 1 FROM ${quoteId(action.table)} WHERE ${quoteId(meta.idColumn)} = ?`).get(id) !== undefined;
+        // The stored author is read with the row, so that an action without an
+        // author clears it only when it holds something.
+        const stored = this.db.prepare(
+            `SELECT ${meta.authorColumn !== undefined ? quoteId(meta.authorColumn) : '1'} AS author `
+            + `FROM ${quoteId(action.table)} WHERE ${quoteId(meta.idColumn)} = ?`).get(id) as { author: unknown } | undefined;
+        const exists = stored !== undefined;
 
         const columns = Object.keys(action.values);
         const setAuthor = meta.authorColumn !== undefined && action.author !== undefined;
@@ -1032,6 +1112,10 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             if (setAuthor) {
                 assignments.push(`${quoteId(meta.authorColumn!)} = ?`);
                 params.push(authorId!);
+            } else if (meta.authorColumn !== undefined && stored.author !== null) {
+                // An action without an author is for a row rdb has none for: the
+                // author column is cleared, whatever a local write left in it.
+                assignments.push(`${quoteId(meta.authorColumn)} = NULL`);
             }
             if (assignments.length === 0) return;   // nothing to update
             params.push(id);
@@ -1072,10 +1156,13 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         const selected = cols.map((col) => `${quoteId(col)} AS ${quoteId(col)}`).join(', ');
         const row = this.db.prepare(
             `SELECT ${selected} FROM ${quoteId(table)} WHERE ${quoteId(meta.idColumn)} = ?`).get(id) as { [column: string]: unknown } | undefined;
+        // A value that can't be read is reported as null: this runs inside
+        // apply() and the settle, which must not fail on a row that a write
+        // with SQLite's checks switched off left behind.
         const values: { [column: string]: json.Literal | null } = {};
         for (const col of cols) {
-            const logical = row === undefined ? undefined : toLogical(row[col], meta.columnTypes[col] ?? (col === meta.idColumn || col === meta.authorColumn ? 'integer' : 'string'));
-            values[col] = logical === undefined ? null : logical;
+            const read = row === undefined ? undefined : readLogical(row[col], meta.columnTypes[col] ?? (col === meta.idColumn || col === meta.authorColumn ? 'integer' : 'string'));
+            values[col] = read === undefined || !read.ok || read.value === undefined ? null : read.value;
         }
         return values;
     }
@@ -1105,6 +1192,13 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     async executeQuery(plan: SingleTableQueryPlan): Promise<ProjectedRow[]> {
         this.ensureBookkeeping();
         this.ensureLike();
+        // One read transaction, so the meta the rows are read with belongs to
+        // the schema they are read under: another handle may change it.
+        return this.db.transaction(() => this.readQuery(plan))();
+    }
+
+    private readQuery(plan: SingleTableQueryPlan): ProjectedRow[] {
+        this.freshMeta();
         const meta = this.loadMeta(plan.table);
         const needsOrder = plan.limit !== undefined || plan.cursor !== undefined;
         const order = normalizeOrder(plan.orderBy, meta.idColumn, needsOrder);
@@ -1126,8 +1220,9 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         return rows.map((row) => {
             const projected: ProjectedRow = { id: Number(row[meta.idColumn]) };
             for (const col of new Set(columns)) {
-                const logical = toLogical(row[col], meta.columnTypes[col] ?? 'integer');
-                projected[col] = logical === undefined ? null : logical;
+                const read = readLogical(row[col], meta.columnTypes[col] ?? 'integer');
+                if (!read.ok) throw new Error(`column '${col}' of row ${projected.id} of '${plan.table}' can't be read: ${read.reason}`);
+                projected[col] = read.value === undefined ? null : read.value;
             }
             return projected;
         });
@@ -1150,34 +1245,53 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
 
     async drainChanges(): Promise<CapturedBatch> {
         this.requireCapture();
-        const rows = this.db.prepare(
-            'SELECT id, "table" AS tbl, local_id, op, changed FROM rdb_outbox ORDER BY id')
-            .all() as { id: number; tbl: string; local_id: number; op: string; changed: string | null }[];
+        // One read transaction, so the meta each change is read with belongs to
+        // the schema it was written under: another handle may change it.
+        const { rows, changes } = this.db.transaction(() => this.readOutbox())();
         const fresh = rows.filter((row) => !this.emittedOutboxIds.has(row.id));
         this.emittedOutboxIds = new Set(rows.map((row) => row.id));
         if (fresh.length > 0) {
             const tables = [...new Set(fresh.map((row) => row.tbl))];
             for (const listener of [...this.commitListeners]) listener({ source: 'local', tables });
         }
+        return { changes };
+    }
 
+    private readOutbox(): { rows: { id: number; tbl: string }[]; changes: CapturedChange[] } {
+        this.freshMeta();
+        const rows = this.db.prepare(
+            'SELECT id, "table" AS tbl, local_id, op, changed FROM rdb_outbox ORDER BY id')
+            .all() as { id: number; tbl: string; local_id: number; op: string; changed: string | null }[];
         const changes: CapturedChange[] = [];
         for (const row of rows) {
             if (row.op === 'delete') {
                 changes.push({ id: row.id, kind: 'delete', table: row.tbl, localId: row.local_id });
                 continue;
             }
-            const meta = this.loadMeta(row.tbl);
+            // A table dropped since the write has no meta: its columns can't be
+            // read, and ingestion drops or refuses the change.
+            let meta: TableMeta | undefined;
+            try { meta = this.loadMeta(row.tbl); } catch { meta = undefined; }
             const stored = (row.changed === null ? {} : JSON.parse(row.changed)) as { [column: string]: unknown };
             // A NULL is kept as a null: an update to NULL is a change, and an
             // insert's captured row names every empty column with one, which
-            // the planner sorts out.
+            // the planner sorts out. A value that can't be read is left out of
+            // the values and named in `unreadable`, so the drain never throws.
             const values: { [column: string]: json.Literal | null } = {};
+            const unreadable: { [column: string]: string } = {};
             for (const [col, raw] of Object.entries(stored)) {
-                values[col] = toLogical(raw, meta.columnTypes[col] ?? 'string') ?? null;
+                if (meta === undefined) {
+                    unreadable[col] = `the table '${row.tbl}' is no longer in the projection`;
+                    continue;
+                }
+                const read = readLogical(raw, meta.columnTypes[col] ?? 'string');
+                if (read.ok) values[col] = read.value ?? null;
+                else unreadable[col] = read.reason;
             }
-            changes.push({ id: row.id, kind: row.op === 'insert' ? 'insert' : 'update', table: row.tbl, localId: row.local_id, values });
+            changes.push({ id: row.id, kind: row.op === 'insert' ? 'insert' : 'update', table: row.tbl, localId: row.local_id, values,
+                ...(Object.keys(unreadable).length > 0 ? { unreadable } : {}) });
         }
-        return { changes };
+        return { rows, changes };
     }
 
     async resolveRow(table: string, localId: number): Promise<SyncMapping | undefined> {
@@ -1225,6 +1339,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     async commitIngest(settle: IngestSettle): Promise<void> {
         this.requireCapture();
         const run = this.db.transaction(() => {
+            this.freshMeta();
             // Echo suppression: reverts materialize rows; gate the capture triggers
             // so they don't re-enter the outbox.
             this.setApplying(true);
@@ -1316,6 +1431,10 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     }
 
     notifyExternalCommit(commit: TargetCommitEvent): void {
+        // Another handle's commit can change tables: the meta of the tables an
+        // apply names is read again, and all of it after a reconnect.
+        if (commit.source === 'apply') for (const table of commit.schemaTables) this.metaCache.delete(table);
+        else if (commit.source === 'reconnect') this.metaCache.clear();
         for (const listener of [...this.commitListeners]) listener(commit);
     }
 

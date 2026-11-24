@@ -458,5 +458,45 @@ export const ingestTests = {
                 assertEquals(JSON.stringify(updateOp.nulls), JSON.stringify(['gone', 'memo', 'tag']), 'an update keeps every null');
             },
         },
+        {
+            name: '[ADPTI21] a column the drain could not read is refused before any other check; an update\'s other columns are still planned',
+            invoke: async () => {
+                const view = {
+                    getTableNames: () => ['notes'],
+                    hasTable: (n: string) => n === 'notes',
+                    getTable: (n: string) => n === 'notes'
+                        ? { name: 'notes', columns: {
+                            title: { type: 'string' },
+                            note: { type: 'string', nullable: true },
+                            data: { type: 'json', nullable: true },
+                        } }
+                        : undefined,
+                    getFKs: () => ({}),
+                } as unknown as RSchemaView;
+                const existing: MappingLookup = (table, localId) =>
+                    localId === 9 ? { table, localId, rowId: 'ROW9', uuid: 'u-row', status: 'active' } : undefined;
+                const reason = "its text is not json: \"nope\"";
+                const plan = changesToEntries({ changes: [
+                    { id: 1, kind: 'insert', table: 'notes', localId: 1, values: { title: 'a' }, unreadable: { data: reason } },
+                    { id: 2, kind: 'update', table: 'notes', localId: 9, values: { note: 'n' }, unreadable: { data: reason } },
+                ] }, view, existing, {}, WRITER, counterUuid());
+
+                const insertReject = plan.rejects.find((r) => r.kind === 'insert');
+                assertTrue(insertReject !== undefined, 'the insert is refused');
+                assertEquals(insertReject!.column, 'data', 'at the column the drain could not read');
+                assertTrue(insertReject!.reason.includes(reason), `with the drain's reason, got: ${insertReject!.reason}`);
+                assertEquals((insertReject!.sources ?? []).map((s) => s.id).join(','), '1', 'and its own captured change');
+
+                const updateRejects = plan.rejects.filter((r) => r.kind === 'update');
+                assertEquals(updateRejects.length, 1, "the update's unreadable column is refused");
+                assertEquals(updateRejects[0].column, 'data', 'at that column');
+
+                const ops = plan.entries.flatMap((e) => e.ops);
+                assertEquals(ops.length, 1, 'one op is planned');
+                const op = ops[0].write.op;
+                assertTrue(op.action === 'update' && JSON.stringify(op.values) === JSON.stringify({ note: 'n' }),
+                    "the update's other column is planned, and no op carries the unreadable column");
+            },
+        },
     ],
 };

@@ -21,7 +21,7 @@
 // Values are stored as their logical json.Literal (no engine coercion), so the
 // read accessors return exactly what was projected.
 
-import type { json } from "@hyper-hyper-space/hhs3_json";
+import { json } from "@hyper-hyper-space/hhs3_json";
 import type { B64Hash, KeyId } from "@hyper-hyper-space/hhs3_crypto";
 import type { ColumnType } from "@hyper-hyper-space/hhs3_rdb";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
@@ -101,6 +101,13 @@ type Store = {
 
 function indexKey(table: string, name: string): string {
     return table + '\u0000' + name;
+}
+
+// Whether two column values are the same value: NULL equals NULL, and a json
+// value is compared by its contents.
+function sameValue(a: json.Literal | null, b: json.Literal | null): boolean {
+    if (a === null || b === null) return a === b;
+    return json.eq(a, b);
 }
 
 function cloneRow(row: MemoryRow): MemoryRow {
@@ -261,34 +268,85 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
     // numeric key id (into rdb_keys), matching the projected author_key_id column.
     // A null sets the column to NULL: the row keeps no key for it (as for a
     // column that was never set), and the change is recorded with the null.
+    // The author column, given in `values` or as `author`, is kept as the row's
+    // author, not among its values, and recorded: ingestion compares it with
+    // the writer key. A value for the id column throws: memory allocates ids.
     localInsert(table: string, values: CapturedValues, author?: number): number {
         const state = requireTable(this.store, table);
+        if (state.idColumn in values) {
+            throw new Error(`an insert into '${table}' can't give the id column '${state.idColumn}' a value: memory allocates ids`);
+        }
         const id = state.nextId++;
         const row: MemoryRow = { values: {} };
+        const recorded: CapturedValues = {};
         for (const [column, value] of Object.entries(values)) {
+            if (column === state.authorColumn) {
+                if (typeof value === 'number') row.author = value;
+                recorded[column] = value;
+                continue;
+            }
             if (value !== null) row.values[column] = value;
+            recorded[column] = value;
         }
-        if (state.authorColumn !== undefined && author !== undefined) row.author = author;
+        if (state.authorColumn !== undefined && author !== undefined) {
+            row.author = author;
+            recorded[state.authorColumn] = author;
+        }
+        // A column the insert leaves out gets its default, in the row and in the
+        // recorded change, as SQLite's DEFAULT does. A null is not left out: it
+        // is an explicit NULL.
+        for (const [column, def] of Object.entries(state.defaults)) {
+            if (column in values) continue;
+            row.values[column] = def;
+            recorded[column] = def;
+        }
         state.rows.set(id, row);
-        this.record({ kind: 'insert', table, localId: id, values: { ...values } });
+        this.record({ kind: 'insert', table, localId: id, values: recorded });
         return id;
     }
 
-    localUpdate(table: string, localId: number, values: CapturedValues): void {
+    // Only the columns whose value changes are written and recorded, compared by
+    // value (json by its contents, NULL equal to a missing key): a captured
+    // unchanged value would become a write, which wins over a clear made
+    // concurrently on another device. An update that changes nothing records
+    // nothing. An update of a row the table doesn't have does nothing and
+    // returns false, since rdb accepts an update only of a live row. The id
+    // can't change, as on SQLite: a value for the id column is set aside when it
+    // is the row's own id, and throws otherwise.
+    localUpdate(table: string, localId: number, values: CapturedValues): boolean {
         const state = requireTable(this.store, table);
         const row = state.rows.get(localId);
-        if (row === undefined) throw new Error(`no local row ${table}#${localId}`);
+        if (row === undefined) return false;
+        if (state.idColumn in values && values[state.idColumn] !== localId) {
+            throw new Error(`the id of row ${localId} of '${table}' can't change (an update gives '${state.idColumn}' the value ${JSON.stringify(values[state.idColumn])})`);
+        }
+        const changed: CapturedValues = {};
         for (const [column, value] of Object.entries(values)) {
+            if (column === state.idColumn) continue;
+            if (column === state.authorColumn) {
+                // a change of the author is recorded, and ingestion refuses it
+                if (sameValue(row.author ?? null, value)) continue;
+                if (typeof value === 'number') row.author = value;
+                else delete row.author;
+                changed[column] = value;
+                continue;
+            }
+            if (sameValue(row.values[column] ?? null, value)) continue;
             if (value === null) delete row.values[column];
             else row.values[column] = value;
+            changed[column] = value;
         }
-        this.record({ kind: 'update', table, localId, values: { ...values } });
+        if (Object.keys(changed).length > 0) this.record({ kind: 'update', table, localId, values: changed });
+        return true;
     }
 
-    localDelete(table: string, localId: number): void {
+    // A delete of a row the table doesn't have does nothing, records nothing,
+    // and returns false: rdb accepts a delete only of a live row.
+    localDelete(table: string, localId: number): boolean {
         const state = requireTable(this.store, table);
-        state.rows.delete(localId);
+        if (!state.rows.delete(localId)) return false;
         this.record({ kind: 'delete', table, localId });
+        return true;
     }
 
     // Runtime enable/disable (level 2). No-op unless provisioned.
@@ -358,11 +416,15 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
         return rows.map((row) => projectColumns(row, plan.select, state.idColumn));
     }
 
+    // A query row: memory keeps a NULL as a missing key, and a row gives null
+    // for each column of the table it has no value in, the author column
+    // included, as SQLite and IndexedDB do. It shows only the table's columns,
+    // so no stored key can stand in for the id.
     private asView(state: TableState, id: number, row: MemoryRow): ProjectedRow {
         const view: ProjectedRow = { id };
         if (state.idColumn !== 'id') view[state.idColumn] = id;
-        for (const [column, value] of Object.entries(row.values)) view[column] = value;
-        if (state.authorColumn !== undefined && row.author !== undefined) view[state.authorColumn] = row.author;
+        for (const column of Object.keys(state.columnTypes)) view[column] = row.values[column] ?? null;
+        if (state.authorColumn !== undefined) view[state.authorColumn] = row.author ?? null;
         return view;
     }
 
@@ -823,7 +885,10 @@ function upsertRow(store: Store, action: Extract<RowAction, { kind: 'upsert-row'
             if (value === null) delete existing.values[column];
             else existing.values[column] = valueForColumn(store, state, column, value, action.keyMaterial);
         }
+        // An action without an author is for a row rdb has none for: the author
+        // column is cleared, whatever a local write left in it.
         if (setAuthor) existing.author = authorId;
+        else delete existing.author;
         return { kind: 'update', table: action.table, localId: id, values: fullImage(state, id, existing) };
     }
 

@@ -13,7 +13,7 @@ import {
     type GroupProjection, type IndexDecl, type IndexSpec, type ResolvedIndex,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import {
-    createGroup, sameVersion,
+    createGroup, createTypedGroup, sameVersion,
     TargetHarness, ProjectionReader, ReadRow, RowValues,
     IngestionHarness, LocalMutator,
 } from "@hyper-hyper-space/hhs3_rdb_adapter_test";
@@ -120,7 +120,9 @@ export function sqliteHarness(): TargetHarness {
 function toParam(value: json.Literal | null, type: ColumnType): number | string | null {
     if (value === null) return null;   // a NULL, of any column type
     if (type === 'boolean') return value ? 1 : 0;
-    if (type === 'json') return json.toStringNormalized(value);
+    // A value that isn't a json literal (a null inside it, say) is written as
+    // plain JSON text, as an app writing raw SQL would.
+    if (type === 'json') return json.literalProblem(value) === undefined ? json.toStringNormalized(value) : JSON.stringify(value);
     return value as number | string;
 }
 
@@ -963,7 +965,8 @@ export const sqliteSpecificTests = {
 
                 // the app never wrote to memo: its captured NULL is not an error
                 const empty = await run('INSERT INTO ledger (ref, amount) VALUES (?, ?)', ['r1', '1.00']);
-                assertEquals(empty.captured.join(';'), '{"ref":"r1","memo":null,"amount":"1.00"}', 'the captured row names the empty column');
+                assertEquals(empty.captured.join(';'), '{"ref":"r1","memo":null,"amount":"1.00","author_key_id":null}',
+                    'the captured row names the empty column, and the author column the app left out');
                 assertEquals(empty.result.accepted, 1, 'the insert is accepted');
                 assertEquals(empty.result.rejected.length, 0, 'nothing is rejected');
                 assertEquals(empty.inRdb, 1, 'the row is in rdb');
@@ -976,6 +979,242 @@ export const sqliteSpecificTests = {
                 assertEquals(set.result.rejected.length, 1, 'one rejection');
                 assertEquals(set.inRdb, 0, 'no row in rdb');
                 assertEquals(set.inSqlite.length, 0, 'the local row is removed');
+            },
+        },
+        {
+            name: '[ADPTS-SQL18] a native statement that changes the id of a projected row fails, also through rowid and with capture paused; the same id passes',
+            invoke: async () => {
+                const { group, admin } = await createGroup();
+                const ledger = await group.getTable('ledger');
+                await ledger.insert('l1', { ref: 'R-1', amount: '1.00', memo: 'a' }, admin);
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db, { captureChanges: true });
+                try {
+                    await syncGroup(group, target, { writer: admin });
+                    const id = (db.prepare('SELECT id FROM ledger').get() as { id: number }).id;
+                    const rowId = (await target.resolveRow('ledger', id))!.rowId;
+                    const outbox = () => (db.prepare('SELECT COUNT(*) AS n FROM rdb_outbox').get() as { n: number }).n;
+                    const refused = (sql: string, why: string) => {
+                        let err: unknown;
+                        try { db.prepare(sql).run(); } catch (e) { err = e; }
+                        assertTrue(err instanceof Error && err.message.includes("can't change"), `${why}: expected the statement to fail, got ${String(err)}`);
+                    };
+
+                    refused(`UPDATE ledger SET id = 999 WHERE id = ${id}`, 'a change of the id column');
+                    refused(`UPDATE ledger SET rowid = 999 WHERE id = ${id}`, 'a change through rowid');
+                    refused(`UPDATE ledger SET memo = 'b', id = 999 WHERE id = ${id}`, 'a change of the id together with another column');
+                    target.setCaptureEnabled(false);
+                    refused(`UPDATE ledger SET id = 999 WHERE id = ${id}`, 'a change of the id while capture is paused');
+                    target.setCaptureEnabled(true);
+                    assertEquals(JSON.stringify(db.prepare('SELECT id, memo FROM ledger').all()), JSON.stringify([{ id, memo: 'a' }]),
+                        'the row keeps its id and its values');
+                    assertEquals(outbox(), 0, 'and nothing is captured');
+
+                    db.prepare(`UPDATE ledger SET id = id WHERE id = ${id}`).run();
+                    assertEquals(outbox(), 0, 'setting the id to itself passes and captures nothing');
+
+                    db.prepare(`UPDATE ledger SET memo = 'c' WHERE id = ${id}`).run();
+                    const result = await syncGroup(group, target, { writer: admin });
+                    assertEquals(result.accepted, 1, 'a native update of another column is ingested');
+                    await ledger.update(rowId, { memo: 'd' }, admin);
+                    await syncGroup(group, target, { writer: admin });
+                    assertEquals(JSON.stringify(db.prepare('SELECT id, memo FROM ledger').all()), JSON.stringify([{ id, memo: 'd' }]),
+                        'a remote update lands on the same local id, in one row');
+                } finally {
+                    db.close();
+                }
+            },
+        },
+        {
+            name: '[ADPTS-SQL19] a native write of a boolean other than 0 or 1, or of json text that isn\'t json or is json\'s null, fails at the statement; NULL and json text in another form sync',
+            invoke: async () => {
+                const { group, admin } = await createTypedGroup();
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db, { captureChanges: true });
+                try {
+                    await syncGroup(group, target, { writer: admin });
+                    const outbox = () => (db.prepare('SELECT COUNT(*) AS n FROM rdb_outbox').get() as { n: number }).n;
+                    const refused = (sql: string, params: (string | number)[], why: string) => {
+                        let err: unknown;
+                        try { db.prepare(sql).run(...params); } catch (e) { err = e; }
+                        assertTrue(err instanceof Error && err.message.includes('CHECK constraint failed'), `${why}: expected a CHECK failure, got ${String(err)}`);
+                    };
+
+                    refused('INSERT INTO things (label, flag) VALUES (?, ?)', ['five', 5], 'a boolean of 5');
+                    refused('INSERT INTO things (label, data) VALUES (?, ?)', ['bad', 'nope'], 'json text that is not json');
+                    refused('INSERT INTO things (label, data) VALUES (?, ?)', ['null', 'null'], 'the json text null');
+                    refused('INSERT INTO things (label, data) VALUES (?, ?)', ['spaced null', ' null '], 'the json text null with spaces');
+                    db.prepare('INSERT INTO things (label, flag) VALUES (?, ?)').run('one', 1);
+                    const one = (db.prepare("SELECT id FROM things WHERE label = 'one'").get() as { id: number }).id;
+                    refused('UPDATE things SET flag = ? WHERE id = ?', [2, one], 'an update to a boolean of 2');
+                    assertEquals(outbox(), 1, 'only the valid insert is captured');
+
+                    db.prepare('INSERT INTO things (label, data) VALUES (?, ?)').run('nulled', null);
+                    db.prepare('INSERT INTO things (label, data) VALUES (?, ?)').run('spaced', '{ "b": 1, "a": 2 }');
+                    db.prepare('INSERT INTO things (label, flag) VALUES (?, ?)').run('text one', '1');
+                    const result = await syncGroup(group, target, { writer: admin });
+                    assertEquals(result.accepted, 4, 'the four valid inserts are accepted');
+                    assertEquals(result.rejected.length, 0, 'and none is refused');
+                    const byLabel = new Map((await groupRows(group, 'things')).map((r) => [r.values.label, r.values]));
+                    assertEquals(byLabel.get('one')?.flag, true, 'a 1 syncs as true');
+                    assertEquals(byLabel.get('text one')?.flag, true, "the text '1' is stored as 1 and syncs as true");
+                    assertEquals(byLabel.get('nulled')?.data ?? null, null, 'SQL NULL syncs as NULL');
+                    const spaced = byLabel.get('spaced')?.data;
+                    assertTrue(spaced !== undefined && spaced !== null && json.toStringNormalized(spaced) === json.toStringNormalized({ a: 2, b: 1 }),
+                        `json text in another form syncs as its value, got ${JSON.stringify(spaced)}`);
+                } finally {
+                    db.close();
+                }
+            },
+        },
+        {
+            name: '[ADPTS-SQL20] the boolean and json checks and the id guard survive an added column, a tighten rebuild, a foreign-key column drop and a plain column drop',
+            invoke: async () => {
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db, { captureChanges: true });
+                const gid = 'g';
+                await target.apply(gid, [
+                    { kind: 'create-table', table: 'parent', syncTable: 'parent_sync', primaryKey: 'id',
+                        columns: [{ name: 'title', def: { type: 'string' } }] },
+                    { kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+                        columns: [
+                            { name: 'ref', def: { type: 'string' } },
+                            { name: 'parent_id', def: { type: 'integer', nullable: true }, fk: { targetTable: 'parent' } },
+                            { name: 'flag', def: { type: 'boolean', nullable: true } },
+                            { name: 'data', def: { type: 'json', nullable: true } },
+                        ] },
+                ], [{ kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { ref: 'a', flag: true, data: { x: 1 } } }], new Set(['v1']));
+                const id = (db.prepare('SELECT id FROM acct').get() as { id: number }).id;
+                const fails = (sql: string, params: (string | number)[], match: string, why: string) => {
+                    let err: unknown;
+                    try { db.prepare(sql).run(...params); } catch (e) { err = e; }
+                    assertTrue(err instanceof Error && err.message.includes(match), `${why}: expected '${match}', got ${String(err)}`);
+                };
+                const checks = (step: string, booleans: string[], jsons: string[]) => {
+                    for (const col of booleans) fails(`UPDATE acct SET ${col} = ? WHERE id = ?`, [5, id], 'CHECK constraint failed', `${step}: boolean ${col}`);
+                    for (const col of jsons) fails(`UPDATE acct SET ${col} = ? WHERE id = ?`, ['nope', id], 'CHECK constraint failed', `${step}: json ${col}`);
+                    fails('UPDATE acct SET id = ? WHERE id = ?', [99, id], "can't change", `${step}: the id guard`);
+                };
+
+                checks('after the create', ['flag'], ['data']);
+                await target.apply(gid, [
+                    { kind: 'add-column', table: 'acct', column: 'flag2', def: { type: 'boolean', default: true } },
+                    { kind: 'add-column', table: 'acct', column: 'data2', def: { type: 'json', nullable: true } },
+                ], [], new Set(['v2']));
+                checks('after adding columns to a non-empty table', ['flag', 'flag2'], ['data', 'data2']);
+                await target.apply(gid, [{ kind: 'add-column', table: 'acct', column: 'status', def: { type: 'string' } }],
+                    [{ kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { status: 'open' } }], new Set(['v3']));
+                checks('after a tighten rebuild', ['flag', 'flag2'], ['data', 'data2']);
+                await target.apply(gid, [{ kind: 'drop-column', table: 'acct', column: 'parent_id' }], [], new Set(['v4']));
+                checks('after a foreign-key column drop', ['flag', 'flag2'], ['data', 'data2']);
+                await target.apply(gid, [{ kind: 'drop-column', table: 'acct', column: 'data2' }], [], new Set(['v5']));
+                checks('after a plain column drop', ['flag', 'flag2'], ['data']);
+                assertEquals(JSON.stringify(db.prepare('SELECT ref, flag, data, flag2, status FROM acct').get()),
+                    JSON.stringify({ ref: 'a', flag: 1, data: '{"x":1}', flag2: 1, status: 'open' }), 'the row came through every step');
+                db.close();
+            },
+        },
+        {
+            name: '[ADPTS-SQL21] with SQLite\'s checks switched off, a value the drain can\'t read is refused with a failure event instead of stopping the drain, and the pass goes on',
+            invoke: async () => {
+                const { group, admin } = await createTypedGroup();
+                const things = await group.getTable('things');
+                await things.insert('t1', { label: 't1', data: { x: 1 } }, admin);
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db, { captureChanges: true });
+                try {
+                    await syncGroup(group, target, { writer: admin });
+                    const t1 = (db.prepare("SELECT id FROM things WHERE label = 't1'").get() as { id: number }).id;
+                    db.pragma('ignore_check_constraints = ON');
+                    db.prepare('INSERT INTO things (label, data) VALUES (?, ?)').run('bad', 'nope');
+                    db.prepare('UPDATE things SET data = ? WHERE id = ?').run('nope', t1);
+                    db.pragma('ignore_check_constraints = OFF');
+                    db.prepare('INSERT INTO things (label) VALUES (?)').run('good');
+
+                    const batch = await target.drainChanges();
+                    const marked = batch.changes.filter((c) => c.kind !== 'delete' && c.unreadable?.data !== undefined);
+                    assertEquals(marked.length, 2, 'the drain marks both changes it cannot read, instead of throwing');
+                    assertTrue(marked.every((c) => c.kind !== 'delete' && !('data' in c.values)), 'and leaves the column out of their values');
+
+                    const result = await ingestChanges(group, target, { writer: admin });
+                    assertEquals(result.accepted, 1, 'the valid insert is accepted');
+                    assertEquals(result.rejected.length, 2, 'both changes it could not read are refused');
+                    const failures = (await target.drainOpEvents()).filter((e) => e.event.direction === 'failure');
+                    assertEquals(failures.length, 2, 'each with a failure event');
+                    assertTrue(failures[0].event.opHash !== failures[1].event.opHash, 'of its own');
+                    assertEquals((db.prepare('SELECT COUNT(*) AS n FROM rdb_outbox').get() as { n: number }).n, 0, 'the outbox is emptied');
+
+                    await syncGroup(group, target, { writer: admin });
+                    const local = db.prepare('SELECT label, data FROM things ORDER BY label').all();
+                    assertEquals(JSON.stringify(local), JSON.stringify([{ label: 'good', data: null }, { label: 't1', data: '{"x":1}' }]),
+                        'the refused insert is gone and the refused update reverted');
+                    const inRdb = (await groupRows(group, 'things')).map((r) => r.values.label).sort();
+                    assertEquals(inRdb.join(','), 'good,t1', 'rdb has the same rows');
+                } finally {
+                    db.close();
+                }
+            },
+        },
+        {
+            name: '[ADPTS-SQL22] a second handle on the same file follows the first one\'s schema changes: a new json column drains as json, and added and dropped columns show in its queries',
+            invoke: async () => {
+                const dbPath = tmpDbPath('meta-follows');
+                const dbA = new Database(dbPath); dbA.pragma('busy_timeout = 5000');
+                const dbB = new Database(dbPath); dbB.pragma('busy_timeout = 5000');
+                const a = new SqliteTarget(dbA, { captureChanges: true });
+                const b = new SqliteTarget(dbB, { captureChanges: true });
+                const query = (t: SqliteTarget, table = 'acct') =>
+                    t.executeQuery({ table, orderBy: [{ column: 'id', direction: 'asc' }], limit: 10 });
+                try {
+                    const gid = 'g';
+                    await a.apply(gid, [{ kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+                        columns: [{ name: 'ref', def: { type: 'string' } }] }],
+                    [{ kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { ref: 'a' } }], new Set(['v1']));
+                    assertEquals((await query(b)).length, 1, 'the second handle reads the table');
+
+                    await a.apply(gid, [{ kind: 'add-column', table: 'acct', column: 'data', def: { type: 'json', nullable: true } }], [], new Set(['v2']));
+                    dbB.prepare('UPDATE acct SET data = ? WHERE id = 1').run('{"k":1}');
+                    const update = (await b.drainChanges()).changes.find((c) => c.kind === 'update');
+                    const drained = update !== undefined && update.kind === 'update' ? update.values.data : undefined;
+                    assertTrue(drained !== null && typeof drained === 'object' && json.toStringNormalized(drained) === '{"k":1}',
+                        `the second handle drains the new json column as json, got ${JSON.stringify(drained)}`);
+
+                    await a.apply(gid, [{ kind: 'add-column', table: 'acct', column: 'note', def: { type: 'string', nullable: true } }],
+                        [{ kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { note: 'n' } }], new Set(['v3']));
+                    assertEquals((await query(b))[0]?.note, 'n', 'an added column shows in the second handle\'s queries');
+
+                    await a.apply(gid, [{ kind: 'drop-column', table: 'acct', column: 'ref' }], [], new Set(['v4']));
+                    const after = await query(b);
+                    assertTrue(after.length === 1 && !('ref' in after[0]), 'a dropped column is gone from them, without an error');
+
+                    await a.apply(gid, [{ kind: 'create-table', table: 'other', syncTable: 'other_sync', primaryKey: 'id',
+                        columns: [{ name: 'title', def: { type: 'string' } }] }], [], new Set(['v5']));
+                    assertEquals((await query(b, 'other')).length, 0, 'and a new table can be queried');
+                } finally {
+                    dbA.close(); dbB.close(); cleanupDb(dbPath);
+                }
+            },
+        },
+        {
+            name: '[ADPTS-SQL23] a rolled-back apply leaves no meta behind: the table reads as it was before',
+            invoke: async () => {
+                const db = new Database(':memory:');
+                const target = new SqliteTarget(db);
+                const query = () => target.executeQuery({ table: 'acct', orderBy: [{ column: 'id', direction: 'asc' }], limit: 10 });
+                await target.apply('g', [{ kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+                    columns: [{ name: 'ref', def: { type: 'string' } }] }],
+                [{ kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { ref: 'a' } }], new Set(['v1']));
+                assertEquals((await query()).length, 1, 'the table is read once');
+
+                let threw = false;
+                try {
+                    await target.apply('g', [{ kind: 'add-column', table: 'acct', column: 'x', def: { type: 'string', nullable: true } }],
+                        [{ kind: 'upsert-row', table: 'ghost', rowId: 'g1', values: {} }], new Set(['v2']));
+                } catch { threw = true; }
+                assertTrue(threw, 'an apply that writes to a table that does not exist fails, and rolls back');
+                const rows = await query();
+                assertTrue(rows.length === 1 && !('x' in rows[0]), 'the table reads as it was, without the column of the failed apply');
+                db.close();
             },
         },
         {

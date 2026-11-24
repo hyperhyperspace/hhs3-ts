@@ -14,12 +14,15 @@ import type { json } from "@hyper-hyper-space/hhs3_json";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import { deriveRowId, MigrationRule, Row, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 import {
-    BidirectionalTarget, CapturedBatch, CapturedChange, CheckpointMovedError, IngestSettle,
-    ingestChanges, MemoryTarget, OpEvent, OpEventQuery, projectGroup, RowAction, SchemaAction,
+    BidirectionalTarget, CapturedBatch, CapturedChange, CheckpointMovedError, DEFAULT_KEY_DOMAIN, IngestSettle,
+    ingestChanges, KeyIndex, MemoryTarget, OpEvent, OpEventQuery, projectGroup, RowAction, SchemaAction,
     StoredOpEvent, SyncMapping,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
+import { serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 
-import { createFkGroup, createFlipGroup, createGroup, createNullsGroup, GroupFixture } from "./group_fixture.js";
+import {
+    createAnonymousGroup, createFkGroup, createFlipGroup, createGroup, createNullsGroup, createTypedGroup, GroupFixture, makeIdentity,
+} from "./group_fixture.js";
 import { ProjectionReader, RowValues } from "./projection_reader.js";
 
 // A BidirectionalTarget wrapper that DROPS the first commitIngest (its settle
@@ -169,8 +172,8 @@ export function memoryIngestionHarness(): IngestionHarness {
     };
     const local: LocalMutator = {
         insert: (table, values, author) => target.localInsert(table, values, author),
-        update: (table, localId, values) => target.localUpdate(table, localId, values),
-        delete: (table, localId) => target.localDelete(table, localId),
+        update: (table, localId, values) => { target.localUpdate(table, localId, values); },
+        delete: (table, localId) => { target.localDelete(table, localId); },
         setCaptureEnabled: (on) => target.setCaptureEnabled(on),
     };
     return { target, read, local };
@@ -1049,6 +1052,289 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                         const next = await ingestChanges(group, target, { writer: admin });
                         assertEquals(next.accepted, 1, 'a later local write is ingested');
                         assertEquals((await rdbRows(group, 'notes')).find((r) => r.rowId === n1)?.values.memo, 'ok', 'and it is in rdb');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN25] a json value with a null inside it is refused before rdb sees it, logged, and the pass goes on`,
+                invoke: async () => {
+                    const { group, admin } = await createTypedGroup();
+                    const { target, read, local, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+                        await local.insert('things', { label: 'bad', data: { a: null } as unknown as json.Literal });
+                        await local.insert('things', { label: 'good' });
+                        const result = await ingestChanges(group, target, { writer: admin });
+                        assertEquals(result.accepted, 1, 'the good insert lands');
+                        assertEquals(result.rejected.length, 1, 'the bad one is refused');
+                        assertEquals((await rdbRows(group, 'things')).map((r) => r.values.label).join(','), 'good',
+                            'only the good row is in rdb');
+                        const failures = (await target.drainOpEvents()).filter((e) => e.event.direction === 'failure');
+                        assertEquals(failures.length, 1, 'the refusal is logged');
+                        assertEquals((await target.drainChanges()).changes.length, 0, 'the outbox is acked');
+                        await projectGroup(group, target);
+                        assertEquals((await read.getRowIds('things')).length, 1, 'the target keeps only the good row');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN26] each refused write is logged: two refused updates of one row, in separate passes, log two events`,
+                invoke: async () => {
+                    const { group, admin } = await createGroup();
+                    await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', amount: '10.00' }, admin);
+                    const l1 = deriveRowId('l1', admin.keyId);
+                    const { target, read, local, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+                        const localId = (await read.syncId('ledger', l1))!;
+                        for (const ref of ['R-2', 'R-3']) {
+                            await local.update('ledger', localId, { ref });
+                            const result = await ingestChanges(group, target, { writer: admin });
+                            assertEquals(result.rejected.length, 1, `the update to ${ref} is refused`);
+                            await projectGroup(group, target);
+                        }
+                        const failures = (await target.drainOpEvents()).filter((e) => e.event.direction === 'failure');
+                        assertEquals(failures.length, 2, 'both refusals are in the event log');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN27] a crash replay of a pass logs each failure once`,
+                invoke: async () => {
+                    const { group, admin } = await createGroup();
+                    await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', amount: '10.00' }, admin);
+                    const l1 = deriveRowId('l1', admin.keyId);
+                    const inner = await factory();
+                    const target = new CrashBeforeSettle(inner.target);
+                    try {
+                        await projectGroup(group, target);
+                        const localId = (await inner.read.syncId('ledger', l1))!;
+                        await inner.local.update('ledger', localId, { ref: 'R-2' });
+                        await ingestChanges(group, target, { writer: admin });   // the settle is lost
+                        await ingestChanges(group, target, { writer: admin });   // the replay
+                        const failures = (await inner.target.drainOpEvents()).filter((e) => e.event.direction === 'failure');
+                        assertEquals(failures.length, 1, 'the replayed refusal is logged once');
+                    } finally {
+                        await inner.cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN28] a native update that sets two readonly columns of one row logs two failure events`,
+                invoke: async () => {
+                    const { group, admin } = await createTypedGroup();
+                    await (await group.getTable('things')).insert('t1', { label: 'a', code: 'c1', spec: { v: 1 } }, admin);
+                    const t1 = deriveRowId('t1', admin.keyId);
+                    const { target, read, local, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+                        const localId = (await read.syncId('things', t1))!;
+                        await local.update('things', localId, { code: 'c2', spec: { v: 2 } });
+                        const result = await ingestChanges(group, target, { writer: admin });
+                        assertEquals(result.rejected.length, 2, 'each readonly column is refused');
+                        const failures = (await target.drainOpEvents()).filter((e) => e.event.direction === 'failure');
+                        assertEquals(failures.length, 2, 'each refusal is logged');
+                        const row = await read.getRow('things', t1);
+                        assertEquals(row?.values.code, 'c1', 'code is put back');
+                        assertEquals(JSON.stringify(row?.values.spec), JSON.stringify({ v: 1 }), 'spec is put back');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN29] a native update that writes the values a row already has, NULL included, captures nothing`,
+                invoke: async () => {
+                    const { group, admin } = await createTypedGroup();
+                    await (await group.getTable('things')).insert('t1', { label: 'a', note: 'n', flag: true, data: { x: 1 } }, admin);
+                    const t1 = deriveRowId('t1', admin.keyId);
+                    const { target, read, local, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+                        const localId = (await read.syncId('things', t1))!;
+                        await local.update('things', localId, { label: 'a', note: 'n', flag: true, data: { x: 1 }, ratio: null });
+                        assertEquals((await target.drainChanges()).changes.length, 0, 'an update that changes nothing captures nothing');
+
+                        await local.update('things', localId, { label: 'b', note: 'n', data: { x: 1 } });
+                        const captured = (await target.drainChanges()).changes
+                            .flatMap((c) => c.kind === 'update' ? Object.keys(c.values) : [c.kind]);
+                        assertEquals(captured.join(','), 'label', 'only the column whose value changed is captured');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN30] a native insert that names another key as its author is refused and reverted, and logged`,
+                invoke: async () => {
+                    const { group, admin } = await createTypedGroup();
+                    const other = await makeIdentity();
+                    const { target, read, local, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+                        const keys = target as unknown as KeyIndex;
+                        const otherId = await keys.registerKey(DEFAULT_KEY_DOMAIN, other.keyId, serializePublicKeyToBase64(other.publicKey));
+                        await local.insert('things', { label: 'x' }, otherId);
+                        const result = await ingestChanges(group, target, { writer: admin });
+                        assertEquals(result.accepted, 0, 'nothing lands');
+                        assertEquals(result.rejected.length, 1, 'the insert is refused');
+                        assertEquals((await rdbRows(group, 'things')).length, 0, 'rdb has no row');
+                        const failures = (await target.drainOpEvents()).filter((e) => e.event.direction === 'failure');
+                        assertEquals(failures.length, 1, 'the refusal is logged');
+                        await projectGroup(group, target);
+                        assertEquals((await read.getRowIds('things')).length, 0, 'the local row is removed');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN31] a native insert that names the writer key, or no author, is signed with the writer key`,
+                invoke: async () => {
+                    const { group, admin } = await createTypedGroup();
+                    const { target, local, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+                        const keys = target as unknown as KeyIndex;
+                        const writerId = await keys.registerKey(DEFAULT_KEY_DOMAIN, admin.keyId, serializePublicKeyToBase64(admin.publicKey));
+                        await local.insert('things', { label: 'named' }, writerId);
+                        await local.insert('things', { label: 'unnamed' });
+                        const result = await ingestChanges(group, target, { writer: admin });
+                        assertEquals(result.accepted, 2, 'both land');
+                        assertEquals(result.rejected.length, 0, 'nothing is refused');
+                        const rows = await rdbRows(group, 'things');
+                        assertTrue(rows.length === 2 && rows.every((r) => r.author === admin.keyId), 'both are signed with the writer key');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN32] a native update of the author column is refused and reverted, and logged; its other columns land`,
+                invoke: async () => {
+                    const { group, admin } = await createTypedGroup();
+                    await (await group.getTable('things')).insert('t1', { label: 'a' }, admin);
+                    const t1 = deriveRowId('t1', admin.keyId);
+                    const other = await makeIdentity();
+                    const { target, read, local, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+                        const keys = target as unknown as KeyIndex;
+                        const adminId = await keys.idForKeyHash(DEFAULT_KEY_DOMAIN, admin.keyId);
+                        const otherId = await keys.registerKey(DEFAULT_KEY_DOMAIN, other.keyId, serializePublicKeyToBase64(other.publicKey));
+                        const localId = (await read.syncId('things', t1))!;
+                        await local.update('things', localId, { author_key_id: otherId, label: 'b' });
+                        const result = await ingestChanges(group, target, { writer: admin });
+                        assertEquals(result.accepted, 1, 'the label lands');
+                        assertEquals(result.rejected.length, 1, 'the author change is refused');
+                        const failures = (await target.drainOpEvents()).filter((e) => e.event.direction === 'failure');
+                        assertEquals(failures.length, 1, 'the refusal is logged');
+                        const rdbRow = (await rdbRows(group, 'things')).find((r) => r.rowId === t1)!;
+                        assertEquals(rdbRow.values.label, 'b', 'rdb has the new label');
+                        assertEquals(rdbRow.author, admin.keyId, 'and the same author');
+                        await projectGroup(group, target);
+                        const row = await read.getRow('things', t1);
+                        assertEquals(row?.author, adminId, 'the local row has its author back');
+                        assertEquals(row?.values.label, 'b', 'and the new label');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN33] without an identity provider, a native insert that names a key is refused, and one that names none is anonymous`,
+                invoke: async () => {
+                    const { group, admin } = await createAnonymousGroup();
+                    const { target, local, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+                        const keys = target as unknown as KeyIndex;
+                        const adminId = await keys.registerKey(DEFAULT_KEY_DOMAIN, admin.keyId, serializePublicKeyToBase64(admin.publicKey));
+                        await local.insert('things', { label: 'named' }, adminId);
+                        await local.insert('things', { label: 'unnamed' });
+                        const result = await ingestChanges(group, target, { writer: admin });
+                        assertEquals(result.accepted, 1, 'the unnamed insert lands');
+                        assertEquals(result.rejected.length, 1, 'the named one is refused');
+                        const rows = await rdbRows(group, 'things');
+                        assertEquals(rows.map((r) => r.values.label).join(','), 'unnamed', 'only the unnamed row is in rdb');
+                        assertEquals(rows[0]?.author, undefined, 'and it is anonymous');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN34] a native insert gets the defaults of the columns it leaves out, in the row and the captured change; an explicit null stays NULL`,
+                invoke: async () => {
+                    const { group, admin } = await createTypedGroup();
+                    const { target, read, local, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+                        await local.insert('things', { label: 'left-out' });
+                        await local.insert('things', { label: 'nulled', kind: null });
+                        const inserts = (await target.drainChanges()).changes.filter((c) => c.kind === 'insert');
+                        const valuesOf = (labelValue: string) => inserts.map((c) => c.kind === 'insert' ? c.values : {})
+                            .find((v) => v.label === labelValue)!;
+                        assertEquals(valuesOf('left-out').kind, 'std', 'the captured insert carries the default it left out');
+                        assertEquals(valuesOf('left-out').level, 1, 'also a required column with a default');
+                        assertEquals(valuesOf('nulled').kind ?? null, null, 'an explicit null is not replaced by the default');
+                        assertEquals(valuesOf('nulled').level, 1, 'the column it left out gets its default');
+
+                        const result = await ingestChanges(group, target, { writer: admin });
+                        assertEquals(result.accepted, 2, 'both land');
+                        await projectGroup(group, target);
+                        const rows = await rdbRows(group, 'things');
+                        const leftOut = rows.find((r) => r.values.label === 'left-out')!;
+                        const nulled = rows.find((r) => r.values.label === 'nulled')!;
+                        assertEquals(sorted((await read.getRow('things', leftOut.rowId))?.values), sorted({ label: 'left-out', kind: 'std', level: 1 }),
+                            'the device that wrote it reads the defaults');
+                        assertEquals(sorted((await read.getRow('things', nulled.rowId))?.values), sorted({ label: 'nulled', level: 1 }),
+                            'and NULL where the app wrote null');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN35] project-back writes NULL to the author column of a row rdb has no author for: after a refused native change, and after a later remote update`,
+                invoke: async () => {
+                    const { group, admin } = await createAnonymousGroup();
+                    const things = await group.getTable('things');
+                    await things.insert('t1', { label: 'a' });
+                    const t1 = deriveRowId('t1', undefined);
+                    const { target, read, local, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+                        const keys = target as unknown as KeyIndex;
+                        const adminId = await keys.registerKey(DEFAULT_KEY_DOMAIN, admin.keyId, serializePublicKeyToBase64(admin.publicKey));
+                        const localId = (await read.syncId('things', t1))!;
+                        assertEquals((await read.getRow('things', t1))?.author ?? null, null, 'the projected row is anonymous');
+
+                        // A captured change of the author column is refused, and the
+                        // revert has no author to write.
+                        await local.update('things', localId, { author_key_id: adminId });
+                        const result = await ingestChanges(group, target, { writer: admin });
+                        assertEquals(result.rejected.length, 1, 'the author change is refused');
+                        const failures = (await target.drainOpEvents()).filter((e) => e.event.direction === 'failure');
+                        assertEquals(failures.length, 1, 'and logged');
+                        assertEquals((await read.getRow('things', t1))?.author ?? null, null, 'the revert clears the author column');
+
+                        // An uncaptured change of the column, then a remote update of the
+                        // row: projecting it clears the column too.
+                        await local.setCaptureEnabled(false);
+                        await local.update('things', localId, { author_key_id: adminId });
+                        await local.setCaptureEnabled(true);
+                        await things.update(t1, { label: 'b' });
+                        await projectGroup(group, target);
+                        const row = await read.getRow('things', t1);
+                        assertEquals(row?.values.label, 'b', 'the remote update lands');
+                        assertEquals(row?.author ?? null, null, 'and the author column is NULL again');
                     } finally {
                         await cleanup?.();
                     }

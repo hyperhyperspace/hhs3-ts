@@ -697,6 +697,46 @@ export const projectionTests = {
                 }
             },
         },
+        {
+            name: '[RDBPROJ15] a table a schema change adds after the projection opened gets its group prefix: in its name, as the target of a cross-group FK, and in ingestion',
+            invoke: async () => {
+                const ctx = newCtx();
+                const { catalog, orders, rdb } = await makeCatalogAndOrders(ctx);
+                const target = new MemoryTarget({ captureChanges: true });
+                const projection = await RdbProjection.open(rdb, ctx, target, { debounceMs: 0, writer: catalog.admin });
+                try {
+                    await catalog.schema.updateSchema([{ rule: 'add-table', def: open('extra', { note: { type: 'string' } }) }], catalog.admin, 'add extra');
+                    await catalog.group.deploy(await (await catalog.schema.getScopedDag()).getFrontier());
+                    await orders.schema.updateSchema([{ rule: 'add-table',
+                        def: open('notes', { ref: { type: 'string', nullable: true } }, { fks: { ref: 'catalog.extra' } }) }], orders.admin, 'add notes');
+                    await orders.group.deploy(await (await orders.schema.getScopedDag()).getFrontier());
+                    await (await catalog.group.getTable('extra')).insert('e1', { note: 'n' });
+                    await orders.group.observe('catalog', await frontier(catalog.group));
+                    await (await orders.group.getTable('notes')).insert('n1', { ref: deriveRowId('e1') });
+                    await projection.sync();
+
+                    const tables = target.listTables();
+                    assertTrue(tables.includes('catalog_extra') && tables.includes('orders_notes'),
+                        `the new tables are projected with their group prefix, got: ${tables.join(', ')}`);
+                    assertTrue(!tables.includes('extra') && !tables.includes('notes'), 'and not under their bare names');
+                    const fkColumns = Object.keys(target.columnTypes('orders_notes') ?? {});
+                    assertTrue(fkColumns.includes('ref_id') && !fkColumns.includes('ref_row_hash'),
+                        `an FK into a foreign table added later is co-projected as an id, got: ${fkColumns.join(', ')}`);
+                    const extraId = target.syncId('catalog_extra', deriveRowId('e1'));
+                    assertTrue(extraId !== undefined, 'the foreign row is projected');
+                    assertEquals(target.getRowByRowId('orders_notes', deriveRowId('n1'))?.values['ref_id'], extraId,
+                        'and the FK resolves to its local id');
+
+                    target.localInsert('catalog_extra', { note: 'local' });
+                    const results = await projection.sync();
+                    assertEquals(results.get(catalog.group.getId())?.accepted, 1, 'a local insert into the new table is ingested');
+                    const view = await (await catalog.group.getTable('extra')).getView();
+                    assertEquals((await view.liveRowIds()).length, 2, 'into its rdb table');
+                } finally {
+                    await projection.stop();
+                }
+            },
+        },
     ],
 };
 

@@ -8,6 +8,7 @@ import { plannerParityTests } from "./planner_parity/planner_parity_tests.js";
 import { indexActionsTests } from "./index_actions_tests.js";
 import { queryEvalTests } from "./query_eval_tests.js";
 import { queryMonitorTests } from "./query_monitor_tests.js";
+import { memoryLocalTests } from "./memory_local_tests.js";
 import { parseTestFilters } from "@hyper-hyper-space/hhs3_rdb_adapter_test_gen";
 
 async function main() {
@@ -21,6 +22,7 @@ async function main() {
     allTests.set(indexActionsTests.title, indexActionsTests.tests);
     allTests.set(queryEvalTests.title, queryEvalTests.tests);
     allTests.set(queryMonitorTests.title, queryMonitorTests.tests);
+    allTests.set(memoryLocalTests.title, memoryLocalTests.tests);
     allTests.set(plannerParityTests.title, plannerParityTests.tests);
 
     console.log('Running tests for Hyper Hyper Space v3 rdb_adapter module'

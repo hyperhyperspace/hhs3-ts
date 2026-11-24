@@ -11,7 +11,7 @@
 // writes maintain the entries of every index listed in index_meta, read in
 // the same transaction.
 
-import type { json } from "@hyper-hyper-space/hhs3_json";
+import { json } from "@hyper-hyper-space/hhs3_json";
 import { DEFAULT_KEY_TABLE, type ResolvedIndex } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 import {
@@ -242,28 +242,54 @@ export type FacadeRecord = Record<string, json.Literal | null>;
 // a null for each column it names with null.
 function businessValues(rec: FacadeRecord, meta: TableMetaRecord): { [column: string]: json.Literal | null } {
     const values: { [column: string]: json.Literal | null } = {};
-    for (const col of Object.keys(meta.columnTypes)) {
+    for (const col of capturedColumns(meta)) {
         if (rec[col] !== undefined) values[col] = rec[col];
     }
     return values;
 }
 
-// The business columns a put changes. A missing property and a null are the
-// same thing, NULL, on both sides: a column that had a value and now has
-// neither is a change to null, and a null put over a column with no value
-// changes nothing.
+// A record the app adds, with the default of each column it leaves out. A null
+// property is not left out.
+function withDefaults(rec: FacadeRecord, meta: TableMetaRecord): FacadeRecord {
+    const filled: FacadeRecord = { ...rec };
+    for (const [column, def] of Object.entries(meta.defaults)) {
+        if (!(column in rec)) filled[column] = def;
+    }
+    return filled;
+}
+
+// The columns capture records: the business columns and the author column.
+// Ingestion compares an insert's author with the writer key, and refuses a
+// change of it.
+function capturedColumns(meta: TableMetaRecord): string[] {
+    const cols = Object.keys(meta.columnTypes);
+    return meta.authorColumn !== undefined ? [...cols, meta.authorColumn] : cols;
+}
+
+// The business columns a put changes, compared by value: two structured clones
+// of a json value are equal when their contents are. A missing property and a
+// null are the same thing, NULL, on both sides: a column that had a value and
+// now has neither is a change to null, and a null put over a column with no
+// value changes nothing.
 function changedColumns(
     oldRec: FacadeRecord | undefined,
     newRec: FacadeRecord,
     meta: TableMetaRecord,
 ): { [column: string]: json.Literal | null } {
     const changed: { [column: string]: json.Literal | null } = {};
-    for (const col of Object.keys(meta.columnTypes)) {
+    for (const col of capturedColumns(meta)) {
         const next = newRec[col] ?? null;
         const prev = oldRec?.[col] ?? null;
-        if (next !== prev) changed[col] = next;
+        if (!sameValue(next, prev)) changed[col] = next;
     }
     return changed;
+}
+
+// Whether two stored column values are the same value: NULL equals NULL, and a
+// json value is compared by its contents.
+function sameValue(a: json.Literal | null, b: json.Literal | null): boolean {
+    if (a === null || b === null) return a === b;
+    return json.eq(a, b);
 }
 
 export class FacadeObjectStore {
@@ -494,14 +520,25 @@ export class FacadeObjectStore {
                         req.fail(constraintError());
                         return;
                     }
-                    // a null property is NULL, stored as a missing key
+                    // A new record gets the default of each column it leaves out,
+                    // in the row and in the captured insert, as SQLite's DEFAULT
+                    // does. A null property is not left out: it is an explicit
+                    // NULL, stored as a missing key.
+                    const written: FacadeRecord = old === undefined ? withDefaults(value, meta) : value;
                     const rec: RowRecord = { table: this.name, id: assignedId };
-                    for (const [column, v] of Object.entries(value)) {
+                    for (const [column, v] of Object.entries(written)) {
                         if (v !== null) rec[column] = v;
                     }
                     rec.table = this.name;
                     rec[meta.idColumn] = assignedId;
                     rec.id = assignedId;
+                    // A put replaces the record, and a record built from a form
+                    // has no author column. No op can change a row's author, so a
+                    // put that leaves it out, or gives it null, keeps the stored one.
+                    const author = meta.authorColumn;
+                    if (old !== undefined && author !== undefined && rec[author] === undefined && old[author] !== undefined) {
+                        rec[author] = old[author];
+                    }
                     if (assignedId >= meta.nextId) {
                         meta.nextId = assignedId + 1;
                         wire(req, tx.objectStore(TABLE_META).put(meta), 'write', () => {});
@@ -511,7 +548,7 @@ export class FacadeObjectStore {
                         if (old === undefined) {
                             this.queueOutbox(req, {
                                 table: this.name, localId: assignedId, op: 'insert',
-                                changed: businessValues(value, meta),
+                                changed: businessValues(written, meta),
                             });
                         } else {
                             const changed = changedColumns(stripTable(old), stripped, meta);

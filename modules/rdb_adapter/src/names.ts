@@ -39,7 +39,8 @@ export function syncTableSuffix(config: AdapterConfig): string {
 }
 
 export function targetTableName(config: AdapterConfig, rdbTable: string): string {
-    return config.tableNames?.[rdbTable] ?? rdbTable;
+    return config.tableNames?.[rdbTable]
+        ?? (config.tablePrefix !== undefined ? `${config.tablePrefix}_${rdbTable}` : rdbTable);
 }
 
 export function targetColumnName(config: AdapterConfig, rdbTable: string, rdbColumn: string): string {
@@ -140,7 +141,8 @@ export function projectedColumnName(
 // ---------------------------------------------------------------------------
 
 // The rdb table name for a target table name (inverse of targetTableName).
-// Falls back to identity when no rename maps to `targetTable`.
+// Without a rename that maps to `targetTable`, it strips `tablePrefix`, or
+// falls back to identity.
 export function rdbTableName(config: AdapterConfig, targetTable: string): string {
     const renames = config.tableNames;
     if (renames !== undefined) {
@@ -148,6 +150,8 @@ export function rdbTableName(config: AdapterConfig, targetTable: string): string
             if (renames[rdbTable] === targetTable) return rdbTable;
         }
     }
+    const prefix = config.tablePrefix === undefined ? undefined : `${config.tablePrefix}_`;
+    if (prefix !== undefined && targetTable.startsWith(prefix)) return targetTable.slice(prefix.length);
     return targetTable;
 }
 

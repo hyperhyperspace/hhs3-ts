@@ -3,7 +3,7 @@ import "fake-indexeddb/auto";
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
 import { json } from "@hyper-hyper-space/hhs3_json";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
-import { projectGroup, SchemaAction, DEFAULT_AUTHOR_COLUMN } from "@hyper-hyper-space/hhs3_rdb_adapter";
+import { projectGroup, SchemaAction, DEFAULT_AUTHOR_COLUMN, type ResolvedIndex } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import {
     createGroup,
     TargetHarness, ProjectionReader, ReadRow, RowValues,
@@ -284,6 +284,86 @@ export const idbSpecificTests = {
                         'the captured insert names the null the app wrote');
                 } finally {
                     target.close();
+                }
+            },
+        },
+        {
+            name: '[ADPTI-07] a put that leaves out the author column, or gives it null, keeps the stored author and captures nothing for it',
+            invoke: async () => {
+                const target = await IdbTarget.open(uniqueDbName('keep-author'), { captureChanges: true });
+                try {
+                    const { group, admin } = await createGroup();
+                    await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', amount: '10.00' }, admin);
+                    await projectGroup(group, target);
+
+                    const write = async (fn: (store: ReturnType<FacadeTransaction['objectStore']>) => Promise<void>): Promise<void> => {
+                        const tx = target.database.transaction(['ledger'], 'readwrite');
+                        const done = waitTx(tx);
+                        await fn(tx.objectStore('ledger'));
+                        await done;
+                    };
+                    const readOne = async (): Promise<Record<string, json.Literal>> => {
+                        const tx = target.database.transaction(['ledger'], 'readonly');
+                        return (await waitReq(tx.objectStore('ledger').getAll()))[0];
+                    };
+                    const stored = await readOne();
+                    const author = stored[DEFAULT_AUTHOR_COLUMN];
+                    assertTrue(typeof author === 'number', 'the projected row has an author');
+
+                    // a record built from a form: no author column
+                    const { [DEFAULT_AUTHOR_COLUMN]: _a, ...formRecord } = stored;
+                    await write(async (store) => { await waitReq(store.put({ ...formRecord, memo: 'one' })); });
+                    assertEquals((await readOne())[DEFAULT_AUTHOR_COLUMN], author, 'a put without the author column keeps it');
+                    await write(async (store) => { await waitReq(store.put({ ...stored, memo: 'two', [DEFAULT_AUTHOR_COLUMN]: null })); });
+                    assertEquals((await readOne())[DEFAULT_AUTHOR_COLUMN], author, 'a put of a null author keeps it');
+
+                    const { changes } = await target.drainChanges();
+                    assertEquals(changes.map((c) => c.kind === 'update' ? Object.keys(c.values).join(',') : c.kind).join('; '), 'memo; memo',
+                        'only the memo is captured');
+                } finally {
+                    target.close();
+                }
+            },
+        },
+        {
+            name: '[ADPTI-08] another target on the same database follows schema changes: a listener can open a new table and its index as soon as the apply is delivered, and a reconnect refreshes a target with no listener',
+            invoke: async () => {
+                const name = uniqueDbName('meta-follows');
+                const a = await IdbTarget.open(name, { captureChanges: true });
+                const b = await IdbTarget.open(name, { captureChanges: true });
+                const c = await IdbTarget.open(name, { captureChanges: true });
+                const byRef: ResolvedIndex = { name: 'by_ref', groupId: 'g', table: 'acct', columns: [{ rdb: 'ref', target: 'ref' }], fingerprint: 'by_ref' };
+                const opens = (target: IdbTarget): string => {
+                    try {
+                        const store = target.database.transaction(['acct'], 'readonly').objectStore('acct');
+                        return store.indexNames.contains('by_ref') ? 'table and index' : 'table only';
+                    } catch (e) {
+                        return e instanceof Error ? e.name : String(e);
+                    }
+                };
+                try {
+                    const delivered = new Promise<string>((resolve, reject) => {
+                        const timer = setTimeout(() => reject(new Error('no apply event within timeout')), 2000);
+                        b.addCommitListener((commit) => {
+                            if (commit.source !== 'apply' || !commit.schemaTables.includes('acct')) return;
+                            clearTimeout(timer);
+                            resolve(opens(b));
+                        });
+                    });
+                    await a.apply('g', [acctCreate, { kind: 'ensure-index', index: byRef }],
+                        [{ kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { ref: 'a' } }], new Set(['v1']));
+                    assertEquals(opens(a), 'table and index', 'the target that applied knows the table and index when apply() returns');
+                    assertEquals(await delivered, 'table and index', 'a listening target knows them when the apply is delivered');
+
+                    assertEquals(opens(c), 'NotFoundError', 'a target with no listener is not told');
+                    c.notifyExternalCommit({ source: 'reconnect' });
+                    const deadline = Date.now() + 2000;
+                    while (opens(c) !== 'table and index' && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+                    assertEquals(opens(c), 'table and index', 'a reconnect makes it read them again');
+                } finally {
+                    a.close();
+                    b.close();
+                    c.close();
                 }
             },
         },

@@ -92,6 +92,12 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
     // `indexNames` / `index()`; reads and writes consult index_meta in-tx.
     private indexCache = new Map<string, ResolvedIndex[]>();
     private commitListeners = new Set<TargetCommitListener>();
+    // Cache refreshes and deliveries run in order on one chain: a commit that
+    // changes tables is delivered only once the caches have read them, so a
+    // listener can open a new table through the facade at once, and no delivery
+    // overtakes another (a query monitor keeps op events by a high-water mark).
+    private chain: Promise<void> = Promise.resolve();
+    private queued = 0;
     private emittedOutboxIds = new Set<number>();
     private observerChannel: BroadcastChannel | undefined;
     private readonly channelName: string;
@@ -140,9 +146,7 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
     }
 
     private async init(): Promise<void> {
-        const metas = await this.env.withRead(TABLE_META, (tx) => storeGetAll<TableMetaRecord>(tx, TABLE_META));
-        for (const m of metas) this.tableNameSet.add(m.table);
-        await this.loadIndexCache();
+        await this.refreshCaches();
 
         const cfg = await this.env.withRead(CAPTURE_CONFIG, (tx) =>
             storeGet<CaptureConfigRecord>(tx, CAPTURE_CONFIG, CAPTURE_KEY));
@@ -220,17 +224,22 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
             ctxChanges = ctx.changes;
             ctxEvents = ctx.events;
         });
-        for (const action of schemaActions) {
-            if (action.kind === 'create-table') this.tableNameSet.add(action.table);
-            if (action.kind === 'drop-table') this.tableNameSet.delete(action.table);
-        }
-        if (schemaActions.some((a) => a.kind === 'ensure-index' || a.kind === 'drop-index' || a.kind === 'drop-table')) {
-            await this.loadIndexCache();
-        }
         const schemaTables = [...new Set(schemaActions.map((action) => action.kind === 'ensure-index' ? action.index.table : action.table))];
-        if (ctxChanges.length > 0 || ctxEvents.length > 0 || schemaTables.length > 0) {
-            this.deliver({ source: 'apply', groupId, schemaTables, changes: ctxChanges, events: ctxEvents }, true);
+        const commit: TargetCommitEvent = { source: 'apply', groupId, schemaTables, changes: ctxChanges, events: ctxEvents };
+        const announce = ctxChanges.length > 0 || ctxEvents.length > 0 || schemaTables.length > 0;
+        if (schemaActions.length === 0) {
+            if (announce) this.deliver(commit, true);
+            return;
         }
+        // The facade's tables and indexes come from the caches: they are read
+        // again before the commit is delivered, and before apply() returns.
+        await this.enqueue(async () => {
+            try {
+                await this.refreshCaches();
+            } finally {
+                if (announce) this.deliverNow(commit, true);
+            }
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -385,12 +394,32 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         await Promise.all(reqs.map((r) => reqToPromise(r)));
     }
 
-    // index_meta is keyed [table, name], so each table's list comes out sorted.
-    private async loadIndexCache(): Promise<void> {
-        const metas = await this.env.withRead(INDEX_META, (tx) => storeGetAll<ResolvedIndex>(tx, INDEX_META));
+    // Read the table names and indexes the facade answers from synchronously, in
+    // one transaction, so the two agree. index_meta is keyed [table, name], so
+    // each table's list comes out sorted.
+    private async refreshCaches(): Promise<void> {
+        const { metas, indexes } = await this.env.withRead([TABLE_META, INDEX_META], async (tx) => ({
+            metas: await storeGetAll<TableMetaRecord>(tx, TABLE_META),
+            indexes: await storeGetAll<ResolvedIndex>(tx, INDEX_META),
+        }));
+        this.tableNameSet = new Set(metas.map((m) => m.table));
         const byTable = new Map<string, ResolvedIndex[]>();
-        for (const m of metas) byTable.set(m.table, [...(byTable.get(m.table) ?? []), m]);
+        for (const m of indexes) byTable.set(m.table, [...(byTable.get(m.table) ?? []), m]);
         this.indexCache = byTable;
+    }
+
+    // Run a step after every refresh and delivery queued before it.
+    private enqueue(step: () => Promise<void> | void): Promise<void> {
+        this.queued++;
+        const run = this.chain.then(async () => {
+            try {
+                await step();
+            } finally {
+                this.queued--;
+            }
+        });
+        this.chain = run.catch(() => undefined);
+        return run;
     }
 
     private async loadMeta(ctx: ApplyCtx, table: string): Promise<TableMetaRecord> {
@@ -483,7 +512,13 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
                 if (value === null) delete existing[column];
                 else existing[column] = await this.valueForColumn(ctx, meta, column, value, action.keyMaterial);
             }
-            if (setAuthor && meta.authorColumn !== undefined) existing[meta.authorColumn] = authorId;
+            // An action without an author is for a row rdb has none for: the
+            // author column is cleared (its index entries with it), whatever a
+            // local write left in it.
+            if (meta.authorColumn !== undefined) {
+                if (setAuthor) existing[meta.authorColumn] = authorId;
+                else delete existing[meta.authorColumn];
+            }
             await storePut(ctx.tx, ROWS, existing);
             await this.syncIndexEntries(ctx, action.table, id, before, existing);
             ctx.changes.push({ kind: 'update', table: action.table, localId: id, values: logicalRow(meta, existing) });
@@ -712,8 +747,19 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         if (this.commitListeners.size === 0) this.disarmChannel();
     }
 
+    // Another target's commit can change tables, and so can anything missed
+    // while disconnected: the caches are read again before such a commit is
+    // delivered. A failed read still delivers, since listeners read rows anew.
     notifyExternalCommit(commit: TargetCommitEvent): void {
-        this.deliver(commit, false);
+        const changesTables = (commit.source === 'apply' && commit.schemaTables.length > 0) || commit.source === 'reconnect';
+        if (!changesTables) {
+            this.deliver(commit, false);
+            return;
+        }
+        void this.enqueue(async () => {
+            try { await this.refreshCaches(); } catch { /* delivered anyway */ }
+            this.deliverNow(commit, false);
+        });
     }
 
     private armChannel(): void {
@@ -723,6 +769,10 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
             if (data !== undefined && typeof data === 'object' && 'source' in data) this.notifyExternalCommit(data);
         };
         this.observerChannel = channel;
+        // Commits made while the channel was closed were not heard.
+        void this.enqueue(async () => {
+            try { await this.refreshCaches(); } catch { /* the next commit reads them again */ }
+        });
     }
 
     private disarmChannel(): void {
@@ -732,7 +782,14 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         }
     }
 
+    // Deliver now, or after what is queued, so deliveries keep their order.
     private deliver(commit: TargetCommitEvent, broadcast: boolean): void {
+        if (this.queued === 0) this.deliverNow(commit, broadcast);
+        else void this.enqueue(() => this.deliverNow(commit, broadcast));
+    }
+
+    private deliverNow(commit: TargetCommitEvent, broadcast: boolean): void {
+        if (this.closed) return;
         for (const listener of [...this.commitListeners]) listener(commit);
         if (!broadcast) return;
         const channel = this.observerChannel ?? new BroadcastChannel(this.channelName);
@@ -786,7 +843,7 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
             }
             await storePut(tx, INDEX_SPEC, { id: 1, spec, fingerprint: specFingerprint } satisfies IndexSpecRecord);
         });
-        await this.loadIndexCache();
+        await this.enqueue(() => this.refreshCaches());
     }
 
     // -----------------------------------------------------------------------
