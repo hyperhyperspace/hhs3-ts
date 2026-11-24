@@ -10,7 +10,7 @@
 //     moved in this pass, each recorded in the change's outbox row, then
 //     appended (an observe the gate refuses, that would be void, that throws
 //     or that needs a key the projection lacks is declined);
-//   - the entry: planned, built, signed and validated (also through the live
+//   - the entry, a plain row op: planned, built, signed and validated (also through the live
 //     observes while a gated binding's two readings differ). A refusal, the
 //     planner's or rdb's, or any error while planning or preparing, records a
 //     failure event; nothing to write records the mark; otherwise the entry's
@@ -32,7 +32,7 @@ import {
 } from "@hyper-hyper-space/hhs3_mvt";
 import type { CausalDag, ValidationFailure, Version } from "@hyper-hyper-space/hhs3_mvt";
 import { deriveRowId, gateGraph, gateGraphOrder } from "@hyper-hyper-space/hhs3_rdb";
-import type { BundlePayload, BundleWrite, PreparedEntry, RowOpPayload, RSchemaView, RTableGroup, RTableGroupDelta } from "@hyper-hyper-space/hhs3_rdb";
+import type { BundleWrite, PreparedEntry, RowEnvelopePayload, RowOpPayload, RSchemaView, RTableGroup, RTableGroupDelta } from "@hyper-hyper-space/hhs3_rdb";
 
 import {
     AdapterConfig, BidirectionalTarget, CapturedChange, ChainSchemaChangeError, DEFAULT_KEY_DOMAIN, IngestRejection, IngestResult,
@@ -184,10 +184,11 @@ async function dueObserve(m: PassMember, binding: string, foreign: PassMember, f
     return prepared;
 }
 
-// The unsigned single-op bundle payload, for the op JSON stored in a failure
-// event and for a synthetic (never-appended) op hash.
-function bundlePayload(write: BundleWrite): json.Literal {
-    return { action: 'bundle', writes: [{ table: write.table, op: write.op }] } as unknown as json.Literal;
+// The unsigned row envelope of a refused op, as the entry would have held it:
+// the op JSON stored in its failure event, and the base of a synthetic
+// (never-appended) op hash.
+function rowPayload(write: BundleWrite): json.Literal {
+    return { action: 'row', table: write.table, op: write.op } as unknown as json.Literal;
 }
 
 // The hash of a failure event, and the op JSON it may carry. The hash covers the
@@ -205,7 +206,7 @@ async function failureHash(
     const extra: { [key: string]: json.Literal } = { changes: f.sources.map((c) => c.id) };
     if (f.column !== undefined) extra.column = f.column;
     if (f.write !== undefined) {
-        const op = bundlePayload(f.write);
+        const op = rowPayload(f.write);
         if (json.literalProblem(op) === undefined) {
             try {
                 return { opHash: await dag.computeEntryHash({ failed: op, ...extra }), op };
@@ -401,7 +402,7 @@ export async function runPass(
         const author = op.anonymous === true ? undefined : authorFor(m);
         let prepared: PreparedEntry;
         try {
-            prepared = await m.group.prepareBundle([op.write], author, at, { liveReads: differ.get(m.groupId) === true });
+            prepared = await m.group.prepareRowOp(op.write.table, op.write.op, author, at, { liveReads: differ.get(m.groupId) === true });
         } catch (e) {
             const why: ValidationFailure = e instanceof ValidationRejectedError ? e.why : { reason: messageOf(e) };
             const event = await failureEvent(m, { change, rowId: op.write.op.rowId, write: op.write, failure: why, author: author?.keyId });
@@ -423,7 +424,7 @@ export async function runPass(
 // ---------------------------------------------------------------------------
 
 function uuidOfFailure(event: OpEvent): string {
-    const op = (event.op as { writes?: { op?: { uuid?: unknown } }[] } | undefined)?.writes?.[0]?.op;
+    const op = (event.op as { op?: { uuid?: unknown } } | undefined)?.op;
     return typeof op?.uuid === 'string' ? op.uuid : '';
 }
 
@@ -562,7 +563,8 @@ export async function endPass(members: IngestMember[], target: BidirectionalTarg
         if (record.entry !== undefined) {
             result.accepted++;
             const entry = await (await m.group.getScopedDag()).loadEntry(record.entry);
-            const op = (entry!.payload as unknown as BundlePayload).writes[0].op as unknown as RowOpPayload & { author?: B64Hash };
+            // An ingested change's entry is a row op of its table (prepareRowOp).
+            const op = (entry!.payload as unknown as RowEnvelopePayload).op as unknown as RowOpPayload & { author?: B64Hash };
             if (change.kind === 'insert' && op.action === 'insert') {
                 const mapping: SyncMapping = { table: change.table, localId: change.localId, rowId: op.rowId, uuid: op.uuid,
                     ...(op.author !== undefined ? { author: op.author } : {}), status: 'active' };

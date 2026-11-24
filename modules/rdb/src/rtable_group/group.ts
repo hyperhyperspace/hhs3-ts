@@ -1071,8 +1071,12 @@ export class RTableGroupImpl implements RTableGroupContract {
     // hashes to it, and after, when the DAG gave the appended entry another
     // hash. So a hash recorded before the append always names the entry
     // appended, or the caller learns it doesn't.
+    // A row op is appended through its table's scope, which wraps it in a row
+    // envelope; a bundle or an observe through the group's.
     async appendPrepared(prepared: PreparedEntry): Promise<B64Hash> {
-        const scopedDag = await this.getScopedDag();
+        const scopedDag = prepared.table === undefined
+            ? await this.getScopedDag()
+            : await this.makeTable(prepared.table).getScopedDag();
         const expected = await scopedDag.computeEntryHash(prepared.payload, prepared.at);
         if (expected !== prepared.hash) throw new PreparedHashMismatchError(prepared.hash, expected);
         const hash = await scopedDag.append(prepared.payload, prepared.meta, prepared.at);
@@ -1096,6 +1100,12 @@ export class RTableGroupImpl implements RTableGroupContract {
     // (all-or-nothing).
     async bundle(writes: BundleWrite[], author?: OwnIdentity, at?: Version): Promise<B64Hash> {
         return this.appendPrepared(await this.prepareBundle(writes, author, at));
+    }
+
+    // The first of a row op's two steps, for the table `table` (see
+    // RTableImpl.prepareRowOp).
+    async prepareRowOp(table: string, op: RowOpPayload, author?: OwnIdentity, at?: Version, opts: PrepareOptions = {}): Promise<PreparedEntry> {
+        return this.makeTable(table).prepareRowOp(op, author, at, opts);
     }
 
     // The first of bundle's two steps: builds the bundle, signs it when an

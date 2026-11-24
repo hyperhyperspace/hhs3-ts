@@ -20,12 +20,13 @@
 // The sync row is allocated on first sight of a rowId and KEPT across delete, so
 // a void-flip reinstatement reuses the same `id` (stable local identity).
 //
-// Foreign keys are ADVISORY: local FK columns project as integer `<col>_id`
-// referencing the target table's `id`, and the sync table's `id` references its
-// app table - both declared, but PRAGMA foreign_keys is left OFF (SQLite's
-// default) so they are never enforced. This is deliberate: rdb permits dangling
-// references and keeps id mappings across deletes, which enforced FKs would
-// reject. Callers must not enable foreign_keys on this connection.
+// No SQL foreign keys: a local FK column projects as an integer `<col>_id`
+// holding the referenced row's `id`, and authors and key columns as integer ids
+// into rdb_keys, but no table declares a FOREIGN KEY. rdb's references are
+// checked by the operation that makes them, at its own position, so a live row
+// can reference a row deleted later, and a sync row outlives its app row; an
+// enforced SQL foreign key would refuse writes rdb accepts, and better-sqlite3
+// enforces them on every connection it opens.
 //
 // Indexes: only indexes recorded in rdb_index_meta (declared in the installed
 // spec) are dropped ahead of a remote drop-column. An index the app created by
@@ -452,11 +453,10 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     private ensureBookkeeping(): void {
         this.ensureOpen();
         if (this.bookkeepingReady) return;
-        // FKs are ADVISORY: turn enforcement OFF on this connection so our
-        // declared FKs (local `<col>_id` -> target id; sync id -> app id) are
-        // never checked. rdb permits dangling references and keeps id mappings
-        // across deletes, both of which enforced FKs would reject. (Some SQLite
-        // bindings enable foreign_keys by default, so we force it off here.)
+        // The projection declares no foreign keys, but the app may, on tables
+        // of its own that reference projected ones: a table rebuild drops and
+        // renames a projected table, which an enforced reference would refuse.
+        // better-sqlite3 enables foreign_keys by default, so force it off here.
         this.db.pragma('foreign_keys = OFF');
         // When we detect local edits by watching the WAL file, the db must
         // actually be in WAL journal mode (better-sqlite3 defaults to a rollback
@@ -821,45 +821,25 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         // no id NEVER reuses an id freed by a delete/revert. That monotonicity is
         // the contract "a local id is never reused" the rdb_adapter relies on; a
         // reused id would let a stale insert image collide with a genuinely new
-        // row. Local FK columns declare an advisory (UNENFORCED) DB FK to the
-        // target's id - unenforced because rdb permits dangling references and
-        // keeps id mappings across deletes (PRAGMA foreign_keys is left OFF; see
-        // the class header note). The author column is an integer key-ref into
-        // rdb_keys, emitted LAST so SELECT * reads as id, business columns, then
-        // author_key_id.
+        // row. A local FK column holds the referenced row's id, and the author
+        // column an id into rdb_keys, with no FOREIGN KEY declared (see the class
+        // header note). The author column is emitted LAST so SELECT * reads as
+        // id, business columns, then author_key_id.
         const cols: string[] = [`${quoteId(action.primaryKey)} INTEGER PRIMARY KEY AUTOINCREMENT`];
         for (const c of action.columns) cols.push(columnDecl(c.name, c.def));
         if (action.authorColumn !== undefined) {
             cols.push(`${quoteId(action.authorColumn)} INTEGER`);
         }
-        // Table-level FK constraints AFTER all column definitions (SQLite is
-        // picky about interleaving in some versions / quoting contexts).
-        if (action.authorColumn !== undefined) {
-            cols.push(
-                `FOREIGN KEY (${quoteId(action.authorColumn)}) `
-                + `REFERENCES ${quoteId(DEFAULT_KEY_TABLE)} (id)`);
-        }
-        for (const c of action.columns) {
-            if (c.fk !== undefined && c.fk.crossGroup !== true) {
-                cols.push(
-                    `FOREIGN KEY (${quoteId(c.name)}) REFERENCES ${quoteId(c.fk.targetTable)} (${quoteId(action.primaryKey)})`);
-            }
-            if (c.keyRef === true) {
-                cols.push(
-                    `FOREIGN KEY (${quoteId(c.name)}) REFERENCES ${quoteId(DEFAULT_KEY_TABLE)} (id)`);
-            }
-        }
 
         this.db.exec(`CREATE TABLE ${quoteId(action.table)} (${cols.join(', ')})`);
-        // Sync table keyed by row_hash, mapping to the app table's serial id via an
-        // advisory FK. `uuid` is the minted uuid for ingested rows (null otherwise).
+        // Sync table keyed by row_hash, mapping to the app table's serial id.
+        // `uuid` is the minted uuid for ingested rows (null otherwise).
         // `status` is the row lifecycle (active / deleted / ingestion_failure);
         // the sync record survives a delete so status records WHY it is gone.
         this.db.exec(
             `CREATE TABLE ${quoteId(action.syncTable)} (`
             + `"row_hash" TEXT PRIMARY KEY, "id" INTEGER, "uuid" TEXT, `
-            + `"status" TEXT NOT NULL DEFAULT 'active', `
-            + `FOREIGN KEY ("id") REFERENCES ${quoteId(action.table)} (${quoteId(action.primaryKey)}))`);
+            + `"status" TEXT NOT NULL DEFAULT 'active')`);
         // A local id maps to exactly one rdb identity: two row_hashes can never
         // share an id, which keeps resolveRow unambiguous. Mirrors the idb
         // target's unique (table, id) index.
@@ -902,12 +882,9 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         action: Extract<SchemaAction, { kind: 'add-column' }>,
         tighten: { table: string; column: string }[],
     ): void {
-        // SQLite cannot ADD COLUMN with an inline table-level FK constraint, so a
-        // local FK / key-ref added later is tracked in meta (for upsert translation)
-        // but its advisory DB FK is not retrofitted - acceptable since FKs are
-        // advisory.
+        // A local FK / key-ref column is tracked in meta, for upsert translation.
         //
-        // SQLite also rejects ADD COLUMN ... NOT NULL with no non-NULL default on
+        // SQLite rejects ADD COLUMN ... NOT NULL with no non-NULL default on
         // a non-empty table. Relax those adds to nullable here; applyTightens
         // restores NOT NULL after the row backfill, in the same transaction.
         const relax = action.def.nullable !== true
@@ -929,24 +906,12 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     }
 
     private dropColumn(action: Extract<SchemaAction, { kind: 'drop-column' }>): void {
-        // A plain-column drop is a direct ALTER. But SQLite REFUSES to DROP a
-        // column named in a table-level FOREIGN KEY clause (a projected FK
-        // companion `<col>_id`, or a key-ref column) - it would leave a dangling
-        // FK definition. Such a column (e.g. an FK-ness flip reverting a
-        // `<col>_id` companion to a plain column) is dropped via a table rebuild
-        // that also removes its now-obsolete FK constraint.
-        const fkList = this.db.prepare(`PRAGMA foreign_key_list(${quoteId(action.table)})`)
-            .all() as { id: number; seq: number; table: string; from: string; to: string }[];
-        if (fkList.some((f) => f.from === action.column)) {
-            this.rebuildTable(action.table, { dropColumn: action.column });
-        } else {
-            // The capture triggers name the column, which would make the ALTER
-            // fail. They are installed again below, once the meta is written.
-            // This runs inside apply()'s transaction, with capture gated off,
-            // so no local write falls between the two.
-            if (this.capture) this.dropTriggers(action.table);
-            this.db.exec(`ALTER TABLE ${quoteId(action.table)} DROP COLUMN ${quoteId(action.column)}`);
-        }
+        // The capture triggers name the column, which would make the ALTER
+        // fail. They are installed again below, once the meta is written. This
+        // runs inside apply()'s transaction, with capture gated off, so no local
+        // write falls between the two.
+        if (this.capture) this.dropTriggers(action.table);
+        this.db.exec(`ALTER TABLE ${quoteId(action.table)} DROP COLUMN ${quoteId(action.column)}`);
         const meta = this.loadMeta(action.table);
         delete meta.columnTypes[action.column];
         delete meta.fkColumns[action.column];
@@ -955,69 +920,40 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         if (this.capture) this.installTriggers(action.table, meta);   // from the columns that are left
     }
 
-    // Rebuild `table` as CREATE tmp / INSERT...SELECT / DROP / RENAME, optionally
-    // dropping a column and/or forcing named columns to NOT NULL. Used when a
-    // plain DROP COLUMN would be rejected for naming a column in a FOREIGN KEY
-    // clause, and by applyTightens to restore NOT NULL after a relaxed ADD COLUMN.
-    // Column defs are read live via PRAGMA table_info, so no NOT NULL / DEFAULT
-    // detail is lost. table_info carries no CHECK, so a column's check is
-    // rendered again from its ColumnType in meta. Runs inside apply()'s
-    // transaction; because foreign_keys is OFF, dropping the old table does not
-    // trip inbound (sync-table / other-app-table) references, and the RENAME - by
-    // the unchanged table name - leaves those references intact.
+    // Rebuild `table` as CREATE tmp / INSERT...SELECT / DROP / RENAME, forcing
+    // named columns to NOT NULL: applyTightens uses it to restore NOT NULL after
+    // a relaxed ADD COLUMN, since SQLite can't add NOT NULL to a column. Column
+    // defs are read live via PRAGMA table_info, so no NOT NULL / DEFAULT detail
+    // is lost. table_info carries no CHECK, so a column's check is rendered
+    // again from its ColumnType in meta. Runs inside apply()'s transaction;
+    // because foreign_keys is OFF, dropping the old table does not trip a
+    // reference the app declared into it.
     //
-    // Trigger reinstall is the caller's job: DROP TABLE removes capture triggers,
-    // and dropColumn still needs to update meta before reinstalling.
-    private rebuildTable(
-        table: string, opts: { dropColumn?: string; forceNotNull?: ReadonlySet<string> } = {},
-    ): void {
+    // Trigger reinstall is the caller's job: DROP TABLE removes capture triggers.
+    private rebuildTable(table: string, forceNotNull: ReadonlySet<string>): void {
         const meta = this.loadMeta(table);
-        const info = this.db.prepare(`PRAGMA table_info(${quoteId(table)})`)
+        const keep = this.db.prepare(`PRAGMA table_info(${quoteId(table)})`)
             .all() as { name: string; type: string; notnull: number; dflt_value: string | null; pk: number }[];
-        const keep = info.filter((c) => c.name !== opts.dropColumn);
 
         // The id column is `INTEGER PRIMARY KEY AUTOINCREMENT` (owned serial, never
         // reused); every other column re-renders its stored type + NOT NULL +
         // DEFAULT verbatim, with forceNotNull overriding a currently-nullable
         // column after backfill. The AUTOINCREMENT must survive the rebuild or the
-        // first NOT NULL tighten / FK-column drop would silently drop the
-        // never-reuse guarantee.
+        // first NOT NULL tighten would silently drop the never-reuse guarantee.
         const decls: string[] = keep.map((c) => {
             if (c.name === meta.idColumn) return `${quoteId(c.name)} INTEGER PRIMARY KEY AUTOINCREMENT`;
-            const nn = c.notnull || opts.forceNotNull?.has(c.name) ? ' NOT NULL' : '';
+            const nn = c.notnull || forceNotNull.has(c.name) ? ' NOT NULL' : '';
             return `${quoteId(c.name)} ${c.type}${nn}`
                 + `${c.dflt_value !== null ? ' DEFAULT ' + c.dflt_value : ''}`
                 + checkFragment(c.name, meta.columnTypes[c.name]);
         });
 
-        // Re-emit every surviving FK constraint (grouped by its id), skipping the
-        // group that referenced a dropped column. Projected FKs are single-column.
-        const fkList = this.db.prepare(`PRAGMA foreign_key_list(${quoteId(table)})`)
-            .all() as { id: number; from: string; to: string; table: string }[];
-        const byId = new Map<number, { from: string; to: string; table: string }[]>();
-        for (const f of fkList) byId.set(f.id, [...(byId.get(f.id) ?? []), f]);
-        for (const group of byId.values()) {
-            if (opts.dropColumn !== undefined && group.some((f) => f.from === opts.dropColumn)) continue;
-            const froms = group.map((f) => quoteId(f.from)).join(', ');
-            const tos = group.map((f) => quoteId(f.to)).join(', ');
-            decls.push(`FOREIGN KEY (${froms}) REFERENCES ${quoteId(group[0].table)} (${tos})`);
-        }
-
         // DROP TABLE removes every index on the table (projection-managed and
         // hand-made alike), so capture their DDL and replay it on the rebuilt
-        // table. An index on the dropped column cannot survive; its record (if
-        // managed) goes with it.
-        const indexes = (this.db.prepare(
+        // table.
+        const indexes = this.db.prepare(
             "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL")
-            .all(table) as { name: string; sql: string }[])
-            .filter((ix) => {
-                if (opts.dropColumn === undefined) return true;
-                const cols = this.db.prepare(`PRAGMA index_info(${quoteId(ix.name)})`).all() as { name: string | null }[];
-                if (!cols.some((c) => c.name === opts.dropColumn)) return true;
-                this.db.prepare('DELETE FROM rdb_index_meta WHERE "table" = ? AND "table" || \'__\' || name = ?')
-                    .run(table, ix.name);
-                return false;
-            });
+            .all(table) as { name: string; sql: string }[];
 
         const tmp = table + '__rebuild';
         const cols = keep.map((c) => quoteId(c.name)).join(', ');
@@ -1060,7 +996,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             else cols.add(s.column);
         }
         for (const [table, cols] of grouped) {
-            this.rebuildTable(table, { forceNotNull: cols });
+            this.rebuildTable(table, cols);
             if (this.capture) this.installTriggers(table, this.loadMeta(table));
         }
     }

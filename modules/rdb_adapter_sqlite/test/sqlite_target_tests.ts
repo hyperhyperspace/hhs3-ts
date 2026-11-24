@@ -13,7 +13,7 @@ import {
     type GroupProjection, type IndexDecl, type IndexSpec, type ResolvedIndex,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import {
-    beforeSettle, createFkGroup, createGroup, createTypedGroup, projectAs, sameVersion,
+    assertAtCheckpoints, beforeSettle, createFkGroup, createGroup, createTypedGroup, projectAs, sameVersion,
     TargetHarness, ProjectionReader, ReadRow, RowValues,
     IngestionHarness, LocalMutator, LocalValues,
 } from "@hyper-hyper-space/hhs3_rdb_adapter_test";
@@ -539,32 +539,43 @@ export const sqliteSpecificTests = {
             },
         },
         {
-            name: '[ADPTS-SQL05] a co-projected cross-group FK declares no DB-level FOREIGN KEY',
+            name: '[ADPTS-SQL05] no projected table declares a SQL foreign key: not a local or a cross-group companion, an author or key column, nor a sync table',
             invoke: async () => {
                 const db = new Database(':memory:');
                 const target = new SqliteTarget(db);
                 const v1: Version = new Set(['v1']);
 
-                // Parent (foreign group) table first.
+                // A table of another group, for a co-projected cross-group reference.
                 await target.apply('gB', [{
                     kind: 'create-table', table: 'archive_entries', syncTable: 'archive_entries_sync',
                     primaryKey: 'id', columns: [{ name: 'title', def: { type: 'string' } }],
                 }], [], v1);
-
-                // Child with a co-projected cross-group FK to it (crossGroup: true).
                 await target.apply('gA', [{
+                    kind: 'create-table', table: 'posts', syncTable: 'posts_sync',
+                    primaryKey: 'id', columns: [{ name: 'title', def: { type: 'string' } }],
+                }, {
                     kind: 'create-table', table: 'comments', syncTable: 'comments_sync', primaryKey: 'id',
+                    authorColumn: 'author_key_id',
                     columns: [
                         { name: 'body', def: { type: 'string' } },
+                        { name: 'post_id', def: { type: 'integer', nullable: true }, fk: { targetTable: 'posts' } },
                         { name: 'origin_id', def: { type: 'integer', nullable: true },
                             fk: { targetTable: 'archive_entries', crossGroup: true } },
+                        { name: 'reviewer_key_id', def: { type: 'integer', nullable: true }, keyRef: true },
                     ],
                 }], [], v1);
 
-                const fkList = db.prepare('SELECT * FROM pragma_foreign_key_list(?)').all('comments');
-                assertEquals(fkList.length, 0, 'a co-projected cross-group FK declares no DB-level foreign key');
-                assertTrue(tableInfo(db, 'comments').some((c) => c.name === 'origin_id' && c.type === 'INTEGER'),
-                    'the cross-group FK still projects as an integer id companion');
+                const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[])
+                    .map((r) => r.name);
+                assertTrue(['comments', 'comments_sync', 'posts_sync'].every((t) => tables.includes(t)), 'the tables are there');
+                for (const table of tables) {
+                    const fkList = db.prepare('SELECT * FROM pragma_foreign_key_list(?)').all(table);
+                    assertEquals(fkList.length, 0, `${table} declares no foreign key`);
+                }
+                const info = tableInfo(db, 'comments');
+                for (const column of ['post_id', 'origin_id', 'reviewer_key_id', 'author_key_id']) {
+                    assertTrue(info.some((c) => c.name === column && c.type === 'INTEGER'), `${column} is an integer column`);
+                }
                 db.close();
             },
         },
@@ -660,7 +671,7 @@ export const sqliteSpecificTests = {
             },
         },
         {
-            name: '[ADPTS-SQL09] inbound FK on another table survives a tighten rebuild of its target',
+            name: '[ADPTS-SQL09] a row that references another table keeps its reference through a tighten rebuild of that table',
             invoke: async () => {
                 const db = new Database(':memory:');
                 const target = new SqliteTarget(db);
@@ -683,10 +694,7 @@ export const sqliteSpecificTests = {
                     values: { qty: 2, order_id: 'o1' },
                 }], new Set(['v2']));
 
-                const before = db.prepare('SELECT "table" AS t, "from", "to" FROM pragma_foreign_key_list(?)')
-                    .all('lines') as { t: string; from: string; to: string }[];
-                assertTrue(before.some((f) => f.from === 'order_id' && f.t === 'orders' && f.to === 'id'),
-                    'lines.order_id references orders.id before tighten');
+                const orderId = (db.prepare('SELECT id FROM orders_sync WHERE row_hash = ?').get('o1') as { id: number }).id;
 
                 await target.apply(gid, [{
                     kind: 'add-column', table: 'orders', column: 'note',
@@ -698,12 +706,11 @@ export const sqliteSpecificTests = {
                 const note = tableInfo(db, 'orders').find((c) => c.name === 'note');
                 assertTrue(note !== undefined && note.notnull === 1,
                     'tightened column on the FK target is NOT NULL');
-                const after = db.prepare('SELECT "table" AS t, "from", "to" FROM pragma_foreign_key_list(?)')
-                    .all('lines') as { t: string; from: string; to: string }[];
-                assertTrue(after.some((f) => f.from === 'order_id' && f.t === 'orders' && f.to === 'id'),
-                    'lines.order_id still references orders.id after the target rebuild');
-                const child = db.prepare('SELECT qty FROM lines').get() as { qty: number };
+                const child = db.prepare('SELECT qty, order_id FROM lines').get() as { qty: number; order_id: number };
                 assertEquals(child.qty, 2, 'referencing row survived the target rebuild');
+                assertEquals(child.order_id, orderId, 'and still holds the id of the order it references');
+                assertEquals((db.prepare('SELECT id FROM orders').get() as { id: number }).id, orderId,
+                    'which the rebuilt order kept');
                 db.close();
             },
         },
@@ -1188,6 +1195,42 @@ export const sqliteSpecificTests = {
             },
         },
         {
+            name: '[ADPTS-SQL28] a connection with foreign keys on, as better-sqlite3 opens one, can delete a referenced row and insert a dangling reference; ingestion decides',
+            invoke: async () => {
+                const dbPath = tmpDbPath('fk-on');
+                const db = new Database(dbPath); db.pragma('busy_timeout = 5000');
+                const target = new SqliteTarget(db, { captureChanges: true });
+                const app = new Database(dbPath); app.pragma('busy_timeout = 5000');
+                try {
+                    assertEquals(app.pragma('foreign_keys', { simple: true }), 1, "the app's connection enforces foreign keys");
+                    const { group, admin } = await createFkGroup();
+                    await projectAs(group, target, admin);
+                    const postId = Number(db.prepare("INSERT INTO posts (title) VALUES ('p')").run().lastInsertRowid);
+                    db.prepare("INSERT INTO comments (body, post_id) VALUES ('c', ?)").run(postId);
+                    await syncGroup(group, target, { writer: admin });
+                    await assertAtCheckpoints(target, [{ group }], 'after the post and its comment');
+                    assertEquals((await groupRows(group, 'comments')).length, 1, 'the comment is in rdb');
+
+                    app.prepare('DELETE FROM posts WHERE id = ?').run(postId);
+                    let result = await syncGroup(group, target, { writer: admin });
+                    assertEquals(result.accepted, 1, 'the delete of the referenced post is ingested');
+                    assertEquals((await groupRows(group, 'posts')).length, 0, 'the post is gone from rdb');
+                    assertEquals((await groupRows(group, 'comments')).length, 1, 'its comment stays, as rdb allows');
+                    await assertAtCheckpoints(target, [{ group }], 'after the delete');
+
+                    app.prepare("INSERT INTO comments (body, post_id) VALUES ('dangling', ?)").run(postId);
+                    result = await syncGroup(group, target, { writer: admin });
+                    assertEquals(result.accepted, 0, 'a comment on the deleted post is not ingested');
+                    assertEquals(result.rejected.length, 1, 'it is refused');
+                    assertEquals((app.prepare("SELECT COUNT(*) AS n FROM comments WHERE body = 'dangling'").get() as { n: number }).n, 0,
+                        'and removed from the table');
+                    await assertAtCheckpoints(target, [{ group }], 'after the refused comment');
+                } finally {
+                    app.close(); db.close(); cleanupDb(dbPath);
+                }
+            },
+        },
+        {
             name: '[ADPTS-SQL25] a native UPDATE is one outbox row per updated row, with every column it names, changed or not; NULL is kept, the id is never captured, and two connections give two rows',
             invoke: async () => {
                 const dbPath = tmpDbPath('outbox-shapes');
@@ -1434,7 +1477,7 @@ export const sqliteSpecificTests = {
             },
         },
         {
-            name: '[ADPTS-IDX04] table rebuilds (NOT NULL tighten, FK-column drop) preserve managed and hand-made indexes',
+            name: '[ADPTS-IDX04] a tighten rebuild keeps managed and hand-made indexes; a foreign key column drops like any other: its managed index goes first, and a hand-made one blocks the drop until it is removed',
             invoke: async () => {
                 const db = new Database(':memory:');
                 const target = new SqliteTarget(db);
@@ -1447,7 +1490,9 @@ export const sqliteSpecificTests = {
                     ],
                 };
                 const row: RowAction = { kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { ref: 'a' } };
-                await target.apply(gid, [create, { kind: 'ensure-index', index: handIndex('by_ref', 'acct', 'ref') }],
+                await target.apply(gid, [create,
+                    { kind: 'ensure-index', index: handIndex('by_ref', 'acct', 'ref') },
+                    { kind: 'ensure-index', index: handIndex('by_parent', 'acct', 'parent_id') }],
                     [row], new Set(['v1']));
                 db.exec('CREATE INDEX hand_ref ON acct (ref)');
                 db.exec('CREATE INDEX hand_parent ON acct (parent_id)');
@@ -1459,14 +1504,28 @@ export const sqliteSpecificTests = {
                     [{ kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { status: 'open' } }],
                     new Set(['v2']));
                 assertEquals(tableInfo(db, 'acct').find((c) => c.name === 'status')?.notnull, 1, 'sanity: status tightened');
-                assertEquals([...physicalIndexes(db, 'acct').keys()].join(','), 'acct__by_ref,hand_parent,hand_ref',
+                assertEquals([...physicalIndexes(db, 'acct').keys()].join(','), 'acct__by_parent,acct__by_ref,hand_parent,hand_ref',
                     'the tighten rebuild kept every index');
 
-                // Dropping an FK column goes through the rebuild; an index on that column cannot survive.
-                await target.apply(gid, [{ kind: 'drop-column', table: 'acct', column: 'parent_id' }], [], new Set(['v3']));
+                // The drop of the foreign key column, as the core plans it: the managed
+                // index on it is dropped first. The hand-made one makes the drop fail.
+                const dropParent: SchemaAction[] = [
+                    { kind: 'drop-index', table: 'acct', name: 'by_parent' },
+                    { kind: 'drop-column', table: 'acct', column: 'parent_id' },
+                ];
+                await expectThrows(() => target.apply(gid, dropParent, [], new Set(['v3'])), 'hand_parent',
+                    'a hand-made index on the foreign key column blocks its drop');
+                assertTrue(tableInfo(db, 'acct').some((c) => c.name === 'parent_id'), 'the apply rolled back: parent_id is there');
+                assertEquals([...physicalIndexes(db, 'acct').keys()].join(','), 'acct__by_parent,acct__by_ref,hand_parent,hand_ref',
+                    'and so is every index');
+                assertTrue(sameVersion(await target.getCheckpoint(gid), new Set(['v2'])), 'and the checkpoint did not move');
+
+                db.exec('DROP INDEX hand_parent');
+                await target.apply(gid, dropParent, [], new Set(['v3']));
+                assertTrue(!tableInfo(db, 'acct').some((c) => c.name === 'parent_id'), 'with it removed, the column drops');
                 assertEquals([...physicalIndexes(db, 'acct').keys()].join(','), 'acct__by_ref,hand_ref',
-                    'the FK-drop rebuild kept the unrelated indexes and removed the one on the dropped column');
-                assertEquals(indexMetaNames(db).join(','), 'acct.by_ref', 'managed record intact');
+                    'and the other indexes stay');
+                assertEquals(indexMetaNames(db).join(','), 'acct.by_ref', 'the managed record of the dropped index is gone');
                 db.close();
             },
         },

@@ -19,8 +19,8 @@ For a whole `RDb`, [rdb_projection](../rdb_projection) is the usual supervisor: 
 
 ## What it does
 
-- Applies schema actions, row actions, and the **per-group checkpoint** in one transaction (`SqliteTarget`), with native column affinity, sync tables for a stable local-id ↔ rowId mapping, and advisory local FKs. A co-projected cross-group FK carries an integer id but declares **no** DB-level `FOREIGN KEY` (its referenced table belongs to another group, materialized in a separate apply). Adding a required column without a default to a non-empty table is add-nullable, then a post-backfill table rebuild restores `NOT NULL` (SQLite's `ADD COLUMN` rule).
-- Owns the shared `rdb_keys(id, key_hash, public_key)` side table and implements `KeyIndex`: authors, provider `key_id`, and `identity` `<col>_key_id` intern to numeric ids (advisory FKs to `rdb_keys`); the public key stays out of the app tables.
+- Applies schema actions, row actions, and the **per-group checkpoint** in one transaction (`SqliteTarget`), with native column affinity and sync tables for a stable local-id ↔ rowId mapping. A foreign key projects as an integer id column, with no SQL foreign key behind it (see [Foreign keys](#foreign-keys)). Adding a required column without a default to a non-empty table is add-nullable, then a post-backfill table rebuild restores `NOT NULL` (SQLite's `ADD COLUMN` rule).
+- Owns the shared `rdb_keys(id, key_hash, public_key)` side table and implements `KeyIndex`: authors, provider `key_id`, and `identity` `<col>_key_id` intern to numeric ids; the public key stays out of the app tables.
 - Implements `MaterializedChangeSource` (capture triggers + an outbox, see [Capture](#capture)) and `RowIdentityIndex`, so it is a full bidirectional backend. A column that is NULL in rdb is a SQL `NULL`, and a local `UPDATE ... SET col = NULL` is ingested as a null write (see [NULL values](../rdb_adapter#null-values)).
 - Implements `IndexTarget`: projection-local indexes declared in an index spec become real SQLite indexes (see [Indexes](#indexes)).
 - Implements `QueryableTarget`: compiles `SingleTableQueryPlan` (including `.before(id)` / `.after(id)` tuple seeks and `LIKE` via a registered deterministic `rdb_like_match` function) into parameterized `SELECT` statements and maps rows to their logical types.
@@ -39,6 +39,14 @@ Every local id comes from its table's own `AUTOINCREMENT` counter. A row the pro
 
 The columns' checks refuse, at the statement, a boolean other than 0 or 1 and json text that isn't json or is json's `null`. Json text in another form, such as `{ "b": 1, "a": 2 }`, is accepted, and the settle that ingests it rewrites it in canonical form, the form rows from rdb have, so a query that binds a json value matches it. A column a pending change writes is left for that change's own settle.
 
+## Foreign keys
+
+A foreign key column projects as an integer column holding the referenced row's local id: a comment's `post` is `post_id` here, and its author is `author_key_id`, an id into `rdb_keys`. None of these columns is declared as a SQL `FOREIGN KEY`.
+
+rdb's references don't work like SQL's. A reference is checked by the operation that makes it, at that operation's own place in the group's history, and not again later (see [What an operation answers for](../rdb#what-an-operation-answers-for)). A post deleted after a comment on it was written leaves the comment live, pointing at a row that is gone. The sync tables also keep a deleted row's id, so that the row gets it back if it is reinstated. A SQL foreign key would refuse both, and better-sqlite3 enforces foreign keys on every connection it opens.
+
+So any connection can write the projected tables, whatever its `foreign_keys` setting. A write that breaks one of rdb's rules, such as a new comment on a post that is gone, is refused at ingestion and reverted, like any other refused write. The target turns `foreign_keys` off on its own connection, so a foreign key an app declares on a table of its own isn't enforced there: a table rebuild drops and renames a projected table, which an enforced reference into it would refuse.
+
 ## Indexes
 
 The index spec and `reconcileIndexes` are described in [rdb_adapter](../rdb_adapter#indexes). On this target:
@@ -46,11 +54,11 @@ The index spec and `reconcileIndexes` are described in [rdb_adapter](../rdb_adap
 - Each index is a `CREATE INDEX` on the projected table, named `<table>__<name>`. It is created after the batch's rows are written.
 - `options` is `{ "columns": { "<rdb column>": { "desc": true, "collate": "NOCASE" | "RTRIM" | "BINARY", "whereNotNull": true } } }`, every field optional. Without `options`, the index is plain ascending. `whereNotNull` makes a partial index; on several columns the conditions are ANDed. Any other key, or a column the declaration does not list, is rejected before anything is installed.
 - The installed spec is the single row of `rdb_index_spec`; each built index is a row of `rdb_index_meta`.
-- Only indexes recorded in `rdb_index_meta` are dropped ahead of a remote column drop. An index created by hand on a projected column makes that drop fail, and the group's sync stalls until the index is removed. Table rebuilds (NOT NULL tightening, FK column drops) keep hand-made indexes and skip any on the dropped column.
+- Only indexes recorded in `rdb_index_meta` are dropped ahead of a remote column drop. An index created by hand on a projected column makes that drop fail, and the group's sync stalls until the index is removed. A table rebuild, which restores `NOT NULL` after a required column is added, keeps every index, hand-made ones included.
 
 ## Test
 
-Runs the shared conformance + ingestion suites from [rdb_adapter_test](../rdb_adapter_test) plus SQLite-specific assertions (affinity, NOT NULL, DEFAULT rendering, transaction rollback, the change signal, and cross-group FK DDL). The index cases cover the built indexes (direction, collation, partial `WHERE`), rejected options, a remote drop of an indexed column, and table rebuilds. `npm test` includes a smoke projection-vs-rdb sweep (shared [generator](../rdb_adapter_test_gen) vs rdb as oracle, not sqlite-vs-idb); heavier profiles:
+Runs the shared conformance + ingestion suites from [rdb_adapter_test](../rdb_adapter_test) plus SQLite-specific assertions (affinity, NOT NULL, DEFAULT rendering, transaction rollback, the change signal, and that no table declares a foreign key). The index cases cover the built indexes (direction, collation, partial `WHERE`), rejected options, a remote drop of an indexed column, and table rebuilds. `npm test` includes a smoke projection-vs-rdb sweep (shared [generator](../rdb_adapter_test_gen) vs rdb as oracle, not sqlite-vs-idb); heavier profiles:
 
 ```
 npm test

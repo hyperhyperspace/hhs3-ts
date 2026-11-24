@@ -51,7 +51,8 @@ async function applyPlan(group: RTableGroupImpl, plan: IngestPlan, writer: OwnId
             for (const o of entry.ops) if (o.kind === 'insert') absent.add(o.write.op.rowId);
             continue;
         }
-        await group.bundle(entry.ops.map((o) => o.write), writer);
+        // each planned op as ingestion appends it: a row op of its table, in two steps
+        for (const o of entry.ops) await group.appendPrepared(await group.prepareRowOp(o.write.table, o.write.op, writer));
     }
 }
 

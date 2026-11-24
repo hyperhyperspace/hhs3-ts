@@ -27,13 +27,16 @@ export type BundleWrite = {
 };
 
 // An entry built, signed and validated but not appended yet (HIP-29): the
-// first of the two steps of bundle and observe. `hash` is the entry's hash,
-// which appendPrepared checks the DAG gives it.
+// first of the two steps of a row op, a bundle or an observe. `hash` is the
+// entry's hash, which appendPrepared checks the DAG gives it. `table` is set
+// for a row op: appendPrepared appends it through that table's scope, which
+// wraps it in a row envelope, and `payload` and `meta` are the op's own.
 export type PreparedEntry = {
     payload: json.LiteralMap;
     meta: MetaProps;
     at: Version;
     hash: B64Hash;
+    table?: string;
 };
 
 // `liveReads`: also validate with the bound groups read through the live
@@ -108,11 +111,14 @@ export interface RTableGroup extends RObject, NestingParent {
     // and the earlier ops. The whole entry validates and applies atomically.
     bundle(writes: BundleWrite[], author?: OwnIdentity, at?: Version): Promise<B64Hash>;
 
-    // The two steps of bundle and observe (HIP-29). prepareBundle and
-    // prepareObserve build the entry, sign it and validate it, and return it
-    // with its hash, without appending it. prepareObserve always validates.
-    // appendPrepared appends a prepared entry, and throws
-    // PreparedHashMismatchError when the DAG gives it another hash.
+    // The two steps of a row op, a bundle and an observe (HIP-29).
+    // prepareRowOp, prepareBundle and prepareObserve build the entry, sign it
+    // and validate it, and return it with its hash, without appending it; a
+    // table's insert, update and delete are prepareRowOp and appendPrepared in
+    // a row. prepareObserve always validates. appendPrepared appends a
+    // prepared entry, and throws PreparedHashMismatchError when the DAG gives
+    // it another hash.
+    prepareRowOp(table: string, op: RowOpPayload, author?: OwnIdentity, at?: Version, opts?: PrepareOptions): Promise<PreparedEntry>;
     prepareBundle(writes: BundleWrite[], author?: OwnIdentity, at?: Version, opts?: PrepareOptions): Promise<PreparedEntry>;
     prepareObserve(group: string | B64Hash, refVersion: Version, author?: OwnIdentity, at?: Version, opts?: PrepareOptions): Promise<PreparedEntry>;
     appendPrepared(prepared: PreparedEntry): Promise<B64Hash>;

@@ -433,6 +433,8 @@ Additive: the orchestrator doesn't send the new fields yet.
 - **HIP-29:** three citations drifted by a few lines and are fixed. The header names `e579e35` as the tree its references are to, since most of them describe code this HIP rewrote.
 - **Left for a decision:** `rdb_adapter/src/ref_advance.ts` has no caller since the new pass, but the index still exports it; HIP-29's status and *Implemented in*.
 
+**After P8, 2026-11-24.** An ingested change is now the plain row op the app wrote, not a one-write bundle, so rdb's log shows `INSERT INTO`, `UPDATE` or `DELETE` for it and a delta's event of it names its kind and row. rdb gains `prepareRowOp`; `appendPrepared` appends a prepared row op through its table's scope, and a table's `insert`, `update` and `delete` are the two steps in a row. A failure event's op is the refused op's row envelope. Tests: `[PREP01]`-`[PREP03]` in rdb, `[IN89]` in the shared suite; IN80 and IN83 now wrap `prepareRowOp`, the method the pass calls. HIP-29, and the rdb and rdb_adapter READMEs, say so.
+
 ## Expected test flips
 
 | Test | Phase | Adaptation |

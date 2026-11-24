@@ -529,7 +529,7 @@ export function createChainCases(label: string, factory: IngestionFactory): Name
                 try {
                     await projectAs(group, target, admin);
                     const localId = await local.insert('tags', { code: 'x' });
-                    const broken = throwingOnce(group, 'prepareBundle', () => new Error('the entry could not be built')) as RTableGroup;
+                    const broken = throwingOnce(group, 'prepareRowOp', () => new Error('the entry could not be built')) as RTableGroup;
                     const result = await ingestChanges(broken, target, { writer: admin });
                     assertEquals(result.rejected.map((r) => r.reason).join(','), 'the entry could not be built', 'a failure with the message');
                     const events = (await target.drainOpEvents()).filter((e) => e.event.direction === 'failure');
@@ -608,9 +608,9 @@ export function createChainCases(label: string, factory: IngestionFactory): Name
                     const skewed = new Proxy(group, {
                         get(obj, prop, receiver) {
                             const value = Reflect.get(obj, prop, receiver);
-                            if (prop !== 'prepareBundle') return typeof value === 'function' ? value.bind(obj) : value;
-                            return async (...args: Parameters<RTableGroup['prepareBundle']>) =>
-                                ({ ...(await obj.prepareBundle(...args)), hash: 'not-the-hash' });
+                            if (prop !== 'prepareRowOp') return typeof value === 'function' ? value.bind(obj) : value;
+                            return async (...args: Parameters<RTableGroup['prepareRowOp']>) =>
+                                ({ ...(await obj.prepareRowOp(...args)), hash: 'not-the-hash' });
                         },
                     });
                     let error: unknown;
@@ -1127,6 +1127,52 @@ export function createChainCases(label: string, factory: IngestionFactory): Name
                     await assertAtCheckpoints(checkedOf(h.target), members, 'after the pass');
                 } finally {
                     await h.cleanup?.();
+                }
+            },
+        },
+        {
+            name: `[${label}-IN89] an ingested change is a plain row op of its table, the entry a native write makes, and a void of an own ingested insert names its kind and its row`,
+            invoke: async () => {
+                {
+                    const { group, admin } = await createGroup();
+                    await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', amount: '1.00' }, admin);
+                    const l1 = deriveRowId('l1', admin.keyId);
+                    const { target, read, local, cleanup } = await factory();
+                    try {
+                        await projectAs(group, target, admin);
+                        const tagId = await local.insert('tags', { code: 'x' });
+                        await local.update('ledger', (await read.syncId('ledger', l1))!, { memo: 'm' });
+                        await local.delete('tags', tagId);
+                        let entries: string[] = [];
+                        const watched = beforeSettle(target, async () => {
+                            entries = (await target.drainChanges()).changes.map((c) => c.record?.entry ?? '');
+                        });
+                        await ingestChanges(group, watched, { writer: admin });
+                        const dag = await group.getScopedDag();
+                        const shapes: string[] = [];
+                        for (const hash of entries) {
+                            const payload = (await dag.loadEntry(hash))?.payload as { action?: string; table?: string; op?: { action?: string } } | undefined;
+                            shapes.push(`${payload?.action} ${payload?.table} ${payload?.op?.action}`);
+                        }
+                        assertEquals(shapes.join('; '), 'row tags insert; row ledger update; row tags delete', 'each a row op of its table, not a bundle');
+                    } finally {
+                        await cleanup?.();
+                    }
+                }
+                {
+                    const h = await factory();
+                    try {
+                        const { members, moveK } = await revocationIn(h, 'concurrent', 'insert', 'alice');
+                        const own = await h.local.insert('notes', { body: 'own' });
+                        await moveK('carol');
+                        await h.local.insert('logs', { entry: 'after the observe' });
+                        await ingestDatabaseChanges(members, h.target);
+                        const ownRow = (await h.target.resolveRow('notes', own))?.rowId;
+                        const event = (await h.target.drainOpEvents()).find((e) => e.event.direction === 'void' && e.event.rowId === ownRow);
+                        assertEquals(`${event?.event.kind} ${event?.event.table}`, 'insert notes', "the own insert's void event names its kind, its table and its row");
+                    } finally {
+                        await h.cleanup?.();
+                    }
                 }
             },
         },

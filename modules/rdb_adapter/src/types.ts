@@ -64,11 +64,12 @@ export type AdapterConfig = {
     // check so an rdb table cannot silently collide with the convention.
     syncTableSuffix?: string;
     // FK column projection suffixes. A LOCAL foreign key column projects as an
-    // integer companion `<col><fkIdSuffix>` referencing the target table's serial
-    // `id` (an advisory DB FK); a CROSS-GROUP foreign key column projects as a
-    // text `<col><crossGroupFkSuffix>` carrying the foreign rowId (row_hash)
-    // verbatim. Business rows therefore never carry a rowId/hash column of their
-    // own. Default to '_id' and '_row_hash'.
+    // integer companion `<col><fkIdSuffix>` holding the referenced row's serial
+    // `id`, a plain column that no target declares as a database FK; a
+    // CROSS-GROUP foreign key column projects as a text `<col><crossGroupFkSuffix>`
+    // carrying the foreign rowId (row_hash) verbatim. Business rows therefore
+    // never carry a rowId/hash column of their own. Default to '_id' and
+    // '_row_hash'.
     fkIdSuffix?: string;
     crossGroupFkSuffix?: string;
     // Identity-typed business columns project as integer `<col><keyRefSuffix>`
@@ -419,13 +420,11 @@ export type IngestResult = {
 };
 
 // FK projection metadata carried on a projected column with an integer id
-// companion. The column is an integer id referencing `targetTable`'s serial
-// `id`. For a LOCAL FK this is declared as an advisory, unenforced DB FK. For a
-// co-projected CROSS-GROUP FK (`crossGroup: true`) the id is still translated at
-// apply time, but NO DB-level FOREIGN KEY is declared (the referenced table
-// belongs to another group and may be created in a different apply, so a DDL FK
-// would impose a cross-table creation order). Non-co-projected cross-group FKs
-// carry no metadata at all - they project as a plain text row_hash passthrough.
+// companion. The column is a plain integer holding a row id of `targetTable`,
+// translated at apply time; no target declares it as a database foreign key.
+// `crossGroup: true` marks a co-projected CROSS-GROUP FK, whose table belongs to
+// another group. Non-co-projected cross-group FKs carry no metadata at all -
+// they project as a plain text row_hash passthrough.
 export type FkColumnInfo = { targetTable: string; crossGroup?: boolean };
 
 // A materialized column: its target name plus the ColumnDef the target should

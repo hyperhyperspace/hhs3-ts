@@ -68,6 +68,7 @@ import { signPayload as signPayloadHelper } from "@hyper-hyper-space/hhs3_mvt";
 import type { RSchemaView } from "../rschema/interfaces.js";
 import { deriveRowOpInnerMeta } from "../rtable_group/scopes.js";
 import type { RowEnvelopePayload } from "../rtable_group/payload.js";
+import type { PreparedEntry, PrepareOptions } from "../rtable_group/interfaces.js";
 import type { Verdict, VerdictEvaluation } from "@hyper-hyper-space/hhs3_mvt";
 import type { OpVoidDetail } from "../rtable_group/op_void.js";
 import { freshVerdictEvaluation } from "../rtable_group/verdict_evaluation.js";
@@ -91,7 +92,8 @@ export type TableGroupHost = {
     resolveSchemaView(at: Version, from?: Version): Promise<RSchemaView>;
     schemaSlotsBetween(at: Version, wider: Version, from: Version): Promise<Set<string>>;
     selfValidate(): boolean;
-    validatePayload(payload: Payload, at: Version): Promise<ValidationResult>;
+    validatePayload(payload: Payload, at: Version, opts?: PrepareOptions): Promise<ValidationResult>;
+    appendPrepared(prepared: PreparedEntry): Promise<B64Hash>;
     makeTable(name: string): RTableImpl;
     isEntryVoided(entryHash: B64Hash, from: Version): Promise<boolean>;
     entryStatusIn(evaluation: VerdictEvaluation<OpVoidDetail>, entryHash: B64Hash, from: Version): Promise<Verdict<OpVoidDetail>>;
@@ -154,36 +156,61 @@ export class RTableImpl implements RTableContract {
     // extends the group's consistent snapshot (not just this table's scope).
 
     async insert(uuid: string, values: RowWrite, author?: OwnIdentity, at?: Version): Promise<B64Hash> {
-        at = at ?? await (await this.group.getScopedDag()).getFrontier();
-
         const base: InsertRowPayload = {
             action: 'insert',
             rowId: deriveRowId(uuid, author?.keyId),
             uuid,
             ...rowWriteParts(values),
         };
-
-        const payload = author !== undefined ? await this.signRowOp(base, author, at) : base;
-
-        return this.appendRowOp(payload, at);
+        return this.group.appendPrepared(await this.prepareRowOp(base, author, at));
     }
 
     async update(rowId: B64Hash, values: RowWrite, author?: OwnIdentity, at?: Version): Promise<B64Hash> {
-        at = at ?? await (await this.group.getScopedDag()).getFrontier();
-
         const base: UpdateRowPayload = { action: 'update', rowId, ...rowWriteParts(values) };
-        const payload = author !== undefined ? await this.signRowOp(base, author, at) : base;
-
-        return this.appendRowOp(payload, at);
+        return this.group.appendPrepared(await this.prepareRowOp(base, author, at));
     }
 
     async delete(rowId: B64Hash, author?: OwnIdentity, at?: Version): Promise<B64Hash> {
-        at = at ?? await (await this.group.getScopedDag()).getFrontier();
-
         const base: DeleteRowPayload = { action: 'delete', rowId };
-        const payload = author !== undefined ? await this.signRowOp(base, author, at) : base;
+        return this.group.appendPrepared(await this.prepareRowOp(base, author, at));
+    }
 
-        return this.appendRowOp(payload, at);
+    // The first of a row op's two steps (HIP-29): signs `op` within this
+    // table's scope when an author is given, validates it, and returns it with
+    // its hash, without appending it. With `liveReads`, it also validates with
+    // the bound groups read through the live observes only, as the op's
+    // verdict reads them, so an op that would be void where it stands is
+    // refused. The group's appendPrepared appends it through this table's
+    // scope, which wraps it in a row envelope: the entry a native write makes.
+    // `at` defaults to the group frontier.
+    async prepareRowOp(op: RowOpPayload, author?: OwnIdentity, at?: Version, opts: PrepareOptions = {}): Promise<PreparedEntry> {
+        at = at ?? await (await this.group.getScopedDag()).getFrontier();
+        const schemaView = await this.group.resolveSchemaView(at);
+        if (!schemaView.hasTable(this.tableName)) {
+            throw new Error(`Table '${this.tableName}' does not exist in the effective schema at this position`);
+        }
+
+        const payload = author !== undefined ? await this.signRowOp(op, author, at) : op;
+        const envelope: RowEnvelopePayload = { action: 'row', table: this.tableName, op: payload };
+        const result = await this.group.validatePayload(envelope, at);
+        if (!result.valid) {
+            throw new ValidationRejectedError(formatValidationFailure(result.why), result.why);
+        }
+        if (opts.liveReads === true) {
+            const live = await this.group.validatePayload(envelope, at, { liveReads: true });
+            if (!live.valid) {
+                throw new ValidationRejectedError(formatValidationFailure(live.why), live.why);
+            }
+        }
+
+        const scopedDag = await this.getScopedDag();
+        return {
+            payload: payload as unknown as json.LiteralMap,
+            meta: deriveRowOpInnerMeta(payload, this.tableName, schemaView),
+            at,
+            hash: await scopedDag.computeEntryHash(payload as unknown as json.Literal, at),
+            table: this.tableName,
+        };
     }
 
     // Signed within this table's scope, so the op cannot be re-enveloped for

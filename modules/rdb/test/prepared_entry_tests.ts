@@ -158,7 +158,7 @@ async function readingsDiffer(G: RTableGroupImpl, bound: RTableGroupImpl, at: Ve
 }
 
 export const preparedEntryTests = {
-    title: "[PREP] HIP-29: bundle and observe in two steps, and the second validation through the live observes",
+    title: "[PREP] HIP-29: row ops, bundle and observe in two steps, and the second validation through the live observes",
     tests: [
         {
             name: '[BUNDLE08] the two steps of bundle give the entry and the hash that one call gives',
@@ -262,6 +262,66 @@ export const preparedEntryTests = {
                 const write: BundleWrite = { table: 'notes', op: { action: 'insert', rowId: deriveRowId('n-1'), uuid: 'n-1', values: { body: 'x' } } };
                 assertTrue(await rejected(() => s.G.prepareBundle([write], undefined, at, { liveReads: true })), 'refused with liveReads');
                 await s.G.prepareBundle([write], undefined, at);   // accepted without it
+            },
+        },
+        {
+            name: '[PREP01] a row op in two steps is the entry a native write makes: a row envelope of its table, appended under its prepared hash, signed and unsigned, for an insert, an update and a delete',
+            invoke: async () => {
+                const s = await voidScenario('rule');
+                const payloadOf = async (group: RTableGroupImpl, hash: string) =>
+                    (await (await group.getScopedDag()).loadEntry(hash))?.payload as { action?: string; table?: string; op?: { action?: string; author?: string } } | undefined;
+
+                // signed, in G: Bob's note, where Mallory's observe brings in his grant
+                const at = new Set([s.malloryObserve]);
+                const { op } = s.note('n-1');
+                const prepared = await s.G.prepareRowOp('notes', op, s.bob, at);
+                assertEquals(await s.G.appendPrepared(prepared), prepared.hash, 'appended under the prepared hash');
+                const inserted = await payloadOf(s.G, prepared.hash);
+                assertEquals(`${inserted?.action} ${inserted?.table} ${inserted?.op?.action}`, 'row notes insert', 'a row envelope of its table, not a bundle');
+                assertEquals(inserted?.op?.author, s.bob.keyId, 'signed by its author');
+                const native = await (await s.G.getTable('notes')).insert('n-1', { body: 'hi' }, s.bob, at);
+                assertEquals(native, prepared.hash, 'the same entry a native insert makes');
+
+                const rowId = deriveRowId('n-1', s.bob.keyId);
+                const update = await s.G.prepareRowOp('notes', { action: 'update', rowId, values: { body: 'edited' } }, s.bob, new Set([prepared.hash]));
+                await s.G.appendPrepared(update);
+                assertEquals((await payloadOf(s.G, update.hash))?.op?.action, 'update', 'an update');
+                const del = await s.G.prepareRowOp('notes', { action: 'delete', rowId }, s.bob, new Set([update.hash]));
+                await s.G.appendPrepared(del);
+                assertEquals((await payloadOf(s.G, del.hash))?.op?.action, 'delete', 'and a delete');
+
+                // unsigned, in K, which has no identity provider
+                const kAt = await frontier(s.K);
+                const grant = await s.K.prepareRowOp('grants', { action: 'insert', rowId: deriveRowId('g-x'), uuid: 'g-x', values: { holder: 'x' } }, undefined, kAt);
+                await s.K.appendPrepared(grant);
+                const anonymous = await payloadOf(s.K, grant.hash);
+                assertEquals(`${anonymous?.action} ${anonymous?.table} ${anonymous?.op?.author}`, 'row grants undefined', 'unsigned');
+                assertEquals(await (await s.K.getTable('grants')).insert('g-x', { holder: 'x' }, undefined, kAt), grant.hash, 'the same entry a native insert makes');
+            },
+        },
+        {
+            name: '[PREP02] appendPrepared throws PreparedHashMismatchError for a prepared row op whose hash was changed, and appends nothing',
+            invoke: async () => {
+                const s = await voidScenario('rule');
+                const prepared = await s.G.prepareRowOp('notes', s.note('n-1').op, s.bob, new Set([s.malloryObserve]));
+                const before = await frontier(s.G);
+                let error: unknown;
+                try { await s.G.appendPrepared({ ...prepared, hash: 'not-the-hash' }); } catch (e) { error = e; }
+                assertTrue(error instanceof PreparedHashMismatchError, 'the mismatch is reported');
+                assertEquals([...(await frontier(s.G))].sort().join(), [...before].sort().join(), 'nothing was appended');
+            },
+        },
+        {
+            name: "[PREP03] the void scenario with a row op: with liveReads Bob's insert is refused, and without, accepted and void where it stands",
+            invoke: async () => {
+                for (const form of ['rule', 'fk'] as const) {
+                    const s = await voidScenario(form);
+                    const { op } = s.note('n-1');
+                    assertTrue(await rejected(() => s.G.prepareRowOp('notes', op, s.bob, s.voidAt, { liveReads: true })), `${form}: refused with liveReads`);
+                    const prepared = await s.G.prepareRowOp('notes', op, s.bob, s.voidAt);
+                    await s.G.appendPrepared(prepared);
+                    assertTrue(await s.G.isEntryVoided(prepared.hash, new Set([prepared.hash])), `${form}: accepted without it, and void where it stands`);
+                }
             },
         },
     ],
