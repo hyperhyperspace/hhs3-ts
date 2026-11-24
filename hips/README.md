@@ -32,6 +32,6 @@ A HIP proposes a change to Hyper Hyper Space: to its design, its implementation,
 | [26](0026-encrypted-tables.md) | Encrypted tables | design | draft |
 | [27](0027-relays.md) | Relays: always-on hosts for databases | design | draft |
 | [28](0028-audience-keys.md) | Audience keys | design | draft |
-| [29](0029-checkpoint-consistency.md) | Checkpoint consistency | design | draft |
+| [29](0029-checkpoint-consistency.md) | Checkpoint consistency | design | implemented |
 | [30](0030-cross-group-skew.md) | Skew between groups in a projection target | design | deferred |
 | [31](0031-projection-over-pending-changes.md) | Projection over pending changes | design | deferred |
