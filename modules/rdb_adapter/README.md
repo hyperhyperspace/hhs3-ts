@@ -219,7 +219,8 @@ const messages = engine
   .limit(50);
 
 const rows = await messages.results();          // one-shot read
-const sub  = engine.monitor(messages);          // live QuerySubscription<ProjectedRow[]>
+const sub  = engine.monitor(messages);          // a QuerySubscription<ProjectedRow[]>; this starts nothing
+const stop = sub.subscribe(() => { /* read sub.getSnapshot() */ });   // the query is live until stop()
 ```
 
 - `select(...columns)` chooses the delivered columns; `id` is always included. If `orderBy` or an exported `.col()` column is omitted from `select`, the engine still fetches it to maintain sort tuples and dependency sets, then strips it from the delivered rows.
@@ -239,7 +240,7 @@ const profiles = engine
 const sub = engine.monitor({ messages, profiles });
 ```
 
-On each flush the engine evaluates upstream monitors before downstream ones, and every run of a monitor waits until each query its `.col()` parameters read has its first result. So `profiles` is never computed on the empty key set of a `messages` monitor that has not run yet: not on its first run or in `results()`, and not after its subscription is dropped and taken again, as React's Strict Mode does. If `messages` re-runs (say, a message body changed or a new message arrived from an author already on screen) and its distinct set of `author_key_id` values is unchanged, that dependency edge does not re-run `profiles`, and `snapshot.data.profiles` keeps the exact same array reference.
+On each flush the engine evaluates upstream monitors before downstream ones. A monitor holds the monitors of the queries its `.col()` parameters read for as long as it exists, and every run of it waits until each of them has its first result. So `profiles` is never computed on the empty key set of a `messages` monitor that has not run yet, on its first run or in `results()`. If `messages` re-runs (say, a message body changed or a new message arrived from an author already on screen) and its distinct set of `author_key_id` values is unchanged, that dependency edge does not re-run `profiles`, and `snapshot.data.profiles` keeps the exact same array reference.
 
 A UI reads the projected tables, not `RObject` views. What is on screen is a query over a projected table, and three different commits can change its result:
 
@@ -278,9 +279,28 @@ Every target therefore enforces the **drain rule**: `drainChanges()` reads its o
 
 ### Subscriptions and snapshot identity
 
-`monitor()` returns a `QuerySubscription<T>` (`getSnapshot()`, `subscribe(listener)`, `whenReady()`), shaped directly for React's `useSyncExternalStore` or any signal/store wrapper.
+`monitor()` returns a `QuerySubscription<T>`: a handle on a query, shaped directly for React's `useSyncExternalStore` or any signal/store wrapper. It has three functions:
 
-Monitors are deduplicated and reference-counted by a canonical fingerprint of the query plan (table, `select`, `where` template, sorted literal parameters, `orderBy`, cursor `side`+`id`, `limit`). A subscription holds its monitor, and a held monitor holds the monitors of the queries its `.col()` parameters read. A monitor nobody holds leaves the engine and stops running. `results()` holds its monitor only while it reads, so a one-shot read leaves nothing running, and it never drops a monitor a subscription holds. Dirty monitors coalesce onto a microtask. When a re-query finishes:
+- `getSnapshot()` returns what the query shows now.
+- `subscribe(listener)` keeps the query live and calls `listener` on each change, until the function it returns is called.
+- `whenReady()` resolves with the query's first result.
+
+**A query runs only while something uses it.** Behind each running query is a *monitor*: it runs the query, keeps the last result, and runs it again when a commit touches its table. There is at most one monitor per query, and everyone showing that query shares it. Two queries are the same when the canonical fingerprint of their plans is (table, `select`, `where` template, sorted literal parameters, `orderBy`, cursor `side`+`id`, `limit`). Each monitor counts its users:
+
+- a listener, from `subscribe` until its cleanup function is called;
+- a monitor whose query reads it through `.col()`, for as long as that monitor exists;
+- a `whenReady()` or `results()` call, while it waits for the first result.
+
+The first user makes the monitor and starts its first run. When the count is back at zero the monitor leaves the engine, and so do the upstream monitors this leaves without a user. A run still in flight stops and delivers nothing. So a monitor is in the engine only while something uses it, and the rest follows from that:
+
+- **Making a handle starts nothing.** `monitor(query)` only remembers the query. A handle that is never subscribed runs no query and leaves nothing behind, so one can be made where the result may be thrown away, as in a React render.
+- **Before it is subscribed, a handle only looks.** `getSnapshot()` returns the snapshot of the monitor already running for that query, when another subscription keeps one running, and a loading snapshot otherwise. It never makes a monitor. The loading snapshot is one constant object, which a new monitor also shows until its first result, so `getSnapshot()` returns the same object just before `subscribe` and just after.
+- **A monitor leaves when the current synchronous code ends, not at once.** This is a microtask, not a timer. A subscription dropped and taken again in one go therefore keeps its monitor, and no query runs for it: React's Strict Mode remounting a component, one component leaving as another that shows the same query arrives, or a component whose query changes and keeps its `.col()` upstream.
+- **A monitor that left does not come back.** Subscribing again later, through the same handle or a new one, makes a new monitor, which runs the query afresh.
+- **A one-shot read leaves nothing running.** `results()` and `whenReady()` use the monitor only while they wait, and never stop one a subscription keeps running. To keep a query live, `subscribe` first: an `await whenReady()` followed by `subscribe` runs the query twice.
+- **A query set** uses its members' monitors while it has a listener. Before that its snapshot is built from the members already running, and a member nobody runs counts as loading.
+
+Dirty monitors coalesce onto a microtask. When a re-query finishes:
 
 - Any row whose columns equal the previous snapshot's row with the same `id` reuses the previous `ProjectedRow` object reference.
 - If every row in the new result matches and no relevant `OpEvent` arrived, `getSnapshot()` keeps returning the exact same `QuerySnapshot` object and listeners are not called.
@@ -293,7 +313,7 @@ A snapshot's `events` are the op-events about rows the query shows: local writes
 - **Which queries it reaches.** An event reaches a query when a row it names is in the query's table and in its result just before the event's commit, or just after it. The table counts, because local ids are per table: the refusal of row 1 of `chat_messages` never reaches a query that shows row 1 of `user_profiles`. Refusals and flips follow the same rule. A refused insert or update, and a void, name a row that was on screen and is now reverted or gone. A refused delete, and a reinstate, name a row that comes back, and the event arrives with the result that shows it again.
 - **When it is delivered.** In the delivery that follows its commit, even when the rows did not change, as when the voided op was an update a later update had already overwritten.
 - **Never later.** A monitor starts at the op-event log's high-water mark and moves past every event it reads, whether the event concerned it or not. An event for a row off the page is not delivered when that row later scrolls into the page, and a monitor opened after an event never sees it. The log keeps every event for `opEvents({ afterId })`.
-- **Query sets.** A query set delivers once per pass, after every member that had to re-run has, and its snapshot carries the events of its members' deliveries in log order, each once even when two members show the same row.
+- **Query sets.** A query set delivers once per pass, after every member that had to re-run has, and its snapshot carries the events of its members' deliveries in log order, each once even when two members show the same row. It carries the events of the deliveries made while it has a listener, and no earlier ones.
 
 ## Layout
 
@@ -336,7 +356,7 @@ Deterministic, fast checks on the pure planners (each prints under its own conso
 - `[ADPTI] rdb_adapter inverse planner` (`ingest_tests.ts`) — ingest planner (mint, reverse-map, the set-aside of readonly and author columns, refusals).
 - `[ADPTV] rdb_adapter concurrency op-events (verdict flips)` (`verdict_events_tests.ts`).
 - `[IDX] rdb_adapter projection-local indexes` (`index_actions_tests.ts`) — index planner, plus reconcile and apply-time index maintenance end to end on the memory target.
-- `[ADPTQ] Query evaluation` and `Query monitors` (`query_eval_tests.ts`, `query_monitor_tests.ts`) — `evalWhere`, `compareSortTuples`, `MemoryTarget` commit events and keyset seeks, and `QueryEngine` relevance filtering and [events in a snapshot](#events-in-a-snapshot).
+- `[ADPTQ] Query evaluation` and `Query monitors` (`query_eval_tests.ts`, `query_monitor_tests.ts`) — `evalWhere`, `compareSortTuples`, `MemoryTarget` commit events and keyset seeks, and `QueryEngine` relevance filtering, [events in a snapshot](#events-in-a-snapshot), and [when a monitor is in the engine](#subscriptions-and-snapshot-identity).
 
 ### Planner-parity fuzzer
 

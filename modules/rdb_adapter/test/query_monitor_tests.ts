@@ -42,16 +42,42 @@ function flip(direction: 'void' | 'reinstate', opHash: string, rows: Partial<OpE
     return { origin: 'concurrency', direction, groupId: 'g', opHash, kind: 'update', ...rows };
 }
 
-// Every snapshot a subscription delivers from now on (after its first result).
-function deliveries<T>(sub: QuerySubscription<T>): QuerySnapshot<T>[] {
+// Subscribes, waits for the first result, and returns every snapshot the
+// subscription delivers after it. A handle is live only while subscribed, so
+// a test that reads `getSnapshot()` or expects deliveries goes through here.
+async function live<T>(sub: QuerySubscription<T>): Promise<QuerySnapshot<T>[]> {
     const seen: QuerySnapshot<T>[] = [];
-    sub.subscribe(() => { seen.push(sub.getSnapshot()); });
+    let recording = false;
+    sub.subscribe(() => { if (recording) seen.push(sub.getSnapshot()); });
+    await sub.whenReady();
+    recording = true;
     return seen;
+}
+
+// The table of each query the target runs from now on. With a latency, each
+// query takes that long, as on an asynchronous store.
+function countQueries(target: MemoryTarget, latencyMs = 0): string[] {
+    const tables: string[] = [];
+    const original = target.executeQuery.bind(target);
+    target.executeQuery = async (plan) => {
+        tables.push(plan.table);
+        if (latencyMs > 0) await sleep(latencyMs);
+        return original(plan);
+    };
+    return tables;
+}
+
+// What the engine holds: its monitors and its query sets.
+function held(engine: QueryEngine): string {
+    const inside = engine as unknown as { monitors: Map<string, unknown>; sets: Set<unknown> };
+    return `${inside.monitors.size} monitors, ${inside.sets.size} sets`;
 }
 
 const ids = (rows: { id: number }[]): string => rows.map((row) => row.id).join(',');
 const eventIds = (events: OpEvent[]): string => events.map((e) => `${e.direction} ${e.opHash}`).join('; ');
-const pause = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 20));
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+const pause = (): Promise<void> => sleep(20);
+const names = (rows: { [column: string]: unknown }[]): string => rows.map((row) => row.name).join(',');
 
 export const queryMonitorTests = {
     title: 'Query monitors',
@@ -107,9 +133,7 @@ export const queryMonitorTests = {
                 const engine = new QueryEngine(target);
                 const notes = engine.monitor(engine.selectFrom('notes'));
                 const folders = engine.monitor(engine.selectFrom('folders'));
-                await Promise.all([notes.whenReady(), folders.whenReady()]);
-                const toNotes = deliveries(notes);
-                const toFolders = deliveries(folders);
+                const [toNotes, toFolders] = await Promise.all([live(notes), live(folders)]);
                 assertEquals(`${ids(notes.getSnapshot().data)} ${ids(folders.getSnapshot().data)}`, '1 1', 'each table shows its row 1');
                 const shown = folders.getSnapshot().data;
 
@@ -134,9 +158,7 @@ export const queryMonitorTests = {
                 const engine = new QueryEngine(target);
                 const notes = engine.monitor(engine.selectFrom('notes'));
                 const folders = engine.monitor(engine.selectFrom('folders'));
-                await Promise.all([notes.whenReady(), folders.whenReady()]);
-                const toNotes = deliveries(notes);
-                const toFolders = deliveries(folders);
+                const [toNotes, toFolders] = await Promise.all([live(notes), live(folders)]);
 
                 const writes: OpEvent['writes'] = [
                     { table: 'notes', action: 'insert', rowId: 'N2' },
@@ -174,8 +196,8 @@ export const queryMonitorTests = {
                     first: engine.selectFrom('notes').where('title = :t', { t: 'a' }),
                     folders: engine.selectFrom('folders'),
                 });
-                const ready = await set.whenReady();
-                const toSet = deliveries(set);
+                const toSet = await live(set);
+                const ready = set.getSnapshot();
                 assertEquals(`${ids(ready.data.all!)} ${ids(ready.data.first!)} ${ids(ready.data.folders!)}`, '1,2 1 1', 'each member shows its rows');
 
                 // Note 1 is in two members; the folder's event is logged first.
@@ -203,8 +225,7 @@ export const queryMonitorTests = {
                 await project(target, [note('N1', 'a'), note('N2', 'b')]);
                 const engine = new QueryEngine(target);
                 const page = engine.monitor(engine.selectFrom('notes').orderBy('id').limit(1));
-                await page.whenReady();
-                const toPage = deliveries(page);
+                const toPage = await live(page);
                 assertEquals(ids(page.getSnapshot().data), '1', 'the page shows row 1');
 
                 await project(target, [note('N2', 'b2')], [flip('void', 'OP1', { table: 'notes', rowId: 'N2' })]);
@@ -253,10 +274,8 @@ export const queryMonitorTests = {
                 const notes = engine.selectFrom('notes');
                 const folders = engine.selectFrom('folders').where('id IN :ids', { ids: notes.col('folder_id') });
                 const sub = engine.monitor(folders);
-                assertEquals((await sub.whenReady()).data.map((row) => row.name).join(','), 'box',
-                    'its first result already reads the folder ids of the notes');
-                const names: string[] = [];
-                sub.subscribe(() => { names.push(sub.getSnapshot().data.map((row) => row.name).join(',')); });
+                const delivered = await live(sub);
+                assertEquals(names(sub.getSnapshot().data), 'box', 'its first result already reads the folder ids of the notes');
 
                 await notes.results();
                 await folders.results();
@@ -264,31 +283,229 @@ export const queryMonitorTests = {
                 await pause();
                 target.localInsert('notes', { title: 'c', folder_id: bag });
                 await pause();
-                assertEquals(JSON.stringify(names), JSON.stringify(['box,bag']),
+                assertEquals(JSON.stringify(delivered.map((snapshot) => names(snapshot.data))), JSON.stringify(['box,bag']),
                     'the subscription delivers once, when a note points at the new folder, with no step through empty keys');
                 engine.close();
             },
         },
         {
-            name: "[ADPTQ18] a subscription dropped and taken again at once, as React's Strict Mode does, never runs its query on empty keys",
+            name: "[ADPTQ18] a subscription dropped and taken again at once, as React's Strict Mode does, keeps its monitors: no query runs twice",
+            invoke: async () => {
+                const mount = async (strict: boolean) => {
+                    const target = new MemoryTarget({ captureChanges: true });
+                    await table(target);
+                    const box = target.localInsert('folders', { name: 'box' });
+                    target.localInsert('notes', { title: 'a', folder_id: box });
+                    const queries = countQueries(target);
+                    const engine = new QueryEngine(target);
+                    const notes = engine.selectFrom('notes');
+                    const sub = engine.monitor(engine.selectFrom('folders').where('id IN :ids', { ids: notes.col('folder_id') }));
+                    const delivered: string[] = [];
+                    const listener = () => { delivered.push(names(sub.getSnapshot().data)); };
+                    if (strict) sub.subscribe(listener)();   // mounted and unmounted
+                    sub.subscribe(listener);                 // mounted, or mounted again
+                    await sub.whenReady();
+                    await pause();
+                    engine.close();
+                    return { queries: [...queries].sort().join(','), delivered: JSON.stringify(delivered) };
+                };
+                const once = await mount(false);
+                const again = await mount(true);
+                assertEquals(again.queries, once.queries, 'the same queries as a single subscribe');
+                assertEquals(`${once.delivered} ${again.delivered}`, '["box"] ["box"]', 'one delivery each, the first result, with no step through no folder');
+            },
+        },
+        {
+            name: '[ADPTQ19] a handle nobody subscribes to starts nothing: it shows loading, and no query ever runs for it',
+            invoke: async () => {
+                const target = new MemoryTarget({ captureChanges: true });
+                await table(target);
+                target.localInsert('notes', { title: 'a', folder_id: 1 });
+                const queries = countQueries(target);
+                const engine = new QueryEngine(target);
+                const one = engine.monitor(engine.selectFrom('notes'));
+                const set = engine.monitor({ notes: engine.selectFrom('notes').where('title = :t', { t: 'a' }), folders: engine.selectFrom('folders') });
+                assertEquals(`${one.getSnapshot().loading} ${set.getSnapshot().loading}`, 'true true', 'a single query and a set both show loading');
+                await pause();
+                target.localInsert('notes', { title: 'b', folder_id: 1 });
+                target.localInsert('folders', { name: 'box' });
+                await pause();
+                assertEquals(queries.length, 0, 'no query ran, before the writes or after them');
+                assertEquals(held(engine), '0 monitors, 0 sets', 'and the engine holds nothing');
+                assertEquals(`${one.getSnapshot().loading} ${set.getSnapshot().loading}`, 'true true', 'they still show loading');
+                engine.close();
+            },
+        },
+        {
+            name: '[ADPTQ20] a .col() query dropped before its first result leaves nothing behind, and the engine keeps working',
+            invoke: async () => {
+                // Dropped at once; dropped while the upstream's query runs; and the
+                // same after a write that made the dependent due to run again.
+                for (const { wait, write } of [{ wait: 0, write: false }, { wait: 3, write: false }, { wait: 3, write: true }]) {
+                    const which = `dropped after ${wait} ms${write ? ' and a write' : ''}`;
+                    const target = new MemoryTarget({ captureChanges: true });
+                    await table(target);
+                    const box = target.localInsert('folders', { name: 'box' });
+                    target.localInsert('notes', { title: 'a', folder_id: box });
+                    const queries = countQueries(target, 10);
+                    const engine = new QueryEngine(target);
+                    const notes = engine.selectFrom('notes');
+                    const folders = engine.selectFrom('folders').where('id IN :ids', { ids: notes.col('folder_id') });
+                    const drop = engine.monitor(folders).subscribe(() => {});
+                    if (wait > 0) await sleep(wait);
+                    if (write) {
+                        target.localInsert('folders', { name: 'bag' });
+                        await sleep(1);
+                    }
+                    drop();
+                    await sleep(60);
+                    assertEquals(held(engine), '0 monitors, 0 sets', `${which}: the engine holds nothing`);
+                    const before = queries.length;
+                    target.localInsert('notes', { title: 'b', folder_id: box });
+                    target.localInsert('folders', { name: 'bin' });
+                    await sleep(60);
+                    assertEquals(queries.length, before, `${which}: later writes to either table run no query`);
+
+                    // A set hears of a member's first result as it arrives.
+                    const later = engine.monitor({ all: engine.selectFrom('folders') });
+                    const dropLater = later.subscribe(() => {});
+                    await sleep(60);
+                    assertEquals(later.getSnapshot().loading, false, `${which}: a set subscribed afterwards still loads`);
+                    dropLater();
+                    engine.close();
+                }
+            },
+        },
+        {
+            name: '[ADPTQ21] a subscription dropped as another is taken keeps what both use: the monitor of the same query, and the upstream of a query that changes',
+            invoke: async () => {
+                const target = new MemoryTarget({ captureChanges: true });
+                await table(target);
+                const box = target.localInsert('folders', { name: 'box' });
+                target.localInsert('folders', { name: 'bag' });
+                target.localInsert('notes', { title: 'a', folder_id: box });
+                const queries = countQueries(target);
+                const engine = new QueryEngine(target);
+
+                // The same query: one component leaves as another arrives.
+                const first = engine.monitor(engine.selectFrom('notes'));
+                const dropFirst = first.subscribe(() => {});
+                await first.whenReady();
+                const shown = first.getSnapshot();
+                const second = engine.monitor(engine.selectFrom('notes'));
+                assertEquals(second.getSnapshot() === shown, true, 'a new handle shows the running monitor before it subscribes');
+                let before = queries.length;
+                dropFirst();
+                const dropSecond = second.subscribe(() => {});
+                await pause();
+                assertEquals(second.getSnapshot() === shown, true, 'and the same snapshot object after it takes over');
+                assertEquals(queries.length, before, 'no query ran');
+                dropSecond();
+                await pause();
+
+                // A query that changes a literal and keeps its upstream.
+                const notes = engine.selectFrom('notes').where('title = :t', { t: 'a' });
+                const named = (name: string) => engine.monitor(
+                    engine.selectFrom('folders').where('name = :n AND id IN :ids', { n: name, ids: notes.col('folder_id') }));
+                const one = named('box');
+                const dropOne = one.subscribe(() => {});
+                await one.whenReady();
+                await pause();
+                assertEquals(names(one.getSnapshot().data), 'box', 'the first query shows the folder of the note');
+                before = queries.filter((queried) => queried === 'notes').length;
+                const other = named('bag');
+                dropOne();
+                other.subscribe(() => {});
+                await other.whenReady();
+                await pause();
+                assertEquals(queries.filter((queried) => queried === 'notes').length, before, 'the upstream both queries read is not queried again');
+                assertEquals(other.getSnapshot().data.length, 0, "the changed query has its own result: no note points at 'bag'");
+                engine.close();
+            },
+        },
+        {
+            name: '[ADPTQ22] before subscribing, a query set shows the rows of members already running, and a member not running counts as loading',
             invoke: async () => {
                 const target = new MemoryTarget({ captureChanges: true });
                 await table(target);
                 const box = target.localInsert('folders', { name: 'box' });
                 target.localInsert('notes', { title: 'a', folder_id: box });
                 const engine = new QueryEngine(target);
-                const notes = engine.selectFrom('notes');
-                const sub = engine.monitor(engine.selectFrom('folders').where('id IN :ids', { ids: notes.col('folder_id') }));
-                await sub.whenReady();
-                const names: string[] = [];
-                const listener = () => { names.push(sub.getSnapshot().data.map((row) => row.name).join(',')); };
+                await Promise.all([live(engine.monitor(engine.selectFrom('notes'))), live(engine.monitor(engine.selectFrom('folders')))]);
 
-                sub.subscribe(listener)();   // mounted and unmounted: both monitors leave the engine
-                sub.subscribe(listener);     // mounted again: the notes monitor is a new one
-                target.localInsert('folders', { name: 'bag' });   // a write before that one has run
+                const set = engine.monitor({ notes: engine.selectFrom('notes'), folders: engine.selectFrom('folders') });
+                const early = set.getSnapshot();
+                assertEquals(`${early.loading} ${ids(early.data.notes!)} ${names(early.data.folders!)}`, 'false 1 box', 'the rows at once, not loading');
+                assertEquals(set.getSnapshot() === early, true, 'the same object while nothing changes');
+                set.subscribe(() => {});
+                assertEquals(set.getSnapshot() === early, true, 'and after subscribing');
                 await pause();
-                assertEquals(JSON.stringify(names), '[]', "nothing changed on screen, so nothing is delivered, not even a step through no folder");
-                assertEquals(sub.getSnapshot().data.map((row) => row.name).join(','), 'box', 'the query still shows the folder of the note');
+                assertEquals(set.getSnapshot() === early, true, 'and it stays: nothing was delivered');
+
+                const half = engine.monitor({ notes: engine.selectFrom('notes'), none: engine.selectFrom('folders').where('name = :n', { n: 'none' }) });
+                const snap = half.getSnapshot();
+                assertEquals(`${snap.loading} ${ids(snap.data.notes!)} ${snap.data.none!.length}`, 'true 1 0', 'a member that is not running yet counts as loading');
+                engine.close();
+            },
+        },
+        {
+            name: '[ADPTQ23] with nothing running, getSnapshot returns the same object before subscribing and right after',
+            invoke: async () => {
+                const target = new MemoryTarget({ captureChanges: true });
+                await table(target);
+                const engine = new QueryEngine(target);
+                const one = engine.monitor(engine.selectFrom('notes'));
+                const before = one.getSnapshot();
+                one.subscribe(() => {});
+                assertEquals(one.getSnapshot() === before, true, 'a single query');
+                const set = engine.monitor({ folders: engine.selectFrom('folders'), some: engine.selectFrom('notes').where('title = :t', { t: 'a' }) });
+                const early = set.getSnapshot();
+                set.subscribe(() => {});
+                assertEquals(set.getSnapshot() === early, true, 'a query set');
+                assertEquals(`${before.loading} ${early.loading}`, 'true true', 'both loading');
+                engine.close();
+            },
+        },
+        {
+            name: '[ADPTQ24] a handle subscribed again after its monitor left runs its query again',
+            invoke: async () => {
+                const target = new MemoryTarget({ captureChanges: true });
+                await table(target);
+                target.localInsert('folders', { name: 'box' });
+                const engine = new QueryEngine(target);
+                const sub = engine.monitor(engine.selectFrom('folders'));
+                const drop = sub.subscribe(() => {});
+                await sub.whenReady();
+                drop();
+                await pause();
+                target.localInsert('folders', { name: 'bag' });
+                await pause();
+                assertEquals(sub.getSnapshot().loading, true, 'with nobody subscribed, the handle shows loading again');
+                sub.subscribe(() => {});
+                assertEquals(names((await sub.whenReady()).data), 'box,bag', 'the write made meanwhile is in its first result');
+                engine.close();
+            },
+        },
+        {
+            name: '[ADPTQ25] whenReady on a query set nobody subscribed to returns its rows and leaves nothing',
+            invoke: async () => {
+                const target = new MemoryTarget({ captureChanges: true });
+                await table(target);
+                const box = target.localInsert('folders', { name: 'box' });
+                target.localInsert('notes', { title: 'a', folder_id: box });
+                const queries = countQueries(target);
+                const engine = new QueryEngine(target);
+                const notes = engine.selectFrom('notes');
+                const folders = engine.selectFrom('folders').where('id IN :ids', { ids: notes.col('folder_id') });
+                const snap = await engine.monitor({ notes, folders }).whenReady();
+                assertEquals(`${snap.loading} ${ids(snap.data.notes!)} ${names(snap.data.folders!)}`, 'false 1 box', "the members' rows, the dependent one read through the other");
+                await pause();
+                assertEquals(held(engine), '0 monitors, 0 sets', 'the engine holds nothing afterwards');
+                const before = queries.length;
+                target.localInsert('notes', { title: 'b', folder_id: box });
+                target.localInsert('folders', { name: 'bag' });
+                await pause();
+                assertEquals(queries.length, before, 'and later writes run no query');
                 engine.close();
             },
         },

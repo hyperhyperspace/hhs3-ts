@@ -16,6 +16,10 @@ export function useQuery(
 ): QuerySnapshot<ProjectedRow[] | { [name: string]: ProjectedRow[] }> {
     const source = useProjection();
     const key = queryKey(query);
+    // The memo only saves work. Making a subscription starts nothing, and any
+    // two for one fingerprint are interchangeable, so React may call this
+    // twice or throw its result away and nothing is left behind. The query
+    // starts when React subscribes, after the screen update.
     const subscription = useMemo(
         () => source.monitor(query) as QuerySubscription<ProjectedRow[] | { [name: string]: ProjectedRow[] }>,
         [source, key],

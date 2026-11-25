@@ -44,8 +44,13 @@ function RoomMessages({ roomId, beforeId }: { roomId: number; beforeId?: number 
 ## How it behaves on render
 
 - **Keyed by value fingerprint, not object identity.** `TableQuery` instances and parameter arrays or sets can be built inline during render. `useQuery` computes the canonical value fingerprint of the query (or query set) and retains the same `QuerySubscription` as long as the fingerprint does not change. Changing a bound parameter or `.before(id)` / `.after(id)` switches to the monitor for the new fingerprint and releases the old one.
-- **Strict Mode safe.** Monitor reference counts are incremented in `subscribe` and decremented in its cleanup function, so React 18 Strict Mode's double mount/unmount settles cleanly on one active monitor.
+- **A render starts nothing.** `useQuery` makes its subscription during render, which only remembers the query. The query starts when React subscribes, after the screen update. A render React throws away leaves nothing in the engine: Strict Mode's second render, a transition that is abandoned, a tree that suspends before it mounts.
+- **The first screen update of a query shows `loading`,** unless a mounted component already shows the same query. Then its rows are there on the first render, and the same goes for each member of a query set.
+- **Strict Mode safe.** Strict Mode unmounts and remounts a new component in one go, which keeps its monitors: no query runs twice, and nothing is left after the real unmount.
+- **Handing over.** When one component leaves as another that shows the same query arrives, in the same update, the monitor keeps running and the arriving component never shows `loading`. A component whose query changes and keeps its `.col()` upstream keeps that upstream's monitor too.
 - **Referentially stable snapshots and rows.** When a local write is later confirmed by a matching `apply()` project-back, or when an unrelated table or off-page row changes, the snapshot reference does not change and the component does not re-render. In a query set `{ messages, profiles }`, if `messages` updates without changing the set of `author_key_id` values, `data.profiles` keeps the exact same array reference.
+
+The rules behind this are in [rdb_adapter's Subscriptions and snapshot identity](../rdb_adapter#subscriptions-and-snapshot-identity).
 
 ## Test
 

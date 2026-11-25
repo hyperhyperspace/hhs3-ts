@@ -72,8 +72,11 @@ const notes = projection
   .orderBy('id', 'desc')
   .limit(50);
 
-const sub = projection.monitor(notes);
+const sub = projection.monitor(notes);                                // starts nothing
+const stop = sub.subscribe(() => { /* read sub.getSnapshot() */ });   // the query is live until stop()
 ```
+
+A query runs only while something uses it, as [rdb_adapter's Subscriptions and snapshot identity](../rdb_adapter#subscriptions-and-snapshot-identity) explains.
 
 `projection.onCommit(listener)` forwards the target's commit events. `SqliteTarget`, `IdbTarget`, and `MemoryTarget` emit `local`, `apply`, and `settle`. [rhost](../rhost) uses it to stream commits to `watchCommits` clients. The query language, `.before(id)` / `.after(id)` keyset seeks, `.col()` query-set DAGs, and the relevance rules are described in [rdb_adapter's Reactive queries section](../rdb_adapter#reactive-queries). For React components, see [hhs3_rdb_react](../rdb_react).
 

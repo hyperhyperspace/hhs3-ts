@@ -24,9 +24,17 @@ export type QuerySnapshot<T> = {
     error?: unknown;
 };
 
+// What `monitor()` returns. Making one starts nothing: a query runs only while
+// something uses it.
 export interface QuerySubscription<T> {
+    // What the query shows now: the result of the query while something keeps
+    // it running, and loading otherwise. It only looks, and returns the same
+    // object until the result changes.
     getSnapshot(): QuerySnapshot<T>;
+    // Keeps the query running and calls the listener on each change, until
+    // the returned function is called.
     subscribe(listener: () => void): () => void;
+    // The first result. It keeps the query running only while it waits.
     whenReady(): Promise<QuerySnapshot<T>>;
 }
 
@@ -76,19 +84,13 @@ export class TableQuery {
         return new ColumnSetRef(this, column);
     }
 
-    // A one-shot read. It holds the query's monitor only while it reads, so
-    // the monitor, and the upstream ones it held, leave the engine after it
-    // unless a subscription holds them.
+    // A one-shot read: the rows of the query's first result. The read keeps
+    // the query running only while it waits, so nothing it started is left
+    // afterwards, and it never stops a query a subscription keeps running.
     async results(): Promise<ProjectedRow[]> {
-        const subscription = this.source.monitor(this);
-        const unsubscribe = subscription.subscribe(() => {});
-        try {
-            const snapshot = await subscription.whenReady();
-            if (snapshot.error !== undefined) throw snapshot.error;
-            return snapshot.data as ProjectedRow[];
-        } finally {
-            unsubscribe();
-        }
+        const snapshot = await this.source.monitor(this).whenReady();
+        if (snapshot.error !== undefined) throw snapshot.error;
+        return snapshot.data as ProjectedRow[];
     }
 
     template(): WhereTemplate | undefined {

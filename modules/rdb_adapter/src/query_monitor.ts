@@ -24,10 +24,24 @@ type Store = QueryableTarget & ReactiveChangeTarget & Partial<OpEventLog>;
 
 type RowView = { [column: string]: json.Literal | null | undefined };
 
+// What a query shows before its first result. One object, for a query with no
+// monitor and for a monitor that has not run yet: a reader that compares
+// snapshots by identity, as React does, sees no change when a monitor is made.
+const LOADING: QuerySnapshot<ProjectedRow[]> = Object.freeze({
+    data: Object.freeze([]) as unknown as ProjectedRow[],
+    events: Object.freeze([]) as unknown as OpEvent[],
+    loading: true,
+});
+
+type Listener = { listener: () => void };
+
 export class QueryEngine {
     readonly source = new QuerySourceImpl(this);
     private readonly monitors = new Map<string, Monitor>();
     private readonly sets = new Set<QuerySet>();
+    // The monitors whose count reached zero in the current synchronous code.
+    private readonly idle = new Set<Monitor>();
+    private sweepQueued = false;
     private flushQueued = false;
     private flushing = 0;
     private readonly onCommit = (commit: TargetCommitEvent): void => { this.receive(commit); };
@@ -42,50 +56,85 @@ export class QueryEngine {
 
     monitor(query: TableQuery): QuerySubscription<ProjectedRow[]>;
     monitor(query: { [name: string]: TableQuery }): QuerySubscription<{ [name: string]: ProjectedRow[] }>;
+    // Returns a handle and touches nothing. A monitor exists only while
+    // something holds it: a subscribed listener, a monitor that reads it
+    // through `.col()`, or a one-shot read while it waits.
     monitor(query: TableQuery | { [name: string]: TableQuery }): QuerySubscription<ProjectedRow[] | { [name: string]: ProjectedRow[] }> {
-        if (query instanceof TableQuery) return this.open(query).subscription();
-        const set = new QuerySet(this, query);
-        this.sets.add(set);
-        return set.subscription();
+        if (!(query instanceof TableQuery)) return new QuerySet(this, query).subscription();
+        const engine = this;
+        const key = query.fingerprint();
+        return {
+            getSnapshot: () => engine.find(key)?.current() ?? LOADING,
+            subscribe(listener: () => void) {
+                const monitor = engine.hold(query);
+                const unlisten = monitor.listen(listener);
+                let held = true;
+                return () => {
+                    if (!held) return;
+                    held = false;
+                    unlisten();
+                    engine.release(monitor);
+                };
+            },
+            whenReady: async () => {
+                const monitor = engine.hold(query);
+                try {
+                    await monitor.firstResult();
+                    return monitor.current();
+                } finally {
+                    engine.release(monitor);
+                }
+            },
+        };
     }
 
     close(): void {
         this.target.removeCommitListener(this.onCommit);
     }
 
-    open(query: TableQuery): Monitor {
+    // The monitor running for a query, by fingerprint. It never makes one.
+    find(key: string): Monitor | undefined {
+        return this.monitors.get(key);
+    }
+
+    // Counts one more user of the query's monitor. The first one makes it: a
+    // new monitor holds the monitors of the queries its `.col()` parameters
+    // read, for as long as it exists, and starts its first run.
+    hold(query: TableQuery): Monitor {
         const key = query.fingerprint();
         let monitor = this.monitors.get(key);
         if (monitor === undefined) {
-            monitor = new Monitor(this, query, this.target, this.idColumn);
+            const upstreams = query.dependencies().map((ref) => this.hold(ref.query));
+            monitor = new Monitor(this, query, this.target, this.idColumn, upstreams);
             this.monitors.set(key, monitor);
             void monitor.start();
         }
+        monitor.refs++;
         return monitor;
     }
 
-    // A subscription holds its monitor, and a held monitor holds the monitors
-    // of the queries its `.col()` parameters read, which every run of it
-    // needs. A monitor nobody holds leaves the engine and lets go of those.
-    hold(monitor: Monitor): void {
-        monitor.retain();
-        this.monitors.set(monitor.key, monitor);
-        if (monitor.refs > 1) return;
-        monitor.upstreams = monitor.query.dependencies().map((ref) => {
-            const upstream = this.open(ref.query);
-            this.hold(upstream);
-            return upstream;
-        });
+    // Counts one user less. A monitor nobody holds leaves the engine when the
+    // current synchronous code ends, not at once: a subscription dropped and
+    // taken again in one go, as React does within a screen update, keeps it.
+    release(monitor: Monitor): void {
+        monitor.refs--;
+        if (monitor.refs > 0) return;
+        this.idle.add(monitor);
+        if (this.sweepQueued) return;
+        this.sweepQueued = true;
+        queueMicrotask(() => { this.sweep(); });
     }
 
-    release(monitor: Monitor): void {
-        if (monitor.refs === 0) return;
-        monitor.release();
-        if (monitor.refs > 0) return;
-        if (this.monitors.get(monitor.key) === monitor) this.monitors.delete(monitor.key);
-        const upstreams = monitor.upstreams;
-        monitor.upstreams = [];
-        for (const upstream of upstreams) this.release(upstream);
+    // Removes the idle monitors nobody took again. Removing one releases its
+    // upstreams, and those left with no holder join the same pass.
+    private sweep(): void {
+        for (const monitor of this.idle) {
+            this.idle.delete(monitor);
+            if (monitor.refs > 0) continue;
+            this.monitors.delete(monitor.key);
+            for (const upstream of monitor.remove()) this.release(upstream);
+        }
+        this.sweepQueued = false;
     }
 
     keepSet(set: QuerySet): void {
@@ -109,9 +158,8 @@ export class QueryEngine {
         try {
             const order = topo([...this.monitors.values()]);
             for (const monitor of order) {
-                // One released during the pass keeps its dirty bit for when
-                // it is held again, and opens nothing upstream meanwhile.
-                if (!monitor.dirty || this.monitors.get(monitor.key) !== monitor) continue;
+                // One removed during the pass has stopped running.
+                if (!monitor.dirty || monitor.removed) continue;
                 await this.settle(monitor);
             }
         } finally {
@@ -123,7 +171,7 @@ export class QueryEngine {
     async settle(monitor: Monitor): Promise<void> {
         const before = this.exportedKeySnapshot(monitor);
         await monitor.run();
-        if (this.exportedKeySnapshot(monitor) === before) return;
+        if (monitor.removed || this.exportedKeySnapshot(monitor) === before) return;
         for (const other of this.monitors.values()) {
             if (other.query.dependencies().some((ref) => ref.query.fingerprint() === monitor.key)) this.schedule(other);
         }
@@ -161,12 +209,15 @@ export class QueryEngine {
 
 class Monitor {
     readonly key: string;
+    // How many use it: subscribed listeners, monitors that read it through
+    // `.col()`, and one-shot reads in progress (QueryEngine.hold).
     refs = 0;
     // start() runs the first query; a pass runs a monitor only once a commit
     // or an upstream marks it.
     dirty = false;
-    // The upstream monitors this one holds while it is held (QueryEngine.hold).
-    upstreams: Monitor[] = [];
+    // Set when it leaves the engine. It never comes back: a later hold of the
+    // same query makes a new monitor.
+    removed = false;
     private highWater = 0;
     private armed = false;
     private rows: ProjectedRow[] = [];
@@ -181,7 +232,7 @@ class Monitor {
     private loading = true;
     private error: unknown;
     private snapshot: QuerySnapshot<ProjectedRow[]>;
-    private readonly listeners = new Set<() => void>();
+    private readonly listeners = new Set<Listener>();
     private ready: (() => void) | undefined;
     private readonly readyPromise: Promise<void>;
     cachedRowIds = new Set<number>();
@@ -194,46 +245,40 @@ class Monitor {
         readonly query: TableQuery,
         private readonly target: Store,
         private readonly idColumn: string,
+        // The monitors of the queries its `.col()` parameters read, in the
+        // order of `query.dependencies()`. It holds them while it exists.
+        readonly upstreams: Monitor[],
     ) {
         this.key = query.fingerprint();
-        this.snapshot = { data: [], events: [], loading: true };
+        this.snapshot = LOADING;
         this.readyPromise = new Promise<void>((resolve) => { this.ready = resolve; });
     }
-
-    retain(): void { this.refs++; }
 
     current(): QuerySnapshot<ProjectedRow[]> { return this.snapshot; }
 
     // The events of the current snapshot, with their log ids.
     deliveredEvents(): StoredOpEvent[] { return this.delivered; }
 
-    release(): void { this.refs = Math.max(0, this.refs - 1); }
+    // Calls the listener on each delivery, until the returned function is called.
+    listen(listener: () => void): () => void {
+        const entry = { listener };
+        this.listeners.add(entry);
+        return () => { this.listeners.delete(entry); };
+    }
 
-    subscription(): QuerySubscription<ProjectedRow[]> {
-        const monitor = this;
-        return {
-            getSnapshot: () => monitor.snapshot,
-            subscribe(listener: () => void) {
-                monitor.engine.hold(monitor);
-                monitor.listeners.add(listener);
-                let held = true;
-                return () => {
-                    if (!held) return;
-                    held = false;
-                    monitor.listeners.delete(listener);
-                    monitor.engine.release(monitor);
-                };
-            },
-            whenReady: async () => {
-                await monitor.readyPromise;
-                return monitor.snapshot;
-            },
-        };
+    // Leaves the engine for good: its runs stop, and a run waiting for its
+    // first result is let go. Returns the upstream monitors it held.
+    remove(): Monitor[] {
+        this.removed = true;
+        this.ready?.();
+        this.ready = undefined;
+        return this.upstreams;
     }
 
     async start(): Promise<void> {
         if (this.target.drainOpEvents !== undefined) {
             const [top] = await this.target.drainOpEvents({ order: 'desc', limit: 1 });
+            if (this.removed) return;
             this.highWater = top?.id ?? 0;
         }
         this.armed = true;
@@ -270,14 +315,19 @@ class Monitor {
         this.pending = [];
         try {
             // A run binds the keys of the queries its `.col()` parameters
-            // name, so it waits for the first result of each: of a new
-            // monitor, and of one opened again after its holders let go.
-            const upstreams = this.query.dependencies().map((ref) => this.engine.open(ref.query));
-            if (upstreams.length > 0) await Promise.all(upstreams.map((upstream) => upstream.firstResult()));
+            // name, so it waits for the first result of each. It holds their
+            // monitors, so it looks nothing up. A monitor removed while one
+            // of its runs waits stops there, and delivers nothing.
+            if (this.upstreams.length > 0) await Promise.all(this.upstreams.map((upstream) => upstream.firstResult()));
+            if (this.removed) return;
             const plan = this.plan();
             const fetched = await this.target.executeQuery(plan);
+            if (this.removed) return;
             const cursor = this.query.cursorBound(this.cursorTuple);
-            if (cursor !== undefined) await this.refreshCursor(cursor, this.order());
+            if (cursor !== undefined) {
+                await this.refreshCursor(cursor, this.order());
+                if (this.removed) return;
+            }
             const delivered = strip(fetched, this.query, this.idColumn).map((row) => {
                 const prev = this.rowById.get(row.id);
                 return prev !== undefined && JSON.stringify(prev) === JSON.stringify(row) ? prev : row;
@@ -300,6 +350,7 @@ class Monitor {
             this.error = undefined;
             this.publish();
         } catch (error) {
+            if (this.removed) return;
             this.loading = false;
             this.error = error;
             this.rows = [];
@@ -332,12 +383,10 @@ class Monitor {
 
     private incomingKeys(): Map<ColumnSetRef, Array<json.Literal | null>> {
         const sets = new Map<ColumnSetRef, Array<json.Literal | null>>();
-        for (const ref of this.query.dependencies()) {
-            // While this monitor is held, it holds the upstream one (see
-            // QueryEngine.hold); this read neither holds nor releases it.
-            const upstream = this.engine.open(ref.query);
-            sets.set(ref, upstream.keys(ref.column));
-        }
+        // The upstream monitors are the ones it holds, in the same order.
+        this.query.dependencies().forEach((ref, index) => {
+            sets.set(ref, this.upstreams[index]!.keys(ref.column));
+        });
         this.keySets = sets;
         return sets;
     }
@@ -421,89 +470,119 @@ class Monitor {
         };
         this.ready?.();
         this.ready = undefined;
-        for (const listener of this.listeners) listener();
+        for (const { listener } of this.listeners) listener();
         this.engine.notifySets();
     }
 }
 
+// Several queries delivered as one snapshot. While it has a listener it holds
+// its members' monitors, and the engine publishes it as they deliver. With no
+// listener it holds nothing: it shows what its members' monitors show when
+// others keep them running, and loading for a member nobody runs.
 class QuerySet {
-    private readonly monitors: { [name: string]: Monitor };
-    private snapshot: QuerySnapshot<{ [name: string]: ProjectedRow[] }>;
-    private readonly listeners = new Set<() => void>();
-    // Each member's snapshot as this set last read it. A member whose snapshot
-    // has changed since has events the set has not delivered. A member that
-    // already ran keeps the events of its earlier deliveries to itself.
+    // Each member's fingerprint, by name.
+    private readonly keys: { [name: string]: string } = {};
+    // The members' monitors, while the set has a listener.
+    private held: { [name: string]: Monitor } | undefined;
+    private snapshot: QuerySnapshot<{ [name: string]: ProjectedRow[] }> | undefined;
+    private readonly listeners = new Set<Listener>();
+    // Each member's snapshot as this set last read it. With a listener, a
+    // member whose snapshot has changed since has events the set has not
+    // delivered. Deliveries a member made before the set had a listener stay
+    // with that member.
     private readonly seen = new Map<string, QuerySnapshot<ProjectedRow[]>>();
 
-    constructor(private readonly engine: QueryEngine, queries: { [name: string]: TableQuery }) {
-        this.monitors = {};
-        const data: { [name: string]: ProjectedRow[] } = {};
-        for (const [name, query] of Object.entries(queries)) {
-            this.monitors[name] = engine.open(query);
-            this.seen.set(name, this.monitors[name]!.current());
-            data[name] = [];
-        }
-        this.snapshot = { data, events: [], loading: true };
+    constructor(private readonly engine: QueryEngine, private readonly queries: { [name: string]: TableQuery }) {
+        for (const [name, query] of Object.entries(queries)) this.keys[name] = query.fingerprint();
     }
 
     subscription(): QuerySubscription<{ [name: string]: ProjectedRow[] }> {
         const set = this;
         return {
-            getSnapshot: () => set.snapshot,
+            getSnapshot: () => set.read(),
             subscribe(listener: () => void) {
-                set.engine.keepSet(set);
-                for (const monitor of Object.values(set.monitors)) set.engine.hold(monitor);
-                set.listeners.add(listener);
+                const entry = { listener };
+                if (set.listeners.size === 0) set.attach();
+                set.listeners.add(entry);
                 let held = true;
                 return () => {
                     if (!held) return;
                     held = false;
-                    set.listeners.delete(listener);
-                    for (const monitor of Object.values(set.monitors)) set.engine.release(monitor);
-                    if (set.listeners.size === 0) set.engine.dropSet(set);
+                    set.listeners.delete(entry);
+                    if (set.listeners.size === 0) set.detach();
                 };
             },
-            whenReady: () => Promise.all(Object.values(set.monitors).map((monitor) => monitor.subscription().whenReady()))
-                .then(() => { set.publish(); return set.snapshot; }),
+            whenReady: async () => {
+                const members = Object.values(set.queries).map((query) => set.engine.hold(query));
+                try {
+                    await Promise.all(members.map((monitor) => monitor.firstResult()));
+                    set.publish();
+                    return set.read();
+                } finally {
+                    for (const monitor of members) set.engine.release(monitor);
+                }
+            },
         };
     }
 
     publish(): void {
-        const next = this.current();
-        const events = this.freshEvents();
-        const prev = this.snapshot;
-        const names = Object.keys(next.data);
-        const sameData = names.length === Object.keys(prev.data).length
-            && names.every((name) => next.data[name] === prev.data[name]);
-        if (sameData && next.loading === prev.loading && next.error === prev.error && events.length === 0) return;
-        this.snapshot = { ...next, events };
-        for (const listener of this.listeners) listener();
+        if (!this.refresh()) return;
+        for (const { listener } of this.listeners) listener();
     }
 
-    private current(): QuerySnapshot<{ [name: string]: ProjectedRow[] }> {
+    // The first listener: hold the members, and join the engine's sets.
+    private attach(): void {
+        const held: { [name: string]: Monitor } = {};
+        for (const [name, query] of Object.entries(this.queries)) held[name] = this.engine.hold(query);
+        // Read the members as they are now, before it counts as listening:
+        // what they delivered so far is not this set's, and carries no event.
+        this.refresh();
+        this.held = held;
+        this.engine.keepSet(this);
+    }
+
+    // The last listener left: leave the engine's sets, and let the members go.
+    private detach(): void {
+        const held = this.held!;
+        this.held = undefined;
+        this.engine.dropSet(this);
+        for (const monitor of Object.values(held)) this.engine.release(monitor);
+    }
+
+    private read(): QuerySnapshot<{ [name: string]: ProjectedRow[] }> {
+        // With a listener, the snapshot changes only when the engine
+        // publishes the set. Without one, nothing publishes it.
+        if (this.held === undefined) this.refresh();
+        return this.snapshot!;
+    }
+
+    // Rebuilds the snapshot from the members' snapshots and says whether it
+    // changed. The object is kept while no member's rows, loading or error
+    // changed and there is no new event. With a listener, the events are those
+    // of the member deliveries the set has not read, in log order, each once:
+    // two members can show the same row.
+    private refresh(): boolean {
         const data: { [name: string]: ProjectedRow[] } = {};
         let loading = false;
         let error: unknown;
-        for (const [name, monitor] of Object.entries(this.monitors)) {
-            const snap = monitor.current();
+        const fresh = new Map<number, StoredOpEvent>();
+        for (const [name, key] of Object.entries(this.keys)) {
+            const monitor = this.held?.[name] ?? this.engine.find(key);
+            const snap = monitor?.current() ?? LOADING;
             data[name] = snap.data;
             loading = loading || snap.loading;
             if (snap.error !== undefined) error = snap.error;
-        }
-        return { data, events: [], loading, ...(error !== undefined ? { error } : {}) };
-    }
-
-    // The events of the member deliveries this set has not read, in log
-    // order, each once: two members can show the same row.
-    private freshEvents(): OpEvent[] {
-        const fresh = new Map<number, StoredOpEvent>();
-        for (const [name, monitor] of Object.entries(this.monitors)) {
-            const snap = monitor.current();
             if (this.seen.get(name) === snap) continue;
             this.seen.set(name, snap);
+            if (this.held === undefined || monitor === undefined) continue;
             for (const stored of monitor.deliveredEvents()) fresh.set(stored.id, stored);
         }
-        return [...fresh.values()].sort((a, b) => a.id - b.id).map((stored) => stored.event);
+        const events = [...fresh.values()].sort((a, b) => a.id - b.id).map((stored) => stored.event);
+        const prev = this.snapshot;
+        if (prev !== undefined && events.length === 0 && prev.loading === loading && prev.error === error
+            && Object.keys(data).every((name) => data[name] === prev.data[name])) return false;
+        this.snapshot = { data, events, loading, ...(error !== undefined ? { error } : {}) };
+        return true;
     }
 }
 

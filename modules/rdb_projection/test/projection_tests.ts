@@ -774,13 +774,14 @@ export const projectionTests = {
                         caps: one('perm_caps'),
                         set: projection.monitor({ items: projection.selectFrom('perm_items'), notes: projection.selectFrom('perm_notes') }),
                     };
-                    await Promise.all(Object.values(subs).map((sub) => sub.whenReady()));
-                    const ids = (sub: QuerySubscription<ProjectedRow[]>) => sub.getSnapshot().data.map((row) => row.id).join(',');
-                    assertEquals(`${ids(subs.items)} ${ids(subs.notes)} ${ids(subs.caps)}`, '1 1 1', 'each table shows its row 1');
+                    // A handle is live while subscribed, so subscribe before reading it.
                     const seen: { [name: string]: OpEvent[] } = { items: [], notes: [], caps: [], set: [] };
                     for (const [name, sub] of Object.entries(subs)) {
                         sub.subscribe(() => { seen[name]!.push(...sub.getSnapshot().events); });
                     }
+                    await Promise.all(Object.values(subs).map((sub) => sub.whenReady()));
+                    const ids = (sub: QuerySubscription<ProjectedRow[]>) => sub.getSnapshot().data.map((row) => row.id).join(',');
+                    assertEquals(`${ids(subs.items)} ${ids(subs.notes)} ${ids(subs.caps)}`, '1 1 1', 'each table shows its row 1');
 
                     // A revoke concurrent with the bundle deletes the cap and voids the bundle.
                     await caps.delete(deriveRowId('c-1'), undefined, base);
@@ -814,11 +815,11 @@ export const projectionTests = {
                         comments: one('forum_comments'),
                         set: projection.monitor({ posts: projection.selectFrom('forum_posts'), comments: projection.selectFrom('forum_comments') }),
                     };
-                    await Promise.all(Object.values(subs).map((sub) => sub.whenReady()));
                     const seen: { [name: string]: OpEvent[] } = { posts: [], comments: [], set: [] };
                     for (const [name, sub] of Object.entries(subs)) {
                         sub.subscribe(() => { seen[name]!.push(...sub.getSnapshot().events); });
                     }
+                    await Promise.all(Object.values(subs).map((sub) => sub.whenReady()));
 
                     // A comment on a post that isn't there: it shows at once, as row 1 of comments.
                     const local = target.localInsert('forum_comments', { body: 'orphan', post_id: 9999 });
@@ -855,16 +856,19 @@ export const projectionTests = {
                 const projection = await RdbProjection.open(db.rdb, ctx, target, { writer: keep.admin });
                 try {
                     const pins = projection.monitor(projection.selectFrom('keep_pins')) as QuerySubscription<ProjectedRow[]>;
-                    await pins.whenReady();
-                    const id = pins.getSnapshot().data[0]!.id;
+                    // Subscribed from the start, and recording after the first result.
                     const delivered: { ids: string; events: string }[] = [];
+                    let recording = false;
                     pins.subscribe(() => {
+                        if (!recording) return;
                         const snap = pins.getSnapshot();
                         delivered.push({
                             ids: snap.data.map((row) => row.id).join(','),
                             events: snap.events.map((e) => `${e.direction} ${e.kind} ${e.table} ${e.localId}`).join('; '),
                         });
                     });
+                    const id = (await pins.whenReady()).data[0]!.id;
+                    recording = true;
 
                     // The delete shows at once.
                     target.localDelete('keep_pins', id);
