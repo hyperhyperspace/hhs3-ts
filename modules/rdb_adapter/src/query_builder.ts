@@ -76,11 +76,19 @@ export class TableQuery {
         return new ColumnSetRef(this, column);
     }
 
-    results(): Promise<ProjectedRow[]> {
-        return this.source.monitor(this).whenReady().then((snapshot) => {
+    // A one-shot read. It holds the query's monitor only while it reads, so
+    // the monitor, and the upstream ones it held, leave the engine after it
+    // unless a subscription holds them.
+    async results(): Promise<ProjectedRow[]> {
+        const subscription = this.source.monitor(this);
+        const unsubscribe = subscription.subscribe(() => {});
+        try {
+            const snapshot = await subscription.whenReady();
             if (snapshot.error !== undefined) throw snapshot.error;
             return snapshot.data as ProjectedRow[];
-        });
+        } finally {
+            unsubscribe();
+        }
     }
 
     template(): WhereTemplate | undefined {

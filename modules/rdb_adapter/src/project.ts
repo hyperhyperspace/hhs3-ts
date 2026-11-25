@@ -93,6 +93,10 @@ export function opVerdictEvents(
         const event: OpEvent = { origin: 'concurrency', direction, groupId, opHash: c.entry, kind: c.kind };
         if (c.table !== undefined) event.table = targetTableName(config, c.table);
         if (c.rowId !== undefined) event.rowId = c.rowId;
+        // A bundle has no row of its own: it names the rows it writes.
+        if (c.writes !== undefined) {
+            event.writes = c.writes.map((w) => ({ table: targetTableName(config, w.table), action: w.action, rowId: w.rowId }));
+        }
         if (c.author !== undefined) event.author = c.author;
         if (c.reason !== undefined) event.reason = { source: 'void', detail: c.reason };
         events.push(event);

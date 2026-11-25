@@ -54,6 +54,7 @@ type EventRec = {
     table?: string;
     rowId?: string;
     localId?: number;
+    writes?: ClientEvent['writes'];
     author?: string;
     op?: ClientEvent['op'];
     reason?: ClientEvent['reason'];
@@ -129,6 +130,7 @@ function toEvent(rec: EventRec): ClientEvent {
     if (rec.table !== undefined) event.table = rec.table;
     if (rec.rowId !== undefined) event.rowId = rec.rowId;
     if (rec.localId !== undefined) event.localId = rec.localId;
+    if (rec.writes !== undefined) event.writes = rec.writes;
     if (rec.author !== undefined) event.author = rec.author;
     if (rec.op !== undefined) event.op = rec.op;
     if (rec.reason !== undefined) event.reason = rec.reason;

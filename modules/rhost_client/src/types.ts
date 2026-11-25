@@ -104,6 +104,8 @@ export type ClientEvent = {
     table?: string;
     rowId?: string;
     localId?: number;
+    // The rows a bundle writes: a bundle names no row of its own.
+    writes?: { table: string; action: string; rowId: string; localId?: number }[];
     author?: string;
     op?: unknown;
     reason?: unknown;

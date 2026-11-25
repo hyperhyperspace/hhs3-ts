@@ -34,7 +34,7 @@ import {
     ProjectedRow, QueryableTarget, ReactiveChangeTarget, ResolvedIndex,
     RowAction, RowIdentityIndex, SchemaAction, SingleTableQueryPlan, StoredOpEvent,
     SyncMapping, SyncStatus, TargetCommitEvent, TargetCommitListener, TargetRowChange, versionsEqual,
-    CapturedChangeId, ChangeRecord, mergeChangeRecord,
+    CapturedChangeId, ChangeRecord, mergeChangeRecord, opEventRows, withLocalIds,
     WriterRecord, WriterRecordStore,
 } from "./types.js";
 
@@ -198,6 +198,8 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
         this.captureEnabled = this.captureProvisioned;
     }
 
+    // Called once the transaction's rows are in the store, so each row an
+    // event names by hash gets the local id its mapping holds.
     private logEvents(events: OpEvent[] | undefined): StoredOpEvent[] {
         const fresh: StoredOpEvent[] = [];
         if (events === undefined) return fresh;
@@ -205,7 +207,8 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
             const key = event.opHash + '\u0000' + event.direction;
             if (this.opEventKeys.has(key)) continue;
             this.opEventKeys.add(key);
-            const stored: StoredOpEvent = { id: this.opEventNextId++, event };
+            const filled = withLocalIds(event, (table, rowId) => this.store.tables.get(table)?.sync.get(rowId));
+            const stored: StoredOpEvent = { id: this.opEventNextId++, event: filled };
             this.opEvents.push(stored);
             fresh.push(stored);
         }
@@ -579,7 +582,7 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
         const logged = this.logEvents([...failures, ...(settle.events ?? [])]);
         const revertedTables = [...new Set([
             ...reverted,
-            ...logged.map((stored) => stored.event.table).filter((table): table is string => table !== undefined),
+            ...logged.flatMap((stored) => opEventRows(stored.event).map((row) => row.table)),
         ])];
         if (reverted.size > 0 || logged.length > 0) {
             this.emit({ source: 'settle', revertedTables, events: logged });

@@ -37,7 +37,7 @@ function RoomMessages({ roomId, beforeId }: { roomId: number; beforeId?: number 
 - **`useProjection(): QuerySource`** returns that `QuerySource` (throws if rendered outside `ProjectionProvider`).
 - **`useQuery(query)`** takes either a single `TableQuery` or a `{ [name: string]: TableQuery }` query set and returns its `QuerySnapshot`:
   - `data`: `ProjectedRow[]` for a single query, or `{ [name: string]: ProjectedRow[] }` for a query set;
-  - `events` is populated for a single `TableQuery`: ingestion failures and concurrency void/reinstate flips whose row is in that delivery. A query set returns `events: []`. A member's events stay on a monitor of that member alone;
+  - `events`: the ingestion failures and concurrency void/reinstate flips about rows the query shows, in the delivery that follows their commit. A query set carries the events of its members. The rules are in [rdb_adapter's Events in a snapshot](../rdb_adapter#events-in-a-snapshot);
   - `loading`: `true` until the initial query completes;
   - `error`: populated if the query failed.
 

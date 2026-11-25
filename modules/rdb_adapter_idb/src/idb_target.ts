@@ -26,7 +26,7 @@ import {
     KeyIndex, MaterializationTarget, MaterializedChangeSource, OpEvent, OpEventQuery, OpEventReason,
     pageOpEvents, ResolvedIndex, RowAction, RowIdentityIndex, SchemaAction, StoredOpEvent, SyncMapping,
     versionsEqual, WriterRecord, WriterRecordStore,
-    CapturedChangeId, ChangeRecord, mergeChangeRecord, RowRevert,
+    CapturedChangeId, ChangeRecord, mergeChangeRecord, RowRevert, opEventRows, withLocalIds,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import { compareSortTuples, evalWhere, normalizeOrder, projectColumns, rowOnSide } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
@@ -563,9 +563,21 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         }
     }
 
-    private async logOpEvent(tx: IDBTransaction, event: OpEvent): Promise<StoredOpEvent | undefined> {
-        const existing = await indexGet<OpEventRecord>(tx, OP_EVENTS, 'by_op', [event.opHash, event.direction]);
+    // Append one op-event (idempotent by (opHash, direction)), with the local
+    // id of each row it names by hash. Called inside the transaction, after
+    // its row writes.
+    private async logOpEvent(tx: IDBTransaction, logged: OpEvent): Promise<StoredOpEvent | undefined> {
+        const existing = await indexGet<OpEventRecord>(tx, OP_EVENTS, 'by_op', [logged.opHash, logged.direction]);
         if (existing !== undefined) return undefined;
+        // The sync records are read first: the shared fill-in looks them up
+        // without awaiting.
+        const ids = new Map<string, number>();
+        for (const row of opEventRows(logged)) {
+            if (row.localId !== undefined || row.rowId === undefined) continue;
+            const sync = await storeGet<SyncRecord>(tx, SYNC, [row.table, row.rowId]);
+            if (sync !== undefined) ids.set(row.table + '\u0000' + row.rowId, sync.id);
+        }
+        const event = withLocalIds(logged, (table, rowId) => ids.get(table + '\u0000' + rowId));
         const rec: OpEventRecord = { ...event };
         const id = Number(await storeAdd(tx, OP_EVENTS, rec));
         return { id, event };
@@ -756,7 +768,7 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         if (written.size > 0 || logged.length > 0) {
             const revertedTables = [...new Set([
                 ...written,
-                ...logged.map((stored) => stored.event.table).filter((table): table is string => table !== undefined),
+                ...logged.flatMap((stored) => opEventRows(stored.event).map((row) => row.table)),
             ])];
             this.deliver({ source: 'settle', revertedTables, events: logged }, true);
         }
@@ -833,6 +845,7 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
             if (rest.table !== undefined) event.table = rest.table;
             if (rest.rowId !== undefined) event.rowId = rest.rowId;
             if (rest.localId !== undefined) event.localId = rest.localId;
+            if (rest.writes !== undefined) event.writes = rest.writes;
             if (rest.author !== undefined) event.author = rest.author;
             if (rest.op !== undefined) event.op = rest.op;
             if (rest.reason !== undefined) event.reason = rest.reason as OpEventReason;

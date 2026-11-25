@@ -229,7 +229,10 @@ export type OpEventReason =
 //   - origin 'concurrency', direction 'void' | 'reinstate': a p2p verdict flip.
 //     `opHash` is the REAL DAG entry hash (the op is fetchable via loadEntry);
 //     `op` is omitted. Both directions are logged (a void, then a later
-//     reinstate, are two distinct events on the same op).
+//     reinstate, are two distinct events on the same op). A row op names its
+//     row in `table` and `rowId`; a bundle names no row of its own and lists
+//     the rows it writes in `writes`. rdb knows rows by hash only: the target
+//     fills in each row's `localId` as it logs the event (withLocalIds).
 export type OpEvent = {
     origin: 'ingestion' | 'concurrency';
     direction: 'failure' | 'void' | 'reinstate';
@@ -239,10 +242,59 @@ export type OpEvent = {
     table?: string;
     rowId?: B64Hash;
     localId?: number;
+    writes?: OpEventWrite[];
     author?: KeyId;
     op?: json.Literal;
     reason?: OpEventReason;
 };
+
+// One write of a bundle an op-event names (rdb sorts them by table and row):
+// its target table, what it does to the row, and the row, by hash and, once
+// the target has logged the event, by local id when the target has a row for
+// that hash.
+export type OpEventWrite = {
+    table: string;
+    action: 'insert' | 'update' | 'delete';
+    rowId: B64Hash;
+    localId?: number;
+};
+
+// The rows an op-event names, as (target table, row hash, local id): its own
+// row, then each write of a bundle. A row the target has no local id for has
+// none here.
+export function opEventRows(event: OpEvent): { table: string; rowId?: B64Hash; localId?: number }[] {
+    const rows: { table: string; rowId?: B64Hash; localId?: number }[] = [];
+    if (event.table !== undefined) {
+        rows.push({
+            table: event.table,
+            ...(event.rowId !== undefined ? { rowId: event.rowId } : {}),
+            ...(event.localId !== undefined ? { localId: event.localId } : {}),
+        });
+    }
+    for (const w of event.writes ?? []) rows.push({ table: w.table, rowId: w.rowId, ...(w.localId !== undefined ? { localId: w.localId } : {}) });
+    return rows;
+}
+
+// The event with the local id of each row it names by hash only, as
+// `localIdOf` finds it in the target's sync table. A target calls it as it
+// logs the event, inside the transaction that writes the rows, after those
+// writes: a row the transaction inserts then has its id, and a row it deletes
+// keeps the one its mapping holds. A row with no mapping stays without one.
+export function withLocalIds(event: OpEvent, localIdOf: (table: string, rowId: B64Hash) => number | undefined): OpEvent {
+    const out: OpEvent = { ...event };
+    if (out.localId === undefined && out.table !== undefined && out.rowId !== undefined) {
+        const id = localIdOf(out.table, out.rowId);
+        if (id !== undefined) out.localId = id;
+    }
+    if (out.writes !== undefined) {
+        out.writes = out.writes.map((w) => {
+            if (w.localId !== undefined) return w;
+            const id = localIdOf(w.table, w.rowId);
+            return id === undefined ? w : { ...w, localId: id };
+        });
+    }
+    return out;
+}
 
 // An op-event as stored, carrying its durable monotonic id (the push cursor).
 export type StoredOpEvent = { id: number; event: OpEvent };

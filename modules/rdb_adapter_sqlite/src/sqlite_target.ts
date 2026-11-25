@@ -56,7 +56,7 @@ import {
     KeyIndex, MaterializationTarget, MaterializedChangeSource, OpEvent, OpEventQuery, OpEventReason,
     ResolvedIndex, resolveOpEventQuery, RowAction, RowIdentityIndex, SchemaAction, StoredOpEvent, SyncMapping,
     versionsEqual, WriterRecord, WriterRecordStore,
-    CapturedChangeId, ChangeRecord, mergeChangeRecord, RowRevert,
+    CapturedChangeId, ChangeRecord, mergeChangeRecord, RowRevert, opEventRows, withLocalIds, type OpEventWrite,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import { normalizeOrder } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
@@ -485,7 +485,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             + 'CREATE TABLE IF NOT EXISTS rdb_op_events ('
             + 'id INTEGER PRIMARY KEY AUTOINCREMENT, origin TEXT NOT NULL, direction TEXT NOT NULL, '
             + 'group_id TEXT NOT NULL, op_hash TEXT NOT NULL, op_json TEXT, kind TEXT NOT NULL, '
-            + '"table" TEXT, row_hash TEXT, local_id INTEGER, author TEXT, reason TEXT, '
+            + '"table" TEXT, row_hash TEXT, local_id INTEGER, writes TEXT, author TEXT, reason TEXT, '
             + "created_at TEXT NOT NULL DEFAULT (datetime('now')), UNIQUE (op_hash, direction));"
             // Projection-local indexes: the installed spec (one row) and the
             // indexes actually materialized (resolved definition as JSON).
@@ -516,20 +516,32 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         this.bookkeepingReady = true;
     }
 
-    // Append one op-event (idempotent by (op_hash, direction)).
-    private logOpEvent(event: OpEvent): StoredOpEvent | undefined {
+    // Append one op-event (idempotent by (op_hash, direction)), with the local
+    // id of each row it names by hash. Called inside the transaction, after
+    // its row writes.
+    private logOpEvent(logged: OpEvent): StoredOpEvent | undefined {
+        const event = withLocalIds(logged, (table, rowId) => this.localIdIn(table, rowId));
         const result = this.db.prepare(
             'INSERT OR IGNORE INTO rdb_op_events '
-            + '(origin, direction, group_id, op_hash, op_json, kind, "table", row_hash, local_id, author, reason) '
-            + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+            + '(origin, direction, group_id, op_hash, op_json, kind, "table", row_hash, local_id, writes, author, reason) '
+            + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
             .run(
                 event.origin, event.direction, event.groupId, event.opHash,
                 event.op === undefined ? null : json.toStringNormalized(event.op),
                 event.kind, event.table ?? null, event.rowId ?? null,
-                event.localId ?? null, event.author ?? null,
+                event.localId ?? null, event.writes === undefined ? null : JSON.stringify(event.writes),
+                event.author ?? null,
                 event.reason === undefined ? null : JSON.stringify(event.reason));
         if (result.changes === 0) return undefined;
         return { id: Number(result.lastInsertRowid), event };
+    }
+
+    // The local id a row has in a projected table, or undefined when the table
+    // isn't projected here or its sync table has no row for the hash.
+    private localIdIn(table: string, rowId: B64Hash): number | undefined {
+        const meta = this.db.prepare('SELECT sync_table FROM rdb_table_meta WHERE "table" = ?').get(table) as
+            { sync_table: string } | undefined;
+        return meta === undefined ? undefined : this.syncIdOf(meta.sync_table, rowId);
     }
 
     // Provision the capture infrastructure (idempotent). The config row holds
@@ -1476,7 +1488,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         if (written.size > 0 || logged.length > 0) {
             const revertedTables = [...new Set([
                 ...written,
-                ...logged.map((stored) => stored.event.table).filter((table): table is string => table !== undefined),
+                ...logged.flatMap((stored) => opEventRows(stored.event).map((row) => row.table)),
             ])];
             for (const listener of [...this.commitListeners]) listener({ source: 'settle', revertedTables, events: logged });
         }
@@ -1560,7 +1572,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         const dir = q.order === 'desc' ? 'DESC' : 'ASC';
         const where = q.beforeId === undefined ? 'id > ?' : 'id > ? AND id < ?';
         const sql = 'SELECT id, origin, direction, group_id, op_hash, op_json, kind, "table" AS tbl, '
-            + 'row_hash, local_id, author, reason FROM rdb_op_events WHERE ' + where
+            + 'row_hash, local_id, writes, author, reason FROM rdb_op_events WHERE ' + where
             + ' ORDER BY id ' + dir
             + (q.limit !== undefined ? ' LIMIT ?' : '');
         const params: number[] = q.beforeId === undefined ? [q.afterId] : [q.afterId, q.beforeId];
@@ -1568,7 +1580,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         const rows = this.db.prepare(sql).all(...params) as {
                 id: number; origin: string; direction: string; group_id: string; op_hash: string;
                 op_json: string | null; kind: string; tbl: string | null; row_hash: string | null;
-                local_id: number | null; author: string | null; reason: string | null;
+                local_id: number | null; writes: string | null; author: string | null; reason: string | null;
             }[];
         return rows.map((r) => {
             const event: OpEvent = {
@@ -1578,6 +1590,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             if (r.tbl !== null) event.table = r.tbl;
             if (r.row_hash !== null) event.rowId = r.row_hash as B64Hash;
             if (r.local_id !== null) event.localId = r.local_id;
+            if (r.writes !== null) event.writes = JSON.parse(r.writes) as OpEventWrite[];
             if (r.author !== null) event.author = r.author as OpEvent['author'];
             if (r.op_json !== null) event.op = JSON.parse(r.op_json) as json.Literal;
             if (r.reason !== null) event.reason = JSON.parse(r.reason) as OpEventReason;

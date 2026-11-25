@@ -11,7 +11,7 @@ import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import { deriveRowId } from "@hyper-hyper-space/hhs3_rdb";
 import {
-    DEFAULT_KEY_DOMAIN, KeyIndex, projectGroup, SchemaAction, RowAction,
+    DEFAULT_KEY_DOMAIN, KeyIndex, projectGroup, SchemaAction, RowAction, type MaterializedChangeSource,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 import { createFkGroup, createFlipGroup, createGroup, createNullsGroup, flipTables, frontier, sameVersion } from "./group_fixture.js";
@@ -537,6 +537,43 @@ export function createProjectionSuite(label: string, factory: TargetFactory): { 
                             'tag shows its earlier value again; memo and topic, never written before, read NULL');
                         assertEquals(await shown('never'), expected({ title: 'a', tag: 'none' }),
                             'tag, never written before, shows its default again; memo and topic read NULL');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}14] a flip is logged with the local id of each row it names, a bundle's rows included`,
+                invoke: async () => {
+                    const { group } = await createNullsGroup();
+                    const topics = await group.getTable('topics');
+                    const notes = await group.getTable('notes');
+                    const t1 = deriveRowId('t1');
+                    await topics.insert('t1', { name: 'topic' });
+                    for (const uuid of ['a', 'b', 'c']) await notes.insert(uuid, { title: uuid });
+                    const base = await frontier(group);
+
+                    // an update, and a bundle of two, point notes at t1 ...
+                    const update = await notes.update(deriveRowId('a'), { topic: t1 }, undefined, base);
+                    const bundle = await group.bundle(['b', 'c'].map((uuid) => ({
+                        table: 'notes', op: { action: 'update' as const, rowId: deriveRowId(uuid), values: { topic: t1 } },
+                    })), undefined, base);
+
+                    const { target, read, cleanup } = await factory();
+                    try {
+                        await projectGroup(group, target);
+                        // ... and a concurrent delete of t1 voids both
+                        await topics.delete(t1, undefined, base);
+                        await projectGroup(group, target);
+                        const log = target as typeof target & Pick<MaterializedChangeSource, 'drainOpEvents'>;
+                        const byOp = new Map((await log.drainOpEvents()).map((stored) => [stored.event.opHash, stored.event]));
+                        const idOf = async (uuid: string) => read.syncId('notes', deriveRowId(uuid));
+                        const own = byOp.get(update);
+                        assertEquals(`${own?.direction} ${own?.table} ${own?.localId}`, `void notes ${await idOf('a')}`,
+                            "the update's void names its row by local id");
+                        const writes = byOp.get(bundle)?.writes?.map((w) => `${w.table} ${w.localId}`).sort();
+                        assertEquals(JSON.stringify(writes), JSON.stringify([`notes ${await idOf('b')}`, `notes ${await idOf('c')}`].sort()),
+                            "the bundle's void names each row it writes by local id");
                     } finally {
                         await cleanup?.();
                     }

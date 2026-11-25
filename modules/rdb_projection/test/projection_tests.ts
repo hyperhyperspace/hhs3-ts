@@ -16,7 +16,7 @@ import {
     RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory, RDbImpl, rDbFactory, deriveRowId,
     RCatalogImpl, rCatalogFactory, RDeployGateImpl, rDeployGateFactory, catalogGroupHash, deployCatalogRelease,
 } from "@hyper-hyper-space/hhs3_rdb";
-import { MemoryTarget, type OpEvent, type BidirectionalTarget, type CapturedBatch, type CapturedChangeId, type ChangeRecord, type IngestSettle, type SyncMapping, type StoredOpEvent, type SchemaAction, type RowAction, type OpEventQuery } from "@hyper-hyper-space/hhs3_rdb_adapter";
+import { MemoryTarget, type OpEvent, type ProjectedRow, type QuerySubscription, type BidirectionalTarget, type CapturedBatch, type CapturedChangeId, type ChangeRecord, type IngestSettle, type SyncMapping, type StoredOpEvent, type SchemaAction, type RowAction, type OpEventQuery } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 import { createMockRContext } from "../../rdb/test/mock_rcontext.js";
 import { RdbProjection, opEventPushable } from "../src/index.js";
@@ -734,6 +734,148 @@ export const projectionTests = {
                     assertEquals(results.get(catalog.group.getId())?.accepted, 1, 'a local insert into the new table is ingested');
                     const view = await (await catalog.group.getTable('extra')).getView();
                     assertEquals((await view.liveRowIds()).length, 2, 'into its rdb table');
+                } finally {
+                    await projection.stop();
+                }
+            },
+        },
+        {
+            name: '[RDBPROJ28] a voided bundle reaches the snapshots of the queries showing its rows, and not a query showing a row with the same local id in another table',
+            invoke: async () => {
+                const ctx = newCtx();
+                const db = await makeDatabase(ctx, 'perm-db', [{
+                    name: 'perm',
+                    tables: [
+                        open('caps', { label: { type: 'string', pub: true } }, { concurrentDeletes: true }),
+                        open('items', { name: { type: 'string' } },
+                            { restrictions: [{ on: 'insert', rule: { p: 'exists', table: 'caps', where: { label: 'grant' } } }] }),
+                        open('notes', { body: { type: 'string' } }),
+                    ],
+                }]);
+                const g = db.members['perm']!;
+                const caps = await g.group.getTable('caps');
+                await caps.insert('c-1', { label: 'grant' });
+                const projection = await RdbProjection.open(db.rdb, ctx, new MemoryTarget());
+                try {
+                    const base = await frontier(g.group);
+                    // One bundle writes an item, which the cap gates, and a note.
+                    const insert = (uuid: string, values: { [column: string]: string }) =>
+                        ({ action: 'insert' as const, rowId: deriveRowId(uuid), uuid, values });
+                    const bundle = await g.group.bundle([
+                        { table: 'items', op: insert('i-1', { name: 'one' }) },
+                        { table: 'notes', op: insert('n-1', { body: 'note' }) },
+                    ]);
+                    await projection.sync();
+
+                    const one = (table: string) => projection.monitor(projection.selectFrom(table)) as QuerySubscription<ProjectedRow[]>;
+                    const subs = {
+                        items: one('perm_items'),
+                        notes: one('perm_notes'),
+                        caps: one('perm_caps'),
+                        set: projection.monitor({ items: projection.selectFrom('perm_items'), notes: projection.selectFrom('perm_notes') }),
+                    };
+                    await Promise.all(Object.values(subs).map((sub) => sub.whenReady()));
+                    const ids = (sub: QuerySubscription<ProjectedRow[]>) => sub.getSnapshot().data.map((row) => row.id).join(',');
+                    assertEquals(`${ids(subs.items)} ${ids(subs.notes)} ${ids(subs.caps)}`, '1 1 1', 'each table shows its row 1');
+                    const seen: { [name: string]: OpEvent[] } = { items: [], notes: [], caps: [], set: [] };
+                    for (const [name, sub] of Object.entries(subs)) {
+                        sub.subscribe(() => { seen[name]!.push(...sub.getSnapshot().events); });
+                    }
+
+                    // A revoke concurrent with the bundle deletes the cap and voids the bundle.
+                    await caps.delete(deriveRowId('c-1'), undefined, base);
+                    await projection.sync();
+                    await poll(() => `${ids(subs.items)}|${ids(subs.notes)}|${ids(subs.caps)}` === '||');
+
+                    const brief = (events: OpEvent[]) => events.map((e) => `${e.direction} ${e.kind} ${e.opHash === bundle}`).join('; ');
+                    assertEquals(brief(seen.items!), 'void bundle true', 'the items query gets the void with its row gone');
+                    assertEquals(brief(seen.notes!), 'void bundle true', 'and so does the notes query');
+                    assertEquals(brief(seen.set!), 'void bundle true', 'the set showing both gets it once');
+                    assertEquals(JSON.stringify(seen.items![0]!.writes?.map((w) => `${w.table} ${w.localId}`).sort()),
+                        JSON.stringify(['perm_items 1', 'perm_notes 1']), 'the event names each row by its table and local id');
+                    assertEquals(seen.caps!.length, 0, 'the caps query, whose row 1 the revoke deleted, gets nothing: the bundle wrote no cap');
+                } finally {
+                    await projection.stop();
+                }
+            },
+        },
+        {
+            name: '[RDBPROJ29] a refused local write reaches the snapshots of the queries showing its row, a query set among them, and not a query showing a row with the same local id in another table',
+            invoke: async () => {
+                const ctx = newCtx();
+                const { forum, rdb } = await makeForum(ctx);
+                await (await forum.group.getTable('posts')).insert('p1', { title: 'first' });
+                const target = new MemoryTarget({ captureChanges: true });
+                const projection = await RdbProjection.open(rdb, ctx, target, { writer: forum.admin });
+                try {
+                    const one = (table: string) => projection.monitor(projection.selectFrom(table)) as QuerySubscription<ProjectedRow[]>;
+                    const subs = {
+                        posts: one('forum_posts'),
+                        comments: one('forum_comments'),
+                        set: projection.monitor({ posts: projection.selectFrom('forum_posts'), comments: projection.selectFrom('forum_comments') }),
+                    };
+                    await Promise.all(Object.values(subs).map((sub) => sub.whenReady()));
+                    const seen: { [name: string]: OpEvent[] } = { posts: [], comments: [], set: [] };
+                    for (const [name, sub] of Object.entries(subs)) {
+                        sub.subscribe(() => { seen[name]!.push(...sub.getSnapshot().events); });
+                    }
+
+                    // A comment on a post that isn't there: it shows at once, as row 1 of comments.
+                    const local = target.localInsert('forum_comments', { body: 'orphan', post_id: 9999 });
+                    await poll(() => subs.comments.getSnapshot().data.length === 1);
+                    assertEquals(`${local} ${subs.posts.getSnapshot().data[0]?.id}`, '1 1', 'the comment and the post are each row 1 of their table');
+
+                    // Ingestion refuses it: the settle removes the row and logs the failure.
+                    await projection.sync();
+                    await poll(() => subs.comments.getSnapshot().data.length === 0);
+                    const brief = (events: OpEvent[]) => events.map((e) => `${e.direction} ${e.table} ${e.localId}`).join('; ');
+                    assertEquals(brief(seen.comments!), 'failure forum_comments 1', 'the comments query gets the failure as the row goes');
+                    assertEquals(brief(seen.set!), 'failure forum_comments 1', 'and so does the set');
+                    assertEquals(seen.posts!.length, 0, 'the posts query, which shows post 1, gets nothing');
+                } finally {
+                    await projection.stop();
+                }
+            },
+        },
+        {
+            name: '[RDBPROJ30] a refused local delete brings its row back, and its failure arrives with the snapshot that shows the row again',
+            invoke: async () => {
+                const ctx = newCtx();
+                const db = await makeDatabase(ctx, 'keep-db', [{
+                    name: 'keep',
+                    tables: [open('pins', { label: { type: 'string' } }, {
+                        restrictions: [
+                            { on: 'insert', rule: { p: 'true' } }, { on: 'update', rule: { p: 'true' } }, { on: 'delete', rule: { p: 'false' } },
+                        ],
+                    })],
+                }]);
+                const keep = db.members['keep']!;
+                await (await keep.group.getTable('pins')).insert('p1', { label: 'kept' });
+                const target = new MemoryTarget({ captureChanges: true });
+                const projection = await RdbProjection.open(db.rdb, ctx, target, { writer: keep.admin });
+                try {
+                    const pins = projection.monitor(projection.selectFrom('keep_pins')) as QuerySubscription<ProjectedRow[]>;
+                    await pins.whenReady();
+                    const id = pins.getSnapshot().data[0]!.id;
+                    const delivered: { ids: string; events: string }[] = [];
+                    pins.subscribe(() => {
+                        const snap = pins.getSnapshot();
+                        delivered.push({
+                            ids: snap.data.map((row) => row.id).join(','),
+                            events: snap.events.map((e) => `${e.direction} ${e.kind} ${e.table} ${e.localId}`).join('; '),
+                        });
+                    });
+
+                    // The delete shows at once.
+                    target.localDelete('keep_pins', id);
+                    await poll(() => pins.getSnapshot().data.length === 0);
+                    // Ingestion refuses it: the settle puts the row back and logs the failure.
+                    await projection.sync();
+                    await poll(() => pins.getSnapshot().data.length === 1);
+                    assertEquals(JSON.stringify(delivered), JSON.stringify([
+                        { ids: '', events: '' },
+                        { ids: `${id}`, events: `failure delete keep_pins ${id}` },
+                    ]), 'the row goes with no event, then comes back under its id with the failure');
                 } finally {
                     await projection.stop();
                 }

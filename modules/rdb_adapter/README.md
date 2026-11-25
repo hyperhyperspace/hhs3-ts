@@ -18,6 +18,8 @@ To project an entire database (`Rdb`), the module **[rdb_projection](../rdb_proj
 
 Co-transactional failures (Rdb changes reverted because of concurrency) and ingestion failures (changes in the local projection that cannot be ingested back into Rdb, either because of programming errors or concurrent Rdb changes) are reported using the `OpEvent` data structure. The app can **subscribe** to new events (`onOpEvents` at open, or `subscribeOpEvents` after) and **inspect** the durable log with `projection.opEvents({ afterId, beforeId, limit, order })`. Subscribe snapshots high-water and streams only later ids; catch-up is the app's own `afterId`. Delivery is at-least-once.
 
+An event names the rows it is about. A row op's event names its row (`table`, `rowId`, `localId`). A bundle's event names each row the bundle writes, in `writes` (`table`, `action`, `rowId`, `localId`). A flip comes from rdb, which knows rows by hash only, so the target fills in each row's local id as it logs the event. The events about the rows a query shows also reach that query's snapshots, as [Events in a snapshot](#events-in-a-snapshot) describes.
+
 
 ## Status and limitations
 
@@ -237,7 +239,7 @@ const profiles = engine
 const sub = engine.monitor({ messages, profiles });
 ```
 
-On each flush the engine evaluates upstream monitors before downstream ones. If `messages` re-runs (say, a message body changed or a new message arrived from an author already on screen) and its distinct set of `author_key_id` values is unchanged, that dependency edge does not re-run `profiles`, and `snapshot.data.profiles` keeps the exact same array reference.
+On each flush the engine evaluates upstream monitors before downstream ones, and every run of a monitor waits until each query its `.col()` parameters read has its first result. So `profiles` is never computed on the empty key set of a `messages` monitor that has not run yet: not on its first run or in `results()`, and not after its subscription is dropped and taken again, as React's Strict Mode does. If `messages` re-runs (say, a message body changed or a new message arrived from an author already on screen) and its distinct set of `author_key_id` values is unchanged, that dependency edge does not re-run `profiles`, and `snapshot.data.profiles` keeps the exact same array reference.
 
 A UI reads the projected tables, not `RObject` views. What is on screen is a query over a projected table, and three different commits can change its result:
 
@@ -262,7 +264,9 @@ The engine handles the three commit streams differently:
   - A delete re-runs the monitor only if `cachedRowIds.has(localId)` (or if it deletes a cursor anchor whose sort tuple was not cached yet; once cached, the anchor's tuple is kept so the page boundary stays stable even after the anchor row is deleted).
   - An insert or update on a row already in `cachedRowIds` (or on the cursor anchor) always re-runs — that covers in-place edits and departures.
   - A row not in `cachedRowIds` is tested in memory with `evalWhere`. If it fails the `WHERE`, or falls on the wrong side of the `before`/`after` anchor tuple, or sorts past the last row of a full `limit` page, the monitor ignores it without touching the database.
-- **`settle` commits** re-run monitors on `revertedTables` and attach any ingestion-failure `OpEvent` whose `localId` was in `cachedRowIds`. Concurrency void/reinstate events from `apply` attach when `localId` was in the previous result or enters the new one. Each monitor tracks the op-event log's high-water id so re-queries never replay old events.
+- **`settle` commits** re-run monitors on `revertedTables`: the tables of the rows the settle reverted, and of the rows its events name.
+
+An `apply` or `settle` commit also carries the op-events it logged, which reach the monitors as [Events in a snapshot](#events-in-a-snapshot) describes.
 
 Predicates agree on Memory, SQLite, and IndexedDB: SQL three-valued `NULL`, case-sensitive `LIKE` through `likeMatch` from `hhs3_rdb`, and Unicode code-point order for text-stored values (`string`, `bigint`, `decimal`, `bytes`, `json`). Sort order places `NULL` below every non-null value. Memory and IndexedDB use that order for the `before` / `after` bound. SQLite's bound is a SQL tuple comparison, `(columns) < (anchor)` or `>`, so a `NULL` in the tuple matches neither side. SQLite `ORDER BY` still sorts `NULL` first.
 
@@ -276,10 +280,20 @@ Every target therefore enforces the **drain rule**: `drainChanges()` reads its o
 
 `monitor()` returns a `QuerySubscription<T>` (`getSnapshot()`, `subscribe(listener)`, `whenReady()`), shaped directly for React's `useSyncExternalStore` or any signal/store wrapper.
 
-Monitors are deduplicated and reference-counted by a canonical fingerprint of the query plan (table, `select`, `where` template, sorted literal parameters, `orderBy`, cursor `side`+`id`, `limit`). Dirty monitors coalesce onto a microtask. When a re-query finishes:
+Monitors are deduplicated and reference-counted by a canonical fingerprint of the query plan (table, `select`, `where` template, sorted literal parameters, `orderBy`, cursor `side`+`id`, `limit`). A subscription holds its monitor, and a held monitor holds the monitors of the queries its `.col()` parameters read. A monitor nobody holds leaves the engine and stops running. `results()` holds its monitor only while it reads, so a one-shot read leaves nothing running, and it never drops a monitor a subscription holds. Dirty monitors coalesce onto a microtask. When a re-query finishes:
 
 - Any row whose columns equal the previous snapshot's row with the same `id` reuses the previous `ProjectedRow` object reference.
 - If every row in the new result matches and no relevant `OpEvent` arrived, `getSnapshot()` keeps returning the exact same `QuerySnapshot` object and listeners are not called.
+
+### Events in a snapshot
+
+A snapshot's `events` are the op-events about rows the query shows: local writes that ingestion refused, and concurrent ops that were voided or reinstated (see [Event monitoring](#event-monitoring)). Each `apply` or `settle` commit carries the events it logged, and each monitor takes the ones that concern it:
+
+- **The rows an event names.** A row op's event names its row by `table` and `localId`. A bundle's event names each row the bundle writes, in `writes`: a voided bundle removes or brings back every one of them, in any table. rdb knows rows by hash only, so the target fills in the local ids when it logs the event, from its sync table, in the transaction that writes the rows: a row the transaction inserts has its new id, and a row it removes keeps the id its mapping holds. A row the target never had has no local id, and no query shows it.
+- **Which queries it reaches.** An event reaches a query when a row it names is in the query's table and in its result just before the event's commit, or just after it. The table counts, because local ids are per table: the refusal of row 1 of `chat_messages` never reaches a query that shows row 1 of `user_profiles`. Refusals and flips follow the same rule. A refused insert or update, and a void, name a row that was on screen and is now reverted or gone. A refused delete, and a reinstate, name a row that comes back, and the event arrives with the result that shows it again.
+- **When it is delivered.** In the delivery that follows its commit, even when the rows did not change, as when the voided op was an update a later update had already overwritten.
+- **Never later.** A monitor starts at the op-event log's high-water mark and moves past every event it reads, whether the event concerned it or not. An event for a row off the page is not delivered when that row later scrolls into the page, and a monitor opened after an event never sees it. The log keeps every event for `opEvents({ afterId })`.
+- **Query sets.** A query set delivers once per pass, after every member that had to re-run has, and its snapshot carries the events of its members' deliveries in log order, each once even when two members show the same row.
 
 ## Layout
 
@@ -322,7 +336,7 @@ Deterministic, fast checks on the pure planners (each prints under its own conso
 - `[ADPTI] rdb_adapter inverse planner` (`ingest_tests.ts`) — ingest planner (mint, reverse-map, the set-aside of readonly and author columns, refusals).
 - `[ADPTV] rdb_adapter concurrency op-events (verdict flips)` (`verdict_events_tests.ts`).
 - `[IDX] rdb_adapter projection-local indexes` (`index_actions_tests.ts`) — index planner, plus reconcile and apply-time index maintenance end to end on the memory target.
-- `[ADPTQ] Query evaluation` and `Query monitors` (`query_eval_tests.ts`, `query_monitor_tests.ts`) — `evalWhere`, `compareSortTuples`, `MemoryTarget` commit events and keyset seeks, and `QueryEngine` relevance filtering.
+- `[ADPTQ] Query evaluation` and `Query monitors` (`query_eval_tests.ts`, `query_monitor_tests.ts`) — `evalWhere`, `compareSortTuples`, `MemoryTarget` commit events and keyset seeks, and `QueryEngine` relevance filtering and [events in a snapshot](#events-in-a-snapshot).
 
 ### Planner-parity fuzzer
 

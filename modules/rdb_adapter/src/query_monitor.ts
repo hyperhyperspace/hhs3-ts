@@ -1,15 +1,19 @@
 // Single-table monitors over a queryable, reactive target. Local commits
 // re-run every monitor of the named tables. Remote apply commits use the
-// predicate, the cached ids, and the keyset window.
+// predicate, the cached ids, and the keyset window. An op-event reaches a
+// monitor when a row it names, by table and local id, is in the result just
+// before its commit or just after.
 
 import type { json } from "@hyper-hyper-space/hhs3_json";
 import type { ColumnType } from "@hyper-hyper-space/hhs3_rdb";
 
 import { ColumnSetRef, QuerySourceImpl, TableQuery, type QuerySnapshot, type QuerySubscription } from "./query_builder.js";
 import { compareSortTuples, evalWhere, normalizeOrder, tupleOf } from "./query_eval.js";
-import type {
-    BoundWhereExpr, CursorBound, OpEvent, OpEventQuery, OrderBySpec, ProjectedRow, QueryableTarget,
-    ReactiveChangeTarget, SingleTableQueryPlan, StoredOpEvent, TargetCommitEvent, TargetRowChange,
+import {
+    opEventRows,
+    type BoundWhereExpr, type CursorBound, type OpEvent, type OpEventQuery, type OrderBySpec, type ProjectedRow,
+    type QueryableTarget, type ReactiveChangeTarget, type SingleTableQueryPlan, type StoredOpEvent,
+    type TargetCommitEvent, type TargetRowChange,
 } from "./types.js";
 
 export type OpEventLog = {
@@ -25,6 +29,7 @@ export class QueryEngine {
     private readonly monitors = new Map<string, Monitor>();
     private readonly sets = new Set<QuerySet>();
     private flushQueued = false;
+    private flushing = 0;
     private readonly onCommit = (commit: TargetCommitEvent): void => { this.receive(commit); };
 
     constructor(private readonly target: Store, private readonly idColumn = 'id') {
@@ -59,14 +64,28 @@ export class QueryEngine {
         return monitor;
     }
 
+    // A subscription holds its monitor, and a held monitor holds the monitors
+    // of the queries its `.col()` parameters read, which every run of it
+    // needs. A monitor nobody holds leaves the engine and lets go of those.
     hold(monitor: Monitor): void {
         monitor.retain();
         this.monitors.set(monitor.key, monitor);
+        if (monitor.refs > 1) return;
+        monitor.upstreams = monitor.query.dependencies().map((ref) => {
+            const upstream = this.open(ref.query);
+            this.hold(upstream);
+            return upstream;
+        });
     }
 
     release(monitor: Monitor): void {
+        if (monitor.refs === 0) return;
         monitor.release();
-        if (monitor.refs === 0) this.monitors.delete(monitor.key);
+        if (monitor.refs > 0) return;
+        if (this.monitors.get(monitor.key) === monitor) this.monitors.delete(monitor.key);
+        const upstreams = monitor.upstreams;
+        monitor.upstreams = [];
+        for (const upstream of upstreams) this.release(upstream);
     }
 
     keepSet(set: QuerySet): void {
@@ -86,10 +105,17 @@ export class QueryEngine {
 
     private async flush(): Promise<void> {
         this.flushQueued = false;
-        const order = topo([...this.monitors.values()]);
-        for (const monitor of order) {
-            if (!monitor.dirty) continue;
-            await this.settle(monitor);
+        this.flushing++;
+        try {
+            const order = topo([...this.monitors.values()]);
+            for (const monitor of order) {
+                // One released during the pass keeps its dirty bit for when
+                // it is held again, and opens nothing upstream meanwhile.
+                if (!monitor.dirty || this.monitors.get(monitor.key) !== monitor) continue;
+                await this.settle(monitor);
+            }
+        } finally {
+            this.flushing--;
         }
         for (const set of this.sets) set.publish();
     }
@@ -103,7 +129,12 @@ export class QueryEngine {
         }
     }
 
+    // A monitor that delivers outside a flush, as on its first run, tells the
+    // sets at once. In a flush, each set delivers once, at the end, with its
+    // members' deliveries of the whole pass: a dependent member has re-run by
+    // then, and an event two members carry is delivered once.
     notifySets(): void {
+        if (this.flushing > 0) return;
         for (const set of this.sets) set.publish();
     }
 
@@ -131,14 +162,22 @@ export class QueryEngine {
 class Monitor {
     readonly key: string;
     refs = 0;
-    dirty = true;
+    // start() runs the first query; a pass runs a monitor only once a commit
+    // or an upstream marks it.
+    dirty = false;
+    // The upstream monitors this one holds while it is held (QueryEngine.hold).
+    upstreams: Monitor[] = [];
     private highWater = 0;
     private armed = false;
     private rows: ProjectedRow[] = [];
     private fullRows: ProjectedRow[] = [];
     private rowById = new Map<number, ProjectedRow>();
-    private events: OpEvent[] = [];
-    private pendingConcurrency: OpEvent[] = [];
+    // The events for the next delivery, and those of the last one.
+    private events: StoredOpEvent[] = [];
+    private delivered: StoredOpEvent[] = [];
+    // Events naming a row of this table that was not in the result before
+    // their commit: the next run attaches each one whose row it reads.
+    private pending: StoredOpEvent[] = [];
     private loading = true;
     private error: unknown;
     private snapshot: QuerySnapshot<ProjectedRow[]>;
@@ -163,6 +202,11 @@ class Monitor {
 
     retain(): void { this.refs++; }
 
+    current(): QuerySnapshot<ProjectedRow[]> { return this.snapshot; }
+
+    // The events of the current snapshot, with their log ids.
+    deliveredEvents(): StoredOpEvent[] { return this.delivered; }
+
     release(): void { this.refs = Math.max(0, this.refs - 1); }
 
     subscription(): QuerySubscription<ProjectedRow[]> {
@@ -172,7 +216,10 @@ class Monitor {
             subscribe(listener: () => void) {
                 monitor.engine.hold(monitor);
                 monitor.listeners.add(listener);
+                let held = true;
                 return () => {
+                    if (!held) return;
+                    held = false;
                     monitor.listeners.delete(listener);
                     monitor.engine.release(monitor);
                 };
@@ -193,32 +240,40 @@ class Monitor {
         await this.engine.settle(this);
     }
 
+    firstResult(): Promise<void> { return this.readyPromise; }
+
     consider(commit: TargetCommitEvent): boolean {
         if (!this.armed) return false;
         if (commit.source === 'reconnect') return true;
         if (commit.source === 'local') return commit.tables.includes(this.query.table);
-        if (commit.source === 'settle') {
-            this.takeEvents(commit.events);
-            const dirty = commit.revertedTables.includes(this.query.table);
-            if (!dirty) this.pendingConcurrency = [];
-            return dirty;
-        }
-        if (commit.source !== 'apply') return false;
-        this.takeEvents(commit.events);
+        if (commit.source !== 'settle' && commit.source !== 'apply') return false;
+        const attached = this.takeEvents(commit.events);
+        if (this.commitDirties(commit)) return true;
+        // A pending event needs its row to enter the result, and this commit
+        // changes nothing the query reads; a run already due checks them all.
+        if (!this.dirty) this.pending = [];
+        // An attached event is delivered now, even with the rows unchanged.
+        return attached;
+    }
+
+    private commitDirties(commit: Extract<TargetCommitEvent, { source: 'settle' | 'apply' }>): boolean {
+        if (commit.source === 'settle') return commit.revertedTables.includes(this.query.table);
         if (commit.schemaTables.includes(this.query.table)) return true;
         const where = this.boundWhere();
         const orderBy = this.order();
-        for (const change of commit.changes) {
-            if (change.table !== this.query.table) continue;
-            if (this.changeDirties(change, where, orderBy)) return true;
-        }
-        this.pendingConcurrency = [];
-        return false;
+        return commit.changes.some((change) => change.table === this.query.table && this.changeDirties(change, where, orderBy));
     }
 
     async run(): Promise<void> {
         this.dirty = false;
+        const pending = this.pending;
+        this.pending = [];
         try {
+            // A run binds the keys of the queries its `.col()` parameters
+            // name, so it waits for the first result of each: of a new
+            // monitor, and of one opened again after its holders let go.
+            const upstreams = this.query.dependencies().map((ref) => this.engine.open(ref.query));
+            if (upstreams.length > 0) await Promise.all(upstreams.map((upstream) => upstream.firstResult()));
             const plan = this.plan();
             const fetched = await this.target.executeQuery(plan);
             const cursor = this.query.cursorBound(this.cursorTuple);
@@ -227,24 +282,24 @@ class Monitor {
                 const prev = this.rowById.get(row.id);
                 return prev !== undefined && JSON.stringify(prev) === JSON.stringify(row) ? prev : row;
             });
+            // Rows equal to the delivered ones keep their array, also in a
+            // delivery made for an event alone.
+            const unchanged = !this.loading && this.error === undefined && sameRows(this.snapshot.data, delivered);
             this.fullRows = fetched;
-            this.rows = delivered;
-            this.rowById = new Map(delivered.map((row) => [row.id, row]));
-            this.cachedRowIds = new Set(delivered.map((row) => row.id));
-            for (const event of this.pendingConcurrency) {
-                if (event.localId !== undefined && this.cachedRowIds.has(event.localId)) this.events.push(event);
+            this.rows = unchanged ? this.snapshot.data : delivered;
+            this.rowById = new Map(this.rows.map((row) => [row.id, row]));
+            this.cachedRowIds = new Set(this.rows.map((row) => row.id));
+            for (const stored of pending) {
+                if (this.namesShownRow(stored.event)) this.events.push(stored);
             }
-            this.pendingConcurrency = [];
             this.lastRowTuple = delivered.length > 0 && this.queryLimit() !== undefined && delivered.length === this.queryLimit()
                 ? tupleOf(fetched[fetched.length - 1]!, this.order())
                 : undefined;
-            const same = sameRows(this.snapshot.data, delivered) && this.events.length === 0 && !this.loading && this.error === undefined;
-            if (same) return;
+            if (unchanged && this.events.length === 0) return;
             this.loading = false;
             this.error = undefined;
             this.publish();
         } catch (error) {
-            this.pendingConcurrency = [];
             this.loading = false;
             this.error = error;
             this.rows = [];
@@ -278,8 +333,8 @@ class Monitor {
     private incomingKeys(): Map<ColumnSetRef, Array<json.Literal | null>> {
         const sets = new Map<ColumnSetRef, Array<json.Literal | null>>();
         for (const ref of this.query.dependencies()) {
-            // open() does not retain, so this read must not release. Releasing
-            // would drop a monitor another subscription still holds.
+            // While this monitor is held, it holds the upstream one (see
+            // QueryEngine.hold); this read neither holds nor releases it.
             const upstream = this.engine.open(ref.query);
             sets.set(ref, upstream.keys(ref.column));
         }
@@ -318,20 +373,33 @@ class Monitor {
         return true;
     }
 
-    private takeEvents(events: StoredOpEvent[]): void {
+    // Takes a commit's events past the high-water mark, the same way for a
+    // refusal and a flip. One that names a row of the result is attached to
+    // the next delivery, and one that names another row of this table waits
+    // for the run (a reinstated row, or a refused delete, enters the result).
+    // An event that names no row of this table is dropped, and the mark moves
+    // past it either way, so an event never attaches later. Returns whether
+    // one was attached.
+    private takeEvents(events: StoredOpEvent[]): boolean {
+        let attached = false;
         for (const stored of events) {
             if (stored.id <= this.highWater) continue;
             this.highWater = stored.id;
-            const event = stored.event;
-            if (event.localId === undefined) continue;
-            if (event.origin === 'ingestion') {
-                if (this.cachedRowIds.has(event.localId)) this.events.push(event);
-                continue;
+            if (this.namesShownRow(stored.event)) {
+                this.events.push(stored);
+                attached = true;
+            } else if (opEventRows(stored.event).some((row) => row.table === this.query.table && row.localId !== undefined)) {
+                this.pending.push(stored);
             }
-            if (event.origin !== 'concurrency') continue;
-            if (this.cachedRowIds.has(event.localId)) this.events.push(event);
-            else this.pendingConcurrency.push(event);
         }
+        return attached;
+    }
+
+    // Whether the event names a row of the result: its table is this query's
+    // and its local id is among the result's ids. Local ids are per table.
+    private namesShownRow(event: OpEvent): boolean {
+        return opEventRows(event).some((row) =>
+            row.table === this.query.table && row.localId !== undefined && this.cachedRowIds.has(row.localId));
     }
 
     private async refreshCursor(cursor: CursorBound, orderBy: OrderBySpec[]): Promise<void> {
@@ -345,8 +413,12 @@ class Monitor {
     }
 
     private publish(): void {
-        this.snapshot = { data: this.rows, events: this.events, loading: false, ...(this.error !== undefined ? { error: this.error } : {}) };
+        this.delivered = this.events.sort((a, b) => a.id - b.id);
         this.events = [];
+        this.snapshot = {
+            data: this.rows, events: this.delivered.map((stored) => stored.event), loading: false,
+            ...(this.error !== undefined ? { error: this.error } : {}),
+        };
         this.ready?.();
         this.ready = undefined;
         for (const listener of this.listeners) listener();
@@ -358,12 +430,17 @@ class QuerySet {
     private readonly monitors: { [name: string]: Monitor };
     private snapshot: QuerySnapshot<{ [name: string]: ProjectedRow[] }>;
     private readonly listeners = new Set<() => void>();
+    // Each member's snapshot as this set last read it. A member whose snapshot
+    // has changed since has events the set has not delivered. A member that
+    // already ran keeps the events of its earlier deliveries to itself.
+    private readonly seen = new Map<string, QuerySnapshot<ProjectedRow[]>>();
 
     constructor(private readonly engine: QueryEngine, queries: { [name: string]: TableQuery }) {
         this.monitors = {};
         const data: { [name: string]: ProjectedRow[] } = {};
         for (const [name, query] of Object.entries(queries)) {
             this.monitors[name] = engine.open(query);
+            this.seen.set(name, this.monitors[name]!.current());
             data[name] = [];
         }
         this.snapshot = { data, events: [], loading: true };
@@ -377,24 +454,29 @@ class QuerySet {
                 set.engine.keepSet(set);
                 for (const monitor of Object.values(set.monitors)) set.engine.hold(monitor);
                 set.listeners.add(listener);
+                let held = true;
                 return () => {
+                    if (!held) return;
+                    held = false;
                     set.listeners.delete(listener);
                     for (const monitor of Object.values(set.monitors)) set.engine.release(monitor);
-                    set.engine.dropSet(set);
+                    if (set.listeners.size === 0) set.engine.dropSet(set);
                 };
             },
-            whenReady: () => Promise.all(Object.values(set.monitors).map((monitor) => monitor.subscription().whenReady())).then(() => set.current()),
+            whenReady: () => Promise.all(Object.values(set.monitors).map((monitor) => monitor.subscription().whenReady()))
+                .then(() => { set.publish(); return set.snapshot; }),
         };
     }
 
     publish(): void {
         const next = this.current();
+        const events = this.freshEvents();
         const prev = this.snapshot;
         const names = Object.keys(next.data);
         const sameData = names.length === Object.keys(prev.data).length
             && names.every((name) => next.data[name] === prev.data[name]);
-        if (sameData && next.loading === prev.loading && next.error === prev.error) return;
-        this.snapshot = next;
+        if (sameData && next.loading === prev.loading && next.error === prev.error && events.length === 0) return;
+        this.snapshot = { ...next, events };
         for (const listener of this.listeners) listener();
     }
 
@@ -403,12 +485,25 @@ class QuerySet {
         let loading = false;
         let error: unknown;
         for (const [name, monitor] of Object.entries(this.monitors)) {
-            const snap = monitor.subscription().getSnapshot();
+            const snap = monitor.current();
             data[name] = snap.data;
             loading = loading || snap.loading;
             if (snap.error !== undefined) error = snap.error;
         }
         return { data, events: [], loading, ...(error !== undefined ? { error } : {}) };
+    }
+
+    // The events of the member deliveries this set has not read, in log
+    // order, each once: two members can show the same row.
+    private freshEvents(): OpEvent[] {
+        const fresh = new Map<number, StoredOpEvent>();
+        for (const [name, monitor] of Object.entries(this.monitors)) {
+            const snap = monitor.current();
+            if (this.seen.get(name) === snap) continue;
+            this.seen.set(name, snap);
+            for (const stored of monitor.deliveredEvents()) fresh.set(stored.id, stored);
+        }
+        return [...fresh.values()].sort((a, b) => a.id - b.id).map((stored) => stored.event);
     }
 }
 

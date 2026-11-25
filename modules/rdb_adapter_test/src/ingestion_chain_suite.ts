@@ -319,7 +319,8 @@ export function createChainCases(label: string, factory: IngestionFactory): Name
                     await syncGroup(group, target, { writer: admin });
                     assertEquals((await rdbRows(group, 'comments')).length, 0, 'the concurrent delete voids it in rdb');
                     assertEquals(await localRow(target, 'comments', commentId), undefined, 'and the projection removes it');
-                    assertTrue((await target.drainOpEvents()).some((e) => e.event.direction === 'void'), 'with a void event');
+                    assertTrue((await target.drainOpEvents()).some((e) => e.event.direction === 'void'
+                        && e.event.table === 'comments' && e.event.localId === commentId), 'with a void event naming the row by its local id');
                     await assertAtCheckpoints(checkedOf(target), [{ group }], 'after the projection');
                 } finally {
                     await cleanup?.();
@@ -1169,7 +1170,8 @@ export function createChainCases(label: string, factory: IngestionFactory): Name
                         await ingestDatabaseChanges(members, h.target);
                         const ownRow = (await h.target.resolveRow('notes', own))?.rowId;
                         const event = (await h.target.drainOpEvents()).find((e) => e.event.direction === 'void' && e.event.rowId === ownRow);
-                        assertEquals(`${event?.event.kind} ${event?.event.table}`, 'insert notes', "the own insert's void event names its kind, its table and its row");
+                        assertEquals(`${event?.event.kind} ${event?.event.table} ${event?.event.localId}`, `insert notes ${own}`,
+                            "the own insert's void event names its kind, its table and its row, by local id too");
                     } finally {
                         await h.cleanup?.();
                     }

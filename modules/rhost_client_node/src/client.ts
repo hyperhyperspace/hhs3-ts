@@ -95,7 +95,8 @@ export async function hostKey(hostDir: string): Promise<HostKey> {
 
 type EventRow = {
     id: number; origin: string; direction: string; group_id: string; op_hash: string; op_json: string | null;
-    kind: string; tbl: string | null; row_hash: string | null; local_id: number | null; author: string | null; reason: string | null;
+    kind: string; tbl: string | null; row_hash: string | null; local_id: number | null; writes: string | null;
+    author: string | null; reason: string | null;
 };
 
 function toEvent(r: EventRow): ClientEvent {
@@ -110,6 +111,7 @@ function toEvent(r: EventRow): ClientEvent {
     if (r.tbl !== null) event.table = r.tbl;
     if (r.row_hash !== null) event.rowId = r.row_hash;
     if (r.local_id !== null) event.localId = r.local_id;
+    if (r.writes !== null) event.writes = JSON.parse(r.writes);
     if (r.author !== null) event.author = r.author;
     if (r.op_json !== null) event.op = JSON.parse(r.op_json);
     if (r.reason !== null) event.reason = JSON.parse(r.reason);
@@ -206,7 +208,7 @@ export function openClient(hostDir: string, options: OpenClientOptions = {}): No
     const eventsAfter = (afterId: number, limit?: number): ClientEvent[] => {
         if (!hasEvents()) return [];
         const rows = database().prepare(
-            'SELECT id, origin, direction, group_id, op_hash, op_json, kind, "table" AS tbl, row_hash, local_id, author, reason '
+            'SELECT id, origin, direction, group_id, op_hash, op_json, kind, "table" AS tbl, row_hash, local_id, writes, author, reason '
             + `FROM ${EVENT_TABLE} WHERE id > ? ORDER BY id ASC` + (limit !== undefined ? ' LIMIT ?' : ''),
         ).all(...(limit !== undefined ? [afterId, limit] : [afterId])) as EventRow[];
         return rows.map(toEvent);

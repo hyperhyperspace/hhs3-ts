@@ -22,6 +22,7 @@ export function toClientEvent(stored: StoredOpEvent): ClientEvent {
     if (event.table !== undefined) out.table = event.table;
     if (event.rowId !== undefined) out.rowId = event.rowId;
     if (event.localId !== undefined) out.localId = event.localId;
+    if (event.writes !== undefined) out.writes = event.writes;
     if (event.author !== undefined) out.author = event.author;
     if (event.op !== undefined) out.op = event.op;
     if (event.reason !== undefined) out.reason = event.reason;
