@@ -65,6 +65,7 @@ function withPlannedIndexes(
 async function checkPair(history: ProjectHistory, startIdx: number, endIdx: number, start: Version, end: Version): Promise<void> {
     const { group } = history;
     const groupId = group.getId();
+    const anonymous = group.getIdProvider() === undefined;
     const groupName = group.getName();
     const startGroupView = await group.getView(start, start);
     const endGroupView = await group.getView(end, end);
@@ -75,19 +76,19 @@ async function checkPair(history: ProjectHistory, startIdx: number, endIdx: numb
 
     const full = new ActionStore();
     full.apply(
-        withPlannedIndexes(indexSpec, groupName, groupId, endView, [], initialSchemaActions(endView)),
+        withPlannedIndexes(indexSpec, groupName, groupId, endView, [], initialSchemaActions(endView, {}, anonymous)),
         await initialRowActions(endGroupView),
     );
 
     const inc = new ActionStore();
     inc.apply(
-        withPlannedIndexes(indexSpec, groupName, groupId, startView, [], initialSchemaActions(startView)),
+        withPlannedIndexes(indexSpec, groupName, groupId, startView, [], initialSchemaActions(startView, {}, anonymous)),
         await initialRowActions(startGroupView),
     );
     try {
         inc.apply(
             withPlannedIndexes(indexSpec, groupName, groupId, endView, inc.materializedIndexes(),
-                schemaDeltaActions(delta.schemaChanges, endView, startView)),
+                schemaDeltaActions(delta.schemaChanges, endView, startView, {}, anonymous)),
             await planIncrementalRowActions(endGroupView, delta, startView, endView, groupId),
         );
     } catch (e) {
@@ -124,7 +125,7 @@ async function checkPair(history: ProjectHistory, startIdx: number, endIdx: numb
     }
 
     const empty = (await group.computeDelta(end, end)) as RTableGroupDelta;
-    const emptySchema = schemaDeltaActions(empty.schemaChanges, endView, endView);
+    const emptySchema = schemaDeltaActions(empty.schemaChanges, endView, endView, {}, anonymous);
     const emptyRows = await planIncrementalRowActions(endGroupView, empty, endView, endView, groupId);
     const emptyFlip = reprojectedTables(empty.schemaChanges, endView, endView);
     if (emptySchema.length !== 0 || emptyRows.length !== 0 || emptyFlip.size !== 0) {

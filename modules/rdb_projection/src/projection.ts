@@ -27,7 +27,8 @@ import {
     isQueryableTarget, isReactiveChangeTarget, QueryEngine, TableQuery, TargetCommitListener,
     DEFAULT_KEY_DOMAIN, GroupProjection, IndexReconcileReport, IndexSpec, IngestResult, KeyIndex, OpEvent,
     OpEventQuery, reconcileIndexes, ReconcileIndexesOptions, StoredOpEvent, syncDatabase, SyncOutcome,
-    isWriterRecordStore, type AuthorshipMode, type WriterRecord,
+    isWriterRecordStore, type AuthorSetting,
+    isTableNameIndex, isWritableTarget, type RowIdentityIndex, type RowWriter,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import { serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 
@@ -60,10 +61,12 @@ export type RdbProjectionOptions = {
     // a group with an identity provider can't ingest, and an anonymous one
     // ingests without a key (HIP-29).
     writer?: OwnIdentity;
-    // What an insert gets when it leaves the author column empty, for every
-    // member that a configOverride doesn't set it for (HIP-20's Authorship).
-    // Default on. Ignored in an anonymous group.
-    autoAuthor?: boolean;
+    // How an insert's author is chosen in a group with an identity provider
+    // (HIP-20's Authorship): under `auto`, the default, an insert that names no
+    // author is signed with the writer key; under `manual` it is anonymous. One
+    // setting for every member: a configOverride doesn't change it. Ignored in
+    // an anonymous group.
+    author?: AuthorSetting;
     configOverride?: GroupConfigOverride;
     // Coalescing window for reactive triggers (ms). Default 50.
     debounceMs?: number;
@@ -171,6 +174,9 @@ export class RdbProjection {
         const p = new RdbProjection(rdb, ctx, target, options);
         try {
             await p.reconfigure();
+            // The writer record, once: none of it changes while the projection
+            // is open (HIP-20).
+            await p.recordWriter();
             // Arm live subscribe BEFORE the initial sync so this session sees
             // events that start produces, without replaying the durable backlog.
             if (options.onOpEvents !== undefined) await p.subscribeOpEvents(options.onOpEvents);
@@ -446,6 +452,38 @@ export class RdbProjection {
         return query instanceof TableQuery ? engine.monitor(query) : engine.monitor(query);
     }
 
+    // HIP-20's Row identity and Table names, answered by the target, as the
+    // query engine's are, so that the projection is a whole QuerySource.
+    async rowHash(table: string, id: number): Promise<string | undefined> {
+        return this.identities().rowHashForLocalId(table, id);
+    }
+
+    async localId(table: string, rowHash: string): Promise<number | undefined> {
+        return this.identities().localIdForRowHash(table, rowHash);
+    }
+
+    async tableNames(member: string): Promise<{ [schemaName: string]: string }> {
+        if (!isTableNameIndex(this.target)) throw new Error('this projection target keeps no table names');
+        return this.target.tableNames(member);
+    }
+
+    // HIP-20's writer, over the projection's target. It opens with or without
+    // a writer key: without one, each write to a group with an identity
+    // provider refuses with `no-writer-key`, and a write to an anonymous group
+    // is captured, and ingested without a key (HIP-29).
+    openWriter(): RowWriter {
+        if (!isWritableTarget(this.target)) throw new Error('this projection target cannot write');
+        return this.target.openWriter();
+    }
+
+    private identities(): RowIdentityIndex {
+        const t = this.target as Partial<RowIdentityIndex>;
+        if (typeof t.rowHashForLocalId !== 'function' || typeof t.localIdForRowHash !== 'function') {
+            throw new Error('this projection target keeps no row identities');
+        }
+        return t as RowIdentityIndex;
+    }
+
     private queries(): QueryEngine {
         if (this.queryEngine !== undefined) return this.queryEngine;
         if (!isQueryableTarget(this.target) || !isReactiveChangeTarget(this.target)) {
@@ -537,20 +575,19 @@ export class RdbProjection {
         const members = await buildScope(groups, {
             names,
             writer: this.options.writer,
-            ...(this.options.autoAuthor !== undefined ? { autoAuthor: this.options.autoAuthor } : {}),
+            ...(this.options.author !== undefined ? { author: this.options.author } : {}),
             configOverride: this.options.configOverride,
         });
-        // autoAuthor off reads each insert's author from its author column, so a
-        // signed group can't have it off without the column. Refused before
+        // `manual` reads each insert's author from its author column, so a
+        // signed group can't do without the column under it. Refused before
         // anything is written to the target.
         for (const m of members) {
-            if (m.group.getIdProvider() !== undefined && m.config.autoAuthor === false && m.config.authorColumn === false) {
-                throw new Error(`group '${names.get(m.group.getId()) ?? m.group.getName()}' has autoAuthor off and no author column: `
-                    + "with autoAuthor off, an insert's author is read from its author column");
+            if (m.group.getIdProvider() !== undefined && m.config.author === 'manual' && m.config.authorColumn === false) {
+                throw new Error(`group '${names.get(m.group.getId()) ?? m.group.getName()}' has no author column: `
+                    + "under author 'manual', an insert's author is read from its author column");
             }
         }
         this.members = members;
-        await this.recordWriter(names);
         for (const group of groups) {
             const id = group.getId();
             if (this.groupCallbacks.has(id)) continue;
@@ -562,10 +599,10 @@ export class RdbProjection {
     }
 
     // Records the writer record in the target (HIP-20): the writer key, interned
-    // in the key table, when there is one, the replica's hash suite, and each
-    // member's name and authorship mode. Capture reads it to fill in the author
-    // column. Recorded at open and on each reconfigure.
-    private async recordWriter(names: Map<B64Hash, string>): Promise<void> {
+    // in the key table, when there is one, the replica's hash suite, and the
+    // author setting. Capture reads it to fill in the author column. None of it
+    // changes while the projection is open, so it is recorded once, at open.
+    private async recordWriter(): Promise<void> {
         if (!isWriterRecordStore(this.target)) return;
         let writerKeyId: number | undefined;
         const writer = this.options.writer;
@@ -573,16 +610,10 @@ export class RdbProjection {
         if (writer !== undefined && keys !== undefined) {
             writerKeyId = await keys.registerKey(DEFAULT_KEY_DOMAIN, writer.keyId, serializePublicKeyToBase64(writer.publicKey));
         }
-        const groups: WriterRecord['groups'] = {};
-        for (const m of this.members) {
-            const id = m.group.getId();
-            const mode: AuthorshipMode = m.group.getIdProvider() === undefined ? 'anonymous' : m.config.autoAuthor === false ? 'off' : 'on';
-            groups[id] = { name: names.get(id) ?? m.group.getName(), mode };
-        }
         await this.target.recordWriter({
             ...(writerKeyId !== undefined ? { writerKeyId } : {}),
             hashSuite: this.ctx.getHashSuite().name,
-            groups,
+            author: this.options.author ?? 'auto',
         });
     }
 

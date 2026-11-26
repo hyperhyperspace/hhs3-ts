@@ -57,6 +57,9 @@ import {
     ResolvedIndex, resolveOpEventQuery, RowAction, RowIdentityIndex, SchemaAction, StoredOpEvent, SyncMapping,
     versionsEqual, WriterRecord, WriterRecordStore,
     CapturedChangeId, ChangeRecord, mergeChangeRecord, RowRevert, opEventRows, withLocalIds, type OpEventWrite,
+    checkWritable, checkWrite, memberTableNames, recordedWriterKeyId, WriteRefusedError,
+    type CheckedWrite, type RowValues as WriteValues, type RowWriter, type TableNameIndex, type TableShape,
+    type WritableTarget, type WriteContext,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import { normalizeOrder } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
@@ -74,10 +77,12 @@ type TableMeta = {
     columnTypes: { [column: string]: ColumnType };
     fkColumns: { [column: string]: { targetTable: string } };
     keyRefColumns: string[];
-    // The group the table was created for, and its name in that group's
-    // schema (HIP-20). Capture reads the group's mode from the writer record.
+    // The group the table was created for, its name in that group's schema,
+    // and whether the group has no identity provider (HIP-20). Capture fills
+    // in the author only in a table whose group has one.
     groupId?: string;
-    schemaName?: string;
+    schemaName: string;
+    anonymous: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -118,6 +123,12 @@ function toParam(value: json.Literal, type: ColumnType): number | string {
     if (type === 'boolean') return value ? 1 : 0;
     if (type === 'json') return json.toStringNormalized(value);
     return value as number | string;
+}
+
+// A writer's parameter for a column: NULL, or the stored form of its value.
+// The author column, which column types leave out, holds a key id.
+function writeParam(meta: TableMeta, column: string, value: json.Literal | null): number | string | null {
+    return value === null ? null : toParam(value, meta.columnTypes[column] ?? 'integer');
 }
 
 // An outbox row as stored, for the settle's reverts.
@@ -257,11 +268,14 @@ function readLogical(value: unknown, type: ColumnType): LogicalRead {
 }
 
 export class SqliteTarget implements MaterializationTarget, MaterializedChangeSource,
-    ReactiveChangeTarget, QueryableTarget, RowIdentityIndex, KeyIndex, IndexTarget, WriterRecordStore {
+    ReactiveChangeTarget, QueryableTarget, RowIdentityIndex, KeyIndex, IndexTarget, WriterRecordStore,
+    WritableTarget, TableNameIndex {
     private db: Database.Database;
     private metaCache = new Map<string, TableMeta>();
     // The schema version the cache was read at (see freshMeta).
     private metaVersion: number | undefined;
+    // The writer's PRAGMA table_info, per table, at the schema version it was read at.
+    private columnInfoCache = new Map<string, { version: number | undefined; columns: Map<string, { notNull: boolean; hasDefault: boolean }> }>();
     private bookkeepingReady = false;
 
     // ChangeSignalSource: an external outbox monitor (the app writes through its
@@ -471,11 +485,11 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             + 'CREATE TABLE IF NOT EXISTS rdb_table_meta ('
             + '"table" TEXT PRIMARY KEY, id_column TEXT NOT NULL, author_column TEXT, '
             + "sync_table TEXT NOT NULL, column_types TEXT NOT NULL, fk_columns TEXT NOT NULL DEFAULT '{}', "
-            + "key_ref_columns TEXT NOT NULL DEFAULT '[]', group_id TEXT, schema_name TEXT);"
+            + "key_ref_columns TEXT NOT NULL DEFAULT '[]', group_id TEXT, schema_name TEXT NOT NULL, anonymous INTEGER NOT NULL);"
             // The writer record (HIP-20): one row, which the projection replaces.
-            // `groups` is a json object of each group's member name and mode.
+            // `author` is the projection's author setting, `auto` or `manual`.
             + 'CREATE TABLE IF NOT EXISTS rdb_writer_record ('
-            + 'id INTEGER PRIMARY KEY CHECK (id = 1), writer_key_id INTEGER, hash_suite TEXT NOT NULL, groups TEXT NOT NULL);'
+            + 'id INTEGER PRIMARY KEY CHECK (id = 1), writer_key_id INTEGER, hash_suite TEXT NOT NULL, author TEXT NOT NULL);'
             + `CREATE TABLE IF NOT EXISTS ${quoteId(DEFAULT_KEY_TABLE)} (`
             + 'id INTEGER PRIMARY KEY, key_hash TEXT NOT NULL UNIQUE, public_key TEXT);'
             // The durable op-event log (ingestion failures + concurrency flips).
@@ -591,14 +605,15 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             return `json_object(${pairs})`;
         };
 
-        if (meta.authorColumn !== undefined && meta.groupId !== undefined) {
+        if (meta.authorColumn !== undefined && !meta.anonymous) {
             // An empty author column gets the writer key's id where the writer
-            // record says the table's group mode is `on`. A BEFORE INSERT trigger
-            // can't change the row, so this one writes it, with capture off for
-            // that write as `applying` does, then records the stored row.
+            // record says `auto`, in a table whose group has an identity
+            // provider. A BEFORE INSERT trigger can't change the row, so this one
+            // writes it, with capture off for that write as `applying` does, then
+            // records the stored row.
             const author = quoteId(meta.authorColumn);
             const record = 'SELECT writer_key_id FROM rdb_writer_record WHERE id = 1';
-            const mode = `SELECT json_extract(groups, ${quoteText('$.' + JSON.stringify(meta.groupId) + '.mode')}) FROM rdb_writer_record WHERE id = 1`;
+            const setting = 'SELECT author FROM rdb_writer_record WHERE id = 1';
             const stored = (): string => {
                 if (cols.length === 0) return "json_object()";
                 return `json_object(${cols.map((c) => `${quoteText(c)}, r.${quoteId(c)}`).join(', ')})`;
@@ -607,7 +622,7 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
                 `CREATE TRIGGER ${quoteId('rdb_cap_ins_' + table)} AFTER INSERT ON ${quoteId(table)} WHEN ${gate} BEGIN `
                 + `UPDATE rdb_capture_config SET applying = 1; `
                 + `UPDATE ${quoteId(table)} SET ${author} = (${record}) `
-                + `WHERE ${id} = NEW.${id} AND ${author} IS NULL AND (${record}) IS NOT NULL AND (${mode}) = 'on'; `
+                + `WHERE ${id} = NEW.${id} AND ${author} IS NULL AND (${record}) IS NOT NULL AND (${setting}) = 'auto'; `
                 + `UPDATE rdb_capture_config SET applying = 0; `
                 + `INSERT INTO rdb_outbox ("table", local_id, op, changed) `
                 + `SELECT ${tableLit}, NEW.${id}, 'insert', ${stored()} FROM ${quoteId(table)} AS r WHERE r.${id} = NEW.${id}; END`);
@@ -686,11 +701,11 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
     private writeMeta(table: string, meta: TableMeta): void {
         this.db.prepare(
             'INSERT OR REPLACE INTO rdb_table_meta '
-            + '("table", id_column, author_column, sync_table, column_types, fk_columns, key_ref_columns, group_id, schema_name) '
-            + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+            + '("table", id_column, author_column, sync_table, column_types, fk_columns, key_ref_columns, group_id, schema_name, anonymous) '
+            + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
             .run(table, meta.idColumn, meta.authorColumn ?? null, meta.syncTable,
                 JSON.stringify(meta.columnTypes), JSON.stringify(meta.fkColumns),
-                JSON.stringify(meta.keyRefColumns), meta.groupId ?? null, meta.schemaName ?? null);
+                JSON.stringify(meta.keyRefColumns), meta.groupId ?? null, meta.schemaName, meta.anonymous ? 1 : 0);
         this.metaCache.set(table, meta);
     }
 
@@ -717,12 +732,12 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
         if (cached !== undefined) return cached;
 
         const row = this.db.prepare(
-            'SELECT id_column, author_column, sync_table, column_types, fk_columns, key_ref_columns, group_id, schema_name '
+            'SELECT id_column, author_column, sync_table, column_types, fk_columns, key_ref_columns, group_id, schema_name, anonymous '
             + 'FROM rdb_table_meta WHERE "table" = ?')
             .get(table) as
             { id_column: string; author_column: string | null; sync_table: string;
                 column_types: string; fk_columns: string | null; key_ref_columns: string | null;
-                group_id: string | null; schema_name: string | null }
+                group_id: string | null; schema_name: string; anonymous: number }
             | undefined;
         if (row === undefined) throw new Error(`no materialized metadata for table '${table}'`);
 
@@ -734,7 +749,8 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             fkColumns: JSON.parse(row.fk_columns ?? '{}') as { [column: string]: { targetTable: string } },
             keyRefColumns: JSON.parse(row.key_ref_columns ?? '[]') as string[],
             ...(row.group_id !== null ? { groupId: row.group_id } : {}),
-            ...(row.schema_name !== null ? { schemaName: row.schema_name } : {}),
+            schemaName: row.schema_name,
+            anonymous: row.anonymous === 1,
         };
         this.metaCache.set(table, meta);
         return meta;
@@ -873,7 +889,8 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
             syncTable: action.syncTable,
             columnTypes,
             ...(groupId !== undefined ? { groupId } : {}),
-            schemaName: action.schemaName ?? action.table,
+            schemaName: action.schemaName,
+            anonymous: action.anonymous,
             fkColumns,
             keyRefColumns,
         };
@@ -1285,29 +1302,166 @@ export class SqliteTarget implements MaterializationTarget, MaterializedChangeSo
 
     async recordWriter(record: WriterRecord): Promise<void> {
         this.ensureBookkeeping();
-        this.db.prepare('INSERT OR REPLACE INTO rdb_writer_record (id, writer_key_id, hash_suite, groups) VALUES (1, ?, ?, ?)')
-            .run(record.writerKeyId ?? null, record.hashSuite, JSON.stringify(record.groups));
+        this.db.prepare('INSERT OR REPLACE INTO rdb_writer_record (id, writer_key_id, hash_suite, author) VALUES (1, ?, ?, ?)')
+            .run(record.writerKeyId ?? null, record.hashSuite, record.author);
     }
 
     async readWriterRecord(): Promise<WriterRecord | undefined> {
         this.ensureBookkeeping();
-        const row = this.db.prepare('SELECT writer_key_id, hash_suite, groups FROM rdb_writer_record WHERE id = 1').get() as
-            { writer_key_id: number | null; hash_suite: string; groups: string } | undefined;
+        return this.writerRecordNow();
+    }
+
+    private writerRecordNow(): WriterRecord | undefined {
+        const row = this.db.prepare('SELECT writer_key_id, hash_suite, author FROM rdb_writer_record WHERE id = 1').get() as
+            { writer_key_id: number | null; hash_suite: string; author: WriterRecord['author'] } | undefined;
         if (row === undefined) return undefined;
         return {
             ...(row.writer_key_id !== null ? { writerKeyId: row.writer_key_id } : {}),
-            hashSuite: row.hash_suite, groups: JSON.parse(row.groups) as WriterRecord['groups'],
+            hashSuite: row.hash_suite, author: row.author,
         };
     }
 
-    // The table's group and its name in the schema, from the table's meta.
-    tableGroup(table: string): { groupId?: B64Hash; schemaName?: string } | undefined {
+    // HIP-20's writer. Each call is one immediate transaction, since it reads
+    // before it writes: a deferred one would fail once another connection, such
+    // as the host's, committed in between. Inside it the call reads what it is
+    // checked against, at the current schema version: the table's meta, its
+    // nullability and defaults, the writer record, the capture switch, the key
+    // table and the row. Then the shared checks, the keys interned last, and
+    // the statement, which the capture triggers record as a native write.
+    openWriter(): RowWriter {
+        this.ensureBookkeeping();
+        if (!this.capture) {
+            throw new WriteRefusedError('no-capture', 'this SQLite target is not set up for capture, so its writes would never reach rdb');
+        }
+        return {
+            insert: async (table, values) => this.writerCall(() => this.writerInsert(table, values)),
+            update: async (table, id, values, options) =>
+                this.writerCall(() => this.writerUpdate(table, id, values, options?.compare === true)),
+            delete: async (table, id) => this.writerCall(() => this.writerDelete(table, id)),
+            writerKeyId: async () => {
+                this.ensureBookkeeping();
+                return recordedWriterKeyId(this.writerRecordNow());
+            },
+        };
+    }
+
+    private writerCall<T>(call: () => T): T {
+        this.ensureBookkeeping();
+        const result = this.db.transaction(call).immediate();
+        this.noteLocalCommit();
+        return result;
+    }
+
+    private writerInsert(table: string, values: WriteValues): number {
+        const { meta, shape } = this.writeShape(table);
+        const written = this.interned(checkWrite(shape, this.writeContext(), { kind: 'insert', values }));
+        const cols = Object.keys(written);
+        const info = cols.length === 0
+            ? this.db.prepare(`INSERT INTO ${quoteId(table)} DEFAULT VALUES`).run()
+            : this.db.prepare(`INSERT INTO ${quoteId(table)} (${cols.map(quoteId).join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`)
+                .run(...cols.map((c) => writeParam(meta, c, written[c])));
+        return Number(info.lastInsertRowid);
+    }
+
+    private writerUpdate(table: string, id: number, values: WriteValues, compare: boolean): boolean {
+        const { meta, shape } = this.writeShape(table);
+        const ctx = this.writeContext();
+        checkWritable(shape, ctx);
+        if (this.db.prepare(`SELECT 1 FROM ${quoteId(table)} WHERE ${quoteId(meta.idColumn)} = ?`).get(id) === undefined) return false;
+        const row = this.readLogicalRow(meta, table, id);
+        const author = meta.authorColumn === undefined ? undefined : row[meta.authorColumn];
+        const written = this.interned(checkWrite(shape, ctx, {
+            kind: 'update', values, compare, row: { id, values: row, author: typeof author === 'number' ? author : undefined },
+        }));
+        const cols = Object.keys(written);
+        if (cols.length > 0) {
+            this.db.prepare(`UPDATE ${quoteId(table)} SET ${cols.map((c) => `${quoteId(c)} = ?`).join(', ')} WHERE ${quoteId(meta.idColumn)} = ?`)
+                .run(...cols.map((c) => writeParam(meta, c, written[c])), id);
+        }
+        return true;
+    }
+
+    // Resolves from the statement's count of changed rows, which leaves out
+    // the rows its capture triggers write.
+    private writerDelete(table: string, id: number): boolean {
+        const { meta, shape } = this.writeShape(table);
+        checkWritable(shape, this.writeContext());
+        return this.db.prepare(`DELETE FROM ${quoteId(table)} WHERE ${quoteId(meta.idColumn)} = ?`).run(id).changes > 0;
+    }
+
+    // What the checks know of a table: its meta, read again when the schema
+    // version changed, and its nullability and defaults from PRAGMA table_info.
+    private writeShape(table: string): { meta: TableMeta; shape: TableShape } {
+        this.freshMeta();
+        if (this.db.prepare('SELECT 1 FROM rdb_table_meta WHERE "table" = ?').get(table) === undefined) {
+            throw new WriteRefusedError('unknown-table', `this target has no table '${table}'`);
+        }
+        const meta = this.loadMeta(table);
+        const info = this.columnInfo(table);
+        const columns: TableShape['columns'] = {};
+        for (const [column, type] of Object.entries(meta.columnTypes)) {
+            const c = info.get(column);
+            columns[column] = {
+                type, nullable: c === undefined || !c.notNull, hasDefault: c?.hasDefault ?? false, key: meta.keyRefColumns.includes(column),
+            };
+        }
+        return {
+            meta,
+            shape: {
+                table, idColumn: meta.idColumn, ...(meta.authorColumn !== undefined ? { authorColumn: meta.authorColumn } : {}),
+                columns, anonymous: meta.anonymous,
+            },
+        };
+    }
+
+    // Each column's nullability and whether it has a default, kept while the
+    // schema version the meta was read at holds.
+    private columnInfo(table: string): Map<string, { notNull: boolean; hasDefault: boolean }> {
+        const cached = this.columnInfoCache.get(table);
+        if (cached !== undefined && cached.version === this.metaVersion) return cached.columns;
+        const rows = this.db.prepare('SELECT name, "notnull" AS nn, dflt_value AS dflt FROM pragma_table_info(?)').all(table) as
+            { name: string; nn: number; dflt: string | null }[];
+        const columns = new Map(rows.map((r) => [r.name, { notNull: r.nn === 1, hasDefault: r.dflt !== null }]));
+        this.columnInfoCache.set(table, { version: this.metaVersion, columns });
+        return columns;
+    }
+
+    private writeContext(): WriteContext {
+        const config = this.db.prepare('SELECT enabled FROM rdb_capture_config').get() as { enabled: number } | undefined;
+        return {
+            record: this.writerRecordNow(),
+            captureOn: this.capture && config?.enabled === 1,
+            keys: {
+                hasId: (id) => this.db.prepare(`SELECT 1 FROM ${quoteId(DEFAULT_KEY_TABLE)} WHERE id = ?`).get(id) !== undefined,
+                idOf: (keyHash) => (this.db.prepare(`SELECT id FROM ${quoteId(DEFAULT_KEY_TABLE)} WHERE key_hash = ?`).get(keyHash) as
+                    { id: number } | undefined)?.id,
+            },
+        };
+    }
+
+    // A checked write's values, with its keys interned.
+    private interned(checked: CheckedWrite): { [column: string]: json.Literal | null } {
+        const values = { ...checked.values };
+        for (const k of checked.intern) values[k.column] = this.internKey(k.keyHash, k.publicKey);
+        return values;
+    }
+
+    async tableNames(member: string): Promise<{ [schemaName: string]: string }> {
+        this.ensureBookkeeping();
+        const rows = this.db.prepare('SELECT "table" AS t, group_id AS g, schema_name AS s FROM rdb_table_meta').all() as
+            { t: string; g: string | null; s: string }[];
+        return memberTableNames(member, rows.map((r) => ({ table: r.t, schemaName: r.s, ...(r.g !== null ? { groupId: r.g } : {}) })));
+    }
+
+    // The table's group, its name in the schema, and whether the group has no
+    // identity provider, from the table's meta.
+    tableGroup(table: string): { groupId?: B64Hash; schemaName: string; anonymous: boolean } | undefined {
         this.ensureBookkeeping();
         this.freshMeta();
         if (this.db.prepare('SELECT 1 FROM rdb_table_meta WHERE "table" = ?').get(table) === undefined) return undefined;
         const meta = this.loadMeta(table);
         return { ...(meta.groupId !== undefined ? { groupId: meta.groupId } : {}),
-            ...(meta.schemaName !== undefined ? { schemaName: meta.schemaName } : {}) };
+            schemaName: meta.schemaName, anonymous: meta.anonymous };
     }
 
     // Whether the outbox holds a change; false without capture.

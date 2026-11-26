@@ -52,7 +52,7 @@ async function quietly<T>(fn: () => Promise<T>): Promise<T> {
 type AnyDb = { transaction(names: string[], mode: IDBTransactionMode): any };
 
 const tCreate: SchemaAction = {
-    kind: 'create-table', table: 't', syncTable: 't_sync', primaryKey: 'id',
+    kind: 'create-table', table: 't', schemaName: 't', anonymous: false, syncTable: 't_sync', primaryKey: 'id',
     columns: [{ name: 'a', def: { type: 'json', nullable: true } }],
 };
 

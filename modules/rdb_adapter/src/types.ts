@@ -17,9 +17,9 @@
 // `_key_id` is the rdb_keys intern suffix (author / identity columns).
 
 import type { json } from "@hyper-hyper-space/hhs3_json";
-import type { B64Hash, KeyId, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
+import type { B64Hash, KeyId, OwnIdentity, PublicKey } from "@hyper-hyper-space/hhs3_crypto";
 import type { ColumnDef, OpVoidDetail, OpVerdictKind } from "@hyper-hyper-space/hhs3_rdb";
-import type { Version, ValidationFailure } from "@hyper-hyper-space/hhs3_mvt";
+import { serializePublicKeyToBase64, type Version, type ValidationFailure } from "@hyper-hyper-space/hhs3_mvt";
 
 export const DEFAULT_ID_COLUMN = 'id';
 export const DEFAULT_AUTHOR_COLUMN = 'author_key_id';
@@ -88,12 +88,13 @@ export type AdapterConfig = {
     // canObserve reads $author.
     writer?: OwnIdentity;
 
-    // What an insert gets when it leaves the author column empty, in a group
-    // with an identity provider (HIP-20's Authorship): on (default), capture
-    // fills in the writer key's id, and the insert is signed with it; off, it
-    // is anonymous, and an insert is signed as its author column says. Ignored
-    // in an anonymous group.
-    autoAuthor?: boolean;
+    // How an insert's author is chosen in a group with an identity provider
+    // (HIP-20's Authorship). `auto`, the default: an insert that leaves the
+    // author column empty gets the writer key's id at capture, and is signed
+    // with it. `manual`: an insert is signed as its author column says, and is
+    // anonymous when it names no author. Ignored in an anonymous group.
+    // RdbProjection sets it on every member: one setting for the projection.
+    author?: AuthorSetting;
 
     // --- cross-group (replica-wide) projection ---
 
@@ -177,9 +178,9 @@ export function mergeChangeRecord(prev: ChangeRecord | undefined, write: ChangeR
     return merged;
 }
 
-// The changes drained in one ingestion pass, in COMMIT order. Reproducing the
-// app's transaction boundaries is not required (bundling is dependency-driven),
-// so a batch is simply the ordered drained set.
+// The changes drained in one ingestion pass, in COMMIT order. The outbox
+// doesn't record which changes the app wrote together: each change becomes its
+// own entry (HIP-29), so a batch is simply the ordered drained set.
 export type CapturedBatch = { changes: CapturedChange[] };
 
 // The lifecycle status recorded on each per-table sync row. `active`: the row
@@ -508,11 +509,11 @@ export type SchemaActionColumn = {
 // BEFORE the table/column actions and every ensure-index AFTER them; a target
 // may defer ensures further (e.g. past the row channel) within the same apply.
 export type SchemaAction =
-    // `schemaName`: the table's name in the group's schema, which the target
-    // keeps in the table's meta with the group the apply is for (HIP-20).
-    // Absent, as tests write them: the projected name is the schema's.
+    // `schemaName`: the table's name in the group's schema. `anonymous`:
+    // whether the group has no identity provider. The target keeps both in the
+    // table's meta, with the group the apply is for (HIP-20).
     | { kind: 'create-table'; table: string; syncTable: string; primaryKey: string;
-        authorColumn?: string; columns: SchemaActionColumn[]; schemaName?: string }
+        authorColumn?: string; columns: SchemaActionColumn[]; schemaName: string; anonymous: boolean }
     | { kind: 'drop-table'; table: string; syncTable: string }
     | { kind: 'add-column'; table: string; column: string; def: ColumnDef;
         fk?: FkColumnInfo; keyRef?: true }
@@ -681,23 +682,23 @@ export class CheckpointMovedError extends Error {
 
 // ---------------------------------------------------------------------------
 // The writer record (HIP-20's What the projection records in the target): what
-// a projection records in its target when it opens and whenever its groups
-// change, so that capture, and a writer in another process, read it inside
-// their own transactions. Capture fills in an empty author column with the
-// writer key's id where the table's group mode is `on` (HIP-29).
+// a projection records in its target when it opens, so that capture, and a
+// writer in another process, read it inside their own transactions. Under
+// `auto`, capture fills in an empty author column with the writer key's id, in
+// a table whose meta says its group has an identity provider (HIP-29).
 // ---------------------------------------------------------------------------
 
-// A group's authorship mode: `anonymous` for a group without an identity
-// provider, else `on` or `off`, from `autoAuthor`.
-export type AuthorshipMode = 'on' | 'off' | 'anonymous';
+// How an insert's author is chosen in a group with an identity provider
+// (AdapterConfig.author).
+export type AuthorSetting = 'auto' | 'manual';
 
 export type WriterRecord = {
     // The writer key's id in the key table, when the projection has a writer.
     writerKeyId?: number;
     // The replica's hash suite, by name.
     hashSuite: string;
-    // Each projected group's member name and authorship mode, by group id.
-    groups: { [groupId: string]: { name: string; mode: AuthorshipMode } };
+    // The projection's author setting.
+    author: AuthorSetting;
 };
 
 export interface WriterRecordStore {
@@ -710,6 +711,74 @@ export interface WriterRecordStore {
 export function isWriterRecordStore(t: object): t is WriterRecordStore {
     const c = t as Partial<WriterRecordStore>;
     return typeof c.recordWriter === 'function' && typeof c.readWriterRecord === 'function';
+}
+
+// ---------------------------------------------------------------------------
+// The writer (HIP-20's RowWriter): inserts, updates and deletes on a projection
+// target, in the table names, columns and value forms queries return, with one
+// meaning on every target. Each call is one target transaction, which it makes
+// as a native write, so capture records it like any other.
+// ---------------------------------------------------------------------------
+
+// A public key for a key column: the base64 of the serialized key. The writer
+// computes its key hash with the recorded hash suite and interns it.
+export type KeyValue = { pk: string };
+
+// A write's values, by projected column. A column given `undefined` counts as
+// not given.
+export type RowValues = { [column: string]: json.Literal | KeyValue | null | undefined };
+
+export interface RowWriter {
+    // Resolves to the new row's local id.
+    insert(table: string, values: RowValues): Promise<number>;
+    // Writes only the columns it is given; with `compare`, only those whose
+    // value differs from the row's. Resolves false when the table has no such
+    // row, and writes nothing then.
+    update(table: string, id: number, values: RowValues, options?: { compare?: boolean }): Promise<boolean>;
+    // Resolves false when the table has no such row.
+    delete(table: string, id: number): Promise<boolean>;
+    // The writer key's id in the key table: the value of a signed insert's
+    // author column.
+    writerKeyId(): Promise<number>;
+}
+
+export interface WritableTarget {
+    // Opening a writer starts nothing and holds nothing. Throws `no-capture`
+    // on a target that isn't set up for capture.
+    openWriter(): RowWriter;
+}
+
+export function isWritableTarget(t: object): t is WritableTarget {
+    return typeof (t as Partial<WritableTarget>).openWriter === 'function';
+}
+
+export function keyValue(pk: PublicKey): KeyValue {
+    return { pk: serializePublicKeyToBase64(pk) };
+}
+
+export type WriteRefusal =
+    | 'unknown-table' | 'unknown-column' | 'id-column' | 'wrong-type' | 'invalid-key'
+    | 'missing-required' | 'not-null' | 'author' | 'no-capture' | 'no-writer-key';
+
+// A write the writer refused before writing anything (HIP-20's Checks).
+export class WriteRefusedError extends Error {
+    constructor(readonly reason: WriteRefusal, message: string) {
+        super(message);
+        this.name = 'WriteRefusedError';
+    }
+}
+
+// The projected names of a member group's tables, read from the tables' meta
+// (HIP-20's Table names): each table whose projected name is the member's
+// prefix, then `_` and its name in the schema, keyed by that name. A member no
+// table matches gives {}: the target holds no member names that could tell a
+// member that doesn't exist from one whose tables aren't projected yet.
+export interface TableNameIndex {
+    tableNames(member: string): Promise<{ [schemaName: string]: string }>;
+}
+
+export function isTableNameIndex(t: object): t is TableNameIndex {
+    return typeof (t as Partial<TableNameIndex>).tableNames === 'function';
 }
 
 // Thrown by apply() while the outbox holds a change, of any group (HIP-29):

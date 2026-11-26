@@ -221,3 +221,27 @@ export function isSystemColumn(config: AdapterConfig, targetColumn: string): boo
     const author = authorColumn(config);
     return author !== undefined && targetColumn === author;
 }
+
+// Make a member name safe to use as an SQL identifier prefix: each character
+// outside [A-Za-z0-9_] becomes `_`, and a name that doesn't start with a
+// letter or `_` gets one in front. A projected table's name is this prefix,
+// then `_` and the table's name in the schema (HIP-20's Table names).
+export function sanitizePrefix(name: string): string {
+    const cleaned = name.replace(/[^A-Za-z0-9_]/g, '_');
+    return /^[A-Za-z_]/.test(cleaned) ? cleaned : '_' + cleaned;
+}
+
+// The projected names of a member group's tables, from the tables' meta
+// (HIP-20's Table names): each table of a group whose projected name is the
+// member's prefix, then `_` and its name in the schema, keyed by that name.
+// The same on every target.
+export function memberTableNames(
+    member: string, tables: Iterable<{ table: string; groupId?: string; schemaName: string }>,
+): { [schemaName: string]: string } {
+    const prefix = sanitizePrefix(member);
+    const names: { [schemaName: string]: string } = {};
+    for (const t of tables) {
+        if (t.groupId !== undefined && t.table === `${prefix}_${t.schemaName}`) names[t.schemaName] = t.table;
+    }
+    return names;
+}

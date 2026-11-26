@@ -1,10 +1,13 @@
 import { testing } from "@hyper-hyper-space/hhs3_util";
 
+import Database from "better-sqlite3";
 import {
     createIngestionSuite, createIngestionSuiteWithEndsInNewCycles, createKeysSuite, createProjectionSuite, createProjectionParitySuite,
-    parseTestFilters,
+    createWriterSuite, parseTestFilters,
 } from "@hyper-hyper-space/hhs3_rdb_adapter_test";
+import { SqliteTarget } from "../src/sqlite_target.js";
 import { sqliteHarness, sqliteIngestionHarness, sqliteSpecificTests } from "./sqlite_target_tests.js";
+import { sqliteWriterTests } from "./writer_tests.js";
 
 async function main() {
     const allTests = new Map<string, Array<{ name: string, invoke: () => Promise<void> }>>();
@@ -20,7 +23,13 @@ async function main() {
     allTests.set(keysSuite.title, keysSuite.tests);
     const projectionSuite = createProjectionParitySuite('SQLITE', sqliteHarness);
     allTests.set(projectionSuite.title, projectionSuite.tests);
+    const writerSuite = createWriterSuite('SQLITE', sqliteIngestionHarness, () => {
+        const db = new Database(':memory:');
+        return { target: new SqliteTarget(db), cleanup: () => { db.close(); } };
+    });
+    allTests.set(writerSuite.title, writerSuite.tests);
     allTests.set(sqliteSpecificTests.title, sqliteSpecificTests.tests);
+    allTests.set(sqliteWriterTests.title, sqliteWriterTests.tests);
 
     console.log('Running tests for Hyper Hyper Space v3 rdb_adapter_sqlite module'
         + (filters.length > 0 ? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');

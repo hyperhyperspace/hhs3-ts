@@ -120,8 +120,8 @@ export function nullTables(): TableDef[] {
 
 // A table with a column of each type a write can carry, for the writer suite
 // and the native write paths: a required column, nullable columns, a nullable
-// column with a default and a required one with a default, and readonly
-// columns of two types.
+// column with a default and a required one with a default, readonly columns of
+// two types, and a nullable identity column, which projects as a key column.
 export function typedTables(): TableDef[] {
     return [
         {
@@ -139,8 +139,31 @@ export function typedTables(): TableDef[] {
                 blob: { type: 'bytes', nullable: true },
                 code: { type: 'string', nullable: true, readonly: true },
                 spec: { type: 'json', nullable: true, readonly: true },
+                owner: { type: 'identity', nullable: true },
             },
             restrictions: [{ on: 'all', rule: { p: 'true' } }],
+        },
+    ];
+}
+
+// A table whose rows can be deleted only while a `delete` grant exists, so a
+// delete concurrent with the grant's revoke is voided (the writer suite's
+// voided delete).
+export function gatedTables(): TableDef[] {
+    return [
+        {
+            name: 'grants',
+            columns: { label: { type: 'string', pub: true } },
+            restrictions: [{ on: 'all', rule: { p: 'true' } }],
+        },
+        {
+            name: 'items',
+            columns: { name: { type: 'string', pub: true } },
+            restrictions: [
+                { on: 'insert', rule: { p: 'true' } },
+                { on: 'update', rule: { p: 'true' } },
+                { on: 'delete', rule: { p: 'exists', table: 'grants', where: { label: 'delete' } } },
+            ],
         },
     ];
 }
@@ -203,6 +226,11 @@ export async function createNullsGroup(): Promise<GroupFixture> {
 // A group with one table of every column type (see typedTables).
 export async function createTypedGroup(): Promise<GroupFixture> {
     return buildGroup('typed', typedTables());
+}
+
+// A group whose items' deletes are gated by a grant (see gatedTables).
+export async function createGatedGroup(): Promise<GroupFixture> {
+    return buildGroup('gated', gatedTables());
 }
 
 // The typed table in a group without an identity provider.

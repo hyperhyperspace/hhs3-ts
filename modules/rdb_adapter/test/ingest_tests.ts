@@ -434,7 +434,7 @@ export const ingestTests = {
             },
         },
         {
-            name: "[ADPTI22] an update's readonly and author columns at rdb's values for the row are set aside, other values are refused; an insert's empty author is refused in a signed group, and is anonymous under autoAuthor off",
+            name: "[ADPTI22] an update's readonly and author columns at rdb's values for the row are set aside, other values are refused; an insert's empty author is refused in a signed group, and is anonymous under manual",
             invoke: async () => {
                 const view = {
                     getTableNames: () => ['notes'],
@@ -482,11 +482,11 @@ export const ingestTests = {
                 assertEquals(p.rejects.length, 0, 'one naming the writer key is not');
                 assertEquals(p.entries[0].ops[0].mapping?.author, WRITER, 'and is signed with it');
 
-                p = plan({ title: 'x', code: 'K' }, 'insert', { autoAuthorOff: true });
+                p = plan({ title: 'x', code: 'K' }, 'insert', { manual: true });
                 const anon = p.entries[0].ops[0];
-                assertTrue(anon.anonymous === true && anon.mapping?.author === undefined, 'under autoAuthor off an empty author is anonymous');
+                assertTrue(anon.anonymous === true && anon.mapping?.author === undefined, 'under manual an empty author is anonymous');
                 assertEquals(anon.mapping?.rowId, deriveRowId('u1'), 'its row hash comes from its uuid alone');
-                p = plan({ title: 'x', code: 'K', author_key_id: 1 }, 'insert', { autoAuthorOff: true });
+                p = plan({ title: 'x', code: 'K', author_key_id: 1 }, 'insert', { manual: true });
                 const signed = p.entries[0].ops[0];
                 assertTrue(signed.anonymous === undefined && signed.mapping?.author === WRITER, 'and one naming the writer key is signed');
                 assertEquals(signed.mapping?.rowId, deriveRowId('u1', WRITER), 'with a row hash from its signer');

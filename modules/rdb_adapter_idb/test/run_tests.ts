@@ -2,11 +2,13 @@ import { testing } from "@hyper-hyper-space/hhs3_util";
 
 import {
     createIngestionSuite, createIngestionSuiteWithEndsInNewCycles, createKeysSuite, createProjectionSuite, createProjectionParitySuite,
-    parseTestFilters,
+    createWriterSuite, parseTestFilters,
 } from "@hyper-hyper-space/hhs3_rdb_adapter_test";
+import { IdbTarget } from "../src/idb_target.js";
 import { idbHarness, idbIngestionHarness, idbSpecificTests } from "./idb_target_tests.js";
 import { idbIndexTests } from "./idb_index_tests.js";
 import { idbFacadeErrorTests } from "./idb_facade_error_tests.js";
+import { idbWriterTests } from "./writer_tests.js";
 
 async function main() {
     const allTests = new Map<string, Array<{ name: string, invoke: () => Promise<void> }>>();
@@ -22,9 +24,16 @@ async function main() {
     allTests.set(keysSuite.title, keysSuite.tests);
     const projectionSuite = createProjectionParitySuite('IDB', idbHarness);
     allTests.set(projectionSuite.title, projectionSuite.tests);
+    let bareCount = 0;
+    const writerSuite = createWriterSuite('IDB', idbIngestionHarness, async () => {
+        const target = await IdbTarget.open(`writer-bare-${Date.now()}-${bareCount++}`);
+        return { target, cleanup: () => { target.close(); } };
+    });
+    allTests.set(writerSuite.title, writerSuite.tests);
     allTests.set(idbSpecificTests.title, idbSpecificTests.tests);
     allTests.set(idbIndexTests.title, idbIndexTests.tests);
     allTests.set(idbFacadeErrorTests.title, idbFacadeErrorTests.tests);
+    allTests.set(idbWriterTests.title, idbWriterTests.tests);
 
     console.log('Running tests for Hyper Hyper Space v3 rdb_adapter_idb module'
         + (filters.length > 0 ? ' (applying filter: ' + filters.toString() + ')' : '') + '\n');

@@ -14,7 +14,7 @@ import { connect, type Socket } from "node:net";
 import { basename, join, resolve } from "node:path";
 import Database from "better-sqlite3";
 
-import { createBasicCrypto, HASH_SHA256, keyIdFromPublicKey } from "@hyper-hyper-space/hhs3_crypto";
+import { getHashSuite, keyIdFromPublicKey, type HashSuite } from "@hyper-hyper-space/hhs3_crypto";
 import { deserializePublicKeyFromBase64 } from "@hyper-hyper-space/hhs3_mvt";
 import {
     LineDecoder, decodeServerMessage, encodeMessage, socketPathFor,
@@ -24,11 +24,11 @@ import {
 
 const KEY_TABLE = 'rdb_keys';
 const EVENT_TABLE = 'rdb_op_events';
+const WRITER_RECORD_TABLE = 'rdb_writer_record';
 const EVENT_POLL_MS = 500;
 const RECONNECT_MS = 1_000;
 const STATUS_TIMEOUT_MS = 5_000;
 
-const hashSuite = createBasicCrypto().hash(HASH_SHA256);
 
 type ProjectionSection = { path?: unknown };
 type HostFile = {
@@ -205,6 +205,23 @@ export function openClient(hostDir: string, options: OpenClientOptions = {}): No
         return run.immediate();
     };
 
+    // The hash suite the projection recorded in its writer record (HIP-20),
+    // the replica's, which a key's hash is computed with. Without the record
+    // the suite is unknown, and a guess could intern a key under a hash rdb
+    // doesn't use.
+    const recordedHashSuite = (): HashSuite => {
+        const row = hasTable(WRITER_RECORD_TABLE)
+            ? database().prepare(`SELECT hash_suite FROM ${WRITER_RECORD_TABLE} WHERE id = 1`).get() as { hash_suite: string } | undefined
+            : undefined;
+        if (row === undefined) {
+            throw new Error(`host '${basename(dir)}' has no writer record in its projection yet, `
+                + 'so the hash suite its keys are hashed with is unknown; start it once');
+        }
+        const suite = getHashSuite(row.hash_suite);
+        if (suite === undefined) throw new Error(`the projection's writer record names the hash suite '${row.hash_suite}', which isn't registered`);
+        return suite;
+    };
+
     const eventsAfter = (afterId: number, limit?: number): ClientEvent[] => {
         if (!hasEvents()) return [];
         const rows = database().prepare(
@@ -259,7 +276,7 @@ export function openClient(hostDir: string, options: OpenClientOptions = {}): No
             return { ...key, id: intern(key.keyId, key.publicKey) };
         },
         async registerKey(publicKey: string): Promise<number> {
-            return intern(keyIdFromPublicKey(deserializePublicKeyFromBase64(publicKey), hashSuite), publicKey);
+            return intern(keyIdFromPublicKey(deserializePublicKeyFromBase64(publicKey), recordedHashSuite()), publicKey);
         },
         events,
         async status(): Promise<ClientStatus> {

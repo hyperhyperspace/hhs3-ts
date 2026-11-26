@@ -10,17 +10,18 @@ import type { ColumnType } from "@hyper-hyper-space/hhs3_rdb";
 import { ColumnSetRef, QuerySourceImpl, TableQuery, type QuerySnapshot, type QuerySubscription } from "./query_builder.js";
 import { compareSortTuples, evalWhere, normalizeOrder, tupleOf } from "./query_eval.js";
 import {
-    opEventRows,
+    isTableNameIndex, isWritableTarget, opEventRows,
     type BoundWhereExpr, type CursorBound, type OpEvent, type OpEventQuery, type OrderBySpec, type ProjectedRow,
-    type QueryableTarget, type ReactiveChangeTarget, type SingleTableQueryPlan, type StoredOpEvent,
-    type TargetCommitEvent, type TargetRowChange,
+    type QueryableTarget, type ReactiveChangeTarget, type RowIdentityIndex, type SingleTableQueryPlan, type StoredOpEvent,
+    type TableNameIndex, type TargetCommitEvent, type TargetRowChange, type WritableTarget,
 } from "./types.js";
 
 export type OpEventLog = {
     drainOpEvents(opts?: OpEventQuery | number): Promise<StoredOpEvent[]>;
 };
 
-type Store = QueryableTarget & ReactiveChangeTarget & Partial<OpEventLog>;
+type Store = QueryableTarget & ReactiveChangeTarget & Partial<OpEventLog> & Partial<RowIdentityIndex>
+    & Partial<TableNameIndex> & Partial<WritableTarget>;
 
 type RowView = { [column: string]: json.Literal | null | undefined };
 
@@ -36,7 +37,8 @@ const LOADING: QuerySnapshot<ProjectedRow[]> = Object.freeze({
 type Listener = { listener: () => void };
 
 export class QueryEngine {
-    readonly source = new QuerySourceImpl(this);
+    // A query source over the target, with openWriter when the target can write.
+    readonly source: QuerySourceImpl;
     private readonly monitors = new Map<string, Monitor>();
     private readonly sets = new Set<QuerySet>();
     // The monitors whose count reached zero in the current synchronous code.
@@ -47,7 +49,30 @@ export class QueryEngine {
     private readonly onCommit = (commit: TargetCommitEvent): void => { this.receive(commit); };
 
     constructor(private readonly target: Store, private readonly idColumn = 'id') {
+        this.source = new QuerySourceImpl(this, isWritableTarget(target) ? () => (target as WritableTarget).openWriter() : undefined);
         target.addCommitListener(this.onCommit);
+    }
+
+    // HIP-20's Row identity and Table names, answered by the target.
+    rowHash(table: string, id: number): Promise<string | undefined> {
+        return this.identities().rowHashForLocalId(table, id);
+    }
+
+    localId(table: string, rowHash: string): Promise<number | undefined> {
+        return this.identities().localIdForRowHash(table, rowHash);
+    }
+
+    async tableNames(member: string): Promise<{ [schemaName: string]: string }> {
+        if (!isTableNameIndex(this.target)) throw new Error("this query engine's target keeps no table names");
+        return this.target.tableNames(member);
+    }
+
+    private identities(): RowIdentityIndex {
+        const t = this.target;
+        if (typeof t.rowHashForLocalId !== 'function' || typeof t.localIdForRowHash !== 'function') {
+            throw new Error("this query engine's target keeps no row identities");
+        }
+        return t as RowIdentityIndex;
     }
 
     selectFrom(table: string): TableQuery {

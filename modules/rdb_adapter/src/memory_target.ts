@@ -35,8 +35,11 @@ import {
     RowAction, RowIdentityIndex, SchemaAction, SingleTableQueryPlan, StoredOpEvent,
     SyncMapping, SyncStatus, TargetCommitEvent, TargetCommitListener, TargetRowChange, versionsEqual,
     CapturedChangeId, ChangeRecord, mergeChangeRecord, opEventRows, withLocalIds,
-    WriterRecord, WriterRecordStore,
+    WriterRecord, WriterRecordStore, RowWriter, TableNameIndex, WritableTarget, WriteRefusedError,
+    type RowValues as WriteValues,
 } from "./types.js";
+import { memberTableNames } from "./names.js";
+import { checkWritable, checkWrite, recordedWriterKeyId, type CheckedWrite, type TableShape, type WriteContext } from "./writer.js";
 
 type RowValues = { [column: string]: json.Literal };
 
@@ -83,10 +86,14 @@ type TableState = {
     // them: add-column backfills existing rows and a new-row upsert fills any
     // defaulted column the insert omitted (mirroring SQLite's DDL DEFAULT).
     defaults: { [column: string]: json.Literal };
+    // The nullable columns, which the writer's checks read (HIP-20).
+    nullable: Set<string>;
     // The group the table was created for, and its name in that group's
-    // schema (HIP-20): capture reads the group's mode from the writer record.
+    // schema (HIP-20).
     groupId?: B64Hash;
-    schemaName?: string;
+    schemaName: string;
+    // Whether the table's group has no identity provider (HIP-20).
+    anonymous: boolean;
 };
 
 type Store = {
@@ -134,8 +141,10 @@ function cloneTable(state: TableState): TableState {
         fkColumns: { ...state.fkColumns },
         keyRefColumns: new Set(state.keyRefColumns),
         defaults: { ...state.defaults },
+        nullable: new Set(state.nullable),
         ...(state.groupId !== undefined ? { groupId: state.groupId } : {}),
-        ...(state.schemaName !== undefined ? { schemaName: state.schemaName } : {}),
+        schemaName: state.schemaName,
+        anonymous: state.anonymous,
     };
 }
 
@@ -161,7 +170,8 @@ function cloneStore(store: Store): Store {
 }
 
 export class MemoryTarget implements MaterializationTarget, MaterializedChangeSource, ChangeSignalSource,
-    ReactiveChangeTarget, QueryableTarget, RowIdentityIndex, KeyIndex, IndexTarget, WriterRecordStore {
+    ReactiveChangeTarget, QueryableTarget, RowIdentityIndex, KeyIndex, IndexTarget, WriterRecordStore,
+    WritableTarget, TableNameIndex {
     private store: Store = {
         tables: new Map(), checkpoints: new Map(), endObserves: new Map(),
         keysByHash: new Map(), keysById: new Map(), nextKeyId: 1,
@@ -374,13 +384,14 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
     }
 
     // The key id capture fills an empty author column with: the writer key's,
-    // where the writer record says the table's group mode is `on`, and capture
-    // is on. Otherwise none: with no writer record, nothing is filled (HIP-29).
+    // where the writer record says `auto`, the table's group has an identity
+    // provider, and capture is on. Otherwise none: with no writer record,
+    // nothing is filled (HIP-29).
     private fillAuthor(state: TableState): number | undefined {
-        if (!this.captureProvisioned || !this.captureEnabled) return undefined;
+        if (!this.captureProvisioned || !this.captureEnabled || state.anonymous) return undefined;
         const record = this.writerRecord;
-        if (record === undefined || record.writerKeyId === undefined || state.groupId === undefined) return undefined;
-        return record.groups[state.groupId]?.mode === 'on' ? record.writerKeyId : undefined;
+        if (record === undefined || record.writerKeyId === undefined || record.author !== 'auto') return undefined;
+        return record.writerKeyId;
     }
 
     private record(change:
@@ -476,19 +487,99 @@ export class MemoryTarget implements MaterializationTarget, MaterializedChangeSo
     }
 
     async recordWriter(record: WriterRecord): Promise<void> {
-        this.writerRecord = { ...record, groups: { ...record.groups } };
+        this.writerRecord = { ...record };
     }
 
     async readWriterRecord(): Promise<WriterRecord | undefined> {
-        return this.writerRecord === undefined ? undefined : { ...this.writerRecord, groups: { ...this.writerRecord.groups } };
+        return this.writerRecord === undefined ? undefined : { ...this.writerRecord };
     }
 
-    // The table's group and its name in the schema, from the table's meta.
-    tableGroup(table: string): { groupId?: B64Hash; schemaName?: string } | undefined {
+    // HIP-20's writer. Each call checks the write with the shared checks, then
+    // makes it with localInsert, localUpdate or localDelete, so capture records
+    // it as a native write. A call runs synchronously, so nothing comes between
+    // its checks and its write, and keys are interned last.
+    openWriter(): RowWriter {
+        if (!this.captureProvisioned) {
+            throw new WriteRefusedError('no-capture', 'this memory target was opened without capture, so its writes would never reach rdb');
+        }
+        return {
+            insert: async (table, values) => this.writerInsert(table, values),
+            update: async (table, id, values, options) => this.writerUpdate(table, id, values, options?.compare === true),
+            delete: async (table, id) => this.writerDelete(table, id),
+            writerKeyId: async () => recordedWriterKeyId(this.writerRecord),
+        };
+    }
+
+    private writerInsert(table: string, values: WriteValues): number {
+        const { shape } = this.writeShape(table);
+        const checked = checkWrite(shape, this.writeContext(), { kind: 'insert', values });
+        return this.localInsert(table, this.interned(checked));
+    }
+
+    private writerUpdate(table: string, id: number, values: WriteValues, compare: boolean): boolean {
+        const { state, shape } = this.writeShape(table);
+        const ctx = this.writeContext();
+        checkWritable(shape, ctx);
+        const row = state.rows.get(id);
+        if (row === undefined) return false;
+        const checked = checkWrite(shape, ctx, { kind: 'update', values, compare, row: { id, values: row.values, author: row.author } });
+        return this.localUpdate(table, id, this.interned(checked));
+    }
+
+    private writerDelete(table: string, id: number): boolean {
+        const { state, shape } = this.writeShape(table);
+        checkWritable(shape, this.writeContext());
+        if (!state.rows.has(id)) return false;
+        return this.localDelete(table, id);
+    }
+
+    // What the checks know of a table, from its state.
+    private writeShape(table: string): { state: TableState; shape: TableShape } {
+        const state = this.store.tables.get(table);
+        if (state === undefined) throw new WriteRefusedError('unknown-table', `this target has no table '${table}'`);
+        const columns: TableShape['columns'] = {};
+        for (const [column, type] of Object.entries(state.columnTypes)) {
+            columns[column] = {
+                type, nullable: state.nullable.has(column), hasDefault: column in state.defaults, key: state.keyRefColumns.has(column),
+            };
+        }
+        return {
+            state,
+            shape: {
+                table, idColumn: state.idColumn, ...(state.authorColumn !== undefined ? { authorColumn: state.authorColumn } : {}),
+                columns, anonymous: state.anonymous,
+            },
+        };
+    }
+
+    private writeContext(): WriteContext {
+        const store = this.store;
+        return {
+            record: this.writerRecord,
+            captureOn: this.captureProvisioned && this.captureEnabled,
+            keys: { hasId: (id) => store.keysById.has(id), idOf: (keyHash) => store.keysByHash.get(keyHash)?.id },
+        };
+    }
+
+    // A checked write's values, with its keys interned.
+    private interned(checked: CheckedWrite): CapturedValues {
+        const values: CapturedValues = { ...checked.values };
+        for (const k of checked.intern) values[k.column] = internKey(this.store, k.keyHash, k.publicKey);
+        return values;
+    }
+
+    async tableNames(member: string): Promise<{ [schemaName: string]: string }> {
+        return memberTableNames(member, [...this.store.tables].map(([table, state]) => (
+            { table, schemaName: state.schemaName, ...(state.groupId !== undefined ? { groupId: state.groupId } : {}) })));
+    }
+
+    // The table's group, its name in the schema, and whether the group has no
+    // identity provider, from the table's meta.
+    tableGroup(table: string): { groupId?: B64Hash; schemaName: string; anonymous: boolean } | undefined {
         const state = this.store.tables.get(table);
         if (state === undefined) return undefined;
         return { ...(state.groupId !== undefined ? { groupId: state.groupId } : {}),
-            ...(state.schemaName !== undefined ? { schemaName: state.schemaName } : {}) };
+            schemaName: state.schemaName, anonymous: state.anonymous };
     }
 
     async drainChanges(): Promise<CapturedBatch> {
@@ -764,11 +855,13 @@ function createTable(store: Store, action: Extract<SchemaAction, { kind: 'create
     const fkColumns: { [column: string]: { targetTable: string } } = {};
     const keyRefColumns = new Set<string>();
     const defaults: { [column: string]: json.Literal } = {};
+    const nullable = new Set<string>();
     for (const c of action.columns) {
         columnTypes[c.name] = c.def.type;
         if (c.fk !== undefined) fkColumns[c.name] = { targetTable: c.fk.targetTable };
         if (c.keyRef === true) keyRefColumns.add(c.name);
         if (c.def.default !== undefined) defaults[c.name] = c.def.default;
+        if (c.def.nullable === true) nullable.add(c.name);
     }
     store.tables.set(action.table, {
         idColumn: action.primaryKey,
@@ -783,8 +876,10 @@ function createTable(store: Store, action: Extract<SchemaAction, { kind: 'create
         fkColumns,
         keyRefColumns,
         defaults,
+        nullable,
         ...(groupId !== undefined ? { groupId } : {}),
-        schemaName: action.schemaName ?? action.table,
+        schemaName: action.schemaName,
+        anonymous: action.anonymous,
     });
 }
 
@@ -801,6 +896,8 @@ function addColumn(store: Store, action: Extract<SchemaAction, { kind: 'add-colu
     state.columnTypes[action.column] = action.def.type;
     if (action.fk !== undefined) state.fkColumns[action.column] = { targetTable: action.fk.targetTable };
     if (action.keyRef === true) state.keyRefColumns.add(action.column);
+    if (action.def.nullable === true) state.nullable.add(action.column);
+    else state.nullable.delete(action.column);
     // The rdb delta channel never enumerates a defaulted column for existing
     // rows, so backfill them here (as SQLite's ALTER ADD COLUMN ... DEFAULT
     // does). Only live rows are present in `state.rows`.
@@ -825,6 +922,7 @@ function dropColumn(store: Store, action: Extract<SchemaAction, { kind: 'drop-co
     delete state.fkColumns[action.column];
     state.keyRefColumns.delete(action.column);
     delete state.defaults[action.column];
+    state.nullable.delete(action.column);
     for (const row of state.rows.values()) delete row.values[action.column];
 }
 

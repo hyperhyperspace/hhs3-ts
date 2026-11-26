@@ -143,7 +143,7 @@ export const schemaActionsTests = {
 
                 const view = (await group.getView()).getSchemaView();
                 const to = await (await group.getScopedDag()).getFrontier();
-                const actions = initialSchemaActions(view, {});
+                const actions = initialSchemaActions(view, {}, false);
                 await target.apply(groupId, actions, [], to);
 
                 const creates = actionOfKind(actions, 'create-table');
@@ -179,7 +179,7 @@ export const schemaActionsTests = {
                     { rule: 'add-column', table: 'ledger', column: 'note', def: { type: 'string', nullable: true } },
                 ]);
 
-                const actions = schemaDeltaActions(changes, endView, startView, {});
+                const actions = schemaDeltaActions(changes, endView, startView, {}, false);
                 const creates = actionOfKind(actions, 'create-table');
                 const adds = actionOfKind(actions, 'add-column');
 
@@ -199,7 +199,7 @@ export const schemaActionsTests = {
                     { rule: 'drop-column', table: 'ledger', column: 'memo' },
                 ]);
 
-                const actions = schemaDeltaActions(changes, endView, startView, {});
+                const actions = schemaDeltaActions(changes, endView, startView, {}, false);
                 assertEquals(actionOfKind(actions, 'drop-table').length, 1, 'one drop-table');
                 assertEquals(actionOfKind(actions, 'drop-column').length, 1, 'one drop-column');
                 const dropTable = actions.find((a) => a.kind === 'drop-table');
@@ -221,7 +221,7 @@ export const schemaActionsTests = {
                     { rule: 'drop-column', table: 'comments', column: 'post' },
                 ]);
 
-                const actions = schemaDeltaActions(changes, endView, startView, {});
+                const actions = schemaDeltaActions(changes, endView, startView, {}, false);
                 const drops = actionOfKind(actions, 'drop-column');
                 const postDrop = drops.find((a) => a.kind === 'drop-column' && a.table === 'comments');
                 assertTrue(postDrop?.kind === 'drop-column' && postDrop.column === 'post_id',
@@ -245,7 +245,7 @@ export const schemaActionsTests = {
                     { rule: 'drop-column', table: 'caps', column: 'grantee' },
                 ]);
 
-                const actions = schemaDeltaActions(changes, endView, startView, {});
+                const actions = schemaDeltaActions(changes, endView, startView, {}, false);
                 const drops = actionOfKind(actions, 'drop-column');
                 assertEquals(drops.length, 1, 'one drop-column');
                 assertTrue(drops[0].kind === 'drop-column' && drops[0].table === 'caps'
@@ -261,7 +261,7 @@ export const schemaActionsTests = {
                     { rule: 'drop-column', table: 'ledger', column: 'memo' },
                 ]);
 
-                const actions = schemaDeltaActions(changes, endView, startView, {});
+                const actions = schemaDeltaActions(changes, endView, startView, {}, false);
                 const drops = actionOfKind(actions, 'drop-column');
                 assertEquals(drops.length, 1, 'one drop-column');
                 assertTrue(drops[0].kind === 'drop-column' && drops[0].table === 'ledger'
@@ -284,7 +284,7 @@ export const schemaActionsTests = {
                     { rule: 'set-fks', table: 'comments', fks: { post: 'posts' } },
                 ]);
 
-                const actions = schemaDeltaActions(changes, endView, startView, {});
+                const actions = schemaDeltaActions(changes, endView, startView, {}, false);
                 const drops = actionOfKind(actions, 'drop-column');
                 const adds = actionOfKind(actions, 'add-column');
                 assertEquals(drops.length, 1, 'exactly one drop-column');
@@ -309,7 +309,7 @@ export const schemaActionsTests = {
                     { rule: 'set-fks', table: 'comments', fks: { parent: 'comments' } },
                 ]);
 
-                const actions = schemaDeltaActions(changes, endView, startView, {});
+                const actions = schemaDeltaActions(changes, endView, startView, {}, false);
                 const drops = actionOfKind(actions, 'drop-column');
                 const adds = actionOfKind(actions, 'add-column');
                 assertEquals(drops.length, 1, 'exactly one drop-column');
@@ -339,7 +339,7 @@ export const schemaActionsTests = {
                     { rule: 'set-fks', table: 'comments', fks: { post: 'tags' } },
                 ]);
 
-                const actions = schemaDeltaActions(changes, endView, startView, {});
+                const actions = schemaDeltaActions(changes, endView, startView, {}, false);
                 const drops = actionOfKind(actions, 'drop-column');
                 const adds = actionOfKind(actions, 'add-column');
                 assertEquals(drops.length, 1, 'the old post_id is dropped');
@@ -369,7 +369,7 @@ export const schemaActionsTests = {
                     { rule: 'set-fks', table: 'comments', fks: { post: 'posts' } },
                 ]);
 
-                const actions = schemaDeltaActions(changes, endView, startView, {});
+                const actions = schemaDeltaActions(changes, endView, startView, {}, false);
                 const drops = actionOfKind(actions, 'drop-column');
                 const adds = actionOfKind(actions, 'add-column');
                 assertEquals(drops.length, 1, 'exactly one drop-column (no double-count)');
@@ -389,7 +389,7 @@ export const schemaActionsTests = {
                     { rule: 'set-concurrent-deletes', table: 'ledger', value: true },
                 ]);
 
-                const actions = schemaDeltaActions(changes, endView, startView, {});
+                const actions = schemaDeltaActions(changes, endView, startView, {}, false);
                 assertEquals(actions.length, 0, 'a pure at-use-semantics flip projects to no DDL');
             },
         },
@@ -473,7 +473,7 @@ export const schemaActionsTests = {
                     { rule: 'add-column', table: 'ledger', column: 'memo', def: { type: 'integer', nullable: true } },
                 ]);
 
-                const actions = schemaDeltaActions(changes, endView, startView, {});
+                const actions = schemaDeltaActions(changes, endView, startView, {}, false);
                 const memoActions = actions.filter((a) =>
                     (a.kind === 'drop-column' || a.kind === 'add-column') && a.table === 'ledger' && a.column === 'memo');
                 assertEquals(memoActions.length, 2, 'changed column yields two actions');
@@ -494,7 +494,7 @@ export const schemaActionsTests = {
                     authorColumn: 'owner',
                 };
                 const view = (await group.getView()).getSchemaView();
-                const actions = initialSchemaActions(view, config);
+                const actions = initialSchemaActions(view, config, false);
 
                 const accounts = actions.find((a) => a.kind === 'create-table' && a.table === 'accounts');
                 assertTrue(accounts !== undefined && accounts.kind === 'create-table', 'ledger renamed to accounts');
@@ -505,7 +505,7 @@ export const schemaActionsTests = {
                 assertTrue(!accounts.columns.some((c) => c.name === 'memo'), 'original column name not emitted');
 
                 // authorColumn: false omits authorship entirely.
-                const noAuthor = initialSchemaActions(view, { authorColumn: false });
+                const noAuthor = initialSchemaActions(view, { authorColumn: false }, false);
                 const ledger = noAuthor.find((a) => a.kind === 'create-table' && a.table === 'ledger');
                 assertTrue(ledger?.kind === 'create-table' && ledger.authorColumn === undefined,
                     'authorColumn: false omits the author column');
@@ -517,21 +517,21 @@ export const schemaActionsTests = {
                 const { group } = await createGroup();
                 const view = (await group.getView()).getSchemaView();
 
-                expectThrow(() => initialSchemaActions(view, { columnNames: { ledger: { memo: 'ref' } } }),
+                expectThrow(() => initialSchemaActions(view, { columnNames: { ledger: { memo: 'ref' } } }, false),
                     'two columns mapping to the same name should throw');
-                expectThrow(() => initialSchemaActions(view, { columnNames: { ledger: { memo: 'id' } } }),
+                expectThrow(() => initialSchemaActions(view, { columnNames: { ledger: { memo: 'id' } } }, false),
                     'a column colliding with the id column should throw');
-                expectThrow(() => initialSchemaActions(view, { columnNames: { ledger: { memo: 'author_key_id' } } }),
+                expectThrow(() => initialSchemaActions(view, { columnNames: { ledger: { memo: 'author_key_id' } } }, false),
                     'a column colliding with the author column should throw');
-                expectThrow(() => initialSchemaActions(view, { tableNames: { ledger: 'x', tags: 'x' } }),
+                expectThrow(() => initialSchemaActions(view, { tableNames: { ledger: 'x', tags: 'x' } }, false),
                     'two tables mapping to the same name should throw');
                 // a real table named like another table's sync table must be rejected.
-                expectThrow(() => initialSchemaActions(view, { tableNames: { tags: 'ledger_sync' } }),
+                expectThrow(() => initialSchemaActions(view, { tableNames: { tags: 'ledger_sync' } }, false),
                     'a table colliding with a sync-table name should throw');
                 // custom suffix reservation.
                 expectThrow(() => initialSchemaActions(view, {
                     syncTableSuffix: '__s', tableNames: { tags: 'ledger__s' },
-                }), 'a table colliding with a custom sync-table suffix should throw');
+                }, false), 'a table colliding with a custom sync-table suffix should throw');
             },
         },
         {
@@ -539,7 +539,7 @@ export const schemaActionsTests = {
             invoke: async () => {
                 const { schema } = await createSchema(localFkTables());
                 const view = await schema.getView();
-                const actions = initialSchemaActions(view, {});
+                const actions = initialSchemaActions(view, {}, false);
 
                 const comments = actions.find((a) => a.kind === 'create-table' && a.table === 'comments');
                 assertTrue(comments?.kind === 'create-table', 'comments create-table present');
@@ -573,7 +573,7 @@ export const schemaActionsTests = {
                     getFKs: (n: string) => n === 'comments' ? { origin: 'archive.entries' } : {},
                 } as unknown as RSchemaView;
 
-                const actions = initialSchemaActions(mockView, {});
+                const actions = initialSchemaActions(mockView, {}, false);
                 const create = actions.find((a) => a.kind === 'create-table' && a.table === 'comments');
                 assertTrue(create?.kind === 'create-table', 'comments create-table present');
                 if (create === undefined || create.kind !== 'create-table') return;
@@ -604,7 +604,7 @@ export const schemaActionsTests = {
                 const config: AdapterConfig = {
                     crossGroup: (ref) => ref === 'archive.entries' ? 'archive_entries' : undefined,
                 };
-                const actions = initialSchemaActions(mockView, config);
+                const actions = initialSchemaActions(mockView, config, false);
                 const create = actions.find((a) => a.kind === 'create-table' && a.table === 'comments');
                 assertTrue(create?.kind === 'create-table', 'comments create-table present');
                 if (create === undefined || create.kind !== 'create-table') return;
@@ -626,7 +626,7 @@ export const schemaActionsTests = {
                 const v = await frontier(schema);
                 const emptyDelta = (await schema.computeDelta(v, v)) as RSchemaDelta;
                 const emptyView = await schema.getView(v, v);
-                assertEquals(schemaDeltaActions(emptyDelta.changes as RSchemaChanges, emptyView, emptyView, {}).length, 0,
+                assertEquals(schemaDeltaActions(emptyDelta.changes as RSchemaChanges, emptyView, emptyView, {}, false).length, 0,
                     'no schema changes -> no actions');
 
                 // mixed migration: drop-table, add-table, add-column, drop-column
@@ -639,7 +639,7 @@ export const schemaActionsTests = {
                     { rule: 'add-column', table: 'ledger', column: 'note', def: { type: 'string', nullable: true } },
                     { rule: 'drop-column', table: 'ledger', column: 'amount' },
                 ]);
-                const actions = schemaDeltaActions(changes, endView, startView, {});
+                const actions = schemaDeltaActions(changes, endView, startView, {}, false);
                 const kinds = actions.map((a) => a.kind);
 
                 const lastDropTable = kinds.lastIndexOf('drop-table');
@@ -665,7 +665,7 @@ export const schemaActionsTests = {
                     getFKs: () => ({}),
                 } as unknown as RSchemaView;
 
-                const actions = initialSchemaActions(mockView, {});
+                const actions = initialSchemaActions(mockView, {}, false);
                 const create = actions.find((a) => a.kind === 'create-table' && a.table === 'caps');
                 assertTrue(create?.kind === 'create-table', 'caps create-table present');
                 if (create === undefined || create.kind !== 'create-table') return;
@@ -698,7 +698,7 @@ export const schemaActionsTests = {
                         : undefined,
                 } as unknown as RSchemaView;
 
-                const actions = initialSchemaActions(mockView, {});
+                const actions = initialSchemaActions(mockView, {}, false);
                 const create = actions.find((a) => a.kind === 'create-table' && a.table === 'identities');
                 assertTrue(create?.kind === 'create-table', 'identities create-table present');
                 if (create === undefined || create.kind !== 'create-table') return;
@@ -724,7 +724,7 @@ export const schemaActionsTests = {
                     getFKs: () => ({}),
                 } as unknown as RSchemaView;
 
-                const actions = initialSchemaActions(mockView, { keyRefSuffix: '_kid' });
+                const actions = initialSchemaActions(mockView, { keyRefSuffix: '_kid' }, false);
                 const create = actions.find((a) => a.kind === 'create-table' && a.table === 'caps');
                 assertTrue(create?.kind === 'create-table', 'caps create-table present');
                 if (create === undefined || create.kind !== 'create-table') return;
@@ -745,7 +745,7 @@ export const schemaActionsTests = {
                     getFKs: () => ({}),
                 } as unknown as RSchemaView;
 
-                expectThrow(() => initialSchemaActions(mockView, {}),
+                expectThrow(() => initialSchemaActions(mockView, {}, false),
                     'identity column author mapping to author_key_id should collide with the author system column');
             },
         },
@@ -764,7 +764,7 @@ export const schemaActionsTests = {
                     getFKs: (n: string) => n === 'caps' ? { foo_key: 'other' } : {},
                 } as unknown as RSchemaView;
 
-                expectThrow(() => initialSchemaActions(mockView, {}),
+                expectThrow(() => initialSchemaActions(mockView, {}, false),
                     'identity foo and FK foo_key both projecting as foo_key_id should collide');
             },
         },
@@ -783,7 +783,7 @@ export const schemaActionsTests = {
                     { rule: 'add-column', table: 'ledger', column: 'memo', def: memoDef },
                 ]);
 
-                const actions = schemaDeltaActions(changes, endView, startView, {});
+                const actions = schemaDeltaActions(changes, endView, startView, {}, false);
                 const memoActions = actions.filter((a) =>
                     (a.kind === 'drop-column' || a.kind === 'add-column') && a.table === 'ledger' && a.column === 'memo');
                 assertEquals(memoActions.length, 2, 'reincarnated column yields two actions');
@@ -817,7 +817,7 @@ export const schemaActionsTests = {
                 assertTrue(tagsChange !== undefined && tagsChange.reincarnated,
                     'the delta flags tags as reincarnated');
 
-                const actions = schemaDeltaActions(changes, endView, startView, {});
+                const actions = schemaDeltaActions(changes, endView, startView, {}, false);
                 const drops = actions.filter((a) => a.kind === 'drop-table' && a.table === 'tags');
                 const creates = actions.filter((a) => a.kind === 'create-table' && a.table === 'tags');
                 assertEquals(drops.length, 1, 'reincarnated table is dropped');

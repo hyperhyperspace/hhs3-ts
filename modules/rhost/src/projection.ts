@@ -1,5 +1,5 @@
 import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
-import { serializePublicKeyToBase64, type RContext } from "@hyper-hyper-space/hhs3_mvt";
+import type { RContext } from "@hyper-hyper-space/hhs3_mvt";
 import type { RDb } from "@hyper-hyper-space/hhs3_rdb";
 import type { BidirectionalTarget, IndexReconcileReport, IndexSpec } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import {
@@ -11,9 +11,6 @@ export type OpenProjectionOptions = Omit<RdbProjectionOptions, 'writer'> & {
     ctx: RContext;
     target: BidirectionalTarget;
     writer: OwnIdentity;
-    // Intern the writer's key in the projection's key table, so the app can
-    // find its own key id there.
-    registerWriterKey?: boolean;
     indexSpec?: IndexSpec;
     files?: { mounts: FilesMountSpec[]; open: FilesMountOpener };
 };
@@ -25,16 +22,14 @@ export type OpenedProjection = {
 };
 
 // Opens a projection of `db` into `target` that ingests local edits as
-// `writer`, then mounts its file folders. If registering the key, reconciling
-// the index spec or mounting fails, the projection is stopped before the
-// error is rethrown.
+// `writer`, then mounts its file folders. The projection interns the writer's
+// key in its key table when it records the writer record, at open, so the app
+// finds its own key id there. If reconciling the index spec or mounting fails,
+// the projection is stopped before the error is rethrown.
 export async function openProjection(options: OpenProjectionOptions): Promise<OpenedProjection> {
-    const { db, ctx, target, writer, registerWriterKey, indexSpec, files, ...rest } = options;
+    const { db, ctx, target, writer, indexSpec, files, ...rest } = options;
     const projection = await RdbProjection.open(db, ctx, target, { ...rest, writer });
     try {
-        if (registerWriterKey === true) {
-            await projection.registerKey(writer.keyId, serializePublicKeyToBase64(writer.publicKey));
-        }
         const indexReport = indexSpec === undefined ? undefined : await projection.reconcileIndexes(indexSpec);
         const filesReport = files === undefined || files.mounts.length === 0
             ? undefined

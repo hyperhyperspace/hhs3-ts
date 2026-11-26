@@ -1,8 +1,10 @@
 import { testing } from "@hyper-hyper-space/hhs3_util";
 
+import { MemoryTarget } from "@hyper-hyper-space/hhs3_rdb_adapter";
+
 import {
     createIngestionSuite, createIngestionSuiteWithEndsInNewCycles, createKeysSuite, createProjectionSuite, createProjectionParitySuite,
-    memoryAuthorIdTest, memoryHarness, memoryIngestionHarness, parseTestFilters,
+    createWriterSuite, memoryAuthorIdTest, memoryHarness, memoryIngestionHarness, parseTestFilters,
 } from "../src/index.js";
 import { scenarioTests } from "./scenario_tests.js";
 
@@ -21,6 +23,8 @@ async function main() {
     allTests.set(memoryKeys.title, [memoryAuthorIdTest, ...memoryKeys.tests]);
     const memoryProjection = createProjectionParitySuite('MEMORY', memoryHarness);
     allTests.set(memoryProjection.title, memoryProjection.tests);
+    const memoryWriter = createWriterSuite('MEMORY', memoryIngestionHarness, () => ({ target: new MemoryTarget() }));
+    allTests.set(memoryWriter.title, memoryWriter.tests);
     allTests.set(scenarioTests.title, scenarioTests.tests);
 
     console.log('Running tests for Hyper Hyper Space v3 rdb_adapter_test module'

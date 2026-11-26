@@ -193,7 +193,7 @@ export function createProjectionSuite(label: string, factory: TargetFactory): { 
                     try {
                         const v1: Version = new Set(['v1']);
                         const create: SchemaAction = {
-                            kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+                            kind: 'create-table', table: 'acct', schemaName: 'acct', anonymous: false, syncTable: 'acct_sync', primaryKey: 'id',
                             columns: [{ name: 'ref', def: { type: 'string' } }],
                         };
                         // A row action targeting an un-materialized table throws,
@@ -224,7 +224,7 @@ export function createProjectionSuite(label: string, factory: TargetFactory): { 
                     try {
                         const gid = 'g-default-backfill';
                         const create: SchemaAction = {
-                            kind: 'create-table', table: 'items', syncTable: 'items_sync', primaryKey: 'id',
+                            kind: 'create-table', table: 'items', schemaName: 'items', anonymous: false, syncTable: 'items_sync', primaryKey: 'id',
                             columns: [{ name: 'label', def: { type: 'string' } }],
                         };
                         const insert: RowAction = {
@@ -256,7 +256,7 @@ export function createProjectionSuite(label: string, factory: TargetFactory): { 
                     try {
                         const gid = 'g-default-insert';
                         const create: SchemaAction = {
-                            kind: 'create-table', table: 'items', syncTable: 'items_sync', primaryKey: 'id',
+                            kind: 'create-table', table: 'items', schemaName: 'items', anonymous: false, syncTable: 'items_sync', primaryKey: 'id',
                             columns: [
                                 { name: 'label', def: { type: 'string' } },
                                 { name: 'status', def: { type: 'string', default: 'active' } },

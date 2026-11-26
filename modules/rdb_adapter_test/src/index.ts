@@ -11,6 +11,8 @@ export * from "./target_hooks.js";
 export * from "./scenarios.js";
 export { createKeysSuite, memoryKeysSuite, memoryAuthorIdTest } from "./keys_tests.js";
 export { createProjectionParitySuite } from "./projection_parity_suite.js";
+export { createWriterSuite, type BareTargetFactory } from "./writer_suite.js";
+export { rdbRows, recordWriter } from "./ingestion_helpers.js";
 export {
     parseTestFilters, resolveFuzzSweepOptions, PARITY_PROFILES, PROJECTION_PROFILES,
     type FuzzProfileName, type ResolvedFuzzSweepOptions,

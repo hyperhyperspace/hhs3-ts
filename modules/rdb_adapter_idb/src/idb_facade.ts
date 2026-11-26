@@ -279,6 +279,173 @@ function putColumns(rec: FacadeRecord, meta: TableMetaRecord): { [column: string
     return values;
 }
 
+// What the write steps need of a transaction: the native transaction over the
+// target's stores, the host, and where they leave what capture recorded, for
+// the commit to announce. A facade transaction is one, and HIP-20's writer
+// makes its own over every store.
+export type WriteStepContext = {
+    readonly real: IDBTransaction;
+    readonly host: FacadeHost;
+    outboxRecords: OutboxRecord[];
+    captured: boolean;
+};
+
+// The table's indexes as listed in index_meta right now (in this
+// transaction), so an index installed by another tab is maintained.
+function withIndexes(ctx: WriteStepContext, table: string, req: FacadeRequest<unknown>, then: (indexes: ResolvedIndex[]) => void): void {
+    const r = ctx.real.objectStore(INDEX_META).getAll(wholeTableRange(table));
+    wire(req, r, 'read', (indexes) => then(indexes as ResolvedIndex[]));
+}
+
+function syncEntries(
+    ctx: WriteStepContext, req: FacadeRequest<unknown>, indexes: ResolvedIndex[], id: number,
+    oldRow: RowRecord | undefined, newRow: RowRecord | undefined, done: () => void,
+): void {
+    const entries = ctx.real.objectStore(INDEX_ENTRIES);
+    whenAll(req, syncEntryRequests(entries, indexes, id, oldRow, newRow), 'write', done);
+}
+
+function queueOutbox(ctx: WriteStepContext, req: FacadeRequest<unknown>, rec: OutboxRecord): void {
+    if (!ctx.host.isCaptureOn()) return;
+    ctx.outboxRecords.push(rec);
+    wire(req, ctx.real.objectStore(OUTBOX).add(rec), 'write', (key) => { rec.id = key as number; });
+    ctx.captured = true;
+}
+
+// An add or a put of a record of an app table, as the facade writes one: the
+// id, the defaults of a new record, the stored author a put keeps, capture's
+// fill of the author (HIP-29), the index entries and the captured change.
+export function writeRecordStep(
+    ctx: WriteStepContext, table: string, meta: TableMetaRecord, req: FacadeRequest<IDBValidKey>,
+    kind: 'add' | 'put', value: FacadeRecord, explicitKey?: IDBValidKey,
+): void {
+    const tx = ctx.real;
+    withIndexes(ctx, table, req, (indexes) => {
+        let id = (explicitKey as number | undefined) ?? (value[meta.idColumn] as number | undefined);
+        const rows = tx.objectStore(ROWS);
+
+        const finish = (assignedId: number, old: RowRecord | undefined): void => {
+            if (kind === 'add' && old !== undefined) {
+                req.fail(constraintError());
+                return;
+            }
+            // A new record gets the default of each column it leaves out,
+            // in the row and in the captured insert, as SQLite's DEFAULT
+            // does. A null property is not left out: it is an explicit
+            // NULL, stored as a missing key.
+            const written: FacadeRecord = old === undefined ? withDefaults(value, meta) : value;
+            const rec: RowRecord = { table, id: assignedId };
+            for (const [column, v] of Object.entries(written)) {
+                if (v !== null) rec[column] = v;
+            }
+            rec.table = table;
+            rec[meta.idColumn] = assignedId;
+            rec.id = assignedId;
+            // A put replaces the record, and a record built from a form
+            // has no author column. No op can change a row's author, so a
+            // put that leaves it out, or gives it null, keeps the stored one.
+            const author = meta.authorColumn;
+            if (old !== undefined && author !== undefined && rec[author] === undefined && old[author] !== undefined) {
+                rec[author] = old[author];
+            }
+            if (assignedId >= meta.nextId) {
+                meta.nextId = assignedId + 1;
+                wire(req, tx.objectStore(TABLE_META).put(meta), 'write', () => {});
+            }
+            const store = (): void => wire(req, rows.put(rec), 'write', () => {
+                if (old === undefined) {
+                    queueOutbox(ctx, req, {
+                        table, localId: assignedId, op: 'insert',
+                        changed: businessValues(written, meta),
+                    });
+                } else {
+                    queueOutbox(ctx, req, { table, localId: assignedId, op: 'update', changed: putColumns(written, meta) });
+                }
+                syncEntries(ctx, req, indexes, assignedId, old, rec, () => req.succeed(assignedId));
+            });
+            // A new record with an empty author column gets the writer key's
+            // id, in the row and in the captured insert, where the writer
+            // record says `auto`, in a table whose group has an identity
+            // provider (HIP-29).
+            if (old !== undefined || author === undefined || rec[author] !== undefined
+                || meta.anonymous || !ctx.host.isCaptureOn()) {
+                store();
+                return;
+            }
+            wire(req, tx.objectStore(CAPTURE_CONFIG).get(WRITER_RECORD_KEY), 'read', (w) => {
+                const record = w as WriterRecordRecord | undefined;
+                const keyId = record?.writerKeyId;
+                if (keyId !== undefined && record!.author === 'auto') {
+                    rec[author] = keyId;
+                    written[author] = keyId;
+                }
+                store();
+            });
+        };
+
+        if (id === undefined) {
+            id = meta.nextId++;
+            wire(req, tx.objectStore(TABLE_META).put(meta), 'write', () => {});
+            finish(id, undefined);
+            return;
+        }
+
+        wire(req, rows.get([table, id]), 'read', (r) => finish(id!, r as RowRecord | undefined));
+    });
+}
+
+// A partial update of the record `id` of an app table (HIP-29's patch): the
+// fields it is given are written, a null one cleared, every other field kept,
+// and exactly the fields it names captured. A key with no record writes and
+// captures nothing.
+export function patchRecordStep(
+    ctx: WriteStepContext, table: string, meta: TableMetaRecord, req: FacadeRequest<IDBValidKey>,
+    id: number, fields: FacadeRecord, cleared: string[],
+): void {
+    const tx = ctx.real;
+    withIndexes(ctx, table, req, (indexes) => {
+        const rows = tx.objectStore(ROWS);
+        wire(req, rows.get([table, id]), 'read', (r) => {
+            const old = r as RowRecord | undefined;
+            if (old === undefined) { req.succeed(id); return; }   // no record: nothing written
+            const rec: RowRecord = { ...old };
+            const changed: { [column: string]: json.Literal | null } = {};
+            for (const [column, v] of Object.entries(fields)) {
+                if (column === meta.idColumn) continue;
+                if (v === null) delete rec[column];
+                else rec[column] = v;
+                changed[column] = v;
+            }
+            for (const column of cleared) {
+                delete rec[column];
+                changed[column] = null;
+            }
+            wire(req, rows.put(rec), 'write', () => {
+                if (Object.keys(changed).length > 0) {
+                    queueOutbox(ctx, req, { table, localId: id, op: 'update', changed });
+                }
+                syncEntries(ctx, req, indexes, id, old, rec, () => req.succeed(id));
+            });
+        });
+    });
+}
+
+// A delete of the record `key` of an app table: nothing for a key with no
+// record, else the row, its index entries and the captured delete.
+export function deleteRecordStep(
+    ctx: WriteStepContext, table: string, req: FacadeRequest<unknown>, key: IDBValidKey, done: () => void,
+): void {
+    const rows = ctx.real.objectStore(ROWS);
+    wire(req, rows.get([table, key]), 'read', (r) => {
+        const old = r as RowRecord | undefined;
+        if (old === undefined) { done(); return; }
+        wire(req, rows.delete([table, key]), 'write', () => {
+            queueOutbox(ctx, req, { table, localId: key as number, op: 'delete' });
+            withIndexes(ctx, table, req, (indexes) => syncEntries(ctx, req, indexes, old.id, old, undefined, done));
+        });
+    });
+}
+
 export class FacadeObjectStore {
     readonly name: string;
     readonly keyPath: string | string[] = 'id';
@@ -394,21 +561,6 @@ export class FacadeObjectStore {
         return validateKey(this.cmpFn, query);
     }
 
-    // The table's indexes as listed in index_meta right now (in this
-    // transaction), so an index installed by another tab is maintained.
-    private withIndexes(req: FacadeRequest<unknown>, then: (indexes: ResolvedIndex[]) => void): void {
-        const r = this.transaction.real.objectStore(INDEX_META).getAll(wholeTableRange(this.name));
-        wire(req, r, 'read', (indexes) => then(indexes as ResolvedIndex[]));
-    }
-
-    private syncEntries(
-        req: FacadeRequest<unknown>, indexes: ResolvedIndex[], id: number,
-        oldRow: RowRecord | undefined, newRow: RowRecord | undefined, done: () => void,
-    ): void {
-        const entries = this.transaction.real.objectStore(INDEX_ENTRIES);
-        whenAll(req, syncEntryRequests(entries, indexes, id, oldRow, newRow), 'write', done);
-    }
-
     add(value: FacadeRecord, key?: IDBValidKey): FacadeRequest<IDBValidKey> {
         return this.issueWrite('add', value, key);
     }
@@ -445,31 +597,7 @@ export class FacadeObjectStore {
             const id = fields[meta.idColumn] as number | undefined;
             if (id === undefined) { req.fail(dataError(`a patch names the record's key, '${meta.idColumn}'.`)); return; }
             try { validateKey(this.cmpFn, id); } catch (e) { req.fail(e as DOMException); return; }
-            this.withIndexes(req, (indexes) => {
-                const rows = tx.objectStore(ROWS);
-                wire(req, rows.get([this.name, id]), 'read', (r) => {
-                    const old = r as RowRecord | undefined;
-                    if (old === undefined) { req.succeed(id); return; }   // no record: nothing written
-                    const rec: RowRecord = { ...old };
-                    const changed: { [column: string]: json.Literal | null } = {};
-                    for (const [column, v] of Object.entries(fields)) {
-                        if (column === meta.idColumn) continue;
-                        if (v === null) delete rec[column];
-                        else rec[column] = v;
-                        changed[column] = v;
-                    }
-                    for (const column of cleared) {
-                        delete rec[column];
-                        changed[column] = null;
-                    }
-                    wire(req, rows.put(rec), 'write', () => {
-                        if (Object.keys(changed).length > 0) {
-                            this.queueOutbox(req, { table: this.name, localId: id, op: 'update', changed });
-                        }
-                        this.syncEntries(req, indexes, id, old, rec, () => req.succeed(id));
-                    });
-                });
-            });
+            patchRecordStep(this.transaction, this.name, meta, req, id, fields, cleared);
         });
     }
 
@@ -525,15 +653,7 @@ export class FacadeObjectStore {
             wire(req, this.transaction.real.objectStore(KEYS).delete(key), 'write', () => done());
             return;
         }
-        const rows = this.transaction.real.objectStore(ROWS);
-        wire(req, rows.get([this.name, key]), 'read', (r) => {
-            const old = r as RowRecord | undefined;
-            if (old === undefined) { done(); return; }
-            wire(req, rows.delete([this.name, key]), 'write', () => {
-                this.queueOutbox(req, { table: this.name, localId: key as number, op: 'delete' });
-                this.withIndexes(req, (indexes) => this.syncEntries(req, indexes, old.id, old, undefined, done));
-            });
-        });
+        deleteRecordStep(this.transaction, this.name, req, key, done);
     }
 
     private write(
@@ -554,86 +674,10 @@ export class FacadeObjectStore {
                 req.fail(notFound(this.name));
                 return;
             }
-            this.withIndexes(req, (indexes) => {
-                let id = (explicitKey as number | undefined) ?? (value[meta.idColumn] as number | undefined);
-                const rows = tx.objectStore(ROWS);
-
-                const finish = (assignedId: number, old: RowRecord | undefined): void => {
-                    if (kind === 'add' && old !== undefined) {
-                        req.fail(constraintError());
-                        return;
-                    }
-                    // A new record gets the default of each column it leaves out,
-                    // in the row and in the captured insert, as SQLite's DEFAULT
-                    // does. A null property is not left out: it is an explicit
-                    // NULL, stored as a missing key.
-                    const written: FacadeRecord = old === undefined ? withDefaults(value, meta) : value;
-                    const rec: RowRecord = { table: this.name, id: assignedId };
-                    for (const [column, v] of Object.entries(written)) {
-                        if (v !== null) rec[column] = v;
-                    }
-                    rec.table = this.name;
-                    rec[meta.idColumn] = assignedId;
-                    rec.id = assignedId;
-                    // A put replaces the record, and a record built from a form
-                    // has no author column. No op can change a row's author, so a
-                    // put that leaves it out, or gives it null, keeps the stored one.
-                    const author = meta.authorColumn;
-                    if (old !== undefined && author !== undefined && rec[author] === undefined && old[author] !== undefined) {
-                        rec[author] = old[author];
-                    }
-                    if (assignedId >= meta.nextId) {
-                        meta.nextId = assignedId + 1;
-                        wire(req, tx.objectStore(TABLE_META).put(meta), 'write', () => {});
-                    }
-                    const store = (): void => wire(req, rows.put(rec), 'write', () => {
-                        if (old === undefined) {
-                            this.queueOutbox(req, {
-                                table: this.name, localId: assignedId, op: 'insert',
-                                changed: businessValues(written, meta),
-                            });
-                        } else {
-                            this.queueOutbox(req, { table: this.name, localId: assignedId, op: 'update', changed: putColumns(written, meta) });
-                        }
-                        this.syncEntries(req, indexes, assignedId, old, rec, () => req.succeed(assignedId));
-                    });
-                    // A new record with an empty author column gets the writer key's
-                    // id, in the row and in the captured insert, where the writer
-                    // record says the table's group mode is `on` (HIP-29).
-                    if (old !== undefined || author === undefined || rec[author] !== undefined
-                        || meta.groupId === undefined || !this.transaction.host.isCaptureOn()) {
-                        store();
-                        return;
-                    }
-                    wire(req, tx.objectStore(CAPTURE_CONFIG).get(WRITER_RECORD_KEY), 'read', (w) => {
-                        const record = w as WriterRecordRecord | undefined;
-                        const keyId = record?.writerKeyId;
-                        if (keyId !== undefined && record!.groups[meta.groupId!]?.mode === 'on') {
-                            rec[author] = keyId;
-                            written[author] = keyId;
-                        }
-                        store();
-                    });
-                };
-
-                if (id === undefined) {
-                    id = meta.nextId++;
-                    wire(req, tx.objectStore(TABLE_META).put(meta), 'write', () => {});
-                    finish(id, undefined);
-                    return;
-                }
-
-                wire(req, rows.get([this.name, id]), 'read', (r) => finish(id!, r as RowRecord | undefined));
-            });
+            writeRecordStep(this.transaction, this.name, meta, req, kind, value, explicitKey);
         });
     }
 
-    private queueOutbox(req: FacadeRequest<unknown>, rec: OutboxRecord): void {
-        if (!this.transaction.host.isCaptureOn()) return;
-        this.transaction.outboxRecords.push(rec);
-        wire(req, this.transaction.real.objectStore(OUTBOX).add(rec), 'write', (key) => { rec.id = key as number; });
-        this.transaction.captured = true;
-    }
 }
 
 const DIRECTIONS: ReadonlySet<string> = new Set(['next', 'nextunique', 'prev', 'prevunique']);

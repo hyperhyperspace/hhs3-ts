@@ -7,13 +7,13 @@ import type { OpEvent, RowAction } from "../src/types.js";
 
 async function table(target: MemoryTarget): Promise<void> {
     await target.apply('g', [{
-        kind: 'create-table', table: 'notes', syncTable: 'notes_sync', primaryKey: 'id',
+        kind: 'create-table', table: 'notes', schemaName: 'notes', anonymous: false, syncTable: 'notes_sync', primaryKey: 'id',
         columns: [
             { name: 'title', def: { type: 'string', nullable: true, pub: true, readonly: false } },
             { name: 'folder_id', def: { type: 'integer', nullable: true, pub: true, readonly: false } },
         ],
     }, {
-        kind: 'create-table', table: 'folders', syncTable: 'folders_sync', primaryKey: 'id',
+        kind: 'create-table', table: 'folders', schemaName: 'folders', anonymous: false, syncTable: 'folders_sync', primaryKey: 'id',
         columns: [{ name: 'name', def: { type: 'string', nullable: false, pub: true, readonly: false } }],
     }], [], new Set(['c']));
 }

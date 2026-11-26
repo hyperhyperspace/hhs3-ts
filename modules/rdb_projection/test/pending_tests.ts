@@ -85,8 +85,9 @@ async function mixedDb(ctx: RContext) {
     return { db, signed: db.members['signed']!.group, anon: db.members['anon']!.group, rdb: db.rdb };
 }
 
-const modesOf = (record: Awaited<ReturnType<MemoryTarget['readWriterRecord']>>): string =>
-    Object.values(record?.groups ?? {}).map((g) => `${g.name}:${g.mode}`).sort().join(',');
+// The author column of a row a native insert wrote, or null.
+const authorOf = async (memory: MemoryTarget, table: string, localId: number): Promise<unknown> =>
+    (await memory.executeQuery({ table })).find((r) => r.id === localId)?.author_key_id ?? null;
 
 export const pendingTests = {
     title: '[RDBPROJ] HIP-29: no projection over a pending change',
@@ -245,10 +246,10 @@ export const pendingTests = {
             },
         },
         {
-            name: "[RDBPROJ20] the projection records the writer record at open and on reconfigure: the writer key, the hash suite, and each group's name and mode",
+            name: "[RDBPROJ20] the projection records the writer record when it opens: the writer key, the hash suite and the author setting, auto by default, and nothing per group",
             invoke: async () => {
                 const ctx = newCtx();
-                const { db, rdb } = await mixedDb(ctx);
+                const { rdb } = await mixedDb(ctx);
                 const memory = new MemoryTarget({ captureChanges: true });
                 const writer = await makeIdentity();
                 const projection = await RdbProjection.open(rdb, ctx, memory, { writer, debounceMs: 5 });
@@ -256,12 +257,8 @@ export const pendingTests = {
                     const record = await memory.readWriterRecord();
                     assertEquals(record?.writerKeyId, await memory.idForKeyHash('default', writer.keyId), "the writer key's id");
                     assertEquals(record?.hashSuite, ctx.getHashSuite().name, 'the hash suite');
-                    assertEquals(modesOf(record), 'anon:anonymous,signed:on', 'each group and its mode');
-
-                    await addGroups(ctx, db, '1.1.0', [{ name: 'late', tables: [open('notes', { body: { type: 'string' } })] }]);
-                    await poll(() => memory.hasTable('late_notes'), 3000);
-                    assertEquals(modesOf(await memory.readWriterRecord()), 'anon:anonymous,late:anonymous,signed:on',
-                        'a group that joins is recorded on reconfigure');
+                    assertEquals(record?.author, 'auto', 'the setting, auto by default');
+                    assertEquals(Object.keys(record ?? {}).sort().join(','), 'author,hashSuite,writerKeyId', 'and nothing per group');
                 } finally {
                     await projection.stop();
                 }
@@ -271,14 +268,14 @@ export const pendingTests = {
                 try {
                     const record = await bare.readWriterRecord();
                     assertEquals(record?.writerKeyId, undefined, 'without a writer, no writer key');
-                    assertEquals(modesOf(record), 'anon:anonymous,late:anonymous,signed:on', 'and the rest');
+                    assertEquals(record?.author, 'auto', 'and the rest');
                 } finally {
                     await readOnly.stop();
                 }
             },
         },
         {
-            name: "[RDBPROJ21] the autoAuthor option and its per-group override; a signed group with autoAuthor off and no author column is refused, and an anonymous one opens",
+            name: "[RDBPROJ21] the author option: manual is recorded, and a signed group's native insert with no author stays anonymous; under manual a signed group with no author column is refused, and an anonymous one opens",
             invoke: async () => {
                 const ctx = newCtx();
                 const { rdb } = await mixedDb(ctx);
@@ -286,34 +283,89 @@ export const pendingTests = {
                 const openWith = async (opts: Parameters<typeof RdbProjection.open>[3]) => {
                     const memory = new MemoryTarget({ captureChanges: true });
                     const p = await RdbProjection.open(rdb, ctx, memory, { writer, debounceMs: 5, ...opts });
-                    const modes = modesOf(await memory.readWriterRecord());
+                    const author = (await memory.readWriterRecord())?.author;
+                    const localId = memory.localInsert('signed_notes', { body: 'x' });
+                    const filled = await authorOf(memory, 'signed_notes', localId);
                     await p.stop();
-                    return { memory, modes };
+                    return { author, filled };
                 };
-                assertEquals((await openWith({ autoAuthor: false })).modes, 'anon:anonymous,signed:off', 'the option sets every signed group');
-                assertEquals((await openWith({
-                    autoAuthor: false,
-                    configOverride: ({ groupName }) => (groupName === 'signed' ? { autoAuthor: true } : {}),
-                })).modes, 'anon:anonymous,signed:on', 'a per-group override wins');
+                const manual = await openWith({ author: 'manual' });
+                assertEquals(manual.author, 'manual', 'the option is recorded');
+                assertEquals(manual.filled, null, "and a signed group's insert that names no author stays anonymous");
+                const auto = await openWith({});
+                assertEquals(auto.author, 'auto', 'auto by default');
+                assertTrue(auto.filled !== null, 'where the same insert gets the writer key');
 
                 const memory = new MemoryTarget({ captureChanges: true });
                 let refusal: unknown;
                 try {
                     await RdbProjection.open(rdb, ctx, memory, {
-                        writer, configOverride: ({ groupName }) => (groupName === 'signed' ? { autoAuthor: false, authorColumn: false } : {}),
+                        writer, author: 'manual', configOverride: ({ groupName }) => (groupName === 'signed' ? { authorColumn: false } : {}),
                     });
                 } catch (e) {
                     refusal = e;
                 }
                 assertTrue(refusal instanceof Error && refusal.message.includes("group 'signed'"),
-                    `a signed group with autoAuthor off and no author column is refused, naming it: ${String(refusal)}`);
+                    `under manual a signed group with no author column is refused, naming it: ${String(refusal)}`);
                 assertEquals(await memory.readWriterRecord(), undefined, 'before anything is written');
                 assertEquals(memory.listTables().length, 0, 'not even a table');
 
-                const anonOnly = await openWith({
-                    configOverride: ({ groupName }) => (groupName === 'anon' ? { autoAuthor: false, authorColumn: false } : {}),
+                const anonOnly = new MemoryTarget({ captureChanges: true });
+                const p = await RdbProjection.open(rdb, ctx, anonOnly, {
+                    writer, author: 'manual', debounceMs: 5,
+                    configOverride: ({ groupName }) => (groupName === 'anon' ? { authorColumn: false } : {}),
                 });
-                assertEquals(anonOnly.modes, 'anon:anonymous,signed:on', 'an anonymous group opens with it');
+                await p.stop();
+                assertEquals((await anonOnly.readWriterRecord())?.author, 'manual', 'an anonymous group with no author column opens under manual');
+            },
+        },
+        {
+            name: "[RDBPROJ31] the writer record is written once, when the projection opens: a reconfigure that adds a group leaves it as it was",
+            invoke: async () => {
+                const ctx = newCtx();
+                const { db, rdb } = await mixedDb(ctx);
+                const memory = new MemoryTarget({ captureChanges: true });
+                let writes = 0;
+                const recordWriter = memory.recordWriter.bind(memory);
+                memory.recordWriter = async (record) => { writes++; await recordWriter(record); };
+                const writer = await makeIdentity();
+                const projection = await RdbProjection.open(rdb, ctx, memory, { writer, debounceMs: 5 });
+                try {
+                    assertEquals(writes, 1, 'written at open');
+                    const before = JSON.stringify(await memory.readWriterRecord());
+                    await addGroups(ctx, db, '1.1.0', [{ name: 'late', tables: [open('notes', { body: { type: 'string' } })] }]);
+                    await poll(() => memory.hasTable('late_notes'), 3000);
+                    assertEquals(writes, 1, 'and not again when a group joins');
+                    assertEquals(JSON.stringify(await memory.readWriterRecord()), before, 'so it reads as it was');
+                } finally {
+                    await projection.stop();
+                }
+            },
+        },
+        {
+            name: "[RDBPROJ32] a configOverride that returns author changes nothing: the record holds the projection's setting, and every signed group follows it",
+            invoke: async () => {
+                const ctx = newCtx();
+                const { rdb } = await mixedDb(ctx);
+                const writer = await makeIdentity();
+                const openWith = async (author: 'auto' | 'manual', override: 'auto' | 'manual') => {
+                    const memory = new MemoryTarget({ captureChanges: true });
+                    const p = await RdbProjection.open(rdb, ctx, memory, {
+                        writer, author, debounceMs: 5,
+                        configOverride: ({ groupName }) => (groupName === 'signed' ? { author: override } : {}),
+                    });
+                    const recorded = (await memory.readWriterRecord())?.author;
+                    const localId = memory.localInsert('signed_notes', { body: 'x' });
+                    const filled = await authorOf(memory, 'signed_notes', localId);
+                    await p.stop();
+                    return { recorded, filled };
+                };
+                const manual = await openWith('manual', 'auto');
+                assertEquals(manual.recorded, 'manual', "under manual, an override of auto isn't recorded");
+                assertEquals(manual.filled, null, 'and the insert that names no author stays anonymous');
+                const auto = await openWith('auto', 'manual');
+                assertEquals(auto.recorded, 'auto', "under auto, an override of manual isn't recorded");
+                assertTrue(auto.filled !== null, 'and the insert gets the writer key');
             },
         },
         {

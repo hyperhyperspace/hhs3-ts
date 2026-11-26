@@ -21,3 +21,4 @@ export * from "./query_monitor.js";
 export * from "./project.js";
 export * from "./index_actions.js";
 export * from "./index_reconcile.js";
+export * from "./writer.js";

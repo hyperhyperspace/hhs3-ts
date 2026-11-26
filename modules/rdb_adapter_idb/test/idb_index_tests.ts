@@ -306,12 +306,12 @@ function issueOp(store: any, op: Op, label: string, track: (l: string, r: any) =
 }
 
 const tCreate: SchemaAction = {
-    kind: 'create-table', table: 't', syncTable: 't_sync', primaryKey: 'id',
+    kind: 'create-table', table: 't', schemaName: 't', anonymous: false, syncTable: 't_sync', primaryKey: 'id',
     columns: [{ name: 'a', def: { type: 'json', nullable: true } }, { name: 'b', def: { type: 'json', nullable: true } }],
 };
 
 const acctCreate: SchemaAction = {
-    kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+    kind: 'create-table', table: 'acct', schemaName: 'acct', anonymous: false, syncTable: 'acct_sync', primaryKey: 'id',
     columns: [{ name: 'ref', def: { type: 'string', nullable: true } }, { name: 'n', def: { type: 'integer', nullable: true } }],
 };
 

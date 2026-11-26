@@ -370,7 +370,7 @@ export async function runPass(
         const ctx: NodeContext = {
             groupId: m.groupId, schemaView: m.schemaView, config: m.config, writerKeyId: authorFor(m)?.keyId,
             subjectRow: (table, rowId) => table === rdbTable && rowId === subjectId ? subject : undefined,
-            ...(m.signed && m.config.autoAuthor === false ? { autoAuthorOff: true } : {}),
+            ...(m.signed && m.config.author === 'manual' ? { manual: true } : {}),
         };
 
         let planned: ChangePlan;
@@ -533,7 +533,7 @@ export async function endPass(members: IngestMember[], target: BidirectionalTarg
         const to = end.get(m.groupId)!;
         const delta = (await m.group.computeDelta(m.checkpoint, to)) as RTableGroupDelta;
         const endSchema = (await m.group.getView(to, to)).getSchemaView();
-        if (schemaDeltaActions(delta.schemaChanges, endSchema, m.schemaView, m.config).length > 0) {
+        if (schemaDeltaActions(delta.schemaChanges, endSchema, m.schemaView, m.config, !m.signed).length > 0) {
             throw new ChainSchemaChangeError(m.groupId);
         }
         events.push(...opVerdictEvents(delta.opVerdictChanges, m.groupId, m.config));

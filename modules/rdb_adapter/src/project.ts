@@ -143,10 +143,13 @@ export async function projectGroupTo(
 
     const view = await group.getView(to, to);
     const endView = view.getSchemaView();
+    // Each table's meta records whether its group has an identity provider,
+    // which never changes (HIP-20).
+    const anonymous = group.getIdProvider() === undefined;
 
     if (checkpoint === undefined) {
         const planned = await withGroupIndexes(
-            group, target, endView, initialSchemaActions(endView, config), config);
+            group, target, endView, initialSchemaActions(endView, config, anonymous), config);
         const rowActions = await initialRowActions(view, config);
         // expectFrom null: this must be the FIRST materialization; if a concurrent
         // projector created the checkpoint meanwhile, apply() rejects (CAS).
@@ -157,7 +160,7 @@ export async function projectGroupTo(
     const delta = (await group.computeDelta(checkpoint, to)) as RTableGroupDelta;
     const startView = (await group.getView(checkpoint, checkpoint)).getSchemaView();
     const planned = await withGroupIndexes(
-        group, target, endView, schemaDeltaActions(delta.schemaChanges, endView, startView, config), config);
+        group, target, endView, schemaDeltaActions(delta.schemaChanges, endView, startView, config, anonymous), config);
     const rowActions = await planIncrementalRowActions(view, delta, startView, endView, groupId, config);
     const events = opVerdictEvents(delta.opVerdictChanges, groupId, config);
     // expectFrom the checkpoint this delta was computed against: if another

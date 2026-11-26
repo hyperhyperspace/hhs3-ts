@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 
-import { createBasicCrypto, createIdentity, HASH_SHA256, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
+import { createBasicCrypto, createIdentity, HASH_BLAKE3, HASH_SHA256, keyIdFromPublicKey, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import { serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 import type { RCatalogImpl } from "@hyper-hyper-space/hhs3_rdb";
 import { MemoryKeyVault, RdbRuntime } from "@hyper-hyper-space/hhs3_rdb_runtime";
@@ -223,6 +223,35 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
                 assertTrue(noKey.includes('has no key with a label, keyId and publicKey'), `a key without its parts is refused (${noKey})`);
             } finally {
                 await fs.rm(dir, { recursive: true, force: true });
+            }
+        },
+    },
+    {
+        name: '[RHOST_CLIENT_NODE04] registerKey hashes with the suite the writer record names, BLAKE3 too, and throws on a projection with no writer record',
+        invoke: async () => {
+            const dir = await fs.mkdtemp(join(tmpdir(), 'rhost-cn-suite-'));
+            const db = new Database(join(dir, 'projection.sqlite'));
+            try {
+                // The two tables the client reads, as the projection's target keeps them.
+                db.exec('CREATE TABLE rdb_keys (id INTEGER PRIMARY KEY, key_hash TEXT NOT NULL UNIQUE, public_key TEXT);'
+                    + 'CREATE TABLE rdb_writer_record (id INTEGER PRIMARY KEY CHECK (id = 1), writer_key_id INTEGER, hash_suite TEXT NOT NULL, author TEXT NOT NULL);');
+                const client = openClient(dir, { db });
+                const identity = await createIdentity(SIGNING_ED25519, createBasicCrypto().hash(HASH_SHA256));
+                const pk = serializePublicKeyToBase64(identity.publicKey);
+                let refused = 'no error';
+                try { await client.registerKey(pk); } catch (e) { refused = String(e); }
+                assertTrue(refused.includes('writer record'), `without a writer record it throws, naming it: ${refused}`);
+                assertEquals((db.prepare('SELECT COUNT(*) AS n FROM rdb_keys').get() as { n: number }).n, 0, 'and interns nothing');
+
+                db.prepare("INSERT INTO rdb_writer_record (id, hash_suite, author) VALUES (1, 'blake3', 'auto')").run();
+                const id = await client.registerKey(pk);
+                const { key_hash } = db.prepare('SELECT key_hash FROM rdb_keys WHERE id = ?').get(id) as { key_hash: string };
+                assertEquals(key_hash, keyIdFromPublicKey(identity.publicKey, createBasicCrypto().hash(HASH_BLAKE3)),
+                    "on a BLAKE3 replica the key is interned under BLAKE3's hash, the one rdb computes");
+                assertTrue(key_hash !== identity.keyId, "not SHA-256's");
+            } finally {
+                db.close();
+                rmSync(dir, { recursive: true, force: true });
             }
         },
     },

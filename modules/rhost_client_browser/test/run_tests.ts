@@ -3,7 +3,7 @@ import "fake-indexeddb/auto";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
-import { createBasicCrypto, createIdentity, HASH_SHA256, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
+import { createBasicCrypto, createIdentity, HASH_BLAKE3, HASH_SHA256, keyIdFromPublicKey, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
 import { serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 import type { BroadcastChannelCtor } from "@hyper-hyper-space/hhs3_mesh_bc";
 import type { RCatalogImpl } from "@hyper-hyper-space/hhs3_rdb";
@@ -222,6 +222,26 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
                 life.abort();
                 await app.close().catch(() => undefined);
                 await platform.close();
+            }
+        },
+    },
+    {
+        name: '[RHOST_CLIENT_BROWSER02] registerKey hashes with the suite the writer record names, BLAKE3 too, and throws on a projection with no writer record',
+        invoke: async () => {
+            const app = `suite-${Date.now()}`;
+            const target = await IdbTarget.open(browserProjectionDatabase(app, 'default'), { captureChanges: true });
+            const client = openClient(app, 'default');
+            try {
+                const identity = await createIdentity(SIGNING_ED25519, hashSuite);
+                const pk = serializePublicKeyToBase64(identity.publicKey);
+                await rejects(() => client.registerKey(pk), 'writer record', 'without a writer record it throws, naming it');
+                await target.recordWriter({ hashSuite: HASH_BLAKE3, author: 'auto' });
+                const id = await client.registerKey(pk);
+                assertEquals(await target.keyHashForId('default', id), keyIdFromPublicKey(identity.publicKey, createBasicCrypto().hash(HASH_BLAKE3)),
+                    "on a BLAKE3 replica the key is interned under BLAKE3's hash, the one rdb computes");
+            } finally {
+                await client.close();
+                target.close();
             }
         },
     },

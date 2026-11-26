@@ -30,11 +30,11 @@ export type FilesMountConfig = { name: string; path: string };
 
 // `path` resolves in the host folder. `indexes` and `indexPub` are the
 // projection index spec, shared by every host. Omitting both leaves an already
-// installed spec alone. `files` mounts FILES members as folders. `autoAuthor`
-// is the projection's default for what an insert gets when it leaves the
-// author column empty (HIP-20's Authorship): on when absent.
+// installed spec alone. `files` mounts FILES members as folders. `author` is
+// the projection's author setting (HIP-20's Authorship): how an insert's author
+// is chosen in a group with an identity provider, `auto` when absent.
 export type ProjectionConfig = {
-    path: string; indexPub?: boolean; indexes?: IndexDecl[]; files?: FilesMountConfig[]; autoAuthor?: boolean;
+    path: string; indexPub?: boolean; indexes?: IndexDecl[]; files?: FilesMountConfig[]; author?: 'auto' | 'manual';
 };
 
 // The spec to reconcile, or undefined when the config names none. `indexPub`
@@ -198,7 +198,7 @@ function checkAllow(c: Checker, value: unknown, field: string): string[] {
 }
 
 function checkProjection(c: Checker, value: unknown, field: string): ProjectionConfig {
-    const o = c.object(value, field, ['path', 'indexes', 'indexPub', 'files', 'autoAuthor']);
+    const o = c.object(value, field, ['path', 'indexes', 'indexPub', 'files', 'author']);
     const out: ProjectionConfig = { path: checkHostPath(c, o['path'], `${field}.path`) };
     if (o['indexPub'] !== undefined) {
         if (typeof o['indexPub'] !== 'boolean') c.fail(`${field}.indexPub`, 'must be true or false');
@@ -211,9 +211,10 @@ function checkProjection(c: Checker, value: unknown, field: string): ProjectionC
         if (reason !== undefined) c.fail(field, reason);
     }
     if (o['files'] !== undefined) out.files = checkFilesMounts(c, o['files'], `${field}.files`, out.path);
-    if (o['autoAuthor'] !== undefined) {
-        if (typeof o['autoAuthor'] !== 'boolean') c.fail(`${field}.autoAuthor`, 'must be true or false');
-        out.autoAuthor = o['autoAuthor'];
+    if (o['author'] !== undefined) {
+        const author = o['author'];
+        if (author !== 'auto' && author !== 'manual') c.fail(`${field}.author`, "must be 'auto' or 'manual'");
+        out.author = author;
     }
     return out;
 }

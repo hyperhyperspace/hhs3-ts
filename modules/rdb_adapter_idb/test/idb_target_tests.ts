@@ -140,7 +140,7 @@ async function idbIngestionHarnessOn(name: string): Promise<IngestionHarness> {
 }
 
 const acctCreate: SchemaAction = {
-    kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+    kind: 'create-table', table: 'acct', schemaName: 'acct', anonymous: false, syncTable: 'acct_sync', primaryKey: 'id',
     columns: [{ name: 'ref', def: { type: 'string' } }],
 };
 
@@ -396,7 +396,7 @@ export const idbSpecificTests = {
                         'every column, the unchanged ones too, and nothing for the author it left out');
 
                     const keyId = await target.registerKey('default', admin.keyId, serializePublicKeyToBase64(admin.publicKey));
-                    await target.recordWriter({ writerKeyId: keyId, hashSuite: 'sha-256', groups: { [group.getId()]: { name: 'finance', mode: 'on' } } });
+                    await target.recordWriter({ writerKeyId: keyId, hashSuite: 'sha-256', author: 'auto' });
                     const tx2 = target.database.transaction(['tags'], 'readwrite');
                     const done2 = waitTx(tx2);
                     const id = await waitReq(tx2.objectStore('tags').add({ code: 'mine' }));

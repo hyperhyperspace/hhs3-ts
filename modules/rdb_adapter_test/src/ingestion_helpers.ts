@@ -4,7 +4,7 @@
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import type { Row, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 import {
-    AdapterConfig, AuthorshipMode, BidirectionalTarget, DEFAULT_KEY_DOMAIN, IngestSettle, KeyIndex, OpEvent, projectGroup,
+    AdapterConfig, AuthorSetting, BidirectionalTarget, DEFAULT_KEY_DOMAIN, IngestSettle, KeyIndex, OpEvent, projectGroup,
     QueryableTarget, RowAction, rowToUpsertAction, WriterRecordStore,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import { serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
@@ -52,17 +52,14 @@ export async function rowOps(group: RTableGroup, table: string): Promise<{ actio
 }
 
 // Records the writer in the target, as RdbProjection does at open: the writer
-// key, when given, and the group's mode, beside the groups already recorded.
-export async function recordWriter(target: BidirectionalTarget, group: RTableGroup, mode: AuthorshipMode, writer?: OwnIdentity): Promise<number | undefined> {
+// key, when given, the hash suite and the author setting.
+export async function recordWriter(target: BidirectionalTarget, author: AuthorSetting, writer?: OwnIdentity): Promise<number | undefined> {
     let writerKeyId: number | undefined;
     if (writer !== undefined) {
         writerKeyId = await (target as unknown as KeyIndex).registerKey(DEFAULT_KEY_DOMAIN, writer.keyId, serializePublicKeyToBase64(writer.publicKey));
     }
-    const store = target as unknown as WriterRecordStore;
-    const prior = await store.readWriterRecord();
-    await store.recordWriter({
-        ...(writerKeyId !== undefined ? { writerKeyId } : {}),
-        hashSuite: 'sha-256', groups: { ...(prior?.groups ?? {}), [group.getId()]: { name: group.getName(), mode } },
+    await (target as unknown as WriterRecordStore).recordWriter({
+        ...(writerKeyId !== undefined ? { writerKeyId } : {}), hashSuite: 'sha-256', author,
     });
     return writerKeyId;
 }
@@ -72,8 +69,7 @@ export async function recordWriter(target: BidirectionalTarget, group: RTableGro
 // the writer key (HIP-29).
 export async function projectAs(group: RTableGroup, target: BidirectionalTarget, writer: OwnIdentity, config: AdapterConfig = {}): Promise<void> {
     await projectGroup(group, target, config);
-    const mode: AuthorshipMode = group.getIdProvider() === undefined ? 'anonymous' : config.autoAuthor === false ? 'off' : 'on';
-    await recordWriter(target, group, mode, writer);
+    await recordWriter(target, config.author ?? 'auto', writer);
 }
 
 // A failure event for the settle cases, which the target stores as given.

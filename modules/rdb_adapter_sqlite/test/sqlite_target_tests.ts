@@ -298,7 +298,7 @@ export const sqliteSpecificTests = {
                 const v1: Version = new Set(['v1']);
 
                 const create: SchemaAction = {
-                    kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+                    kind: 'create-table', table: 'acct', schemaName: 'acct', anonymous: false, syncTable: 'acct_sync', primaryKey: 'id',
                     authorColumn: 'author_key_id',
                     columns: [
                         { name: 'ref', def: { type: 'string' } },
@@ -342,7 +342,7 @@ export const sqliteSpecificTests = {
                 const v1: Version = new Set(['v1']);
 
                 const create: SchemaAction = {
-                    kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+                    kind: 'create-table', table: 'acct', schemaName: 'acct', anonymous: false, syncTable: 'acct_sync', primaryKey: 'id',
                     columns: [{ name: 'ref', def: { type: 'string' } }],
                 };
                 const badRow = { kind: 'upsert-row' as const, table: 'ghost', rowId: 'r1', values: { ref: 'x' } };
@@ -547,14 +547,14 @@ export const sqliteSpecificTests = {
 
                 // A table of another group, for a co-projected cross-group reference.
                 await target.apply('gB', [{
-                    kind: 'create-table', table: 'archive_entries', syncTable: 'archive_entries_sync',
+                    kind: 'create-table', table: 'archive_entries', schemaName: 'archive_entries', anonymous: false, syncTable: 'archive_entries_sync',
                     primaryKey: 'id', columns: [{ name: 'title', def: { type: 'string' } }],
                 }], [], v1);
                 await target.apply('gA', [{
-                    kind: 'create-table', table: 'posts', syncTable: 'posts_sync',
+                    kind: 'create-table', table: 'posts', schemaName: 'posts', anonymous: false, syncTable: 'posts_sync',
                     primaryKey: 'id', columns: [{ name: 'title', def: { type: 'string' } }],
                 }, {
-                    kind: 'create-table', table: 'comments', syncTable: 'comments_sync', primaryKey: 'id',
+                    kind: 'create-table', table: 'comments', schemaName: 'comments', anonymous: false, syncTable: 'comments_sync', primaryKey: 'id',
                     authorColumn: 'author_key_id',
                     columns: [
                         { name: 'body', def: { type: 'string' } },
@@ -586,7 +586,7 @@ export const sqliteSpecificTests = {
                 const target = new SqliteTarget(db);
                 const gid = 'g';
                 await target.apply(gid, [{
-                    kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+                    kind: 'create-table', table: 'acct', schemaName: 'acct', anonymous: false, syncTable: 'acct_sync', primaryKey: 'id',
                     columns: [{ name: 'ref', def: { type: 'string' } }],
                 }], [], new Set(['v1']));
 
@@ -612,7 +612,7 @@ export const sqliteSpecificTests = {
                     kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { ref: 'a', extra: 'x' },
                 };
                 await target.apply(gid, [{
-                    kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+                    kind: 'create-table', table: 'acct', schemaName: 'acct', anonymous: false, syncTable: 'acct_sync', primaryKey: 'id',
                     columns: [
                         { name: 'ref', def: { type: 'string' } },
                         { name: 'extra', def: { type: 'string' } },
@@ -648,7 +648,7 @@ export const sqliteSpecificTests = {
                 const gid = 'g';
                 const v1: Version = new Set(['v1']);
                 await target.apply(gid, [{
-                    kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+                    kind: 'create-table', table: 'acct', schemaName: 'acct', anonymous: false, syncTable: 'acct_sync', primaryKey: 'id',
                     columns: [{ name: 'ref', def: { type: 'string' } }],
                 }], [{ kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { ref: 'a' } }], v1);
 
@@ -677,14 +677,14 @@ export const sqliteSpecificTests = {
                 const target = new SqliteTarget(db);
                 const gid = 'g';
                 await target.apply(gid, [{
-                    kind: 'create-table', table: 'orders', syncTable: 'orders_sync', primaryKey: 'id',
+                    kind: 'create-table', table: 'orders', schemaName: 'orders', anonymous: false, syncTable: 'orders_sync', primaryKey: 'id',
                     columns: [{ name: 'customer', def: { type: 'string' } }],
                 }], [{
                     kind: 'upsert-row', table: 'orders', rowId: 'o1', values: { customer: 'acme' },
                 }], new Set(['v1']));
 
                 await target.apply(gid, [{
-                    kind: 'create-table', table: 'lines', syncTable: 'lines_sync', primaryKey: 'id',
+                    kind: 'create-table', table: 'lines', schemaName: 'lines', anonymous: false, syncTable: 'lines_sync', primaryKey: 'id',
                     columns: [
                         { name: 'qty', def: { type: 'integer' } },
                         { name: 'order_id', def: { type: 'integer' }, fk: { targetTable: 'orders' } },
@@ -790,7 +790,7 @@ export const sqliteSpecificTests = {
                 // Three rows materialized (sync ids 1..3), then two deleted: the sync
                 // ledger keeps ids 1..3, the app table keeps only id 1.
                 await target.apply(gid, [{
-                    kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+                    kind: 'create-table', table: 'acct', schemaName: 'acct', anonymous: false, syncTable: 'acct_sync', primaryKey: 'id',
                     columns: [{ name: 'ref', def: { type: 'string' } }],
                 }], [
                     { kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { ref: 'a' } },
@@ -866,7 +866,7 @@ export const sqliteSpecificTests = {
                 const doc = { tags: ['line\nbreak', "it's", 'tab\there'], seq: long };
                 const op = { action: 'insert', values: { body: doc } };
                 await target.apply(gid, [{
-                    kind: 'create-table', table: 'docs', syncTable: 'docs_sync', primaryKey: 'id',
+                    kind: 'create-table', table: 'docs', schemaName: 'docs', anonymous: false, syncTable: 'docs_sync', primaryKey: 'id',
                     columns: [
                         { name: 'body', def: { type: 'json' } },
                         { name: 'extra', def: { type: 'json', default: long } },
@@ -1040,9 +1040,9 @@ export const sqliteSpecificTests = {
                 const target = new SqliteTarget(db, { captureChanges: true });
                 const gid = 'g';
                 await target.apply(gid, [
-                    { kind: 'create-table', table: 'parent', syncTable: 'parent_sync', primaryKey: 'id',
+                    { kind: 'create-table', table: 'parent', schemaName: 'parent', anonymous: false, syncTable: 'parent_sync', primaryKey: 'id',
                         columns: [{ name: 'title', def: { type: 'string' } }] },
-                    { kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+                    { kind: 'create-table', table: 'acct', schemaName: 'acct', anonymous: false, syncTable: 'acct_sync', primaryKey: 'id',
                         columns: [
                             { name: 'ref', def: { type: 'string' } },
                             { name: 'parent_id', def: { type: 'integer', nullable: true }, fk: { targetTable: 'parent' } },
@@ -1134,7 +1134,7 @@ export const sqliteSpecificTests = {
                     t.executeQuery({ table, orderBy: [{ column: 'id', direction: 'asc' }], limit: 10 });
                 try {
                     const gid = 'g';
-                    await a.apply(gid, [{ kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+                    await a.apply(gid, [{ kind: 'create-table', table: 'acct', schemaName: 'acct', anonymous: false, syncTable: 'acct_sync', primaryKey: 'id',
                         columns: [{ name: 'ref', def: { type: 'string' } }] }],
                     [{ kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { ref: 'a' } }], new Set(['v1']));
                     assertEquals((await query(b)).length, 1, 'the second handle reads the table');
@@ -1156,7 +1156,7 @@ export const sqliteSpecificTests = {
                     const after = await query(b);
                     assertTrue(after.length === 1 && !('ref' in after[0]), 'a dropped column is gone from them, without an error');
 
-                    await a.apply(gid, [{ kind: 'create-table', table: 'other', syncTable: 'other_sync', primaryKey: 'id',
+                    await a.apply(gid, [{ kind: 'create-table', table: 'other', schemaName: 'other', anonymous: false, syncTable: 'other_sync', primaryKey: 'id',
                         columns: [{ name: 'title', def: { type: 'string' } }] }], [], new Set(['v5']));
                     assertEquals((await query(b, 'other')).length, 0, 'and a new table can be queried');
                 } finally {
@@ -1353,7 +1353,7 @@ export const sqliteSpecificTests = {
                 const db = new Database(':memory:');
                 const target = new SqliteTarget(db);
                 const query = () => target.executeQuery({ table: 'acct', orderBy: [{ column: 'id', direction: 'asc' }], limit: 10 });
-                await target.apply('g', [{ kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+                await target.apply('g', [{ kind: 'create-table', table: 'acct', schemaName: 'acct', anonymous: false, syncTable: 'acct_sync', primaryKey: 'id',
                     columns: [{ name: 'ref', def: { type: 'string' } }] }],
                 [{ kind: 'upsert-row', table: 'acct', rowId: 'r1', values: { ref: 'a' } }], new Set(['v1']));
                 assertEquals((await query()).length, 1, 'the table is read once');
@@ -1483,7 +1483,7 @@ export const sqliteSpecificTests = {
                 const target = new SqliteTarget(db);
                 const gid = 'g';
                 const create: SchemaAction = {
-                    kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+                    kind: 'create-table', table: 'acct', schemaName: 'acct', anonymous: false, syncTable: 'acct_sync', primaryKey: 'id',
                     columns: [
                         { name: 'ref', def: { type: 'string' } },
                         { name: 'parent_id', def: { type: 'integer', nullable: true }, fk: { targetTable: 'acct' } },
@@ -1537,7 +1537,7 @@ export const sqliteSpecificTests = {
                 const gid = 'g';
                 const v1: Version = new Set(['v1']);
                 await target.apply(gid, [{
-                    kind: 'create-table', table: 'acct', syncTable: 'acct_sync', primaryKey: 'id',
+                    kind: 'create-table', table: 'acct', schemaName: 'acct', anonymous: false, syncTable: 'acct_sync', primaryKey: 'id',
                     columns: [{ name: 'ref', def: { type: 'string' } }],
                 }], [], v1);
                 const spec: IndexSpec = { indexes: [] };

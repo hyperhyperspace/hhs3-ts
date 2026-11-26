@@ -27,10 +27,16 @@ import {
     pageOpEvents, ResolvedIndex, RowAction, RowIdentityIndex, SchemaAction, StoredOpEvent, SyncMapping,
     versionsEqual, WriterRecord, WriterRecordStore,
     CapturedChangeId, ChangeRecord, mergeChangeRecord, RowRevert, opEventRows, withLocalIds,
+    checkWritable, checkWrite, keyLookups, memberTableNames, recordedWriterKeyId, WriteRefusedError,
+    type CheckedWrite, type RowValues as WriteValues, type RowWriter, type TableNameIndex, type TableShape,
+    type WritableTarget, type WriteContext,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import { compareSortTuples, evalWhere, normalizeOrder, projectColumns, rowOnSide } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
-import { FacadeDatabase, type FacadeHost } from "./idb_facade.js";
+import {
+    deleteRecordStep, FacadeDatabase, FacadeRequest, patchRecordStep, writeRecordStep,
+    type FacadeHost, type FacadeRecord, type WriteStepContext,
+} from "./idb_facade.js";
 import {
     deletePrefix, IdbEnv, indexGet, storeAdd, storeCount, storeDelete, storeGet, storeGetAll,
     storeGetAllPrefix, storePut,
@@ -45,6 +51,18 @@ import {
     type IndexSpecRecord, type KeyRecord, type OpEventRecord, type OutboxRecord, type RowRecord,
     type SyncRecord, type TableMetaRecord, type WriterRecordRecord, WRITER_RECORD_KEY, reqToPromise,
 } from "./idb_schema.js";
+
+// Runs one of the facade's write steps on a request of its own: resolves with
+// the step's result, or rejects with its error, which aborts the writer's
+// transaction.
+function runStep<T>(start: (req: FacadeRequest<T>) => void): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+        const req = new FacadeRequest<T>();
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+        start(req);
+    });
+}
 
 export type IdbTargetOptions = {
     captureChanges?: boolean;
@@ -81,7 +99,8 @@ function logicalRow(meta: TableMetaRecord, rec: RowRecord): import("@hyper-hyper
 }
 
 export class IdbTarget implements MaterializationTarget, MaterializedChangeSource,
-    ReactiveChangeTarget, QueryableTarget, RowIdentityIndex, KeyIndex, IndexTarget, FacadeHost, WriterRecordStore {
+    ReactiveChangeTarget, QueryableTarget, RowIdentityIndex, KeyIndex, IndexTarget, FacadeHost, WriterRecordStore,
+    WritableTarget, TableNameIndex {
 
     readonly name: string;
     readonly env: IdbEnv;
@@ -274,11 +293,13 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         const fkColumns: { [column: string]: { targetTable: string } } = {};
         const keyRefColumns: string[] = [];
         const defaults: { [column: string]: json.Literal } = {};
+        const nullable: string[] = [];
         for (const c of action.columns) {
             columnTypes[c.name] = c.def.type;
             if (c.fk !== undefined) fkColumns[c.name] = { targetTable: c.fk.targetTable };
             if (c.keyRef === true) keyRefColumns.push(c.name);
             if (c.def.default !== undefined) defaults[c.name] = c.def.default;
+            if (c.def.nullable === true) nullable.push(c.name);
         }
         const meta: TableMetaRecord = {
             table: action.table,
@@ -289,9 +310,11 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
             fkColumns,
             keyRefColumns,
             defaults,
+            nullable,
             nextId: 1,
             ...(groupId !== undefined ? { groupId } : {}),
-            schemaName: action.schemaName ?? action.table,
+            schemaName: action.schemaName,
+            anonymous: action.anonymous,
         };
         await storePut(ctx.tx, TABLE_META, meta);
         ctx.meta.set(action.table, meta);
@@ -314,6 +337,8 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         meta.columnTypes[action.column] = action.def.type;
         if (action.fk !== undefined) meta.fkColumns[action.column] = { targetTable: action.fk.targetTable };
         if (action.keyRef === true) meta.keyRefColumns.push(action.column);
+        meta.nullable = meta.nullable.filter((c) => c !== action.column);
+        if (action.def.nullable === true) meta.nullable.push(action.column);
         if (action.def.default !== undefined) {
             meta.defaults[action.column] = action.def.default;
             const rows = await storeGetAllPrefix<RowRecord>(ctx.tx, ROWS, [action.table]);
@@ -339,6 +364,7 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         delete meta.columnTypes[action.column];
         delete meta.fkColumns[action.column];
         meta.keyRefColumns = meta.keyRefColumns.filter((c) => c !== action.column);
+        meta.nullable = meta.nullable.filter((c) => c !== action.column);
         delete meta.defaults[action.column];
         const rows = await storeGetAllPrefix<RowRecord>(ctx.tx, ROWS, [action.table]);
         for (const row of rows) {
@@ -627,13 +653,131 @@ export class IdbTarget implements MaterializationTarget, MaterializedChangeSourc
         return record;
     }
 
-    // The table's group and its name in the schema, from the table's meta.
-    async tableGroup(table: string): Promise<{ groupId?: B64Hash; schemaName?: string } | undefined> {
+    // HIP-20's writer. Each call is one native read-write transaction over every
+    // store, the key counter included, which a facade transaction leaves out.
+    // Inside it the call reads what it is checked against: the table's meta
+    // record, from the meta store also for a table this tab hasn't seen, the
+    // writer record, the key table and the row. Then the shared checks, the
+    // keys interned last, and the facade's own write steps, so the facade's
+    // rules hold. A call resolves when its transaction completes, and announces
+    // its local commit as the facade does.
+    openWriter(): RowWriter {
+        this.ensureOpen();
+        if (!this.capture) {
+            throw new WriteRefusedError('no-capture', 'this IndexedDB target is not set up for capture, so its writes would never reach rdb');
+        }
+        return {
+            insert: (table, values) => this.writerCall((steps) => this.writerInsert(steps, table, values)),
+            update: (table, id, values, options) =>
+                this.writerCall((steps) => this.writerUpdate(steps, table, id, values, options?.compare === true)),
+            delete: (table, id) => this.writerCall((steps) => this.writerDelete(steps, table, id)),
+            writerKeyId: async () => recordedWriterKeyId(await this.readWriterRecord()),
+        };
+    }
+
+    private async writerCall<T>(call: (steps: WriteStepContext) => Promise<T>): Promise<T> {
+        this.ensureOpen();
+        let steps: WriteStepContext | undefined;
+        const result = await this.env.withReadWrite(async (tx) => {
+            steps = { real: tx, host: this, outboxRecords: [], captured: false };
+            return call(steps);
+        });
+        if (steps?.captured === true) this.onOutboxCommitted(steps.outboxRecords);
+        return result;
+    }
+
+    private async writerInsert(steps: WriteStepContext, table: string, values: WriteValues): Promise<number> {
+        const { meta, shape, ctx } = await this.writeSetup(steps.real, table, values);
+        const record = await this.interned(steps.real, checkWrite(shape, ctx, { kind: 'insert', values }));
+        return await runStep<IDBValidKey>((req) => writeRecordStep(steps, table, meta, req, 'add', record)) as number;
+    }
+
+    // An update reads the row first and stops when it is missing: a put of a
+    // missing row would insert it again. It takes patch's read-merge-write.
+    private async writerUpdate(steps: WriteStepContext, table: string, id: number, values: WriteValues, compare: boolean): Promise<boolean> {
+        const { meta, shape, ctx } = await this.writeSetup(steps.real, table, values);
+        checkWritable(shape, ctx);
+        const row = await storeGet<RowRecord>(steps.real, ROWS, [table, id]);
+        if (row === undefined) return false;
+        const author = meta.authorColumn === undefined ? undefined : row[meta.authorColumn];
+        const fields = await this.interned(steps.real, checkWrite(shape, ctx, {
+            kind: 'update', values, compare,
+            row: { id, values: row as { [column: string]: json.Literal }, author: typeof author === 'number' ? author : undefined },
+        }));
+        if (Object.keys(fields).length === 0) return true;
+        await runStep<IDBValidKey>((req) => patchRecordStep(steps, table, meta, req, id, fields, []));
+        return true;
+    }
+
+    private async writerDelete(steps: WriteStepContext, table: string, id: number): Promise<boolean> {
+        const { shape, ctx } = await this.writeSetup(steps.real, table, {});
+        checkWritable(shape, ctx);
+        if (await storeGet<RowRecord>(steps.real, ROWS, [table, id]) === undefined) return false;
+        await runStep<unknown>((req) => deleteRecordStep(steps, table, req, id, () => req.succeed(undefined)));
+        return true;
+    }
+
+    // What the checks read, in the call's transaction: the table's meta, the
+    // writer record, and the key table for the ids and keys the write names.
+    private async writeSetup(tx: IDBTransaction, table: string, values: WriteValues): Promise<{
+        meta: TableMetaRecord; shape: TableShape; ctx: WriteContext;
+    }> {
+        const meta = await storeGet<TableMetaRecord>(tx, TABLE_META, table);
+        if (meta === undefined) throw new WriteRefusedError('unknown-table', `this target has no table '${table}'`);
+        const stored = await storeGet<WriterRecordRecord>(tx, CAPTURE_CONFIG, WRITER_RECORD_KEY);
+        let record: WriterRecord | undefined;
+        if (stored !== undefined) {
+            const { key: _key, ...rest } = stored;
+            record = rest;
+        }
+        const columns: TableShape['columns'] = {};
+        for (const [column, type] of Object.entries(meta.columnTypes)) {
+            columns[column] = {
+                type, nullable: meta.nullable.includes(column), hasDefault: meta.defaults[column] !== undefined,
+                key: meta.keyRefColumns.includes(column),
+            };
+        }
+        const shape: TableShape = {
+            table, idColumn: meta.idColumn, ...(meta.authorColumn !== undefined ? { authorColumn: meta.authorColumn } : {}),
+            columns, anonymous: meta.anonymous,
+        };
+        const { ids, hashes } = keyLookups(shape, record, values);
+        const knownIds = new Set<number>();
+        for (const id of ids) if (await storeGet<KeyRecord>(tx, KEYS, id) !== undefined) knownIds.add(id);
+        const idsByHash = new Map<string, number>();
+        for (const hash of hashes) {
+            const key = await indexGet<KeyRecord>(tx, KEYS, 'by_hash', hash);
+            if (key !== undefined) idsByHash.set(hash, key.id);
+        }
+        const ctx: WriteContext = {
+            record, captureOn: this.isCaptureOn(),
+            keys: { hasId: (id) => knownIds.has(id), idOf: (keyHash) => idsByHash.get(keyHash) },
+        };
+        return { meta, shape, ctx };
+    }
+
+    // A checked write's values, with its keys interned.
+    private async interned(tx: IDBTransaction, checked: CheckedWrite): Promise<FacadeRecord> {
+        const values: FacadeRecord = { ...checked.values };
+        for (const k of checked.intern) values[k.column] = await this.internKey(tx, k.keyHash, k.publicKey);
+        return values;
+    }
+
+    async tableNames(member: string): Promise<{ [schemaName: string]: string }> {
+        this.ensureOpen();
+        const metas = await this.env.withRead(TABLE_META, (tx) => storeGetAll<TableMetaRecord>(tx, TABLE_META));
+        return memberTableNames(member, metas.map((m) => (
+            { table: m.table, schemaName: m.schemaName, ...(m.groupId !== undefined ? { groupId: m.groupId } : {}) })));
+    }
+
+    // The table's group, its name in the schema, and whether the group has no
+    // identity provider, from the table's meta.
+    async tableGroup(table: string): Promise<{ groupId?: B64Hash; schemaName: string; anonymous: boolean } | undefined> {
         this.ensureOpen();
         const meta = await this.env.withRead(TABLE_META, (tx) => storeGet<TableMetaRecord>(tx, TABLE_META, table));
         if (meta === undefined) return undefined;
         return { ...(meta.groupId !== undefined ? { groupId: meta.groupId } : {}),
-            ...(meta.schemaName !== undefined ? { schemaName: meta.schemaName } : {}) };
+            schemaName: meta.schemaName, anonymous: meta.anonymous };
     }
 
     async drainChanges(): Promise<CapturedBatch> {

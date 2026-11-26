@@ -29,7 +29,7 @@ import {
 
 // One translated, ready-to-submit op. `mapping` is the identity of an
 // insert: its row hash, uuid and signer. `anonymous` marks an insert signed by
-// no one (autoAuthor off with an empty author column).
+// no one (under `manual`, with an empty author column).
 export type PlannedOp = {
     table: string;            // target (projected) table
     localId: number;
@@ -101,9 +101,9 @@ export type NodeContext = {
     // rdb's row for an update's subject, to set aside a readonly or author
     // column that holds the row's own value (HIP-29). Absent: none set aside.
     subjectRow?: (rdbTable: string, rowId: string) => SubjectRow | undefined;
-    // autoAuthor off in a group with an identity provider: an insert is signed
-    // as its captured author column says, and is anonymous when it is empty.
-    autoAuthorOff?: boolean;
+    // `manual`, in a group with an identity provider: an insert is signed as
+    // its captured author column says, and is anonymous when it is empty.
+    manual?: boolean;
 };
 
 // rdb's values of a row, and its author's key hash, as an update finds it.
@@ -272,10 +272,10 @@ function reverseCols(
     // Capture fills in an empty author column with the writer key from the
     // writer record the projection keeps in the target. So an insert in a
     // signed group that still leaves it empty was written while no writer key
-    // was recorded, and is refused, unless autoAuthor is off, where it is
-    // anonymous (HIP-29). HIP-20's writer refuses such a write too
+    // was recorded, and is refused, unless the setting is `manual`, where it
+    // is anonymous (HIP-29). HIP-20's writer refuses such a write too
     // (no-writer-key).
-    if (!isUpdate && authorCol !== undefined && ctx.writerKeyId !== undefined && ctx.autoAuthorOff !== true
+    if (!isUpdate && authorCol !== undefined && ctx.writerKeyId !== undefined && ctx.manual !== true
         && (targetValues[authorCol] ?? null) === null) {
         return { ok: false, column: authorCol,
             reason: `an insert into '${rdbTable}' leaves its author empty: it was written while no writer key was recorded` };
@@ -301,12 +301,12 @@ function insertWrite(reversed: RowWrite, def: TableDef | undefined): RowWrite {
 }
 
 
-// The signer of an insert: the writer key, or no one under autoAuthor off when
-// its author column is empty (HIP-20).
+// The signer of an insert: the writer key, or no one under `manual` when its
+// author column is empty (HIP-20).
 function insertSigner(change: CapturedChange, ctx: NodeContext): { signer: KeyId | undefined; anonymous: boolean } {
     const author = authorColumn(ctx.config);
     const values = change.kind === 'delete' ? {} : change.values;
-    const anonymous = ctx.autoAuthorOff === true && author !== undefined && (values[author] ?? null) === null;
+    const anonymous = ctx.manual === true && author !== undefined && (values[author] ?? null) === null;
     return { signer: anonymous ? undefined : ctx.writerKeyId, anonymous };
 }
 

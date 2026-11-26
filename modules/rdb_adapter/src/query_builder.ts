@@ -3,7 +3,7 @@
 
 import type { json } from "@hyper-hyper-space/hhs3_json";
 
-import type { BoundWhereExpr, CursorBound, OrderBySpec, OrderDirection, ProjectedRow, SingleTableQueryPlan } from "./types.js";
+import type { BoundWhereExpr, CursorBound, OrderBySpec, OrderDirection, ProjectedRow, RowWriter, SingleTableQueryPlan } from "./types.js";
 import { bindWhere, parseWhere, type BoundParam, type WhereTemplate } from "./where_parser.js";
 
 export type ParamValue = json.Literal | null | Array<json.Literal | null> | Set<json.Literal | null> | ColumnSetRef;
@@ -15,6 +15,17 @@ export class ColumnSetRef {
 export type QuerySource = {
     selectFrom(table: string): TableQuery;
     monitor(query: TableQuery | { [name: string]: TableQuery }): QuerySubscription<ProjectedRow[] | { [name: string]: ProjectedRow[] }>;
+    // A row's row hash, rdb's id for it: undefined until the row is ingested
+    // (HIP-20's Row identity).
+    rowHash(table: string, id: number): Promise<string | undefined>;
+    // The local id a row hash has in this target, if any.
+    localId(table: string, rowHash: string): Promise<number | undefined>;
+    // The projected names of a member group's tables, keyed by their names in
+    // the schema; {} for a member no table matches (HIP-20's Table names).
+    tableNames(member: string): Promise<{ [schemaName: string]: string }>;
+    // Present only when the source's target can write, so that
+    // isWritableTarget(source) answers (HIP-20's Where apps get a writer).
+    openWriter?(): RowWriter;
 };
 
 export type QuerySnapshot<T> = {
@@ -176,10 +187,29 @@ function compareLiteral(a: json.Literal | null, b: json.Literal | null): number 
 }
 
 export class QuerySourceImpl implements QuerySource {
+    readonly openWriter?: () => RowWriter;
+
     constructor(private readonly engine: {
         selectFrom(table: string): TableQuery;
         monitor(query: TableQuery | { [name: string]: TableQuery }): QuerySubscription<ProjectedRow[] | { [name: string]: ProjectedRow[] }>;
-    }) {}
+        rowHash(table: string, id: number): Promise<string | undefined>;
+        localId(table: string, rowHash: string): Promise<number | undefined>;
+        tableNames(member: string): Promise<{ [schemaName: string]: string }>;
+    }, openWriter?: () => RowWriter) {
+        if (openWriter !== undefined) this.openWriter = openWriter;
+    }
+
+    rowHash(table: string, id: number): Promise<string | undefined> {
+        return this.engine.rowHash(table, id);
+    }
+
+    localId(table: string, rowHash: string): Promise<number | undefined> {
+        return this.engine.localId(table, rowHash);
+    }
+
+    tableNames(member: string): Promise<{ [schemaName: string]: string }> {
+        return this.engine.tableNames(member);
+    }
 
     selectFrom(table: string): TableQuery {
         return this.engine.selectFrom(table);

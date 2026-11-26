@@ -93,7 +93,7 @@ export const queryEvalTests = {
                 const seen: TargetCommitEvent[] = [];
                 target.addCommitListener((commit) => { seen.push(commit); });
                 await target.apply('g', [{
-                    kind: 'create-table', table: 'notes', syncTable: 'notes_sync', primaryKey: 'id',
+                    kind: 'create-table', table: 'notes', schemaName: 'notes', anonymous: false, syncTable: 'notes_sync', primaryKey: 'id',
                     columns: [{ name: 'title', def: { type: 'string', nullable: true, pub: true, readonly: false } }],
                 }], [], new Set(['c']));
                 target.localInsert('notes', { title: 'a' });

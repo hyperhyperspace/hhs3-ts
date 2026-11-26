@@ -8,7 +8,7 @@
 // host is stopped. Status comes from whichever tab is serving. With no answer
 // within a second, status is a stopped status from the host record.
 
-import { createBasicCrypto, HASH_SHA256, keyIdFromPublicKey } from "@hyper-hyper-space/hhs3_crypto";
+import { getHashSuite, keyIdFromPublicKey, type HashSuite } from "@hyper-hyper-space/hhs3_crypto";
 import { deserializePublicKeyFromBase64 } from "@hyper-hyper-space/hhs3_mvt";
 import {
     BROWSER_HOSTS_STORE, BROWSER_HOSTS_VERSION, browserClientChannel, browserHostsDatabase,
@@ -21,11 +21,13 @@ const KEYS = 'keys';
 const COUNTERS = 'counters';
 const NEXT_KEY_ID = 'nextKeyId';
 const OP_EVENTS = 'op_events';
+// The writer record (HIP-20): a record of the capture config store.
+const CAPTURE_CONFIG = 'capture_config';
+const WRITER_RECORD_KEY = 'writer';
 const STATUS_TIMEOUT_MS = 1_000;
 const RECONNECT_MS = 1_000;
 const EVENT_POLL_MS = 500;
 
-const hashSuite = createBasicCrypto().hash(HASH_SHA256);
 
 type Channel = {
     postMessage(message: unknown): void;
@@ -135,6 +137,25 @@ function toEvent(rec: EventRec): ClientEvent {
     if (rec.op !== undefined) event.op = rec.op;
     if (rec.reason !== undefined) event.reason = rec.reason;
     return event;
+}
+
+// The hash suite the projection recorded in its writer record (HIP-20), the
+// replica's, which a key's hash is computed with. Without the record the suite
+// is unknown, and a guess could intern a key under a hash rdb doesn't use.
+async function recordedHashSuite(db: IDBDatabase): Promise<HashSuite> {
+    let record: { hashSuite?: string } | undefined;
+    if (db.objectStoreNames.contains(CAPTURE_CONFIG)) {
+        const tx = db.transaction(CAPTURE_CONFIG, 'readonly');
+        record = await request<{ hashSuite?: string } | undefined>(tx.objectStore(CAPTURE_CONFIG).get(WRITER_RECORD_KEY));
+        await txDone(tx);
+    }
+    if (record?.hashSuite === undefined) {
+        throw new Error('the projection has no writer record yet, so the hash suite its keys are hashed with is unknown; '
+            + "start the host's projection once");
+    }
+    const suite = getHashSuite(record.hashSuite);
+    if (suite === undefined) throw new Error(`the projection's writer record names the hash suite '${record.hashSuite}', which isn't registered`);
+    return suite;
 }
 
 // The same allocation as IdbTarget.internKey, in one readwrite transaction.
@@ -321,7 +342,7 @@ export function openClient(appName: string, host: string, options: OpenClientOpt
         async registerKey(publicKey: string): Promise<number> {
             const db = await projection();
             if (db === undefined) throw noKeyTable();
-            const keyId = keyIdFromPublicKey(deserializePublicKeyFromBase64(publicKey), hashSuite);
+            const keyId = keyIdFromPublicKey(deserializePublicKeyFromBase64(publicKey), await recordedHashSuite(db));
             return intern(db, keyId, publicKey);
         },
         events,

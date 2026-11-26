@@ -23,12 +23,13 @@
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import type { RContext } from "@hyper-hyper-space/hhs3_mvt";
 import type { RDb, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
-import type { AdapterConfig, CrossGroupResolver, GroupProjection } from "@hyper-hyper-space/hhs3_rdb_adapter";
+import { sanitizePrefix, type AdapterConfig, type AuthorSetting, type CrossGroupResolver, type GroupProjection } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
 // Optional per-group config hook. It may set naming/writer, but NOT
 // tableNames or tablePrefix: the shared projection owns the group-qualified
 // namespace so the cross-group resolver stays consistent (an override of
-// either is ignored).
+// either is ignored). Nor the author setting, which is one for the whole
+// projection (HIP-20).
 export type GroupConfigOverride = (info: { groupId: B64Hash; groupName: string; tableNames: string[] }) => AdapterConfig;
 
 export type ScopeOptions = {
@@ -38,17 +39,11 @@ export type ScopeOptions = {
     names?: Map<B64Hash, string>;
     // Default writer applied to every member that lacks one (enables ingestion).
     writer?: OwnIdentity;
-    // Default autoAuthor for every member that does not set it (see
-    // AdapterConfig.autoAuthor); a per-group configOverride still wins.
-    autoAuthor?: boolean;
+    // The author setting (AdapterConfig.author), set on every member after its
+    // configOverride, as tableNames and tablePrefix are.
+    author?: AuthorSetting;
     configOverride?: GroupConfigOverride;
 };
-
-// Make a group name safe to use as a SQL identifier prefix.
-function sanitizePrefix(name: string): string {
-    const cleaned = name.replace(/[^A-Za-z0-9_]/g, '_');
-    return /^[A-Za-z_]/.test(cleaned) ? cleaned : '_' + cleaned;
-}
 
 // Resolve the RTableGroup objects the replica currently holds for an RDb's
 // member groups. Members not yet present are skipped.
@@ -116,15 +111,15 @@ export async function buildScope(groups: RTableGroup[], options: ScopeOptions = 
     const members: GroupProjection[] = [];
     for (const group of groups) {
         const id = group.getId();
-        const override = options.configOverride?.({ groupId: id, groupName: group.getName(), tableNames: tableList.get(id)! }) ?? {};
+        const { author: _author, ...override } = options.configOverride?.({ groupId: id, groupName: group.getName(), tableNames: tableList.get(id)! }) ?? {};
         const config: AdapterConfig = {
             ...override,
             tableNames: tableNamesById.get(id)!,       // owned by the scope (overrides any override)
             tablePrefix: prefixes.get(id)!,            // so is the prefix of the tables added later
             crossGroup: resolverFor(group),
+            ...(options.author !== undefined ? { author: options.author } : {}),   // and the author setting
         };
         if (config.writer === undefined && options.writer !== undefined) config.writer = options.writer;
-        if (config.autoAuthor === undefined && options.autoAuthor !== undefined) config.autoAuthor = options.autoAuthor;
         members.push({ group, config });
     }
     return members;

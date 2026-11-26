@@ -1,34 +1,34 @@
 import "./register_dom.js";
 
-import { createElement, StrictMode, Suspense, useEffect, useState } from "react";
+import { Component, createElement, StrictMode, Suspense, useEffect, useState, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { act } from "react";
 
 import { testing } from "@hyper-hyper-space/hhs3_util";
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
-import { MemoryTarget, QueryEngine, type ProjectedRow, type QuerySnapshot } from "@hyper-hyper-space/hhs3_rdb_adapter";
+import { MemoryTarget, QueryEngine, type ProjectedRow, type QuerySnapshot, type QuerySource } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
-import { ProjectionProvider, useQuery } from "../src/index.js";
+import { ProjectionProvider, useQuery, useWriter } from "../src/index.js";
 
 async function notesTable(target: MemoryTarget): Promise<void> {
     await target.apply("g", [{
-        kind: "create-table", table: "notes", syncTable: "notes_sync", primaryKey: "id",
+        kind: "create-table", table: "notes", schemaName: "notes", anonymous: false, syncTable: "notes_sync", primaryKey: "id",
         columns: [
             { name: "title", def: { type: "string", nullable: true, pub: true, readonly: false } },
             { name: "folder_id", def: { type: "integer", nullable: true, pub: true, readonly: false } },
         ],
     }, {
-        kind: "create-table", table: "folders", syncTable: "folders_sync", primaryKey: "id",
+        kind: "create-table", table: "folders", schemaName: "folders", anonymous: false, syncTable: "folders_sync", primaryKey: "id",
         columns: [{ name: "name", def: { type: "string", nullable: false, pub: true, readonly: false } }],
     }], [], new Set(["c"]));
 }
 
 async function messageTables(target: MemoryTarget): Promise<void> {
     await target.apply("g", [{
-        kind: "create-table", table: "profiles", syncTable: "profiles_sync", primaryKey: "id",
+        kind: "create-table", table: "profiles", schemaName: "profiles", anonymous: false, syncTable: "profiles_sync", primaryKey: "id",
         columns: [{ name: "name", def: { type: "string", nullable: false, pub: true, readonly: false } }],
     }, {
-        kind: "create-table", table: "messages", syncTable: "messages_sync", primaryKey: "id",
+        kind: "create-table", table: "messages", schemaName: "messages", anonymous: false, syncTable: "messages_sync", primaryKey: "id",
         columns: [
             { name: "body", def: { type: "string", nullable: false, pub: true, readonly: false } },
             { name: "author_id", def: { type: "integer", nullable: false, pub: true, readonly: false } },
@@ -404,6 +404,67 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
             const { root } = await show(engine, createElement(List));
             await settle();
             assertEquals(JSON.stringify(renders), '["loading","1"]', "subscribing after the first render causes no render of its own");
+            await act(async () => { root.unmount(); });
+            engine.close();
+        },
+    },
+    {
+        name: "[REACT10] useWriter() throws when the provider's source can't write",
+        invoke: async () => {
+            const target = new MemoryTarget({ captureChanges: true });
+            await notesTable(target);
+            const engine = new QueryEngine(target);
+            // A source with every read and no openWriter.
+            const source: QuerySource = {
+                selectFrom: (table) => engine.source.selectFrom(table),
+                monitor: (query) => engine.source.monitor(query),
+                rowHash: (table, id) => engine.source.rowHash(table, id),
+                localId: (table, rowHash) => engine.source.localId(table, rowHash),
+                tableNames: (member) => engine.source.tableNames(member),
+            };
+            const caught: unknown[] = [];
+            class Boundary extends Component<{ children?: ReactNode }, { failed: boolean }> {
+                state = { failed: false };
+                static getDerivedStateFromError() { return { failed: true }; }
+                componentDidCatch(error: unknown) { caught.push(error); }
+                render() { return this.state.failed ? createElement("div", null, "failed") : this.props.children; }
+            }
+            function Form() {
+                useWriter();
+                return createElement("div", null, "form");
+            }
+            const host = document.createElement("div");
+            document.body.appendChild(host);
+            const root = createRoot(host);
+            await act(async () => {
+                root.render(createElement(ProjectionProvider, { source }, createElement(Boundary, null, createElement(Form))));
+            });
+            assertTrue(caught.length > 0 && String(caught[0]).includes("can't write"), `the render throws: ${String(caught[0])}`);
+            await act(async () => { root.unmount(); });
+            engine.close();
+        },
+    },
+    {
+        name: "[REACT11] an insert through useWriter() re-renders a useQuery over that table",
+        invoke: async () => {
+            const target = new MemoryTarget({ captureChanges: true });
+            await notesTable(target);
+            // the writer record a projection leaves: the tables' group has an identity provider
+            await target.recordWriter({ writerKeyId: await target.registerKey("default", "WRITER", "PK"), hashSuite: "sha-256", author: "auto" });
+            const engine = new QueryEngine(target);
+            let save: (() => Promise<number>) | undefined;
+            function Notes() {
+                const writer = useWriter();
+                const snapshot = useQuery(engine.selectFrom("notes").select("title"));
+                save = () => writer.insert("notes", { title: "written", folder_id: 1 });
+                return createElement("div", null, snapshot.data.map((row) => String(row.title)).join(","));
+            }
+            const { root, host } = await show(engine, createElement(Notes));
+            await settle();
+            assertEquals(host.textContent, "", "no notes yet");
+            await act(async () => { await save!(); });
+            await settle();
+            assertEquals(host.textContent, "written", "the insert renders");
             await act(async () => { root.unmount(); });
             engine.close();
         },

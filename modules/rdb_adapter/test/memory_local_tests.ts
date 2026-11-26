@@ -9,7 +9,7 @@ import { MemoryTarget } from "../src/memory_target.js";
 async function notesTarget(): Promise<MemoryTarget> {
     const target = new MemoryTarget({ captureChanges: true });
     await target.apply('g', [{
-        kind: 'create-table', table: 'notes', syncTable: 'notes_sync', primaryKey: 'id', authorColumn: 'author_key_id',
+        kind: 'create-table', table: 'notes', schemaName: 'notes', anonymous: false, syncTable: 'notes_sync', primaryKey: 'id', authorColumn: 'author_key_id',
         columns: [
             { name: 'title', def: { type: 'string', nullable: true, pub: true, readonly: false } },
             { name: 'memo', def: { type: 'string', nullable: true, pub: true, readonly: false } },

@@ -12,12 +12,12 @@ import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test
 import type { B64Hash, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import type { json } from "@hyper-hyper-space/hhs3_json";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
-import { deriveRowId, MigrationRule, Row, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
+import { deriveRowId, MigrationRule, Row, RTableGroup, TableDef } from "@hyper-hyper-space/hhs3_rdb";
 import {
     AdapterConfig, BidirectionalTarget, CapturedBatch, CapturedChange, CapturedChangeId, ChangeRecord, CheckpointMovedError, DEFAULT_KEY_DOMAIN, IngestSettle,
     ingestChanges, KeyIndex, MemoryTarget, OpEvent, OpEventQuery, PendingChangesError, projectGroup, QueryableTarget, RowAction,
     rowToUpsertAction,
-    SchemaAction, StoredOpEvent, SyncMapping, syncGroup, WriterRecordStore, AuthorshipMode,
+    SchemaAction, StoredOpEvent, SyncMapping, syncGroup, WriterRecordStore,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import { serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 import { leaveEndsToNewCycles } from "@hyper-hyper-space/hhs3_rdb_adapter/testing";
@@ -1206,7 +1206,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                 },
             },
             {
-                name: `[${label}-IN40] a native insert's empty author column reads the writer key's id at once where the group's mode is on; under autoAuthor off and in an anonymous group it stays NULL`,
+                name: `[${label}-IN40] a native insert's empty author column reads the writer key's id at once under auto; under manual and in an anonymous group it stays NULL`,
                 invoke: async () => {
                     const authorOf = async (target: BidirectionalTarget, table: string, localId: number): Promise<unknown> =>
                         (await (target as unknown as QueryableTarget).executeQuery({ table })).find((r) => r.id === localId)?.author_key_id ?? null;
@@ -1219,7 +1219,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     let harness = await factory();
                     try {
                         await projectGroup(group, harness.target);
-                        const keyId = await recordWriter(harness.target, group, 'on', admin);
+                        const keyId = await recordWriter(harness.target, 'auto', admin);
                         const localId = await harness.local.insert('tags', { code: 'mine' });
                         assertEquals(await authorOf(harness.target, 'tags', localId), keyId, 'the row reads the writer key at once');
                         assertEquals(await capturedAuthor(harness.target, localId), keyId, 'and so does the captured insert');
@@ -1230,9 +1230,9 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     harness = await factory();
                     try {
                         await projectGroup(group, harness.target);
-                        await recordWriter(harness.target, group, 'off', admin);
+                        await recordWriter(harness.target, 'manual', admin);
                         const localId = await harness.local.insert('tags', { code: 'anon' });
-                        assertEquals(await authorOf(harness.target, 'tags', localId), null, 'under autoAuthor off the column stays empty');
+                        assertEquals(await authorOf(harness.target, 'tags', localId), null, 'under manual the column stays empty');
                     } finally {
                         await harness.cleanup?.();
                     }
@@ -1241,9 +1241,9 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     harness = await factory();
                     try {
                         await projectGroup(anon.group, harness.target);
-                        await recordWriter(harness.target, anon.group, 'anonymous', anon.admin);
+                        await recordWriter(harness.target, 'auto', anon.admin);
                         const localId = await harness.local.insert('things', { label: 'x' });
-                        assertEquals(await authorOf(harness.target, 'things', localId), null, 'in an anonymous group it stays empty');
+                        assertEquals(await authorOf(harness.target, 'things', localId), null, 'in an anonymous group it stays empty, under auto too');
                     } finally {
                         await harness.cleanup?.();
                     }
@@ -1301,9 +1301,9 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const { target, local, cleanup } = await factory();
                     try {
                         await projectGroup(group, target);
-                        await recordWriter(target, group, 'on');          // opened without a writer key
+                        await recordWriter(target, 'auto');          // opened without a writer key
                         await local.insert('tags', { code: 'early' });
-                        await recordWriter(target, group, 'on', admin);   // then with one
+                        await recordWriter(target, 'auto', admin);   // then with one
                         const result = await ingestChanges(group, target, { writer: admin });
                         assertEquals(result.accepted, 0, 'nothing lands');
                         assertTrue(result.rejected.length === 1 && result.rejected[0].reason.includes('author'),
@@ -1315,16 +1315,16 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                 },
             },
             {
-                name: `[${label}-IN43] under autoAuthor off a native insert that leaves the author empty is ingested anonymously, and one naming the writer key's id is signed; with no author column the writer key signs`,
+                name: `[${label}-IN43] under manual a native insert that leaves the author empty is ingested anonymously, and one naming the writer key's id is signed; with no author column the writer key signs`,
                 invoke: async () => {
                     const { group, admin } = await createGroup();
                     let harness = await factory();
                     try {
-                        await projectGroup(group, harness.target, { autoAuthor: false });
-                        const keyId = await recordWriter(harness.target, group, 'off', admin);
+                        await projectGroup(group, harness.target, { author: 'manual' });
+                        const keyId = await recordWriter(harness.target, 'manual', admin);
                         await harness.local.insert('tags', { code: 'anon' });
                         await harness.local.insert('tags', { code: 'signed', author_key_id: keyId! });
-                        const result = await ingestChanges(group, harness.target, { writer: admin, autoAuthor: false });
+                        const result = await ingestChanges(group, harness.target, { writer: admin, author: 'manual' });
                         assertEquals(result.rejected.length, 0, 'nothing is refused');
                         const rows = await rdbRows(group, 'tags');
                         const byCode = new Map(rows.map((r) => [r.values.code, r]));
@@ -1339,7 +1339,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const second = await createGroup();
                     harness = await factory();
                     try {
-                        const config = { autoAuthor: false, authorColumn: false as const };
+                        const config = { author: 'manual' as const, authorColumn: false as const };
                         await projectGroup(second.group, harness.target, config);
                         await harness.local.insert('tags', { code: 'plain' });
                         const result = await ingestChanges(second.group, harness.target, { writer: second.admin, ...config });
@@ -1348,6 +1348,41 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     } finally {
                         await harness.cleanup?.();
                     }
+                },
+            },
+            {
+                name: `[${label}-IN90] each table's meta records whether its group has an identity provider, also for a table a schema change adds later: under auto, a native insert into that table reads the writer key's id at once in a signed group, and stays NULL in an anonymous one`,
+                invoke: async () => {
+                    type GroupOf = (table: string) => { anonymous: boolean } | undefined | Promise<{ anonymous: boolean } | undefined>;
+                    const anonymousOf = async (target: BidirectionalTarget, table: string): Promise<boolean | undefined> =>
+                        (await (target as unknown as { tableGroup: GroupOf }).tableGroup(table))?.anonymous;
+                    const authorOf = async (target: BidirectionalTarget, table: string, localId: number): Promise<unknown> =>
+                        (await (target as unknown as QueryableTarget).executeQuery({ table })).find((r) => r.id === localId)?.author_key_id ?? null;
+                    const later: TableDef = {
+                        name: 'later', columns: { note: { type: 'string', nullable: true } },
+                        restrictions: [{ on: 'all', rule: { p: 'true' } }],
+                    };
+                    const run = async (fixture: GroupFixture, table: string, anonymous: boolean): Promise<void> => {
+                        const { schema, group, admin } = fixture;
+                        const harness = await factory();
+                        try {
+                            await projectGroup(group, harness.target);
+                            const keyId = await recordWriter(harness.target, 'auto', admin);
+                            assertEquals(await anonymousOf(harness.target, table), anonymous, `${table} records it`);
+
+                            await schema.updateSchema([{ rule: 'add-table', def: later }], admin, 'add later');
+                            await group.deploy(await (await schema.getScopedDag()).getFrontier());
+                            await projectGroup(group, harness.target);
+                            assertEquals(await anonymousOf(harness.target, 'later'), anonymous, 'so does a table added later');
+                            const localId = await harness.local.insert('later', { note: 'x' });
+                            assertEquals(await authorOf(harness.target, 'later', localId), anonymous ? null : keyId,
+                                anonymous ? 'an insert into it stays NULL' : "an insert into it reads the writer key's id at once");
+                        } finally {
+                            await harness.cleanup?.();
+                        }
+                    };
+                    await run(await createGroup(), 'tags', false);
+                    await run(await createAnonymousGroup(), 'things', true);
                 },
             },
             {

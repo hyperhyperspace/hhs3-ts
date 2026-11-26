@@ -165,7 +165,7 @@ function checkTableNameCollisions(config: AdapterConfig, rdbTables: string[]): v
 }
 
 function createTableAction(
-    config: AdapterConfig, rdbTable: string, def: TableDef, fks: FKs, provider?: IdProvider,
+    config: AdapterConfig, rdbTable: string, def: TableDef, fks: FKs, anonymous: boolean, provider?: IdProvider,
 ): SchemaAction {
     const table = targetTableName(config, rdbTable);
     const action: SchemaAction = {
@@ -175,6 +175,7 @@ function createTableAction(
         primaryKey: idColumn(config),
         columns: resolveTableColumns(config, rdbTable, def, fks, provider),
         schemaName: rdbTable,
+        anonymous,
     };
     const author = authorColumn(config);
     if (author !== undefined) action.authorColumn = author;
@@ -186,7 +187,9 @@ function createTableAction(
 // ---------------------------------------------------------------------------
 
 // Full materialization from a resolved schema view: one create-table per table.
-export function initialSchemaActions(view: RSchemaView, config: AdapterConfig = {}): SchemaAction[] {
+// `anonymous`: whether the group has no identity provider, which each table's
+// meta records (HIP-20).
+export function initialSchemaActions(view: RSchemaView, config: AdapterConfig, anonymous: boolean): SchemaAction[] {
     const tables = view.getTableNames();
     checkTableNameCollisions(config, tables);
 
@@ -194,7 +197,7 @@ export function initialSchemaActions(view: RSchemaView, config: AdapterConfig = 
     for (const rdbTable of tables) {
         const def = view.getTable(rdbTable);
         if (def === undefined) continue;   // defensive: name came from getTableNames()
-        actions.push(createTableAction(config, rdbTable, def, view.getFKs(rdbTable), view.getIdProvider?.(rdbTable)));
+        actions.push(createTableAction(config, rdbTable, def, view.getFKs(rdbTable), anonymous, view.getIdProvider?.(rdbTable)));
     }
     return actions;
 }
@@ -210,12 +213,14 @@ export function initialSchemaActions(view: RSchemaView, config: AdapterConfig = 
 // no-ops).
 //
 // Ordering is deterministic and drop-before-add: drop-table, create-table,
-// then per altered table drop-column before add-column.
+// then per altered table drop-column before add-column. `anonymous`, as in
+// initialSchemaActions.
 export function schemaDeltaActions(
     changes: RSchemaChanges,
     endView: RSchemaView,
     startView: RSchemaView,
-    config: AdapterConfig = {},
+    config: AdapterConfig,
+    anonymous: boolean,
 ): SchemaAction[] {
     checkTableNameCollisions(config, endView.getTableNames());
 
@@ -237,7 +242,7 @@ export function schemaDeltaActions(
             const def = endView.getTable(rdbTable);
             if (def !== undefined) {
                 createTables.push(createTableAction(
-                    config, rdbTable, def, endView.getFKs(rdbTable), endView.getIdProvider?.(rdbTable)));
+                    config, rdbTable, def, endView.getFKs(rdbTable), anonymous, endView.getIdProvider?.(rdbTable)));
             }
             continue;
         }
@@ -253,7 +258,7 @@ export function schemaDeltaActions(
             const def = endView.getTable(rdbTable);
             if (def !== undefined) {
                 createTables.push(createTableAction(
-                    config, rdbTable, def, endView.getFKs(rdbTable), endView.getIdProvider?.(rdbTable)));
+                    config, rdbTable, def, endView.getFKs(rdbTable), anonymous, endView.getIdProvider?.(rdbTable)));
             }
             continue;
         }

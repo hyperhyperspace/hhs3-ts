@@ -47,11 +47,15 @@ export type TableMetaRecord = {
     fkColumns: { [column: string]: { targetTable: string } };
     keyRefColumns: string[];
     defaults: { [column: string]: json.Literal };
+    // The nullable columns, which the writer's checks read (HIP-20).
+    nullable: string[];
     nextId: number;
-    // The group the table was created for, and its name in that group's
-    // schema (HIP-20). Capture reads the group's mode from the writer record.
+    // The group the table was created for, its name in that group's schema,
+    // and whether the group has no identity provider (HIP-20). Capture fills
+    // in the author only in a table whose group has one.
     groupId?: string;
-    schemaName?: string;
+    schemaName: string;
+    anonymous: boolean;
 };
 
 // `endObserves`: the observes an end of a pass recorded beside the
@@ -108,7 +112,7 @@ export type WriterRecordRecord = {
     key: string;
     writerKeyId?: number;
     hashSuite: string;
-    groups: { [groupId: string]: { name: string; mode: 'on' | 'off' | 'anonymous' } };
+    author: 'auto' | 'manual';
 };
 
 export type IndexEntryRecord = {
