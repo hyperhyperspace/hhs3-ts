@@ -31,9 +31,14 @@ export const ed25519: SigningSuite = {
         return nobleEd25519.sign(message, secretKey);
     },
 
+    // Strict RFC 8032 verification. noble's default for Ed25519 is ZIP-215,
+    // which also accepts non-canonical encodings and small-order public keys:
+    // against a small-order key, a signature whose R is the neutral point and
+    // whose S is 0 verifies for every message. Strict mode refuses both, and
+    // every key pair and signature this suite makes passes it.
     async verify(message: Uint8Array, signature: Uint8Array, publicKey: Uint8Array): Promise<boolean> {
         try {
-            return nobleEd25519.verify(signature, message, publicKey);
+            return nobleEd25519.verify(signature, message, publicKey, { zip215: false });
         } catch {
             return false;
         }

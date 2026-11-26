@@ -66,6 +66,8 @@ interface SigningSuite {
 
 The hybrid suite concatenates classical and post-quantum keys/signatures and requires **both** to verify.
 
+Ed25519 verifies by the strict rules of RFC 8032, alone and as the hybrid's classical half: a non-canonical encoding fails, and so does a small-order public key. noble's default, ZIP-215, accepts both, and against a small-order key a signature whose R is the neutral point and whose S is 0 verifies for every message, so anyone could sign as an identity that holds one. Every key pair and signature the suite makes passes the strict rules.
+
 ### Key Encapsulation (`KemSuite`)
 
 
@@ -194,7 +196,7 @@ npm run build
 
 ## Testing
 
-The test suite covers all suite interfaces, hybrid constructions (component tampering), identity serialization round-trips, registry lookups, and an RFC 8032 Ed25519 test vector. To run it, first build the workspace and then within `modules/crypto`:
+The test suite covers all suite interfaces, hybrid constructions (component tampering), Ed25519's refusal of small-order public keys, identity serialization round-trips, registry lookups, and an RFC 8032 Ed25519 test vector. To run it, first build the workspace and then within `modules/crypto`:
 
 ```
 npm run test

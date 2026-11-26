@@ -24,7 +24,11 @@ import {
     getHashSuite,
     createBasicCrypto,
 } from '../registry.js';
-import { ed25519 as nobleEd25519 } from '@noble/curves/ed25519.js';
+import { ED25519_TORSION_SUBGROUP, ed25519 as nobleEd25519 } from '@noble/curves/ed25519.js';
+
+function fromHex(hex: string): Uint8Array {
+    return Uint8Array.from(hex.match(/../g)!.map((byte) => parseInt(byte, 16)));
+}
 
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
     if (a.length !== b.length) return false;
@@ -150,6 +154,37 @@ async function testHybridSigningTampering() {
     const badPqSig = tamperByte(signature, pqOffset);
     const r2 = await ed25519_mlDsa65.verify(message, badPqSig, publicKey);
     testing.assertFalse(r2, 'tampered PQ component should fail');
+}
+
+// ---- Ed25519 small-order public keys ----
+
+// The 8 small-order points decode as public keys, but no key pair makes one.
+// Against any of them, a signature whose R is the neutral point and whose S
+// is 0 passes the cofactored check of ZIP-215 for every message, so anyone
+// could sign as an identity that holds one. Strict RFC 8032 verification
+// refuses small-order keys, and so does the hybrid, whose classical half is
+// checked the same way.
+async function testEd25519SmallOrderKeys() {
+    const forged = new Uint8Array(ed25519.signatureSize);
+    forged.set(fromHex(ED25519_TORSION_SUBGROUP[0]!), 0);   // R = the neutral point, S = 0
+    const messages = ['', 'hello hhs3', 'grant me the manager cap'].map((text) => new TextEncoder().encode(text));
+    for (const hex of ED25519_TORSION_SUBGROUP) {
+        for (const message of messages) {
+            testing.assertFalse(await ed25519.verify(message, forged, fromHex(hex)),
+                `the forged signature must not verify against the small-order key ${hex}`);
+        }
+    }
+
+    const { publicKey: pq, secretKey: pqSecret } = await mlDsa65.generateKeyPair();
+    const hybridKey = new Uint8Array(ed25519_mlDsa65.publicKeySize);
+    hybridKey.set(fromHex(ED25519_TORSION_SUBGROUP[0]!), 0);
+    hybridKey.set(pq, ed25519.publicKeySize);
+    const message = messages[1]!;
+    const hybridSig = new Uint8Array(ed25519_mlDsa65.signatureSize);
+    hybridSig.set(forged, 0);
+    hybridSig.set(await mlDsa65.sign(message, pqSecret), ed25519.signatureSize);
+    testing.assertFalse(await ed25519_mlDsa65.verify(message, hybridSig, hybridKey),
+        'a hybrid key with a small-order classical half verifies nothing, even with a valid post-quantum signature');
 }
 
 // ---- Hybrid KEM component tampering ----
@@ -358,6 +393,7 @@ const signingTests = {
         { name: '[SIGN_01] ML-DSA-65 round-trip', invoke: () => testSigningRoundTrip(mlDsa65) },
         { name: '[SIGN_02] Hybrid Ed25519+ML-DSA-65 round-trip', invoke: () => testSigningRoundTrip(ed25519_mlDsa65) },
         { name: '[SIGN_03] Hybrid signing component tampering', invoke: testHybridSigningTampering },
+        { name: '[SIGN_04] Ed25519 refuses small-order public keys, alone and in the hybrid', invoke: testEd25519SmallOrderKeys },
     ]
 };
 
