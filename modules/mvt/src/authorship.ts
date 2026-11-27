@@ -13,6 +13,7 @@ import type { HashSuite } from "@hyper-hyper-space/hhs3_crypto";
 import { json } from "@hyper-hyper-space/hhs3_json";
 
 import type { Version } from "./mvt.js";
+import type { ValidationResult } from "./validation.js";
 
 export const MAX_KEY_ID_LENGTH = 256;
 export const MAX_SIGNATURE_LENGTH = 8192;
@@ -80,6 +81,31 @@ export function serializePublicKeyToBase64(pk: PublicKey): string {
 export function deserializePublicKeyFromBase64(b64: string): PublicKey {
     const buf = base64.toArrayBuffer(b64);
     return deserializePublicKey(new Uint8Array(buf));
+}
+
+// Whether `publicKey` is the base64 of a well-formed public key, and if not,
+// why: the signing suite it names is registered, its bytes are a public key
+// of that suite (each suite's publicKeyProblem), and the base64 is the
+// canonical encoding, so a key has one text. The deserializer above checks
+// none of it. The projection writer, every registerKey and lookupKey run it
+// before they hash or store a key (HIP-20's Key columns).
+export function validateKey(publicKey: string): ValidationResult {
+    const refuse = (reason: string): ValidationResult => ({ valid: false, why: { reason } });
+    let pk: PublicKey;
+    try {
+        pk = deserializePublicKeyFromBase64(publicKey);
+    } catch {
+        return refuse("the text isn't a serialized public key");
+    }
+    const suite = getSigningSuite(pk.suite);
+    if (suite === undefined) {
+        const shown = pk.suite.length > 40 ? `${pk.suite.slice(0, 40)}…` : pk.suite;
+        return refuse(`the key names the signing suite ${JSON.stringify(shown)}, which isn't registered`);
+    }
+    const problem = suite.publicKeyProblem(pk.key);
+    if (problem !== undefined) return refuse(problem);
+    if (serializePublicKeyToBase64(pk) !== publicKey) return refuse("the key isn't in canonical base64");
+    return { valid: true };
 }
 
 export function computeKeyId(pk: PublicKey, hashSuite: HashSuite): KeyId {

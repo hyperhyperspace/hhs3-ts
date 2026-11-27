@@ -40,6 +40,7 @@ function RoomMessages({ roomId, beforeId }: { roomId: number; beforeId?: number 
   - `events`: the ingestion failures and concurrency void/reinstate flips about rows the query shows, in the delivery that follows their commit. A query set carries the events of its members. The rules are in [rdb_adapter's Events in a snapshot](../rdb_adapter#events-in-a-snapshot);
   - `loading`: `true` until the initial query completes;
   - `error`: populated if the query failed.
+- **`useWriter(): RowWriter`** opens a writer from the provider's source, the `RowWriter` of [rdb_adapter's Writing](../rdb_adapter#writing), and throws when that source can't write (`isWritableTarget`). It is kept in a memo keyed by the source, so callbacks built on it don't change between renders. Opening a writer starts nothing, so React may run the memo twice or throw it away. A write through it re-renders the `useQuery`s over its table, as any local write does.
 
 ## How it behaves on render
 
@@ -58,4 +59,4 @@ The rules behind this are in [rdb_adapter's Subscriptions and snapshot identity]
 npm test
 ```
 
-**HIPs:** [5](../../hips/0005-reactive-queries.md)
+**HIPs:** [5](../../hips/0005-reactive-queries.md), [20](../../hips/0020-unified-write-api.md)

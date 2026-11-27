@@ -9,7 +9,7 @@
 // within a second, status is a stopped status from the host record.
 
 import { getHashSuite, keyIdFromPublicKey, type HashSuite } from "@hyper-hyper-space/hhs3_crypto";
-import { deserializePublicKeyFromBase64 } from "@hyper-hyper-space/hhs3_mvt";
+import { deserializePublicKeyFromBase64, validateKey } from "@hyper-hyper-space/hhs3_mvt";
 import {
     BROWSER_HOSTS_STORE, BROWSER_HOSTS_VERSION, browserClientChannel, browserHostsDatabase,
     browserProjectionDatabase, decodeServerMessage, encodeMessage, isBrowserChannelMessage,
@@ -156,6 +156,21 @@ async function recordedHashSuite(db: IDBDatabase): Promise<HashSuite> {
     const suite = getHashSuite(record.hashSuite);
     if (suite === undefined) throw new Error(`the projection's writer record names the hash suite '${record.hashSuite}', which isn't registered`);
     return suite;
+}
+
+// Throws on a public key validateKey refuses, before anything hashes or
+// stores it (HIP-20's Row identity).
+function checkKey(publicKey: string): void {
+    const valid = validateKey(publicKey);
+    if (!valid.valid) throw new Error(`not a public key: ${valid.why.reason}`);
+}
+
+// A key hash's id in the keys store, or undefined, read without writing.
+async function lookup(db: IDBDatabase, keyHash: string): Promise<number | undefined> {
+    const tx = db.transaction(KEYS, 'readonly');
+    const existing = await request<KeyRec | undefined>(tx.objectStore(KEYS).index('by_hash').get(keyHash));
+    await txDone(tx);
+    return existing?.id;
 }
 
 // The same allocation as IdbTarget.internKey, in one readwrite transaction.
@@ -340,10 +355,17 @@ export function openClient(appName: string, host: string, options: OpenClientOpt
             return { ...key, id: await intern(db, key.keyId, key.publicKey) };
         },
         async registerKey(publicKey: string): Promise<number> {
+            checkKey(publicKey);
             const db = await projection();
             if (db === undefined) throw noKeyTable();
             const keyId = keyIdFromPublicKey(deserializePublicKeyFromBase64(publicKey), await recordedHashSuite(db));
             return intern(db, keyId, publicKey);
+        },
+        async lookupKey(publicKey: string): Promise<number | undefined> {
+            checkKey(publicKey);
+            const db = await projection();
+            if (db === undefined) throw noKeyTable();
+            return lookup(db, keyIdFromPublicKey(deserializePublicKeyFromBase64(publicKey), await recordedHashSuite(db)));
         },
         events,
         async status(): Promise<ClientStatus> {

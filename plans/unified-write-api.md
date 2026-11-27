@@ -1,10 +1,10 @@
 # Implementing HIP-20: the unified write API
 
-- **Status:** Phases C and D done, Phase E not started.
+- **Status:** Phases C, D and E done. C landed in `22589f1`, and D is outside the repo.
 - **Written:** 2026-11-25, against `527bb38` with HIP-20's citation pass of the same day, and revised the same day for decision 11 and on 2026-11-26 for decisions 12 to 16. Line numbers are from that tree.
 - **Design:** [HIP-20](../hips/0020-unified-write-api.md). Its *Changes* lists the work by module, and says in which order what is left lands.
 - **Earlier plan:** the plan approved on 2026-11-19, in a Claude Code session, was never committed. Its phases were 0 (a baseline), A (the HIP text), B (*Changes* 1), C (the draft writer), D (the trial app) and E (the rest). A and B are done, and HIP-29 came between B and C. This plan replaces it for C to E, keeps their names, and keeps its decisions (*Decisions*).
-- **Modules:** rdb_adapter, rdb_adapter_sqlite, rdb_adapter_idb, rdb_adapter_test, rdb_projection, rhost, rhost_client_node, rhost_client_browser, rdb_react, and for decision 15 rhost_client, crypto and mvt. Outside the repo: the trial app, `/Users/santi/Hyper/mb-chat-exploration`, made again, since the copy set up on 2026-11-19 is gone.
+- **Modules:** rdb_adapter, rdb_adapter_sqlite, rdb_adapter_idb, rdb_adapter_test, rdb_adapter_test_gen (the mock context's hash suite, for the BLAKE3 case), rdb_projection, rhost, rhost_client_node, rhost_client_browser, rdb_react, and for decision 15 rhost_client, crypto and mvt. Outside the repo: the trial app, `/Users/santi/Hyper/mb-chat-exploration`, made again, since the copy set up on 2026-11-19 is gone.
 
 ## Summary
 
@@ -224,3 +224,5 @@ None by surprise. C1 rewrites the cases it lists, since decision 11 changed what
 - **A stale code comment:** `types.ts:180-182` still describes dependency-driven bundling (detail 1).
 - **Nothing in the target read the writer record's member names.** They were there for `tableNames`, which isn't built yet (decision 11).
 - **`autoAuthor` could differ per group only through `RdbProjection`'s `configOverride`**, which no app used, and rhost's config set only the default. On 2026-11-16 you had asked for one switch (decision 11).
+- **Which cases keep a native mutator** (Phase E). The rule above names the cases HIP-20 lists and those that use `insertAt` or `replaceAt`. Twenty-five keep one: those, the eight whose writes the writer refuses up front (Stop C), IN24, and the cases named for a native path that would pass through the writer while no longer testing it (IN31, IN40, IN41, IN43, IN90: capture's fill and the native author and update rules). Three cases that test the settle's records, IN44, IN47 and IN48, projected without recording a writer, which the writer needs, so they set the target up as `RdbProjection` does (`projectAs`). No case changed outcome through the writer.
+- **A replica's hash suite governs key ids only.** rdb hashes its entries, row ids and catalog payloads with SHA-256 whatever the suite (`rdb/src/rschema/rschema.ts:63`, `rdb/src/rtable_group/group.ts:132`, `rdb/src/rtable/hash.ts:14`), and checks identity rows with the replica's suite (`rdb/src/rtable_group/validate_ops.ts:412`). The writer suite's BLAKE3 case models that: BLAKE3 key ids over SHA-256 entries.

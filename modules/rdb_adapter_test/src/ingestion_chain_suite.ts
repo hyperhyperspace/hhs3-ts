@@ -55,7 +55,7 @@ async function eventsOf(target: BidirectionalTarget, direction: 'void' | 'reinst
     return (await target.drainOpEvents()).filter((e) => e.event.direction === direction).map((e) => e.event.rowId ?? '');
 }
 
-export function createChainCases(label: string, factory: IngestionFactory): NamedTest[] {
+export function createChainCases(label: string, factory: IngestionFactory, nativeFactory: IngestionFactory): NamedTest[] {
     return [
         {
             name: `[${label}-IN49] a row ingested and then deleted remotely before the next projection is gone after it, also after a reopen`,
@@ -355,17 +355,20 @@ export function createChainCases(label: string, factory: IngestionFactory): Name
                 const { group, admin } = await createGroup();
                 await (await group.getTable('tags')).insert('g1', { code: 'from-rdb' }, admin);
                 const g1 = deriveRowId('g1', admin.keyId);
-                const { target, read, local, cleanup } = await factory();
+                const { target, read, local, cleanup } = await nativeFactory();
                 if (local.replaceAt === undefined) { await cleanup?.(); return; }
                 try {
                     await projectAs(group, target, admin);
                     const projected = (await read.syncId('tags', g1))!;
                     const mine = await local.insert('tags', { code: 'mine' });
                     await ingestChanges(group, target, { writer: admin });
+                    const failures = async () => (await target.drainOpEvents()).filter((e) => e.event.direction === 'failure').length;
                     for (const [localId, code] of [[projected, 'from-rdb'], [mine, 'mine']] as const) {
+                        const logged = await failures();
                         await local.replaceAt('tags', localId, { code: 'replaced' });
                         const result = await ingestChanges(group, target, { writer: admin });
                         assertEquals(`${result.accepted} ${result.rejected.length}`, '0 1', `the replace of ${code} is refused`);
+                        assertEquals(await failures(), logged + 1, 'and logged as a failure');
                         assertEquals((await localRow(target, 'tags', localId))?.code, code, "rdb's row is back");
                         assertEquals((await target.resolveRow('tags', localId))?.status, 'active', 'and its mapping stays active');
                         assertEquals((await target.drainChanges()).changes.length, 0, 'the outbox is empty');
@@ -378,12 +381,40 @@ export function createChainCases(label: string, factory: IngestionFactory): Name
             },
         },
         {
+            name: `[${label}-IN95] under manual, an INSERT OR REPLACE over a row inserted on this device that names another author is refused: rdb's row and author come back, the refusal is logged, and rdb gets no second row`,
+            invoke: async () => {
+                const { group, admin } = await createTypedGroup();
+                const other = await makeIdentity();
+                const { target, local, cleanup } = await nativeFactory();
+                if (local.replaceAt === undefined) { await cleanup?.(); return; }
+                try {
+                    await projectAs(group, target, admin, { author: 'manual' });
+                    const keys = target as unknown as KeyIndex;
+                    const adminId = (await keys.idForKeyHash(DEFAULT_KEY_DOMAIN, admin.keyId))!;
+                    const otherId = await keys.registerKey(DEFAULT_KEY_DOMAIN, other.keyId, serializePublicKeyToBase64(other.publicKey));
+                    const mine = await local.insert('things', { label: 'mine', author_key_id: adminId });
+                    await ingestChanges(group, target, { writer: admin, author: 'manual' });
+                    await local.replaceAt('things', mine, { label: 'replaced', author_key_id: otherId });
+                    const result = await ingestChanges(group, target, { writer: admin, author: 'manual' });
+                    assertEquals(`${result.accepted} ${result.rejected.length}`, '0 1', 'the replace is refused');
+                    assertEquals((await target.drainOpEvents()).filter((e) => e.event.direction === 'failure').length, 1, 'and logged');
+                    const row = await localRow(target, 'things', mine);
+                    assertEquals(`${row?.label} ${row?.author_key_id}`, `mine ${adminId}`, "rdb's row and author are back");
+                    const rows = await rdbRows(group, 'things');
+                    assertEquals(rows.map((r) => `${r.values.label} ${r.author}`).join(','), `mine ${admin.keyId}`, 'rdb has its one row');
+                    await assertAtCheckpoints(checkedOf(target), [{ group }], 'after the refused replace');
+                } finally {
+                    await cleanup?.();
+                }
+            },
+        },
+        {
             name: `[${label}-IN72] an insert that reuses a deleted row's id is refused: the row is removed and the mapping stays deleted`,
             invoke: async () => {
                 const { group, admin } = await createGroup();
                 await (await group.getTable('tags')).insert('g1', { code: 'old' }, admin);
                 const g1 = deriveRowId('g1', admin.keyId);
-                const { target, read, local, cleanup } = await factory();
+                const { target, read, local, cleanup } = await nativeFactory();
                 if (local.insertAt === undefined) { await cleanup?.(); return; }
                 try {
                     await projectAs(group, target, admin);
@@ -394,6 +425,8 @@ export function createChainCases(label: string, factory: IngestionFactory): Name
                     await local.insertAt('tags', localId, { code: 'reused' });
                     const result = await ingestChanges(group, target, { writer: admin });
                     assertEquals(`${result.accepted} ${result.rejected.length}`, '0 1', 'the insert is refused');
+                    assertEquals((await target.drainOpEvents()).filter((e) => e.event.direction === 'failure').length, 1,
+                        'and logged as a failure');
                     assertEquals(await localRow(target, 'tags', localId), undefined, 'its row is removed');
                     assertEquals((await target.resolveRow('tags', localId))?.status, 'deleted', 'the mapping stays deleted');
                     assertEquals((await target.drainChanges()).changes.length, 0, 'the outbox is empty');
@@ -408,7 +441,7 @@ export function createChainCases(label: string, factory: IngestionFactory): Name
             name: `[${label}-IN73] an insert, a delete and an insert of one local id in one pass: the second insert is refused, and the mapping ends deleted`,
             invoke: async () => {
                 const { group, admin } = await createGroup();
-                const { target, local, cleanup } = await factory();
+                const { target, local, cleanup } = await nativeFactory();
                 if (local.insertAt === undefined) { await cleanup?.(); return; }
                 try {
                     await projectAs(group, target, admin);
@@ -627,7 +660,7 @@ export function createChainCases(label: string, factory: IngestionFactory): Name
             invoke: async () => {
                 const run = async (mode: 'two passes' | 'one pass' | 'crash'): Promise<void> => {
                     const { group, admin } = await createFkGroup();
-                    const { target, local, cleanup } = await factory();
+                    const { target, local, cleanup } = await nativeFactory();
                     try {
                         if (mode === 'two passes' ? local.insertAt === undefined : local.replaceAt === undefined) return;
                         await projectAs(group, target, admin);
@@ -661,7 +694,7 @@ export function createChainCases(label: string, factory: IngestionFactory): Name
                 const { group, admin } = await createTypedGroup();
                 await (await group.getTable('things')).insert('t1', { label: 'rdb', code: 'c1' }, admin);
                 const t1 = deriveRowId('t1', admin.keyId);
-                const { target, read, local, cleanup } = await factory();
+                const { target, read, local, cleanup } = await nativeFactory();
                 if (local.replaceAt === undefined && local.insertAt === undefined) { await cleanup?.(); return; }
                 try {
                     await projectAs(group, target, admin);
@@ -1036,7 +1069,7 @@ export function createChainCases(label: string, factory: IngestionFactory): Name
             },
         },
         {
-            name: `[${label}-IN70] a permission written natively and used right away in another group: the use is accepted in the same pass`,
+            name: `[${label}-IN70] a permission written locally and used right away in another group: the use is accepted in the same pass`,
             invoke: async () => {
                 const ci = await createCapsItems();
                 const members = [ci.perm, ci.items].map((group) => ({ group, config: { writer: ci.admin } }));

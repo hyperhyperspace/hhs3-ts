@@ -18,7 +18,7 @@
 // A single-flight guard (plus the per-database lock inside syncDatabase) ensures
 // cycles never overlap; a trigger during a run schedules exactly one more.
 
-import type { B64Hash, KeyId, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
+import { keyIdFromPublicKey, type B64Hash, type KeyId, type OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import type { Version, RContext } from "@hyper-hyper-space/hhs3_mvt";
 import type { RBlobStore, RDb, RFileMap, RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 import { PreparedHashMismatchError } from "@hyper-hyper-space/hhs3_rdb";
@@ -30,7 +30,7 @@ import {
     isWriterRecordStore, type AuthorSetting,
     isTableNameIndex, isWritableTarget, type RowIdentityIndex, type RowWriter,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
-import { serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
+import { deserializePublicKeyFromBase64, serializePublicKeyToBase64, validateKey } from "@hyper-hyper-space/hhs3_mvt";
 
 import { buildScope, resolveMemberGroups, GroupConfigOverride } from "./scope.js";
 import type { FileDirectory } from "./files/directory.js";
@@ -419,7 +419,16 @@ export class RdbProjection {
 
     // Get-or-allocate a key id for (keyHash, publicKey). Public key is
     // mandatory — required for ingest self-certification of identity rows.
+    // The key must be well formed (validateKey), and keyHash its hash under
+    // the replica's hash suite; otherwise this throws and stores nothing
+    // (HIP-20's Row identity).
     async registerKey(keyHash: string, publicKey: string, domain: string = DEFAULT_KEY_DOMAIN): Promise<number> {
+        const valid = validateKey(publicKey);
+        if (!valid.valid) throw new Error(`registerKey: not a public key: ${valid.why.reason}`);
+        const suite = this.ctx.getHashSuite();
+        if (keyIdFromPublicKey(deserializePublicKeyFromBase64(publicKey), suite) !== keyHash) {
+            throw new Error(`registerKey: ${keyHash} isn't the key's hash under the replica's hash suite, ${suite.name}`);
+        }
         return this.requireKeys().registerKey(domain, keyHash, publicKey);
     }
 

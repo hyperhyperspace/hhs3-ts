@@ -2,7 +2,7 @@
 // calls go through the running projection, so they need the host started.
 
 import { keyIdFromPublicKey } from "@hyper-hyper-space/hhs3_crypto";
-import { deserializePublicKeyFromBase64 } from "@hyper-hyper-space/hhs3_mvt";
+import { deserializePublicKeyFromBase64, validateKey } from "@hyper-hyper-space/hhs3_mvt";
 import type { StoredOpEvent } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import type { RdbProjection } from "@hyper-hyper-space/hhs3_rdb_projection";
 import type { ClientEvent, ClientEvents, ClientKey, ClientStatus, RhostClient } from "@hyper-hyper-space/hhs3_rhost_client";
@@ -36,6 +36,14 @@ export function inProcessClient(host: Host): RhostClient {
         const projection = host.projection;
         if (projection === undefined) throw new Error(`host '${host.name}' is not running`);
         return projection;
+    };
+
+    // A public key's hash under the replica's hash suite, once validateKey
+    // accepts the key (HIP-20's Row identity).
+    const keyHashOf = (publicKey: string): string => {
+        const valid = validateKey(publicKey);
+        if (!valid.valid) throw new Error(`not a public key: ${valid.why.reason}`);
+        return keyIdFromPublicKey(deserializePublicKeyFromBase64(publicKey), host.runtime.workspace.replica.getHashSuite());
     };
 
     const track = (unsubscribe: () => void): (() => void) => {
@@ -86,8 +94,10 @@ export function inProcessClient(host: Host): RhostClient {
             return { label, keyId, publicKey, id };
         },
         async registerKey(publicKey: string): Promise<number> {
-            const keyId = keyIdFromPublicKey(deserializePublicKeyFromBase64(publicKey), host.runtime.workspace.replica.getHashSuite());
-            return requireProjection().registerKey(keyId, publicKey);
+            return requireProjection().registerKey(keyHashOf(publicKey), publicKey);
+        },
+        async lookupKey(publicKey: string): Promise<number | undefined> {
+            return requireProjection().idForKeyHash(keyHashOf(publicKey));
         },
         events,
         async status(): Promise<ClientStatus> {

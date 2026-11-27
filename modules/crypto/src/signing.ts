@@ -10,9 +10,16 @@ export interface SigningSuite {
     generateKeyPair(): Promise<{ publicKey: Uint8Array; secretKey: Uint8Array }>;
     sign(message: Uint8Array, secretKey: Uint8Array): Promise<Uint8Array>;
     verify(message: Uint8Array, signature: Uint8Array, publicKey: Uint8Array): Promise<boolean>;
+    // What is wrong with `key` as a raw public key of this suite, or undefined
+    // when it is one.
+    publicKeyProblem(key: Uint8Array): string | undefined;
     readonly publicKeySize: number;
     readonly secretKeySize: number;
     readonly signatureSize: number;
+}
+
+function lengthProblem(suite: string, key: Uint8Array, size: number): string | undefined {
+    return key.length === size ? undefined : `the key is ${key.length} bytes, where an ${suite} public key is ${size}`;
 }
 
 export const ed25519: SigningSuite = {
@@ -29,6 +36,24 @@ export const ed25519: SigningSuite = {
 
     async sign(message: Uint8Array, secretKey: Uint8Array): Promise<Uint8Array> {
         return nobleEd25519.sign(message, secretKey);
+    },
+
+    // The bytes must decode, by the strict rules, to a point of the curve
+    // that isn't of small order. A key pair makes only points of prime order.
+    // A point with a small-order part beside its prime-order one passes: the
+    // cofactored check in verify ignores that part, so it verifies only what
+    // its prime-order part does.
+    publicKeyProblem(key: Uint8Array): string | undefined {
+        const length = lengthProblem('ed25519', key, 32);
+        if (length !== undefined) return length;
+        let point;
+        try {
+            point = nobleEd25519.Point.fromBytes(key, false);
+        } catch {
+            return 'the key is not a point of the ed25519 curve';
+        }
+        if (point.isSmallOrder()) return "the key is one of the ed25519 curve's small-order points, which no key pair makes";
+        return undefined;
     },
 
     // Strict RFC 8032 verification. noble's default for Ed25519 is ZIP-215,
@@ -53,6 +78,12 @@ export const mlDsa65: SigningSuite = {
 
     async generateKeyPair() {
         return ml_dsa65.keygen();
+    },
+
+    // FIPS 204 decodes any string of the right length as a public key, so
+    // the length is the whole check.
+    publicKeyProblem(key: Uint8Array): string | undefined {
+        return lengthProblem('ml-dsa-65', key, 1952);
     },
 
     async sign(message: Uint8Array, secretKey: Uint8Array): Promise<Uint8Array> {
@@ -92,6 +123,15 @@ export const ed25519_mlDsa65: SigningSuite = {
             publicKey: concatBytes(classical.publicKey, pq.publicKey),
             secretKey: concatBytes(classical.secretKey, pq.secretKey),
         };
+    },
+
+    publicKeyProblem(key: Uint8Array): string | undefined {
+        const length = lengthProblem('ed25519+ml-dsa-65', key, ed25519.publicKeySize + mlDsa65.publicKeySize);
+        if (length !== undefined) return length;
+        const classical = ed25519.publicKeyProblem(key.subarray(0, ed25519.publicKeySize));
+        if (classical !== undefined) return `its ed25519 half: ${classical}`;
+        const pq = mlDsa65.publicKeyProblem(key.subarray(ed25519.publicKeySize));
+        return pq === undefined ? undefined : `its ml-dsa-65 half: ${pq}`;
     },
 
     async sign(message: Uint8Array, secretKey: Uint8Array): Promise<Uint8Array> {

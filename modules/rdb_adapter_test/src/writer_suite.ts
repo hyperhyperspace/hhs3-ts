@@ -4,8 +4,11 @@
 // their schema names, as the ingestion suites project them.
 
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
-import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
-import { deriveRowId, type Row } from "@hyper-hyper-space/hhs3_rdb";
+import {
+    createBasicCrypto, createIdentity, HASH_BLAKE3, keyIdFromPublicKey, sha256, SIGNING_ED25519, SIGNING_ED25519_ML_DSA_65, SIGNING_ML_DSA_65,
+    type OwnIdentity, type PublicKey,
+} from "@hyper-hyper-space/hhs3_crypto";
+import { deriveRowId, type Row, type RTableGroup } from "@hyper-hyper-space/hhs3_rdb";
 import { serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 import {
     DEFAULT_KEY_DOMAIN, ingestChanges, isWritableTarget, keyValue, projectGroup, QueryEngine, WriteRefusedError,
@@ -15,9 +18,13 @@ import {
 
 import { createAnonymousGroup, createGatedGroup, createTypedGroup, makeIdentity, type GroupFixture } from "./group_fixture.js";
 import type { IngestionFactory, IngestionHarness } from "./ingestion_suite.js";
-import { localRow, rdbRows, recordWriter, rowOps } from "./ingestion_helpers.js";
+import { CrashBeforeSettle, localRow, rdbRows, recordWriter, rowOps } from "./ingestion_helpers.js";
 
 type NamedTest = { name: string; invoke: () => Promise<void> };
+
+function fromHex(hex: string): Uint8Array {
+    return Uint8Array.from(hex.match(/../g)!.map((byte) => parseInt(byte, 16)));
+}
 
 // A target with no capture, for the writers that can't replicate.
 export type BareTargetFactory = () => { target: BidirectionalTarget; cleanup?: () => void | Promise<void> }
@@ -43,13 +50,13 @@ type Bench = {
 
 async function bench(
     factory: IngestionFactory, fixture: GroupFixture, author: AuthorSetting = 'auto',
-    opts: { key?: boolean; config?: AdapterConfig } = {},
+    opts: { key?: boolean; config?: AdapterConfig; hashSuite?: string } = {},
 ): Promise<Bench> {
     const harness = await factory();
     const target = harness.target;
     const config: AdapterConfig = { ...opts.config, author };
     await projectGroup(fixture.group, target, config);
-    const keyId = await recordWriter(target, author, opts.key === false ? undefined : fixture.admin);
+    const keyId = await recordWriter(target, author, opts.key === false ? undefined : fixture.admin, opts.hashSuite);
     let commits = 0;
     (target as unknown as ReactiveChangeTarget).addCommitListener((e) => { if (e.source === 'local') commits++; });
     const writer = (target as unknown as WritableTarget).openWriter();
@@ -67,6 +74,17 @@ async function secondDevice(factory: IngestionFactory, fixture: GroupFixture, co
     const harness = await factory();
     await projectGroup(fixture.group, harness.target, config);
     return harness;
+}
+
+// Each insert op of `table` the group holds, by its label, with the key its
+// entry is signed by, or undefined for an anonymous one.
+async function insertSigners(group: RTableGroup, table: string): Promise<Map<string, string | undefined>> {
+    const signers = new Map<string, string | undefined>();
+    for await (const entry of (await group.getScopedDag()).loadAllEntries()) {
+        const p = entry.payload as { action?: string; table?: string; op?: { action?: string; author?: string; values?: { label?: unknown } } };
+        if (p.action === 'row' && p.table === table && p.op?.action === 'insert') signers.set(String(p.op.values?.label), p.op.author);
+    }
+    return signers;
 }
 
 // What a refused write gives: its reason, or what happened instead.
@@ -634,6 +652,114 @@ export function createWriterSuite(label: string, factory: IngestionFactory, bare
                         'a table a schema change adds is named the same way');
                     const id = await b.writer.insert((await engine.source.tableNames('my-chat')).later!, { note: 'x' });
                     assertTrue(id > 0, 'and takes writes');
+                } finally {
+                    await b.cleanup();
+                }
+            },
+        },
+        {
+            name: `[${label}-WR20] a { pk } holding an ed25519 key off the curve or of small order is refused, alone and as a hybrid's classical half, and leaves the key table as it was`,
+            invoke: async () => {
+                const fixture = await createTypedGroup();
+                const b = await bench(factory, fixture);
+                try {
+                    const keys = b.target as unknown as KeyIndex;
+                    const owner = (pk: PublicKey) => b.writer.insert('things', { label: 'a', owner_key_id: keyValue(pk) });
+                    const ed25519 = (hex: string): PublicKey => ({ suite: SIGNING_ED25519, key: fromHex(hex) });
+                    const offCurve = ed25519('02' + '00'.repeat(31));
+                    const neutral = ed25519('01' + '00'.repeat(31));
+                    const orderTwo = ed25519('ec' + 'ff'.repeat(30) + '7f');
+                    const { publicKey: pq } = await createIdentity(SIGNING_ML_DSA_65, sha256);
+                    const hybridKey = new Uint8Array(neutral.key.length + pq.key.length);
+                    hybridKey.set(neutral.key, 0);
+                    hybridKey.set(pq.key, neutral.key.length);
+                    const hybrid: PublicKey = { suite: SIGNING_ED25519_ML_DSA_65, key: hybridKey };
+                    const before = b.commits();
+                    for (const [pk, what] of [
+                        [offCurve, 'an ed25519 key off the curve'], [neutral, 'the neutral point'], [orderTwo, 'the point of order two'],
+                        [hybrid, 'a hybrid key with a small-order classical half'],
+                    ] as const) {
+                        assertEquals(await refusal(owner(pk)), 'invalid-key', what);
+                        assertEquals(await keys.idForKeyHash(DEFAULT_KEY_DOMAIN, keyIdFromPublicKey(pk, sha256)), undefined, `${what} isn't interned`);
+                    }
+                    assertEquals(b.commits(), before, 'and nothing is written');
+                } finally {
+                    await b.cleanup();
+                }
+            },
+        },
+        {
+            name: `[${label}-WR21] on a BLAKE3 replica, a { pk } is interned under BLAKE3's key hash, which its op carries, and rdb accepts an identity-provider row written with one`,
+            invoke: async () => {
+                const blake3 = createBasicCrypto().hash(HASH_BLAKE3);
+                const fixture = await createTypedGroup({ hashSuite: blake3 });
+                const b = await bench(factory, fixture, 'auto', { hashSuite: HASH_BLAKE3 });
+                try {
+                    const other = await makeIdentity(blake3);
+                    const pk = keyValue(other.publicKey);
+                    const providerId = await b.writer.insert('identities', { key_id: pk, name: 'other' });
+                    const keyId = (await localRow(b.target, 'identities', providerId))?.key_id as number;
+                    const blake3Hash = keyIdFromPublicKey(other.publicKey, blake3);
+                    assertTrue(blake3Hash !== keyIdFromPublicKey(other.publicKey, sha256), "the fixture's two hashes differ");
+                    assertEquals(await (b.target as unknown as KeyIndex).keyHashForId(DEFAULT_KEY_DOMAIN, keyId), blake3Hash,
+                        "the key is interned under BLAKE3's hash, the one rdb computes");
+                    await b.writer.insert('things', { label: 'a', owner_key_id: pk });
+                    const result = await b.ingest();
+                    assertTrue(result.accepted === 2 && result.rejected.length === 0, `both land: ${JSON.stringify(result.rejected)}`);
+                    const provider = (await rdbRows(fixture.group, 'identities')).find((r) => r.values.name === 'other');
+                    assertEquals(provider?.values.keyId, blake3Hash, 'rdb accepts the identity-provider row, which it checks against the key');
+                    assertEquals((await rdbRows(fixture.group, 'things'))[0]?.values.owner, blake3Hash, 'and the key column carries the BLAKE3 hash');
+                } finally {
+                    await b.cleanup();
+                }
+            },
+        },
+        {
+            name: `[${label}-WR22] under manual, an insert and its delete, both written before ingestion, sign the insert as its author column said`,
+            invoke: async () => {
+                const fixture = await createTypedGroup();
+                const b = await bench(factory, fixture, 'manual');
+                try {
+                    const keyId = await b.writer.writerKeyId();
+                    const signed = await b.writer.insert('things', { label: 'signed', author_key_id: keyId });
+                    const anonymous = await b.writer.insert('things', { label: 'anonymous' });
+                    assertTrue(await b.writer.delete('things', signed), 'the signed row is deleted');
+                    assertTrue(await b.writer.delete('things', anonymous), 'and so is the anonymous one');
+                    const result = await b.ingest();
+                    assertTrue(result.accepted === 4 && result.rejected.length === 0, `all four land: ${JSON.stringify(result.rejected)}`);
+                    assertEquals((await rdbRows(fixture.group, 'things')).length, 0, 'rdb has neither row');
+                    const signers = await insertSigners(fixture.group, 'things');
+                    assertEquals(signers.get('signed'), fixture.admin.keyId, 'the insert that named the writer key is signed with it');
+                    assertTrue(signers.has('anonymous') && signers.get('anonymous') === undefined, 'and the one that named none is anonymous');
+                } finally {
+                    await b.cleanup();
+                }
+            },
+        },
+        {
+            name: `[${label}-WR23] under manual, after a crash between the append and the settle, an insert already appended keeps its signer and its row hash`,
+            invoke: async () => {
+                const fixture = await createTypedGroup();
+                const b = await bench(factory, fixture, 'manual');
+                try {
+                    const keyId = await b.writer.writerKeyId();
+                    const ids = {
+                        signed: await b.writer.insert('things', { label: 'signed', author_key_id: keyId }),
+                        anonymous: await b.writer.insert('things', { label: 'anonymous' }),
+                    };
+                    const config: AdapterConfig = { author: 'manual', writer: fixture.admin };
+                    const first = await ingestChanges(fixture.group, new CrashBeforeSettle(b.target), config);
+                    assertEquals(first.accepted, 2, 'both were appended before the crash');
+                    const second = await b.ingest();
+                    assertEquals(second.rejected.length, 0, 'the next cycle settles them, refusing neither');
+                    const rows = await rdbRows(fixture.group, 'things');
+                    for (const [name, author] of [['signed', fixture.admin.keyId], ['anonymous', undefined]] as const) {
+                        const row = rows.find((r) => r.values.label === name);
+                        assertEquals(row?.author, author, `the ${name} insert keeps its signer`);
+                        assertEquals((await b.target.resolveRow('things', ids[name]))?.rowId, row?.rowId,
+                            `and its local row maps to the row hash that signer derives`);
+                    }
+                    assertEquals(rows.length, 2, 'and rdb has no second copy of either');
                 } finally {
                     await b.cleanup();
                 }

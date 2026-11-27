@@ -108,9 +108,11 @@ A host's key is unlocked once per app, by key id: relabeling it in the keystore 
 `host.client` is the [rhost_client](../rhost_client) interface in process:
 
 - `status()` and `watchStatus(listener)` come from the host.
-- `me()` is the key `host.json` records; its `id` and `registerKey(publicKey)` and `events` go through the running projection, and fail while it is stopped.
+- `me()` is the key `host.json` records; its `id`, `registerKey(publicKey)`, `lookupKey(publicKey)` and `events` go through the running projection, and fail while it is stopped. `registerKey` and `lookupKey` hash a key with the replica's hash suite and refuse a malformed one, as [rhost_client](../rhost_client) describes.
 
 `host.onCommit(listener)` subscribes in-process to the running projection's `TargetCommitEvent`s (`local`, `apply`, `settle`).
+
+`host.projection` is the running projection, and `host.projection.openWriter()` its writer: the `RowWriter` of [rdb_adapter's Writing](../rdb_adapter#writing), under the host's `projection.author` setting.
 
 `serveClient(host, connection)` answers the same protocol over any line-based `Connection`. The platform's `listen` hands it each connection. The protocol is read-only: `status`, `watchStatus`, `watchCommits`, and `unwatch`, and nothing that signs. If `connection.send` returns `false` or throws, `serveClient` drops the connection's watches so a slow or disconnected client cannot accumulate buffered events.
 
@@ -298,4 +300,4 @@ npm test
 
 The tests run on the catalog in [`examples/editor.sql`](../rdb/examples/editor.sql), released at 1.0.0, 1.1.0 and 2.0.0, over a memory platform and a shared in-memory mesh. A 1.1.0 that declares `:moderator` drives the param hold, one that adds `FILES media` drives the two-host mount test, on `MemoryDirectory` folders, and one that adds a group drives the allow-list test for a group added after the database was created.
 
-**HIPs:** [2](../../hips/0002-rpack-rhost.md), [5](../../hips/0005-reactive-queries.md), [23](../../hips/0023-join-bootstrap.md), [29](../../hips/0029-checkpoint-consistency.md)
+**HIPs:** [2](../../hips/0002-rpack-rhost.md), [5](../../hips/0005-reactive-queries.md), [20](../../hips/0020-unified-write-api.md), [23](../../hips/0023-join-bootstrap.md), [29](../../hips/0029-checkpoint-consistency.md)

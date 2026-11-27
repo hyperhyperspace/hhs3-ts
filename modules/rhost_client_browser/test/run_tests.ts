@@ -245,6 +245,35 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
             }
         },
     },
+    {
+        name: "[RHOST_CLIENT_BROWSER03] lookupKey gives a key's id without storing it, or undefined, with the recorded suite, BLAKE3 too; it and registerKey throw on a malformed key and store nothing, and lookupKey throws on a projection with no writer record",
+        invoke: async () => {
+            const app = `lookup-${Date.now()}`;
+            const target = await IdbTarget.open(browserProjectionDatabase(app, 'default'), { captureChanges: true });
+            const client = openClient(app, 'default');
+            try {
+                const identity = await createIdentity(SIGNING_ED25519, hashSuite);
+                const pk = serializePublicKeyToBase64(identity.publicKey);
+                const blake3Hash = keyIdFromPublicKey(identity.publicKey, createBasicCrypto().hash(HASH_BLAKE3));
+                await rejects(() => client.lookupKey(pk), 'writer record', 'without a writer record lookupKey throws, naming it');
+                await target.recordWriter({ hashSuite: HASH_BLAKE3, author: 'auto' });
+                assertEquals(await client.lookupKey(pk), undefined, "a key the projection doesn't have gives undefined");
+                assertEquals(await target.idForKeyHash('default', blake3Hash), undefined, 'and lookupKey stores nothing');
+                const id = await client.registerKey(pk);
+                assertEquals(await client.lookupKey(pk), id, 'a key it has gives the id registerKey gave, under the BLAKE3 hash');
+
+                const neutral = serializePublicKeyToBase64({ suite: SIGNING_ED25519, key: Uint8Array.from({ length: 32 }, (_, i) => (i === 0 ? 1 : 0)) });
+                for (const [bad, what] of [['not a key', 'a bare word'], [neutral, 'a small-order ed25519 key']] as const) {
+                    await rejects(() => client.registerKey(bad), 'not a public key', `registerKey throws on ${what}`);
+                    await rejects(() => client.lookupKey(bad), 'not a public key', `and so does lookupKey`);
+                }
+                assertEquals(await target.keyHashForId('default', id + 1), undefined, 'and neither stores a key');
+            } finally {
+                await client.close();
+                target.close();
+            }
+        },
+    },
 ];
 
 async function main() {

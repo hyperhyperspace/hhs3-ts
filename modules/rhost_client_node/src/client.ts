@@ -15,7 +15,7 @@ import { basename, join, resolve } from "node:path";
 import Database from "better-sqlite3";
 
 import { getHashSuite, keyIdFromPublicKey, type HashSuite } from "@hyper-hyper-space/hhs3_crypto";
-import { deserializePublicKeyFromBase64 } from "@hyper-hyper-space/hhs3_mvt";
+import { deserializePublicKeyFromBase64, validateKey } from "@hyper-hyper-space/hhs3_mvt";
 import {
     LineDecoder, decodeServerMessage, encodeMessage, socketPathFor,
     type ClientEvent, type ClientEvents, type ClientKey, type ClientStatus, type HostStatus,
@@ -185,10 +185,14 @@ export function openClient(hostDir: string, options: OpenClientOptions = {}): No
     const hasEvents = (): boolean =>
         (db !== undefined || existsSync(projectionFile())) && hasTable(EVENT_TABLE);
 
+    const requireKeyTable = (): void => {
+        if (!hasTable(KEY_TABLE)) throw new Error(`host '${basename(dir)}' has no key table yet; start it once`);
+    };
+
     // The same interning as the projection's target: the existing id, or the
     // next one, in one immediate transaction so another writer can't race it.
     const intern = (keyId: string, publicKey: string): number => {
-        if (!hasTable(KEY_TABLE)) throw new Error(`host '${basename(dir)}' has no key table yet; start it once`);
+        requireKeyTable();
         const run = database().transaction(() => {
             const existing = database().prepare(`SELECT id, public_key AS pk FROM ${KEY_TABLE} WHERE key_hash = ?`)
                 .get(keyId) as { id: number; pk: string | null } | undefined;
@@ -220,6 +224,14 @@ export function openClient(hostDir: string, options: OpenClientOptions = {}): No
         const suite = getHashSuite(row.hash_suite);
         if (suite === undefined) throw new Error(`the projection's writer record names the hash suite '${row.hash_suite}', which isn't registered`);
         return suite;
+    };
+
+    // A public key's hash under the recorded suite, once validateKey accepts
+    // the key (HIP-20's Row identity).
+    const keyHashOf = (publicKey: string): string => {
+        const valid = validateKey(publicKey);
+        if (!valid.valid) throw new Error(`not a public key: ${valid.why.reason}`);
+        return keyIdFromPublicKey(deserializePublicKeyFromBase64(publicKey), recordedHashSuite());
     };
 
     const eventsAfter = (afterId: number, limit?: number): ClientEvent[] => {
@@ -276,7 +288,13 @@ export function openClient(hostDir: string, options: OpenClientOptions = {}): No
             return { ...key, id: intern(key.keyId, key.publicKey) };
         },
         async registerKey(publicKey: string): Promise<number> {
-            return intern(keyIdFromPublicKey(deserializePublicKeyFromBase64(publicKey), recordedHashSuite()), publicKey);
+            return intern(keyHashOf(publicKey), publicKey);
+        },
+        async lookupKey(publicKey: string): Promise<number | undefined> {
+            const keyHash = keyHashOf(publicKey);
+            requireKeyTable();
+            const row = database().prepare(`SELECT id FROM ${KEY_TABLE} WHERE key_hash = ?`).get(keyHash) as { id: number } | undefined;
+            return row?.id;
         },
         events,
         async status(): Promise<ClientStatus> {

@@ -8,6 +8,7 @@ The interface an app programs against to talk to an [rhost](../rhost) host, and 
 interface RhostClient {
     me(): Promise<ClientKey>;                        // { label, keyId, publicKey, id }
     registerKey(publicKey: string): Promise<number>; // an rdb_keys id, for key columns
+    lookupKey(publicKey: string): Promise<number | undefined>; // the same id, or undefined, storing nothing
     events: {
         since(afterId?: number, limit?: number): Promise<ClientEvent[]>;
         watch(listener: (events: ClientEvent[]) => void): () => void;
@@ -24,6 +25,7 @@ interface RhostClient {
   - While it runs, it adds `peers`, `bootstrapping` (`true` while a host that joined has not yet found its own key on the app's `allow` list, and so admits any peer; see rhost's [Allow lists](../rhost/README.md#allow-lists)), `files` (one `FilesMountStatus` per file mount: `mounted` with its file, missing and local-only counts and whether this key can write, or `pending`) and `lastError`.
   - `StoppedStatus` is what a client in another process knows of a host that isn't running: its name, database, catalog, and whether it was created here.
 - **`ClientEvent`** is a rejected local write, or a concurrent change that voided or reinstated one. It has the same fields as the projection's op-event log, plus its id.
+- **Keys.** `registerKey` interns a public key, the base64 of the serialized key, and gives its id in the key table. `lookupKey` gives that id without storing the key, or `undefined` when the projection doesn't have it, which no row names then: a binding that compares a public key with rows before it writes asks it first, and writes the key as a `{ pk }` ([Writing](../rdb_adapter#key-columns)). Both hash the key with the replica's hash suite, and both throw on a key that mvt's `validateKey` refuses, storing nothing. A form can call `validateKey` itself to say why a pasted key is refused.
 
 There are three implementations:
 
@@ -57,3 +59,5 @@ host -> client   { id, result }   { id, error }
 ```
 npm test
 ```
+
+**HIPs:** [20](../../hips/0020-unified-write-api.md), [23](../../hips/0023-join-bootstrap.md)

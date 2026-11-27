@@ -17,7 +17,7 @@ import {
     AdapterConfig, BidirectionalTarget, CapturedBatch, CapturedChange, CapturedChangeId, ChangeRecord, CheckpointMovedError, DEFAULT_KEY_DOMAIN, IngestSettle,
     ingestChanges, KeyIndex, MemoryTarget, OpEvent, OpEventQuery, PendingChangesError, projectGroup, QueryableTarget, RowAction,
     rowToUpsertAction,
-    SchemaAction, StoredOpEvent, SyncMapping, syncGroup, WriterRecordStore,
+    SchemaAction, StoredOpEvent, SyncMapping, syncGroup, WriterRecordStore, type RowWriter, type WritableTarget,
 } from "@hyper-hyper-space/hhs3_rdb_adapter";
 import { serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
 import { leaveEndsToNewCycles } from "@hyper-hyper-space/hhs3_rdb_adapter/testing";
@@ -112,7 +112,34 @@ export function createIngestionSuiteWithEndsInNewCycles(label: string, factory: 
     };
 }
 
-export function createIngestionSuite(label: string, factory: IngestionFactory): { title: string; tests: NamedTest[] } {
+// The suite's harness. `local` writes through the target's writer (HIP-20's
+// Changes 5), behind the mutator surface the cases call, and `native` is the
+// harness's own mutator: the target's native write paths, which the cases
+// about those paths take instead (nativeFactory).
+type SuiteHarness = Omit<IngestionHarness, 'reopen'> & { native: LocalMutator; reopen?: () => Promise<SuiteHarness> };
+
+function throughWriter(factory: IngestionFactory): () => Promise<SuiteHarness> {
+    const wrap = (h: IngestionHarness): SuiteHarness => {
+        let writer: RowWriter | undefined;
+        const w = (): RowWriter => (writer ??= (h.target as unknown as WritableTarget).openWriter());
+        const local: LocalMutator = {
+            // An author goes in the author column, as the writer takes it.
+            insert: (table, values, author) => w().insert(table, author === undefined ? values : { ...values, author_key_id: author }),
+            update: async (table, localId, values) => { await w().update(table, localId, values); },
+            delete: async (table, localId) => { await w().delete(table, localId); },
+            setCaptureEnabled: (on) => h.local.setCaptureEnabled(on),
+        };
+        const { reopen, ...rest } = h;
+        return { ...rest, local, native: h.local, ...(reopen !== undefined ? { reopen: async () => wrap(await reopen()) } : {}) };
+    };
+    return async () => wrap(await factory());
+}
+
+export function createIngestionSuite(label: string, nativeFactory: IngestionFactory): { title: string; tests: NamedTest[] } {
+    // Every case writes through the target's writer, except the cases about a
+    // native write path, which take nativeFactory: those paths stay, and these
+    // cases are their only coverage.
+    const factory = throughWriter(nativeFactory);
     return {
         title: `[${label}] rdb_adapter change-ingestion conformance`,
         tests: [
@@ -208,7 +235,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const { group, admin } = await createGroup();
                     await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', amount: '10.00' }, admin);
 
-                    const { target, local, cleanup } = await factory();
+                    const { target, local, cleanup } = await nativeFactory();
                     try {
                         await projectAs(group, target, admin);
 
@@ -762,7 +789,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     await (await group.getTable('notes')).insert('n1', { title: 'a' }, admin);
                     const n1 = deriveRowId('n1', admin.keyId);
 
-                    const { target, read, local, cleanup } = await factory();
+                    const { target, read, local, cleanup } = await nativeFactory();
                     try {
                         await projectAs(group, target, admin);
                         const localId = (await read.syncId('notes', n1))!;
@@ -808,7 +835,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                 name: `[${label}-IN25] a json value with a null inside it is refused before rdb sees it, logged, and the pass goes on`,
                 invoke: async () => {
                     const { group, admin } = await createTypedGroup();
-                    const { target, read, local, cleanup } = await factory();
+                    const { target, read, local, cleanup } = await nativeFactory();
                     try {
                         await projectAs(group, target, admin);
                         await local.insert('things', { label: 'bad', data: { a: null } as unknown as json.Literal });
@@ -834,7 +861,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const { group, admin } = await createGroup();
                     await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', amount: '10.00' }, admin);
                     const l1 = deriveRowId('l1', admin.keyId);
-                    const { target, read, local, cleanup } = await factory();
+                    const { target, read, local, cleanup } = await nativeFactory();
                     try {
                         await projectAs(group, target, admin);
                         const localId = (await read.syncId('ledger', l1))!;
@@ -857,7 +884,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const { group, admin } = await createGroup();
                     await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', amount: '10.00' }, admin);
                     const l1 = deriveRowId('l1', admin.keyId);
-                    const inner = await factory();
+                    const inner = await nativeFactory();
                     const target = new CrashBeforeSettle(inner.target);
                     try {
                         await projectAs(group, target, admin);
@@ -878,7 +905,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const { group, admin } = await createTypedGroup();
                     await (await group.getTable('things')).insert('t1', { label: 'a', code: 'c1', spec: { v: 1 } }, admin);
                     const t1 = deriveRowId('t1', admin.keyId);
-                    const { target, read, local, cleanup } = await factory();
+                    const { target, read, local, cleanup } = await nativeFactory();
                     try {
                         await projectAs(group, target, admin);
                         const localId = (await read.syncId('things', t1))!;
@@ -901,7 +928,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const { group, admin } = await createTypedGroup();
                     await (await group.getTable('things')).insert('t1', { label: 'a', note: 'n', flag: true, data: { x: 1 } }, admin);
                     const t1 = deriveRowId('t1', admin.keyId);
-                    const { target, read, local, cleanup } = await factory();
+                    const { target, read, local, cleanup } = await nativeFactory();
                     try {
                         await projectAs(group, target, admin);
                         const localId = (await read.syncId('things', t1))!;
@@ -922,7 +949,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                 invoke: async () => {
                     const { group, admin } = await createTypedGroup();
                     const other = await makeIdentity();
-                    const { target, read, local, cleanup } = await factory();
+                    const { target, read, local, cleanup } = await nativeFactory();
                     try {
                         await projectAs(group, target, admin);
                         const keys = target as unknown as KeyIndex;
@@ -945,7 +972,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                 name: `[${label}-IN31] a native insert that names the writer key, or no author, is signed with the writer key`,
                 invoke: async () => {
                     const { group, admin } = await createTypedGroup();
-                    const { target, local, cleanup } = await factory();
+                    const { target, local, cleanup } = await nativeFactory();
                     try {
                         await projectAs(group, target, admin);
                         const keys = target as unknown as KeyIndex;
@@ -969,7 +996,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     await (await group.getTable('things')).insert('t1', { label: 'a' }, admin);
                     const t1 = deriveRowId('t1', admin.keyId);
                     const other = await makeIdentity();
-                    const { target, read, local, cleanup } = await factory();
+                    const { target, read, local, cleanup } = await nativeFactory();
                     try {
                         await projectAs(group, target, admin);
                         const keys = target as unknown as KeyIndex;
@@ -994,15 +1021,15 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                 },
             },
             {
-                name: `[${label}-IN33] without an identity provider, a native insert that names a key is refused, and one that names none is anonymous`,
+                name: `[${label}-IN33] without an identity provider, a native insert that names a key, the writer key's or another, is refused, removed from the writing device and logged, and one that names none is anonymous`,
                 invoke: async () => {
                     const { group, admin } = await createAnonymousGroup();
-                    const { target, local, cleanup } = await factory();
+                    const { target, local, cleanup } = await nativeFactory();
                     try {
                         await projectAs(group, target, admin);
                         const keys = target as unknown as KeyIndex;
                         const adminId = await keys.registerKey(DEFAULT_KEY_DOMAIN, admin.keyId, serializePublicKeyToBase64(admin.publicKey));
-                        await local.insert('things', { label: 'named' }, adminId);
+                        const named = await local.insert('things', { label: 'named' }, adminId);
                         await local.insert('things', { label: 'unnamed' });
                         const result = await ingestChanges(group, target, { writer: admin });
                         assertEquals(result.accepted, 1, 'the unnamed insert lands');
@@ -1010,6 +1037,16 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                         const rows = await rdbRows(group, 'things');
                         assertEquals(rows.map((r) => r.values.label).join(','), 'unnamed', 'only the unnamed row is in rdb');
                         assertEquals(rows[0]?.author, undefined, 'and it is anonymous');
+                        const failures = async () => (await target.drainOpEvents()).filter((e) => e.event.direction === 'failure').length;
+                        assertEquals(await localRow(target, 'things', named), undefined, 'the refused row is removed from the writing device');
+                        assertEquals(await failures(), 1, 'and the refusal is logged');
+                        const other = await makeIdentity();
+                        const otherId = await keys.registerKey(DEFAULT_KEY_DOMAIN, other.keyId, serializePublicKeyToBase64(other.publicKey));
+                        const another = await local.insert('things', { label: 'another' }, otherId);
+                        const again = await ingestChanges(group, target, { writer: admin });
+                        assertEquals(`${again.accepted} ${again.rejected.length}`, '0 1', 'an insert naming another key is refused the same way');
+                        assertEquals(await localRow(target, 'things', another), undefined, 'removed');
+                        assertEquals(await failures(), 2, 'and logged beside the first');
                     } finally {
                         await cleanup?.();
                     }
@@ -1019,11 +1056,14 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                 name: `[${label}-IN34] a native insert gets the defaults of the columns it leaves out, in the row and the captured change; an explicit null stays NULL`,
                 invoke: async () => {
                     const { group, admin } = await createTypedGroup();
-                    const { target, read, local, cleanup } = await factory();
+                    const { target, read, local, cleanup } = await nativeFactory();
                     try {
                         await projectAs(group, target, admin);
-                        await local.insert('things', { label: 'left-out' });
-                        await local.insert('things', { label: 'nulled', kind: null });
+                        const leftOutId = await local.insert('things', { label: 'left-out' });
+                        const nulledId = await local.insert('things', { label: 'nulled', kind: null });
+                        const atOnce = await localRow(target, 'things', leftOutId);
+                        assertEquals(`${atOnce?.kind} ${atOnce?.level}`, 'std 1', 'the row reads the defaults it left out at once');
+                        assertEquals((await localRow(target, 'things', nulledId))?.kind ?? null, null, 'and NULL where the app wrote null');
                         const inserts = (await target.drainChanges()).changes.filter((c) => c.kind === 'insert');
                         const valuesOf = (labelValue: string) => inserts.map((c) => c.kind === 'insert' ? c.values : {})
                             .find((v) => v.label === labelValue)!;
@@ -1054,7 +1094,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const things = await group.getTable('things');
                     await things.insert('t1', { label: 'a' });
                     const t1 = deriveRowId('t1', undefined);
-                    const { target, read, local, cleanup } = await factory();
+                    const { target, read, local, cleanup } = await nativeFactory();
                     try {
                         await projectAs(group, target, admin);
                         const keys = target as unknown as KeyIndex;
@@ -1188,7 +1228,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const { group, admin } = await createGroup();
                     await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', memo: 'same', amount: '1.00' }, admin);
                     const l1 = deriveRowId('l1', admin.keyId);
-                    const { target, read, local, cleanup } = await factory();
+                    const { target, read, local, cleanup } = await nativeFactory();
                     try {
                         await projectAs(group, target, admin);
                         const localId = (await read.syncId('ledger', l1))!;
@@ -1216,7 +1256,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     };
 
                     const { group, admin } = await createGroup();
-                    let harness = await factory();
+                    let harness = await nativeFactory();
                     try {
                         await projectGroup(group, harness.target);
                         const keyId = await recordWriter(harness.target, 'auto', admin);
@@ -1227,7 +1267,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                         await harness.cleanup?.();
                     }
 
-                    harness = await factory();
+                    harness = await nativeFactory();
                     try {
                         await projectGroup(group, harness.target);
                         await recordWriter(harness.target, 'manual', admin);
@@ -1238,7 +1278,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     }
 
                     const anon = await createAnonymousGroup();
-                    harness = await factory();
+                    harness = await nativeFactory();
                     try {
                         await projectGroup(anon.group, harness.target);
                         await recordWriter(harness.target, 'auto', anon.admin);
@@ -1248,7 +1288,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                         await harness.cleanup?.();
                     }
 
-                    harness = await factory();
+                    harness = await nativeFactory();
                     try {
                         await projectGroup(group, harness.target);
                         const localId = await harness.local.insert('tags', { code: 'no record' });
@@ -1264,7 +1304,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     const { group, admin } = await createGroup();
                     await (await group.getTable('ledger')).insert('l1', { ref: 'R-1', amount: '1.00' }, admin);
                     const l1 = deriveRowId('l1', admin.keyId);
-                    const { target, read, local, cleanup } = await factory();
+                    const { target, read, local, cleanup } = await nativeFactory();
                     try {
                         await projectAs(group, target, admin);
                         const localId = (await read.syncId('ledger', l1))!;
@@ -1298,7 +1338,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                 name: `[${label}-IN42] an insert with an empty author column, captured while no writer key was recorded, is refused`,
                 invoke: async () => {
                     const { group, admin } = await createGroup();
-                    const { target, local, cleanup } = await factory();
+                    const { target, local, cleanup } = await nativeFactory();
                     try {
                         await projectGroup(group, target);
                         await recordWriter(target, 'auto');          // opened without a writer key
@@ -1318,7 +1358,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                 name: `[${label}-IN43] under manual a native insert that leaves the author empty is ingested anonymously, and one naming the writer key's id is signed; with no author column the writer key signs`,
                 invoke: async () => {
                     const { group, admin } = await createGroup();
-                    let harness = await factory();
+                    let harness = await nativeFactory();
                     try {
                         await projectGroup(group, harness.target, { author: 'manual' });
                         const keyId = await recordWriter(harness.target, 'manual', admin);
@@ -1337,7 +1377,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     }
 
                     const second = await createGroup();
-                    harness = await factory();
+                    harness = await nativeFactory();
                     try {
                         const config = { author: 'manual' as const, authorColumn: false as const };
                         await projectGroup(second.group, harness.target, config);
@@ -1364,7 +1404,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     };
                     const run = async (fixture: GroupFixture, table: string, anonymous: boolean): Promise<void> => {
                         const { schema, group, admin } = fixture;
-                        const harness = await factory();
+                        const harness = await nativeFactory();
                         try {
                             await projectGroup(group, harness.target);
                             const keyId = await recordWriter(harness.target, 'auto', admin);
@@ -1386,13 +1426,109 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                 },
             },
             {
+                name: `[${label}-IN91] under manual, as under auto, a native insert that names another key as its author is refused, reverted and logged, and a native update of the author column is refused and reverted`,
+                invoke: async () => {
+                    const { group, admin } = await createTypedGroup();
+                    await (await group.getTable('things')).insert('t1', { label: 'a' }, admin);
+                    const t1 = deriveRowId('t1', admin.keyId);
+                    const other = await makeIdentity();
+                    const { target, read, local, cleanup } = await nativeFactory();
+                    try {
+                        await projectGroup(group, target, { author: 'manual' });
+                        const adminId = (await recordWriter(target, 'manual', admin))!;
+                        const keys = target as unknown as KeyIndex;
+                        const otherId = await keys.registerKey(DEFAULT_KEY_DOMAIN, other.keyId, serializePublicKeyToBase64(other.publicKey));
+                        const inserted = await local.insert('things', { label: 'x' }, otherId);
+                        await local.update('things', (await read.syncId('things', t1))!, { author_key_id: otherId });
+                        const result = await ingestChanges(group, target, { writer: admin, author: 'manual' });
+                        assertEquals(`${result.accepted} ${result.rejected.length}`, '0 2', 'both are refused');
+                        assertEquals((await target.drainOpEvents()).filter((e) => e.event.direction === 'failure').length, 2, 'and logged');
+                        assertEquals((await rdbRows(group, 'things')).map((r) => `${r.values.label} ${r.author}`).join(','), `a ${admin.keyId}`,
+                            'rdb has only t1, with its author');
+                        assertEquals(await localRow(target, 'things', inserted), undefined, 'the inserted row is removed');
+                        assertEquals((await read.getRow('things', t1))?.author, adminId, "and t1's author is put back");
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN92] a native insert that sets the author column to NULL is signed with the writer key under auto, and anonymous under manual`,
+                invoke: async () => {
+                    for (const author of ['auto', 'manual'] as const) {
+                        const { group, admin } = await createTypedGroup();
+                        const { target, local, cleanup } = await nativeFactory();
+                        try {
+                            await projectGroup(group, target, { author });
+                            await recordWriter(target, author, admin);
+                            await local.insert('things', { label: 'nulled', author_key_id: null });
+                            const result = await ingestChanges(group, target, { writer: admin, author });
+                            assertEquals(`${result.accepted} ${result.rejected.length}`, '1 0', `under ${author} it lands`);
+                            assertEquals((await rdbRows(group, 'things'))[0]?.author, author === 'auto' ? admin.keyId : undefined,
+                                author === 'auto' ? 'signed with the writer key under auto' : 'anonymous under manual');
+                        } finally {
+                            await cleanup?.();
+                        }
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN93] a native insert that leaves a required column out: SQLite refuses it at the statement; memory and IndexedDB take it and show it, and ingestion refuses it, removes the row and logs it`,
+                invoke: async () => {
+                    const { group, admin } = await createTypedGroup();
+                    const { target, local, cleanup } = await nativeFactory();
+                    try {
+                        await projectAs(group, target, admin);
+                        let id: number | undefined;
+                        try {
+                            id = await local.insert('things', { kind: 'x' });
+                        } catch {
+                            // SQLite: the statement fails on the NOT NULL column
+                        }
+                        if (id === undefined) {
+                            assertEquals((await target.drainChanges()).changes.length, 0, 'the refused statement captures nothing');
+                            return;
+                        }
+                        assertEquals((await localRow(target, 'things', id))?.kind, 'x', 'the target shows the row');
+                        const result = await ingestChanges(group, target, { writer: admin });
+                        assertEquals(`${result.accepted} ${result.rejected.length}`, '0 1', 'ingestion refuses it');
+                        assertEquals(await localRow(target, 'things', id), undefined, 'and removes the row');
+                        assertEquals((await target.drainOpEvents()).filter((e) => e.event.direction === 'failure').length, 1, 'logging the refusal');
+                        assertEquals((await rdbRows(group, 'things')).length, 0, 'rdb has no row');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
+                name: `[${label}-IN94] a native update or delete of a row the table doesn't have captures nothing`,
+                invoke: async () => {
+                    const { group, admin } = await createGroup();
+                    const { target, local, cleanup } = await nativeFactory();
+                    try {
+                        await projectAs(group, target, admin);
+                        try {
+                            await local.update('tags', 987654, { code: 'x' });
+                        } catch {
+                            // the IndexedDB harness reads the record first and refuses a missing one; IndexedDB's patch of one is [ADPTI-11]'s
+                        }
+                        await local.delete('tags', 987654);
+                        assertEquals((await target.drainChanges()).changes.length, 0, 'nothing is captured');
+                        const result = await ingestChanges(group, target, { writer: admin });
+                        assertEquals(`${result.accepted} ${result.rejected.length}`, '0 0', 'and ingestion has nothing to do');
+                    } finally {
+                        await cleanup?.();
+                    }
+                },
+            },
+            {
                 name: `[${label}-IN44] a settle with a moved checkpoint throws and changes nothing; with the checkpoint it expects, it writes and moves it`,
                 invoke: async () => {
-                    const { group } = await createGroup();
+                    const { group, admin } = await createGroup();
                     const groupId = group.getId();
                     const { target, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         const cp = (await target.getCheckpoint(groupId))!;
                         const localId = await local.insert('tags', { code: 'x' });
                         const [change] = (await target.drainChanges()).changes;
@@ -1480,11 +1616,11 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
             {
                 name: `[${label}-IN47] writing each kind of record, and an end's observe beside a checkpoint, signals no change and moves no checkpoint`,
                 invoke: async () => {
-                    const { group } = await createGroup();
+                    const { group, admin } = await createGroup();
                     const groupId = group.getId();
                     const { target, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         const cp = (await target.getCheckpoint(groupId))!;
                         for (const code of ['a', 'b', 'c']) await local.insert('tags', { code });
                         const [c1, c2, c3] = (await target.drainChanges()).changes;
@@ -1555,11 +1691,11 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
             {
                 name: `[${label}-IN48] the settle stores the failure events of the handled rows, before its other events, and none of the rows it keeps`,
                 invoke: async () => {
-                    const { group } = await createGroup();
+                    const { group, admin } = await createGroup();
                     const groupId = group.getId();
                     const { target, local, cleanup } = await factory();
                     try {
-                        await projectGroup(group, target);
+                        await projectAs(group, target, admin);
                         await local.insert('tags', { code: 'a' });
                         await local.insert('tags', { code: 'b' });
                         const [c1, c2] = (await target.drainChanges()).changes;
@@ -1583,7 +1719,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     await ledger.insert('l1', { ref: 'R-1', amount: '10.00' }, admin);
                     await ledger.insert('l2', { ref: 'R-2', memo: 'two', amount: '2.00' }, admin);
 
-                    const { target, read, local, cleanup } = await factory();
+                    const { target, read, local, cleanup } = await nativeFactory();
                     try {
                         await projectAs(group, target, admin);
                         const checked = target as unknown as CheckedTarget;
@@ -1634,7 +1770,7 @@ export function createIngestionSuite(label: string, factory: IngestionFactory): 
                     }
                 },
             },
-            ...createChainCases(label, factory),
+            ...createChainCases(label, factory, nativeFactory),
         ],
     };
 }

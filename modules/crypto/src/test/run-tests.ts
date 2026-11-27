@@ -187,6 +187,43 @@ async function testEd25519SmallOrderKeys() {
         'a hybrid key with a small-order classical half verifies nothing, even with a valid post-quantum signature');
 }
 
+// ---- Public key checks ----
+
+// Each suite says whether raw bytes are a public key of that suite: the key
+// pairs it makes pass, and so does any 1952 bytes as an ML-DSA-65 key, which
+// FIPS 204 decodes whatever they hold. An Ed25519 key must decode to a point
+// of the curve, and not one of its 8 small-order points; the hybrid checks
+// both halves.
+async function testPublicKeyProblem() {
+    for (const suite of [ed25519, mlDsa65, ed25519_mlDsa65]) {
+        const { publicKey } = await suite.generateKeyPair();
+        testing.assertEquals(suite.publicKeyProblem(publicKey), undefined, `a ${suite.name} key pair's public key passes`);
+        testing.assertTrue(suite.publicKeyProblem(publicKey.subarray(0, publicKey.length - 1)) !== undefined,
+            `a ${suite.name} key a byte short is refused`);
+        const long = new Uint8Array(publicKey.length + 1);
+        long.set(publicKey, 0);
+        testing.assertTrue(suite.publicKeyProblem(long) !== undefined, `a ${suite.name} key a byte long is refused`);
+    }
+
+    const notAPoint = fromHex('0200000000000000000000000000000000000000000000000000000000000000');
+    testing.assertTrue(!nobleEd25519.utils.isValidPublicKey(notAPoint, false), 'the fixture is not a point of the curve');
+    testing.assertTrue(ed25519.publicKeyProblem(notAPoint) !== undefined, 'an ed25519 key that is not a point of the curve is refused');
+    for (const hex of ED25519_TORSION_SUBGROUP) {
+        testing.assertTrue(ed25519.publicKeyProblem(fromHex(hex)) !== undefined, `the small-order point ${hex} is refused`);
+    }
+
+    const pattern = Uint8Array.from({ length: mlDsa65.publicKeySize }, (_, i) => (i * 7) % 256);
+    testing.assertEquals(mlDsa65.publicKeyProblem(pattern), undefined, 'any 1952 bytes are an ml-dsa-65 key');
+
+    const { publicKey: pq } = await mlDsa65.generateKeyPair();
+    for (const classical of [notAPoint, fromHex(ED25519_TORSION_SUBGROUP[0]!)]) {
+        const hybrid = new Uint8Array(ed25519_mlDsa65.publicKeySize);
+        hybrid.set(classical, 0);
+        hybrid.set(pq, ed25519.publicKeySize);
+        testing.assertTrue(ed25519_mlDsa65.publicKeyProblem(hybrid) !== undefined, 'a hybrid key whose classical half is refused is refused');
+    }
+}
+
 // ---- Hybrid KEM component tampering ----
 
 async function testHybridKemTampering() {
@@ -394,6 +431,7 @@ const signingTests = {
         { name: '[SIGN_02] Hybrid Ed25519+ML-DSA-65 round-trip', invoke: () => testSigningRoundTrip(ed25519_mlDsa65) },
         { name: '[SIGN_03] Hybrid signing component tampering', invoke: testHybridSigningTampering },
         { name: '[SIGN_04] Ed25519 refuses small-order public keys, alone and in the hybrid', invoke: testEd25519SmallOrderKeys },
+        { name: '[SIGN_05] Each suite says whether bytes are one of its public keys', invoke: testPublicKeyProblem },
     ]
 };
 

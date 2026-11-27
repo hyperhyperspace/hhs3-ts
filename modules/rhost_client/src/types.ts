@@ -121,8 +121,13 @@ export interface ClientEvents {
 export interface RhostClient {
     me(): Promise<ClientKey>;
     // Interns a public key (base64 of the serialized key) in the projection's
-    // key table and returns its id.
+    // key table and returns its id. A key validateKey refuses throws, and
+    // nothing is stored.
     registerKey(publicKey: string): Promise<number>;
+    // The key's id in the projection's key table, or undefined when the
+    // projection doesn't have it, which no row names then. Stores nothing,
+    // and throws where registerKey throws.
+    lookupKey(publicKey: string): Promise<number | undefined>;
     readonly events: ClientEvents;
     status(): Promise<ClientStatus>;
     // Calls `listener` with a fresh status on every change; returns the

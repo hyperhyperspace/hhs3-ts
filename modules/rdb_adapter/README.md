@@ -29,7 +29,7 @@ The forward projection planner is universal, and should be usable without limita
 
 Change ingestion works at the data level only. Schema changes can only be performed directly on the **Rdb** instance, since the schema change logic imposes limitations that make concurrent state reconciliation in the face of schema updates more straightforward. The forward planner then applies schema changes safely on any projections.
 
-The projection replaces hash-based ids with database-native numeric ids, that also are used for foreign key dependencies when possible. The numeric ids are not inter-replica stable, and are meant for local usage. If the app needs to communicate off-replica, it sould use the hash-based row/key ids. They can be obtained by using the projection API (`projection.keyHashForId`, `projection.rowHashForLocalId`, etc.) or by directly inspecting the shadow tables that maintain sync state (not recommended).
+The projection replaces hash-based ids with database-native numeric ids, that also are used for foreign key dependencies when possible. The numeric ids are not inter-replica stable, and are meant for local usage. If the app needs to communicate off-replica, it sould use the hash-based row/key ids. They can be obtained through the query source (`rowHash(table, id)`, `localId(table, rowHash)`) and the projection (`projection.keyHashForId`) or by directly inspecting the shadow tables that maintain sync state (not recommended).
 
 ## Ingestion and checkpoints
 
@@ -43,9 +43,9 @@ Capture also fills in the author. When an insert leaves the author column empty,
 
 ### A pass
 
-Ingestion works from what the app saw. For each group it starts at the checkpoint, translates the group's changes with the schema there, and turns each change into one entry, in commit order: the plain row op the app wrote, the same entry a native write of it would make. The first entry of a group is appended at its checkpoint and each next one after the previous, so a pass builds a chain on top of the checkpoint. Nothing is bundled or merged. An insert that references a row inserted earlier in the pass finds it, since that row's entry comes first, and an update lands or is refused as a whole.
+Ingestion works from what the app saw. For each group it starts at the checkpoint, translates the group's changes with the schema there, and turns each change into one entry, in commit order: the plain row op the app wrote, the same entry a write of it straight to rdb would make. The first entry of a group is appended at its checkpoint and each next one after the previous, so a pass builds a chain on top of the checkpoint. Nothing is bundled or merged. An insert that references a row inserted earlier in the pass finds it, since that row's entry comes first, and an update lands or is refused as a whole.
 
-Groups that bind other groups need one more step. Before a change's entry, its group observes each group it binds whose chain grew in this pass, at that group's checkpoint plus its chain so far, joined with what it already observes (rdb only accepts an observe that extends the earlier ones). A permission written natively in one group and used right away in another reaches rdb in order this way: the permission's entry comes first, and the use reads it through the observe. An observe the gate would refuse, or one that would be void where it stands, is not written. While some observe of a gated binding is void, the group's entries are also checked through the live observes only, as their verdicts will read them, so a write that would be void from the start is refused rather than appended.
+Groups that bind other groups need one more step. Before a change's entry, its group observes each group it binds whose chain grew in this pass, at that group's checkpoint plus its chain so far, joined with what it already observes (rdb only accepts an observe that extends the earlier ones). A permission written locally in one group and used right away in another reaches rdb in order this way: the permission's entry comes first, and the use reads it through the observe. An observe the gate would refuse, or one that would be void where it stands, is not written. While some observe of a gated binding is void, the group's entries are also checked through the live observes only, as their verdicts will read them, so a write that would be void from the start is refused rather than appended.
 
 Remote changes that reached rdb after the checkpoint stay out of the pass. They are concurrent with the chain, and rdb resolves them against it when the next projection applies them.
 
@@ -315,6 +315,74 @@ A snapshot's `events` are the op-events about rows the query shows: local writes
 - **Never later.** A monitor starts at the op-event log's high-water mark and moves past every event it reads, whether the event concerned it or not. An event for a row off the page is not delivered when that row later scrolls into the page, and a monitor opened after an event never sees it. The log keeps every event for `opEvents({ afterId })`.
 - **Query sets.** A query set delivers once per pass, after every member that had to re-run has, and its snapshot carries the events of its members' deliveries in log order, each once even when two members show the same row. It carries the events of the deliveries made while it has a listener, and no earlier ones.
 
+## Writing
+
+`RowWriter` writes to a projection target in the names and value forms its queries return, and a write means the same on SQLite, IndexedDB and memory. Each call is one target transaction, which capture records as it records any local write, so ingestion takes it to rdb like the rest.
+
+```ts
+const w = projection.openWriter();
+const id = await w.insert('chat_messages', { channelId_id: 3, body: 'hi', author_key_id: await w.writerKeyId() });
+await w.update('chat_messages', id, { body: 'hi!' });             // false when the table has no such row
+await w.update('chat_channels', 3, formFields, { compare: true }); // only the fields that differ are written
+await w.delete('chat_messages', id);
+```
+
+**Where a writer comes from.** `RdbProjection.openWriter()`, which with rhost is `host.projection.openWriter()`; a query source whose target can write, such as `QueryEngine`'s, which `isWritableTarget(source)` tells apart; `openWriter()` on a target opened directly, as a client process opens one; and `useWriter()` in [rdb_react](../rdb_react). Opening a writer starts nothing and holds nothing: no transaction, no lock, no listener, and there is no `close()`. A writer reads what it checks against inside each call, so one opened before a schema change, or before the projection reopened with another `author` setting, follows it at its next write.
+
+### What a write means
+
+- **Values** are logical, in the forms a query returns for each column type. A column given `undefined` counts as not given.
+- **An insert** writes the columns it names. A column it leaves out reads its default, or NULL, and a `null` writes NULL, also where the column has a default ([NULL values](#null-values), rdb's [Nulls and defaults](../rdb#nulls-and-defaults)). It resolves to the new row's local id.
+- **An update** writes the columns it names, each a write even at the value the row already has: rdb resolves concurrent updates column by column, and a value wins over a concurrent NULL. With `{ compare: true }` it writes only the columns whose value differs from the row's, which is what a form that saves every field wants, and a field the user emptied, given as `null`, clears its column. The row's own id and author, as a query row spread into the update holds them, are set aside; any other value there is refused.
+- **An update or a delete of a missing row** writes nothing and resolves `false`.
+- **Readonly columns, foreign keys and rdb's rules** are checked by ingestion, as for any local write: a refused change is reverted and logged as an op event ([Reverts](#reverts)).
+
+### Key columns
+
+A key column takes a key id from the target's key table, or `{ pk }`: a public key, the base64 of the serialized key, which `keyValue(publicKey)` builds. The writer checks a `{ pk }` with mvt's `validateKey`: the signing suite it names must be registered, its bytes must be a key of that suite (an Ed25519 key a point of the curve that isn't one of its small-order points), and its base64 must be canonical. It hashes the key with the replica's hash suite, which the writer record holds, and interns it in the call's transaction once the write's checks pass. A bare string is refused, so text from a form is never taken for a key. In a json column a `{ pk }` is json like any other value.
+
+### Authorship
+
+In a group with an identity provider, the projection's `author` setting decides how an insert's author is chosen:
+
+| The insert gives, for the author column | `auto` (default) | `manual` |
+|---|---|---|
+| nothing | signed with the writer key | anonymous |
+| `writerKeyId()` | signed with the writer key | signed with the writer key |
+| `null` | refused | anonymous |
+| another key's id, or a `{ pk }` | refused | refused |
+
+`writerKeyId()` is the writer key's id in the key table: the value that means "signed", and the one a signed row reads back in its author column. In a group without an identity provider every insert is anonymous, and a key in the author column is refused. An update can't change a row's author. Native writes follow the same setting, applied by capture and ingestion ([What capture records](#what-capture-records)).
+
+### Refusals
+
+A write the writer can check is refused before anything is written, with a `WriteRefusedError` whose `reason` is one of these:
+
+| `reason` | When |
+|---|---|
+| `unknown-table`, `unknown-column` | the target has no such table or column |
+| `id-column` | an insert names the id column, or an update names another id |
+| `wrong-type` | a value of the wrong JSON type, a json value with a `null` inside it, or a bare string in a key column |
+| `invalid-key` | a key id the key table doesn't have, a `{ pk }` that `validateKey` refuses, or a `{ pk }` on a target with no writer record, whose hash suite is unknown |
+| `missing-required`, `not-null` | an insert that leaves out a column with no default that isn't nullable, or a `null` for a column that isn't nullable |
+| `author` | an author column at a value the setting doesn't allow |
+| `no-capture` | a target that doesn't capture, which `openWriter()` refuses, or one whose capture is switched off: the write would never reach rdb |
+| `no-writer-key` | a write to a group with an identity provider on a target where no projection has recorded a writer key, and `writerKeyId()` there |
+
+What only rdb can decide is refused later, at ingestion, as for a native write.
+
+### Several writes
+
+The writer offers no multi-row atomicity. Each call is its own transaction and becomes its own op, so a new member's identity row and their capability are two ops, and either can be refused alone. Writes that must land or fail together go to rdb directly ([Status and limitations](#status-and-limitations)).
+
+### Row identity and table names
+
+The query source has `rowHash(table, id)` and `localId(table, rowHash)`, rdb's id of a row and back. A row has no row hash until it is ingested. `tableNames(member)` gives a member group's projected table names, keyed by their names in the schema, from the tables' meta, so a binding never builds one by hand; a member with no projected tables gives `{}`.
+
+### Native writes
+
+SQL on SQLite, the IndexedDB facade and memory's `localInsert`, `localUpdate` and `localDelete` stay. Capture records them as it records a writer's call, and each target's README gives their own rules ([SQLite](../rdb_adapter_sqlite#capture), [IndexedDB](../rdb_adapter_idb#write)).
+
 ## Layout
 
 - `types.ts` — vocabulary + `MaterializationTarget` / `MaterializedChangeSource` / `ReactiveChangeTarget` / `QueryableTarget` / `ChangeSignalSource` / `AdapterConfig`.
@@ -388,4 +456,4 @@ node --import ../../register.mjs ./test/run_tests.ts --ops 40 --max-pairs 80
 
 `--profile`, `--seeds`, `--ops`, and `--max-pairs` override the profile's values; the profile itself can also be selected with the `PARITY_PROFILE` env var.
 
-**HIPs:** [3](../../hips/0003-schema-composability.md), [5](../../hips/0005-reactive-queries.md), [14](../../hips/0014-observer-frame-ref.md), [29](../../hips/0029-checkpoint-consistency.md)
+**HIPs:** [3](../../hips/0003-schema-composability.md), [5](../../hips/0005-reactive-queries.md), [14](../../hips/0014-observer-frame-ref.md), [20](../../hips/0020-unified-write-api.md), [29](../../hips/0029-checkpoint-consistency.md)

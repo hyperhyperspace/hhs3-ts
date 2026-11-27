@@ -255,7 +255,75 @@ const tests: { name: string; invoke: () => Promise<void> }[] = [
             }
         },
     },
+    {
+        name: "[RHOST_CLIENT_NODE05] lookupKey gives a key's id without storing it, or undefined, with the recorded suite, BLAKE3 too; it and registerKey throw on a malformed key and store nothing, and lookupKey throws on a projection with no writer record",
+        invoke: async () => {
+            const dir = await fs.mkdtemp(join(tmpdir(), 'rhost-cn-lookup-'));
+            const db = new Database(join(dir, 'projection.sqlite'));
+            try {
+                db.exec('CREATE TABLE rdb_keys (id INTEGER PRIMARY KEY, key_hash TEXT NOT NULL UNIQUE, public_key TEXT);'
+                    + 'CREATE TABLE rdb_writer_record (id INTEGER PRIMARY KEY CHECK (id = 1), writer_key_id INTEGER, hash_suite TEXT NOT NULL, author TEXT NOT NULL);');
+                const client = openClient(dir, { db });
+                const keys = () => (db.prepare('SELECT COUNT(*) AS n FROM rdb_keys').get() as { n: number }).n;
+                const pk = await newPublicKey();
+                assertTrue((await threw(client.lookupKey(pk))).includes('writer record'), 'without a writer record lookupKey throws, naming it');
+
+                db.prepare("INSERT INTO rdb_writer_record (id, hash_suite, author) VALUES (1, 'blake3', 'auto')").run();
+                assertEquals(await client.lookupKey(pk), undefined, "a key the projection doesn't have gives undefined");
+                assertEquals(keys(), 0, 'and lookupKey stores nothing');
+                const id = await client.registerKey(pk);
+                assertEquals(await client.lookupKey(pk), id, 'a key it has gives the id registerKey gave, under the BLAKE3 hash');
+
+                const neutral = serializePublicKeyToBase64({ suite: SIGNING_ED25519, key: Uint8Array.from({ length: 32 }, (_, i) => (i === 0 ? 1 : 0)) });
+                for (const [bad, what] of [['not a key', 'a bare word'], [neutral, 'a small-order ed25519 key']] as const) {
+                    assertTrue((await threw(client.registerKey(bad))) !== '', `registerKey throws on ${what}`);
+                    assertTrue((await threw(client.lookupKey(bad))) !== '', `and so does lookupKey`);
+                }
+                assertEquals(keys(), 1, 'and neither stores a key');
+            } finally {
+                db.close();
+                rmSync(dir, { recursive: true, force: true });
+            }
+        },
+    },
+    {
+        name: "[RHOST_CLIENT_NODE06] on a running host, the in-process client's lookupKey and registerKey agree with the file's, and both refuse a malformed key without storing it",
+        invoke: async () => {
+            await withRunningHost(async ({ hostDir, app }) => {
+                const host = await app.host('default');
+                const client = openClient(hostDir);
+                const file = new Database(projectionPath(hostDir), { readonly: true });
+                try {
+                    const keys = () => (file.prepare('SELECT COUNT(*) AS n FROM rdb_keys').get() as { n: number }).n;
+                    const pk = await newPublicKey();
+                    const before = keys();
+                    assertEquals(await host.client.lookupKey(pk), undefined, "the in-process client: a key the projection doesn't have");
+                    assertEquals(await client.lookupKey(pk), undefined, 'and the file client agrees');
+                    assertEquals(keys(), before, 'neither stores it');
+                    const id = await host.client.registerKey(pk);
+                    assertEquals(await host.client.lookupKey(pk), id, 'once registered, the in-process client finds its id');
+                    assertEquals(await client.lookupKey(pk), id, 'and so does the file client');
+                    assertTrue((await threw(host.client.registerKey('not a key'))) !== '', "the in-process registerKey refuses a malformed key");
+                    assertTrue((await threw(host.client.lookupKey('not a key'))) !== '', 'and so does its lookupKey');
+                    assertEquals(keys(), before + 1, 'storing nothing for it');
+                } finally {
+                    file.close();
+                    await client.close();
+                }
+            });
+        },
+    },
 ];
+
+// The message of what `call` threw, or '' when it resolved.
+async function threw(call: Promise<unknown>): Promise<string> {
+    try {
+        await call;
+        return '';
+    } catch (e) {
+        return String(e);
+    }
+}
 
 async function main() {
     const filters = process.argv.slice(2);

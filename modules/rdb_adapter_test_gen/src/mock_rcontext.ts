@@ -2,7 +2,7 @@
 // APIs (dag / mvt / crypto). Mesh and fetchObject are omitted (histories never
 // trigger sync or member bootstrap).
 
-import { B64Hash, createBasicCrypto, HASH_SHA256 } from "@hyper-hyper-space/hhs3_crypto";
+import { B64Hash, createBasicCrypto, HASH_SHA256, type HashSuite } from "@hyper-hyper-space/hhs3_crypto";
 import { dag, Dag } from "@hyper-hyper-space/hhs3_dag";
 import {
     RContext, RObject, Payload, RObjectConfig,
@@ -13,7 +13,10 @@ import {
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
 
-export function createMockRContext(config: RObjectConfig = { selfValidate: true }): RContext {
+// `hash` is the replica's hash suite, which key ids are hashed with: SHA-256
+// unless a case asks for another. The DAGs hash their entries with SHA-256
+// whatever it is, as rdb hashes its create entries.
+export function createMockRContext(config: RObjectConfig = { selfValidate: true }, hash: HashSuite = hashSuite): RContext {
     const registry = new TypeRegistryMap();
     const objects = new Map<B64Hash, RObject>();
     const rootIds = new Set<B64Hash>();
@@ -42,7 +45,7 @@ export function createMockRContext(config: RObjectConfig = { selfValidate: true 
 
     const ctx: RContext = {
         getCrypto: () => crypto,
-        getHashSuite: () => hashSuite,
+        getHashSuite: () => hash,
         getConfig: () => config,
         getRegistry: () => registry,
 

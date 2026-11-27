@@ -9,6 +9,7 @@ IndexedDB [`MaterializationTarget`](../rdb_adapter) for [rdb_adapter](../rdb_ada
 - Applies schema actions, row actions, and the **per-group checkpoint** in one IndexedDB transaction (`IdbTarget.apply`). Local ids and key ids are assigned inside that transaction, so concurrent connections serialize on IndexedDB's per-store locking.
 - Owns the shared `rdb_keys` side table and implements `KeyIndex`.
 - Implements `MaterializedChangeSource` (an outbox of local edits to the projected tables) and `RowIdentityIndex`.
+- Implements `WritableTarget`: `openWriter()` gives the `RowWriter` of [Writing](../rdb_adapter#writing) over this target. Each call is one read-write transaction over every store, through the facade's own write steps, and resolves when it completes.
 - Implements `IndexTarget`: projection-local indexes declared in an index spec (see [rdb_adapter](../rdb_adapter#indexes)) become read-only, native-shaped indexes on `target.database` (see [Indexes](#indexes)).
 - Implements `QueryableTarget` and `ReactiveChangeTarget` (see [rdb_adapter](../rdb_adapter#reactive-queries)): executes `SingleTableQueryPlan` over `rows` and emits `local`, `apply`, and `settle` commit events in-process and across tabs on [`BroadcastChannel`](https://developer.mozilla.org/en-US/docs/Web/API/BroadcastChannel) (`hhs3-rdb-idb:${dbName}`). Receiving tabs deliver those events through `notifyExternalCommit` and do not post them again. The target emits `local`, `apply`, and `settle`. A catch-up re-query is a `{ source: 'reconnect' }` event passed to `notifyExternalCommit` by the caller. The anchor for `before` / `after` is taken from the rows that passed the `WHERE`, or from `cachedValues` when the monitor has one. An anchor excluded by the predicate is not loaded by a separate primary-key read.
 
@@ -93,6 +94,8 @@ The same database name opened with `indexedDB.open` shows the physical stores (`
 
 ### Write
 
+The target's writer, `openWriter()`, is the path that means the same on every target ([Writing](../rdb_adapter#writing)). This section is the facade's.
+
 `add()` without an `id` allocates `nextId` in that transaction. `put` replaces the whole document, `patch` changes some of its fields, and `delete` takes the local `id`.
 
 A `null` property sets the column to NULL, and the store keeps no key for it: a document written with `memo: null` reads back without `memo`, exactly like one written without the property. This is one difference from native IndexedDB, which would keep the `null`. In return a row reads the same before and after its write is ingested, and the same on every device. A `put` that sets a property to `null` and a `put` that drops a property the row had are the same change, a clear of the column. See [NULL values](../rdb_adapter#null-values) for what a clear becomes in rdb.
@@ -138,7 +141,7 @@ await waitReq(ledger.patch({ id: 1, amount: '5.00' }, { delete: ['memo'] }));   
 
 `patch` reads the stored record, writes the fields it is given over it, clears the ones `delete` lists, and keeps the rest and their index entries. It compares nothing, so a field it names at its current value is still a write. Like an `UPDATE` that matches no row, a `patch` of an id with no record writes and captures nothing, and a field both given and listed is a `DataError`.
 
-The author column follows the record. A `put` that leaves it out, or gives it `null`, keeps the stored author and captures nothing for it, so a record built from a form keeps its author. An `add`, or a `put` of a new record, that leaves it empty gets the writer key's id when the writer record says `auto` and the table's group has an identity provider, in the row and in what is captured, as SQLite's insert trigger does.
+The author column follows the record. A `put` that leaves it out, or gives it `null`, keeps the stored author and captures nothing for it, so a record built from a form keeps its author. An `add`, or a `put` of a new record, that leaves it empty gets the writer key's id when the writer record says `auto` and the table's group has an identity provider, in the row and in what is captured, as SQLite's insert trigger does. Under `manual` it stays empty, and the insert is anonymous: the `author` setting applies to the facade's writes as it does to the writer's ([Authorship](../rdb_adapter#authorship)).
 
 Two writers whose scopes overlap take turns: the second transaction starts after the first commits. Native IndexedDB defines that scope as the object stores named in `transaction(...)`. Here those names are projected tables we model ourselves. Every row lives in physical `rows`, and every `target.database` transaction opens that store (plus `table_meta`, `keys`, `outbox`, `index_meta`, `index_entries` and `capture_config`, which `add`/`put`/`patch`/`delete` also touch). So two `'readwrite'` transactions — even on different app tables — run one after the other. A `'readonly'` transaction overlaps the same physical stores as a writer, so a long read of `tags` and a write to `ledger` also take turns. Two `'readonly'` transactions may run at the same time.
 
@@ -243,4 +246,4 @@ npm run test:projection:fast
 npm run test:projection:full
 ```
 
-**HIPs:** [5](../../hips/0005-reactive-queries.md), [29](../../hips/0029-checkpoint-consistency.md)
+**HIPs:** [5](../../hips/0005-reactive-queries.md), [20](../../hips/0020-unified-write-api.md), [29](../../hips/0029-checkpoint-consistency.md)

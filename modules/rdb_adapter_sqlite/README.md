@@ -15,7 +15,7 @@ await projectGroup(group, target);
 target.close();  // checkpoints WAL; drops -wal/-shm when this is the last connection
 ```
 
-For a whole `RDb`, [rdb_projection](../rdb_projection) is the usual supervisor: `RdbProjection.open(rdb, ctx, target, { writer })` materializes every member under group-qualified table names and keeps both directions in sync. You still read and write the SQLite `db` handle.
+For a whole `RDb`, [rdb_projection](../rdb_projection) is the usual supervisor: `RdbProjection.open(rdb, ctx, target, { writer })` materializes every member under group-qualified table names and keeps both directions in sync. You still read and write the SQLite `db` handle, or write through the projection's writer, the path that means the same on every target ([Writing](../rdb_adapter#writing)).
 
 ## What it does
 
@@ -25,13 +25,14 @@ For a whole `RDb`, [rdb_projection](../rdb_projection) is the usual supervisor: 
 - Implements `IndexTarget`: projection-local indexes declared in an index spec become real SQLite indexes (see [Indexes](#indexes)).
 - Implements `QueryableTarget`: compiles `SingleTableQueryPlan` (including `.before(id)` / `.after(id)` tuple seeks and `LIKE` via a registered deterministic `rdb_like_match` function) into parameterized `SELECT` statements and maps rows to their logical types.
 - Implements `ReactiveChangeTarget` (see [rdb_adapter](../rdb_adapter#reactive-queries)): emits `local`, `apply`, and `settle` commit events. Local writes are detected by an optional in-process commit shim (`wrapDatabase(db, target)` / `target.noteLocalCommit()`) together with a coalesced kernel WAL watcher (via [file_watch](../file_watch) when `dbPath` is passed, or an epoch-gated unref'd poll for `:memory:` / no path) and the drain rule in `drainChanges()`. Announced outbox rows are tracked in `emittedOutboxIds` as a set rather than a high-water mark, so rolled-back `AUTOINCREMENT` ids and out-of-order commits never stall or drop notifications.
+- Implements `WritableTarget`: `openWriter()` gives the `RowWriter` of [Writing](../rdb_adapter#writing) over this target. Each call is one immediate transaction, built from `rdb_table_meta` and `PRAGMA table_info`, and announces its commit as `noteLocalCommit()` does.
 - `close()` disarms that monitor and closes the `better-sqlite3` handle (idempotent). A file-backed db checkpoints and drops `-wal`/`-shm` when this is the last connection. `RdbProjection.stop()` calls this.
 
 ## Capture
 
 With `captureChanges: true`, triggers on every projected table record the app's writes in `rdb_outbox`, whichever connection makes them. The adapter's own writes don't reach the outbox: they run with `rdb_capture_config.applying` set, which the triggers check. What ingestion then does with the outbox is described in [Ingestion and checkpoints](../rdb_adapter#ingestion-and-checkpoints).
 
-An insert is recorded from the row as stored, defaults included. When the table has an author column, its group has an identity provider, and the writer record (`rdb_writer_record`) says `auto`, the insert trigger first writes the writer key's id into an empty author column, so the row reads its author straight away. A `RETURNING` clause on the insert still shows the column empty, because SQLite computes it before `AFTER` triggers run; any later read has the id.
+An insert is recorded from the row as stored, defaults included. When the table has an author column, its group has an identity provider, and the writer record (`rdb_writer_record`) says `auto`, the insert trigger first writes the writer key's id into an empty author column, so the row reads its author straight away. A `RETURNING` clause on the insert still shows the column empty, because SQLite computes it before `AFTER` triggers run; any later read has the id. Under `manual` the trigger leaves the column as the insert wrote it, so an insert that names no author is anonymous and one naming the writer key's id is signed: the `author` setting applies to native writes as it does to the writer's ([Authorship](../rdb_adapter#authorship)).
 
 An `UPDATE` is recorded as one outbox row per updated row, with every column the statement names and the value it set, whether it changed or not: `UPDATE notes SET body = body` is a write of `body`. A `BEFORE UPDATE` trigger closes what an earlier statement left open for the row, and an `AFTER UPDATE OF <column>` trigger per column adds its column to this statement's row. A statement can't change a row's id, with capture on or off: a trigger fails it, since the row would sit under an id rdb doesn't know.
 
@@ -66,4 +67,4 @@ npm run test:projection:fast
 npm run test:projection:full
 ```
 
-**HIPs:** [5](../../hips/0005-reactive-queries.md), [29](../../hips/0029-checkpoint-consistency.md)
+**HIPs:** [5](../../hips/0005-reactive-queries.md), [20](../../hips/0020-unified-write-api.md), [29](../../hips/0029-checkpoint-consistency.md)

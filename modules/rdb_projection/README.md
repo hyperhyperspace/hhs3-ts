@@ -9,9 +9,10 @@ An `RDb`'s member table groups are computed from the catalog releases deployed i
 - **materializes** every member with group-qualified table names (`<group>_<table>`, where `<group>` is the member name from `rdb.getMemberGroupNames()`: an identifier, unique within the database, so tables from different groups never collide);
 - **resolves cross-group FKs to serial ids** when the referenced group is co-projected (otherwise a `row_hash` passthrough);
 - **ingests local edits in commit order**, each as its own entry at its group's checkpoint, observing co-projected groups as the pass extends them so an observer's cross-group FKs and `exists` reads validate against sibling groups ingested in the same pass (see [Ingestion and checkpoints](../rdb_adapter#ingestion-and-checkpoints));
-- **interns authors and identity keys** into a shared `rdb_keys` table as `author_key_id` / `<col>_key_id` (`registerKey` / `keyHashForId` / `publicKeyForId` on the projection);
+- **interns authors and identity keys** into a shared `rdb_keys` table as `author_key_id` / `<col>_key_id` (`registerKey` / `keyHashForId` / `publicKeyForId` / `idForKeyHash` on the projection; `registerKey` refuses a malformed key, checked with mvt's `validateKey`, and a key hash that isn't the key's under the replica's hash suite);
 - **stays in sync reactively** — a debounced, coalesced `syncDatabase` fires on three triggers: each member group's `subscribe` (the rdb side advanced), the target's `{ source: 'local' }` commit events on `ReactiveChangeTarget` (or `ChangeSignalSource` fallback when local edits are waiting), and the `RDb`'s own `subscribe` (a release was deployed, possibly adding members). An explicit `sync()` and a `nudge()` fallback are also provided. How a cycle runs is described in [Cycles](#cycles).
-- **exposes reactive queries and commit streaming** — `projection.selectFrom(table)`, `projection.monitor(queryOrSet)`, and `projection.onCommit(listener)` delegate to the [query engine](../rdb_adapter#reactive-queries) on the underlying target.
+- **exposes reactive queries and commit streaming** — `projection.selectFrom(table)`, `projection.monitor(queryOrSet)`, and `projection.onCommit(listener)` delegate to the [query engine](../rdb_adapter#reactive-queries) on the underlying target, and so do `rowHash`, `localId` and `tableNames`;
+- **opens writers** — `projection.openWriter()` gives the `RowWriter` of [Writing](../rdb_adapter#writing), over the target.
 - **exposes the op-event log** as inspect (`opEvents({ afterId, beforeId, limit, order })`) plus live subscribe (`subscribeOpEvents` / `onOpEvents`). Subscribe does not replay history.
 - **maintains projection-local indexes** declared in an index spec, installed with `reconcileIndexes` (below).
 - **mounts FILES members as folders** with `reconcileFiles` (below). Files have no projection tables; the target is used only for `rdb_keys` ids.
@@ -33,6 +34,8 @@ Any other error ends the cycle, reaches `onError`, and leaves its message in `la
 ### The writer
 
 `writer` signs what the projection ingests. When it opens, the projection records it in the target, with its `author` setting. That record is how capture fills the empty author column of a native insert with the writer's key id, so the row shows its author before it is ingested. `author` decides how an insert's author is chosen in a group with an identity provider: under `'auto'`, the default, an insert that leaves the author column empty is signed with the writer's key; under `'manual'` it is signed only when it names the writer's key id in that column, and is anonymous otherwise. It is one setting for the whole projection, and a `configOverride` doesn't change it for a group. Under `'manual'`, a group with an identity provider and `authorColumn: false` is refused at open: an insert names its author in that column, and there is none. A group without an identity provider never signs, whatever the setting, and needs no key.
+
+`projection.openWriter()` opens a writer over the target, with or without a writer key. Without one, a write to a group with an identity provider is refused with `no-writer-key`, and a write to an anonymous group is captured and ingested ([Writing](../rdb_adapter#writing)). The writer reads the record at each write, so a writer opened before the projection reopened with another `author` follows the new setting.
 
 ### A group without a key
 
@@ -120,4 +123,4 @@ A mount whose FILES isn't a member yet, or whose objects haven't arrived, is `pe
 npm test
 ```
 
-**HIPs:** [3](../../hips/0003-schema-composability.md), [5](../../hips/0005-reactive-queries.md), [29](../../hips/0029-checkpoint-consistency.md)
+**HIPs:** [3](../../hips/0003-schema-composability.md), [5](../../hips/0005-reactive-queries.md), [20](../../hips/0020-unified-write-api.md), [29](../../hips/0029-checkpoint-consistency.md)

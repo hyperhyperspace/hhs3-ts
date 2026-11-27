@@ -11,8 +11,8 @@
 // columns, FK validity, ALLOW rules and voiding (HIP-20's Checks).
 
 import { json } from "@hyper-hyper-space/hhs3_json";
-import { getHashSuite, getSigningSuite, keyIdFromPublicKey, type PublicKey } from "@hyper-hyper-space/hhs3_crypto";
-import { deserializePublicKeyFromBase64, serializePublicKeyToBase64 } from "@hyper-hyper-space/hhs3_mvt";
+import { getHashSuite, keyIdFromPublicKey } from "@hyper-hyper-space/hhs3_crypto";
+import { deserializePublicKeyFromBase64, validateKey } from "@hyper-hyper-space/hhs3_mvt";
 import type { ColumnType } from "@hyper-hyper-space/hhs3_rdb";
 
 import { WriteRefusedError, type KeyValue, type RowValues, type WriteRefusal, type WriterRecord } from "./types.js";
@@ -248,33 +248,18 @@ function readForm(type: ColumnType): string {
     }
 }
 
-// A `{ pk }`'s key, checked: the deserializer checks nothing, so a key hash
-// passed by mistake would parse into a garbage suite and an empty key. Its
-// suite must be a registered signing suite, its length that suite's public key
-// size, and its base64 canonical. The key hash is computed with the hash suite
-// the projection recorded, the replica's (HIP-20's Key columns).
+// A `{ pk }`'s key, checked with validateKey: the deserializer checks nothing,
+// so a key hash passed by mistake would parse into a garbage suite and an
+// empty key. The key hash is computed with the hash suite the projection
+// recorded, the replica's (HIP-20's Key columns).
 function keyOf(where: string, value: KeyValue, ctx: WriteContext): { keyHash: string; publicKey: string } {
     const hash = ctx.record === undefined ? undefined : getHashSuite(ctx.record.hashSuite);
     if (hash === undefined) {
         refuse('invalid-key', `${where}: no projection has recorded the hash suite a key is hashed with in this target`);
     }
-    let pk: PublicKey;
-    try {
-        pk = deserializePublicKeyFromBase64(value.pk);
-    } catch {
-        refuse('invalid-key', `${where}: ${JSON.stringify(value.pk)} isn't a serialized public key`);
-    }
-    const signing = getSigningSuite(pk.suite);
-    if (signing === undefined) {
-        refuse('invalid-key', `${where}: the key names the signing suite ${JSON.stringify(pk.suite)}, which isn't registered`);
-    }
-    if (pk.key.length !== signing.publicKeySize) {
-        refuse('invalid-key', `${where}: the key is ${pk.key.length} bytes, and a ${pk.suite} public key is ${signing.publicKeySize}`);
-    }
-    if (serializePublicKeyToBase64(pk) !== value.pk) {
-        refuse('invalid-key', `${where}: the key isn't in canonical base64`);
-    }
-    return { keyHash: keyIdFromPublicKey(pk, hash), publicKey: value.pk };
+    const valid = validateKey(value.pk);
+    if (!valid.valid) refuse('invalid-key', `${where}: ${valid.why.reason}`);
+    return { keyHash: keyIdFromPublicKey(deserializePublicKeyFromBase64(value.pk), hash), publicKey: value.pk };
 }
 
 // Whether an update's value for a column equals the row's, by value, json

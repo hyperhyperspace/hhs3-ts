@@ -53,13 +53,15 @@ export async function rowOps(group: RTableGroup, table: string): Promise<{ actio
 
 // Records the writer in the target, as RdbProjection does at open: the writer
 // key, when given, the hash suite and the author setting.
-export async function recordWriter(target: BidirectionalTarget, author: AuthorSetting, writer?: OwnIdentity): Promise<number | undefined> {
+export async function recordWriter(
+    target: BidirectionalTarget, author: AuthorSetting, writer?: OwnIdentity, hashSuite = 'sha-256',
+): Promise<number | undefined> {
     let writerKeyId: number | undefined;
     if (writer !== undefined) {
         writerKeyId = await (target as unknown as KeyIndex).registerKey(DEFAULT_KEY_DOMAIN, writer.keyId, serializePublicKeyToBase64(writer.publicKey));
     }
     await (target as unknown as WriterRecordStore).recordWriter({
-        ...(writerKeyId !== undefined ? { writerKeyId } : {}), hashSuite: 'sha-256', author,
+        ...(writerKeyId !== undefined ? { writerKeyId } : {}), hashSuite, author,
     });
     return writerKeyId;
 }

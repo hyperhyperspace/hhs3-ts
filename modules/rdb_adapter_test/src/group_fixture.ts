@@ -5,7 +5,7 @@
 // backend runs the same suite against the same group shape.
 
 import { createBasicCrypto, HASH_SHA256, createIdentity, SIGNING_ED25519 } from "@hyper-hyper-space/hhs3_crypto";
-import type { OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
+import type { HashSuite, OwnIdentity } from "@hyper-hyper-space/hhs3_crypto";
 import type { Version } from "@hyper-hyper-space/hhs3_mvt";
 import {
     IDENTITIES_TABLE, identityRow, RSchemaImpl, rSchemaFactory, RTableGroupImpl, rTableGroupFactory, TableDef,
@@ -17,8 +17,8 @@ import { createMockRContext } from "./mock_rcontext.js";
 const crypto = createBasicCrypto();
 const hashSuite = crypto.hash(HASH_SHA256);
 
-export async function makeIdentity(): Promise<OwnIdentity> {
-    return createIdentity(SIGNING_ED25519, hashSuite);
+export async function makeIdentity(suite: HashSuite = hashSuite): Promise<OwnIdentity> {
+    return createIdentity(SIGNING_ED25519, suite);
 }
 
 // `ref` readonly pub string, `memo` nullable bounded string, `amount` a
@@ -177,12 +177,12 @@ export type GroupFixture = {
 // The group is its own identity provider with `admin` registered, so the
 // suites can sign rows as `admin`. An anonymous group has no identity provider:
 // every op in it is unsigned, and `admin` signs nothing.
-async function buildGroup(name: string, tables: TableDef[], opts: { anonymous?: boolean } = {}): Promise<GroupFixture> {
-    const ctx = createMockRContext({ selfValidate: true });
+async function buildGroup(name: string, tables: TableDef[], opts: { anonymous?: boolean; hashSuite?: HashSuite } = {}): Promise<GroupFixture> {
+    const ctx = createMockRContext({ selfValidate: true }, opts.hashSuite ?? hashSuite);
     ctx.getRegistry().register(RSchemaImpl.typeId, rSchemaFactory);
     ctx.getRegistry().register(RTableGroupImpl.typeId, rTableGroupFactory);
 
-    const admin = await makeIdentity();
+    const admin = await makeIdentity(opts.hashSuite ?? hashSuite);
     const schemaInit = await RSchemaImpl.create({
         name,
         creators: [{ keyId: admin.keyId, publicKey: admin.publicKey }],
@@ -224,8 +224,9 @@ export async function createNullsGroup(): Promise<GroupFixture> {
 }
 
 // A group with one table of every column type (see typedTables).
-export async function createTypedGroup(): Promise<GroupFixture> {
-    return buildGroup('typed', typedTables());
+// `hashSuite` is the replica's, which the admin's key id is hashed with too.
+export async function createTypedGroup(opts: { hashSuite?: HashSuite } = {}): Promise<GroupFixture> {
+    return buildGroup('typed', typedTables(), opts);
 }
 
 // A group whose items' deletes are gated by a grant (see gatedTables).

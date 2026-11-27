@@ -61,8 +61,11 @@ interface SigningSuite {
     generateKeyPair(): Promise<{ publicKey: Uint8Array; secretKey: Uint8Array }>;
     sign(message: Uint8Array, secretKey: Uint8Array): Promise<Uint8Array>;
     verify(message: Uint8Array, signature: Uint8Array, publicKey: Uint8Array): Promise<boolean>;
+    publicKeyProblem(key: Uint8Array): string | undefined;   // what is wrong with a raw public key, or undefined
 }
 ```
+
+`publicKeyProblem` says whether raw bytes are a public key of the suite. An `ed25519` key must be 32 bytes that decode, by the strict rules, to a point of the curve, which about half of all 32-byte strings don't, and the point must not be one of the curve's 8 small-order points, which no key pair makes. A point with a small-order part beside its prime-order one passes: verification ignores that part. FIPS 204 decodes any 1952 bytes as an `ml-dsa-65` key, so its length is the whole check. The hybrid checks its two halves. mvt's `validateKey` checks a serialized key with it.
 
 The hybrid suite concatenates classical and post-quantum keys/signatures and requires **both** to verify.
 
@@ -202,3 +205,5 @@ The test suite covers all suite interfaces, hybrid constructions (component tamp
 npm run test
 ```
 
+
+**HIPs:** [20](../../hips/0020-unified-write-api.md)

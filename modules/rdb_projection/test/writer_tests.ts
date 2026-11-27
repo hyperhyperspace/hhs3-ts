@@ -3,7 +3,8 @@
 // read by a writer at each write.
 
 import { assertEquals, assertTrue } from "@hyper-hyper-space/hhs3_util/dist/test.js";
-import type { RContext } from "@hyper-hyper-space/hhs3_mvt";
+import { keyIdFromPublicKey, SIGNING_ED25519, type PublicKey } from "@hyper-hyper-space/hhs3_crypto";
+import { serializePublicKeyToBase64, type RContext } from "@hyper-hyper-space/hhs3_mvt";
 import { IDENTITIES_TABLE, registerIdentity, usersSchemaTables } from "@hyper-hyper-space/hhs3_rdb";
 import { isWritableTarget, MemoryTarget, WriteRefusedError } from "@hyper-hyper-space/hhs3_rdb_adapter";
 
@@ -162,6 +163,35 @@ export const writerTests = {
                         'and takes a null author, which auto refused');
                 } finally {
                     await second.stop();
+                }
+            },
+        },
+        {
+            name: "[RDBPROJ38] registerKey refuses a malformed key, and a hash that isn't the key's, and stores neither",
+            invoke: async () => {
+                const ctx = newCtx();
+                const { rdb, writer } = await mixedDb(ctx);
+                const memory = new MemoryTarget({ captureChanges: true });
+                const projection = await RdbProjection.open(rdb, ctx, memory, { writer, debounceMs: 5 });
+                const throws = async (call: Promise<unknown>): Promise<boolean> => call.then(() => false, () => true);
+                try {
+                    const neutral: PublicKey = { suite: SIGNING_ED25519, key: Uint8Array.from({ length: 32 }, (_, i) => (i === 0 ? 1 : 0)) };
+                    const neutralHash = keyIdFromPublicKey(neutral, ctx.getHashSuite());
+                    assertTrue(await throws(projection.registerKey(neutralHash, serializePublicKeyToBase64(neutral))),
+                        "a small-order ed25519 key, which isn't a well-formed key, is refused");
+                    assertEquals(await projection.idForKeyHash(neutralHash), undefined, 'and not stored');
+
+                    const other = await makeIdentity();
+                    const pk = serializePublicKeyToBase64(other.publicKey);
+                    const wrongHash = (await makeIdentity()).keyId;
+                    assertTrue(await throws(projection.registerKey(wrongHash, pk)), "a hash that isn't the key's is refused");
+                    assertEquals(await projection.idForKeyHash(wrongHash), undefined, 'and not stored');
+
+                    const keyHash = keyIdFromPublicKey(other.publicKey, ctx.getHashSuite());
+                    const id = await projection.registerKey(keyHash, pk);
+                    assertEquals(await projection.idForKeyHash(keyHash), id, 'a well-formed key under its own hash is stored');
+                } finally {
+                    await projection.stop();
                 }
             },
         },
