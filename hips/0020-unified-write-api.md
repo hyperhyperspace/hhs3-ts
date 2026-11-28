@@ -1,11 +1,12 @@
 # HIP-20: Unified write API for projection targets
 
 - **Type:** design
-- **Status:** draft
+- **Status:** implemented
 - **Modules:** rdb_adapter, rdb_adapter_sqlite, rdb_adapter_idb, rdb_adapter_test, rdb_adapter_test_gen, rdb_projection, rdb_react, rhost, rhost_client, rhost_client_node, rhost_client_browser, crypto, mvt
 - **Requires:** [29](0029-checkpoint-consistency.md), which carries the native insert over an existing local id of *Changes* 1
 - **Superseded by:** —
-- **Implemented in:** —
+- **Implemented in:** `4db216b`, `3bae793`, `22589f1`, `6580444`
+- **Code references:** to the tree at `6580444`, where the last of this HIP landed, except those that name another commit
 
 ## Summary
 

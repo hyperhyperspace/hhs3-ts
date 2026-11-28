@@ -23,7 +23,7 @@ A HIP proposes a change to Hyper Hyper Space: to its design, its implementation,
 | [17](0017-verdict-cache.md) | Verdict cache across computations | implementation | deferred |
 | [18](0018-mvt-ideas.md) | MVT candidate data types | informational | active |
 | [19](0019-replicated-spreadsheets.md) | Replicated spreadsheets (prior art toward RCalc) | informational | active |
-| [20](0020-unified-write-api.md) | Unified write API for projection targets | design | draft |
+| [20](0020-unified-write-api.md) | Unified write API for projection targets | design | implemented |
 | [21](0021-exists-where-or.md) | `OR` in `EXISTS ... WHERE` | design | implemented |
 | [22](0022-concurrent-removals.md) | Concurrent removals of one target | design | draft |
 | [23](0023-join-bootstrap.md) | Bootstrapping a joined host under an allow list | design | implemented |
